@@ -135,15 +135,120 @@ pub fn validateBatchRequest(request: anytype) !void {
     }
 }
 
-pub const Command = struct {
+pub const Control = struct {
     effect: Effect,
     binding: jobs.Binding,
     inputs_b64: ?[]const u8 = null,
 
-    pub fn validate(self: Command) !void {
+    pub fn validate(self: Control) !void {
         _ = try self.binding.encode();
         if (self.binding.authority != .raft or self.binding.phase != .fencing or
             ((self.effect == .admitted) != (self.inputs_b64 != null))) return error.InvalidPrivateIndexOwnerJob;
         if (self.inputs_b64) |bytes| if (bytes.len == 0 or bytes.len > std.base64.standard.Encoder.calcSize(inputs.max_bytes)) return error.InvalidPrivateIndexInputs;
+    }
+};
+
+/// Exactly one owned effect per committed entry. The execution position is
+/// absent: only the committed-entry callback can supply that authority cut.
+/// This replaces the earlier branch-local flat control framing.
+pub const Command = union(enum) {
+    control: Control,
+    cancel_control: Control,
+    cancel_intent: Admission,
+    cancel_cleanup: jobs.Binding,
+    cancel_complete: jobs.Binding,
+    cancel_release: @import("relational_index_release.zig").CancellationIntent,
+    build: @import("relational_index_jobs.zig").Page.PrivateCommand,
+    claims: @import("relational_index_owner_control.zig").ClaimCommand,
+    consume: @import("relational_index_owner_control.zig").ConsumeCommand,
+    inventory_validation: @import("relational_index_private_claims.zig").InventoryValidation.Command,
+    generation_validation: @import("relational_index_validation.zig").Command,
+    validation_seal: @import("relational_index_validation.zig").SealCommand,
+    install: @import("relational_index_validation.zig").InstallCommand,
+    release: @import("relational_index_release.zig").Intent,
+    release_gc: @import("relational_index_release.zig").Gc.Command,
+
+    pub fn fence(self: Command) @import("relational_integrity_topology.zig").Fence {
+        return switch (self) {
+            .control, .cancel_control => |value| value.binding.fence,
+            .cancel_intent => |value| value.fence,
+            .cancel_cleanup, .cancel_complete => |value| value.fence,
+            .cancel_release => |value| value.canceled.binding.fence,
+            .install => |value| value.validation.command.binding.fence,
+            .release => |value| value.installed.command.validation.command.binding.fence,
+            .release_gc => |value| value.record.intent.installed.command.validation.command.binding.fence,
+            inline else => |value| value.binding.fence,
+        };
+    }
+
+    pub fn validate(self: Command) !void {
+        switch (self) {
+            .cancel_intent => |value| try value.validate(),
+            .cancel_cleanup, .cancel_complete => |value| {
+                _ = try value.encode();
+                if (value.authority != .raft or value.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
+            },
+            .cancel_release => |value| {
+                try value.validate();
+                if (value.canceled.position != .raft) return error.InvalidControlReceiptPosition;
+            },
+            .install => |value| {
+                try value.validate();
+                if (value.validation.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+            },
+            .release => |value| {
+                try value.validate();
+                if (value.installed.position != .raft) return error.InvalidControlReceiptPosition;
+            },
+            .release_gc => |value| {
+                try value.validate();
+                if (value.record.position != .raft) return error.InvalidControlReceiptPosition;
+            },
+            inline else => |value| {
+                try value.validate();
+                if (value.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+            },
+        }
+    }
+
+    pub fn wireLimit(self: Command) usize {
+        const native = @import("relational_index_owner_control.zig");
+        return switch (self) {
+            .control, .cancel_control => native.max_control_wire_bytes,
+            .claims => native.max_claim_wire_bytes,
+            .build => @import("relational_index_jobs.zig").Page.PrivateCommand.max_wire_bytes,
+            .generation_validation => @import("relational_index_validation.zig").max_wire_bytes,
+            .inventory_validation => @import("relational_index_private_claims.zig").InventoryValidation.max_wire_bytes,
+            .release_gc => @import("relational_index_release.zig").Gc.max_wire_bytes,
+            else => native.max_cancellation_wire_bytes,
+        };
+    }
+
+    /// Bound typed duplication while still borrowing the general JSON tree.
+    /// Claim/build parsers additionally enforce their record-count budgets.
+    pub fn validateBorrowed(value: std.json.Value) !void {
+        if (value != .object or value.object.count() != 1) return error.InvalidBatchRequest;
+        const tag = std.meta.stringToEnum(std.meta.Tag(Command), value.object.keys()[0]) orelse return error.InvalidBatchRequest;
+        const body = value.object.values()[0];
+        if (body != .object) return error.InvalidBatchRequest;
+        const native = @import("relational_index_owner_control.zig");
+        const limit: usize = switch (tag) {
+            .control, .cancel_control => blk: {
+                if (body.object.get("inputs_b64")) |raw| if (raw != .null) {
+                    if (raw != .string or raw.string.len == 0 or raw.string.len > std.base64.standard.Encoder.calcSize(inputs.max_bytes)) return error.InvalidPrivateIndexInputs;
+                };
+                break :blk native.max_control_wire_bytes;
+            },
+            .claims => native.max_claim_wire_bytes,
+            .build => @import("relational_index_jobs.zig").Page.PrivateCommand.max_wire_bytes,
+            .generation_validation => @import("relational_index_validation.zig").max_wire_bytes,
+            .inventory_validation => @import("relational_index_private_claims.zig").InventoryValidation.max_wire_bytes,
+            .release_gc => @import("relational_index_release.zig").Gc.max_wire_bytes,
+            else => native.max_cancellation_wire_bytes,
+        };
+        var buffer: [256]u8 = undefined;
+        var count = std.Io.Writer.Discarding.init(&buffer);
+        std.json.Stringify.value(body, .{}, &count.writer) catch return error.InvalidBatchRequest;
+        if (count.fullCount() > limit) return error.TransactionTooLarge;
     }
 };

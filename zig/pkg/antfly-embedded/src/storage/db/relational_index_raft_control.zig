@@ -33,7 +33,7 @@ const Entry = receipts.OrderedApplyReceipt;
 
 const contract = @import("relational_index_raft_contract.zig");
 pub const Effect = contract.Effect;
-pub const Command = contract.Command;
+pub const Command = contract.Control;
 pub const Identity = contract.Identity;
 pub const Observation = contract.Observation;
 pub const AdmissionPreparation = contract.AdmissionPreparation;

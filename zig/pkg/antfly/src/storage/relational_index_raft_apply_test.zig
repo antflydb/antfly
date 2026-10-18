@@ -80,7 +80,7 @@ pub fn run(command: controls.Command) !void {
     };
     var driver: Driver = .{ .database = &db };
     const group = command.binding.fence.owner_group_id;
-    const control_bytes = try batch.encode(a, "docs", .{ .relational_index_owner_control = command });
+    const control_bytes = try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .control = command } });
     defer a.free(control_bytes);
     {
         const unmounted_path = try std.fmt.allocPrint(a, "{s}/unmounted", .{directory.path()});
@@ -152,7 +152,7 @@ pub fn run(command: controls.Command) !void {
     try machine.stateMachine().applyReady(group, null, &entries, &.{});
     try std.testing.expectEqual(@as(u64, 2), driver.applied);
     for ([_]controls.Effect{ .fenced, .reserved }, 0..) |effect, ordinal| {
-        const payload = try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .effect = effect, .binding = command.binding } });
+        const payload = try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .control = .{ .effect = effect, .binding = command.binding } } });
         defer a.free(payload);
         try machine.stateMachine().applyReady(group, null, &.{.{ .term = 8, .index = ordinal + 3, .entry_type = .normal, .data = payload }}, &.{});
         const receipt = (try db.raftIndexOwnerReceipt(group, command.binding, effect)).?;
@@ -162,9 +162,64 @@ pub fn run(command: controls.Command) !void {
         try std.testing.expectEqual(@as(u64, ordinal + 3), driver.applied);
     }
     const reserved = (try db.raftIndexOwnerReceipt(group, command.binding, .reserved)).?;
-    const retry = try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .effect = .reserved, .binding = command.binding } });
+    const retry = try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .control = .{ .effect = .reserved, .binding = command.binding } } });
     defer a.free(retry);
     try machine.stateMachine().applyReady(group, null, &.{.{ .term = 9, .index = 5, .entry_type = .normal, .data = retry }}, &.{});
     try std.testing.expectEqual(@as(u64, 5), driver.applied);
     try std.testing.expectEqualDeep(reserved, (try db.raftIndexOwnerReceipt(group, command.binding, .reserved)).?);
+    const owners = local.storage_db_relational_index_owner_control;
+    const jobs = local.storage_db_relational_index_owner_job;
+    const build_payload = blk: {
+        var reservation = try db.prepareRaftIndexOwnerControl(.{ .effect = .reserved, .binding = command.binding });
+        defer reservation.deinit();
+        var page = (try owners.PreparedBuild.prepareRaft(a, null, db.core, "docs", &reservation, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})).?;
+        defer page.deinit();
+        break :blk try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .build = page.command } });
+    };
+    defer a.free(build_payload);
+    const build_entry = [_]raft_engine.core.Entry{.{ .term = 9, .index = 6, .entry_type = .normal, .data = build_payload }};
+    driver.before = true;
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, machine.stateMachine().applyReady(group, null, &build_entry, &.{}));
+    try std.testing.expectEqual(@as(u64, 5), (try db.orderedApplyReceipt()).?.index);
+    driver.after = true;
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, machine.stateMachine().applyReady(group, null, &build_entry, &.{}));
+    try std.testing.expectEqual(@as(u64, 6), (try db.orderedApplyReceipt()).?.index);
+    try std.testing.expectEqual(@as(u64, 5), driver.applied);
+    db.close();
+    db_live = false;
+    store.deinit();
+    store_live = false;
+    db = try db_mod.DB.open(a, native_path, options);
+    db_live = true;
+    store = try projection.RaftApplyStore.init(a, .{ .root_dir = path, .native_source_delegate = true });
+    store_live = true;
+    machine = driver.machine(&store);
+    try machine.stateMachine().applyReady(group, null, &build_entry, &.{});
+    try std.testing.expectEqual(@as(u64, 6), driver.applied);
+    const binding = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const current = (try jobs.load(&read)).?;
+        try owners.PreparedBuild.verifyRecovery(&read, current);
+        const head = (try jobs.private_claims.SourceStream.load(&read, current)).?;
+        try std.testing.expectEqual(@as(u64, 6), head.last_sequence);
+        try std.testing.expectEqual(@as(u64, 1), head.pending());
+        break :blk current;
+    };
+    const cancel_payload = try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .cancel_intent = controls.Admission.fromBinding(binding) } });
+    defer a.free(cancel_payload);
+    const cancel_entry = [_]raft_engine.core.Entry{.{ .term = 10, .index = 7, .entry_type = .normal, .data = cancel_payload }};
+    driver.after = true;
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, machine.stateMachine().applyReady(group, null, &cancel_entry, &.{}));
+    try std.testing.expectEqual(@as(u64, 7), (try db.orderedApplyReceipt()).?.index);
+    try std.testing.expectEqual(@as(u64, 6), driver.applied);
+    try machine.stateMachine().applyReady(group, null, &cancel_entry, &.{});
+    const cleanup_payload = try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .cancel_cleanup = binding } });
+    defer a.free(cleanup_payload);
+    try machine.stateMachine().applyReady(group, null, &.{.{ .term = 10, .index = 8, .entry_type = .normal, .data = cleanup_payload }}, &.{});
+    try std.testing.expectEqual(@as(u64, 8), driver.applied);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 8), (try jobs.requireCancellationCleanup(&read, binding)).raft.index);
+    try jobs.private_claims.SourceStream.requireCanceledRetired(&read, binding);
 }

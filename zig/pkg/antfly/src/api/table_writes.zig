@@ -22554,7 +22554,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const apply_req = req;
         try @import("antfly_local_sources").storage_db_relational_index_raft_contract.validateBatchRequest(apply_req);
-        if (apply_req.relational_index_owner_control) |command| if (command.binding.fence.owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
+        if (apply_req.relational_index_owner_control) |command| if (command.fence().owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
         const split_identity_namespace = try validateSplitReplicationForApply(apply_req, group_id);
         const merge_identity_namespace = try validateMergeReplicationForApply(apply_req, group_id);
         try validateMergeCheckpointForApply(apply_req, group_id);

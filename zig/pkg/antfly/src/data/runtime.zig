@@ -42383,8 +42383,10 @@ fn consumerTests() type {
             // Intentionally invalid: capability classification and generic-route
             // rejection must not assume that decoding authorized the binding.
             const request: antfly.db.types.BatchRequest = .{ .relational_index_owner_control = .{
-                .effect = .fenced,
-                .binding = std.mem.zeroInit(@FieldType(Command, "binding"), .{ .authority = .raft, .fence = .{ .role = .index_build } }),
+                .control = .{
+                    .effect = .fenced,
+                    .binding = std.mem.zeroInit(@FieldType(@FieldType(Command, "control"), "binding"), .{ .authority = .raft, .fence = .{ .role = .index_build } }),
+                },
             } };
             try std.testing.expectEqual(data_raft_batch.index_owner_control_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
             var mixed = request;

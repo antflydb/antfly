@@ -26,6 +26,9 @@ The mounted distributed UNIQUE-index gate still rejects CREATE with `501`:
 replicated publication is not fully activated. Admission stays guarded and no
 original cases receive credit for storage-only work. Next delivery must cross
 the public owner/coordinator boundary, not merely add more protocol contracts.
+The mounted Debug lifecycle campaign was rerun with real local listeners after
+the dispatcher integration: the unchanged first UNIQUE/NND statement still
+returns `501` / `0A000`. The public producer remains closed; this is not a pass.
 
 The existing bounded physical builder now supports trusted committed Raft apply
 using the same page, progress CAS and claim-source queue as standalone execution.
@@ -75,8 +78,16 @@ GC pages also apply at real Raft cuts: cold recovery resumes the exact retained
 release, and cleanup never deletes live UNIQUE claims. New build admission stays
 closed until companion retirement completes. The standalone worker leaves Raft
 retirement to ordered proposals. Terminal records use one tagged AIIR v2 format.
-This does not yet wire replicated claim delivery, validation seals,
-installation, cancellation or publication release through the public receiver.
+Owned effects now pass through the data-Raft batch dispatcher in one tagged
+command format (protocol 23, introduced only on this branch). Admission/drain,
+build pages, claims, consumption, both verifiers, seals, installation, release,
+companion retirement and cancellation terminal effects reuse their existing
+prepared execution paths. Borrowed JSON is size-checked before typed duplication;
+the command supplies no execution cut. Dispatch joins actual group/namespace
+identity, skips old replay before preparation and rechecks replay after a raced
+preparation failure. Earlier branch-local flat control envelopes are unsupported.
+This is committed-entry dispatch, not the public metadata-authorized producer:
+claim delivery and publication are not yet mounted through that public receiver.
 Cancellation intent now commits at a real Raft position, including an owner's
 first entry or an owner that has not visited the job. Ordinary work stays closed;
 explicit cancellation controls drain and burn the exact generation. Cleanup
@@ -132,6 +143,12 @@ Terminal controls reuse the write-failure injector for every completion/release
 write and the apply marker. They cover expired preparation, foreign groups,
 checksummed future cuts, cold retained-cut retry, delayed old admission, and a
 real ordinary Raft write after release, with the native clock unchanged.
+The same regression now roundtrips every owned effect through the internal batch
+codec and real server dispatcher, including installation on a freshly reopened
+store. The two-store fixture additionally applies encoded build and cancellation
+effects through the actual data state machine: failure before native commit
+advances neither store, and failure after it leaves the projection behind until
+cold replay converges without reapplying the effect or inventing a native cut.
 `zig build antfly-relational-index-pages-test -Doptimize=Debug -j1` also passes
 all 12 standalone lifecycle tests, including standby replay and bounded released
 companion retirement. This gate is distinct from the publication-only suite.

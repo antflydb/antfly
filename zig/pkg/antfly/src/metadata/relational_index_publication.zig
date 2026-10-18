@@ -1129,7 +1129,7 @@ pub const OwnerDecision = struct {
     /// The receiver obtains this decision independently and inspects the real
     /// local job. The command contains no claimed term, position or grant bit;
     /// committed apply must still CAS the binding against its own durable job.
-    pub fn raftControl(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !raft_control.Command {
+    pub fn raftControl(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !raft_control.Control {
         const effect: raft_control.Effect = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
@@ -1138,7 +1138,7 @@ pub const OwnerDecision = struct {
         _ = try self.raftExecutionIdentity(request);
         try self.requireRetainedBinding(observed, .raft);
         if (observed.phase != .fencing and observed.phase != .reserved) return error.PrivateIndexOwnerJobChanged;
-        var command: raft_control.Command = .{ .effect = effect, .binding = observed };
+        var command: raft_control.Control = .{ .effect = effect, .binding = observed };
         command.binding.phase = .fencing;
         try command.validate();
         return command;

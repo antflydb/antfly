@@ -1548,21 +1548,29 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     try std.testing.expectError(error.IdentityNamespaceMismatch, db.raftIndexOwnerState(11, foreign_identity));
     try std.testing.expectError(error.OnlineSourceScopeChanged, db.nativeIndexOwnerState(identity));
     const Wire = struct {
+        fn apply(database: *db_mod.DB, command: @import("relational_index_raft_contract.zig").Command, entry: receipts.OrderedApplyReceipt) !void {
+            const codec = @import("../../api/batch.zig");
+            const encoded = try codec.encodeBatchRequest(alloc, .{ .relational_index_owner_control = command });
+            defer alloc.free(encoded);
+            var decoded = try codec.parseInternalBatchRequest(alloc, encoded);
+            defer decoded.deinit(alloc);
+            try server_test_adapter.applyOrderedGroup(database, 11, decoded.req, entry);
+        }
         fn roundtrip(backing: std.mem.Allocator, command: raft.Command) !void {
             const codec = @import("../../api/batch.zig");
-            const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = command, .timestamp_ns = 18446744073709551600 };
+            const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = .{ .control = command }, .timestamp_ns = 18446744073709551600 };
             const encoded = try codec.encodeBatchRequest(backing, request);
             defer backing.free(encoded);
             var decoded = try codec.parseInternalBatchRequest(backing, encoded);
             defer decoded.deinit(backing);
-            try std.testing.expectEqualDeep(command, decoded.req.relational_index_owner_control.?);
+            try std.testing.expectEqualDeep(command, decoded.req.relational_index_owner_control.?.control);
             try std.testing.expectEqual(request.timestamp_ns, decoded.req.timestamp_ns);
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Wire.roundtrip, .{admission.command});
     {
         const codec = @import("../../api/batch.zig");
-        const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = admission.command };
+        const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = .{ .control = admission.command } };
         const encoded = try codec.encodeBatchRequest(alloc, request);
         defer alloc.free(encoded);
         try std.testing.expectError(error.InvalidBatchRequest, codec.parseBatchRequest(alloc, encoded));
@@ -1600,7 +1608,8 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         defer alloc.free(unknown);
         try std.testing.expectError(error.InvalidBatchRequest, codec.parseInternalBatchRequest(alloc, unknown));
         _ = parsed_wire.value.object.swapRemove("future_control");
-        const control = parsed_wire.value.object.getPtr("_relational_index_owner_control").?;
+        const envelope = parsed_wire.value.object.getPtr("_relational_index_owner_control").?;
+        const control = envelope.object.getPtr("control").?;
         const original_inputs = control.object.get("inputs_b64").?;
         const oversized = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(@import("relational_index_inputs.zig").max_bytes) + 1);
         defer alloc.free(oversized);
@@ -1614,7 +1623,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         const caller_cut = try std.json.Stringify.valueAlloc(alloc, parsed_wire.value, .{});
         defer alloc.free(caller_cut);
         try std.testing.expectError(error.InvalidBatchRequest, codec.parseInternalBatchRequest(alloc, caller_cut));
-        const alias = control.*;
+        const alias = envelope.*;
         _ = parsed_wire.value.object.swapRemove("_relational_index_owner_control");
         try parsed_wire.value.object.put(owned, "relational_index_owner_control", alias);
         const public_alias = try std.json.Stringify.valueAlloc(alloc, parsed_wire.value, .{});
@@ -1846,7 +1855,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         missed = try db_mod.DB.open(alloc, missed_directory.path(), options);
         missed_live = true;
         try std.testing.expectError(error.PrivateIndexPublicationCanceled, missed.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 2, .index = 3 }));
-        try missed.applyCommittedRaftIndexCancellationControl(&admission, 11, .{ .term = 2, .index = 3 });
+        try Wire.apply(&missed, .{ .cancel_control = admission.command }, .{ .term = 2, .index = 3 });
         var fence_control = try missed.prepareRaftIndexOwnerControl(.{ .effect = .fenced, .binding = binding });
         defer fence_control.deinit();
         try std.testing.expectError(error.PrivateIndexPublicationCanceled, missed.applyCommittedRaftIndexOwnerControl(&fence_control, 11, .{ .term = 2, .index = 4 }));
@@ -1883,7 +1892,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     {
         var pinned = try db.core.store.beginReadTxn();
         defer pinned.abort();
-        try db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 10 });
+        try Wire.apply(&db, .{ .control = admission.command }, .{ .term = 1, .index = 10 });
         const old = try raft.observe(&pinned, identity);
         try std.testing.expect(old.binding == null and old.fenced == null and old.reserved == null);
         try std.testing.expectEqual(@as(u64, 1), old.applied.?.raft.index);
@@ -1997,7 +2006,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     // time-limited scan. A later retry retains the first effect position.
     var replayed_page = try build.replayPrepared(alloc, db.core, first.command);
     defer replayed_page.deinit();
-    try db.applyCommittedRaftIndexBuild(&replayed_page, 11, .{ .term = 4, .index = 50 });
+    try Wire.apply(&db, .{ .build = replayed_page.command }, .{ .term = 4, .index = 50 });
     try db.applyCommittedRaftIndexBuild(&replayed_page, 11, .{ .term = 4, .index = 50 });
     try std.testing.expectError(error.ConflictingOrderedApplyReceipt, db.applyCommittedRaftIndexBuild(&replayed_page, 11, .{ .term = 5, .index = 50 }));
     db.close();
@@ -2173,7 +2182,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expectEqual(@as(u64, 60), head.last_sequence);
         try std.testing.expectEqual(@as(u64, 70), (try source.loadConsumption(&txn, reserved_binding, head)).?.position.raft.index);
     }
-    try db.applyCommittedRaftIndexConsumption(&consume, 11, .{ .term = 5, .index = 58 });
+    try Wire.apply(&db, .{ .consume = consume.command }, .{ .term = 5, .index = 58 });
     try db.applyCommittedRaftIndexConsumption(&consume, 11, .{ .term = 5, .index = 58 });
     db.close();
     db_live = false;
@@ -2331,7 +2340,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expectError(error.NotFound, read.get(&claim_store.inventoryKey(target.batch.entries[0].address)));
         try std.testing.expectEqual(@as(u64, 70), (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
     }
-    try db.applyCommittedRaftIndexClaims(&target, 11, .{ .term = 7, .index = 80 });
+    try Wire.apply(&db, .{ .claims = target.command }, .{ .term = 7, .index = 80 });
     const inventory_key = claim_store.inventoryKey(target.batch.entries[0].address);
     const original_inventory = try db.core.store.get(alloc, &inventory_key);
     defer alloc.free(original_inventory);
@@ -2401,7 +2410,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         const gc = @import("relational_index_gc.zig");
         var cancel = try owner_control.PreparedCancellation.init(alloc, cancellation.Intent.fromBinding(reserved_binding));
         defer cancel.deinit();
-        try canceled_db.applyCommittedRaftIndexCancellation(&cancel, 11, .{ .term = 10, .index = 120 });
+        try Wire.apply(&canceled_db, .{ .cancel_intent = cancel.intent }, .{ .term = 10, .index = 120 });
         var completion: owner_control.PreparedCancellationCompletion = .{ .alloc = alloc, .binding = reserved_binding };
         defer completion.deinit();
         try std.testing.expectError(error.InvalidControlReceiptPosition, completion.preparePayload());
@@ -2422,7 +2431,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
             try std.testing.expectEqual(@as(u64, 120), (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
         }
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, canceled_db.applyCommittedRaftIndexCancellationCleanup(&cleanup, 99, .{ .term = 10, .index = 121 }));
-        try canceled_db.applyCommittedRaftIndexCancellationCleanup(&cleanup, 11, .{ .term = 10, .index = 121 });
+        try Wire.apply(&canceled_db, .{ .cancel_cleanup = cleanup.binding }, .{ .term = 10, .index = 121 });
         try canceled_db.applyCommittedRaftIndexCancellationCleanup(&cleanup, 11, .{ .term = 10, .index = 121 });
         try canceled_db.applyCommittedRaftIndexCancellationCleanup(&cleanup, 11, .{ .term = 11, .index = 123 });
         canceled_db.close();
@@ -2514,7 +2523,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expectError(error.DeadlineExceeded, canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, completion_entry));
         completion.context = .{};
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 99, completion_entry));
-        try canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, completion_entry);
+        try Wire.apply(&canceled_db, .{ .cancel_complete = completion.binding }, completion_entry);
         try canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, completion_entry);
         canceled_db.close();
         canceled_live = false;
@@ -2550,7 +2559,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         const cancellation_release_entry: receipts.OrderedApplyReceipt = .{ .term = 14, .index = cut + 3 };
         try Fault.probe(&canceled_db, &release_control, cancellation_release_entry);
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, canceled_db.applyCommittedRaftIndexCancellationRelease(&release_control, 99, cancellation_release_entry));
-        try canceled_db.applyCommittedRaftIndexCancellationRelease(&release_control, 11, cancellation_release_entry);
+        try Wire.apply(&canceled_db, .{ .cancel_release = release_control.intent }, cancellation_release_entry);
         try canceled_db.applyCommittedRaftIndexCancellationRelease(&release_control, 11, cancellation_release_entry);
         canceled_db.close();
         canceled_live = false;
@@ -2635,7 +2644,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     }
     var freeze_replay = try Inventory.replayPage(&db, freeze.batch.command);
     defer freeze_replay.deinit();
-    try db.applyCommittedRaftIndexInventory(&freeze_replay, 11, .{ .term = 10, .index = 120 });
+    try Wire.apply(&db, .{ .inventory_validation = freeze_replay.batch.command }, .{ .term = 10, .index = 120 });
     try db.applyCommittedRaftIndexInventory(&freeze_replay, 11, .{ .term = 10, .index = 121 });
     try std.testing.expectError(error.PrivateIndexTargetSealed, db.applyCommittedRaftIndexClaims(&late, 11, .{ .term = 10, .index = 122 }));
     try std.testing.expectEqual(@as(u64, 121), (try db.orderedApplyReceipt()).?.index);
@@ -2701,7 +2710,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
             try follower.stageRaft(db.core, &txn, 11, entry);
         }
         try std.testing.expectEqual(last_validation_index, (try db.orderedApplyReceipt()).?.index);
-        try db.applyCommittedRaftIndexGeneration(&follower, 11, entry);
+        try Wire.apply(&db, .{ .generation_validation = follower.page.command }, entry);
         last_validation_index = entry.index;
         // A new log entry retry must retain the original physical proof cut.
         try db.applyCommittedRaftIndexGeneration(&follower, 11, .{ .term = 11, .index = last_validation_index + 1 });
@@ -2764,7 +2773,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expect(try physical.Seal.load(alloc, &read, reserved_binding) == null);
         try std.testing.expectEqual(last_validation_index, (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
     }
-    try db.applyCommittedRaftIndexValidation(&seal_prepared, 11, seal_entry);
+    try Wire.apply(&db, .{ .validation_seal = seal_prepared.command }, seal_entry);
     try db.applyCommittedRaftIndexValidation(&seal_prepared, 11, .{ .term = 13, .index = seal_entry.index + 1 });
     db.close();
     db_live = false;
@@ -2851,6 +2860,22 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     }
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.applyCommittedRaftIndexInstallation(&installation, 99, install_entry));
     {
+        var wire_directory = try @import("../../common/test_directory.zig").TestDirectory.init("raft-index-wire-install");
+        defer wire_directory.cleanup();
+        {
+            var seed = try db_mod.DB.open(alloc, wire_directory.path(), options);
+            defer seed.close();
+            try seedNativeIndexFixture(&db, &seed);
+        }
+        var wire_db = try db_mod.DB.open(alloc, wire_directory.path(), options);
+        defer wire_db.close();
+        try Wire.apply(&wire_db, .{ .install = installation.command }, install_entry);
+        try std.testing.expectEqual(@as(u32, 2), wire_db.core.schema.?.version);
+        var read = try wire_db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(install_entry.index, (try physical.Installed.load(alloc, &read, reserved_binding)).?.position.raft.index);
+    }
+    {
         var before_view = db.core.acquireSchemaView().?;
         defer before_view.release();
         try db.applyCommittedRaftIndexInstallation(&installation, 11, install_entry);
@@ -2914,7 +2939,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expectEqual(.installed, (try jobs.load(&read)).?.phase);
     }
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.applyCommittedRaftIndexRelease(&release_prepared, 99, release_entry));
-    try db.applyCommittedRaftIndexRelease(&release_prepared, 11, release_entry);
+    try Wire.apply(&db, .{ .release = release_prepared.intent }, release_entry);
     try db.applyCommittedRaftIndexRelease(&release_prepared, 11, release_entry);
     try db.applyCommittedRaftIndexRelease(&release_prepared, 11, .{ .term = 18, .index = release_entry.index + 1 });
     db.close();
@@ -2966,7 +2991,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
             try gc_prepared.stageRaft(db.core, &txn, 11, entry);
         }
         try std.testing.expectEqual(gc_index, (try db.orderedApplyReceipt()).?.index);
-        try db.applyCommittedRaftIndexReleaseGc(&gc_prepared, 11, entry);
+        try Wire.apply(&db, .{ .release_gc = gc_prepared.command }, entry);
         try db.applyCommittedRaftIndexReleaseGc(&gc_prepared, 11, entry);
         gc_index = entry.index;
         if (gc_pages == 1) {

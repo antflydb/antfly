@@ -655,13 +655,7 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
         if (root.get("deletes")) |deletes| if (deletes != .null and (deletes != .array or deletes.array.items.len != 0)) return error.InvalidBatchRequest;
         // Check the borrowed manifest before typed parsing duplicates it. The
         // general batch string limit is larger than this control's input budget.
-        if (value != .object) return error.InvalidBatchRequest;
-        if (value.object.get("inputs_b64")) |input| {
-            if (input != .null) {
-                if (input != .string or input.string.len == 0 or
-                    input.string.len > std.base64.standard.Encoder.calcSize(@import("../storage/db/relational_index_inputs.zig").max_bytes)) return error.InvalidPrivateIndexInputs;
-            }
-        }
+        try @import("../storage/db/relational_index_raft_contract.zig").Command.validateBorrowed(value);
         const parsed = std.json.parseFromValue(@import("../storage/db/relational_index_raft_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| {
             if (err == error.OutOfMemory) return err;
             return error.InvalidBatchRequest;

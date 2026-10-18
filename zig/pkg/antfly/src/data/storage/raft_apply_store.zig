@@ -2440,7 +2440,7 @@ pub const RaftApplyStore = struct {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
             try operations.append(alloc, .{ .require_raft_batch_protocol = .{
                 .version = data_raft_batch.index_owner_control_protocol_version,
-                .owner_group_id = command.binding.fence.owner_group_id,
+                .owner_group_id = command.fence().owner_group_id,
             } });
             return;
         }
