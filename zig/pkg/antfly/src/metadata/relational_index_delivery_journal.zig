@@ -624,7 +624,7 @@ fn requireRetainedBinding(alloc: std.mem.Allocator, reader: anytype, group: u64,
 
 /// O(1) final-input projection. EOF completion freezes metadata acceptance;
 /// it does not prove physical claims, close target writers or publish a schema.
-pub const FrozenTarget = struct { expected: jobs.private_claims.TargetExpectation, source_members: u64, source_position: positions.Native };
+pub const FrozenTarget = struct { expected: jobs.private_claims.TargetExpectation, source_members: u64, source_position: positions.Position };
 pub fn targetExpectation(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, owner: progress.OwnerState, incarnation: Digest) !jobs.private_claims.TargetExpectation {
     return (try frozenTarget(alloc, reader, group, head, owner, incarnation)).expected;
 }
@@ -639,7 +639,7 @@ pub fn frozenTargetForRecovery(alloc: std.mem.Allocator, reader: anytype, group:
     try head.validate();
     try owner.validate();
     if (head.completed_sources != head.owner_count or head.completion_revision == 0) return error.GenerationPublicationChanged;
-    if (owner.owner.authority != .native or !owner.source_completed or owner.owner.namespace.table_id != head.table_id or owner.owner.ordinal >= head.owner_count or
+    if (!owner.source_completed or owner.owner.namespace.table_id != head.table_id or owner.owner.ordinal >= head.owner_count or
         !std.mem.eql(u8, &owner.owner.plan_id, &head.plan_id) or !equal(owner.owner.plan_digest, head.plan_digest)) return error.InvalidCatalogRecord;
     var buf: [192]u8 = undefined;
     const source = (try anchored(reader, try sourceKey(&buf, group, head.table_id, owner.owner.ordinal), owner.source_delivery)) orelse return error.InvalidCatalogRecord;
@@ -649,7 +649,7 @@ pub fn frozenTargetForRecovery(alloc: std.mem.Allocator, reader: anytype, group:
         prefix_.binding.fence.owner_group_id != owner.owner.group_id or !std.mem.eql(u8, &prefix_.binding.id, &head.plan_id)) return error.InvalidCatalogRecord;
     var dispatch = try publication.readDispatch(alloc, reader, group, owner.owner);
     defer dispatch.deinit();
-    try (publication.OwnerDecision{ .metadata_group_id = group, .metadata_incarnation = incarnation, .head = head, .owner = owner, .disposition = .execute, .dispatch = dispatch.value }).requireRetainedNativeBinding(prefix_.binding);
+    try dispatch.value.requireBinding(head, owner.owner, prefix_.binding, owner.owner.authority, incarnation);
     const source_scope: Source.Scope = .{ .table_name = dispatch.value.table_name, .generation = prefix_.header.bytes[72..88].*, .schema_version = std.mem.readInt(u32, prefix_.header.bytes[88..92], .little), .tuple_fingerprint = prefix_.header.bytes[192..224].*, .nulls_not_distinct = prefix_.header.bytes[185] != 0 };
     if (!equal(try source_scope.digest(), prefix_.head.scope_digest)) return error.InvalidCatalogRecord;
     try requireEnrollment(alloc, reader, group, complete.proof, incarnation);
@@ -672,9 +672,8 @@ pub fn frozenTargetForRecovery(alloc: std.mem.Allocator, reader: anytype, group:
         result.inventory_xor = target.inventory.inventory_xor;
         result.provenance = target.inventory.provenance;
     }
-    try result.requireBinding(prefix_.binding);
-    if (complete.position != .native) return error.InvalidCatalogRecord;
-    return .{ .expected = result, .source_members = complete.rows, .source_position = complete.position.native };
+    try result.requireOwnerBinding(prefix_.binding);
+    return .{ .expected = result, .source_members = complete.rows, .source_position = complete.position };
 }
 fn requireEnrollment(alloc: std.mem.Allocator, reader: anytype, group: u64, proof: publication.RootProof, incarnation: Digest) !void {
     const enrollment = @import("store_root_enrollment.zig");

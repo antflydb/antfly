@@ -655,7 +655,7 @@ pub fn auditPage(alloc: Allocator, core: anytype, binding: owner.Binding, expect
 pub fn auditReadPage(alloc: Allocator, core: anytype, read: anytype, binding: owner.Binding, expected: Expected, addition: *const catalog.PrivateAddition, root_incarnation: u128, inventory_audit: claims.InventoryValidation.Audit, previous: ?*const Audit, budget: jobs.Budget, context: Context) !Audit {
     try context.ensureActive();
     try budget.validate();
-    try expected.requireBinding(binding);
+    try expected.requireOwnerBinding(binding);
     if (root_incarnation == 0 or inventory_audit.root_incarnation != root_incarnation or
         !equal(inventory_audit.expectation_digest, try expected.digest())) return error.PrivateIndexAuditScopeChanged;
     try inventory_audit.fields.validate(expected);
@@ -669,13 +669,13 @@ pub fn auditReadPage(alloc: Allocator, core: anytype, read: anytype, binding: ow
     const index = for (pinned.plan.boundIndexes()) |value| {
         if (value.id().mapKey() == binding.index.mapKey()) break value;
     } else return error.IndexNotFound;
-    const frozen = try claims.InventoryValidation.requireReady(alloc, read, binding, expected);
+    const frozen = try claims.InventoryValidation.requireReadyAt(alloc, read, binding, expected);
     if (!equal(inventory_audit.canonical_digest, frozen.digest)) return error.PrivateIndexAuditScopeChanged;
     var canonical = (try load(alloc, read, binding)) orelse return error.PrivateIndexTargetValidationRequired;
     defer canonical.deinit();
     if (!equal(try canonical.summary.expected.digest(), try expected.digest()) or
         !equal(canonical.summary.inventory_digest, frozen.digest) or canonical.summary.source_members != frozen.source_members or
-        canonical.summary.position.native.sequence <= frozen.position.sequence) return error.PrivateIndexAuditScopeChanged;
+        !canonical.summary.position.strictlyAfter(frozen.position)) return error.PrivateIndexAuditScopeChanged;
     if (canonical.summary.fields.phase != .ready) return error.PrivateIndexTargetValidationRequired;
     var local: ?Loaded = null;
     if (previous) |state| {

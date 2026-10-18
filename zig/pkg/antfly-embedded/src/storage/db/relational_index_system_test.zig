@@ -2790,6 +2790,39 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         defer alloc.free(encoded);
         try std.testing.expectEqualSlices(u8, "AIGV\x02\x00\x00\x00", encoded[0..8]);
     }
+    {
+        var signing_dir = try @import("../../common/test_directory.zig").TestDirectory.init("raft-index-physical-audit");
+        defer signing_dir.cleanup();
+        const signing = @import("root_signing_identity.zig");
+        const root = try signing.loadOrCreate(alloc, std.testing.io, signing_dir.path());
+        var audit_request = try owner_control.BuildRequest.initRaft(identity, reserved_binding, .{ .records = 1, .time_ns = std.time.ns_per_s });
+        audit_request.target_expectation = expected;
+        var turns: usize = 0;
+        const audited = audited: while (turns < 64) : (turns += 1) {
+            const summary = try db.stepRaftIndexOwnerAudit(11, "usage_records", audit_request, signing_dir.path(), root.root_incarnation, .{});
+            try summary.validateFor(expected, root.root_incarnation);
+            try std.testing.expectEqual(last_validation_index, (try db.orderedApplyReceipt()).?.index);
+            if (turns == 0) {
+                // Resume the root-local audit across a real DB restart.
+                db.close();
+                db_live = false;
+                db = try db_mod.DB.open(alloc, directory.path(), options);
+                db_live = true;
+            }
+            if (summary.generation) |generation| if (generation.phase == .ready) break :audited summary;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expect(turns > 1);
+        try std.testing.expectEqual(physical.Phase.ready, audited.generation.?.phase);
+        try std.testing.expectEqual(last_validation_index - 1, audited.canonical_position.?.raft.index);
+        const outcome: owner_control.AuditOutcome = .{ .binding = reserved_binding, .expected = expected, .audit = audited };
+        try outcome.validateForRaft(audit_request);
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, outcome.validateFor(audit_request));
+        _ = try outcome.readyDigest();
+        try std.testing.expectEqualDeep(audited.canonical_position.?, (try outcome.logicalCommand()).generation_position);
+        try std.testing.expectEqualDeep(audited, try db.stepRaftIndexOwnerAudit(11, "usage_records", audit_request, signing_dir.path(), root.root_incarnation, .{}));
+        var canceled = std.atomic.Value(bool).init(true);
+        try std.testing.expectError(error.Canceled, db.stepRaftIndexOwnerAudit(11, "usage_records", audit_request, signing_dir.path(), root.root_incarnation, .{ .cancellation = .fromAtomic(&canceled) }));
+    }
     const seal_command = logical: {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();

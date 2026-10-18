@@ -8848,6 +8848,15 @@ pub const DB = struct {
     /// the physical incarnation comes from this live DB. Both lifecycle leases
     /// must remain held. This grants no publication or adoption authority.
     pub fn stepNativeIndexOwnerAudit(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+        return self.stepIndexOwnerAudit(table_name, request, signing_root_dir, signing_root_incarnation, context, false);
+    }
+
+    pub fn stepRaftIndexOwnerAudit(self: *DB, owner_group: u64, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+        try self.requireRaftIndexOwnerIdentity(owner_group, request.identity);
+        return self.stepIndexOwnerAudit(table_name, request, signing_root_dir, signing_root_incarnation, context, true);
+    }
+
+    fn stepIndexOwnerAudit(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext, comptime replicated: bool) !@import("relational_index_audit_checkpoint.zig").Summary {
         try context.ensureActive();
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -8855,8 +8864,8 @@ pub const DB = struct {
         // also work on followers. Adoption still needs independent authority.
         const expected = request.target_expectation orelse return error.PrivateIndexTargetValidationRequired;
         if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
-        const binding = (try self.nativeIndexOwnerState(request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
-        try request.requireBinding(binding);
+        const binding = (if (replicated) try self.raftIndexOwnerState(request.identity.owner_group_id, request.identity) else try self.nativeIndexOwnerState(request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        if (replicated) try request.requireRaftBinding(binding) else try request.requireBinding(binding);
         const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
         var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
         defer if (budget) |*value| value.deinit();
@@ -8956,9 +8965,10 @@ pub const DB = struct {
             };
             state = .{ .inventory = next };
         } else if (state.?.inventory.fields.phase == .ready) {
-            var lease = try self.native_index_build_cache.acquire(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
+            var lease = if (binding.authority == .raft) try self.native_index_build_cache.acquireRaft(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context) else try self.native_index_build_cache.acquire(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
             defer lease.deinit();
-            const next = try @import("relational_index_validation.zig").auditPage(alloc, self.core, binding, expected, &lease.reservation().artifacts.?.addition, self.root_incarnation, state.?.inventory, if (state.?.generation) |*value| value else null, request.budget, context);
+            const addition = if (binding.authority == .raft) &lease.raftReservation().artifacts.?.addition else &lease.reservation().artifacts.?.addition;
+            const next = try @import("relational_index_validation.zig").auditPage(alloc, self.core, binding, expected, addition, self.root_incarnation, state.?.inventory, if (state.?.generation) |*value| value else null, request.budget, context);
             if (state.?.generation) |*value| value.deinit();
             state.?.generation = next;
         }

@@ -214,10 +214,10 @@ pub const SignedAudit = struct {
     proof: RootProof,
     pub fn verifiedDigest(self: @This(), outcome: native_control.AuditOutcome) !Digest {
         const actual = try outcome.readyDigest();
-        if (self.proof.authority != .native or !std.mem.eql(u8, &actual, &self.outcome_digest) or
+        if ((self.proof.authority == .native) != (outcome.binding.authority == .native) or !std.mem.eql(u8, &actual, &self.outcome_digest) or
             self.proof.identity.root_incarnation != outcome.audit.root_incarnation or
             !std.mem.eql(u8, &self.proof.identity.metadata_incarnation, &outcome.expected.metadata_incarnation)) return error.InvalidIndexOwnerReceipt;
-        try (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(outcome.expected.metadata_incarnation);
+        if (self.proof.authority == .native) try (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(outcome.expected.metadata_incarnation);
         self.proof.verify(actual) catch return error.InvalidIndexOwnerReceipt;
         return actual;
     }
@@ -421,13 +421,13 @@ pub const ValidationWitness = struct {
     /// Consistency and signatures only. Accepting apply must independently
     /// join frozen provenance and current root authority in its transaction.
     pub fn verifyFor(self: @This(), receipt: SignedReceipt) !void {
-        if (receipt.receipt.action != .validated or receipt.receipt.position != .native) return error.InvalidIndexOwnerReceipt;
+        if (receipt.receipt.action != .validated) return error.InvalidIndexOwnerReceipt;
         try receipt.verifySignature();
         return self.verifyPhysicalAndScope(receipt);
     }
     fn verifyPhysicalAndScope(self: @This(), receipt: SignedReceipt) !void {
         const command = try self.outcome.logicalCommand();
-        if (!std.meta.eql(try command.receipt(receipt.receipt.position.native), receipt.receipt)) return error.InvalidIndexOwnerReceipt;
+        if (!std.meta.eql(try command.receiptAt(receipt.receipt.position), receipt.receipt)) return error.InvalidIndexOwnerReceipt;
         try (AuditEvidence{ .outcome = self.outcome, .signed = self.signed }).verifyScope(receipt);
     }
 };
@@ -482,7 +482,7 @@ pub const CancellationWitness = struct {
 
 fn requireWitnesses(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness) !void {
     const is_native = signed.receipt.owner.authority == .native;
-    if ((is_native and signed.receipt.action == .validated) != (validation != null) or
+    if ((signed.receipt.action == .validated) != (validation != null) or
         (is_native and signed.receipt.action == .installed) != (installation != null) or
         (is_native and signed.receipt.action == .canceled) != (cancellation != null)) return error.InvalidIndexOwnerReceipt;
 }
@@ -989,7 +989,7 @@ pub const OwnerDecision = struct {
         if (self.head.table_id != request.table_id or self.owner.owner.group_id != request.group_id or
             !std.mem.eql(u8, &self.head.plan_id, &request.id)) return error.GenerationPublicationChanged;
         if (try ownerPermission(self.head, self.owner, request.operation) != self.disposition) return error.InvalidCatalogRecord;
-        if (request.operation == .validate and self.disposition == .execute and self.owner.owner.authority == .native) {
+        if (request.operation == .validate and self.disposition == .execute) {
             const expected = self.target_expectation orelse return error.InvalidCatalogRecord;
             try expected.validate();
             if (self.head.completed_sources != self.head.owner_count or !self.owner.source_completed or
@@ -1308,6 +1308,32 @@ pub const OwnerDecision = struct {
         try expected.requireBinding(observed);
         return expected;
     }
+    pub fn raftInventoryValidation(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding, budget: local.storage_db_relational_index_jobs.Budget) !native_control.BuildRequest {
+        if (request.operation != .validate) return error.InvalidGenerationPublication;
+        _ = try self.raftExecutionIdentity(request);
+        try self.requireRetainedRaftBinding(observed);
+        const expected = self.target_expectation orelse return error.InvalidCatalogRecord;
+        try expected.requireOwnerBinding(observed);
+        var result = try native_control.BuildRequest.initRaft(try self.raftExecutionIdentity(request), observed, budget);
+        result.target_expectation = expected;
+        try result.validate();
+        return result;
+    }
+
+    pub fn signRaftAudit(self: OwnerDecision, request: OwnerRequest, outcome: native_control.AuditOutcome, physical_root_incarnation: u128, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !SignedAudit {
+        const validation_request = try self.raftInventoryValidation(request, outcome.binding, .{});
+        try outcome.validateForRaft(validation_request);
+        const digest_ = try outcome.readyDigest();
+        const view = try self.raftSigningView(request);
+        try view.requireLocal(actual);
+        if (physical_root_incarnation == 0 or outcome.audit.physical_root_incarnation != physical_root_incarnation or outcome.audit.root_incarnation != view.identity.root_incarnation) return error.IndexOwnerReceiptChanged;
+        const position = outcome.audit.canonical_position.?.raft;
+        if (position.term > actual.leader_term or position.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        const signed: SignedAudit = .{ .outcome_digest = digest_, .proof = try (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, digest_) };
+        _ = try signed.verifiedDigest(outcome);
+        return signed;
+    }
+
     pub fn nativeInstallationIntent(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !local.storage_db_relational_index_validation.InstallIntent {
         if (request.operation != .install) return error.InvalidGenerationPublication;
         try self.requireNativeBinding(request, observed);
@@ -1347,6 +1373,9 @@ pub const OwnerDecision = struct {
     /// this for retained acceptance after cancellation or publication as well.
     pub fn requireRetainedNativeBinding(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding) !void {
         try self.requireRetainedBinding(observed, .native);
+    }
+    pub fn requireRetainedRaftBinding(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding) !void {
+        try self.requireRetainedBinding(observed, .raft);
     }
 
     fn requireRetainedBinding(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding, authority: progress.Authority) !void {
@@ -2379,7 +2408,7 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
                 };
                 if (!std.mem.eql(u8, &try frozen.expected.digest(), &try witness.outcome.expected.digest()) or
                     frozen.source_members != witness.outcome.audit.source_members.? or
-                    witness.outcome.audit.canonical_position.?.sequence <= frozen.source_position.sequence) return error.InvalidCatalogRecord;
+                    !witness.outcome.audit.canonical_position.?.strictlyAfter(frozen.source_position)) return error.InvalidCatalogRecord;
             }
             if (!std.mem.eql(u8, &signed.proof.identity.metadata_incarnation, &std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower))) return error.InvalidCatalogRecord;
             // Usually all stages share one grant. Cache only a fixed-size

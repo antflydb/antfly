@@ -818,7 +818,7 @@ pub const BuildRequest = struct {
     }
     fn requireBindingAuthority(self: BuildRequest, binding: jobs.Binding, authority: @import("relational_index_publication_progress.zig").Authority) !void {
         try self.validate();
-        if (self.target_expectation) |expected| try expected.requireBinding(binding);
+        if (self.target_expectation) |expected| try expected.requireOwnerBinding(binding);
         const identity = self.identity;
         if (binding.phase != .reserved or binding.authority != authority or
             !std.mem.eql(u8, &binding.id, &identity.id) or !std.mem.eql(u8, &binding.plan_digest, &identity.plan_digest) or
@@ -929,26 +929,37 @@ pub const AuditOutcome = struct {
     audit: @import("relational_index_audit_checkpoint.zig").Summary,
     pub fn logicalCommand(self: @This()) !validation.SealCommand {
         _ = try self.readyDigest();
-        return .{ .binding = self.binding, .expected = self.expected, .generation_digest = self.audit.generation_canonical_digest.?, .inventory_digest = self.audit.inventory_canonical_digest, .source_members = self.audit.source_members.?, .generation_position = .{ .native = self.audit.canonical_position.? } };
+        return .{ .binding = self.binding, .expected = self.expected, .generation_digest = self.audit.generation_canonical_digest.?, .inventory_digest = self.audit.inventory_canonical_digest, .source_members = self.audit.source_members.?, .generation_position = self.audit.canonical_position.? };
     }
     pub fn validateFor(self: @This(), request: BuildRequest) !void {
         try request.requireBinding(self.binding);
         if (!std.mem.eql(u8, &try self.expected.digest(), &try (request.target_expectation orelse return error.InvalidPrivateIndexNativeReceipt).digest())) return error.InvalidPrivateIndexNativeReceipt;
         try self.audit.validateFor(self.expected, self.audit.root_incarnation);
-        if (self.audit.canonical_position) |position| if (!position.namespace.eql(self.binding.fence.namespace)) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.audit.canonical_position) |position| {
+            if (position != .native) return error.InvalidPrivateIndexNativeReceipt;
+            position.requireNamespace(self.binding.fence.namespace) catch return error.InvalidPrivateIndexNativeReceipt;
+        }
+    }
+    pub fn validateForRaft(self: @This(), request: BuildRequest) !void {
+        try request.requireRaftBinding(self.binding);
+        if (!std.mem.eql(u8, &try self.expected.digest(), &try (request.target_expectation orelse return error.InvalidRelationalIndexValidation).digest())) return error.InvalidRelationalIndexValidation;
+        try self.audit.validateFor(self.expected, self.audit.root_incarnation);
+        if (self.audit.canonical_position) |position| if (position != .raft) return error.InvalidControlReceiptPosition;
     }
     /// Physical witness identity only, deliberately distinct from a logical
     /// publication receipt. It changes when the physical DB is replaced.
     pub fn readyDigest(self: @This()) !integrity.Digest {
-        try self.expected.requireBinding(self.binding);
+        try self.expected.requireOwnerBinding(self.binding);
         try self.audit.validateFor(self.expected, self.audit.root_incarnation);
         if (self.audit.inventory.phase != .ready or self.audit.generation == null or self.audit.generation.?.phase != .ready) return error.PrivateIndexTargetValidationRequired;
-        if (!self.audit.canonical_position.?.namespace.eql(self.binding.fence.namespace)) return error.InvalidPrivateIndexNativeReceipt;
+        const position = self.audit.canonical_position.?;
+        if ((position == .native) != (self.binding.authority == .native)) return error.InvalidControlReceiptPosition;
+        try position.requireNamespace(self.binding.fence.namespace);
         var buffer: [16 * 1024]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
         std.json.Stringify.value(self, .{}, &writer) catch return error.InvalidPrivateIndexNativeReceipt;
         var digest = std.crypto.hash.Blake3.init(.{});
-        digest.update("antfly/private-index-complete-physical-audit/v2");
+        digest.update("antfly/private-index-complete-physical-audit/v3");
         digest.update(buffer[0..writer.end]);
         var result: integrity.Digest = undefined;
         digest.final(&result);

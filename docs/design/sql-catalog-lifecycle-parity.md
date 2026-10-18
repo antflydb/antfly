@@ -123,8 +123,14 @@ before proposing consumption through the existing member/term barrier. Exact
 retries recover the original consumption record from the same owner lease.
 The existing source ABI has a consumed-only projection: receipt recovery
 verifies the checkpoint without loading or base64-encoding the next payload.
+Frozen target expectations and physical-audit summaries now retain tagged
+positions for either authority. Raft owners reuse the bounded inventory and
+generation audit passes and signed root-local restart checkpoints; auditing
+does not advance the replicated apply marker. Metadata requires a physical
+witness for validated ACKs of either authority and independently verifies both
+the audited canonical cut and the later logical seal against current ownership.
 This is not complete public activation: the worker's Raft cohort guard,
-validation/audit and later publication receiver paths
+validation-page/audit receiver wiring and later publication receiver paths
 remain unfinished, and public CREATE remains guarded. No original case is
 closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's

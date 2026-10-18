@@ -40,7 +40,7 @@ pub const State = struct {
         self.* = undefined;
     }
     fn validate(self: State, root: signing.State, physical_incarnation: u128, binding: jobs.Binding, expected: claims.TargetExpectation) !void {
-        try expected.requireBinding(binding);
+        try expected.requireOwnerBinding(binding);
         if (root.root_incarnation == 0 or physical_incarnation == 0 or self.inventory.root_incarnation != physical_incarnation or
             !equal(self.inventory.expectation_digest, try expected.digest()) or !nonzero(self.inventory.canonical_digest) or !nonzero(self.inventory.page_digest)) return error.PrivateIndexAuditScopeChanged;
         try self.inventory.fields.validate(expected);
@@ -62,7 +62,7 @@ pub const Summary = struct {
     generation: ?generation.Fields,
     generation_canonical_digest: ?Digest,
     source_members: ?u64,
-    canonical_position: ?@import("receipt_position.zig").Native,
+    canonical_position: ?@import("receipt_position.zig").Position,
     checkpoint_digest: Digest,
     pub fn validateFor(self: @This(), expected: claims.TargetExpectation, root_incarnation: u128) !void {
         try expected.validate();
@@ -234,7 +234,7 @@ pub const Guard = struct {
     }
     pub fn summary(self: *const @This(), state: State) !Summary {
         try state.validate(self.root, self.physical_incarnation, self.binding, self.expected);
-        return .{ .root_incarnation = self.root.root_incarnation, .physical_root_incarnation = self.physical_incarnation, .expectation_digest = state.inventory.expectation_digest, .inventory = state.inventory.fields, .generation = if (state.generation) |value| value.progress.summary.fields else null, .inventory_canonical_digest = state.inventory.canonical_digest, .generation_canonical_digest = if (state.generation) |value| value.canonical_digest else null, .source_members = if (state.generation) |value| value.progress.summary.source_members else null, .canonical_position = if (state.generation) |value| value.progress.summary.position.native else null, .checkpoint_digest = self.checkpoint_digest orelse return error.PrivateIndexTargetValidationRequired };
+        return .{ .root_incarnation = self.root.root_incarnation, .physical_root_incarnation = self.physical_incarnation, .expectation_digest = state.inventory.expectation_digest, .inventory = state.inventory.fields, .generation = if (state.generation) |value| value.progress.summary.fields else null, .inventory_canonical_digest = state.inventory.canonical_digest, .generation_canonical_digest = if (state.generation) |value| value.canonical_digest else null, .source_members = if (state.generation) |value| value.progress.summary.source_members else null, .canonical_position = if (state.generation) |value| value.progress.summary.position else null, .checkpoint_digest = self.checkpoint_digest orelse return error.PrivateIndexTargetValidationRequired };
     }
 };
 
@@ -243,7 +243,7 @@ pub const Guard = struct {
 /// Both root lifecycle leases outlive this guard and every scan it protects.
 pub fn open(alloc: Allocator, io: std.Io, root_dir: []const u8, root_incarnation: u128, physical_incarnation: u128, binding: jobs.Binding, expected: claims.TargetExpectation, context: Context) !Guard {
     try context.ensureActive();
-    try expected.requireBinding(binding);
+    try expected.requireOwnerBinding(binding);
     const identity = try root_identity.load(alloc, io, root_dir);
     if (root_incarnation == 0 or physical_incarnation == 0 or identity.incarnation != root_incarnation) return error.PrivateIndexAuditScopeChanged;
     // Provisioning owns key creation. An audit must not mint a new identity
