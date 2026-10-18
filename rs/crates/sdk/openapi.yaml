@@ -39497,6 +39497,10 @@ components:
         expected_revision:
           type: integer
           format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables
+            the fence.
         wait:
           $ref: '#/components/schemas/ResolverWait'
     ResolverRedirectList:
@@ -39544,6 +39548,9 @@ components:
           type: integer
           format: uint64
           minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables
+            the fence.
         wait:
           $ref: '#/components/schemas/ResolverWait'
     ResolverUnmergeRequest:
@@ -39557,6 +39564,9 @@ components:
           type: integer
           format: uint64
           minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables
+            the fence.
         wait:
           $ref: '#/components/schemas/ResolverWait'
     ResolverSuppressionList:
@@ -39619,6 +39629,9 @@ components:
           type: integer
           format: uint64
           minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables
+            the fence.
         wait:
           $ref: '#/components/schemas/ResolverWait'
     ResolverReview:

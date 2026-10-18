@@ -122,3 +122,70 @@ def test_suppression_replays_mention_and_relation_edges(aflite_path):
         db.run_until_idle()
         assert len(db.edges("knowledge", "source", "mentions", 0)) == 2
         assert len(db.edges("knowledge", "concept/alpha", "uses", 0)) == 1
+
+
+def test_reviewed_endpoints_follow_merges_and_unmerges(aflite_path):
+    import base64
+
+    options = antfly_embedded.OpenOptions(generated_enrichment_replay=True)
+    with antfly_embedded.create_with_options(aflite_path, options) as db:
+        db.add_index(
+            {
+                "name": "knowledge",
+                "type": "graph",
+                "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+                "artifact": {
+                    "name": "kg",
+                    "kind": "asset",
+                    "source": {"type": "field", "value": "kg"},
+                    "content_type": "application/json",
+                },
+                "edge_types": [{"name": "mentions"}],
+                "resolvers": [
+                    {
+                        "name": "concepts",
+                        "table": "default",
+                        "promote": False,
+                        "source_artifact": "kg",
+                        "resolution_artifact": "resolved",
+                        "key_template": "concept/{{uslug _entity.text}}",
+                        "candidate_search": "prefix",
+                        "scorer": {
+                            "comparisons": [],
+                            "combine": {"bias": 1},
+                            "decision": {"match": 0.95, "review": 0.6},
+                        },
+                    }
+                ],
+            }
+        )
+        db.batch_json(
+            {
+                "inserts": {
+                    "concept/a": {"entity_type": "concept", "canonical_name": "A"},
+                    "concept/b": {"entity_type": "concept", "canonical_name": "B"},
+                    "source": {"kg": {"entities": [{"id": "c", "text": "C", "label": "concept"}]}},
+                }
+            }
+        )
+        db.run_until_idle()
+        review = db.resolver_reviews({"operation": "reviews", "resolver": "concepts"})["reviews"][0]
+        db.resolver_reviews(
+            {"operation": "review", "resolver": "concepts", "id": review["id"], "decision": "match", "key": "concept/a"}
+        )
+        db.run_until_idle()
+
+        def target():
+            edges = db.edges("knowledge", "source", "mentions", 0)
+            assert len(edges) == 1
+            return base64.b64decode(edges[0]["target_b64"]).decode()
+
+        assert target() == "concept/a"
+        db.merge_resolver_keys("concepts", "concept/a", "concept/b")
+        db.run_until_idle()
+        assert target() == "concept/b"
+        # Keep the curator's original identity durable rather than replacing
+        # its receipt with B; undoing the merge must restore its original link.
+        db.unmerge_resolver_key("concepts", {"from": "concept/a"})
+        db.run_until_idle()
+        assert target() == "concept/a"

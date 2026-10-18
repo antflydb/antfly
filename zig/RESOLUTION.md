@@ -1664,6 +1664,20 @@ bindings rather than physical IDs. A denied source fails the complete read with
 unmerged keys for the requested redirect component; text suppressions and
 unrelated keys remain available only through the source resolver resources.
 HTTP and embedded entity inspection share this projection.
+Serving `:resolve` preflights read permission on its destination and executed
+sibling destinations using the admitted credential, including API-key scopes.
+Redirect survivor tables bind through the same authorization boundary. Candidate
+lookups, prefix scans, ANN searches and description assets apply the destination
+row predicate before projecting results; projected assets never authorize a read
+using a separate primary-document snapshot. Background replay continues to use
+its own stored destination grants.
+
+Review receipts retain the curator's selected identity. Replay follows its
+current redirect chain when emitting graph and promotion endpoints, so a later
+merge moves reviewed links and unmerge restores them. Resolver redirects never
+rewrite an override in a different entity table. Go revision-fence request fields
+preserve presence explicitly: `nil` omits the guard; a pointer to zero fences the
+first edit just as `expected_revision:0` does on the wire.
 Retired identities accept and retain policy without running resolution or
 promotion. Remote replay progress remains pending until an index declares
 execution again; waiting never reactivates a retired identity.

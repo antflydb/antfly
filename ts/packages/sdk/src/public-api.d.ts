@@ -19705,7 +19705,10 @@ export interface components {
             reset_curation?: boolean;
             key_map?: components["schemas"]["ResolverRedirect"][];
             aliases?: components["schemas"]["ResolverRedirect"][];
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+             */
             expected_revision?: number;
             wait?: components["schemas"]["ResolverWait"];
         };
@@ -19725,14 +19728,20 @@ export interface components {
              * @default false
              */
             pin_distinct?: boolean;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+             */
             expected_revision?: number;
             wait?: components["schemas"]["ResolverWait"];
         };
         ResolverUnmergeRequest: {
             /** @default false */
             pin_distinct?: boolean;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+             */
             expected_revision?: number;
             wait?: components["schemas"]["ResolverWait"];
         };
@@ -19752,7 +19761,10 @@ export interface components {
             texts?: string[];
             add?: components["schemas"]["ResolverSuppressionSelection"];
             remove?: components["schemas"]["ResolverSuppressionSelection"];
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+             */
             expected_revision?: number;
             wait?: components["schemas"]["ResolverWait"];
         };

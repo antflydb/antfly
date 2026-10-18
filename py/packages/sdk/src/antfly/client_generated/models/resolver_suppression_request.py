@@ -25,7 +25,8 @@ class ResolverSuppressionRequest:
             texts (list[str] | Unset):
             add (ResolverSuppressionSelection | Unset):
             remove (ResolverSuppressionSelection | Unset):
-            expected_revision (int | Unset):
+            expected_revision (int | Unset): Optional revision fence. Explicit zero fences the first edit; omission disables
+                the fence.
             wait (ResolverWait | Unset): Wait for observed replay completion up to this timeout. A timeout returns accepted
                 state with applied=false; it does not undo the mutation.
     """

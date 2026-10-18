@@ -37,14 +37,24 @@ components:
         to: {type: string, minLength: 1, maxLength: 16384}
         replace: {type: boolean, default: false}
         pin_distinct: {type: boolean, default: false, description: Pin the replaced former target distinct. Requires an existing different redirect and replace=true.}
-        expected_revision: {type: integer, format: uint64, minimum: 0}
+        expected_revision:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
         wait: {$ref: '#/components/schemas/ResolverWait'}
     ResolverUnmergeRequest:
       type: object
       additionalProperties: false
       properties:
         pin_distinct: {type: boolean, default: false}
-        expected_revision: {type: integer, format: uint64, minimum: 0}
+        expected_revision:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
         wait: {$ref: '#/components/schemas/ResolverWait'}
     ResolverSuppressionRequest:
       type: object
@@ -55,7 +65,12 @@ components:
         texts: {type: array, maxItems: 100000, items: {type: string, minLength: 1, maxLength: 16384}}
         add: {$ref: '#/components/schemas/ResolverSuppressionSelection'}
         remove: {$ref: '#/components/schemas/ResolverSuppressionSelection'}
-        expected_revision: {type: integer, format: uint64, minimum: 0}
+        expected_revision:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
         wait: {$ref: '#/components/schemas/ResolverWait'}
     ResolverCurationState:
       type: object
@@ -259,7 +274,12 @@ components:
         reset_curation: {type: boolean, default: false}
         key_map: {type: array, items: {$ref: '#/components/schemas/ResolverRedirect'}}
         aliases: {type: array, items: {$ref: '#/components/schemas/ResolverRedirect'}}
-        expected_revision: {type: integer, format: uint64}
+        expected_revision:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
         wait: {$ref: '#/components/schemas/ResolverWait'}
     EntityMergeRequest:
       type: object

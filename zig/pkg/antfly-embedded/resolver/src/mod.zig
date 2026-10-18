@@ -2149,12 +2149,15 @@ pub const ResolutionStage = struct {
             for (ents) |*e| {
                 if (e.decision == .suppressed or e.identity_restored) continue;
                 const o = ov.overrideFor(e.local_id) orelse continue;
-                if (self.resolver.curation_index.keySuppressed(o.key)) {
+                // Keep the curator's selected identity durable, but resolve its
+                // endpoint through the current redirect graph on every replay.
+                const target = if (std.mem.eql(u8, o.table, self.resolver.table)) try self.resolver.canonicalKey(o.key) else o.key;
+                if (self.resolver.curation_index.keySuppressed(o.key) or self.resolver.curation_index.keySuppressed(target)) {
                     e.decision = .suppressed;
                     e.suppression_reason = .key;
                     continue;
                 }
-                if (try self.resolver.curation_index.pinnedDistinct(result_arena, e.rendered_key, o.key)) continue;
+                if (try self.resolver.curation_index.pinnedDistinct(result_arena, e.rendered_key, target)) continue;
                 e.decision = o.decision;
                 if (o.decision == .suppressed) {
                     e.suppression_reason = .curator;
@@ -2162,7 +2165,7 @@ pub const ResolutionStage = struct {
                 }
                 e.doc_ref = .{
                     .table = try result_arena.dupe(u8, o.table),
-                    .key = try result_arena.dupe(u8, o.key),
+                    .key = try result_arena.dupe(u8, target),
                 };
             }
         }
@@ -3646,4 +3649,30 @@ test "resolver unmerge restores an intermediate redirect survivor" {
     try testing.expectEqualStrings("concept/beta", result.doc_ref.key);
     try testing.expectEqualStrings("concept/alpha", result.redirected_from.?);
     try testing.expect(result.identity_restored);
+}
+
+test "resolver reviewed targets follow current redirects without changing the selected identity" {
+    const a = testing.allocator;
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","aliases":[{"key":"concept/a","target":"concept/b"}]}
+    );
+    defer resolver.deinit();
+    var map: MapStore = .{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"c\",\"label\":\"concept\",\"text\":\"C\"}]}");
+    var curated: FixedOverride = .{ .local_id = "c", .override = .{ .decision = .match, .table = "entities", .key = "concept/a" } };
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .overrides = curated.provider() };
+    const raw = (try stage.computeAlloc(a, map.store(), null, "source")).?;
+    defer a.free(raw);
+    var resolution = try parseResolution(a, raw);
+    defer resolution.deinit();
+    try testing.expectEqualStrings("concept/b", resolution.entities[0].doc_ref.key);
+    try testing.expectEqualStrings("concept/a", curated.override.key);
+    // Redirects in one namespace cannot rewrite a distinct target table.
+    curated.override.table = "other";
+    const cross_table = (try stage.computeAlloc(a, map.store(), null, "source")).?;
+    defer a.free(cross_table);
+    var separate = try parseResolution(a, cross_table);
+    defer separate.deinit();
+    try testing.expectEqualStrings("concept/a", separate.entities[0].doc_ref.key);
 }

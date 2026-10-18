@@ -692,6 +692,14 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
         server: *Server,
         request: operation.RequestContext,
         source_table: []const u8,
+        arena: std.mem.Allocator,
+        revision: ?u64 = null,
+        filters: std.StringHashMapUnmanaged([]const u8) = .empty,
+        fn filter(ptr: *anyopaque, _: std.mem.Allocator, physical: []const u8) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.request.ensureActive();
+            return self.filters.get(physical) orelse error.Forbidden;
+        }
         fn options(ptr: *anyopaque) local.asset_producer_runtime.Runtime.Options {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{ .antfly_provider = self.server.antfly_provider, .inference_api_url = self.server.configuredInferenceAPIURL(), .secret_store = self.server.cfg.secret_store, .source_table = self.source_table };
@@ -702,25 +710,48 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
             var scratch = std.heap.ArenaAllocator.init(allocator);
             defer scratch.deinit();
             const arena = scratch.allocator();
-            const targets = try arena.alloc(domain.Target, names.len);
-            for (names, targets) |name, *target| target.* = try domain.Target.parse(name);
-            const bytes = try self.server.source.systemCatalog(arena, self.request, .{ .resolve_many = .{ .targets = targets } });
-            const result = try std.json.parseFromSliceLeaky(domain.ResolvedMany, arena, bytes, .{});
-            if (result.tables.len != names.len) return error.InvalidCatalogRecord;
             const out = try allocator.alloc([]u8, names.len);
             var kept: usize = 0;
             errdefer {
                 for (out[0..kept]) |name| allocator.free(name);
                 allocator.free(out);
             }
-            for (result.tables, out) |item, *name| {
-                name.* = try allocator.dupe(u8, (item orelse return error.TableNotFound).name);
-                kept += 1;
+            var offset: usize = 0;
+            while (offset < names.len) {
+                const end = @min(names.len, offset + 256);
+                const targets = try arena.alloc(domain.Target, end - offset);
+                const filters = try arena.alloc([]const u8, targets.len);
+                for (names[offset..end], targets, filters) |name, *target, *predicate| {
+                    target.* = try domain.Target.parse(name);
+                    const logical = try target.resourceNameAlloc(arena);
+                    predicate.* = try self.server.authorizedReadFilter(self.arena, self.request, logical);
+                }
+                const bound: ?[]const ?domain.ResolvedTable = if (self.server.source.vtable.system_catalog != null) resolved: {
+                    const bytes = try self.server.source.systemCatalog(arena, self.request, .{ .resolve_many = .{ .targets = targets, .expected_revision = self.revision } });
+                    const result = try std.json.parseFromSliceLeaky(domain.ResolvedMany, arena, bytes, .{});
+                    if (result.tables.len != targets.len) return error.InvalidCatalogRecord;
+                    self.revision = result.revision;
+                    break :resolved result.tables;
+                } else null;
+                for (names[offset..end], filters, out[offset..end], 0..) |name, predicate, *physical, i| {
+                    const storage = if (bound) |tables| (tables[i] orelse return error.TableNotFound).name else name;
+                    try self.filters.put(self.arena, try self.arena.dupe(u8, storage), predicate);
+                    physical.* = try allocator.dupe(u8, storage);
+                    kept += 1;
+                }
+                offset = end;
             }
             return out;
         }
     };
-    var bridge: Bridge = .{ .server = server, .request = request, .source_table = table.name };
+    var bridge: Bridge = .{ .server = server, .request = request, .source_table = table.name, .arena = a };
+    // Preflight every destination actually executed, including compositional
+    // siblings, before extraction/model work. Redirect survivors bind through
+    // the same credential-aware callback and catalog revision on demand.
+    var names: std.StringArrayHashMapUnmanaged(void) = .empty;
+    try names.put(a, cfg.table, {});
+    for (all) |item| if (!item.retired and cfg.sharesRoutingDomain(item)) try names.put(a, item.table, {});
+    _ = try Bridge.bind(&bridge, a, names.keys());
     const io = server.inferenceIo();
     const invocation: local.storage_db_enrichment_asset_producer.InvocationContext = .{ .io = io, .deadline_ns = request.deadline_ns, .cancellation = request.cancellation };
     var candidates: @import("distributed_candidate_source.zig").DistributedCandidateSource = .{
@@ -728,7 +759,8 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
         .io = io,
         .request_context = invocation,
         .producer_options = .{ .ptr = &bridge, .get = Bridge.options },
-        .catalog_binding = if (server.source.vtable.system_catalog != null) .{ .ptr = &bridge, .bind_fn = Bridge.bind } else null,
+        .catalog_binding = .{ .ptr = &bridge, .bind_fn = Bridge.bind },
+        .read_filter = .{ .ptr = &bridge, .get = Bridge.filter },
     };
     const managed = local.inference_managed_embedder;
     const options: managed.InitOptions = .{

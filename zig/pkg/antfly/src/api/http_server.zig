@@ -13452,6 +13452,22 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    /// Resolve the ingress credential's row predicate for a discovered public
+    /// table, preserving API-key scope and checking live permission revocation.
+    /// Only this server boundary interprets the borrowed credential capability.
+    pub fn authorizedReadFilter(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, logical: []const u8) ![]const u8 {
+        try context.ensureActive();
+        if (self.cfg.auth_enabled or context.principal != null) {
+            const authority = context.table_read_authorization orelse return error.Forbidden;
+            if (!authority.allows(authority.ptr, logical)) return error.Forbidden;
+        }
+        const admitted: ?*const ?AuthenticatedIdentity = if (context.row_policy_credential) |ptr| @ptrCast(@alignCast(ptr)) else null;
+        const identity = if (admitted) |ptr| ptr.* else null;
+        if (context.principal != null and identity == null) return error.Forbidden;
+        if (!try tablePermissionCurrentlyAllowed(identity, logical, .read)) return error.Forbidden;
+        return (try resolveEffectiveRowFilterJson(alloc, identity, logical)) orelse "";
+    }
+
     /// Authorize discovered read participants using the admitted credential,
     /// never physical storage IDs. Reverse bindings are bounded and share a
     /// catalog revision so a rename cannot mix authorization namespaces.

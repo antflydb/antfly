@@ -52,6 +52,68 @@ pub const DistributedCandidateSource = struct {
     /// `read_index` keeps candidates consistent with committed writes; callers
     /// can relax this to `stale` to trade freshness for latency.
     consistency: raft_mod.ReadConsistency = .read_index,
+    /// Serving callers supply a request-owned, authorized predicate for each
+    /// pinned physical table. Background replay retains its independent grants.
+    read_filter: ?struct {
+        ptr: *anyopaque,
+        get: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]const u8,
+    } = null,
+
+    fn queryRequest(self: *@This(), a: std.mem.Allocator, physical: []const u8, input: db_mod.types.SearchRequest) !db_mod.types.SearchRequest {
+        var req = input;
+        if (self.read_filter) |policy| {
+            const filter = try policy.get(policy.ptr, a, physical);
+            if (filter.len > 0) {
+                req.filter_query_json = filter;
+                req.authorization_filter_query_json = filter;
+            }
+        }
+        if (self.request_context) |context| {
+            req.execution_deadline_ns = context.deadline_ns;
+            req.cancellation = context.cancellation;
+        }
+        return req;
+    }
+
+    fn lookupDocument(self: *@This(), a: std.mem.Allocator, physical: []const u8, key: []const u8, options: db_mod.types.LookupOptions) !?[]u8 {
+        if (self.read_filter != null) {
+            // Filter before projection in one query snapshot. A projected
+            // description lookup must not evaluate policy on missing fields
+            // or admit an asset using a separate, racy primary-document read.
+            const req = try self.queryRequest(a, physical, .{
+                .filter_doc_ids = &.{key},
+                .filter_doc_ids_positive = true,
+                .limit = 1,
+                .include_stored = true,
+                .fields = options.fields,
+                .include_all_fields = options.include_all_fields,
+            });
+            var response = (try self.reads.query(a, physical, req, self.consistency)) orelse return null;
+            defer response.deinit(a);
+            const One = struct {
+                a: std.mem.Allocator,
+                key: []const u8,
+                value: ?[]u8 = null,
+                fn consume(ptr: *anyopaque, id: []const u8, json: []const u8) !void {
+                    const one: *@This() = @ptrCast(@alignCast(ptr));
+                    if (!std.mem.eql(u8, id, one.key) or one.value != null) return error.InvalidCandidateResponse;
+                    one.value = try one.a.dupe(u8, json);
+                }
+            };
+            var one: One = .{ .a = a, .key = key };
+            errdefer if (one.value) |bytes| a.free(bytes);
+            try consumeQueryHits(a, response.json, &one, One.consume);
+            return one.value;
+        }
+        var opts = options;
+        if (self.request_context) |context| {
+            opts.execution_deadline_ns = context.deadline_ns;
+            opts.cancellation = context.cancellation;
+        }
+        var row = (try self.reads.lookup(a, physical, key, opts, self.consistency)) orelse return null;
+        defer row.deinit(a);
+        return try a.dupe(u8, row.json);
+    }
 
     pub fn candidateSource(self: *DistributedCandidateSource) CandidateSource {
         return .{ .ptr = self, .vtable = &vtable };
@@ -73,9 +135,9 @@ pub const DistributedCandidateSource = struct {
         defer a.free(field);
         const physical = if (self.catalog_binding) |binding| try binding.bindOne(a, table) else table;
         defer if (self.catalog_binding != null) a.free(physical);
-        var row = (try self.reads.lookup(a, physical, key, .{ .fields = &.{field}, .include_all_fields = false }, self.consistency)) orelse return null;
-        defer row.deinit(a);
-        return @import("antfly_local_sources").functions_resolver_adjudication.projectedDescription(a, row.json, artifact);
+        const row = (try self.lookupDocument(a, physical, key, .{ .fields = &.{field}, .include_all_fields = false })) orelse return null;
+        defer a.free(row);
+        return @import("antfly_local_sources").functions_resolver_adjudication.projectedDescription(a, row, artifact);
     }
 
     fn adjudicate(ptr: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
@@ -165,7 +227,9 @@ pub const DistributedCandidateSource = struct {
         errdefer arena.deinit();
         const owned = try arena.allocator().alloc([]const u8, names.len);
         for (names, owned) |name, *copy| copy.* = try arena.allocator().dupe(u8, name);
-        batch.* = .{ .arena = arena, .raw = .{ .reads = self.reads, .consistency = self.consistency, .io = self.io, .producer_options = self.producer_options }, .binding = binding, .names = owned };
+        var raw = self.*;
+        raw.catalog_binding = null;
+        batch.* = .{ .arena = arena, .raw = raw, .binding = binding, .names = owned };
         return .{ .source = .{ .ptr = batch, .vtable = &BoundBatch.vtable }, .release = BoundBatch.release };
     }
 
@@ -178,9 +242,7 @@ pub const DistributedCandidateSource = struct {
         const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
         const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else table;
         defer if (self.catalog_binding != null) allocator.free(physical);
-        var resp = (try self.reads.lookup(allocator, physical, key, .{}, self.consistency)) orelse return null;
-        defer resp.deinit(allocator);
-        return try allocator.dupe(u8, resp.json);
+        return self.lookupDocument(allocator, physical, key, .{});
     }
 
     fn getManyFn(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
@@ -195,13 +257,13 @@ pub const DistributedCandidateSource = struct {
         var start: usize = 0;
         while (start < keys.len) {
             const end = @min(start + max_keys, keys.len);
-            var response = (try self.reads.query(alloc, physical, .{
+            var response = (try self.reads.query(alloc, physical, try self.queryRequest(alloc, physical, .{
                 .filter_doc_ids = keys[start..end],
                 .filter_doc_ids_positive = true,
                 .limit = @intCast(end - start),
                 .include_stored = true,
                 .include_all_fields = true,
-            }, self.consistency)) orelse return error.TableNotFound;
+            }), self.consistency)) orelse return error.TableNotFound;
             defer response.deinit(alloc);
             try consumeQueryHits(alloc, response.json, ctx, consume);
             start = end;
@@ -224,12 +286,18 @@ pub const DistributedCandidateSource = struct {
         const upper = (try prefixUpperBoundAlloc(allocator, prefix)) orelse return;
         defer allocator.free(upper);
 
-        var resp = (try self.reads.scan(allocator, physical, prefix, upper, .{
+        var scan_options: db_mod.types.ScanOptions = .{
             .inclusive_from = true,
             .exclusive_to = true,
             .include_documents = true,
             .limit = @intCast(@min(opts.limit, std.math.maxInt(u32))),
-        }, self.consistency)) orelse return;
+        };
+        if (self.read_filter) |policy| scan_options.filter_query_json = try policy.get(policy.ptr, allocator, physical);
+        if (self.request_context) |context| {
+            scan_options.execution_deadline_ns = context.deadline_ns;
+            scan_options.cancellation = context.cancellation;
+        }
+        var resp = (try self.reads.scan(allocator, physical, prefix, upper, scan_options, self.consistency)) orelse return;
         defer resp.deinit(allocator);
 
         var lines = std.mem.splitScalar(u8, resp.ndjson, '\n');
@@ -264,7 +332,7 @@ pub const DistributedCandidateSource = struct {
             .include_stored = true,
             .include_all_fields = true,
         };
-        var resp = (try self.reads.query(allocator, physical, req, self.consistency)) orelse return;
+        var resp = (try self.reads.query(allocator, physical, try self.queryRequest(allocator, physical, req), self.consistency)) orelse return;
         defer resp.deinit(allocator);
         try consumeQueryHits(allocator, resp.json, ctx, consume);
     }
@@ -361,6 +429,7 @@ const FakeTableReadSource = struct {
     last_query_k: u32 = 0,
     point_query_calls: usize = 0,
     last_query_index: []const u8 = "",
+    expected_filter: ?[]const u8 = null,
 
     fn source(self: *FakeTableReadSource) table_reads.TableReadSource {
         return .{ .ptr = self, .vtable = &vtable };
@@ -384,6 +453,7 @@ const FakeTableReadSource = struct {
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table)) return null;
+        if (self.expected_filter != null) return error.RawServingLookup;
         const doc = self.docs.get(key) orelse return null;
         return .{ .json = try alloc.dupe(u8, doc), .version = 1 };
     }
@@ -397,9 +467,9 @@ const FakeTableReadSource = struct {
         opts: db_mod.types.ScanOptions,
         consistency: raft_mod.ReadConsistency,
     ) !?table_reads.ScanResponse {
-        _ = opts;
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.expected_filter) |filter| try testing.expectEqualStrings(filter, opts.filter_query_json);
         if (!std.mem.eql(u8, table_name, self.table)) return null;
 
         var out = std.ArrayListUnmanaged(u8).empty;
@@ -433,6 +503,7 @@ const FakeTableReadSource = struct {
     ) !?@import("antfly_local_sources").api_query.QueryResponse {
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.expected_filter) |filter| try testing.expectEqualStrings(filter, req.filter_query_json);
         if (!std.mem.eql(u8, table_name, self.table)) return null;
         if (req.filter_doc_ids_positive) {
             try testing.expect(req.filter_doc_ids.len <= 256);
@@ -663,4 +734,45 @@ test "DistributedCandidateSource system catalog bulk reads are bounded and prese
     try testing.expectEqualStrings("first", collected.keys.items[0]);
     try testing.expectEqualStrings("last", collected.keys.items[1]);
     try testing.expectError(error.InvalidCandidateResponse, consumeQueryHits(alloc, "{\"responses\":[{\"status\":503}]}", &collected, CollectCtx.consume));
+}
+
+test "DistributedCandidateSource serving policy survives binding and protects every read mode" {
+    const a = testing.allocator;
+    const Policy = struct {
+        denied: bool = false,
+        fn bind(_: *anyopaque, alloc: std.mem.Allocator, names: []const []const u8) ![][]u8 {
+            const out = try alloc.alloc([]u8, names.len);
+            for (out) |*name| name.* = try alloc.dupe(u8, "table:entities");
+            return out;
+        }
+        fn filter(ptr: *anyopaque, _: std.mem.Allocator, physical: []const u8) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.denied) return error.Forbidden;
+            try testing.expectEqualStrings("table:entities", physical);
+            return "{\"term\":{\"tier\":\"public\"}}";
+        }
+    };
+    var policy: Policy = .{};
+    var fake = FakeTableReadSource{ .alloc = a, .table = "table:entities", .expected_filter = "{\"term\":{\"tier\":\"public\"}}" };
+    defer fake.docs.deinit(a);
+    const doc = "{\"canonical_name\":\"Visible\",\"_artifacts\":{\"summary\":{\"value\":\"Visible description\"}}}";
+    try fake.docs.put(a, "concept/a", doc);
+    fake.query_body = "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"concept/a\",\"_source\":{\"canonical_name\":\"Visible\"}}]}}]}";
+    var adapter = DistributedCandidateSource{ .reads = fake.source(), .read_filter = .{ .ptr = &policy, .get = Policy.filter }, .catalog_binding = .{ .ptr = &policy, .bind_fn = Policy.bind } };
+    const batch = try adapter.candidateSource().beginBatch(a, &.{"entities"});
+    defer batch.deinit(a);
+    const value = (try batch.source.get(a, "entities", "concept/a")).?;
+    defer a.free(value);
+    const description = (try batch.source.getDescription(a, "entities", "concept/a", "summary")).?;
+    defer a.free(description);
+    try testing.expectEqualStrings("\"Visible description\"", description);
+    var rows: CollectCtx = .{ .alloc = a };
+    defer rows.deinit();
+    try batch.source.getMany(a, "entities", &.{"concept/a"}, &rows, CollectCtx.consume);
+    try batch.source.scanPrefix(a, "entities", "concept/", .{ .limit = 10 }, &rows, CollectCtx.consume);
+    try batch.source.nearest(a, "entities", .{ .embedding = &.{ 1, 0 }, .k = 10, .index_name = "names" }, &rows, CollectCtx.consume);
+    try testing.expectEqual(@as(usize, 3), rows.keys.items.len);
+    policy.denied = true;
+    try testing.expectError(error.Forbidden, batch.source.get(a, "entities", "concept/a"));
+    try testing.expectError(error.Forbidden, batch.source.getDescription(a, "entities", "concept/a", "summary"));
 }
