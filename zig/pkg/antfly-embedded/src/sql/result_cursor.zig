@@ -37,6 +37,20 @@ pub const Cursor = struct {
     memory_leased: bool = false,
     block: ?*@import("spill.zig").Sequential.OwnedBlock = null,
     block_begin: usize = 0,
+    payloads: ?*@import("spill.zig").JoinPayloads = null,
+    payload_reader: ?*@import("spill.zig").PayloadReader = null,
+    reference_reader: ?@import("spill.zig").Sequential.ReplayReader = null,
+    reference_values: []@import("scalar.zig").Datum = &.{},
+    reference_row_bytes: usize = 0,
+    fn payloadReader(self: *Cursor) !*@import("spill.zig").PayloadReader {
+        if (self.payload_reader == null) {
+            const reader = try self.a.create(@import("spill.zig").PayloadReader);
+            reader.* = .init(self.payloads.?);
+            reader.row_bytes = self.reference_row_bytes;
+            self.payload_reader = reader;
+        }
+        return self.payload_reader.?;
+    }
     const Location = struct {
         block: ?*@import("spill.zig").Sequential.OwnedBlock = null,
         index: usize = 0,
@@ -78,6 +92,17 @@ pub const Cursor = struct {
         if (self.replay_failed) return error.InvalidSqlBackendResponse;
         self.releaseBorrowed();
         if (self.index == self.count()) return .{ .values = .{ .rows = &.{} } };
+        if (self.payloads != null) {
+            if (self.reference_reader == null) self.reference_reader = try self.rows.openReader();
+            const input = try self.reference_reader.?.readBatchCurrent(a, self.index, @min(@min(64, maximum), @max(1, byte_limit / @max(1, self.reference_row_bytes))));
+            const page = try (try self.payloadReader()).nativePage(a, input.values, self.width, byte_limit);
+            errdefer page.release();
+            const blocks = try a.alloc(*@import("spill.zig").Sequential.OwnedBlock, page.payloads.len);
+            for (blocks, page.payloads) |*block, payload| block.* = payload.block;
+            self.index += page.values.len();
+            _ = self.refs.fetchAdd(1, .monotonic);
+            return .{ .values = page.values, .blocks = blocks, .owner = self };
+        }
         if (if (self.sorted == null) self.memory else null) |memory| {
             try memory.finish();
             const begin = self.index;
@@ -94,20 +119,37 @@ pub const Cursor = struct {
         }
         if (self.sorted) |top| {
             if (top.external == null) self.memory_leased = true;
-            const capacity = @min(maximum, self.count() - self.index);
+            const capacity = @min(64, @min(maximum, self.count() - self.index));
             const rows = try a.alloc(Location, capacity);
             const blocks = try a.alloc(*@import("spill.zig").Sequential.OwnedBlock, capacity);
             var held: usize = 0;
             errdefer for (blocks[0..held]) |block| block.release();
+            var gathered: ?[]@import("spill.zig").Sort.RowLease = null;
+            if (top.external) |sort| if (sort.order_sort != null) {
+                while (self.sorted_offset != 0) : (self.sorted_offset -= 1) if (!try sort.skip()) return error.InvalidSqlSpill;
+                gathered = try sort.nextPageLeased(a, capacity, byte_limit);
+                if (gathered.?.len == 0) {
+                    a.free(gathered.?);
+                    return error.InvalidSqlSpill;
+                }
+            };
+            defer if (gathered) |leases| {
+                for (leases) |lease| lease.release();
+                a.free(leases);
+            };
             var count_rows: usize = 0;
             var bytes: usize = 0;
             var leased_bytes: usize = capacity *| (@sizeOf(Location) + @sizeOf(*@import("spill.zig").Sequential.OwnedBlock));
-            while (count_rows < capacity) {
+            while (count_rows < (if (gathered) |leases| leases.len else capacity)) {
                 if (top.external) |sort| {
                     while (self.sorted_offset != 0) : (self.sorted_offset -= 1) {
                         if (!try sort.skip()) return error.InvalidSqlSpill;
                     }
-                    const lease = (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
+                    const lease = if (gathered) |leases| leases[count_rows] else (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
+                    if (gathered) |leases| {
+                        leases[count_rows].block = null;
+                        leases[count_rows].key_block = null;
+                    }
                     if (lease.key_block) |keys| keys.release();
                     rows[count_rows] = .{ .block = lease.block, .index = lease.index, .values = lease.row.values, .typed = lease.values };
                     if (lease.block) |block| {
@@ -127,7 +169,7 @@ pub const Cursor = struct {
                 for (0..self.width) |column| bytes +|= try rows[count_rows].bytes(a, column);
                 self.index += 1;
                 count_rows += 1;
-                if (bytes >= byte_limit or leased_bytes >= byte_limit) break;
+                if (gathered == null and (bytes >= byte_limit or leased_bytes >= byte_limit)) break;
             }
             const View = struct {
                 rows: []const Location,
@@ -231,7 +273,7 @@ pub const Cursor = struct {
         }
         // Compact spill rows already allocated their descriptor span in a.
         // Own the payloads in place; resident/sorted spans remain borrowed.
-        const values = if (self.block != null and self.block.?.encoded != null and self.sorted == null and self.memory == null) @constCast(row.values) else try a.alloc(@import("scalar.zig").Datum, row.values.len);
+        const values = if (self.payloads == null and self.block != null and self.block.?.encoded != null and self.sorted == null and self.memory == null) @constCast(row.values) else try a.alloc(@import("scalar.zig").Datum, row.values.len);
         for (row.values, values) |value, *out| out.* = try @import("operators.zig").cloneDatum(a, value);
         if (!self.sealed and !self.memory_leased) if (self.sorted) |top| if (top.external == null) top.releaseFinishedRow(self.sorted_offset + self.index);
         self.index += 1;
@@ -309,6 +351,17 @@ pub const Cursor = struct {
     }
     pub fn read(self: *Cursor, a: std.mem.Allocator) !@import("operators.zig").Row {
         if (self.replay_failed) return error.InvalidSqlBackendResponse;
+        if (self.payloads != null) {
+            if (self.reference_reader == null) self.reference_reader = try self.rows.openReader();
+            const input = try self.reference_reader.?.readCurrent(self.index);
+            const payload = try (try self.payloadReader()).read(try @import("spill.zig").PayloadReader.Reference.decode(input.row.values));
+            if (self.block) |block| block.release();
+            self.block = payload.block;
+            if (self.reference_values.len == 0) self.reference_values = try self.a.alloc(@import("scalar.zig").Datum, self.width);
+            if (payload.block.width() != self.width) return error.InvalidSqlSpill;
+            for (self.reference_values, 0..) |*value, column| value.* = try payload.block.cell(payload.index, column);
+            return .{ .values = self.reference_values, .keys = &.{}, .ordinal = self.index };
+        }
         if (self.sorted) |top| {
             if (top.external) |sort| {
                 while (self.sorted_offset != 0) : (self.sorted_offset -= 1) {
@@ -356,6 +409,17 @@ pub const Cursor = struct {
         std.debug.assert(self.replay_readers == 0);
         const a = self.a;
         if (self.block) |block| block.release();
+        if (self.reference_reader) |*reader| reader.deinit();
+        if (self.payload_reader) |reader| {
+            reader.deinit();
+            a.destroy(reader);
+        }
+        a.free(self.reference_values);
+        if (self.payloads) |pages| {
+            const backing = pages.file.manager.allocator();
+            pages.close();
+            backing.destroy(pages);
+        }
         if (self.sorted) |top| {
             a.free(self.sorted_rows);
             top.deinit();
@@ -373,23 +437,46 @@ pub const Cursor = struct {
 
     /// Freeze a capture and start an independent borrowed pass. Resident sorted
     /// rows and existing runs are reused without copying. A forward-only sort
-    /// merge must be sealed once into bounded final blocks before replay; it
-    /// cannot be rewound. Partially consumed sorts reject admission because
-    /// their earlier rows may already have been retired.
+    /// merge seals its selected ordering references before replay; wide
+    /// payload pages keep their original owner and are never rewritten.
+    /// Partially consumed sorts reject admission because earlier rows may
+    /// already have been retired.
     pub fn openReplayReader(self: *Cursor) !*ReplayReader {
         if (self.replay_failed) return error.InvalidSqlBackendResponse;
         if (!self.sealed) {
             if (self.sorted) |top| {
                 if (self.index != 0) return error.InvalidSqlBackendResponse;
                 if (top.external != null) {
-                    // A sort has no resident final run. Drain only its selected
-                    // offset/limit window, preserving complete Datum values.
+                    // Seal only the selected offset/limit window. Indirect
+                    // sorts copy references; narrow sorts keep inline rows.
                     // Failed admission cannot retry a partially advanced merge.
                     errdefer self.replay_failed = true;
                     if (self.memory != null or self.rows.size != 0) return error.InvalidSqlBackendResponse;
                     var scratch = std.heap.ArenaAllocator.init(self.a);
                     defer scratch.deinit();
-                    for (0..self.sorted_count) |ordinal| {
+                    const sort = top.external.?;
+                    if (sort.order_sort != null) {
+                        while (self.sorted_offset != 0) : (self.sorted_offset -= 1) if (!try sort.skip()) return error.InvalidSqlSpill;
+                        var ordinal: usize = 0;
+                        while (ordinal < self.sorted_count) {
+                            _ = scratch.reset(.free_all);
+                            const cohort_rows = @min(64, self.sorted_count - ordinal);
+                            var references: [64][2]@import("scalar.zig").Datum = undefined;
+                            var rows: [64][]const @import("scalar.zig").Datum = undefined;
+                            var ordinals: [64]u64 = undefined;
+                            for (references[0..cohort_rows], rows[0..cohort_rows], ordinals[0..cohort_rows], 0..) |*reference, *row, *sequence, i| {
+                                const lease = (try sort.nextReference()) orelse return error.InvalidSqlSpill;
+                                defer lease.release();
+                                reference.* = .{ try lease.cell(0), try lease.cell(1) };
+                                row.* = reference;
+                                sequence.* = ordinal + i;
+                            }
+                            try self.rows.appendBatch(.{ .rows = rows[0..cohort_rows] }, .{ .vectors = .{ .values = &.{}, .count = cohort_rows } }, ordinals[0..cohort_rows]);
+                            ordinal += cohort_rows;
+                        }
+                        self.reference_row_bytes = sort.max_payload_bytes;
+                        self.payloads = (try sort.takePayloads()).?;
+                    } else for (0..self.sorted_count) |ordinal| {
                         _ = scratch.reset(.retain_capacity);
                         const row = try self.read(scratch.allocator());
                         _ = try self.rows.append(.{ .values = row.values, .keys = &.{}, .ordinal = ordinal }, @import("spill.zig").none);
@@ -426,9 +513,39 @@ pub const Cursor = struct {
             disk: @import("spill.zig").Sequential.ReplayReader,
         },
         index: usize = 0,
+        payload_reader: ?@import("spill.zig").PayloadReader = null,
+        payload_blocks: [64]?*@import("spill.zig").Sequential.OwnedBlock = @splat(null),
+        payload_scratch: ?std.heap.ArenaAllocator = null,
+        fn retirePayloads(self: *ReplayReader) void {
+            for (&self.payload_blocks) |*block| if (block.*) |owner| {
+                owner.release();
+                block.* = null;
+            };
+            if (self.payload_scratch) |*arena| _ = arena.reset(.free_all);
+        }
+        fn payloadReader(self: *ReplayReader) *@import("spill.zig").PayloadReader {
+            if (self.payload_reader == null) {
+                self.payload_reader = .init(self.owner.payloads.?);
+                self.payload_reader.?.row_bytes = self.owner.reference_row_bytes;
+            }
+            return &self.payload_reader.?;
+        }
 
         pub fn next(self: *ReplayReader) !?[]const @import("scalar.zig").Datum {
+            self.retirePayloads();
             if (self.index == self.owner.count()) return null;
+            if (self.owner.payloads != null) {
+                const input = try self.storage.disk.readCurrent(self.index);
+                const payload = try self.payloadReader().read(try @import("spill.zig").PayloadReader.Reference.decode(input.row.values));
+                self.payload_blocks[0] = payload.block;
+                if (payload.block.width() != self.owner.width) return error.InvalidSqlSpill;
+                if (self.payload_scratch == null) self.payload_scratch = .init(self.owner.a);
+                const a = self.payload_scratch.?.allocator();
+                const values = try a.alloc(@import("scalar.zig").Datum, self.owner.width);
+                for (values, 0..) |*value, column| value.* = try payload.block.cell(payload.index, column);
+                self.index += 1;
+                return values;
+            }
             const values = switch (self.storage) {
                 .sorted => (try self.owner.sorted.?.scalarRow(self.owner.sorted_offset + self.index)).values,
                 .memory => |reader| (try reader.next()) orelse return error.InvalidSqlBackendResponse,
@@ -441,10 +558,18 @@ pub const Cursor = struct {
 
         pub fn nextBatch(self: *ReplayReader, a: std.mem.Allocator, maximum: usize) !@import("execution_batch.zig").Batch {
             if (maximum == 0) return error.InvalidSqlLimit;
+            self.retirePayloads();
             if (self.index == self.owner.count()) return .{ .rows = &.{} };
             return switch (self.storage) {
                 .disk => |*reader| blk: {
-                    const batch = try reader.readBatchCurrent(a, self.index, maximum);
+                    const bound = if (self.owner.payloads != null) @min(@min(64, maximum), @max(1, (128 * 1024) / @max(1, self.owner.reference_row_bytes))) else maximum;
+                    const batch = try reader.readBatchCurrent(a, self.index, bound);
+                    if (self.owner.payloads != null) {
+                        const page = try self.payloadReader().nativePage(a, batch.values, self.owner.width, 128 * 1024);
+                        for (page.payloads, 0..) |payload, i| self.payload_blocks[i] = payload.block;
+                        self.index += page.values.len();
+                        break :blk page.values;
+                    }
                     self.index = @intCast(batch.following);
                     break :blk batch.values;
                 },
@@ -481,12 +606,16 @@ pub const Cursor = struct {
         }
 
         pub fn rewind(self: *ReplayReader) void {
+            self.retirePayloads();
             self.index = 0;
             if (self.storage == .memory) self.storage.memory.rewind();
         }
 
         pub fn close(self: *ReplayReader) void {
             const owner = self.owner;
+            self.retirePayloads();
+            if (self.payload_reader) |*reader| reader.deinit();
+            if (self.payload_scratch) |*arena| arena.deinit();
             switch (self.storage) {
                 .sorted => {},
                 .memory => |reader| reader.close(),

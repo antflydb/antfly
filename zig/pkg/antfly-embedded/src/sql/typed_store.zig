@@ -188,6 +188,7 @@ const JsonCache = struct {
     text_arena: std.heap.ArenaAllocator,
     entries: ?*Entry = null,
     mutex: std.atomic.Mutex = .unlocked,
+    admission: ?*std.atomic.Mutex = null,
     const Entry = struct { arena: std.heap.ArenaAllocator, datum: Datum, next: ?*Entry };
     fn deinit(self: *JsonCache) void {
         while (self.entries) |entry| {
@@ -205,6 +206,8 @@ const JsonCache = struct {
         const entry = blk: {
             defer self.mutex.unlock();
             if (!payload.attempted) {
+                if (self.admission) |gate| while (!gate.tryLock()) std.atomic.spinLoopHint();
+                defer if (self.admission) |gate| gate.unlock();
                 payload.cached = try self.cache(payload.*);
                 payload.attempted = true;
             }
@@ -259,6 +262,7 @@ const JsonPayload = struct {
     frozen: ?@import("execution_batch.zig").FrozenJson = null,
     cached: ?*JsonCache.Entry = null,
     attempted: bool = false,
+    shared: ?*Store.SharedJson = null,
     fn decode(self: JsonPayload, a: A) !Datum {
         if (self.frozen) |value| return @import("spill.zig").materializeFrozenJson(a, value);
         return Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, a, self.text.?, .{ .parse_numbers = false }));
@@ -302,7 +306,7 @@ const Column = struct {
     fn cell(self: Column, a: A, row: usize) !Datum {
         if (self.isNull(row)) return .{};
         if (self.json_bytes) |bytes| if (bytes.items[row]) |json| {
-            return self.json_cache.?.materialize(json, a);
+            return (if (json.shared) |shared| &shared.cache else self.json_cache.?).materialize(json, a);
         };
         const value: std.json.Value = switch (self.values) {
             .unknown => return error.InvalidSqlBackendResponse,
@@ -543,10 +547,78 @@ pub const Store = struct {
     initialized: bool = false,
     failed: bool = false,
     json_cache: ?*JsonCache = null,
+    json_pool: ?*JsonPool = null,
     // Content keys borrow only this store's owned immutable payloads. Small
     // values avoid dictionary metadata; large fan-out rows share bytes/cache.
     json_payloads: std.HashMapUnmanaged(JsonKey, *JsonPayload, JsonKeyContext, 80) = .empty,
     const JsonKey = struct { representation: u8, bytes: []const u8, hash: u64 };
+    /// Stable, reference-counted bodies shared across independently retired
+    /// stores. Keys own their bytes; the last store releases the body and its
+    /// lazy cache immediately. One cache budget bounds all pooled DOMs.
+    /// The retaining operator sequences ownership mutations; parallel readers
+    /// use the synchronized lazy caches without changing ownership counts.
+    pub const JsonPool = struct {
+        budget: @import("memory_budget.zig"),
+        cache_budget: @import("memory_budget.zig"),
+        bodies: std.HashMapUnmanaged(JsonKey, *SharedJson, JsonKeyContext, 80) = .empty,
+        cache_mutex: std.atomic.Mutex = .unlocked,
+        fn growthBytes(self: *const JsonPool, additional: usize) usize {
+            if (additional <= self.bodies.available) return 0;
+            const entries = self.bodies.count() +| additional;
+            const required = entries *| 100 / 80 +| 1;
+            const capacity = std.math.ceilPowerOfTwo(usize, @max(8, required)) catch return std.math.maxInt(usize);
+            return capacity *| (@sizeOf(u8) + @sizeOf(JsonKey) + @sizeOf(*SharedJson)) +| 64;
+        }
+        pub fn create(a: A) !*JsonPool {
+            const self = try a.create(JsonPool);
+            self.* = .{ .budget = .{ .backing = a, .limit = std.math.maxInt(usize) }, .cache_budget = .{ .backing = undefined, .limit = JsonCache.limit } };
+            self.cache_budget.backing = self.budget.allocator();
+            return self;
+        }
+        pub fn deinit(self: *JsonPool) void {
+            std.debug.assert(self.bodies.count() == 0 and self.cache_budget.live == 0);
+            const a = self.budget.backing;
+            self.bodies.deinit(self.budget.allocator());
+            std.debug.assert(self.budget.live == 0);
+            a.destroy(self);
+        }
+        fn acquire(self: *JsonPool, key: JsonKey, payload: JsonPayload) !*JsonPayload {
+            if (self.bodies.get(key)) |owner| {
+                owner.references += 1;
+                return &owner.payload;
+            }
+            const a = self.budget.allocator();
+            const owner = try a.create(SharedJson);
+            errdefer a.destroy(owner);
+            const bytes = try a.dupe(u8, key.bytes);
+            errdefer a.free(bytes);
+            var owned_key = key;
+            owned_key.bytes = bytes;
+            owner.* = .{ .pool = self, .key = owned_key, .payload = payload, .cache = .{ .budget = .{ .backing = self.cache_budget.allocator(), .limit = JsonCache.limit }, .text_arena = .init(a), .admission = &self.cache_mutex } };
+            owner.payload.shared = owner;
+            if (payload.frozen != null) owner.payload.frozen.?.bytes = bytes else owner.payload.text = bytes;
+            try self.bodies.put(a, owned_key, owner);
+            return &owner.payload;
+        }
+        fn release(self: *JsonPool, payload: *JsonPayload) void {
+            const owner = payload.shared.?;
+            std.debug.assert(owner.pool == self and owner.references != 0);
+            owner.references -= 1;
+            if (owner.references != 0) return;
+            std.debug.assert(self.bodies.remove(owner.key));
+            owner.cache.deinit();
+            const a = self.budget.allocator();
+            a.free(owner.key.bytes);
+            a.destroy(owner);
+        }
+    };
+    const SharedJson = struct {
+        pool: *JsonPool,
+        key: JsonKey,
+        payload: JsonPayload,
+        cache: JsonCache,
+        references: usize = 1,
+    };
     /// A memo belongs to one destination store and immutable producer lease,
     /// and is discarded before another pull. Admission and retention may share it; borrowed addresses
     /// must never become persistent keys in the destination store.
@@ -602,6 +674,13 @@ pub const Store = struct {
                 return existing;
             }
         }
+        if (resolved) |entry| if (self.json_pool) |pool| {
+            const result = try pool.acquire(entry.key, payload);
+            errdefer pool.release(result);
+            try self.json_payloads.put(self.a, result.shared.?.key, result);
+            entry.owned = result;
+            return result;
+        };
         const owned = self.arena.allocator();
         const result = try owned.create(JsonPayload);
         result.* = payload;
@@ -615,12 +694,31 @@ pub const Store = struct {
         }
         return result;
     }
+    /// Bytes that retire when this store drops the final reference to a
+    /// pooled body. Hash-table capacity stays with the pool and is excluded.
+    pub fn exclusiveJsonBytes(self: *const Store) usize {
+        var bytes: usize = 0;
+        var payloads = self.json_payloads.valueIterator();
+        while (payloads.next()) |payload| if (payload.*.shared) |shared| if (shared.references == 1) {
+            bytes +|= @sizeOf(SharedJson) +| shared.key.bytes.len +| shared.cache.budget.live;
+            bytes +|= shared.cache.text_arena.queryCapacity();
+            inline for (.{ shared.cache.text_arena.state.used_list, shared.cache.text_arena.state.free_list }) |head| {
+                var node = head;
+                while (node) |value| : (node = value.next) bytes +|= @sizeOf(@TypeOf(value.*));
+            }
+        };
+        return bytes;
+    }
     pub fn init(a: A) Store {
         return .{ .a = a, .arena = .init(a) };
     }
     pub fn deinit(self: *Store) void {
         for (self.columns) |*column| column.deinit(self.a);
         self.a.free(self.columns);
+        if (self.json_pool) |pool| {
+            var payloads = self.json_payloads.valueIterator();
+            while (payloads.next()) |payload| pool.release(payload.*);
+        }
         self.json_payloads.deinit(self.a);
         self.arena.deinit();
         if (self.json_cache) |cache| {
@@ -749,8 +847,11 @@ pub const Store = struct {
                     resolved.estimated = lease.generation;
                     if (resolved.owned == null) resolved.owned = self.json_payloads.get(resolved.key);
                     if (resolved.owned != null) continue;
+                    if (self.json_pool) |pool| if (pool.bodies.contains(resolved.key)) continue;
+                    const prior_growth = if (self.json_pool) |pool| pool.growthBytes(incoming.count()) else @as(usize, 0);
                     const entry = try incoming.getOrPut(work, resolved.key);
                     if (entry.found_existing) continue;
+                    if (self.json_pool) |pool| bytes +|= pool.growthBytes(incoming.count()) -| prior_growth;
                 }
                 bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
             } else {
@@ -859,7 +960,7 @@ pub const Store = struct {
         if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
         const values = self.columns[column].json_bytes orelse return null;
         const payload = values.items[index] orelse return null;
-        return self.json_cache.?.encoded(payload);
+        return (if (payload.shared) |shared| &shared.cache else self.json_cache.?).encoded(payload);
     }
     pub fn frozenJson(self: *const Store, index: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
         if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
