@@ -16,4 +16,5 @@
 test {
     _ = @import("registry/download.zig");
     _ = @import("registry/artifact_dependencies.zig");
+    _ = @import("registry/embedding_gemma2_catalog.zig");
 }

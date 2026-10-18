@@ -21,6 +21,7 @@ pub const recipe_version = "embeddinggemma2-f32-mean-v4-logical-timestamps";
 pub const max_tokens: usize = 8192;
 
 pub const Config = struct {
+    resident: ?@import("../models/embedding_gemma2.zig").Config = null,
     vision: bool = false,
     audio: bool = false,
     hidden_size: usize = 512,
@@ -64,6 +65,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8) !Config {
     if (text != .object) return error.InvalidEmbeddingGemma2Config;
     const obj = text.object;
     var cfg = Config{};
+    cfg.resident = @import("../models/embedding_gemma2.zig").parseConfig(allocator, bytes) catch null;
     const expected = .{ .hidden_size = 512, .embedding_dim = 768, .intermediate_size = 2048, .num_hidden_layers = 24, .num_attention_heads = 4, .vocab_size = 262144, .hidden_size_per_layer_input = 512, .head_dim = 256, .num_key_value_heads = 2, .sliding_window = 512 };
     inline for (@typeInfo(@TypeOf(expected)).@"struct".field_names) |field| {
         const value = obj.get(field) orelse return error.InvalidEmbeddingGemma2Config;
