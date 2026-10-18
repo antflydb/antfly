@@ -2062,12 +2062,92 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
         ("MATCH (b)<-[:R*24..24]-(c:D) RETURN sum(c.score)", ["3355443200000000"]),
         ("OPTIONAL MATCH (b)<-[:R*24..24]-(c:D) RETURN count(*),count(c)", ["83886080000000", "83886080000000"]),
         ("MATCH (b)<-[:R*64..64]-(c:D) WITH DISTINCT c RETURN count(*)", ["1"]),
+        ("MATCH (b)<-[:R*64..64]-(c:D) RETURN min(c.score),max(c.score)", ["0", "0"]),
+        ("MATCH (b)<-[:R*64..64]-(c:D) RETURN sum(DISTINCT c.score),avg(DISTINCT c.score)", ["0", 0.0]),
+        ("MATCH (b)<-[:R*64..64]-(c:D) RETURN min(c.score)+max(c.score)", ["0"]),
+        ("MATCH (b)<-[:R*24..24]-(c:D) RETURN count(*)+1", ["83886080000001"]),
+        ("CALL { WITH b MATCH (b)-[:R]->(c:D) RETURN c } RETURN count(*)", ["0"]),
+        ("CALL { WITH b OPTIONAL MATCH (b)-[:R]->(c:D) RETURN c } RETURN count(*),count(c)", ["5000000", "0"]),
+        ("CALL { WITH b MATCH (b)-[:R]->(c:D) } RETURN count(*)", ["5000000"]),
+        ("CALL { WITH b MATCH (b)<-[:R*64..64]-(c:D) } RETURN count(*)", ["5000000"]),
+        ("CALL { WITH b MATCH (b)<-[:R*64..64]-(c:D) RETURN c LIMIT 3 } RETURN count(*)", ["15000000"]),
+        ("CALL { WITH b MATCH (b)-[:R]->(c:D) RETURN count(*) AS n } RETURN count(*),sum(n)", ["5000000", "0"]),
+        ("CALL { WITH b MATCH (b)<-[:R*24..24]-(c:D) RETURN c } RETURN count(*)", ["83886080000000"]),
+        ("CALL { WITH b MATCH (b)<-[:R*64..64]-(c:D) RETURN c } RETURN min(c.score)", ["0"]),
+        ("CALL { WITH b CALL { WITH b RETURN b.score AS n } RETURN n } RETURN sum(n)", ["320000000"]),
         ("MATCH (b)<-[:R*0..64]-(c:D) RETURN count(DISTINCT CASE WHEN c.score=0 THEN 1 END)", ["1"]),
     ):
         result = db.cypher_json(
             "g", {"query": window + tail, "limits": {"intermediate_states": 15000, "explored_edges": 1000}}
         )
         assert [cell["value"] for cell in result["rows"][0]] == expected
+
+    for hops in (48, 64):
+        for goal, parameters in (("3", {}), ("$take", {"take": 3}), ("$take+1", {"take": 2})):
+            result = db.cypher_json(
+                "g",
+                {
+                    "query": window
+                    + f"MATCH (b)<-[:R*{hops}..{hops}]-(c:D) WITH c SKIP $skip LIMIT {goal} RETURN count(*)",
+                    "parameters": {**parameters, "skip": 2},
+                    "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+                },
+            )
+            assert result["rows"] == [[{"type": "integer", "value": "3"}]]
+    result = db.cypher_json(
+        "g",
+        {
+            "query": window + "MATCH (b)<-[:R*48..48]-(c:D) WITH c LIMIT $take RETURN count(*)",
+            "parameters": {"take": 0},
+            "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+        },
+    )
+    assert result["rows"] == [[{"type": "integer", "value": "0"}]]
+    for take in (-1, None, "3"):
+        with pytest.raises(af.GraphError, match="InvalidCypherLimit"):
+            db.cypher_json(
+                "g",
+                {
+                    "query": window + "MATCH (b)<-[:R*8..8]-(c:D) WITH c LIMIT $take RETURN count(*)",
+                    "parameters": {"take": take},
+                },
+            )
+    for body in ("RETURN 1 AS b", "WITH b RETURN b"):
+        with pytest.raises(af.GraphError, match="CypherVariableConflict"):
+            db.cypher_json("g", {"query": window + f"CALL {{ {body} }} RETURN count(*)"})
+    result = db.cypher_json(
+        "g",
+        {
+            "query": window + "MATCH (b)<-[:R*64..64]-(c:D) RETURN collect(DISTINCT c.score)",
+            "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+        },
+    )
+    assert result["rows"] == [[{"type": "list", "value": [{"type": "integer", "value": "0"}]}]]
+    base = "MATCH (s:D {id:'start'})-[:R*64..64]->(b:D) "
+    for tail in (
+        "WITH b WHERE EXISTS { MATCH (b)-[:R]->(c:D) } RETURN count(*)",
+        "WITH b,[(b)-[:R]->(c:D) | c.score] AS xs UNWIND xs AS x RETURN count(*)",
+        "UNWIND [(b)-[:R]->(c:D) | c.score] AS x RETURN count(*)",
+        "CALL { WITH b MATCH (b)-[:R]->(c:D) RETURN c } RETURN count(*)",
+    ):
+        result = db.cypher_json(
+            "g", {"query": base + tail, "limits": {"intermediate_states": 10000, "explored_edges": 1000}}
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "0"}]]
+    result = db.cypher_json(
+        "g",
+        {
+            "query": base + "RETURN size(collect(DISTINCT b.score))",
+            "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+        },
+    )
+    assert result["rows"] == [[{"type": "integer", "value": "1"}]]
+    for tail in (
+        "CALL { WITH b RETURN 1/0 AS n } RETURN count(*)",
+        "WITH b WHERE EXISTS { MATCH (b)-[:R]->(c:D) WHERE false } AND 1/0=1 RETURN count(*)",
+    ):
+        with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+            db.cypher_json("g", {"query": window + tail})
 
     empty_binding = db.cypher_json(
         "g",
@@ -2081,6 +2161,30 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
         },
     )
     assert collected["rows"] == [[{"type": "list", "value": [{"type": "integer", "value": "64"}] * 7}]]
+
+
+def test_ordered_graph_windows_cover_the_entire_signed_offset_range(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    patterns = ["(s:D {id:'start',score:0})"]
+    patterns += [f"(v{i}_{j}:D {{score:{i + 1}}})" for i in range(64) for j in range(2)]
+    patterns += ["(a:D {id:'a',score:65})", "(z:D {id:'z',score:65})"]
+    patterns += [f"(s)-[:R]->(v0_{j})" for j in range(2)]
+    patterns += [f"(v{i}_{j})-[:R]->(v{i + 1}_{k})" for i in range(63) for j in range(2) for k in range(2)]
+    patterns += [f"(v63_{j})-[:R]->({end})" for j in range(2) for end in ("a", "z")]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    base = "MATCH (s:D {id:'start'})-[:R*65..65]->(b:D) "
+    for projection, tail in (("RETURN b.id", ""), ("WITH b", " RETURN b.id")):
+        for goal in ("SKIP 9223372036854775807 LIMIT 3", "SKIP $skip LIMIT $take"):
+            result = db.cypher_json(
+                "g",
+                {
+                    "query": base + projection + " ORDER BY b.id " + goal + tail,
+                    "parameters": {"skip": 2**63 - 1, "take": 3},
+                    "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+                },
+            )
+            assert result["rows"] == [[{"type": "string", "value": "a"}]] * 3
 
 
 def test_persisted_dimensions_membership_and_outer_joins_keep_weights(graph_db):

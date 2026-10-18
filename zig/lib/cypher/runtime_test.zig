@@ -1660,6 +1660,7 @@ test "saturated path counts never become approximate SUM or AVG weights" {
         try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 20000 }));
     }
     try check("MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN min(1),max(1),count(DISTINCT b)", "[[1,1,3]]");
+    try check("MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN size(collect(DISTINCT b.rank))", "[[3]]");
     try check("MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN DISTINCT b.rank ORDER BY b.rank", "[[1],[2],[3]]");
 }
 
@@ -2017,6 +2018,8 @@ test "optional compressed bags preserve per-input null extension and dead bindin
         const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
         var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
         defer result.deinit();
+        try std.testing.expect(result.stages.len != 0);
+        try std.testing.expectEqualStrings("match", result.stages[0].operation);
         var expected = try runtime.execute(a, backend, graph, &exact, &.{}, .{});
         defer expected.deinit();
         try std.testing.expectEqual(expected.rows.len, result.rows.len);
@@ -2049,6 +2052,12 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         "",                              " WHERE a.rank>=0",              " WHERE b.rank>=0",            " WHERE a.rank<0", " WHERE a.id IS NOT NULL",
         " WHERE a.rank>1 AND b.rank>=2", " WHERE b.rank>=2 AND a.rank>1", " WHERE a.rank<2 OR b.rank>2",
     }) |predicate| for ([_][]const u8{
+        "WITH b WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) } RETURN count(*),sum(b.rank)",
+        "WITH b,[(b)-[:CITES]->(d:Document) | d.rank] AS xs UNWIND xs AS x RETURN count(*),sum(x)",
+        "WITH b ORDER BY b.rank LIMIT 3 CALL { WITH b MATCH (b)-[:CITES]->(d:Document) RETURN d } RETURN count(*),sum(d.rank)",
+        "WITH b ORDER BY b.rank LIMIT 3 CALL { WITH b OPTIONAL MATCH (b)-[:CITES]->(d:Document) RETURN d } RETURN count(*),count(d)",
+        "WITH b ORDER BY b.rank LIMIT 3 CALL { WITH b MATCH (b)-[:CITES]->(d:Document) } RETURN count(*)",
+        "WITH b ORDER BY b.rank LIMIT 3 MATCH (b)<-[:CITES*0..3]-(d:Document) RETURN min(d.rank)+max(d.rank),sum(DISTINCT d.rank)",
         "RETURN count(*),sum(b.rank),min(a.rank)",
         "WITH b ORDER BY b.rank DESC RETURN count(*),min(b.rank),max(b.rank)",
         "WITH b ORDER BY b.rank SKIP 1 LIMIT 3 RETURN b.rank ORDER BY b.rank",

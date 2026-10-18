@@ -1488,8 +1488,9 @@ early predicates and path-sensitive constraints retain ordinary execution.
 Single-hop bound-pair plans keep their direct seek instead of discovering a
 component closure.
 
-Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their
-DISTINCT variants consume weighted endpoint rows from those same states.
+Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX, their
+DISTINCT variants, and COLLECT(DISTINCT ...) consume weighted endpoint rows
+from those same states.
 Scope-aware analysis also carries these bags through repeatable row-local WITH
 projections, filters and UNWIND, including alias shadowing and lexical locals.
 UNWIND preserves the incoming weight for each emitted list item. Intermediate
@@ -1514,7 +1515,12 @@ a weighted TopK heap: excess multiplicities are trimmed at the worst key, SKIP
 consumes weights, and intermediate WITH windows pass the clipped exact bags to
 subsequent projections, filters, UNWIND, wildcard DISTINCT, MATCH, OPTIONAL MATCH
 and reductions. Pure correlated EXISTS and pattern-comprehension expressions
-run once per weighted binding, preserving their own aggregate scopes; writes
+run once per weighted binding, including unbounded initial MATCH pipelines,
+preserving their own aggregate scopes. Read-only CALL subqueries use weighted
+correlated apply: returned child weights multiply the parent contribution,
+empty returning bodies suppress the parent, and unit bodies preserve it once.
+Nested calls isolate projection metadata, aggregate demand and profiling buffers;
+variable conflicts and recursion limits follow ordinary subquery semantics. Writes
 and procedure calls remain execution barriers. Expression evaluation isolates
 nested profiling buffers and weighted continuations from retained execution state.
 Each subsequent match negotiates a seed-aware weighted child producer. Binding
@@ -1523,8 +1529,14 @@ and eager expression dependencies. Endpoint-only children retain compressed
 counts and multiply them by the parent contribution; observing route or interior
 identity keeps exact production. Presence reductions do not require exact path
 counts, COUNT retains its overflow sentinel, and numeric folds require exact
-weights. Finite child windows use capped counts only when a proven row goal fits
-the protocol's saturation bound. Trail scope and optional null extension remain
+weights. Demand analysis visits aggregate calls inside scalar expressions:
+MIN/MAX and DISTINCT aggregates require only presence, COUNT needs capped counts,
+and non-DISTINCT SUM/AVG/COLLECT need exact multiplicity. Proof-only constant
+folding accepts bound parameters and constant arithmetic in finite row goals
+without moving invalid-goal errors ahead of their projection. Native path counts
+saturate at maxInt(u64), strictly above every legal signed SKIP+LIMIT sum, so even
+large-offset ordered windows retain sufficient prefix counts. Exact consumers
+reject that sentinel; finite consumers clip it to their requested window. Trail scope and optional null extension remain
 clause-local. Expansion is
 reserved for external rows and consumers such as non-DISTINCT collect that need
 individual elements. Saturated path

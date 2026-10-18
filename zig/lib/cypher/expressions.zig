@@ -254,8 +254,7 @@ fn rowLocalScoped(expr: *const ast.Expr, context: anytype, locals: ?*const Local
         .binary => |b| rowLocalScoped(b.left, context, locals) and rowLocalScoped(b.right, context, locals),
         .comparison => |c| allLocal(c.operands, context, locals),
         .call => |c| blk: {
-            const safe = if (@import("functions.zig").lookup(c.name)) |signature| signature.repeatable else std.ascii.eqlIgnoreCase(c.name, "count") or std.ascii.eqlIgnoreCase(c.name, "sum") or
-                std.ascii.eqlIgnoreCase(c.name, "avg") or std.ascii.eqlIgnoreCase(c.name, "min") or std.ascii.eqlIgnoreCase(c.name, "max");
+            const safe = if (@import("functions.zig").lookup(c.name)) |signature| signature.repeatable else aggregateName(c.name);
             break :blk safe and allLocal(c.args, context, locals);
         },
         .list => |items| allLocal(items, context, locals),

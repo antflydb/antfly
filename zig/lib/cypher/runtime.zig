@@ -28,8 +28,9 @@ pub const max_response_bytes: usize = 32 << 20;
 pub const Limits = struct { memory_bytes: usize = 64 << 20, scanned_anchors: usize = 1_000_000, explored_edges: usize = 1_000_000, intermediate_states: usize = 1_000_000, path_depth: usize = 1024, recursion_depth: usize = 64 };
 /// A presence consumer is insensitive to duplicates of an identical source row.
 /// It receives unit contributions, including when exact path counts overflow.
-/// Capped consumers use counts up to maxInt(i64)+1 as a lower bound for
-/// finite output windows. They must never treat that sentinel as an exact SUM.
+/// Capped consumers receive lower bounds at least as large as i64 overflow.
+/// Native finite windows count through maxInt(u64), covering SKIP+LIMIT for
+/// every signed row goal. Sentinels must never be treated as exact SUM weights.
 pub const Multiplicity = enum { exact, presence, capped };
 pub const Stats = struct { scanned_anchors: usize = 0, explored_edges: usize = 0, intermediate_states: usize = 0, mutations: usize = 0, search_calls: usize = 0, search_candidates: usize = 0, search_approximate: bool = false, memory_bytes: usize = 0 };
 pub const Stage = struct { operation: []const u8, span: ast.Span, input_rows: usize, output_rows: usize };
@@ -949,6 +950,7 @@ const Engine = struct {
     component_leaves: []const ComponentLeaf = &.{},
     retain_windows: bool = false,
     match_weight_demand: ?Multiplicity = null,
+    terminal_weight_demand: ?Multiplicity = null,
     pending_window: ?WeightedRows = null,
     weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, u64) anyerror!void, multiplicity: Multiplicity } = null,
     lower_graph: ?*LowerGraph = null,
@@ -1697,7 +1699,7 @@ const Engine = struct {
             if (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) break :blk false;
             for (calls.items) |expression| {
                 const name = expression.value.call.name;
-                if (!std.ascii.eqlIgnoreCase(name, "count") and !std.ascii.eqlIgnoreCase(name, "sum") and !std.ascii.eqlIgnoreCase(name, "avg") and !std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max")) break :blk false;
+                if (!std.ascii.eqlIgnoreCase(name, "count") and !std.ascii.eqlIgnoreCase(name, "sum") and !std.ascii.eqlIgnoreCase(name, "avg") and !std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max") and !(std.ascii.eqlIgnoreCase(name, "collect") and expression.value.call.distinct)) break :blk false;
             }
             for (input) |row| {
                 if (operation.predicate) |predicate| if (!endpointExpression(predicate, path, row)) break :blk false;
@@ -2039,6 +2041,13 @@ const Engine = struct {
     // result keeps that binding's multiplicity. Procedures and writes are
     // execution barriers, including when nested inside EXISTS.
     fn weightedExpression(value: anytype) bool {
+        if (@TypeOf(value) == ast.Expr) if (value.value == .call) {
+            const function_call = value.value.call;
+            if (!aggregateName(function_call.name)) {
+                const signature = @import("functions.zig").lookup(function_call.name) orelse return false;
+                if (!signature.repeatable) return false;
+            }
+        };
         if (@TypeOf(value) == ast.Clause) switch (value.operation) {
             .match, .project, .unwind, .subquery => {},
             else => return false,
@@ -2061,11 +2070,27 @@ const Engine = struct {
         }
         return true;
     }
+    fn hasCorrelatedBoundary(value: anytype) bool {
+        if (@TypeOf(value) == ast.Clause) if (value.operation == .subquery) return true;
+        if (@TypeOf(value) == *const ast.Expr) return @import("expressions.zig").containsPattern(value);
+        switch (@typeInfo(@TypeOf(value))) {
+            .pointer => |p| {
+                if (p.size == .slice and p.child != u8) for (value) |child| if (hasCorrelatedBoundary(child)) return true;
+            },
+            .@"struct" => |s| inline for (s.field_names) |name| if (hasCorrelatedBoundary(@field(value, name))) return true,
+            .@"union" => switch (value) {
+                inline else => |child| return hasCorrelatedBoundary(child),
+            },
+            .optional => if (value) |child| return hasCorrelatedBoundary(child),
+            else => {},
+        }
+        return false;
+    }
     fn weightedTail(self: *Engine, clauses: []const ast.Clause) bool {
         _ = self;
         if (clauses.len == 0) return false;
         for (clauses) |clause| switch (clause.operation) {
-            .project, .match, .unwind => if (!weightedExpression(clause)) return false,
+            .project, .match, .unwind, .subquery => if (!weightedExpression(clause)) return false,
             else => return false,
         };
         return true;
@@ -2092,42 +2117,43 @@ const Engine = struct {
             else => {},
         }
     }
-    fn matchDemand(clauses: []const ast.Clause) Multiplicity {
+    fn matchDemand(self: *Engine, clauses: []const ast.Clause) !Multiplicity {
         for (clauses) |clause| switch (clause.operation) {
             .match, .unwind => {},
             .project => |p| {
-                var calls = false;
-                for (p.value.items) |item| calls = calls or aggregates(item.expression);
-                for (p.value.order) |order| if (aggregates(order.expression)) return .exact;
-                if (!calls and p.value.distinct) return .presence;
-                if (!calls and p.value.limit != null) {
-                    // The capped protocol saturates at i64 overflow. It can
-                    // select a finite window only when that covers SKIP+LIMIT.
-                    // Unknown/large row goals retain exact multiplicities.
-                    const limit = p.value.limit.?;
-                    if (limit.value != .literal or limit.value.literal != .integer or limit.value.literal.integer < 0) return .exact;
-                    const skip: u64 = if (p.value.skip) |expression| blk: {
-                        if (expression.value != .literal or expression.value.literal != .integer or expression.value.literal.integer < 0) return .exact;
-                        break :blk @intCast(expression.value.literal.integer);
-                    } else 0;
-                    return if (skip + @as(u64, @intCast(limit.value.literal.integer)) <= @as(u64, std.math.maxInt(i64)) + 1) .capped else .exact;
+                var calls: std.ArrayList(*const ast.Expr) = .empty;
+                for (p.value.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return .exact;
+                for (p.value.order) |order| if (!try self.collectStreamingAggregates(order.expression, &calls)) return .exact;
+                if (calls.items.len != 0) {
+                    var demand: Multiplicity = .presence;
+                    for (calls.items) |expression| {
+                        const aggregate_call = expression.value.call;
+                        if (aggregate_call.distinct or std.ascii.eqlIgnoreCase(aggregate_call.name, "min") or std.ascii.eqlIgnoreCase(aggregate_call.name, "max")) continue;
+                        if (!std.ascii.eqlIgnoreCase(aggregate_call.name, "count")) return .exact;
+                        demand = .capped;
+                    }
+                    return demand;
                 }
-                // An unbounded OFFSET still observes duplicate counts even
-                // if a later DISTINCT only needs presence.
-                if (!calls and p.value.skip != null) return .exact;
-                // COUNT can consume the overflow sentinel. Numeric folds
-                // need exact weights, including their eager error behavior.
-                if (calls) {
-                    for (p.value.items) |item| {
-                        const expr = item.expression;
-                        if (expr.value != .call or !std.ascii.eqlIgnoreCase(expr.value.call.name, "count")) return .exact;
+                if (p.value.distinct) return .presence;
+                if (p.value.limit) |expression| {
+                    // Proof-only folding never raises an error early. The
+                    // projection remains responsible for validating its goal.
+                    const limit = self.constant(expression, &.{}) orelse return .exact;
+                    if (limit != .integer or limit.integer < 0) return .exact;
+                    if (p.value.skip) |skip_expression| {
+                        const skip = self.constant(skip_expression, &.{}) orelse return .exact;
+                        if (skip != .integer or skip.integer < 0) return .exact;
                     }
                     return .capped;
                 }
+                if (p.value.skip != null) return .exact;
             },
+            // Pure correlated apply depends on bindings, not their duplicate
+            // count. Its body has a separate aggregate and row-goal scope.
+            .subquery => {},
             else => return .exact,
         };
-        return .exact;
+        return self.terminal_weight_demand orelse .exact;
     }
     fn weightedMatch(self: *Engine, input: Row, operation: ast.Match, tail: []const ast.Clause) !WeightedRows {
         var shape: Row = input;
@@ -2183,7 +2209,7 @@ const Engine = struct {
         defer self.stages.shrinkRetainingCapacity(saved_stages);
         defer self.match_weight_demand = saved_demand;
         defer self.retain_windows = saved_retention;
-        self.match_weight_demand = matchDemand(tail);
+        self.match_weight_demand = try self.matchDemand(tail);
         self.retain_windows = true;
         if (try self.streamMatchProjection(&.{input}, operation, .{ .items = items.items }, &.{}, .{}, .{})) |_| {
             const weighted = self.pending_window orelse return error.CypherInvalidBackendResponse;
@@ -2206,6 +2232,9 @@ const Engine = struct {
         return self.run(clauses, rows, false, preserve_rows);
     }
     fn runWeighted(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool) anyerror![]const Row {
+        return (try self.runWeightedRows(clauses, initial, preserve_rows, false)).rows;
+    }
+    fn runWeightedRows(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool, retain_final: bool) anyerror!WeightedRows {
         var bags = initial;
         const saved_retention = self.retain_windows;
         defer self.retain_windows = saved_retention;
@@ -2216,7 +2245,7 @@ const Engine = struct {
                 .match => |operation| {
                     var rows: std.ArrayList(Row) = .empty;
                     var weights: std.ArrayList(u64) = .empty;
-                    const demand = matchDemand(clauses[clause_index + 1 ..]);
+                    const demand = try self.matchDemand(clauses[clause_index + 1 ..]);
                     for (bags.rows, bags.weights) |input, weight| {
                         const children = try self.weightedMatch(input, operation, clauses[clause_index + 1 ..]);
                         for (children.rows, children.weights) |output, child_weight| {
@@ -2247,6 +2276,7 @@ const Engine = struct {
                     bags = .{ .rows = rows.items, .weights = weights.items };
                 },
                 .project => |p| {
+                    self.retain_windows = (retain_final and clause_index + 1 == clauses.len) or (!p.final and self.weightedTail(clauses[clause_index + 1 ..]));
                     var projection = p.value;
                     // Resolve DISTINCT * against the complete current scope,
                     // before reducing multiplicities. Explicit items follow
@@ -2292,7 +2322,6 @@ const Engine = struct {
                             else => return err,
                         };
                     }
-                    self.retain_windows = !p.final and self.weightedTail(clauses[clause_index + 1 ..]);
                     const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, calls.items, projection);
                     if (self.pending_window) |weighted| {
                         self.pending_window = null;
@@ -2303,12 +2332,46 @@ const Engine = struct {
                         bags = .{ .rows = rows, .weights = weights };
                     }
                 },
+                .subquery => |inner| {
+                    self.recursion += 1;
+                    defer self.recursion -= 1;
+                    if (self.recursion > self.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
+                    var rows: std.ArrayList(Row) = .empty;
+                    var weights: std.ArrayList(u64) = .empty;
+                    const last = inner[inner.len - 1].operation;
+                    const unit = last != .project or !last.project.final;
+                    const demand = try self.matchDemand(clauses[clause_index + 1 ..]);
+                    for (bags.rows, bags.weights) |row, weight| {
+                        const scope = PatternScope.enter(self);
+                        const children = blk: {
+                            defer scope.leave(self);
+                            self.terminal_weight_demand = if (unit) .presence else demand;
+                            break :blk try self.runWeightedRows(inner, .{ .rows = &.{row}, .weights = &.{1} }, true, true);
+                        };
+                        if (unit) {
+                            try rows.append(self.a, row);
+                            try weights.append(self.a, weight);
+                            continue;
+                        }
+                        for (children.rows, children.weights) |child, child_weight| {
+                            var merged = row;
+                            for (child) |entry| merged = (try self.bind(merged, entry.name, entry.value)) orelse return error.CypherVariableConflict;
+                            try rows.append(self.a, merged);
+                            try weights.append(self.a, switch (demand) {
+                                .presence => 1,
+                                .capped => multiplyPathWays(weight, child_weight),
+                                .exact => std.math.mul(u64, weight, child_weight) catch return error.CypherNumericOverflow,
+                            });
+                        }
+                    }
+                    bags = .{ .rows = rows.items, .weights = weights.items };
+                },
                 else => unreachable,
             }
             try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = before, .output_rows = bags.count() });
         }
-        if (!preserve_rows and clauses[clauses.len - 1].operation != .project) return &.{};
-        return bags.rows;
+        if (!preserve_rows and clauses.len != 0 and clauses[clauses.len - 1].operation != .project) return .{ .rows = &.{}, .weights = &.{} };
+        return bags;
     }
     fn run(self: *Engine, clauses: []const ast.Clause, input: []const Row, explain: bool, preserve_rows: bool) anyerror![]const Row {
         const prior_retention = self.retain_windows;
@@ -2355,6 +2418,21 @@ const Engine = struct {
                 continue;
             }
             if (clause.operation == .match) {
+                const tail = clauses[clause_index + 1 ..];
+                if (self.weightedTail(tail) and hasCorrelatedBoundary(tail)) {
+                    // Lower the producer before evaluating pure correlated
+                    // expressions, once per binding with its bag weight.
+                    var rows_out: std.ArrayList(Row) = .empty;
+                    var weights: std.ArrayList(u64) = .empty;
+                    for (rows) |row| {
+                        const children = try self.weightedMatch(row, clause.operation.match, tail);
+                        try rows_out.appendSlice(self.a, children.rows);
+                        try weights.appendSlice(self.a, children.weights);
+                    }
+                    const weighted: WeightedRows = .{ .rows = rows_out.items, .weights = weights.items };
+                    try self.stages.append(self.a, .{ .operation = "match", .span = clause.span, .input_rows = before, .output_rows = weighted.count() });
+                    return self.runWeighted(tail, weighted, preserve_rows);
+                }
                 if (try self.tryComponent(rows, clauses[clause_index..])) |component| {
                     if (clause_index + component.next < clauses.len) return self.runNext(clauses[clause_index + component.next ..], component.rows, preserve_rows);
                     return component.rows;
@@ -3370,7 +3448,7 @@ const Engine = struct {
             } else false;
             if (needs_weights) {
                 var weights = current.valueIterator();
-                while (weights.next()) |weight| if (weight.* > std.math.maxInt(i64)) {
+                while (weights.next()) |weight| if (weight.* == std.math.maxInt(u64)) {
                     exact_weights = false;
                     break;
                 };
@@ -3403,7 +3481,13 @@ const Engine = struct {
                 const row = (try self.bind(input.row, path.nodes[path.nodes.len - 1].alias, .{ .node = node })) orelse continue;
                 if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
                 if (self.weighted_sink) |sink| {
-                    try sink.emit(sink.ptr, row, if (sink.multiplicity == .presence) 1 else ways);
+                    // SQL's cursor protocol keeps its signed-overflow cap;
+                    // native windows retain the wider internal prefix counts.
+                    try sink.emit(sink.ptr, row, switch (sink.multiplicity) {
+                        .presence => 1,
+                        .capped => @min(ways, @as(u64, std.math.maxInt(i64)) + 1),
+                        .exact => ways,
+                    });
                     continue;
                 }
                 const fold = self.stream_fold.?;
@@ -3419,7 +3503,9 @@ const Engine = struct {
         return left.identity.eql(right.identity) and std.mem.eql(u8, left.index, right.index);
     }
     fn multiplyPathWays(left: u64, right: u64) u64 {
-        return @min(@as(u64, std.math.maxInt(i64)) + 1, left *| right);
+        // Every legal finite window has SKIP+LIMIT < maxInt(u64).
+        // Reserve maxInt(u64) as the overflow sentinel for exact consumers.
+        return left *| right;
     }
     fn branchWays(self: *Engine, graph: *LowerGraph, position: usize, pivot: usize, excluded: ?*const v.Relationship, mode: ast.PathMode) anyerror!u64 {
         var leaf_count: usize = 0;
@@ -3668,7 +3754,7 @@ const Engine = struct {
         return bound == .node and bound.node.identity.eql(node.identity);
     }
     fn mergePathWays(left: u64, right: u64) u64 {
-        return @min(@as(u64, std.math.maxInt(i64)) + 1, left +| right);
+        return left +| right;
     }
     fn addPathCount(left: u64, right: u64) !u64 {
         const sum = std.math.add(u64, left, right) catch return error.CypherNumericOverflow;
@@ -5229,15 +5315,17 @@ const Engine = struct {
         stages: @FieldType(Engine, "stages"),
         retain_windows: bool,
         match_weight_demand: ?Multiplicity,
+        terminal_weight_demand: ?Multiplicity,
         pending_window: ?WeightedRows,
         fn enter(engine: *Engine) PatternScope {
-            const scope: PatternScope = .{ .columns = engine.columns, .stages = engine.stages, .retain_windows = engine.retain_windows, .match_weight_demand = engine.match_weight_demand, .pending_window = engine.pending_window };
+            const scope: PatternScope = .{ .columns = engine.columns, .stages = engine.stages, .retain_windows = engine.retain_windows, .match_weight_demand = engine.match_weight_demand, .terminal_weight_demand = engine.terminal_weight_demand, .pending_window = engine.pending_window };
             // A correlated query owns its result/profiling buffers and must
             // produce ordinary expression values. Its caller may itself be
             // retaining a weighted window in a temporary evaluation arena.
             engine.stages = .empty;
             engine.retain_windows = false;
             engine.match_weight_demand = null;
+            engine.terminal_weight_demand = null;
             engine.pending_window = null;
             return scope;
         }
@@ -5246,6 +5334,7 @@ const Engine = struct {
             engine.stages = scope.stages;
             engine.retain_windows = scope.retain_windows;
             engine.match_weight_demand = scope.match_weight_demand;
+            engine.terminal_weight_demand = scope.terminal_weight_demand;
             engine.pending_window = scope.pending_window;
         }
     };
@@ -5384,7 +5473,7 @@ const Engine = struct {
                     }
                 }
             }
-            self.total = if (engine.match_weight_demand != null) @intCast(@min(total, std.math.maxInt(usize))) else std.math.cast(usize, total) orelse return error.CypherNumericOverflow;
+            self.total = if (engine.match_weight_demand != null or engine.retain_windows) @intCast(@min(total, std.math.maxInt(usize))) else std.math.cast(usize, total) orelse return error.CypherNumericOverflow;
         }
         fn finish(self: *TopK, final: bool) ![]const Row {
             const engine = self.engine;
