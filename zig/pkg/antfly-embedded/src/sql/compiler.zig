@@ -2142,6 +2142,63 @@ const Parser = struct {
         }
     }
 
+    fn viewDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action"), replace: bool) Error!ast.CatalogDdl {
+        try self.node();
+        var conditional = false;
+        if (action == .drop or action == .rename) {
+            conditional = self.keyword(.@"if");
+            if (conditional) try self.expectKeyword(.exists);
+        } else if (self.keyword(.@"if")) {
+            return self.fail(error.InvalidSqlSyntax, "CREATE VIEW does not support IF NOT EXISTS");
+        }
+        var ddl: ast.CatalogDdl = .{ .kind = .view, .action = action, .name = try self.name(), .conditional = conditional };
+        if (action == .drop) {
+            ddl.cascade = self.ddlWord("CASCADE");
+            if (!ddl.cascade) _ = self.ddlWord("RESTRICT");
+            return ddl;
+        }
+        if (action == .rename) {
+            if (!self.keyword(.rename)) return self.fail(error.UnsupportedSqlShape, "ALTER VIEW requires RENAME TO");
+            try self.expectKeyword(.to);
+            ddl.new_name = try self.identifier();
+            return ddl;
+        }
+        const columns = if (self.peek(.lparen)) try self.ddlColumnList() else &.{};
+        if (columns.len > 1024) return self.fail(error.SqlLimitExceeded, "view output column limit exceeded");
+        var invoker = false;
+        var barrier = false;
+        var seen: u2 = 0;
+        if (self.keyword(.with)) {
+            try self.expect(.lparen);
+            while (true) {
+                const option_name = try self.identifier();
+                const bit: u2 = if (std.mem.eql(u8, option_name, "security_invoker")) 1 else if (std.mem.eql(u8, option_name, "security_barrier")) 2 else return self.fail(error.UnsupportedSqlShape, "unsupported view option");
+                if (seen & bit != 0) return self.fail(error.SqlInvalidParameterValue, "duplicate view option");
+                seen |= bit;
+                try self.expect(.eq);
+                const enabled = if (self.keyword(.true)) true else if (self.keyword(.false)) false else return self.fail(error.InvalidSqlSyntax, "view security option requires TRUE or FALSE");
+                if (bit == 1) invoker = enabled else barrier = enabled;
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rparen);
+        }
+        try self.expectKeyword(.as);
+        if (self.pos == self.tokens.len) return self.fail(error.InvalidSqlSyntax, "view requires a SELECT query");
+        const start = self.tokens[self.pos].source_start;
+        const parameters = self.parameter_count;
+        self.relation_depth += 1;
+        defer self.relation_depth -= 1;
+        if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL query nesting limit exceeded");
+        const statement_ = try self.statement();
+        if (statement_ != .select) return self.fail(error.InvalidSqlSyntax, "view requires a SELECT query");
+        if (self.parameter_count != parameters) return self.fail(error.InvalidSqlParameter, "view query cannot contain parameters");
+        const end = self.tokens[self.pos - 1].source_end;
+        const query = try self.alloc.create(ast.Select);
+        query.* = statement_.select;
+        ddl.view_definition = .{ .query = query, .query_sql = try self.alloc.dupe(u8, self.source[start..end]), .columns = columns, .replace = replace, .security_invoker = invoker, .security_barrier = barrier };
+        return ddl;
+    }
+
     fn catalogDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
         const kind: @FieldType(ast.CatalogDdl, "kind") = if (self.keyword(.database)) .database else if (self.keyword(.schema)) .namespace else if (self.keyword(.tablespace)) .tablespace else if (self.keyword(.table)) .table else return self.fail(error.UnsupportedSqlShape, "expected a table, database, schema, or tablespace");
         var conditional = false;
@@ -2803,6 +2860,11 @@ const Parser = struct {
         }
         if (self.keyword(.merge)) return .{ .merge = try self.merge() };
         if (self.keyword(.create)) {
+            if (self.keyword(.@"or")) {
+                if (!self.ddlWord("REPLACE") or !self.ddlWord("VIEW")) return self.fail(error.UnsupportedSqlShape, "CREATE OR REPLACE requires VIEW");
+                return .{ .catalog_ddl = try self.viewDdl(.create, true) };
+            }
+            if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.create, false) };
             if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.create) };
             if (self.keyword(.table)) return .{ .create_table = try self.createTable() };
             const unique = self.keyword(.unique);
@@ -2811,6 +2873,7 @@ const Parser = struct {
             return .{ .catalog_ddl = try self.catalogDdl(.create) };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.drop, false) };
             if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.drop) };
             if (self.keyword(.index)) return .{ .catalog_ddl = try self.indexDdl(false, false) };
             if (!self.keyword(.table)) return .{ .catalog_ddl = try self.catalogDdl(.drop) };
@@ -2819,6 +2882,7 @@ const Parser = struct {
             return .{ .drop_table = .{ .table = try self.name(), .if_exists = if_exists } };
         }
         if (self.keyword(.alter)) {
+            if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.rename, false) };
             if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.alter) };
             const before_table = self.pos;
             if (self.keyword(.table)) {
@@ -3781,6 +3845,44 @@ test "SQL DROP INDEX resolves catalog ownership with an optional ON clause" {
     defer scoped.deinit();
     try std.testing.expectEqualStrings("threads", scoped.statement.catalog_ddl.name.table);
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE INDEX recency", .{}));
+}
+
+test "SQL view DDL compiler owns qualified read intents and PostgreSQL lifecycle clauses" {
+    var source = "CREATE OR REPLACE VIEW app.public.summary(record_id) WITH (security_invoker=true, security_barrier=false) AS WITH q AS (SELECT id FROM things) SELECT id FROM q;".*;
+    var compiled = try compile(std.testing.allocator, &source, .{});
+    defer compiled.deinit();
+    @memset(&source, 'x');
+    const ddl = compiled.statement.catalog_ddl;
+    try std.testing.expectEqual(.view, ddl.kind);
+    try std.testing.expectEqual(.create, ddl.action);
+    try std.testing.expectEqualStrings("app", ddl.name.database.?);
+    try std.testing.expectEqualStrings("public", ddl.name.namespace.?);
+    try std.testing.expectEqualStrings("summary", ddl.name.table);
+    const definition = ddl.view_definition.?;
+    try std.testing.expect(definition.replace and definition.security_invoker and !definition.security_barrier);
+    try std.testing.expectEqualStrings("record_id", definition.columns[0]);
+    try std.testing.expectEqualStrings("WITH q AS (SELECT id FROM things) SELECT id FROM q", definition.query_sql);
+    try std.testing.expectEqual(@as(usize, 1), definition.query.ctes.len);
+    var rename = try compile(std.testing.allocator, "ALTER VIEW IF EXISTS public.summary RENAME TO renamed", .{});
+    defer rename.deinit();
+    try std.testing.expectEqual(.rename, rename.statement.catalog_ddl.action);
+    try std.testing.expect(rename.statement.catalog_ddl.conditional);
+    try std.testing.expectEqualStrings("renamed", rename.statement.catalog_ddl.new_name.?);
+    var drop = try compile(std.testing.allocator, "DROP VIEW IF EXISTS public.renamed CASCADE", .{});
+    defer drop.deinit();
+    try std.testing.expectEqual(.drop, drop.statement.catalog_ddl.action);
+    try std.testing.expect(drop.statement.catalog_ddl.conditional and drop.statement.catalog_ddl.cascade);
+    try std.testing.expect(drop.statement.catalog_ddl.view_definition == null);
+}
+
+test "SQL view DDL compiler rejects nonexistent PostgreSQL grammar and writable parameterized bodies" {
+    for ([_][]const u8{
+        "CREATE VIEW IF NOT EXISTS v AS SELECT 1",
+        "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT 1",
+        "CREATE VIEW v AS UPDATE things SET id=1",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+    try std.testing.expectError(error.SqlInvalidParameterValue, compile(std.testing.allocator, "CREATE VIEW v WITH (security_invoker=true, security_invoker=false) AS SELECT 1", .{}));
+    try std.testing.expectError(error.InvalidSqlParameter, compile(std.testing.allocator, "CREATE VIEW v AS SELECT $1", .{}));
 }
 
 test "compiler leaves anonymous constraint identities for native admission" {

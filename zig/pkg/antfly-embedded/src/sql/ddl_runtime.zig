@@ -84,6 +84,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .namespace => "CREATE SCHEMA",
                 .tablespace => "CREATE TABLESPACE",
                 .index => "CREATE INDEX",
+                .view => "CREATE VIEW",
                 .table => unreachable,
             },
             .drop => switch (ddl.kind) {
@@ -91,6 +92,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .namespace => "DROP SCHEMA",
                 .tablespace => "DROP TABLESPACE",
                 .index => "DROP INDEX",
+                .view => "DROP VIEW",
                 .table => unreachable,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
@@ -99,6 +101,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .tablespace => "ALTER TABLESPACE",
                 .table => "ALTER TABLE",
                 .index => "ALTER INDEX",
+                .view => "ALTER VIEW",
             },
         },
     }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt };
@@ -258,6 +261,46 @@ pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.C
         return @import("schema_expression.zig").numericLiteral(alloc, if (value == .null) .null else .{ .string = value.string });
     const literal = try bindDefault(alloc, value, kind, element);
     return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }, .{}), .{ .parse_numbers = false });
+}
+
+test "SQL view DDL describes without mutation and forwards one exact catalog intent" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn ddl(raw: *anyopaque, _: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(.catalog_ddl, std.meta.activeTag(request));
+            const command = request.catalog_ddl;
+            try std.testing.expectEqual(.view, command.kind);
+            if (command.action == .create) {
+                try std.testing.expectEqualStrings("SELECT id FROM things", command.view_definition.?.query_sql);
+                try std.testing.expect(command.view_definition.?.security_invoker);
+            }
+            self.calls += 1;
+            return .{};
+        }
+    };
+    const cases = [_]struct { sql: []const u8, tag: []const u8 }{
+        .{ .sql = "CREATE VIEW v WITH (security_invoker=true) AS SELECT id FROM things", .tag = "CREATE VIEW" },
+        .{ .sql = "ALTER VIEW v RENAME TO renamed", .tag = "ALTER VIEW" },
+        .{ .sql = "DROP VIEW IF EXISTS v CASCADE", .tag = "DROP VIEW" },
+    };
+    for (cases) |case| {
+        var probe: Probe = .{};
+        const backend: catalog.Backend = .{ .ptr = &probe, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Probe.checkpoint, .ddl = Probe.ddl } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const bound = try @import("describe.zig").bind(a, backend, &compiled, &.{});
+        try std.testing.expect(bound.table == null);
+        try std.testing.expectEqual(@as(usize, 0), bound.columns.len);
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        const output = try execute(.{ .result = a, .scratch = a }, backend, compiled.statement);
+        try std.testing.expectEqualStrings(case.tag, output.command_tag);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    }
 }
 
 test "SQL DDL generated name hints use one bounded allocation and borrow compiler-owned names" {

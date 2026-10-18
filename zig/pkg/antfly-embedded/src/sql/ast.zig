@@ -310,7 +310,7 @@ pub const Column = struct {
 pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false };
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index },
+    kind: enum { database, namespace, tablespace, table, index, view },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -325,6 +325,17 @@ pub const CatalogDdl = struct {
     index_table: ?Name = null,
     index_targets: []const Name = &.{},
     concurrently: bool = false,
+    view_definition: ?ViewDefinition = null,
+};
+/// Compiler-owned view intent. The parsed query is reused for semantic
+/// preparation; retained text is for durable definition/rebinding, not execution.
+pub const ViewDefinition = struct {
+    query: *const Select,
+    query_sql: []const u8,
+    columns: []const []const u8 = &.{},
+    replace: bool = false,
+    security_invoker: bool = false,
+    security_barrier: bool = false,
 };
 pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,

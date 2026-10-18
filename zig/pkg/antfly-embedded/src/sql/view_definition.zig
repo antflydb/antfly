@@ -39,7 +39,14 @@ pub const Security = enum { owner, invoker };
 pub const Output = struct { name: []const u8, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, numeric_modifier: ?scalar.NumericModifier = null };
 /// Names are resolved to durable attribute IDs by catalog publication in the
 /// same transaction as source-epoch admission; they are not execution identity.
-pub const ColumnDependency = struct { name: []const u8, signature: [32]u8 };
+pub const ColumnDependency = struct {
+    name: []const u8,
+    signature: [32]u8,
+    /// Creation-time order and hiddenness reconstruct a captured star even
+    /// after compatible source-column additions or reordering.
+    ordinal: u32,
+    virtual: bool,
+};
 pub const Source = struct {
     reference: ast.Name,
     database: []const u8,
@@ -77,6 +84,8 @@ pub const Definition = struct {
 };
 pub const ResolvedSource = struct { table: catalog.Table, schema_digest: [32]u8 };
 /// Resolve only referenced names against one authorized metadata snapshot.
+/// This is definition lookup (source-schema USAGE), not runtime source SELECT
+/// admission. PostgreSQL permits creating a view without source-table SELECT.
 /// Returned metadata must survive preparation (or be allocated in `a`). There
 /// is deliberately no scan, snapshot acquisition or mutation capability here.
 pub const Resolver = struct {
@@ -203,6 +212,22 @@ const Preparation = struct {
 };
 
 pub fn prepare(backing: A, resolver: Resolver, query: []const u8, options: Options) !Owned {
+    return prepareOwned(backing, resolver, query, options, null);
+}
+
+/// Trusted compiler intent, not deserialized public JSON. Reuse its SELECT
+/// tree; do not parse the CREATE VIEW body again during ingress preparation.
+pub fn prepareDdl(backing: A, resolver: Resolver, ddl: ast.CatalogDdl, options: Options) !Owned {
+    if (ddl.kind != .view or ddl.action != .create) return error.InvalidSqlViewDefinition;
+    const definition = ddl.view_definition orelse return error.InvalidSqlViewDefinition;
+    var effective = options;
+    effective.columns = definition.columns;
+    effective.security = if (definition.security_invoker) .invoker else .owner;
+    effective.security_barrier = definition.security_barrier;
+    return prepareOwned(backing, resolver, definition.query_sql, effective, definition.query);
+}
+
+fn prepareOwned(backing: A, resolver: Resolver, query: []const u8, options: Options, parsed: ?*const ast.Select) !Owned {
     if (query.len == 0) return error.InvalidSqlViewDefinition;
     if (query.len > max_query_bytes or options.columns.len > max_columns) return error.SqlProgramLimitExceeded;
     const budget = try backing.create(Budget);
@@ -210,14 +235,14 @@ pub fn prepare(backing: A, resolver: Resolver, query: []const u8, options: Optio
     budget.* = .{ .backing = backing, .limit = options.memory_bytes };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     errdefer arena.deinit();
-    const value = prepareValue(budget.allocator(), arena.allocator(), resolver, query, options) catch |err| {
+    const value = prepareValue(budget.allocator(), arena.allocator(), resolver, query, options, parsed) catch |err| {
         if (err == error.OutOfMemory and budget.exhausted) return error.SqlProgramLimitExceeded;
         return err;
     };
     // Move the arena only after every allocation and inner deferred cleanup.
     return .{ .backing = backing, .budget = budget, .arena = arena, .value = value };
 }
-fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []const u8, options: Options) !Definition {
+fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []const u8, options: Options, parsed: ?*const ast.Select) !Definition {
     // Compiler/binder regions must not stay resident with a saved definition.
     // Both temporary and retained capacity compete for the same admission.
     var scratch = std.heap.ArenaAllocator.init(scratch_backing);
@@ -225,13 +250,17 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
     const a = scratch.allocator();
     try resolver.checkpoint(resolver.ptr);
     const owner = try cloneOwner(output, options.owner);
-    var compiled = try compiler.compile(a, query, .{ .max_bytes = max_query_bytes, .max_nodes = 4096, .max_depth = 32 });
-    defer compiled.deinit();
-    if (compiled.statement != .select or compiled.parameter_count != 0) return error.InvalidSqlViewDefinition;
+    var compiled: ?compiler.Compiled = null;
+    defer if (compiled) |*value| value.deinit();
+    const statement = if (parsed) |value| value.* else blk: {
+        compiled = try compiler.compile(a, query, .{ .max_bytes = max_query_bytes, .max_nodes = 4096, .max_depth = 32 });
+        if (compiled.?.statement != .select or compiled.?.parameter_count != 0) return error.InvalidSqlViewDefinition;
+        break :blk compiled.?.statement.select;
+    };
     var preparation: Preparation = .{ .resolver = resolver };
     const backend: catalog.Backend = .{ .ptr = &preparation, .settings_view = options.settings, .vtable = &.{ .resolve = Preparation.resolve, .scan = Preparation.scan, .mutate = Preparation.mutate, .checkpoint = Preparation.checkpoint } };
     const relations = @import("relation_binding.zig");
-    const relation = try relations.bindDefinition(a, backend, compiled.statement.select);
+    const relation = try relations.bindDefinition(a, backend, statement);
     var adapter: relations.ResolveAdapter = .{ .backend = backend, .table = relation.table };
     const lowered: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = relation.statement }, .parameter_count = 0 };
     const bound = try describe.bind(a, adapter.iface(), &lowered, &.{});
@@ -247,20 +276,21 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
     const sources = try output.alloc(Source, preparation.sources.items.len);
     for (preparation.sources.items, sources) |source, *out| {
         out.* = try cloneSource(output, source);
-        var unique: std.StringHashMapUnmanaged([32]u8) = .empty;
+        var unique: std.StringHashMapUnmanaged(ColumnDependency) = .empty;
         for (relation.column_dependencies) |dependency| {
             if (dependency.table_id != source.table_id) continue;
             const signature = try dependency.column.identitySignature(a);
             const entry = try unique.getOrPut(a, dependency.column.name);
             if (entry.found_existing) {
-                if (!std.mem.eql(u8, &entry.value_ptr.*, &signature)) return error.InvalidSqlBackendResponse;
-            } else entry.value_ptr.* = signature;
+                if (!std.mem.eql(u8, &entry.value_ptr.signature, &signature) or entry.value_ptr.ordinal != dependency.ordinal or entry.value_ptr.virtual != dependency.virtual) return error.InvalidSqlBackendResponse;
+            } else entry.value_ptr.* = .{ .name = dependency.column.name, .signature = signature, .ordinal = dependency.ordinal, .virtual = dependency.virtual };
         }
         const dependencies = try output.alloc(ColumnDependency, unique.count());
         var iterator = unique.iterator();
         for (dependencies) |*dependency| {
             const entry = iterator.next().?;
-            dependency.* = .{ .name = try output.dupe(u8, entry.key_ptr.*), .signature = entry.value_ptr.* };
+            dependency.* = entry.value_ptr.*;
+            dependency.name = try output.dupe(u8, entry.key_ptr.*);
         }
         std.mem.sort(ColumnDependency, dependencies, {}, struct {
             fn less(_: void, left: ColumnDependency, right: ColumnDependency) bool {
@@ -315,6 +345,36 @@ const TestResolver = struct {
         };
     }
 };
+
+test "SQL view DDL preparation reuses compiled query and owns its exact security and output contract" {
+    var resolver: TestResolver = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "CREATE OR REPLACE VIEW summary(key) WITH (security_invoker=true,security_barrier=true) AS SELECT id,amount FROM things", .{});
+    var definition = try prepareDdl(std.testing.allocator, resolver.resolver(), compiled.statement.catalog_ddl, .{ .owner = .auth_disabled });
+    compiled.deinit();
+    defer definition.deinit();
+    try std.testing.expectEqual(Security.invoker, definition.value.security);
+    try std.testing.expect(definition.value.security_barrier);
+    try std.testing.expectEqualStrings("key", definition.value.columns[0].name);
+    try std.testing.expectEqualStrings("amount", definition.value.columns[1].name);
+    try std.testing.expectEqualStrings("SELECT id,amount FROM things", definition.value.query);
+    try std.testing.expectEqual(@as(usize, 2), definition.value.sources[0].columns.len);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+}
+
+test "SQL view DDL preparation cleans allocation failures without consuming compiler ownership" {
+    const Check = struct {
+        fn run(a: A, ddl: ast.CatalogDdl) !void {
+            var resolver: TestResolver = .{};
+            var prepared = try prepareDdl(a, resolver.resolver(), ddl, .{ .owner = .auth_disabled });
+            defer prepared.deinit();
+            const bytes = try prepared.value.encode(a);
+            defer a.free(bytes);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "CREATE VIEW v(key) AS SELECT a.id,b.amount FROM things a JOIN things b ON a.id=b.id", .{});
+    defer compiled.deinit();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{compiled.statement.catalog_ddl});
+}
 
 test "SQL view definition owns descriptors and resolves repeated sources once without readers" {
     var physical = "native-things".*;
@@ -389,6 +449,9 @@ test "SQL view definition retains semantic column dependencies independently of 
         for (case.names, columns) |name, column| {
             try std.testing.expectEqualStrings(name, column.name);
             try std.testing.expect(!std.mem.allEqual(u8, &column.signature, 0));
+            const ordinal: u32 = if (std.mem.eql(u8, name, "id")) 0 else if (std.mem.eql(u8, name, "items")) 1 else if (std.mem.eql(u8, name, "amount")) 2 else 3;
+            try std.testing.expectEqual(ordinal, column.ordinal);
+            try std.testing.expectEqual(std.mem.eql(u8, name, "_id"), column.virtual);
         }
     }
 }

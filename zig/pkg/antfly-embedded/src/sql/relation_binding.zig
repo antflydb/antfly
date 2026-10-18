@@ -155,7 +155,7 @@ pub const Node = struct {
     },
 };
 pub const virtual_table_name = "$sql_relation";
-pub const ColumnDependency = struct { table_id: u64, column: catalog.Column };
+pub const ColumnDependency = struct { table_id: u64, column: catalog.Column, ordinal: u32, virtual: bool };
 pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select, prepared_fields: []const []const u8 = &.{}, access_graph: ?*const @import("relation_access.zig").Graph = null, column_dependencies: []const ColumnDependency = &.{} };
 pub const prepared_scope_name = "$sql_prepared_scope";
 
@@ -1611,16 +1611,16 @@ const Builder = struct {
                 const columns = try self.alloc.alloc(Column, table.columns.len + virtual_count + metadata_count);
                 const source_columns = try self.alloc.alloc([]const u8, columns.len);
                 const fields = try self.alloc.alloc([]const u8, table.columns.len);
-                for (table.columns, columns[0..table.columns.len], source_columns[0..table.columns.len], fields) |column, *out, *source_name, *field_name| {
+                for (table.columns, columns[0..table.columns.len], source_columns[0..table.columns.len], fields, 0..) |column, *out, *source_name, *field_name, position| {
                     out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
                     source_name.* = column.name;
                     field_name.* = column.path;
-                    if (self.capture_dependencies) try self.dependency_origins.put(self.alloc, out.internal, .{ .table_id = table.id, .column = column });
+                    if (self.capture_dependencies) try self.dependency_origins.put(self.alloc, out.internal, .{ .table_id = table.id, .column = column, .ordinal = @intCast(position), .virtual = false });
                 }
                 for (virtual_columns, table.columns.len..) |column, position| {
                     columns[position] = .{ .name = column.name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .visible = reference.search != null and std.mem.eql(u8, column.name, "_id") };
                     source_columns[position] = column.name;
-                    if (self.capture_dependencies) try self.dependency_origins.put(self.alloc, columns[position].internal, .{ .table_id = table.id, .column = column });
+                    if (self.capture_dependencies) try self.dependency_origins.put(self.alloc, columns[position].internal, .{ .table_id = table.id, .column = column, .ordinal = @intCast(position), .virtual = true });
                 }
                 for (@import("joined_mutation.zig").metadata_fields[0..metadata_count], 0..) |name, i| {
                     columns[table.columns.len + virtual_count + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };

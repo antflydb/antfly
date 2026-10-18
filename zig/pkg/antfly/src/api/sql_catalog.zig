@@ -740,6 +740,10 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .index)
         return executeIndex(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
+    // View intent is not a table mutation. Enable only with transactional
+    // definition/dependency admission and execution-time delegation in place.
+    if (input == .catalog_ddl and input.catalog_ddl.kind == .view)
+        return error.UnsupportedSqlExecution;
     const name = switch (input) {
         .create_table => |v| v.name,
         .drop_table => |v| v.table,
@@ -750,7 +754,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     try target.validate();
     const kind: domain.Kind = switch (input) {
         .catalog_ddl => |ddl| switch (ddl.kind) {
-            .index => unreachable,
+            .index, .view => unreachable,
             inline else => |tag| @field(domain.Kind, @tagName(tag)),
         },
         .policy_ddl => unreachable,

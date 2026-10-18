@@ -9765,6 +9765,52 @@ independent PostgreSQL 18.6 oracle tests passed in
 /private/tmp/antfly-sql-view-semantic-dependencies-postgres.log. These component
 gates do not qualify stored-view execution.
 
+### SQL view-DDL ingress (publication still guarded)
+
+CREATE [OR REPLACE] VIEW, output aliases, explicit security_invoker /
+security_barrier booleans, ALTER VIEW [IF EXISTS] RENAME, and DROP VIEW
+[IF EXISTS] with CASCADE/RESTRICT now lower to compiler-owned view intents in
+the existing catalog-DDL interface. Describe performs no mutation. Execution
+forwards one intent; it never emulates a view as a physical table. The public
+SQL transport remains unchanged; these AST fields are not new public JSON enums.
+
+Preparation reuses the compiled SELECT tree rather than parsing the body a
+second time, and retains owned query text, exact outputs, semantic source
+dependencies and security mode after compiler teardown. PostgreSQL 18.6 confirms
+the lifecycle grammar: CREATE VIEW IF NOT EXISTS is invalid (42601), while
+duplicate security options are invalid parameters (22023), not syntax errors.
+Compiler limits and allocator-failure cleanup apply to the ingress path.
+Source dependencies also retain creation-time ordinal and hiddenness so a
+captured star can be reconstructed without admitting later source columns or
+silently adopting their new ordering.
+
+Production view execution remains explicitly nonadmitted until namespace-owned
+publication, dependency-aware source mutation and fresh owner/RLS delegation
+are connected. The next integration must resolve views as tagged relations,
+not fabricated ResolvedTable records, and preserve caller SQL expression
+identity separately from the subject used for source permission/policy checks.
+No original cases receive credit for parsing or a backend probe alone.
+
+PostgreSQL creation admission checks source-schema USAGE, not source-table
+SELECT. A view can be created without SELECT and fail when queried until the
+owner receives that grant. After creation, revoking source-schema USAGE does
+not prevent reads through the stored view if source SELECT still permits them.
+Therefore ingress must not reuse the ordinary read-authorizing table resolver,
+and execution must bind stored source IDs without repeating source-schema
+name-lookup authorization. The PostgreSQL oracle covers both boundaries.
+
+Validation: /private/tmp/antfly-sql-view-ddl-full-debug.log passed the complete
+Debug SQL gate (937 core and 234 extracted tests, four opt-in benchmark skips,
+zero failures/leaks). The subsequent captured-order addition passed all 14
+focused Debug tests without skips/failures/leaks in
+/private/tmp/antfly-sql-view-ddl-captured-order-debug.log. The API index-access
+layout regression passed all 83 build steps and 11 tests in
+/private/tmp/antfly-sql-view-ddl-api-debug.log. All seven independent PostgreSQL
+18.6 oracle tests passed in
+/private/tmp/antfly-sql-view-ddl-admission-postgres.log. The original-case
+inventory remains 559 implemented / 131 rejected / 125 superseded / 771
+unresolved. These gates do not qualify persisted-view activation.
+
 ### Captured Apply prefix replay
 
 Invariant captured inputs under Apply now retain one suspended iterator instead

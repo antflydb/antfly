@@ -34,6 +34,62 @@ def attributes(db, relation):
 
 
 class ViewCatalogTest(unittest.TestCase):
+    def test_creation_checks_schema_usage_not_select_and_does_not_recheck_source_usage(self):
+        with postgres() as db:
+            db.execute("CREATE ROLE view_creator")
+            db.execute("CREATE SCHEMA source")
+            db.execute("CREATE SCHEMA published")
+            db.execute("CREATE TABLE source.rows(id BIGINT)")
+            db.execute("INSERT INTO source.rows VALUES(1)")
+            db.execute("GRANT USAGE,CREATE ON SCHEMA published TO view_creator")
+            db.execute("SET ROLE view_creator")
+            with self.assertRaises(psycopg.Error) as schema:
+                db.execute("CREATE VIEW published.stored AS SELECT id FROM source.rows")
+            self.assertEqual("42501", schema.exception.sqlstate)
+            db.execute("RESET ROLE")
+            db.execute("GRANT USAGE ON SCHEMA source TO view_creator")
+            db.execute("SET ROLE view_creator")
+            # Source SELECT is not a CREATE VIEW admission requirement.
+            db.execute("CREATE VIEW published.stored AS SELECT id FROM source.rows")
+            with self.assertRaises(psycopg.Error) as select:
+                db.execute("SELECT * FROM published.stored")
+            self.assertEqual("42501", select.exception.sqlstate)
+            db.execute("RESET ROLE")
+            db.execute("GRANT SELECT ON source.rows TO view_creator")
+            db.execute("REVOKE USAGE ON SCHEMA source FROM view_creator")
+            db.execute("SET ROLE view_creator")
+            # Stored relation IDs do not perform source-name lookup again.
+            self.assertEqual(
+                [(1,)], db.execute("SELECT * FROM published.stored").fetchall()
+            )
+
+    def test_view_ddl_alias_replace_security_and_rename_contracts(self):
+        with postgres() as db:
+            db.execute("CREATE TABLE rows(id BIGINT,status TEXT)")
+            db.execute("INSERT INTO rows VALUES(1,'ready')")
+            db.execute(
+                "CREATE VIEW stored(record_id) WITH "
+                "(security_invoker=true,security_barrier=false) AS SELECT id FROM rows"
+            )
+            self.assertEqual(
+                ["record_id"], [row[0] for row in attributes(db, "stored")]
+            )
+            db.execute(
+                "CREATE OR REPLACE VIEW stored AS SELECT id AS record_id FROM rows"
+            )
+            db.execute("ALTER VIEW IF EXISTS stored RENAME TO renamed")
+            self.assertEqual([(1,)], db.execute("SELECT * FROM renamed").fetchall())
+            db.execute("DROP VIEW IF EXISTS renamed CASCADE")
+            with self.assertRaises(psycopg.Error) as invalid:
+                db.execute("CREATE OR REPLACE VIEW IF NOT EXISTS stored AS SELECT 1")
+            self.assertEqual("42601", invalid.exception.sqlstate)
+            with self.assertRaises(psycopg.Error) as duplicate:
+                db.execute(
+                    "CREATE VIEW duplicated WITH "
+                    "(security_invoker=true,security_invoker=false) AS SELECT 1"
+                )
+            self.assertEqual("22023", duplicate.exception.sqlstate)
+
     def test_unused_ctes_and_discarded_inner_outputs_still_own_dependencies(self):
         with postgres() as db:
             db.execute("CREATE TABLE rows(id BIGINT,status TEXT)")
