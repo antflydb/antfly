@@ -2261,7 +2261,15 @@ pub const PreparedCancellation = struct {
 
     pub fn stage(self: *PreparedCancellation, _: anytype, txn: anytype, replay: ?Native) !CancellationOutcome {
         const staged = try jobs.stageCancellationIntentWithReplay(txn, self.intent, replay);
-        return .{ .intent = staged.record.intent, .position = staged.record.position, .duplicate = staged.duplicate };
+        return .{ .intent = staged.record.intent, .position = staged.record.position.native, .duplicate = staged.duplicate };
+    }
+    pub fn stageRaft(self: *PreparedCancellation, _: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.validate();
+        if (owner_group == 0 or owner_group != self.intent.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        _ = try jobs.stageCancellationIntentAt(txn, self.intent, .{ .raft = .{ .term = entry.term, .index = entry.index } });
     }
 
     pub fn hasPublicationReceipt(_: *const PreparedCancellation) bool {
@@ -2288,7 +2296,8 @@ pub const PreparedCleanup = struct {
     prefix_len: usize = 0,
 
     pub fn init(alloc: Allocator, binding: jobs.Binding) !PreparedCleanup {
-        try (Effect{ .cancel_cleanup = binding }).validate();
+        _ = try binding.encode();
+        if (binding.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
         return .{ .alloc = alloc, .binding = binding };
     }
     pub fn deinit(self: *PreparedCleanup) void {
@@ -2296,7 +2305,8 @@ pub const PreparedCleanup = struct {
         self.* = undefined;
     }
     pub fn validate(self: *const PreparedCleanup) !void {
-        try (Effect{ .cancel_cleanup = self.binding }).validate();
+        _ = try self.binding.encode();
+        if (self.binding.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
     }
     pub fn namespace(self: *const PreparedCleanup) @FieldType(Native, "namespace") {
         return self.binding.fence.namespace;
@@ -2313,15 +2323,68 @@ pub const PreparedCleanup = struct {
         const result = try jobs.stageCancellationCleanupWithReplay(txn, &manager, self.binding, replay);
         return .{ .binding = self.binding, .position = result.position, .duplicate = result.duplicate };
     }
+    pub fn stageRaft(self: *PreparedCleanup, core: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.validate();
+        if (self.binding.authority != .raft or owner_group == 0 or owner_group != self.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        _ = try jobs.stageCancellationCleanupAt(txn, &manager, self.binding, .{ .raft = .{ .term = entry.term, .index = entry.index } });
+    }
     pub fn hasPublicationReceipt(_: *const PreparedCleanup) bool {
         return false;
     }
     pub fn populateReceipt(_: *const PreparedCleanup, _: anytype, _: *CleanupOutcome) !void {}
     pub fn preparePayload(self: *PreparedCleanup) !void {
+        if (self.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "cancel_cleanup", self.binding, max_cancellation_wire_bytes);
     }
     pub fn finalizePayload(self: *PreparedCleanup, position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);
+    }
+};
+
+/// Borrow the already bounded deletion selection. Committed-entry replay uses
+/// these selected keys, not a new time-limited scan on each follower. This is
+/// local execution machinery, not a public cleanup grant or a wire envelope.
+pub const PreparedCancellationGc = struct {
+    binding: jobs.Binding,
+    work: union(enum) {
+        artifacts: *@import("relational_index_gc.zig").Page,
+        claims: *private_claims.GcPage,
+    },
+
+    pub fn validate(self: *const @This()) !void {
+        _ = try self.binding.encode();
+        if (self.binding.authority != .raft or self.binding.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
+        switch (self.work) {
+            .artifacts => |page| if (page.id.mapKey() != self.binding.index.mapKey()) return error.PrivateIndexOwnerJobChanged,
+            .claims => |page| if (!std.meta.eql(page.binding, self.binding)) return error.PrivateIndexOwnerJobChanged,
+        }
+    }
+
+    pub fn checkWriteConflicts(self: *const @This(), core: anytype) !void {
+        try self.validate();
+        if (self.work == .artifacts) {
+            var manager = try core.initTxnManager();
+            defer manager.deinit();
+            try manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(self.binding.index));
+        }
+    }
+
+    pub fn stageRaft(self: *@This(), core: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.validate();
+        if (owner_group == 0 or owner_group != self.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        _ = try jobs.requireCancellationCleanup(txn, self.binding);
+        switch (self.work) {
+            .artifacts => |page| try page.stage(core, txn),
+            .claims => |page| try page.stage(txn),
+        }
     }
 };
 

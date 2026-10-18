@@ -131,9 +131,10 @@ pub fn stageSchemaValidationCancellation(txn: anytype, manager: *transactions.Tx
 /// A never-visited cancellation closes ordinary admission before schema-sized
 /// inputs are fetched. Its durable intent is exact owner authority, not a job
 /// absence ACK. Generic begin/release/cancel remain unable to bypass it.
-pub fn stagePrivateIndexCancellationIntent(txn: anytype, fence: Fence) !void {
+pub fn stagePrivateIndexCancellationIntent(txn: anytype, record: @import("relational_index_cancellation_intent.zig").Record) !void {
+    const fence = record.intent.fence;
     if (fence.role != .index_build) return error.InvalidIntegrityTopologyFence;
-    try @import("relational_index_cancellation_intent.zig").requireFence(txn, fence);
+    try @import("relational_index_cancellation_intent.zig").requireStaged(txn, record);
     return stageBeginImpl(txn, fence, null);
 }
 

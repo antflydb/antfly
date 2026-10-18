@@ -40,6 +40,7 @@ pub const cancellation_cleanup_key = key ++ ":cancel-gc";
 /// Public retirement admission leaves a single reserved slot for the active
 /// private job, so cancellation cannot deadlock behind a full churn queue.
 pub const CancellationCleanup = struct { position: positions.Native, duplicate: bool };
+pub const OrderedCancellationCleanup = struct { position: positions.Position, duplicate: bool };
 
 /// Retain claim scope with queue admission, before the large immutable inputs
 /// can be retired. The generation is derived from the table incarnation and
@@ -47,7 +48,7 @@ pub const CancellationCleanup = struct { position: positions.Native, duplicate: 
 pub const CancellationCleanupRecord = struct {
     pub const encoded_len = 416;
     intent: cancellation.Intent,
-    position: positions.Native,
+    position: positions.Position,
     claim_allocation: u64,
 
     pub fn claimGeneration(self: CancellationCleanupRecord) !@import("relational_integrity.zig").Generation {
@@ -58,7 +59,7 @@ pub const CancellationCleanupRecord = struct {
         _ = try self.claimGeneration();
         const admission: cancellation.Record = .{ .intent = self.intent, .position = self.position };
         var bytes: [encoded_len]u8 = undefined;
-        @memcpy(bytes[0..8], "AICG\x01\x00\x00\x00");
+        @memcpy(bytes[0..8], "AICG\x02\x00\x00\x00");
         @memcpy(bytes[8..376], &try admission.encode());
         std.mem.writeInt(u64, bytes[376..384], self.claim_allocation, .little);
         @memcpy(bytes[384..416], &digest(bytes[0..384]));
@@ -66,7 +67,7 @@ pub const CancellationCleanupRecord = struct {
     }
 
     pub fn decode(bytes: []const u8) !CancellationCleanupRecord {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AICG\x01\x00\x00\x00") or
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AICG\x02\x00\x00\x00") or
             !std.mem.eql(u8, bytes[384..416], &digest(bytes[0..384]))) return error.InvalidPrivateIndexCancellation;
         const admission = try cancellation.Record.decode(bytes[8..376]);
         const result: CancellationCleanupRecord = .{
@@ -343,7 +344,7 @@ pub fn inspectNative(txn: anytype, expected: anytype) !?Binding {
         !std.mem.eql(u8, &binding.owner_digest, &expected.owner_digest) or binding.ordinal != expected.ordinal or
         !binding.fence.namespace.eql(expected.namespace) or binding.fence.owner_group_id != expected.owner_group_id)
         return error.PrivateIndexOwnerJobChanged;
-    _ = try requireNativeJob(txn, binding);
+    _ = try requireCurrentJob(txn, binding);
     return binding;
 }
 
@@ -371,10 +372,11 @@ pub const CancellationState = struct {
         if (self.source.kind != .native or !std.mem.eql(u8, &self.source.namespace, &@import("online_source_contract.zig").namespaceBytes(expected.namespace)))
             return error.OnlineSourceScopeChanged;
         if (self.intent) |record| {
+            if (record.position != .native) return error.InvalidPrivateIndexCancellation;
             try record.intent.validate();
             try requireCancellationIdentity(record.intent, expected);
         }
-        for ([_]?positions.Native{ if (self.intent) |record| record.position else null, self.admitted, self.fenced, self.reserved, self.cleanup }) |maybe| {
+        for ([_]?positions.Native{ if (self.intent) |record| record.position.native else null, self.admitted, self.fenced, self.reserved, self.cleanup }) |maybe| {
             if (maybe) |cut| {
                 try cut.validate();
                 if (!cut.namespace.eql(expected.namespace) or cut.sequence > self.source.sequence) return error.InvalidPrivateIndexCancellation;
@@ -392,7 +394,7 @@ pub const CancellationState = struct {
         if (self.reserved) |cut| if (self.fenced == null or cut.sequence <= self.fenced.?.sequence) return error.InvalidPrivateIndexCancellation;
         if (self.cleanup) |cut| {
             if (self.intent == null or self.reserved == null or self.claim_allocation == null or self.claim_allocation.? == 0 or
-                cut.sequence <= self.intent.?.position.sequence or cut.sequence <= self.reserved.?.sequence)
+                cut.sequence <= self.intent.?.position.native.sequence or cut.sequence <= self.reserved.?.sequence)
                 return error.InvalidPrivateIndexCancellation;
         } else if (self.claim_allocation != null) return error.InvalidPrivateIndexCancellation;
         if (self.artifacts_retired and self.cleanup == null) return error.InvalidPrivateIndexCancellation;
@@ -400,8 +402,8 @@ pub const CancellationState = struct {
         if (self.completed) |record| {
             try record.validate();
             if (!self.artifacts_retired or !self.claims_retired or self.binding == null or self.intent == null or
-                !std.meta.eql(record.binding, self.binding.?) or !std.meta.eql(record.intent_position, self.intent.?.position) or
-                !std.meta.eql(record.cleanup.position, self.cleanup.?) or record.cleanup.claim_allocation != self.claim_allocation.? or
+                !std.meta.eql(record.binding, self.binding.?) or !std.meta.eql(record.intent_position, self.intent.?.position.native) or
+                record.cleanup.position != .native or !std.meta.eql(record.cleanup.position.native, self.cleanup.?) or record.cleanup.claim_allocation != self.claim_allocation.? or
                 record.position.sequence > self.source.sequence) return error.InvalidPrivateIndexCancellation;
         }
     }
@@ -434,7 +436,8 @@ pub fn inspectCancellation(txn: anytype, expected: anytype) !CancellationState {
     }
     if (try loadCancellationCleanup(txn, binding)) |record| {
         const current = binding orelse return error.InvalidPrivateIndexCancellation;
-        result.cleanup = record.position;
+        if (record.position != .native) return error.InvalidPrivateIndexCancellation;
+        result.cleanup = record.position.native;
         result.claim_allocation = record.claim_allocation;
         if (requireCancellationArtifactsRetired(txn, current)) |_| {
             result.artifacts_retired = true;
@@ -530,13 +533,13 @@ pub fn validateNativeReceipt(binding: Binding, action: NativeEffect, position: p
 /// retry. Metadata admission/phase authority is independently checked by the
 /// receiving worker; local state and a checksum alone cannot grant it.
 pub fn nativeReceipt(txn: anytype, binding: Binding, action: NativeEffect) !publication.Receipt {
-    const current = try requireNativeJob(txn, binding);
+    const current = try requireCurrentJob(txn, binding);
     try inputs_mod.require(txn, current.inputs_digest);
     if (action == .reserved and current.phase != .reserved) return error.InvalidPrivateIndexNativeReceipt;
     return logicalReceipt(binding, action, try requireNativeCut(txn, binding, action));
 }
 
-fn requireNativeJob(txn: anytype, binding: Binding) !Binding {
+fn requireCurrentJob(txn: anytype, binding: Binding) !Binding {
     const current = (try load(txn)) orelse return error.PrivateIndexJobRequired;
     if (!std.mem.eql(u8, &try nativeContext(current), &try nativeContext(binding))) return error.PrivateIndexOwnerJobChanged;
     try requireActive(txn, binding.fence);
@@ -578,7 +581,7 @@ pub fn stageCanceledFencedWithReplay(txn: anytype, manager: *transactions.TxnMan
 fn stageNativeFencedImpl(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native, comptime canceling: bool) !publication.Receipt {
     try validateReplay(binding, replay);
     if (canceling) try cancellation.requireCanceled(txn, binding) else try cancellation.requireOpen(txn, binding);
-    const current = try requireNativeJob(txn, binding);
+    const current = try requireCurrentJob(txn, binding);
     // Integrity must fail before staging a new cut, not only when the caller
     // subsequently reconstructs its receipt after commit.
     try inputs_mod.require(txn, current.inputs_digest);
@@ -616,6 +619,11 @@ pub fn requireActive(txn: anytype, fence: topology.Fence) !void {
 /// independently compiled/reloaded before page preparation.
 pub fn requireReserved(txn: anytype, binding: Binding) !void {
     try cancellation.requireOpen(txn, binding);
+    try requireReservedState(txn, binding);
+}
+
+pub fn requireCanceledReserved(txn: anytype, binding: Binding) !void {
+    try cancellation.requireCanceled(txn, binding);
     try requireReservedState(txn, binding);
 }
 
@@ -870,21 +878,31 @@ fn stageReservationImpl(txn: anytype, manager: *transactions.TxnManager, binding
 pub fn stageCancellationIntentWithReplay(txn: anytype, intent: cancellation.Intent, replay: ?positions.Native) !cancellation.Stage {
     try intent.validate();
     const binding = try load(txn);
-    if (binding) |current| _ = try requireNativeJob(txn, current);
+    if (binding) |current| _ = try requireCurrentJob(txn, current);
     return cancellation.stage(txn, intent, binding, replay);
+}
+
+pub fn stageCancellationIntentAt(txn: anytype, intent: cancellation.Intent, position: positions.Position) !cancellation.Stage {
+    try intent.validate();
+    try position.validate();
+    const binding = try load(txn);
+    if (binding) |current| _ = try requireCurrentJob(txn, current);
+    return cancellation.stageAt(txn, intent, binding, position, if (position == .native) .native else .raft);
 }
 
 fn loadCancellationCleanup(txn: anytype, binding: ?Binding) !?CancellationCleanupRecord {
     // Decode before any subsequent store read invalidates borrowed bytes.
     const record = try CancellationCleanupRecord.decode((try optional(txn, cancellation_cleanup_key)) orelse return null);
-    const authority = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(record.intent.fence.namespace));
-    if (record.position.sequence > authority.sequence) return error.InvalidPrivateIndexCancellation;
+    try cancellation.requireCommitted(txn, record.intent.fence.namespace, record.position);
     if (binding) |current| if (record.intent.eql(cancellation.Intent.fromBinding(current))) {
         if (current.phase != .reserved) return error.InvalidPrivateIndexCancellation;
         try cancellation.requireCanceled(txn, current);
         const intent = (try cancellation.load(txn)).?;
-        const reserved = try requireNativeCut(txn, current, .reserved);
-        if (record.position.sequence <= intent.position.sequence or record.position.sequence <= reserved.position.sequence)
+        const reserved: positions.Position = if (current.authority == .native)
+            .{ .native = (try requireNativeCut(txn, current, .reserved)).position }
+        else
+            (try @import("relational_index_raft_control.zig").retainedPosition(txn, current, .reserved)) orelse return error.InvalidPrivateIndexCancellation;
+        if (!record.position.strictlyAfter(intent.position) or !record.position.strictlyAfter(reserved))
             return error.InvalidPrivateIndexCancellation;
         const allocation = try integrity_catalog.privateIndexAllocationFromReservation(try txn.get(integrity_catalog.key), current.integrity_reserved, current.fence.namespace.table_id);
         if (record.claim_allocation != allocation.allocation) return error.InvalidPrivateIndexCancellation;
@@ -904,20 +922,38 @@ fn loadCancellationCleanup(txn: anytype, binding: ?Binding) !?CancellationCleanu
 /// state machine. The caller must commit its outbox atomically and abort on
 /// every error. Neither queue admission nor its cut is a canceled owner ACK.
 pub fn stageCancellationCleanupWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !CancellationCleanup {
-    try validateReplay(binding, replay);
+    if (binding.authority != .native) return error.InvalidControlReceiptPosition;
+    const result = try stageCancellationCleanupAt(txn, manager, binding, if (replay) |cut| .{ .native = cut } else null);
+    return .{ .position = result.position.native, .duplicate = result.duplicate };
+}
+
+pub fn stageCancellationCleanupAt(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Position) !OrderedCancellationCleanup {
+    if (replay) |cut| {
+        try cut.requireNamespace(binding.fence.namespace);
+        if ((cut == .native) != (binding.authority == .native)) return error.InvalidControlReceiptPosition;
+    } else if (binding.authority == .raft) return error.InvalidControlReceiptPosition;
     try cancellation.requireCanceled(txn, binding);
     try requireReservedState(txn, binding);
     try topology.requireDrained(txn, manager, binding.fence);
     const gc = @import("relational_index_gc.zig");
     const queue_key = gc.key(binding.index);
     if (try loadCancellationCleanup(txn, try load(txn))) |record| {
-        try requireReplay(.{ .position = record.position, .evidence = @splat(0) }, replay);
+        if (binding.authority == .native) {
+            if (replay) |cut| if (!std.meta.eql(cut, record.position)) return error.InvalidControlReceiptPosition;
+        }
         if (try optional(txn, &queue_key)) |bytes| _ = try gc.decode(binding.index, bytes);
         return .{ .position = record.position, .duplicate = true };
     }
     if (try optional(txn, &queue_key) != null) return error.InvalidPrivateIndexCancellation;
     const allocation = try integrity_catalog.privateIndexAllocationFromReservation(try txn.get(integrity_catalog.key), binding.integrity_reserved, binding.fence.namespace.table_id);
-    const position: positions.Native = .{ .namespace = binding.fence.namespace, .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |value| value.sequence else null) };
+    const position: positions.Position = if (binding.authority == .native)
+        .{ .native = .{ .namespace = binding.fence.namespace, .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |value| value.native.sequence else null) } }
+    else blk: {
+        const prior = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+        const cut = replay.?;
+        if (!cut.strictlyAfter(.{ .raft = .{ .term = prior.term, .index = prior.index } })) return error.InvalidControlReceiptPosition;
+        break :blk cut;
+    };
     const record: CancellationCleanupRecord = .{ .intent = cancellation.Intent.fromBinding(binding), .position = position, .claim_allocation = allocation.allocation };
     try txn.put(cancellation_cleanup_key, &try record.encode());
     try txn.put(&queue_key, &gc.initial(binding.index));
@@ -934,7 +970,7 @@ pub fn stageCancellationCleanupWithReplay(txn: anytype, manager: *transactions.T
 /// Bounded physical-artifact verification only. Global claims, final binding
 /// retirement and epoch release still need independent completion; callers
 /// must not turn this check into a signed canceled publication receipt.
-pub fn requireCancellationCleanup(txn: anytype, binding: Binding) !positions.Native {
+pub fn requireCancellationCleanup(txn: anytype, binding: Binding) !positions.Position {
     try cancellation.requireCanceled(txn, binding);
     try requireReservedState(txn, binding);
     const record = (try loadCancellationCleanup(txn, try load(txn))) orelse return error.PrivateIndexCancellationRequired;
@@ -977,8 +1013,8 @@ pub const Canceled = struct {
             !self.cleanup.intent.eql(cancellation.Intent.fromBinding(self.binding)) or
             !self.intent_position.namespace.eql(self.binding.fence.namespace) or
             !self.position.namespace.eql(self.binding.fence.namespace) or
-            self.cleanup.position.sequence <= self.intent_position.sequence or
-            self.position.sequence <= self.cleanup.position.sequence) return error.InvalidPrivateIndexCancellation;
+            self.cleanup.position != .native or self.cleanup.position.native.sequence <= self.intent_position.sequence or
+            self.position.sequence <= self.cleanup.position.native.sequence) return error.InvalidPrivateIndexCancellation;
     }
 
     pub fn encode(self: @This()) ![encoded_len]u8 {
@@ -1037,7 +1073,7 @@ pub const Canceled = struct {
         try private_claims.requireRetired(txn, self.binding);
         const actual = (try loadCancellationCleanup(txn, self.binding)) orelse return error.PrivateIndexCancellationRequired;
         const intent = (try cancellation.load(txn)) orelse return error.PrivateIndexCancellationRequired;
-        if (!std.meta.eql(actual, self.cleanup) or !std.meta.eql(intent.position, self.intent_position)) return error.PrivateIndexOwnerJobChanged;
+        if (intent.position != .native or !std.meta.eql(actual, self.cleanup) or !std.meta.eql(intent.position.native, self.intent_position)) return error.PrivateIndexOwnerJobChanged;
     }
 
     /// The caller stages the native replay marker and durable outbox in this
@@ -1062,7 +1098,8 @@ pub const Canceled = struct {
         const intent = (try cancellation.load(txn)) orelse return error.PrivateIndexCancellationRequired;
         const cleanup = (try loadCancellationCleanup(txn, binding)) orelse return error.PrivateIndexCancellationRequired;
         const source = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
-        const record: Canceled = .{ .binding = binding, .cleanup = cleanup, .intent_position = intent.position, .position = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition } };
+        if (intent.position != .native) return error.InvalidControlReceiptPosition;
+        const record: Canceled = .{ .binding = binding, .cleanup = cleanup, .intent_position = intent.position.native, .position = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition } };
         const encoded = try record.encode();
         if (replay) |cut| if (!std.meta.eql(cut, record.position)) return error.InvalidControlReceiptPosition;
         _ = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |cut| cut.sequence else null);

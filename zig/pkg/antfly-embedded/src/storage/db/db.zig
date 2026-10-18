@@ -8454,15 +8454,35 @@ pub const DB = struct {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
+    pub fn applyCommittedRaftIndexCancellation(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCancellation, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
+    pub fn applyCommittedRaftIndexCancellationControl(self: *DB, prepared: *RaftIndexOwnerControl.Prepared, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        return self.applyCommittedRaftIndexEffectMode(prepared, owner_group, entry, true);
+    }
+
+    pub fn applyCommittedRaftIndexCancellationCleanup(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCleanup, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
+    pub fn applyCommittedRaftIndexCancellationGc(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCancellationGc, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
     fn applyCommittedRaftIndexEffect(self: *DB, prepared: anytype, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        return self.applyCommittedRaftIndexEffectMode(prepared, owner_group, entry, false);
+    }
+    fn applyCommittedRaftIndexEffectMode(self: *DB, prepared: anytype, owner_group: u64, entry: OrderedApplyReceipt, comptime canceling: bool) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         const PreparedType = @typeInfo(@TypeOf(prepared)).pointer.child;
-        const command = if (comptime @hasField(PreparedType, "command")) prepared.command else if (comptime @hasField(PreparedType, "batch")) prepared.batch.command else if (comptime @hasField(PreparedType, "page")) prepared.page.command else prepared.intent;
-        try command.validate();
-        const binding = if (comptime @hasField(@TypeOf(command), "binding")) command.binding else if (comptime @hasField(@TypeOf(command), "validation")) command.validation.command.binding else if (comptime @hasField(@TypeOf(command), "installed")) command.installed.command.validation.command.binding else command.record.intent.installed.command.validation.command.binding;
-        if (owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
-        if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const command = if (comptime @hasField(PreparedType, "command")) prepared.command else if (comptime @hasField(PreparedType, "batch")) prepared.batch.command else if (comptime @hasField(PreparedType, "page")) prepared.page.command else if (comptime @hasField(PreparedType, "intent")) prepared.intent else prepared.binding;
+        if (comptime @hasDecl(@TypeOf(command), "validate")) try command.validate() else _ = try command.encode();
+        const fence = if (comptime @hasField(@TypeOf(command), "fence")) command.fence else if (comptime @hasField(@TypeOf(command), "binding")) command.binding.fence else if (comptime @hasField(@TypeOf(command), "validation")) command.validation.command.binding.fence else if (comptime @hasField(@TypeOf(command), "installed")) command.installed.command.validation.command.binding.fence else command.record.intent.installed.command.validation.command.binding.fence;
+        if (owner_group == 0 or owner_group != fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        if (!fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         // Until the ordered standby envelope carries this control, fail closed
         // for configured mirrors instead of committing an unmirrored effect.
         var replication_mutation = self.acquireReplicationMutationShared();
@@ -8496,6 +8516,7 @@ pub const DB = struct {
                 return;
             }
         }
+        if (comptime @hasDecl(PreparedType, "checkWriteConflicts")) try prepared.checkWriteConflicts(self.core);
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         const prior = try apply_receipts.readOrderedApplyReceiptTxn(&txn);
@@ -8503,7 +8524,9 @@ pub const DB = struct {
             txn.abort();
             return;
         }
-        if (comptime @hasDecl(@typeInfo(@TypeOf(prepared)).pointer.child, "stageRaft")) {
+        if (comptime canceling) {
+            _ = try prepared.stageCanceling(self.core, &txn, owner_group, entry);
+        } else if (comptime @hasDecl(@typeInfo(@TypeOf(prepared)).pointer.child, "stageRaft")) {
             try prepared.stageRaft(self.core, &txn, owner_group, entry);
         } else _ = try prepared.stage(self.core, &txn, owner_group, entry);
         var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;

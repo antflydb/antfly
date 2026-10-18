@@ -4996,7 +4996,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         position.sequence += 1;
         // Synthetic root-signed cuts qualify metadata's joins. Real cleanup,
         // abort/outbox/reopen and signing use the native owner fixtures.
-        const record: local.storage_db_relational_index_owner_job.Canceled = .{ .binding = binding, .intent_position = intent_position, .position = position, .cleanup = .{ .intent = local.storage_db_relational_index_owner_control.Admission.fromBinding(binding), .position = cleanup_position, .claim_allocation = allocation.allocation } };
+        const record: local.storage_db_relational_index_owner_job.Canceled = .{ .binding = binding, .intent_position = intent_position, .position = position, .cleanup = .{ .intent = local.storage_db_relational_index_owner_control.Admission.fromBinding(binding), .position = .{ .native = cleanup_position }, .claim_allocation = allocation.allocation } };
         const receipt = try record.receipt();
         const ack: index_publication.Ack = .{ .table_id = head.table_id, .expected_revision = head.revision, .signed = .{ .receipt = receipt, .proof = try accepted.signed.proof.sign(root, try receipt.digest()) }, .cancellation = .{ .record = record } };
         try ack.validate();
@@ -6272,7 +6272,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                         const record: @import("antfly_local_sources").storage_db_relational_index_owner_job.Canceled = .{
                             .binding = binding,
                             .intent_position = .{ .namespace = intent.fence.namespace, .sequence = 1 },
-                            .cleanup = .{ .intent = intent, .claim_allocation = allocation.allocation, .position = .{ .namespace = intent.fence.namespace, .sequence = 5 } },
+                            .cleanup = .{ .intent = intent, .claim_allocation = allocation.allocation, .position = .{ .native = .{ .namespace = intent.fence.namespace, .sequence = 5 } } },
                             .position = .{ .namespace = intent.fence.namespace, .sequence = 6 },
                         };
                         cleanup.cancellation = .{ .record = record };

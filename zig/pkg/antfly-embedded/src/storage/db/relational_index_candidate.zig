@@ -1052,7 +1052,8 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             const future = try a.dupe(u8, try txn.get(&selected_key));
             defer a.free(future);
             const canceled = (try @import("relational_index_cancellation_intent.zig").load(&txn)).?;
-            std.mem.writeInt(u64, future[0..8], canceled.position.sequence, .little);
+            try std.testing.expect(canceled.position == .native);
+            std.mem.writeInt(u64, future[0..8], canceled.position.native.sequence, .little);
             // Re-sign the physical checksum to isolate cut-order validation
             // from the preceding ordinary checksum-corruption regression.
             var checksum = std.crypto.hash.Blake3.init(.{});
@@ -1583,7 +1584,8 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
         defer txn.abort();
         const staged = try jobs.stageCancellationIntentWithReplay(&txn, intent, null);
         try std.testing.expect(!staged.duplicate);
-        try std.testing.expectEqual(old_sequence + 1, staged.record.position.sequence);
+        try std.testing.expect(staged.record.position == .native);
+        try std.testing.expectEqual(old_sequence + 1, staged.record.position.native.sequence);
     }
     {
         var txn = try store.beginReadTxn();
@@ -1606,10 +1608,10 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
-        const duplicate = try jobs.stageCancellationIntentWithReplay(&txn, intent, committed.position);
+        const duplicate = try jobs.stageCancellationIntentWithReplay(&txn, intent, committed.position.native);
         try std.testing.expect(duplicate.duplicate);
         try std.testing.expectEqualDeep(committed, duplicate.record);
-        try std.testing.expectEqual(committed.position.sequence, (try authority.load(&txn)).?.sequence);
+        try std.testing.expectEqual(committed.position.native.sequence, (try authority.load(&txn)).?.sequence);
         var foreign = intent;
         foreign.owner_digest[0] ^= 1;
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, jobs.stageCancellationIntentWithReplay(&txn, foreign, null));
@@ -1808,7 +1810,7 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
         var txn = try store.beginWriteTxn();
         defer txn.abort();
         var future = committed;
-        future.position.sequence = (try authority.load(&txn)).?.sequence + 1;
+        future.position.native.sequence = (try authority.load(&txn)).?.sequence + 1;
         try txn.put(cancellation.key, &try future.encode());
         try std.testing.expectError(error.InvalidPrivateIndexCancellation, testOwnerRecoveryAllocations(a, &txn));
     }

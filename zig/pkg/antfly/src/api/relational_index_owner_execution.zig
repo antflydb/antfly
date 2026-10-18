@@ -1957,7 +1957,7 @@ const TestDriver = struct {
         };
         if (self.foreign_cancellation) result.intent.owner_digest[0] ^= 1;
         if (self.cancel_state) |*state| {
-            state.intent = .{ .intent = result.intent, .position = result.position };
+            state.intent = .{ .intent = result.intent, .position = .{ .native = result.position } };
             state.source.sequence = result.position.sequence;
         }
         if (self.cancel_after_commit) |signal| signal.store(true, .release);

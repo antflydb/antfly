@@ -841,7 +841,8 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expect(repeated == .retired);
         var status = try owners.nativeIndexOwnerCancellationState(alloc, group, plan.before.name, owner_identity, .{});
         defer status.deinit();
-        try std.testing.expectEqual(canceled.position, status.value.intent.?.position);
+        try std.testing.expect(status.value.intent.?.position == .native);
+        try std.testing.expectEqual(canceled.position, status.value.intent.?.position.native);
         try std.testing.expectEqual(cleanup.position, status.value.cleanup.?);
         try std.testing.expectEqual(cleanup.position.sequence, status.value.source.sequence);
         try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);

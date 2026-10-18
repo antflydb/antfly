@@ -129,10 +129,14 @@ pub fn stageRetireCuts(txn: anytype, binding: jobs.Binding) !void {
 }
 
 fn currentState(txn: anytype, binding: jobs.Binding) !jobs.Binding {
+    return currentStateMode(txn, binding, false);
+}
+fn currentStateMode(txn: anytype, binding: jobs.Binding, comptime canceling: bool) !jobs.Binding {
     try requireAuthority(txn, binding);
     const current = (try jobs.load(txn)) orelse return error.PrivateIndexJobRequired;
     if (!std.mem.eql(u8, &try context(binding), &try context(current))) return error.PrivateIndexOwnerJobChanged;
-    try @import("relational_index_cancellation_intent.zig").requireOpen(txn, binding);
+    const cancellation = @import("relational_index_cancellation_intent.zig");
+    if (canceling) try cancellation.requireCanceled(txn, binding) else try cancellation.requireOpen(txn, binding);
     try jobs.requireActive(txn, binding.fence);
     const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
     if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
@@ -149,7 +153,9 @@ fn currentState(txn: anytype, binding: jobs.Binding) !jobs.Binding {
         if (head == null or !head.?.eql(value)) return error.PreparedGenerationChanged;
     } else if (head != null) return error.PreparedGenerationChanged;
     try requireCuts(txn, current);
-    if (current.phase == .reserved) try jobs.requireReserved(txn, current);
+    if (current.phase == .reserved) {
+        if (canceling) try jobs.requireCanceledReserved(txn, current) else try jobs.requireReserved(txn, current);
+    }
     return current;
 }
 
@@ -170,6 +176,13 @@ pub fn inspect(txn: anytype, expected: Identity) !?jobs.Binding {
 }
 
 /// Read-only recovery never mints a cut from the current term/index.
+pub fn retainedPosition(txn: anytype, binding: jobs.Binding, effect: Effect) !?@import("receipt_position.zig").Position {
+    try requireAuthority(txn, binding);
+    const cut = (try loadCut(txn, binding, effect)) orelse return null;
+    try requireCommitted(cut, (try marker(txn)) orelse return error.InvalidControlReceiptPosition);
+    return .{ .raft = .{ .term = cut.entry.term, .index = cut.entry.index } };
+}
+
 pub fn receipt(txn: anytype, binding: jobs.Binding, effect: Effect) !?publication.Receipt {
     if (effect == .admitted) return error.InvalidControlReceiptPosition;
     const current = try currentState(txn, binding);
@@ -285,6 +298,12 @@ pub const Prepared = struct {
     /// Caller has authenticated the owner group and holds apply exclusion.
     /// This stages no apply watermark: commit it with the returned effect.
     pub fn stage(self: *Prepared, core: anytype, txn: anytype, owner_group: u64, entry: Entry) !Outcome {
+        return self.stageImpl(core, txn, owner_group, entry, false);
+    }
+    pub fn stageCanceling(self: *Prepared, core: anytype, txn: anytype, owner_group: u64, entry: Entry) !Outcome {
+        return self.stageImpl(core, txn, owner_group, entry, true);
+    }
+    fn stageImpl(self: *Prepared, core: anytype, txn: anytype, owner_group: u64, entry: Entry, comptime canceling: bool) !Outcome {
         try self.command.validate();
         const binding = self.command.binding;
         if (owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
@@ -293,16 +312,17 @@ pub const Prepared = struct {
         if (try receipts.orderedApplyDisposition(try marker(txn), entry) != .apply) return error.InvalidControlReceiptPosition;
         if (try marker(txn)) |prior| try requirePrecedes(prior, entry);
         if (try jobs.load(txn) != null) {
-            _ = try currentState(txn, binding);
+            _ = try currentStateMode(txn, binding, canceling);
             if (try loadCut(txn, binding, self.command.effect)) |cut| return .{ .binding = binding, .cut = cut, .duplicate = true };
         } else if (self.command.effect != .admitted) return error.PrivateIndexJobRequired;
         switch (self.command.effect) {
             .admitted => {
                 const artifacts = if (self.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
-                if (!try jobs.stageBegin(txn, binding, &artifacts.candidate.inputs)) return error.InvalidControlReceiptPosition;
+                const changed = if (canceling) try jobs.stageCanceledBeginWithReplay(txn, binding, &artifacts.candidate.inputs, null) else try jobs.stageBegin(txn, binding, &artifacts.candidate.inputs);
+                if (!changed) return error.InvalidControlReceiptPosition;
             },
             .fenced => {
-                const current = try currentState(txn, binding);
+                const current = try currentStateMode(txn, binding, canceling);
                 if (current.phase != .fencing) return error.InvalidPrivateIndexOwnerJob;
                 const admitted = (try loadCut(txn, binding, .admitted)) orelse return error.InvalidControlReceiptPosition;
                 try requirePrecedes(admitted.entry, entry);
@@ -316,7 +336,8 @@ pub const Prepared = struct {
                 const artifacts = if (self.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
                 var manager = try core.initTxnManager();
                 defer manager.deinit();
-                if (!try jobs.stageReservation(txn, &manager, binding, &artifacts.candidate, &artifacts.addition)) return error.InvalidControlReceiptPosition;
+                const changed = if (canceling) try jobs.stageCanceledReservationWithReplay(txn, &manager, binding, &artifacts.candidate, &artifacts.addition, null) else try jobs.stageReservation(txn, &manager, binding, &artifacts.candidate, &artifacts.addition);
+                if (!changed) return error.InvalidControlReceiptPosition;
             },
         }
         return .{ .binding = binding, .cut = try stageCut(txn, binding, self.command.effect, entry), .duplicate = false };

@@ -69,15 +69,14 @@ fn digest(bytes: []const u8) [32]u8 {
 pub const Record = struct {
     pub const encoded_len = 368;
     intent: Intent,
-    position: positions.Native,
+    position: positions.Position,
 
     pub fn encode(self: Record) ![encoded_len]u8 {
         try self.intent.validate();
-        try self.position.validate();
-        if (!self.position.namespace.eql(self.intent.fence.namespace)) return error.IdentityNamespaceMismatch;
+        try self.position.requireNamespace(self.intent.fence.namespace);
         var out: [encoded_len]u8 = @splat(0);
         @memcpy(out[0..4], "AICI");
-        std.mem.writeInt(u32, out[4..8], 1, .little);
+        std.mem.writeInt(u32, out[4..8], 2, .little);
         @memcpy(out[8..24], &self.intent.id);
         @memcpy(out[24..56], &self.intent.plan_digest);
         @memcpy(out[56..88], &self.intent.owner_digest);
@@ -85,21 +84,20 @@ pub const Record = struct {
         @memcpy(out[96..232], &try self.intent.fence.encode());
         @memcpy(out[232..264], &self.intent.candidate_digest);
         @memcpy(out[264..296], &self.intent.reservation_digest);
-        @memcpy(out[296..329], &try (positions.Position{ .native = self.position }).encode());
+        @memcpy(out[296..329], &try self.position.encode());
         @memcpy(out[336..368], &digest(out[0..336]));
         return out;
     }
 
     pub fn decode(bytes: []const u8) !Record {
         if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AICI") or
-            std.mem.readInt(u32, bytes[4..8], .little) != 1 or !std.mem.allEqual(u8, bytes[90..96], 0) or
+            std.mem.readInt(u32, bytes[4..8], .little) != 2 or !std.mem.allEqual(u8, bytes[90..96], 0) or
             !std.mem.allEqual(u8, bytes[329..336], 0) or !std.mem.eql(u8, bytes[336..368], &digest(bytes[0..336])))
             return error.InvalidPrivateIndexCancellation;
         const position = positions.Position.decode(bytes[296..329]) catch return error.InvalidPrivateIndexCancellation;
-        if (position != .native) return error.InvalidPrivateIndexCancellation;
         const result: Record = .{
             .intent = .{ .id = bytes[8..24].*, .plan_digest = bytes[24..56].*, .owner_digest = bytes[56..88].*, .ordinal = std.mem.readInt(u16, bytes[88..90], .little), .fence = try topology.Fence.decode(bytes[96..232]), .candidate_digest = bytes[232..264].*, .reservation_digest = bytes[264..296].* },
-            .position = position.native,
+            .position = position,
         };
         _ = try result.encode();
         return result;
@@ -113,19 +111,41 @@ fn optional(txn: anytype, item: []const u8) !?[]const u8 {
     };
 }
 
-fn requireScope(txn: anytype, namespace: identity.Namespace) !authority.State {
+fn requireScope(txn: anytype, namespace: identity.Namespace, kind: authority.Kind) !authority.State {
     const actual = (try identity.loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
     if (!actual.eql(namespace)) return error.IdentityNamespaceMismatch;
-    return authority.require(txn, .native, scope.namespaceBytes(namespace));
+    return authority.require(txn, kind, scope.namespaceBytes(namespace));
+}
+
+pub fn requireCommitted(txn: anytype, namespace: identity.Namespace, cut: positions.Position) !void {
+    try cut.requireNamespace(namespace);
+    const state = try requireScope(txn, namespace, if (cut == .native) .native else .raft);
+    if (cut == .native) {
+        if (cut.native.sequence > state.sequence) return error.InvalidPrivateIndexCancellation;
+    } else {
+        const applied = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidPrivateIndexCancellation;
+        if (cut.raft.index > applied.index or cut.raft.term > applied.term or (cut.raft.index == applied.index and cut.raft.term != applied.term)) return error.InvalidPrivateIndexCancellation;
+    }
 }
 
 /// Decode borrowed bytes before any further read; this remains safe on stores
 /// that reuse one scratch buffer for every point lookup.
 pub fn load(txn: anytype) !?Record {
     const record = if (try optional(txn, key)) |bytes| try Record.decode(bytes) else return null;
-    const state = try requireScope(txn, record.intent.fence.namespace);
-    if (record.position.sequence > state.sequence) return error.InvalidPrivateIndexCancellation;
+    try requireCommitted(txn, record.intent.fence.namespace, record.position);
     return record;
+}
+
+/// Only for the same uncommitted transaction that staged this exact record.
+/// Durable readers must use load, which requires the committed apply marker.
+pub fn requireStaged(txn: anytype, record: Record) !void {
+    const encoded = try record.encode();
+    if (!std.mem.eql(u8, &encoded, (try optional(txn, key)) orelse return error.PrivateIndexCancellationRequired)) return error.PrivateIndexOwnerJobChanged;
+    if (record.position == .native) return requireCommitted(txn, record.intent.fence.namespace, record.position);
+    _ = try requireScope(txn, record.intent.fence.namespace, .raft);
+    if (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) |applied| {
+        if (!record.position.strictlyAfter(.{ .raft = .{ .term = applied.term, .index = applied.index } })) return error.InvalidControlReceiptPosition;
+    }
 }
 
 /// A retained completed intent is a tombstone, not pending work for a later
@@ -154,19 +174,27 @@ fn requireCompleted(txn: anytype, record: Record) !void {
 pub const Stage = struct { record: Record, duplicate: bool };
 
 pub fn stage(txn: anytype, intent: Intent, binding: anytype, replay: ?positions.Native) !Stage {
+    return stageAt(txn, intent, binding, if (replay) |cut| .{ .native = cut } else null, .native);
+}
+
+pub fn stageAt(txn: anytype, intent: Intent, binding: anytype, replay: ?positions.Position, kind: authority.Kind) !Stage {
     try intent.validate();
-    _ = try requireScope(txn, intent.fence.namespace);
+    _ = try requireScope(txn, intent.fence.namespace, kind);
+    if (kind == .raft and replay == null) return error.InvalidControlReceiptPosition;
     if (replay) |position| {
-        try position.validate();
-        if (!position.namespace.eql(intent.fence.namespace)) return error.IdentityNamespaceMismatch;
+        try position.requireNamespace(intent.fence.namespace);
+        if ((position == .native) != (kind == .native)) return error.InvalidControlReceiptPosition;
     }
     if (binding) |current| {
-        if (current.authority != .native or !intent.eql(Intent.fromBinding(current))) return error.PrivateIndexOwnerJobChanged;
+        if ((current.authority == .native) != (kind == .native) or !intent.eql(Intent.fromBinding(current))) return error.PrivateIndexOwnerJobChanged;
     }
     if (try load(txn)) |previous| {
         if (previous.intent.eql(intent)) {
             try verifyRecovery(txn, binding);
-            if (replay) |position| if (!std.meta.eql(position, previous.position)) return error.InvalidControlReceiptPosition;
+            if (replay) |position| {
+                if (position == .native and !std.meta.eql(position, previous.position)) return error.InvalidControlReceiptPosition;
+                if (!std.meta.eql(position, previous.position) and !position.strictlyAfter(previous.position)) return error.InvalidControlReceiptPosition;
+            }
             return .{ .record = previous, .duplicate = true };
         }
         if (intent.fence.admission_epoch <= previous.intent.fence.admission_epoch) return error.PrivateIndexOwnerJobChanged;
@@ -177,9 +205,15 @@ pub fn stage(txn: anytype, intent: Intent, binding: anytype, replay: ?positions.
         const before = (try optional(txn, catalog.key)) orelse return error.IntegrityCatalogChanged;
         if (!std.mem.eql(u8, &digest(before), &intent.fence.catalog_digest)) return error.IntegrityCatalogChanged;
     }
-    const record: Record = .{ .intent = intent, .position = .{ .namespace = intent.fence.namespace, .sequence = try authority.advance(txn, scope.namespaceBytes(intent.fence.namespace), if (replay) |value| value.sequence else null) } };
+    const position: positions.Position = if (kind == .raft) replay.? else .{ .native = .{ .namespace = intent.fence.namespace, .sequence = try authority.advance(txn, scope.namespaceBytes(intent.fence.namespace), if (replay) |value| value.native.sequence else null) } };
+    if (position == .raft) {
+        if (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) |applied| {
+            if (position.raft.index <= applied.index or position.raft.term < applied.term) return error.InvalidControlReceiptPosition;
+        }
+    }
+    const record: Record = .{ .intent = intent, .position = position };
     try txn.put(key, &try record.encode());
-    try topology.stagePrivateIndexCancellationIntent(txn, intent.fence);
+    try topology.stagePrivateIndexCancellationIntent(txn, record);
     return .{ .record = record, .duplicate = false };
 }
 
@@ -207,7 +241,7 @@ pub fn requireOpen(txn: anytype, binding: anytype) !void {
 
 pub fn requireCanceled(txn: anytype, binding: anytype) !void {
     const record = (try load(txn)) orelse return error.PrivateIndexCancellationRequired;
-    if (binding.authority != .native or !record.intent.eql(Intent.fromBinding(binding))) return error.PrivateIndexOwnerJobChanged;
+    if ((binding.authority == .native) != (record.position == .native) or !record.intent.eql(Intent.fromBinding(binding))) return error.PrivateIndexOwnerJobChanged;
 }
 
 /// Structural recovery must validate even an intent for a never-visited job.
@@ -227,7 +261,7 @@ pub fn verifyRecovery(txn: anytype, binding: anytype) !void {
     if (!std.mem.eql(u8, &digest(before), &record.intent.fence.catalog_digest)) return error.IntegrityCatalogChanged;
 }
 
-test "relational index candidate cancellation intent framing preserves canonical native identity" {
+test "relational index candidate cancellation intent framing preserves canonical authority" {
     const intent: Intent = .{
         .id = @splat(1),
         .plan_digest = @splat(2),
@@ -237,7 +271,7 @@ test "relational index candidate cancellation intent framing preserves canonical
         .candidate_digest = @splat(5),
         .reservation_digest = @splat(6),
     };
-    const record: Record = .{ .intent = intent, .position = .{ .namespace = intent.fence.namespace, .sequence = std.math.maxInt(u64) } };
+    const record: Record = .{ .intent = intent, .position = .{ .native = .{ .namespace = intent.fence.namespace, .sequence = std.math.maxInt(u64) } } };
     const bytes = try record.encode();
     try std.testing.expectEqualDeep(record, try Record.decode(&bytes));
     for (0..bytes.len) |length| try std.testing.expectError(error.InvalidPrivateIndexCancellation, Record.decode(bytes[0..length]));
@@ -255,9 +289,9 @@ test "relational index candidate cancellation intent framing preserves canonical
     var raft = bytes;
     @memcpy(raft[296..329], &try (positions.Position{ .raft = .{ .term = 1, .index = 1 } }).encode());
     @memcpy(raft[336..368], &digest(raft[0..336]));
-    try std.testing.expectError(error.InvalidPrivateIndexCancellation, Record.decode(&raft));
+    try std.testing.expectEqualDeep(positions.Position{ .raft = .{ .term = 1, .index = 1 } }, (try Record.decode(&raft)).position);
     var foreign = record;
-    foreign.position.namespace.range_id += 1;
+    foreign.position.native.namespace.range_id += 1;
     try std.testing.expectError(error.IdentityNamespaceMismatch, foreign.encode());
     foreign = record;
     foreign.intent.plan_digest = @splat(0);

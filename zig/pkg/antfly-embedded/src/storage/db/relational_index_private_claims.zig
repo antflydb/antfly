@@ -917,6 +917,7 @@ fn decodeInventoryPosition(key: []const u8, value: []const u8, provenance: Prove
     if (sequence <= provenance.reserved or sequence > provenance.maximum) return error.InvalidPrivateIndexClaimInventory;
     if (position.term() < provenance.reserved_cut.term() or position.term() > provenance.maximum_cut.term() or
         (sequence == provenance.maximum and position.term() != provenance.maximum_cut.term())) return error.InvalidPrivateIndexClaimInventory;
+    if (provenance.cancellation_cut) |cut| if (!cut.strictlyAfter(position)) return error.InvalidPrivateIndexClaimInventory;
     return position;
 }
 
@@ -933,12 +934,32 @@ test "relational index system compact claim cuts preserve authority and committe
     const native_bytes = try encodeInventory(&key, binding_digest, value_digest, native, &storage);
     try std.testing.expectEqual(inventory_value_len, native_bytes.len);
     try std.testing.expectEqualDeep(native, try decodeInventoryPosition(&key, native_bytes, native_provenance, value_digest));
+    var native_canceled = native_provenance;
+    native_canceled.cancellation_cut = .{ .native = .{ .namespace = ns, .sequence = 6 } };
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, native_bytes, native_canceled, value_digest));
+    native_canceled.cancellation_cut = .{ .native = .{ .namespace = ns, .sequence = 2 } };
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, native_bytes, native_canceled, value_digest));
     try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, native_bytes, raft_provenance, value_digest));
     const raft: Position = .{ .raft = .{ .term = 3, .index = 50 } };
     const raft_bytes = try encodeInventory(&key, binding_digest, value_digest, raft, &storage);
     try std.testing.expectEqual(max_inventory_value_len, raft_bytes.len);
     try std.testing.expectEqualDeep(raft, try decodeInventoryPosition(&key, raft_bytes, raft_provenance, value_digest));
     try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, raft_bytes, native_provenance, value_digest));
+    var canceled = raft_provenance;
+    canceled.cancellation_cut = .{ .raft = .{ .term = 3, .index = 60 } };
+    try std.testing.expectEqualDeep(raft, try decodeInventoryPosition(&key, raft_bytes, canceled, value_digest));
+    var never_visited = raft_provenance;
+    never_visited.cancellation_cut = .{ .raft = .{ .term = 1, .index = 20 } };
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, raft_bytes, never_visited, value_digest));
+    for ([_]Position{
+        .{ .raft = .{ .term = 3, .index = 60 } },
+        .{ .raft = .{ .term = 4, .index = 70 } },
+        .{ .raft = .{ .term = 4, .index = 55 } },
+    }) |after_cancel| {
+        var changed: [max_inventory_value_len]u8 = undefined;
+        const bytes = try encodeInventory(&key, binding_digest, value_digest, after_cancel, &changed);
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, bytes, canceled, value_digest));
+    }
     storage[storage.len - 1] ^= 1;
     try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, &storage, raft_provenance, value_digest));
     for ([_]Position{
@@ -986,29 +1007,42 @@ const Provenance = struct {
     maximum: u64,
     reserved_cut: Position,
     maximum_cut: Position,
+    cancellation_cut: ?Position = null,
 
     fn init(txn: anytype, binding: jobs.Binding) !Provenance {
         const namespace = @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace);
         if (binding.authority == .raft) {
             _ = try authority.require(txn, .raft, namespace);
-            const reserved = (try @import("relational_index_raft_control.zig").receipt(txn, binding, .reserved)) orelse return error.InvalidControlReceiptPosition;
+            const reserved = (try @import("relational_index_raft_control.zig").retainedPosition(txn, binding, .reserved)) orelse return error.InvalidControlReceiptPosition;
             const applied = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
-            return .{ .binding_digest = try bindingDigest(binding), .reserved = reserved.position.raft.index, .maximum = applied.index, .reserved_cut = reserved.position, .maximum_cut = .{ .raft = .{ .term = applied.term, .index = applied.index } } };
+            const cancellation = @import("relational_index_cancellation_intent.zig");
+            var cancellation_cut: ?Position = null;
+            if (try cancellation.load(txn)) |closed| {
+                if (closed.intent.fence.admission_epoch < binding.fence.admission_epoch) {
+                    try cancellation.requireOpen(txn, binding);
+                } else {
+                    try cancellation.requireCanceled(txn, binding);
+                    cancellation_cut = closed.position;
+                }
+            }
+            return .{ .binding_digest = try bindingDigest(binding), .reserved = reserved.raft.index, .maximum = applied.index, .reserved_cut = reserved, .maximum_cut = .{ .raft = .{ .term = applied.term, .index = applied.index } }, .cancellation_cut = cancellation_cut };
         }
         const current = try authority.require(txn, .native, namespace);
         const reserved = (try jobs.nativeEffectPosition(txn, binding, .reserved)) orelse return error.InvalidPrivateIndexNativeReceipt;
-        var maximum = current.sequence;
+        const maximum = current.sequence;
+        var cancellation_cut: ?Position = null;
         const cancellation = @import("relational_index_cancellation_intent.zig");
         if (try cancellation.load(txn)) |canceled| {
             if (canceled.intent.fence.admission_epoch < binding.fence.admission_epoch) {
                 try cancellation.requireOpen(txn, binding);
             } else {
                 try cancellation.requireCanceled(txn, binding);
-                maximum = @min(maximum, canceled.position.sequence -| 1);
+                if (canceled.position != .native) return error.InvalidControlReceiptPosition;
+                cancellation_cut = canceled.position;
             }
         }
         if (maximum < reserved.sequence) return error.InvalidPrivateIndexClaimInventory;
-        return .{ .binding_digest = try bindingDigest(binding), .reserved = reserved.sequence, .maximum = maximum, .reserved_cut = .{ .native = reserved }, .maximum_cut = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = maximum } } };
+        return .{ .binding_digest = try bindingDigest(binding), .reserved = reserved.sequence, .maximum = maximum, .reserved_cut = .{ .native = reserved }, .maximum_cut = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = maximum } }, .cancellation_cut = cancellation_cut };
     }
 };
 
@@ -1421,6 +1455,7 @@ pub const InventoryValidation = struct {
         if ((record.position == .native) != (binding.authority == .native) or positionNumber(record.position) <= provenance.reserved or
             positionNumber(record.position) > provenance.maximum or record.position.term() < provenance.reserved_cut.term() or
             record.position.term() > provenance.maximum_cut.term() or (positionNumber(record.position) == provenance.maximum and record.position.term() != provenance.maximum_cut.term())) return error.InvalidPrivateIndexClaimInventory;
+        if (provenance.cancellation_cut) |cut| if (!cut.strictlyAfter(record.position)) return error.InvalidPrivateIndexClaimInventory;
         return record;
     }
     pub fn requireReady(alloc: Allocator, txn: anytype, binding: jobs.Binding, expected: TargetExpectation) !struct { digest: integrity.Digest, source_members: u64, position: Native } {
@@ -1716,17 +1751,20 @@ pub const GcPage = struct {
             if (!std.mem.startsWith(u8, entry.key, &start)) break;
             if (io) |runtime| try runtime.checkCancel();
             const address = try addressFromInventory(entry.key);
-            if (entry.value.len != inventory_value_len) return error.InvalidPrivateIndexClaimInventory;
+            const inventory_len: usize = if (binding.authority == .native) inventory_value_len else max_inventory_value_len;
+            if (entry.value.len != inventory_len) return error.InvalidPrivateIndexClaimInventory;
             // Copy before the claim read can invalidate borrowed cursor bytes.
-            const inventory = entry.value[0..inventory_value_len].*;
+            var inventory_storage: [max_inventory_value_len]u8 = undefined;
+            const inventory = inventory_storage[0..inventory_len];
+            @memcpy(inventory, entry.value);
             const raw = (try optional(txn, &address.claimKey())) orelse return error.InvalidPrivateIndexClaimInventory;
             if (raw.len > integrity.max_record_bytes) return error.InvalidPrivateIndexClaimInventory;
-            const record_bytes = raw.len + key_len + integrity.key_len + inventory_value_len;
+            const record_bytes = raw.len + key_len + integrity.key_len + inventory_len;
             if (record_bytes > max_bytes) return error.InvalidPrivateIndexClaimInventory;
             // Stop BEFORE owning another row; checking after append can admit
             // almost two page budgets when the next claim is large.
             if (record_bytes > max_bytes - bytes) break;
-            const sequence = try decodeInventory(&inventoryKey(address), &inventory, provenance, hash(raw));
+            const sequence = try decodeInventory(&inventoryKey(address), inventory, provenance, hash(raw));
             const value = try owned.dupe(u8, raw);
             const claim = try integrity.Claim.decode(&address.claimKey(), value);
             if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;

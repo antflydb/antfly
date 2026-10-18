@@ -912,7 +912,7 @@ pub fn requireNativeCancellationWitness(group: u64, head: progress.Head, owner: 
     if (witness.record.cleanup.claim_allocation != dispatch.native_claim_allocation) return error.PrivateIndexOwnerJobChanged;
     if (prior) |accepted| {
         const previous = accepted.signed;
-        if (previous.receipt.position != .native or witness.record.cleanup.position.sequence <= previous.receipt.position.native.sequence or
+        if (previous.receipt.position != .native or witness.record.cleanup.position != .native or witness.record.cleanup.position.native.sequence <= previous.receipt.position.native.sequence or
             !std.meta.eql(previous.proof.identity, signed.proof.identity) or !std.meta.eql(previous.proof.authority, signed.proof.authority) or
             previous.proof.root_generation != signed.proof.root_generation or previous.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
         if (accepted.validation) |validation| if (!std.meta.eql(validation.outcome.binding, binding)) return error.PrivateIndexOwnerJobChanged;

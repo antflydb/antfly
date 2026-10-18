@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `1b4b255aae` (2026-10-17). Earlier implementation and
+at `206f116db3` (2026-10-17). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -77,8 +77,21 @@ closed until companion retirement completes. The standalone worker leaves Raft
 retirement to ordered proposals. Terminal records use one tagged AIIR v2 format.
 This does not yet wire replicated claim delivery, validation seals,
 installation, cancellation or publication release through the public receiver.
-Raft cancellation and failed-build convergence also remain required before
-public activation; none of these storage primitives grants metadata authority.
+Cancellation intent now commits at a real Raft position, including an owner's
+first entry or an owner that has not visited the job. Ordinary work stays closed;
+explicit cancellation controls drain and burn the exact generation. Cleanup
+admission retains its original cut, retires the bounded source window and queues
+the shared physical GC machinery atomically with the apply marker. Selected
+physical pages and private claim pairs retire through that same apply boundary.
+Claim provenance checks both the real committed watermark and the actual intent
+cut; cancellation before the allocation burn correctly permits only an empty
+inventory. Native and Raft intent/cleanup records each use one tagged format
+(AICI v2 and AICG v2); native transport adapters still reject Raft positions.
+Cancellation completion, cohort-authorized release and public dispatch remain
+required before activation. The borrowed GC selections are local apply inputs,
+not serialized receiver commands: replicated dispatch must carry the same bounded
+selection to followers without rerunning a timed scan. None of these storage
+primitives grants metadata authority or closes an original SQL case.
 
 Verification: `zig build antfly-relational-index-system-test -Doptimize=Debug -j1`
 passes 291 storage tests and one server test, with no skips or leaks. The Raft
@@ -100,6 +113,10 @@ and later-entry retries, cold installed recovery and unchanged fence ownership.
 Release controls cover abort/replay, immutable terminal cuts, removed private
 control slots, fence completion, cold partial-GC resume, retained retries after
 cleanup, unchanged live claims and exclusion from the native-clock worker.
+Cancellation controls cover first-entry intent, pre-visit drain/burn, delayed
+normal-work rejection, aborted admission/deletions, exact and later-entry retry,
+cold cleanup resumption, 48-byte Raft claim companions, actual cancellation-cut
+bounds and the fence remaining held after physical and claim retirement.
 `zig build antfly-relational-index-pages-test -Doptimize=Debug -j1` also passes
 all 12 standalone lifecycle tests, including standby replay and bounded released
 companion retirement. This gate is distinct from the publication-only suite.
