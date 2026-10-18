@@ -127,7 +127,7 @@ const CachedPayload = struct {
         errdefer payload.arena.deinit();
         payload.value = value;
         inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "payload")) payload.value.payload = null else @field(payload.value, name) = try retainedClone(@FieldType(SavedCandidate, name), payload.arena.allocator(), @field(value, name), 0);
+            if (comptime std.mem.eql(u8, name, "payload")) payload.value.payload = payload else @field(payload.value, name) = try retainedClone(@FieldType(SavedCandidate, name), payload.arena.allocator(), @field(value, name), 0);
         }
         return payload;
     }
@@ -146,20 +146,24 @@ const CachedPayload = struct {
 const SavedQuery = struct {
     summary: Summary,
     considered: usize,
-    items: []SavedCandidate,
+    items: []const *const SavedCandidate,
+    by_path: std.StringHashMapUnmanaged(*const SavedCandidate) = .empty,
     pub fn cacheClone(value: SavedQuery, owner: anytype, a: Allocator) !SavedQuery {
         var result = value;
-        result.items = try a.alloc(SavedCandidate, value.items.len);
+        const items = try a.alloc(*const SavedCandidate, value.items.len);
+        result.items = items;
+        result.by_path = .empty;
+        try result.by_path.ensureTotalCapacity(a, @intCast(items.len));
         var done: usize = 0;
-        var logical: usize = result.items.len * @sizeOf(SavedCandidate);
+        var logical: usize = result.items.len * @sizeOf(*const SavedCandidate) + result.by_path.capacity() * (@sizeOf([]const u8) + @sizeOf(*const SavedCandidate) + 1);
         errdefer for (result.items[0..done]) |item| item.payload.?.release();
-        for (value.items, result.items) |item, *dest| {
+        for (value.items, items) |item, *dest| {
             const payload = if (item.payload) |existing| blk: {
                 _ = existing.refs.fetchAdd(1, .monotonic);
                 break :blk existing;
-            } else try CachedPayload.create(owner, item);
-            dest.* = payload.value;
-            dest.payload = payload;
+            } else try CachedPayload.create(owner, item.*);
+            dest.* = &payload.value;
+            result.by_path.putAssumeCapacity(payload.value.path, &payload.value);
             done += 1;
             logical += payload.bytes();
             if (logical > @TypeOf(owner.*).value_limit - 4096) return error.OutOfMemory;
@@ -1315,6 +1319,11 @@ pub const Search = struct {
         self.binary_offset = null;
         self.replacement_file_context = false;
         self.json_started = false;
+        // Capture only this file's evidence (including evaluation-cache hits).
+        // Restore worker-wide times after both capture and index admission.
+        const previous_times = self.decider.evidence_times;
+        self.decider.evidence_times = .{};
+        defer self.decider.evidence_times.merge(previous_times);
         defer if (self.incremental) |index| {
             index.commit(self.pending_record, summaryDelta(self.summary, before), self.best_probability);
             self.pending_record = null;
@@ -2704,9 +2713,12 @@ pub const Search = struct {
     }
     fn runIncremental(self: *Search, index: *Incremental, started: std.Io.Timestamp) !?u8 {
         const generation = self.workspace_generation orelse return null;
-        if (!index.valid(self.options.cache_ttl_seconds)) return null;
+        if (index.revision == null) return null;
         const same = std.mem.eql(u8, &index.revision.?, &generation.revision);
         if (!same and (generation.parent_revision == null or !std.mem.eql(u8, &index.revision.?, &generation.parent_revision.?))) return null;
+        if (same) {
+            if (!index.valid(self.options.cache_ttl_seconds)) return null;
+        } else if (!index.validAfter(generation.changes.items, self.options.cache_ttl_seconds)) return null;
         self.decider.prepareCache();
         try self.decider.ensureLocal();
         var changed: usize = 0;
@@ -2760,7 +2772,7 @@ pub const Search = struct {
         self.summary.file_evaluation_cache_hits = 0;
         self.summary.complete = self.summary.complete and self.summary.errors == 0 and index.healthy and index.files.count() == generation.entries.items.len;
         if (self.summary.complete) index.revision = generation.revision else index.fail();
-        self.decider.evidence_times.merge(index.times);
+        self.decider.evidence_times.merge(index.evidenceTimes());
         const ranking = try self.a.create(Ranking);
         ranking.* = .{ .a = self.a, .io = self.io, .limits = &self.limits, .capacity = self.options.max_result_files, .max_bytes = self.options.max_pending_output };
         self.ranking = ranking;
@@ -2778,10 +2790,9 @@ pub const Search = struct {
                 if (std.mem.eql(u8, &token, &base.token)) previous = lease else lease.release();
             }
         }
-        var previous_items: std.StringHashMapUnmanaged(SavedCandidate) = .empty;
-        defer previous_items.deinit(self.a);
-        if (previous) |lease| for (lease.value.items) |candidate| try previous_items.put(self.a, candidate.path, candidate);
-        var items: std.ArrayList(SavedCandidate) = .empty;
+        var items: std.ArrayList(*const SavedCandidate) = .empty;
+        var fresh = std.heap.ArenaAllocator.init(self.a);
+        defer fresh.deinit();
         defer items.deinit(self.a);
         var current = index.first();
         var count: usize = 0;
@@ -2789,9 +2800,11 @@ pub const Search = struct {
             if (count >= self.options.max_result_files or self.limits.cancel.load(.acquire)) break;
             const entry = generation.find(record.path) orelse continue;
             if (!std.mem.eql(u8, &entry.revision, &record.revision) or entry.prepared == null) return error.InconsistentIncrementalIndex;
-            var borrowed: ?SavedCandidate = null;
+            var borrowed: ?*const SavedCandidate = null;
             if (self.prior_delivery) |base| if (base.by_path.get(record.path)) |tag| {
-                if (std.mem.eql(u8, &tag, &record.tag)) borrowed = previous_items.get(record.path);
+                if (std.mem.eql(u8, &tag, &record.tag)) if (previous) |lease| {
+                    borrowed = lease.value.by_path.get(record.path);
+                };
             };
             if (borrowed) |candidate| {
                 try items.append(self.a, candidate);
@@ -2826,9 +2839,9 @@ pub const Search = struct {
                 self.deferred_candidate = null;
                 candidate.summary = record.summary;
                 try ranking.offer(candidate);
-                var saved: SavedCandidate = undefined;
+                const saved = try fresh.allocator().create(SavedCandidate);
                 inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| {
-                    if (comptime std.mem.eql(u8, name, "payload")) @field(saved, name) = null else @field(saved, name) = @field(candidate, name);
+                    if (comptime std.mem.eql(u8, name, "payload")) @field(saved.*, name) = null else @field(saved.*, name) = @field(candidate, name);
                 }
                 try items.append(self.a, saved);
             }
@@ -2919,9 +2932,6 @@ pub const Search = struct {
                 return !v.preview_rejected;
             }
         };
-        const previous_times = self.decider.evidence_times;
-        self.decider.evidence_times = .{};
-        defer self.decider.evidence_times.merge(previous_times);
         const before = self.summary;
         var preview_rejected = false;
         if (self.options.jev_mode) {
@@ -2967,10 +2977,12 @@ pub const Search = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const ranking = self.ranking.?;
-        const items = arena.allocator().alloc(SavedCandidate, ranking.items.items.len) catch return;
-        for (items, ranking.items.items) |*saved, candidate| {
+        const items = arena.allocator().alloc(*const SavedCandidate, ranking.items.items.len) catch return;
+        for (items, ranking.items.items) |*dest, candidate| {
+            const saved = arena.allocator().create(SavedCandidate) catch return;
+            dest.* = saved;
             inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| {
-                if (comptime std.mem.eql(u8, name, "payload")) @field(saved, name) = null else @field(saved, name) = @field(candidate, name);
+                if (comptime std.mem.eql(u8, name, "payload")) @field(saved.*, name) = null else @field(saved.*, name) = @field(candidate, name);
             }
         }
         self.reuse.?.queries.put(key, self.decider.evidence_times, .{ .summary = self.summary, .considered = ranking.considered, .items = items });
@@ -3951,7 +3963,8 @@ test "query revisions share immutable payloads and retain physical charges throu
     @memset(text, 'x');
     var rows = [_]RenderRow{.{ .raw = text, .length = text.len, .line = 1, .offset = 0, .matched = true, .probability = 1, .independent = true, .gap = false }};
     var candidates = [_]SavedCandidate{.{ .path = "same.py", .score = 1, .ordinal = 0, .provenance = .{}, .rows = &rows, .view = null, .before = .{}, .summary = .{}, .filename = true, .color = false }};
-    cache.put(@splat(1), times, .{ .summary = .{}, .considered = 1, .items = &candidates });
+    const refs = [_]*const SavedCandidate{&candidates[0]};
+    cache.put(@splat(1), times, .{ .summary = .{}, .considered = 1, .items = &refs });
     const first = cache.lease(@splat(1), 100) orelse return error.TestUnexpectedResult;
     const before = cache.physical.load(.monotonic);
     cache.put(@splat(2), times, first.value);
@@ -3966,8 +3979,38 @@ test "query revisions share immutable payloads and retain physical charges throu
     try std.testing.expectEqual(@as(usize, 0), cache.physical.load(.monotonic));
     // Distinct changed payloads must evict old entries rather than permanently
     // exhausting admission headroom, while shared/active owners remain bounded.
-    for (0..64) |i| cache.put(@splat(@as(u8, @intCast(i))), times, .{ .summary = .{}, .considered = 1, .items = &candidates });
+    for (0..64) |i| cache.put(@splat(@as(u8, @intCast(i))), times, .{ .summary = .{}, .considered = 1, .items = &refs });
     const latest = cache.lease(@splat(63), 100) orelse return error.TestUnexpectedResult;
     latest.release();
     try std.testing.expect(cache.physical.load(.monotonic) <= @TypeOf(cache).physical_limit);
+}
+
+test "query revision metadata stores pointers and one admission-owned path index" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var cache: @TypeOf(@as(WorkspaceReuse, undefined).queries) = .{ .a = a, .io = io };
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var times: @import("reuse_cache.zig").Times = .{};
+    times.add(std.Io.Clock.real.now(io).toSeconds());
+    var candidates: [128]SavedCandidate = undefined;
+    var refs: [128]*const SavedCandidate = undefined;
+    for (&candidates, &refs, 0..) |*candidate, *ref, i| {
+        candidate.* = .{ .path = try std.fmt.allocPrint(arena.allocator(), "f{d}.py", .{i}), .score = 1, .ordinal = i, .provenance = .{}, .rows = &.{}, .view = null, .before = .{}, .summary = .{}, .filename = true, .color = false };
+        ref.* = candidate;
+    }
+    cache.put(@splat(1), times, .{ .summary = .{}, .considered = refs.len, .items = &refs });
+    const first = cache.lease(@splat(1), 100) orelse return error.TestUnexpectedResult;
+    defer first.release();
+    const before = cache.physical.load(.monotonic);
+    cache.put(@splat(2), times, first.value);
+    const second = cache.lease(@splat(2), 100) orelse return error.TestUnexpectedResult;
+    defer second.release();
+    try std.testing.expect(cache.physical.load(.monotonic) - before < 32 * 1024);
+    try std.testing.expect(@sizeOf(@TypeOf(second.value.items[0])) == @sizeOf(usize));
+    for (second.value.items) |item| {
+        try std.testing.expect(second.value.by_path.get(item.path).? == item);
+        try std.testing.expect(first.value.by_path.get(item.path).? == item);
+    }
 }

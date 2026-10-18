@@ -2046,18 +2046,27 @@ and skip opens for intact source witnesses. With no source or dependency events,
 it republishes the same owned generation without an O(file-count) inventory walk.
 Otherwise uncertified paths use open/stat/device/inode/timestamp checks and normal
 reads; incomplete namespace coverage uses ordinary discovery. Subscriptions
-are bounded (at most 256 macOS files/4096 Linux files, further capped by the
-file-descriptor limit); missing subscriptions, admission failures, overflow,
+are bounded (at most 4096 inode witnesses per owner, further capped at one
+quarter of the file-descriptor limit). Linux named directory events can cover
+additional regular files without individual inode subscriptions; macOS always
+requires an inode witness to certify source contents. Missing subscriptions,
+admission failures, overflow,
 watch loss, unsupported targets and errors fall back to ordinary reads. Linux
 event dispatch uses a bounded handle map. Capture retries without watches if
 watch resources cause a capture failure. `workspace_ready` reports
 `source_bytes_read`, `source_bytes_reused`, `sources_opened`, `discovery_reused`
 and `watch_fallback`. The dependency journal has a 1 MiB allocation cap and its
-own bounded native watch table. Resource-related capture failure closes both
+own bounded native watch table. The Linux directory event owner has a separate
+2 MiB allocation cap. macOS uses strict kqueue source/directory witnesses and
+directory membership certificates; asynchronous FSEvents is not a certification
+mechanism. Linux directory-prefix routing uses the generation's sorted inventory
+rather than a second per-file pathname table. Resource-related capture failure closes both
 watch owners and retries conservatively without watch allocations during capture.
 
 Use watching only where kernel events cover the writers/filesystem in use.
-Linux mmap writes and remote filesystem changes may not produce inotify events.
+Linux mmap writes, remote filesystem changes and writes through out-of-tree
+hard-link aliases may bypass directory notifications. Known multi-link files
+outside inode coverage cannot receive directory-only content certificates.
 Send `{"version":1,"id":5,"op":"refresh","force_rescan":true}` for a conservative
 read/hash capture that also rebuilds witnesses. Trim drops witnesses and the
 next refresh reads sources normally. Watches accelerate explicit refresh; they
@@ -2391,3 +2400,74 @@ Evidence: [paired startup/refresh](bench/results/review-refresh-macos.json),
 [differential](bench/results/review-refresh-differential.json),
 [validation/source identities](bench/results/refresh-validation.json), and
 [release archives](bench/results/refresh-archives.json).
+
+
+### Strict refresh and active evidence follow-up
+
+Refresh fallback revalidates the namespace certificate after a rejected dirty
+capture. An invalidation observed while reading a source cannot be carried into
+trusted-membership fallback. Atomic saves verify the affected directory's names,
+kinds, inode and permissions, then stage only changed source entries. Ancestor
+notifications revalidate tracked pathname identities and absent configuration
+targets; unrelated siblings do not require reopening all sources. Watch rearming
+uses validated sequence numbers, preserving events arriving after validation.
+Healthy directory-event subscriptions survive rediscovery; namespace/configuration
+certificates are rebuilt, and events racing that rebuild remain pending. Directory
+loss, overflow, alias uncertainty and admission failure use conservative
+discovery and reads. File additions/deletions still rebuild the flat inventory
+and canonical Merkle metadata; they are not logarithmic membership updates.
+
+Linux uses synchronous named inotify directory events beyond the individual-file
+watch budget. macOS uses bounded strict kqueue inode and directory witnesses without
+an asynchronous event layer. Captures beyond the macOS witness budget explicitly report
+`watch_fallback` and read unwitnessed sources. Tests mutate every file in a
+512-file macOS corpus, sample a 4352-file Linux corpus, and verify conservative
+macOS reads above its witness budget. Optimized revisions are checked against
+forced rescans. Windows runtime conformance remains unverified.
+
+Complete-result cache entries contain payload pointers and a path lookup built
+once at admission. Full rediscovery batches witness polling, validates retained
+witnesses before publication, and reads conservatively if a retained witness changed.
+Incremental queries borrow unchanged payloads without rebuilding
+a map of large candidate structs. Payloads, lookup metadata, constructors and
+active leases remain charged to the existing 4 MiB physical cap. Per-file evidence
+times are scoped before capture. Two removable ordered time indexes track oldest
+and newest evidence across active positive and negative outcomes; deleting or
+replacing a file retires its expiry witnesses in logarithmic time. Validity checks
+exclude pending changed/deleted records before mutation, so an expired removed
+record does not force rebuilding fresh surviving outcomes. Active rejected
+or unselected outcomes still constrain TTL; reuse never renews evidence timestamps.
+
+This does not make search resource-free. Unchanged conditional results can avoid
+provider calls and payload delivery; changed sources, expiry and uncertain
+coverage require work. Client-held handles/revisions/tokens can avoid an RPC only
+while their own freshness conditions remain valid.
+
+Final paired controls against the rebuilt `16fa2b9184` PR binary (identical
+baseline SHA-256 to the original frozen artifact):
+
+| Corpus / refresh | Before | After | Source opens before → after |
+|---|---:|---:|---:|
+| 512 files / unchanged | 7.050 ms | 0.061 ms | 256 → 0 |
+| 512 files / inplace | 7.211 ms | 0.147 ms | 257 → 1 |
+| 512 files / atomic | 15.258 ms | 2.171 ms | 512 → 1 |
+| 512 files / add_delete | 14.882 ms | 3.471 ms | 513 → 1 |
+
+Eleven alternating pairs per case, warm shared host; every mode ends with a
+forced-rescan revision comparison. File additions/deletions still visit the
+inventory: the measured gain removes repeated polling and source opens, not
+the linear metadata rebuild. At 64 files, unchanged/in-place controls are
+essentially unchanged; atomic saves improve and add/delete rediscovery improves.
+
+Nineteen-pair native-inference controls show selected-file refresh + search
+at 0.573 vs 0.544 ms for 15 winners and 0.667 vs 0.680 ms for 128 winners.
+No broad decision-search latency gain is claimed. Both binaries make one
+fixture evaluation per edit and reconstruct identical results. The deterministic
+128-winner ownership regression requires new shared-query metadata below 32 KiB,
+including its admission-owned path lookup, under the unchanged physical cache cap.
+
+Evidence: [refresh controls](bench/results/directory-events-macos.json),
+[selected-file controls](bench/results/directory-incremental-macos.json),
+[differential replay](bench/results/directory-differential.json),
+[validation/source identities](bench/results/directory-validation.json), and
+[release archives](bench/results/directory-archives.json).

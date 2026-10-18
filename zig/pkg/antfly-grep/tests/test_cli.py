@@ -5990,6 +5990,65 @@ class CliTests(unittest.TestCase):
             self.assertFalse(changed["discovery_reused"])
             self.assertEqual(changed["files"], len(paths) + 1)
 
+    def test_workspace_watched_refresh_scales_and_mutates_every_file(self):
+        count = 4352 if sys.platform.startswith("linux") else 512
+        paths = [self.write(f"src/f{i:04}.txt", "original\n") for i in range(count)]
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            if sys.platform not in ("darwin", "linux"):
+                self.skipTest("native directory events require macOS or Linux")
+            self.assertFalse(ready["watch_fallback"], ready)
+            stable = request("refresh")[0]
+            self.assertEqual(stable["sources_opened"], 0, stable)
+            self.assertEqual(stable["refresh_entries_visited"], 0, stable)
+            revision = stable["revision"]
+            targets = paths if sys.platform == "darwin" else paths[::17]
+            for i, target in enumerate(targets):
+                target.write_text(f"file changed {i}\n")
+                changed = request("refresh")[0]
+                self.assertNotEqual(changed["revision"], revision, changed)
+                self.assertEqual(changed["sources_opened"], 1, changed)
+                self.assertEqual(changed["refresh_entries_visited"], 1, changed)
+                revision = changed["revision"]
+            replacement = self.write("src/.history-save", "after edit history\n")
+            os.replace(replacement, paths[17])
+            saved = request("refresh")[0]
+            self.assertEqual(saved["sources_opened"], 1, saved)
+            revision = saved["revision"]
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(forced["revision"], revision)
+
+    @unittest.skipUnless(sys.platform == "darwin", "kqueue admission is macOS specific")
+    def test_workspace_witness_limit_uses_explicit_conservative_source_reads(self):
+        paths = [self.write(f"src/f{i:04}.txt", "before\n") for i in range(4352)]
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            self.assertTrue(ready["watch_fallback"], ready)
+            for i, path in enumerate(paths):
+                path.write_text(f"updated {i}\n")
+            changed = request("refresh")[0]
+            self.assertTrue(changed["watch_fallback"], changed)
+            self.assertNotEqual(changed["revision"], ready["revision"])
+            stable = request("refresh")[0]
+            self.assertTrue(stable["watch_fallback"], stable)
+            self.assertGreater(stable["source_bytes_read"], 0, stable)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(forced["revision"], changed["revision"])
+
+    def test_workspace_atomic_save_updates_one_entry_with_directory_events(self):
+        paths = [self.write(f"src/f{i:03}.txt", "original\n") for i in range(64)]
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            if sys.platform not in ("darwin", "linux"):
+                self.skipTest("native directory events require macOS or Linux")
+            self.assertFalse(ready["watch_fallback"], ready)
+            replacement = self.write("src/.save-temp", "atomic replacement\n")
+            os.replace(replacement, paths[17])
+            changed = request("refresh")[0]
+            self.assertEqual(changed["sources_opened"], 1, changed)
+            self.assertEqual(changed["refresh_entries_visited"], 1, changed)
+            self.assertTrue(changed["discovery_reused"], changed)
+            self.assertEqual(request("refresh")[0]["sources_opened"], 0)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(forced["revision"], changed["revision"])
+
     def test_workspace_prepares_sources_only_for_decision_queries(self):
         self.write("src/a.py", "def retry():\n" + "    STOP()\n" * 32)
         with self.workspace("src") as (ready, request):
@@ -6724,6 +6783,54 @@ class CliTests(unittest.TestCase):
             # The selected file is fresh. The rejected file's earlier expiry
             # must invalidate the complete result and force reconsideration.
             self.assertEqual(run()["stats"]["query_cache_hits"], 0)
+
+    def test_workspace_removed_expired_evidence_preserves_fresh_survivor_index(self):
+        rejected = self.write("src/a.txt", "irrelevant\n")
+        self.write("src/z.txt", "STOP HIGH\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--unit=line",
+            "--threads=1",
+            "--cache-dir=scores",
+            "--cache-ttl=10",
+            "--max-result-files=1",
+        ]
+        self.raw_cli(*args, "src")
+        aged = 0
+        for path in (self.root / "scores").glob("batch-v10-*"):
+            data = read_batch(path)
+            for i, score in enumerate(data["scores"]):
+                if score is not None and score < 0.5:
+                    data["written"][i] = int(time.time()) - 8
+                    aged += 1
+            write_batch(path, data)
+        self.assertGreater(aged, 0)
+        with self.workspace("src") as (ready, request):
+            handle = request("register", args=args)[0]["query_handle"]
+            first = request("search", revision=ready["revision"], query_handle=handle)
+            token = next(
+                r["result_token"] for r in first if r["type"] == "result_token"
+            )
+            time.sleep(2.1)
+            rejected.unlink()
+            changed = request("refresh")[0]
+            rows = request(
+                "search",
+                revision=changed["revision"],
+                query_handle=handle,
+                if_result_token=token,
+                delta=True,
+            )
+            self.assertEqual(rows[-1]["exit_code"], 0, rows)
+            summary = next(r for r in rows if r["type"] == "summary")
+            self.assertEqual(summary["requests"], 0, summary)
+            self.assertEqual(summary["stats"]["incremental_cache_hits"], 1, summary)
+            self.assertEqual(
+                summary["stats"]["incremental_files_evaluated"], 0, summary
+            )
+            self.assertTrue(any(r["type"] == "workspace_delta" for r in rows), rows)
+            self.assertFalse(any(r["type"] == "match" for r in rows), rows)
 
     def test_workspace_cached_outcomes_expire_and_no_cache_bypasses(self):
         self.write("src/a.txt", "STOP HIGH\n")

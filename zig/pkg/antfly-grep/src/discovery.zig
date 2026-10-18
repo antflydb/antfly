@@ -398,7 +398,7 @@ pub const Discovery = struct {
         }
         var dir = try parent.openDir(self.io, entry_name, .{ .iterate = true });
         defer dir.close(self.io);
-        if (self.journal) |journal| journal.directory(path);
+        if (self.journal) |journal| journal.displayDirectory(path, display);
         var it = dir.iterate();
         // Most directories contain no ignore files. A bounded lookahead avoids
         // two failing opens per directory without a second directory scan or
@@ -475,6 +475,10 @@ pub const Discovery = struct {
                 try context.reportError(shown, err);
             };
         }
+        if (self.journal) |journal| if (!context.stopped()) {
+            const membership: ?@import("directory_stamp.zig").Stamp = if (@import("directory_stamp.zig").Stamp.capture(self.io, path)) |value| value else |_| null;
+            journal.inventory(path, membership);
+        };
     }
     fn allowed(self: *Discovery, path: []const u8, display: []const u8, dir: bool) !bool {
         if (self.options.jev_mode or self.options.inventory) {

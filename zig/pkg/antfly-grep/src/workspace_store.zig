@@ -28,6 +28,7 @@ pub const Entry = struct {
     bytes: []const u8,
     revision: [64]u8,
     explicit_file: bool = false,
+    witness_reused: bool = false,
     prepared: ?source.Prepared = null,
     preparation: ?*PreparedOwner = null,
     fn retain(self: Entry) void {
@@ -91,10 +92,20 @@ pub const Generation = struct {
     pub fn captureJournal(a: A, io: std.Io, o: *const Options, previous: ?*Generation, watcher: ?*Watch, journal: ?*@import("discovery_journal.zig").Journal) !*Generation {
         const w = watcher orelse return captureWatched(a, io, o, previous, null);
         const j = journal orelse return captureWatched(a, io, o, previous, w);
+        if (o.trace) {
+            j.native.lock();
+            j.native.trace = true;
+            j.native.unlock();
+        }
+        j.allow_native_sources = !o.follow;
         w.beginRefresh();
         const clean = previous != null and j.clean();
-        if (clean and j.sources_covered and !w.failed and w.fd >= 0 and j.source_epoch == w.epoch) {
+        if (clean and j.sources_covered and !w.failed and w.fd >= 0 and j.source_epoch == w.epoch and (!j.native_active or !j.nativeDirty())) {
             const old = previous.?;
+            if (j.native_refresh) {
+                j.rearmDirectories();
+                if (!j.native_active) j.native.retire(j.native.checkpoint());
+            }
             old.refs += 1;
             old.captured_at = std.Io.Clock.real.now(io).toSeconds();
             old.source_bytes_read = 0;
@@ -107,9 +118,29 @@ pub const Generation = struct {
             return old;
         }
         if (clean and j.sources_covered and previous.?.refs == 1 and !w.failed) {
-            if (captureDirty(a, io, o, previous.?, w, j) catch null) |updated| return updated;
+            // Delayed/coalesced events may arrive while a source is staged.
+            // Retry boundedly against the new checkpoint before full capture.
+            for (0..3) |_| {
+                if (captureDirty(a, io, o, previous.?, w, j) catch null) |updated| return updated;
+                w.poll();
+                if (!j.clean() or w.failed) break;
+            }
         }
-        if (!clean) j.reset();
+        return captureFallback(a, io, o, previous, w, j, clean);
+    }
+    fn captureFallback(a: A, io: std.Io, o: *const Options, previous: ?*Generation, w: *Watch, j: *@import("discovery_journal.zig").Journal, was_clean: bool) !*Generation {
+        // A rejected dirty capture may have observed a namespace/configuration
+        // event while reading. Never carry its earlier certificate into fallback.
+        const clean = was_clean and j.clean();
+        if (o.trace) std.debug.print("antfly-grep: refresh fallback trusted={} directory_events={} reason={s}\n", .{ clean, j.native_refresh, j.rejection });
+        if (!clean) {
+            if (previous == null) j.reset() else j.rediscover();
+        } else {
+            // Conservative capture rereads every unwitnessed source. Events
+            // preceding it are consumed; racing later callbacks stay queued.
+            j.native.poll();
+            j.native.retire(j.native.checkpoint());
+        }
         const next = captureOnce(a, io, o, previous, w, j, clean) catch {
             w.deinit();
             j.deinit();
@@ -120,7 +151,8 @@ pub const Generation = struct {
             fallback.watch_fallback = true;
             return fallback;
         };
-        j.seal(w, next.entries.items);
+        j.sealGeneration(w, next);
+        next.watch_fallback = !j.sources_covered or !j.coverage;
         return next;
     }
     fn captureOnce(a: A, io: std.Io, o: *const Options, previous: ?*const Generation, watcher: ?*Watch, journal: ?*@import("discovery_journal.zig").Journal, trusted: bool) !*Generation {
@@ -131,9 +163,15 @@ pub const Generation = struct {
         errdefer self.deinit();
         var collector = Collector{ .generation = self, .io = io, .options = o, .previous = previous, .watcher = watcher, .journal = journal, .trusted_membership = trusted };
         self.discovery_reused = trusted;
+        if (watcher) |w| w.poll();
         if (trusted) {
             for (previous.?.entries.items) |entry| try collector.addFile(entry.path, entry.path, entry.explicit_file);
         } else if (o.paths.items.len == 0) try collector.path(".") else for (o.paths.items) |path| try collector.path(path);
+        if (watcher) |w| {
+            w.poll();
+            for (self.entries.items) |entry| if (entry.witness_reused and
+                (entry.blob.token == null or !w.intact(entry.blob.token.?))) return error.WorkspaceChangedDuringCapture;
+        }
         std.mem.sort(Entry, self.entries.items, {}, struct {
             fn less(_: void, x: Entry, y: Entry) bool {
                 return std.mem.order(u8, x.path, y.path) == .lt;
@@ -244,6 +282,8 @@ pub const Generation = struct {
     fn captureDirty(a: A, io: std.Io, o: *const Options, old: *Generation, w: *Watch, journal: *@import("discovery_journal.zig").Journal) !?*Generation {
         if (old.watch_heads.len == 0 or old.watch_next.len != old.entries.items.len or old.touch_epoch == std.math.maxInt(u64)) return null;
         const epoch = w.epoch;
+        const native_epoch = journal.native.checkpoint();
+        const native_refresh = journal.native_refresh;
         const original_limit = old.budget.limit;
         var published = false;
         defer if (!published) {
@@ -269,6 +309,21 @@ pub const Generation = struct {
                 old.touched[i] = old.touch_epoch;
                 try indices.append(scratch, i);
             }
+        }
+        if (native_refresh) {
+            journal.native.lock();
+            defer journal.native.unlock();
+            var paths = journal.native.paths.keyIterator();
+            while (paths.next()) |path| if (journal.sourceIndex(path.*)) |i| {
+                const entry = old.entries.items[i];
+                // An advisory/delayed event may describe a file already read.
+                // A strict intact inode witness proves its payload is current.
+                // The final source epoch barrier catches racing new writes.
+                if (entry.blob.token) |token| if (w.intact(token)) continue;
+                if (old.touched[i] == old.touch_epoch) continue;
+                old.touched[i] = old.touch_epoch;
+                try indices.append(scratch, i);
+            };
         }
         if (indices.items.len == 0) return null;
         var collector: Collector = .{ .generation = &stage, .io = io, .options = o, .previous = old, .watcher = w };
@@ -306,8 +361,27 @@ pub const Generation = struct {
             };
         }
         w.poll();
-        if (!journal.clean() or w.failed or w.epoch != epoch) return null;
-        for (stage.entries.items) |entry| if (entry.blob.token == null or !w.intact(entry.blob.token.?)) return null;
+        if (!journal.clean() or w.failed or w.epoch != epoch) {
+            if (o.trace) std.debug.print("antfly-grep: dirty refresh retry source_epoch={d}/{d} reason={s}\n", .{ w.epoch, epoch, journal.rejection });
+            return null;
+        }
+        if (native_refresh) {
+            if (!journal.namespaceClean()) return null;
+            journal.native.lock();
+            defer journal.native.unlock();
+            if (journal.native.epoch != native_epoch) {
+                if (o.trace) std.debug.print("antfly-grep: dirty refresh retry directory_epoch={d}/{d}\n", .{ journal.native.epoch, native_epoch });
+                return null;
+            }
+        } else for (stage.entries.items) |entry| if (entry.blob.token == null or !w.intact(entry.blob.token.?)) return null;
+        var missing_inode_witness = false;
+        var requires_inode_witness = false;
+        for (stage.entries.items) |entry| if (entry.blob.token == null or !w.intact(entry.blob.token.?)) {
+            missing_inode_witness = true;
+            if (entry.explicit_file or (entry.blob.stamp != null and entry.blob.stamp.?.nlink > 1)) requires_inode_witness = true;
+        };
+        const native_source_proof = @import("builtin").os.tag == .linux and journal.allow_native_sources and journal.native_covered and !requires_inode_witness;
+        const sources_covered = journal.sources_covered and (!missing_inode_witness or native_source_proof);
         // No fallible work remains after this point.
         const content_changed = !std.mem.eql(u8, &revision, &old.revision);
         if (content_changed) {
@@ -344,6 +418,15 @@ pub const Generation = struct {
         published = true;
         w.clearEvents();
         journal.source_epoch = w.epoch;
+        journal.sources_covered = sources_covered;
+        if (requires_inode_witness) journal.allow_native_sources = false;
+        journal.native_active = journal.native_active or missing_inode_witness;
+        old.watch_fallback = !sources_covered or !journal.coverage;
+        if (native_refresh) {
+            journal.rearmDirectories();
+            journal.native.retire(native_epoch);
+            journal.native_epoch = native_epoch;
+        }
         return old;
     }
     /// Immutable content has an optional, independently owned derived memo.
@@ -521,8 +604,11 @@ const Collector = struct {
     fn addFile(self: *Collector, path_name: []const u8, display: []const u8, explicit_file: bool) !void {
         const generation = self.generation;
         if (generation.entries.items.len >= self.options.workspace_max_files) return error.WorkspaceFileLimit;
-        if (self.trusted_membership) if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
-            if (old.blob.watcher == watcher and old.blob.token != null and watcher.intact(old.blob.token.?)) {
+        if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
+            if (old.blob.watcher == watcher and old.blob.token != null and
+                watcher.intact(old.blob.token.?) and
+                (self.trusted_membership or watcher.identityMatchesPath(old.blob.token.?, path_name)))
+            {
                 const available = generation.budget.limit -| generation.budget.live;
                 old.blob.refs += 1;
                 errdefer old.blob.release();
@@ -536,7 +622,12 @@ const Collector = struct {
         defer file_handle.close(self.io);
         const before = try file_handle.stat(self.io);
         if (before.kind != .file) return error.NotRegularFile;
-        if (before.size > self.options.max_file_bytes and self.options.skip_oversize) return;
+        if (before.size > self.options.max_file_bytes and self.options.skip_oversize) {
+            // Size affects discovery eligibility without changing directory
+            // membership. Observe excluded inputs as discovery dependencies.
+            if (self.journal) |journal| journal.dependency(path_name);
+            return;
+        }
         const available = generation.budget.limit -| generation.budget.live;
         if (available < @sizeOf(Blob)) return error.OutOfMemory;
         if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
@@ -568,7 +659,6 @@ const Collector = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(blob.bytes, &digest, .{});
         const revision = std.fmt.bytesToHex(digest, .lower);
-        var reused = false;
         if (if (self.previous) |old| old.find(display) else null) |old| {
             if (std.mem.eql(u8, &old.revision, &revision)) {
                 const retained = old.blob.budget.live + @sizeOf(Blob);
@@ -576,7 +666,6 @@ const Collector = struct {
                 blob.release();
                 blob = old.blob;
                 blob.refs += 1;
-                reused = true;
             }
         }
         if (blob.watcher) |w| if (blob.token) |old| w.release(old);
@@ -584,12 +673,12 @@ const Collector = struct {
         blob.token = token;
         blob.stamp = before;
         token = null;
-        try self.append(blob, display, explicit_file, revision, reused, available);
+        try self.append(blob, display, explicit_file, revision, false, available);
     }
     fn sameStamp(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
         return a.inode == b.inode and a.kind == b.kind and a.size == b.size and a.mtime.nanoseconds == b.mtime.nanoseconds and a.ctime.nanoseconds == b.ctime.nanoseconds;
     }
-    fn append(self: *Collector, blob: *Blob, display: []const u8, explicit_file: bool, revision: [64]u8, reused: bool, available: usize) !void {
+    fn append(self: *Collector, blob: *Blob, display: []const u8, explicit_file: bool, revision: [64]u8, witness_reused: bool, available: usize) !void {
         const generation = self.generation;
         const a = generation.arena.allocator();
         const previous = if (self.previous) |old| old.find(display) else null;
@@ -602,14 +691,13 @@ const Collector = struct {
             generation.budget.limit += charge;
             generation.blob_bytes -= charge;
         }
-        try generation.entries.append(a, .{ .blob = blob, .path = try a.dupe(u8, display), .bytes = blob.bytes, .revision = revision, .explicit_file = explicit_file, .prepared = if (preparation) |owner| owner.value else null, .preparation = preparation });
+        try generation.entries.append(a, .{ .blob = blob, .path = try a.dupe(u8, display), .bytes = blob.bytes, .revision = revision, .explicit_file = explicit_file, .witness_reused = witness_reused, .prepared = if (preparation) |owner| owner.value else null, .preparation = preparation });
         generation.source_bytes += blob.bytes.len;
         if (preparation) |owner| {
             owner.refs += 1;
             generation.preparations_reused += 1;
             generation.preparation_count += 1;
         }
-        _ = reused;
     }
 };
 
@@ -696,4 +784,121 @@ test "dirty capture preserves a retained generation and lazy preparations stay b
     try std.testing.expect(next.retainedBytes() <= o.workspace_memory_limit);
     try std.testing.expect(old.entries.items[0].prepared == null);
     try std.testing.expectEqualStrings("changed", next.entries.items[0].prepared.?.index.declarations[0].name);
+}
+
+test "fallback revalidates an earlier clean namespace certificate before publishing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "before" });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var o: Options = .{ .no_ignore = true };
+    defer o.deinit(a);
+    try o.paths.append(a, path);
+    var watch = Watch.init();
+    defer watch.deinit();
+    var journal = @import("discovery_journal.zig").Journal.init(a, io);
+    defer journal.deinit();
+    const old = try Generation.captureJournal(a, io, &o, null, &watch, &journal);
+    defer old.deinit();
+    if (!journal.clean()) return error.SkipZigTest;
+    // Deterministically reproduce events observed after the initial clean
+    // checkpoint, exactly where a rejected dirty fast path enters fallback.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "after" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "new.txt", .data = "newneedle" });
+    const next = try Generation.captureFallback(a, io, &o, old, &watch, &journal, true);
+    defer next.deinit();
+    try std.testing.expect(!next.discovery_reused);
+    try std.testing.expectEqual(@as(usize, 2), next.entries.items.len);
+    try std.testing.expectEqualStrings("newneedle", next.entries.items[1].bytes);
+}
+
+test "atomic replacement at inode admission limit cannot retain a false clean certificate" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "before" });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var o: Options = .{ .no_ignore = true };
+    defer o.deinit(a);
+    try o.paths.append(a, path);
+    var watch = Watch.init();
+    defer watch.deinit();
+    watch.limit = 1;
+    var journal = @import("discovery_journal.zig").Journal.init(a, io);
+    defer journal.deinit();
+    var current = try Generation.captureJournal(a, io, &o, null, &watch, &journal);
+    defer current.deinit();
+    if (!journal.sources_covered) return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = ".replacement", .data = "replacement" });
+    try tmp.dir.rename(".replacement", tmp.dir, "a.txt", io);
+    const next = try Generation.captureJournal(a, io, &o, current, &watch, &journal);
+    current.deinit();
+    current = next;
+    try std.testing.expectEqualStrings("replacement", current.entries.items[0].bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "immediate next write" });
+    const changed = try Generation.captureJournal(a, io, &o, current, &watch, &journal);
+    current.deinit();
+    current = changed;
+    try std.testing.expectEqualStrings("immediate next write", current.entries.items[0].bytes);
+}
+
+test "unwitnessed hard links cannot use directory-only content certification" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "src", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside", .data = "before" });
+    try tmp.dir.hardLink("outside", tmp.dir, "src/a.txt", io, .{});
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/src", .{tmp.sub_path});
+    defer a.free(path);
+    var o: Options = .{ .no_ignore = true };
+    defer o.deinit(a);
+    try o.paths.append(a, path);
+    var watch = Watch.init();
+    defer watch.deinit();
+    watch.limit = 0;
+    var journal = @import("discovery_journal.zig").Journal.init(a, io);
+    defer journal.deinit();
+    const old = try Generation.captureJournal(a, io, &o, null, &watch, &journal);
+    defer old.deinit();
+    try std.testing.expect(old.watch_fallback);
+    try std.testing.expect(!journal.sources_covered);
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside", .data = "changed through another name" });
+    const next = try Generation.captureJournal(a, io, &o, old, &watch, &journal);
+    defer next.deinit();
+    try std.testing.expectEqualStrings("changed through another name", next.entries.items[0].bytes);
+    try std.testing.expect(next.source_bytes_read != 0);
+}
+
+test "size-excluded inputs invalidate discovery when they become eligible" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "too large" });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var o: Options = .{ .no_ignore = true, .max_file_bytes = 4, .skip_oversize = true };
+    defer o.deinit(a);
+    try o.paths.append(a, path);
+    var watch = Watch.init();
+    defer watch.deinit();
+    var journal = @import("discovery_journal.zig").Journal.init(a, io);
+    defer journal.deinit();
+    const old = try Generation.captureJournal(a, io, &o, null, &watch, &journal);
+    defer old.deinit();
+    try std.testing.expectEqual(@as(usize, 0), old.entries.items.len);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hit" });
+    const next = try Generation.captureJournal(a, io, &o, old, &watch, &journal);
+    defer next.deinit();
+    try std.testing.expectEqual(@as(usize, 1), next.entries.items.len);
+    try std.testing.expectEqualStrings("hit", next.entries.items[0].bytes);
 }

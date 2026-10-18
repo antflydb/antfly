@@ -213,7 +213,10 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
     if (session.http) |*http| searcher.decider.shared_http = http;
     if (!plan.options.no_cache and plan.options.cache_dir != null) searcher.decider.batch_store = &session.batches;
     if (Search.incrementalEligible(&plan.options) and (plan.incremental_disabled_revision == null or !std.mem.eql(u8, &plan.incremental_disabled_revision.?, &generation.revision))) {
-        if (!plan.index.valid(plan.options.cache_ttl_seconds) or (plan.index.revision != null and !std.mem.eql(u8, &plan.index.revision.?, &generation.revision) and (generation.parent_revision == null or !std.mem.eql(u8, &plan.index.revision.?, &generation.parent_revision.?)))) plan.index.clear();
+        const same = plan.index.revision != null and std.mem.eql(u8, &plan.index.revision.?, &generation.revision);
+        const parent = plan.index.revision != null and generation.parent_revision != null and std.mem.eql(u8, &plan.index.revision.?, &generation.parent_revision.?);
+        const valid = if (same) plan.index.valid(plan.options.cache_ttl_seconds) else if (parent) plan.index.validAfter(generation.changes.items, plan.options.cache_ttl_seconds) else false;
+        if (!valid) plan.index.clear();
         searcher.incremental = &plan.index;
         if (plan.delivery != null) searcher.prior_delivery = &plan.delivery.?;
         if (delta and token != null and plan.delivery != null and std.mem.eql(u8, token.?, &plan.delivery.?.token)) searcher.delta_base = &plan.delivery.?;

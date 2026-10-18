@@ -26,7 +26,9 @@ pub const Token = struct { slot: usize, generation: u64, sequence: u64 };
 pub const Watch = struct {
     fd: c_int = -1,
     failed: bool = false,
-    limit: usize = if (builtin.os.tag == .macos) 256 else 4096,
+    // Strict kqueue witnesses consume one FD per inode. Reserve descriptor
+    // headroom and fall back explicitly above this bounded admission budget.
+    limit: usize = 4096,
     generation: u64 = 0,
     epoch: u64 = 0,
     events: [4096]u16 = undefined,
@@ -191,6 +193,10 @@ pub const Watch = struct {
             slot.dirty = false;
         };
     }
+    pub fn observed(self: *Watch, token: Token) ?Token {
+        const slot = self.get(token) orelse return null;
+        return .{ .slot = token.slot, .generation = slot.generation, .sequence = slot.sequence };
+    }
     pub fn intact(self: *Watch, token: Token) bool {
         const slot = self.get(token) orelse return false;
         return !slot.dirty and token.sequence == slot.sequence;
@@ -201,6 +207,32 @@ pub const Watch = struct {
         const slot = self.get(token) orelse return false;
         if (slot.dirty or token.sequence != slot.sequence) return false;
         const id = identity(file.handle) orelse return false;
+        return id.device == slot.device and id.inode == slot.inode;
+    }
+    /// Namespace rediscovery can retain a source without opening it only when
+    /// both its inode witness and the current pathname identity still agree.
+    pub fn unchangedPath(self: *Watch, token: Token, path: []const u8) bool {
+        if (comptime !supported) return false;
+        self.poll();
+        if (!self.intact(token) or !self.identityMatchesPath(token, path)) return false;
+        self.poll();
+        return self.intact(token);
+    }
+    pub fn identityMatchesPath(self: *Watch, token: Token, path: []const u8) bool {
+        if (comptime !supported) return false;
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const name = std.mem.printSentinel(&buffer, "{s}", .{path}, 0) catch return false;
+        const slot = self.get(token) orelse return false;
+        const id: Identity = if (comptime builtin.os.tag == .linux) blk: {
+            const linux = std.os.linux;
+            var stat: linux.Statx = undefined;
+            if (linux.statx(linux.AT.FDCWD, name, 0, .{ .INO = true }, &stat) != 0 or !stat.mask.INO) return false;
+            break :blk .{ .device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor, .inode = stat.ino };
+        } else blk: {
+            var stat: std.c.Stat = undefined;
+            if (std.c.stat(name, &stat) != 0) return false;
+            break :blk .{ .device = @as(u32, @bitCast(stat.dev)), .inode = @intCast(stat.ino) };
+        };
         return id.device == slot.device and id.inode == slot.inode;
     }
     fn dirty(slot: *Slot) void {
@@ -321,4 +353,29 @@ test "kernel witnesses observe writes, bound admission and recover from watch lo
     try std.testing.expect(!watch.clean(next, file));
     watch.limit = 0;
     try std.testing.expect(watch.arm(file) == null);
+}
+
+test "pathname identity rejects symlink retargeting independently of watch state" {
+    if (comptime !supported) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "old" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b", .data = "new" });
+    try tmp.dir.symLink(io, "a", "link", .{});
+    var file = try tmp.dir.openFile(io, "link", .{});
+    defer file.close(io);
+    var watch = Watch.init();
+    defer watch.deinit();
+    const token = watch.arm(file) orelse return error.SkipZigTest;
+    defer watch.release(token);
+    watch.certify(token);
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/link", .{tmp.sub_path});
+    defer a.free(path);
+    try std.testing.expect(watch.identityMatchesPath(token, path));
+    try tmp.dir.deleteFile(io, "link");
+    try tmp.dir.symLink(io, "b", "link", .{});
+    try std.testing.expect(!watch.identityMatchesPath(token, path));
+    try std.testing.expect(!watch.unchangedPath(token, path));
 }
