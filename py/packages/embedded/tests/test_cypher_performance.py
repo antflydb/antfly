@@ -2142,6 +2142,28 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
         },
     )
     assert result["rows"] == [[{"type": "integer", "value": "1"}]]
+    for verb, tail, expected in (
+        ("MATCH", "WHERE EXISTS { MATCH (b)-[:R]->(c:D) } RETURN count(*)", ["0"]),
+        ("MATCH", "WHERE NOT EXISTS { MATCH (b)-[:R]->(c:D) } RETURN count(DISTINCT b)", ["2"]),
+        ("OPTIONAL MATCH", "WHERE EXISTS { MATCH (b)-[:R]->(c:D) } RETURN count(*),count(b)", ["1", "0"]),
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": verb + base.removeprefix("MATCH") + tail,
+                "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == expected
+    result = db.cypher_json(
+        "g",
+        {
+            "query": window
+            + "OPTIONAL MATCH (b)<-[:R*64..64]-(c:D) WHERE EXISTS { MATCH (c)-[:R]->(d:D) WHERE false } RETURN count(*),count(c)",
+            "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+        },
+    )
+    assert [cell["value"] for cell in result["rows"][0]] == ["5000000", "0"]
     for tail in (
         "CALL { WITH b RETURN 1/0 AS n } RETURN count(*)",
         "WITH b WHERE EXISTS { MATCH (b)-[:R]->(c:D) WHERE false } AND 1/0=1 RETURN count(*)",

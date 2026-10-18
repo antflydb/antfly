@@ -2049,8 +2049,8 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         }
     };
     for ([_]bool{ false, true }) |dag| for ([_][]const u8{ "MATCH", "OPTIONAL MATCH" }) |verb| for ([_][]const u8{
-        "",                              " WHERE a.rank>=0",              " WHERE b.rank>=0",            " WHERE a.rank<0", " WHERE a.id IS NOT NULL",
-        " WHERE a.rank>1 AND b.rank>=2", " WHERE b.rank>=2 AND a.rank>1", " WHERE a.rank<2 OR b.rank>2",
+        "",                              " WHERE a.rank>=0",              " WHERE b.rank>=0",            " WHERE a.rank<0",                                    " WHERE a.id IS NOT NULL",
+        " WHERE a.rank>1 AND b.rank>=2", " WHERE b.rank>=2 AND a.rank>1", " WHERE a.rank<2 OR b.rank>2", " WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) }", " WHERE NOT EXISTS { MATCH (b)-[:CITES]->(d:Document) }",
     }) |predicate| for ([_][]const u8{
         "WITH b WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) } RETURN count(*),sum(b.rank)",
         "WITH b,[(b)-[:CITES]->(d:Document) | d.rank] AS xs UNWIND xs AS x RETURN count(*),sum(x)",
@@ -2101,8 +2101,10 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         defer expected.deinit();
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected.rows, .{}), try std.json.Stringify.valueAlloc(a, result.rows, .{}));
     };
+    try check("OPTIONAL MATCH (a:Document)-[:CITES*1..2]->(b:Document) WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) WHERE false } RETURN count(*),count(b)", "[[1,0]]");
     for ([_][]const u8{
         "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WHERE a.rank<0 AND 1/0=1 RETURN count(*)",
+        "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) WHERE false } AND 1/0=1 RETURN count(*)",
         "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WHERE 1/0=1 AND a.rank<0 RETURN count(*)",
         "MATCH (a:Document)-[:CITES*1..2 {weight:1/0}]->(b:Document) WHERE a.rank<0 RETURN count(*)",
         "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH b ORDER BY 1/0 RETURN count(*)",

@@ -1515,7 +1515,9 @@ a weighted TopK heap: excess multiplicities are trimmed at the worst key, SKIP
 consumes weights, and intermediate WITH windows pass the clipped exact bags to
 subsequent projections, filters, UNWIND, wildcard DISTINCT, MATCH, OPTIONAL MATCH
 and reductions. Pure correlated EXISTS and pattern-comprehension expressions
-run once per weighted binding, including unbounded initial MATCH pipelines,
+run once per weighted binding, including unbounded initial MATCH pipelines
+and predicates attached directly to MATCH. OPTIONAL MATCH evaluates these
+predicates before deciding whether to emit a null extension,
 preserving their own aggregate scopes. Read-only CALL subqueries use weighted
 correlated apply: returned child weights multiply the parent contribution,
 empty returning bodies suppress the parent, and unit bodies preserve it once.

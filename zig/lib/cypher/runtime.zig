@@ -2155,7 +2155,51 @@ const Engine = struct {
         };
         return self.terminal_weight_demand orelse .exact;
     }
-    fn weightedMatch(self: *Engine, input: Row, operation: ast.Match, tail: []const ast.Clause) !WeightedRows {
+    fn weightedMatch(self: *Engine, input: Row, operation: ast.Match, tail: []const ast.Clause) anyerror!WeightedRows {
+        if (operation.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate) and weightedExpression(predicate)) {
+            // Correlated predicates need the complete binding, not individual
+            // routes. Retain their dependencies in the producer, then evaluate
+            // once per bag. OPTIONAL extends only when no candidate qualifies.
+            var producer = operation;
+            producer.predicate = null;
+            producer.optional = false;
+            const dependencies = try self.a.alloc(ast.Clause, tail.len + 1);
+            dependencies[0] = .{ .span = .{}, .operation = .{ .project = .{ .value = .{ .items = &.{}, .wildcard = true, .predicate = predicate }, .final = false } } };
+            @memcpy(dependencies[1..], tail);
+            const candidates = try self.weightedMatch(input, producer, dependencies);
+            var rows: std.ArrayList(Row) = .empty;
+            var weights: std.ArrayList(u64) = .empty;
+            for (candidates.rows, candidates.weights) |row, weight| {
+                const accepted = blk: {
+                    var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+                    defer scratch.deinit();
+                    const scope = EvalScope.enter(self, scratch.allocator());
+                    defer scope.leave(self);
+                    break :blk (try (try self.eval(predicate, row, null)).truth()) == true;
+                };
+                if (accepted) {
+                    try rows.append(self.a, row);
+                    try weights.append(self.a, weight);
+                }
+            }
+            if (operation.optional and rows.items.len == 0) {
+                var extended = input;
+                for (operation.paths) |path| {
+                    if (path.alias) |alias| if (lookup(extended, alias) == null) {
+                        extended = (try self.bind(extended, alias, .null)).?;
+                    };
+                    for (path.nodes) |node| if (node.alias) |alias| if (lookup(extended, alias) == null) {
+                        extended = (try self.bind(extended, alias, .null)).?;
+                    };
+                    for (path.edges) |edge| if (edge.alias) |alias| if (lookup(extended, alias) == null) {
+                        extended = (try self.bind(extended, alias, .null)).?;
+                    };
+                }
+                try rows.append(self.a, extended);
+                try weights.append(self.a, 1);
+            }
+            return .{ .rows = rows.items, .weights = weights.items };
+        };
         var shape: Row = input;
         for (operation.paths) |path| {
             for (path.nodes) |node| if (node.alias) |name| {
@@ -2419,7 +2463,8 @@ const Engine = struct {
             }
             if (clause.operation == .match) {
                 const tail = clauses[clause_index + 1 ..];
-                if (self.weightedTail(tail) and hasCorrelatedBoundary(tail)) {
+                const correlated_predicate = if (clause.operation.match.predicate) |predicate| @import("expressions.zig").containsPattern(predicate) and weightedExpression(predicate) else false;
+                if (self.weightedTail(tail) and (hasCorrelatedBoundary(tail) or correlated_predicate)) {
                     // Lower the producer before evaluating pure correlated
                     // expressions, once per binding with its bag weight.
                     var rows_out: std.ArrayList(Row) = .empty;
