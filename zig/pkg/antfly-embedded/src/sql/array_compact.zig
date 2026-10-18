@@ -251,6 +251,13 @@ pub const ResultBuilder = union(enum) {
     /// Primitive native conversions keep a physical cursor and visit only
     /// present slots. The scalar codec remains the range/rounding oracle.
     pub fn appendConverted(self: *ResultBuilder, value: arrays.Value, work: *arrays.Budget) !bool {
+        return self.appendConvertedWithWork(value, .cast_and_emission, work);
+    }
+    pub const ConversionWork = enum(u2) { prepaid = 0, emission = 1, cast_and_emission = 2 };
+    /// Fused callers charge both logical cast visits before evaluating later
+    /// operands. Emit once for concat, or only poll when replacing a cast's
+    /// identity result; conversion still polls at each bounded native block.
+    pub fn appendConvertedWithWork(self: *ResultBuilder, value: arrays.Value, accounting: ConversionWork, work: *arrays.Budget) !bool {
         if (self.* != .fixed) return false;
         const view = value.stored orelse return false;
         const target = self.fixed.builder.state.kind;
@@ -258,24 +265,24 @@ pub const ResultBuilder = union(enum) {
         if (view.validation == null or !supported(view.kind) or view.kind == .text or !supported(target) or target == .text or !casts.allowed(view.kind, target)) return false;
         _ = try value.knownNonNullCount();
         switch (view.kind) {
-            .boolean => try self.convertFrom(bool, view.*, work),
-            .int16 => try self.convertFrom(i16, view.*, work),
-            .int32 => try self.convertFrom(i32, view.*, work),
-            .int64 => try self.convertFrom(i64, view.*, work),
-            .float32 => try self.convertFrom(f32, view.*, work),
-            .float64 => try self.convertFrom(f64, view.*, work),
+            .boolean => try self.convertFrom(bool, view.*, accounting, work),
+            .int16 => try self.convertFrom(i16, view.*, accounting, work),
+            .int32 => try self.convertFrom(i32, view.*, accounting, work),
+            .int64 => try self.convertFrom(i64, view.*, accounting, work),
+            .float32 => try self.convertFrom(f32, view.*, accounting, work),
+            .float64 => try self.convertFrom(f64, view.*, accounting, work),
             else => unreachable,
         }
         return true;
     }
-    fn convertFrom(self: *ResultBuilder, comptime Source: type, view: layout.View, work: *arrays.Budget) !void {
+    fn convertFrom(self: *ResultBuilder, comptime Source: type, view: layout.View, accounting: ConversionWork, work: *arrays.Budget) !void {
         switch (self.fixed.builder.state.kind) {
-            .boolean => try self.convertTo(Source, bool, view, work),
-            .int16 => try self.convertTo(Source, i16, view, work),
-            .int32 => try self.convertTo(Source, i32, view, work),
-            .int64 => try self.convertTo(Source, i64, view, work),
-            .float32 => try self.convertTo(Source, f32, view, work),
-            .float64 => try self.convertTo(Source, f64, view, work),
+            .boolean => try self.convertTo(Source, bool, view, accounting, work),
+            .int16 => try self.convertTo(Source, i16, view, accounting, work),
+            .int32 => try self.convertTo(Source, i32, view, accounting, work),
+            .int64 => try self.convertTo(Source, i64, view, accounting, work),
+            .float32 => try self.convertTo(Source, f32, view, accounting, work),
+            .float64 => try self.convertTo(Source, f64, view, accounting, work),
             else => unreachable,
         }
     }
@@ -303,7 +310,7 @@ pub const ResultBuilder = union(enum) {
         if (Source == f32 or Source == f64) return @intCast(try @import("builtin_cast.zig").floatingInteger(value, primitiveKind(Target)));
         return std.math.cast(Target, value) orelse error.SqlNumericOutOfRange;
     }
-    fn convertTo(self: *ResultBuilder, comptime Source: type, comptime Target: type, view: layout.View, work: *arrays.Budget) !void {
+    fn convertTo(self: *ResultBuilder, comptime Source: type, comptime Target: type, view: layout.View, accounting: ConversionWork, work: *arrays.Budget) !void {
         const state = &self.fixed.builder.state;
         const present = view.validation.?.non_null;
         if (view.count > state.count - state.index) return error.InvalidSqlArrayShape;
@@ -315,7 +322,7 @@ pub const ResultBuilder = union(enum) {
         while (at < view.count) {
             const count = @min(@as(usize, view.count) - at, 64 - state.index % 64);
             // Preserve scalar cast + emission work, including skipped NULLs.
-            try work.consume(count * 2);
+            try work.consume(count * @backingInt(accounting));
             const bits = nullBits(view, at, count);
             const mask = if (count == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
             var candidates = ~bits & mask;

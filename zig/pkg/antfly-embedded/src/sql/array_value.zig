@@ -382,13 +382,18 @@ pub const Value = struct {
         var output = try @import("array_compact.zig").ResultBuilder.initPlanned(alloc, self.element_type, dimensions, count, non_null, if (self.element_type == .text) text_bytes else null, limits);
         if (native) {
             try work.consume(self.cardinality());
+            if (count == 0) return output.finish(alloc, limits, work);
             var cursor: usize = 0;
             while (cursor < self.cardinality()) {
-                const next = nextMatch(matches.?, cursor, self.cardinality());
-                try output.appendRange(self, cursor, next - cursor, work);
+                const next = nextBit(matches.?, cursor, self.cardinality(), true);
+                if (next != cursor) try output.appendRange(self, cursor, next - cursor, work);
                 if (next == self.cardinality()) break;
-                if (replacement) |value| try output.append(value, work);
-                cursor = next + 1;
+                if (replacement) |value| {
+                    try output.append(value, work);
+                    cursor = next + 1;
+                } else {
+                    cursor = nextBit(matches.?, next + 1, self.cardinality(), false);
+                }
             }
         } else {
             for (0..self.cardinality()) |i| {
@@ -401,10 +406,11 @@ pub const Value = struct {
         return output.finish(alloc, limits, work);
     }
 
-    fn nextMatch(bitmap: []const u8, begin: usize, count: usize) usize {
+    fn nextBit(bitmap: []const u8, begin: usize, count: usize, matched: bool) usize {
         var cursor = begin;
         while (cursor < count) {
-            const byte = bitmap[cursor / 8] & (@as(u8, 0xff) << @intCast(cursor % 8));
+            const bits = if (matched) bitmap[cursor / 8] else ~bitmap[cursor / 8];
+            const byte = bits & (@as(u8, 0xff) << @intCast(cursor % 8));
             if (byte != 0) return @min(count, cursor / 8 * 8 + @ctz(byte));
             cursor = (cursor / 8 + 1) * 8;
         }
@@ -1146,5 +1152,47 @@ test "SQL native bitmap transforms match opaque scalar NULL NaN text and removal
             try std.testing.expectEqualSlices(u8, expected, actual);
             _ = try @import("../common/sql_array_layout.zig").View.open(kind, actual, .{});
         };
+    }
+}
+
+test "SQL native removal skips matched runs and empty outputs with exact work parity" {
+    const a = std.testing.allocator;
+    for (0..3) |pattern| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const region = arena.allocator();
+        const count = 65536;
+        const survivors: usize = if (pattern == 0) 0 else 17;
+        var builder = try @import("array_compact.zig").CheckedBuilder.init(region, .int64, &.{.{ .length = count, .lower = -19 }}, count, if (pattern == 2) count else survivors, 0, .{});
+        var build_work: Budget = .{};
+        for (0..count) |i| try builder.appendChecked(if (pattern != 0 and (i % 4096 == 0 or i == count - 1)) .json(.{ .integer = 9 }) else if (pattern == 2) .json(.{ .integer = 7 }) else .{}, .int64, .{}, &build_work);
+        const source = try builder.finish(region, .{});
+        var view = source.stored.?.*;
+        view.validation = null;
+        var unproven = source;
+        unproven.stored = &view;
+        const needle: Element = if (pattern == 2) .json(.{ .integer = 7 }) else .{};
+        var oracle: ?[]const u8 = null;
+        var expected_work: ?usize = null;
+        for (0..2) |mode| {
+            var elapsed: i96 = 0;
+            for (0..20) |_| {
+                var output_arena = std.heap.ArenaAllocator.init(a);
+                defer output_arena.deinit();
+                var work: Budget = .{};
+                const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+                const result = try (if (mode == 0) unproven else source).transform(output_arena.allocator(), needle, null, .{}, &work);
+                elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+                try std.testing.expectEqual(survivors, result.cardinality());
+                try std.testing.expectEqual(@as(usize, if (survivors == 0) 0 else 1), result.dimensions.len);
+                if (survivors != 0) try std.testing.expectEqual(@as(i32, -19), result.dimensions[0].lower);
+                const bytes = try @import("array_storage.zig").encodeAlloc(region, result, .{});
+                if (oracle) |expected| try std.testing.expectEqualSlices(u8, expected, bytes) else oracle = bytes;
+                if (expected_work) |expected| try std.testing.expectEqual(expected, work.remaining) else expected_work = work.remaining;
+            }
+            std.debug.print("SQL_REMOVAL_RUNS pattern={} native={} repetitions=20 elapsed_ns={} identical_canonical_and_work=true\n", .{ pattern, mode == 1, elapsed });
+        }
+        var denied: Budget = .{ .remaining = 1 };
+        try std.testing.expectError(error.SqlProgramLimitExceeded, source.transform(std.testing.failing_allocator, needle, null, .{}, &denied));
     }
 }
