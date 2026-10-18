@@ -2073,7 +2073,9 @@ fn partialAllocationRun(a: std.mem.Allocator) !void {
     _ = try reader.streamNext(&capture, PartialCapture.accept);
 }
 test "partial DASH append-only version allocation failures preserve owners and release prefix leases" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, partialAllocationRun, .{});
+    // Refuse backing remaps so every campaign enumerates the same allocations.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), partialAllocationRun, .{});
 }
 
 test "partial DASH rejects a new fragment decode gap without advancing accepted output" {

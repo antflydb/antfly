@@ -80,6 +80,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);
     tests.root_module.addImport("antfly_video", ctx.graph.inference_mod.import_table.get("antfly_video").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
     tests.root_module.addImport("jinja", ctx.graph.jinja_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
@@ -130,6 +131,10 @@ pub fn create(ctx: Context) Suite {
     cli_tests.root_module.link_libc = ctx.backend.link_libc;
 
     const run_cli_tests = ctx.addRunArtifact(cli_tests);
+    // Runtime passthrough arguments arrive after Zig 0.17's configure phase.
+    // The library runner remains strict; its default-only CLI companion may
+    // be empty only when an explicit include selector matches no CLI test.
+    run_cli_tests.addArg("--allow-empty-filtered-suite");
     for (selected_test_filters) |filter| {
         run_cli_tests.addArgs(&.{ "--test-filter", filter });
     }

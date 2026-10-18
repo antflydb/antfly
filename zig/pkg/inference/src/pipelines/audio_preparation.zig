@@ -319,24 +319,31 @@ test "audio preparation Gemma4 splits bounded waves without consuming deferred c
         fn close(_: *anyopaque) void {}
     };
     const Runner = struct {
-        fn run(a: std.mem.Allocator, session: Session, clips: []const Clip) !void {
+        fn run(a: std.mem.Allocator, session: Session, clips: []const Clip, budget: usize) !void {
             var errors: [3]?anyerror = @splat(null);
             var offset: usize = 0;
+            var waves: usize = 0;
             while (offset < clips.len) {
-                var wave = Wave.init(session, clips[offset..], errors[offset..], .{}, .gemma4, 1024 * 1024);
+                var wave = Wave.init(session, clips[offset..], errors[offset..], .{}, .gemma4, budget);
                 wave.bounded.backing = a;
                 defer wave.deinit();
                 wave.run();
                 if (wave.failure) |err| return err;
-                // Every clip fits on its own; retaining one forces the next
-                // clip into a fresh wave. No input index or error is lost.
-                try std.testing.expectEqual(@as(usize, 1), wave.consumed);
-                try std.testing.expectEqual(@as(usize, 1), wave.retained);
-                try std.testing.expectEqual(@as(usize, 0), wave.indexes[0]);
-                try std.testing.expect(wave.gemma[0].tokenCount() > 0);
+                // The exact count can change as preprocessing improves. Every
+                // successful item stays owned, and the deferred suffix is
+                // retried in the next wave without losing an index or error.
+                try std.testing.expect(wave.consumed > 0);
+                try std.testing.expectEqual(wave.consumed, wave.retained);
+                for (wave.indexes[0..wave.retained], wave.gemma[0..wave.retained], 0..) |index, prepared, expected| {
+                    try std.testing.expectEqual(expected, index);
+                    try std.testing.expect(prepared.tokenCount() > 0);
+                }
+                try std.testing.expect(wave.bounded.peak <= budget);
                 try std.testing.expect(!wave.bounded.denied);
                 offset += wave.consumed;
+                waves += 1;
             }
+            try std.testing.expect(waves >= 2);
             for (errors) |err| try std.testing.expect(err == null);
         }
     };
@@ -350,8 +357,22 @@ test "audio preparation Gemma4 splits bounded waves without consuming deferred c
         .{ .pcm = .{ .samples = &samples, .sample_rate = 16000 } },
         .{ .bytes = bytes },
     };
-    try Runner.run(std.testing.allocator, session, &clips);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{ session, &clips });
+    // Bound a wave by the largest measured single-clip peak. The final encoded
+    // clip needs that same peak, so retained earlier clips force a real split
+    // without pinning the test to an obsolete preprocessing scratch size.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var budget: usize = 0;
+    for (clips) |clip| {
+        var probe = Wave.init(session, &.{clip}, null, .{}, .gemma4, 1024 * 1024);
+        defer probe.deinit();
+        probe.bounded.backing = stable.allocator();
+        probe.run();
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), probe.retained);
+        budget = @max(budget, probe.bounded.peak);
+    }
+    try Runner.run(stable.allocator(), session, &clips, budget);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{ session, &clips, budget });
 }
 
 test "clap prepared waves preserve fusion inputs across uneven batches and memory splits" {

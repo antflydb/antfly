@@ -23,6 +23,15 @@ const builtin = @import("builtin");
 const std = @import("std");
 const platform = @import("antfly_platform");
 
+// Match the engine runner's diagnostic allocator policy. Debug-info caches
+// remain process-owned, but temporary DWARF unwind buffers must be reclaimable
+// rather than accumulating in the default debug arena across allocation tests.
+pub const debug = struct {
+    pub fn getDebugInfoAllocator() std.mem.Allocator {
+        return platform.allocator.processAllocator(platform.allocator.concurrentFallback());
+    }
+};
+
 var log_err_count: usize = 0;
 
 pub const std_options: std.Options = .{
@@ -40,11 +49,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer skip_filters.deinit(allocator);
 
     var reverse_order = false;
+    var allow_empty_filtered_suite = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--listen=-")) {
             continue;
+        } else if (std.mem.eql(u8, arg, "--allow-empty-filtered-suite")) {
+            allow_empty_filtered_suite = true;
         } else if (std.mem.eql(u8, arg, "--reverse-test-order")) {
             reverse_order = true;
         } else if (std.mem.startsWith(u8, arg, "--seed=")) {
@@ -58,7 +70,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             try filters.append(allocator, filter);
         } else if (std.mem.eql(u8, arg, "--test-filter")) {
             i += 1;
-            if (i >= args.len) @panic("missing value after --test-filter");
+            if (i >= args.len or args[i].len == 0) @panic("missing value after --test-filter");
             try filters.append(allocator, args[i]);
         } else if (std.mem.startsWith(u8, arg, "--skip-test-filter=")) {
             const filter = arg["--skip-test-filter=".len..];
@@ -66,7 +78,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             try skip_filters.append(allocator, filter);
         } else if (std.mem.eql(u8, arg, "--skip-test-filter")) {
             i += 1;
-            if (i >= args.len) @panic("missing value after --skip-test-filter");
+            if (i >= args.len or args[i].len == 0) @panic("missing value after --skip-test-filter");
             try skip_filters.append(allocator, args[i]);
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.panic("unrecognized command line argument: {s}", .{arg});
@@ -140,6 +152,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     if (selected_count == 0) {
+        if (allow_empty_filtered_suite and filters.items.len != 0 and matched_count == 0) {
+            std.debug.print("No companion tests matched focused runtime filters.\n", .{});
+            return;
+        }
         std.debug.print("No tests matched runtime filters.\n", .{});
         std.process.exit(1);
     }

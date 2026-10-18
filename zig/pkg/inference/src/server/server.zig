@@ -31264,7 +31264,7 @@ fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !
 fn deinitChunkRequestInput(allocator: std.mem.Allocator, input: lib_chunker.Input) void {
     switch (input) {
         .binary => |binary| allocator.free(binary.data),
-        .text => {},
+        .text, .source => {},
     }
 }
 

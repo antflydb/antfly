@@ -639,7 +639,9 @@ test "WebM header metadata admission outlives indexing and allocation failures r
             try std.testing.expectEqual(@as(u64, headers.pictures.len * @sizeOf(Picture) + headers.restarts.len * @sizeOf(Restart)), pool.snapshot().host_bytes);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+    // Refuse backing remaps so every campaign enumerates the same allocations.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Campaign.run, .{});
 }
 
 test "WebM metadata indexing rejects overflowing and denied shared budgets" {
@@ -762,7 +764,9 @@ test "WebM indexed replay allocation failures reclaim index bootstrap and decode
             try walkIndexed(a, &reader, options, indexed, &.{3}, &dummy, accept);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+    // Refuse backing remaps so every campaign enumerates the same allocations.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Campaign.run, .{});
 }
 
 test "WebM indexed replay preserves expanded VP9 AV1 depth chroma grain and layers" {

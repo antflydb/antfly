@@ -50,8 +50,8 @@ class TestRunnerSelection(unittest.TestCase):
             'test "environment unavailable" { return error.SkipZigTest; }\n'
             'test "debug allocator policy" { '
             "const actual = std.debug.getDebugInfoAllocator(); "
-            "try std.testing.expectEqual(std.heap.c_allocator.ptr, actual.ptr); "
             "try std.testing.expectEqual(std.heap.c_allocator.vtable, actual.vtable); "
+            "const scratch = try actual.alloc(u8, 4096); actual.free(scratch); "
             "var frames: [8]usize = undefined; "
             "for (0..2000) |_| { "
             "const trace = std.debug.captureCurrentStackTrace(.{}, &frames); "
@@ -311,6 +311,79 @@ class InferenceRunnerProgress(unittest.TestCase):
     test_progress_survives_captured_output_before_exit = (
         TestRunnerSelection.test_progress_survives_captured_output_before_exit
     )
+
+    test_debug_allocator_reclaims_without_disabling_diagnostics = (
+        TestRunnerSelection.test_debug_allocator_reclaims_without_disabling_diagnostics
+    )
+
+    def test_focused_empty_companion_is_explicit_and_primary_stays_strict(self):
+        missing = ["--test-filter", "not-in-this-owner"]
+        primary = subprocess.run(
+            [str(self.binary), *missing], capture_output=True, timeout=5, check=False
+        )
+        self.assertNotEqual(primary.returncode, 0)
+        self.assertIn(b"No tests matched runtime filters", primary.stderr)
+        companion = subprocess.run(
+            [str(self.binary), "--allow-empty-filtered-suite", *missing],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(companion.returncode, 0, companion.stderr.decode())
+        valid = subprocess.run(
+            [
+                str(self.binary),
+                "--allow-empty-filtered-suite",
+                "--test-filter",
+                "enrichment split",
+            ],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(valid.returncode, 0, valid.stderr.decode())
+        self.assertIn(b"1 selected; 1 passed", valid.stderr)
+
+    def test_empty_include_and_skip_values_remain_invalid_for_companions(self):
+        for option in ("--test-filter", "--skip-test-filter"):
+            with self.subTest(option=option):
+                result = subprocess.run(
+                    [str(self.binary), "--allow-empty-filtered-suite", option, ""],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"missing value after", result.stderr)
+
+    def test_companion_allowance_preserves_default_and_offset_validation(self):
+        empty_default = subprocess.run(
+            [
+                str(self.binary),
+                "--allow-empty-filtered-suite",
+                "--skip-test-filter",
+                "test.",
+            ],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertNotEqual(empty_default.returncode, 0)
+        self.assertIn(b"No tests matched runtime filters", empty_default.stderr)
+        exhausted = subprocess.run(
+            [
+                str(self.binary),
+                "--allow-empty-filtered-suite",
+                "--test-filter",
+                "enrichment split",
+            ],
+            env={**os.environ, "ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET": "100"},
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertNotEqual(exhausted.returncode, 0)
+        self.assertIn(b"No tests matched runtime filters", exhausted.stderr)
 
     def test_namespace_prefix_does_not_exclude_suffix_module(self):
         with tempfile.TemporaryDirectory() as directory:
