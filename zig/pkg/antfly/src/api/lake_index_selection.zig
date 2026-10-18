@@ -101,7 +101,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
         const immutable_proof = source.immutable_objects and source.plan_identity != null and root.coverage != null and
             root.coverage.?.plan != null and std.mem.eql(u8, &source.plan_identity.?, &root.coverage.?.plan.?) and
             reader != null and cached != null and store.reopen_options != null;
-        const data = if (immutable_proof) root.coverage.?.data else coverage.dataDigest(try coverage.pinData(source, context, null, null));
+        const data = if (immutable_proof) root.coverage.?.data else coverage.dataDigest(if (published.reader_protocol >= 53) try coverage.pinData(source, context, null, null) else try coverage.pinDataLegacy(source, context, null, null));
         // Delete object versions are always freshly qualified, including when
         // the data census is inherited from an identical immutable plan.
         const pinned = try coverage.finishReadDigest(source, context, data);
@@ -134,8 +134,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
         defer if (proof_lease) |lease| lease.release();
         const data = if (proof_lease) |lease|
             @as(*const coverage.DataProof, @ptrCast(@alignCast(lease.item.payload.extension))).*
-        else
-            try coverage.pinData(source, context, inventory, &metadata.by_id);
+        else if (published.reader_protocol >= 53) try coverage.pinData(source, context, inventory, &metadata.by_id) else try coverage.pinDataLegacy(source, context, inventory, &metadata.by_id);
         const pinned = if (published.reader_protocol < 47) try coverage.finishLegacy(source, context, data) else try coverage.finishReadDigest(source, context, coverage.dataDigest(data));
         if (!std.mem.eql(u8, &published.signature.source, &pinned.source)) return error.ExternalLakeIndexSourceChanged;
         if (proof_lease == null) {
@@ -187,7 +186,7 @@ const InventoryMetadata = struct {
     fn load(a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead) !InventoryMetadata {
         const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cached);
         defer a.free(bytes);
-        var inventory = try local.serverless_external_source_mod.decodeInventoryAlloc(a, bytes);
+        var inventory = try @import("lake_source_navigation.zig").decodeInventory(a, store, bytes, cancellation);
         errdefer inventory.deinit(a);
         var result: InventoryMetadata = .{ .inventory = inventory };
         errdefer result.by_id.deinit(a);
@@ -235,9 +234,17 @@ test "external lake legacy coverage proofs bind immutable plans publications and
     defer parsed.deinit();
     // Retained protocol-46 publications keep the original signature preimage
     // and inventory-backed proof memo even after protocol-47 publication.
+    const legacy_inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);
+    defer a.free(legacy_inventory_bytes);
+    var legacy_store = artifact_store;
+    legacy_store.upload_scope = try @import("../serverless/artifacts/store.zig").uploadScopeFromArtifactId(parsed.value.published.?.inventory.artifact_id);
+    var legacy_inventory = try legacy_store.putWithCancellation(legacy_inventory_bytes, .none);
+    defer legacy_inventory.deinit(a);
+    parsed.value.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
+    parsed.value.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
     parsed.value.published.?.reader_protocol = 46;
     parsed.value.published.?.source_navigation = null;
-    parsed.value.published.?.signature.source = (try coverage.finishLegacy(&source, .{}, try coverage.pinData(&source, .{}, null, null))).source;
+    parsed.value.published.?.signature.source = (try coverage.finishLegacy(&source, .{}, try coverage.pinDataLegacy(&source, .{}, null, null))).source;
     const legacy_json = try catalog.encode(a, parsed.value);
     defer a.free(legacy_json);
     const sql_table: sql.Table = .{ .id = 9, .physical_name = "lake", .schema_version = 1, .columns = &.{}, .external_base_source = binding, .external_indexes = .{ .catalog_json = legacy_json, .indexes_json = table.indexes_json, .schema_json = schema_json, .desired = parsed.value.published.?.signature.desired } };

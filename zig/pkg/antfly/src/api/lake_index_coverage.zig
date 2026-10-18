@@ -78,6 +78,25 @@ pub fn pinWithFileMap(source: *Source, context: Context, previous: ?local.server
 // delete-object evidence remains fresh for every selection.
 pub const DataProof = Hash;
 pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap) !DataProof {
+    return pinDataMode(source, context, previous, verified_files, true);
+}
+pub fn pinDataLegacy(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap) !DataProof {
+    return pinDataMode(source, context, previous, verified_files, false);
+}
+fn merkleData(source: *Source, digest: [32]u8, count: usize) !Hash {
+    var hash = Hash.init(.{});
+    hash.update("native-lake-source-data-merkle-v2");
+    try jsonPart(source.alloc, &hash, .{ .format = source.inventory.format, .source_id = source.inventory.source_id, .source_uri = source.inventory.source_uri, .snapshot_id = source.inventory.snapshot_id, .schema = source.inventory.schema_fingerprint });
+    word(&hash, count);
+    hash.update(&digest);
+    try jsonPart(source.alloc, &hash, source.inventory.deleted_row_groups);
+    return hash;
+}
+fn pinDataMode(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap, merkle: bool) !DataProof {
+    try context.ensureActive();
+    if (merkle and source.immutable_objects and !source.lazy_versions and source.verified_files == null) if (source.catalog()) |index| {
+        if (index.allStrong()) return merkleData(source, index.coverageDigest(), index.count());
+    };
     try source.ensureInventory(context);
     try source.ownInventory();
     const a = source.alloc;
@@ -177,6 +196,14 @@ pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_ex
             return std.mem.order(u8, inventory.files[left].file_id, inventory.files[right].file_id) == .lt;
         }
     }.less);
+    if (merkle) {
+        var builder: local.serverless_query_lake_inventory_catalog.CoverageBuilder = .{};
+        for (0..files.len) |position| {
+            try context.ensureActive();
+            try builder.add(files[if (sorted) position else order[position]]);
+        }
+        return merkleData(source, builder.finish(), files.len);
+    }
     word(&hash, files.len);
     for (0..files.len) |position| {
         const file = files[if (sorted) position else order[position]];
@@ -396,4 +423,48 @@ test "external lake immutable object contract avoids data HEAD while mutable cov
     // Publication still freshly checks objects even after serving qualification.
     try std.testing.expectEqual(serial, try finishDigest(&source, .{}, read_data));
     try std.testing.expectEqual(@as(usize, 8), spy.heads.load(.acquire));
+}
+
+test "external lake metadata navigation Merkle coverage matches private plans without flattening strong immutable catalogs" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("merkle-data-coverage");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const payload = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "n", .values = &.{1} }});
+    defer a.free(payload);
+    var put = try client.putObject("antfly", "part.parquet", payload, .{});
+    put.deinit(a);
+    var metadata = try client.statObject("antfly", "part.parquet");
+    defer metadata.deinit(a);
+    const manifests = local.serverless_query_lake_parquet_manifest;
+    const chunk = try std.json.Stringify.valueAlloc(a, &[_]manifests.File{.{ .file_id = "p", .object_uri = "object://antfly/part.parquet", .byte_len = payload.len, .row_count = 1, .etag = metadata.etag.? }}, .{});
+    defer a.free(chunk);
+    put = try client.putObject("antfly", "chunk.json", chunk, .{});
+    put.deinit(a);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(chunk, &digest, .{});
+    const head = try std.json.Stringify.valueAlloc(a, manifests.Head{ .version = 1, .source_id = "s", .chunks = &.{.{ .uri = "object://antfly/chunk.json", .byte_len = chunk.len, .file_count = 1, .sha256 = &std.fmt.bytesToHex(digest, .lower) }}, .file_count = 1 }, .{});
+    defer a.free(head);
+    put = try client.putObject("antfly", "head.parquet-manifest.json", head, .{});
+    put.deinit(a);
+    const schema = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"s\",\"format\":\"parquet\",\"uri\":\"file://{s}/head.parquet-manifest.json\",\"schema_fingerprint\":\"schema\",\"object_mutability\":\"immutable\"}}}}", .{directory.path()});
+    defer a.free(schema);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer binding.deinit(a);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    var lazy = try Source.openLazyCached(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{}, .{}, &cache);
+    defer lazy.deinit();
+    try std.testing.expect(lazy.catalog() != null);
+    try std.testing.expectEqual(@as(usize, 0), lazy.inventory.files.len);
+    const cached = dataDigest(try pinData(&lazy, .{}, null, null));
+    try std.testing.expectEqual(@as(usize, 0), lazy.inventory.files.len);
+    var private = try Source.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer private.deinit();
+    try std.testing.expectEqual(@as(usize, 1), private.inventory.files.len);
+    const full = dataDigest(try pinData(&private, .{}, null, null));
+    try std.testing.expectEqualDeep(full, cached);
 }

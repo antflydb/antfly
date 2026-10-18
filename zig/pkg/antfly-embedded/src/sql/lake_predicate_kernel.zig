@@ -142,6 +142,9 @@ pub fn apply(a: A, batch: types.ColumnBatch, table: catalog.Table, condition: ca
         return true;
     }
     const definition = try table.column(condition.column);
+    // Physical callbacks do not carry the SQL width. Use the typed cell
+    // boundary for REAL, including lazy encoded/dictionary lanes.
+    if (definition.element_type == .float32) return false;
     if (definition.element_type == .numeric) {
         if (vector.values != .decimal128 or definition.numeric_modifier != null) return false;
         if (condition.datum().sql_null) {

@@ -607,3 +607,17 @@ before their parent reader authority ends; saturation and oversized work retain
 serial execution. Native text admission uses streaming predicate pack proofs and
 range-local pattern proofs; fixed-frequency BM25 envelopes can also prove
 logical-order tie pruning using the scorer's actual f32 arithmetic.
+
+### Native SQL join batch delivery
+
+Join delivery stages bounded probe/build row references and retains their typed
+column owners until the next pull. Native primitive column views, frozen JSON,
+and encoded JSON pass through projection and replay without building a complete
+Datum row matrix. Output reordering follows the logical join plan even when the
+optimizer flips build/probe roles. Residual predicates evaluate over candidate
+batches before matched-state updates and outer-row emission. Null-extended rows
+never evaluate the ON expression; unsupported or lazy expressions retain scalar
+prefix/error semantics. Inseparable spilled partitions expose borrowed block
+references with the same pull boundary, rather than materializing every candidate
+row in the skew loop. Public result materialization and response-size admission
+remain at the delivery boundary.

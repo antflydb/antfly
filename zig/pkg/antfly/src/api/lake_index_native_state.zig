@@ -129,9 +129,9 @@ pub const Plan = struct {
     a: A,
     files: []File,
     changed: []bool,
-    by_id: std.StringHashMapUnmanaged(usize) = .empty,
+    by_id: local.serverless_query_lake_inventory_catalog.Positions = .empty,
     pub fn init(a: A, out: A, provider: *Provider, previous: []const File) !Plan {
-        var self: Plan = .{ .a = a, .files = try out.alloc(File, provider.source.inventory.files.len), .changed = try a.alloc(bool, provider.source.inventory.files.len) };
+        var self: Plan = .{ .a = a, .by_id = .{ .catalog = provider.source.catalog() }, .files = try out.alloc(File, provider.source.inventory.files.len), .changed = try a.alloc(bool, provider.source.inventory.files.len) };
         errdefer self.deinit();
         var old: std.StringHashMapUnmanaged(*const File) = .empty;
         defer old.deinit(a);
@@ -150,9 +150,9 @@ pub const Plan = struct {
         return self;
     }
     pub fn fromDelta(a: A, out: A, delta: @import("lake_source_navigation.zig").Delta) !Plan {
-        var self: Plan = .{ .a = a, .files = try out.dupe(File, delta.files), .changed = try a.dupe(bool, delta.changed) };
+        var self: Plan = .{ .a = a, .by_id = .{ .catalog = delta.by_id.catalog }, .files = try out.dupe(File, delta.files), .changed = try a.dupe(bool, delta.changed) };
         errdefer self.deinit();
-        for (self.files, 0..) |file, i| try self.by_id.put(a, file.id, i);
+        if (self.by_id.catalog == null) for (self.files, 0..) |file, i| try self.by_id.put(a, file.id, i);
         return self;
     }
     pub fn fromInventory(a: A, out: A, provider: *Provider, prior: local.serverless_external_source_types.Inventory) !Plan {

@@ -5855,3 +5855,39 @@ SDK/frontend builds, source/error catalogs, formatting, Python lint, whitespace,
 licenses and the Apache boundary passed. The branch includes origin/main
 through 0f85c7907f (merge b4958dd66b). Archive-scale latency/RSS and live cloud
 retention qualification remain deferred.
+
+### Protocol 53 publication and native join delivery
+
+The remaining static REAL filter gap now normalizes stored DOUBLE cells at the
+SQL width boundary while preserving each operand's comparison domain. Encoded
+physical masks decline REAL until their callback carries a SQL type descriptor;
+shared typed cell comparison handles flat and dictionary fallback consistently.
+Committed Parquet catalog admission is optional under pinned-reader pressure and
+falls back to already-loaded chunks, matching Iceberg planning.
+
+Publication writes a compact, versioned paged inventory descriptor referencing the
+existing authenticated source file tree. Canonical data coverage is a path-copied
+Merkle reduction, with cached and streaming reductions sharing one format. Strong
+immutable committed-Parquet catalogs avoid flattening merely to establish data
+coverage; unresolved Iceberg selectors and mutable sources retain qualification.
+Consumers borrow immutable catalog rank directories. Compact mutable builder
+arrays remain linear and are not described as fully delta-sized producer state.
+
+The origin/main SQL memory changes are integrated with native physical/decimal
+views, output reordering, and block-skew fallback. Native join batches expose
+primitive columns, forward encoded JSON, and evaluate residuals before outer
+match bookkeeping. Cold Parquet metadata uses bounded shared scheduling and
+serial large-object fallback. Live-provider retention and full-archive latency/RSS
+qualification remain separate from deterministic contract coverage.
+
+Qualification after integrating origin/main's SQL memory changes passed 925
+shared SQL checks (three opt-in benchmarks skipped), 226 server SQL checks,
+and 224 query-contract checks, without leaks. Lake/API sweeps passed 472, 223,
+and 319 checks; their only failures were the schema-prefetch fixture missing a
+schema and two legacy protocol fixtures retaining the new inventory descriptor.
+The corrected fixtures passed focused reruns. Frontier owners passed 26 and 70
+checks, and focused native join, protocol, coverage, navigation, and REAL
+parameter regressions passed. The real Parquet E2E suite was extended for static
+REAL comparisons but could not be rerun: available disk remained below its
+16.25 GiB admission requirement. The earlier 61-case E2E result above applies to
+the prior executable, not this merged implementation.

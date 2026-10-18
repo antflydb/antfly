@@ -192,9 +192,9 @@ fn priorInventory(a: A, store: stores.ArtifactStore, ref: local.serverless_manif
     };
     defer a.free(bytes);
     try token.check();
-    const inventory = local.serverless_external_source_mod.decodeInventoryAlloc(a, bytes) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null, // pure decode/validation failure, not provider I/O
+    const inventory = @import("lake_source_navigation.zig").decodeInventory(a, store, bytes, token) catch |err| switch (err) {
+        error.InvalidNativeLakeFileState, error.InvalidGraphPage, error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.CloudGenerationMapUnavailable, error.LakeIndexArtifactUnavailable => return null,
+        else => return err, // paged inventory reads retain operational failures
     };
     return inventory;
 }
@@ -242,27 +242,8 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     };
     // The descriptor and source navigation negotiate the same identity epoch.
     // Identity belongs to the pinned source binding, never the index build.
+    try source.ensureInventory(context);
     try source.ensureCanonicalPlan(context);
-    var inventory_view = source.inventory;
-    var qualified_files: ?[]local.serverless_external_source_types.FileEntry = null;
-    defer if (qualified_files) |files| a.free(files);
-    if (source.verified_files) |verified| {
-        const files = try a.dupe(local.serverless_external_source_types.FileEntry, source.inventory.files);
-        qualified_files = files;
-        for (files) |*file| {
-            const selected_file = verified.get(file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
-            if (!std.mem.eql(u8, file.object_uri, selected_file.object_uri) or file.byte_len != selected_file.byte_len) return error.ExternalLakeSnapshotMismatch;
-            file.etag = selected_file.etag;
-            file.version_id = selected_file.version_id;
-        }
-        inventory_view.files = files;
-    }
-    const inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, inventory_view);
-    defer a.free(inventory_bytes);
-    var inventory_artifact = try scoped.putScoped(scope, inventory_bytes, cancellation);
-    defer inventory_artifact.deinit(a);
-    const inventory: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .external_base_source, .artifact_id = inventory_artifact.artifact_id, .checksum = inventory_artifact.checksum, .byte_len = inventory_artifact.byte_len };
-    const base_source = try binding.binding.toManifestBaseSource(source.inventory.snapshot_id, inventory.artifact_id);
     var provider: @import("lake_index_row_source.zig").Provider = .{ .source = source, .context = context, .expected_delete_objects = pinned.delete_objects, .embedding_options = embedding_options, .vector_memo = memo };
     // Same-label source replacements and credential/store changes prohibit
     // reuse even if a legacy sidecar's binding happens to look identical.
@@ -332,6 +313,13 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     }
     var navigation = try navigation_api.buildProven(a, na, &scoped, &provider, prior_navigation, cancellation, pinned.data);
     provider.native_delta = navigation.delta;
+    const inventory_bytes = try navigation_api.encodeInventory(a, &provider, navigation.root);
+    defer a.free(inventory_bytes);
+    var inventory_artifact = try scoped.putScoped(scope, inventory_bytes, cancellation);
+    defer inventory_artifact.deinit(a);
+    const inventory: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .external_base_source, .metadata_version = navigation_api.inventoryVersion(inventory_bytes), .artifact_id = inventory_artifact.artifact_id, .checksum = inventory_artifact.checksum, .byte_len = inventory_artifact.byte_len };
+    const base_source = try binding.binding.toManifestBaseSource(source.inventory.snapshot_id, inventory.artifact_id);
+
     var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .reuse_published = reuse_published, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref } };
     defer progress.deinit();
     if (lease) |owner| if (owner.save_checkpoint != null) {

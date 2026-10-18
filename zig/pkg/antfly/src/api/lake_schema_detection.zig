@@ -76,7 +76,7 @@ pub fn prepare(a: A, input: []const u8, options: @import("../serverless/configur
             defer if (committed == null) inventory.deinit(a);
             if (binding.binding.snapshot_mode == .object_version_digest) if (!std.mem.eql(u8, inventory.snapshot_id, binding.binding.snapshot_mode.object_version_digest)) return error.ExternalLakeSnapshotMismatch;
             var reader = @import("antfly_local_sources").serverless_query_lake_object_reader.ObjectStorageRangeReader.init(client);
-            break :blk try schema.parquetSchema(a, inventory, reader.parquetReader());
+            break :blk try schema.parquetSchemaWithContext(a, inventory, reader.parquetReader(), context);
         },
         .iceberg => blk: {
             if (binding.binding.catalog != null) {

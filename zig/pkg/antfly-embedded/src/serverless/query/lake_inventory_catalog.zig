@@ -21,6 +21,82 @@ const decoded = @import("lake_decoded_cache.zig");
 const Context = @import("lake_read_context.zig").Context;
 const A = std.mem.Allocator;
 pub const Chunk = struct { key: [32]u8, lease: decoded.Lease };
+const Digest = [32]u8;
+const Hash = std.crypto.hash.sha2.Sha256;
+fn proofWord(hash: *Hash, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hash.update(&bytes);
+}
+fn proofPart(hash: *Hash, value: []const u8) void {
+    proofWord(hash, value.len);
+    hash.update(value);
+}
+fn optionalProofWord(hash: *Hash, value: ?u64) void {
+    hash.update(&.{@intFromBool(value != null)});
+    if (value) |number| proofWord(hash, number);
+}
+pub fn coverageFileDigest(file: external.FileEntry) Digest {
+    var hash = Hash.init(.{});
+    hash.update("native-lake-coverage-file-v2");
+    for ([_][]const u8{ file.file_id, file.object_uri, file.etag, file.version_id }) |part| proofPart(&hash, part);
+    proofWord(&hash, file.byte_len);
+    proofWord(&hash, file.row_count);
+    optionalProofWord(&hash, if (file.data_sequence_number) |n| @intCast(n) else null);
+    optionalProofWord(&hash, if (file.partition_spec_id) |n| @intCast(n) else null);
+    proofWord(&hash, file.partition_field_count);
+    proofWord(&hash, file.partition_values.len);
+    for (file.partition_values) |value| {
+        proofPart(&hash, value.column_id);
+        proofPart(&hash, value.string_value);
+    }
+    return hash.finalResult();
+}
+fn coverageBranch(left: Digest, file: Digest, right: Digest) Digest {
+    var hash = Hash.init(.{});
+    hash.update("native-lake-coverage-branch-v2");
+    hash.update(&left);
+    hash.update(&file);
+    hash.update(&right);
+    return hash.finalResult();
+}
+fn strong(file: external.FileEntry) bool {
+    return file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "object-stat:v1:") and !std.mem.startsWith(u8, file.version_id, "iceberg:"));
+}
+/// Canonical Cartesian-tree reduction over file-ID ordered entries. The bounded
+/// stack computes exactly the catalog's Merkle root without constructing nodes.
+pub const CoverageBuilder = struct {
+    const Entry = struct { id: []const u8, priority: u64, left: Digest, file: Digest };
+    stack: [256]Entry = undefined,
+    len: usize = 0,
+    previous: ?[]const u8 = null,
+    pub fn add(self: *@This(), file: external.FileEntry) !void {
+        if (self.previous) |id| if (!std.mem.lessThan(u8, id, file.file_id)) return error.InvalidExternalSourceInventory;
+        self.previous = file.file_id;
+        var hash: Digest = undefined;
+        std.crypto.hash.Blake3.hash(file.file_id, &hash, .{});
+        const priority = std.mem.readInt(u64, hash[0..8], .little);
+        var left: Digest = @splat(0);
+        while (self.len != 0) {
+            const top = self.stack[self.len - 1];
+            if (priority > top.priority or (priority == top.priority and !std.mem.lessThan(u8, file.file_id, top.id))) break;
+            self.len -= 1;
+            left = coverageBranch(top.left, top.file, left);
+        }
+        if (self.len == self.stack.len) return error.InvalidExternalSourceInventory;
+        self.stack[self.len] = .{ .id = file.file_id, .priority = priority, .left = left, .file = coverageFileDigest(file) };
+        self.len += 1;
+    }
+    pub fn finish(self: *@This()) Digest {
+        var right: Digest = @splat(0);
+        while (self.len != 0) {
+            self.len -= 1;
+            const top = self.stack[self.len];
+            right = coverageBranch(top.left, top.file, right);
+        }
+        return right;
+    }
+};
 const Node = struct {
     refs: std.atomic.Value(usize) = .init(1),
     a: A,
@@ -31,6 +107,8 @@ const Node = struct {
     count: usize,
     rows: u64,
     bytes: u64,
+    coverage: Digest = @splat(0),
+    strong_count: usize = 0,
     fn retain(node: ?*Node) ?*Node {
         if (node) |value| _ = value.refs.fetchAdd(1, .monotonic);
         return node;
@@ -47,6 +125,8 @@ const Node = struct {
         var hash: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(file.file_id, &hash, .{});
         node.* = .{ .a = a, .file = file, .left = retain(left), .right = retain(right), .priority = std.mem.readInt(u64, hash[0..8], .little), .count = 1 + (if (left) |v| v.count else 0) + (if (right) |v| v.count else 0), .rows = file.row_count +| (if (left) |v| v.rows else 0) +| (if (right) |v| v.rows else 0), .bytes = file.byte_len +| (if (left) |v| v.bytes else 0) +| (if (right) |v| v.bytes else 0) };
+        node.coverage = coverageBranch(if (left) |n| n.coverage else @splat(0), coverageFileDigest(file.*), if (right) |n| n.coverage else @splat(0));
+        node.strong_count = @intFromBool(strong(file.*)) + (if (left) |n| n.strong_count else 0) + (if (right) |n| n.strong_count else 0);
         return node;
     }
     fn summarize(node: ?*Node, depth: usize) !void {
@@ -57,6 +137,8 @@ const Node = struct {
         value.count = 1 + (if (value.left) |n| n.count else 0) + (if (value.right) |n| n.count else 0);
         value.rows = value.file.row_count +| (if (value.left) |n| n.rows else 0) +| (if (value.right) |n| n.rows else 0);
         value.bytes = value.file.byte_len +| (if (value.left) |n| n.bytes else 0) +| (if (value.right) |n| n.bytes else 0);
+        value.coverage = coverageBranch(if (value.left) |n| n.coverage else @splat(0), coverageFileDigest(value.file.*), if (value.right) |n| n.coverage else @splat(0));
+        value.strong_count = @intFromBool(strong(value.file.*)) + (if (value.left) |n| n.strong_count else 0) + (if (value.right) |n| n.strong_count else 0);
     }
     fn precedes(priority: u64, id: []const u8, other: *const Node) bool {
         return priority < other.priority or (priority == other.priority and std.mem.lessThan(u8, id, other.file.file_id));
@@ -148,6 +230,39 @@ pub const Ordering = struct {
         a.destroy(self);
     }
 };
+/// File-ID ranks borrow the immutable catalog instead of building another
+/// archive-sized hash table in each publication consumer. Flat legacy plans
+/// retain an owned map with the same lookup contract.
+pub const Positions = struct {
+    catalog: ?*const Index = null,
+    map: std.StringHashMapUnmanaged(usize) = .empty,
+    pub const empty: @This() = .{};
+    pub fn get(self: *const @This(), id: []const u8) ?usize {
+        if (self.catalog) |index| {
+            // Canonical source ordering already owns this rank directory.
+            // Borrow it when resident; never allocate one merely for lookup.
+            const order = index.ordering2.load(.acquire) orelse index.ordering.load(.acquire);
+            return if (order) |ready| ready.by_id.get(id) else index.positionOf(id);
+        }
+        return self.map.get(id);
+    }
+    pub fn contains(self: *const @This(), id: []const u8) bool {
+        return self.get(id) != null;
+    }
+    pub fn ensureTotalCapacity(self: *@This(), a: A, count: u32) !void {
+        if (self.catalog == null) try self.map.ensureTotalCapacity(a, count);
+    }
+    pub fn putAssumeCapacity(self: *@This(), id: []const u8, position: usize) void {
+        if (self.catalog == null) self.map.putAssumeCapacity(id, position);
+    }
+    pub fn put(self: *@This(), a: A, id: []const u8, position: usize) !void {
+        if (self.catalog == null) try self.map.put(a, id, position);
+    }
+    pub fn deinit(self: *@This(), a: A) void {
+        self.map.deinit(a);
+        self.* = .{};
+    }
+};
 pub const Index = struct {
     census_mu: std.atomic.Mutex = .unlocked,
     census: ?*@import("lake_file_census.zig").Census = null,
@@ -214,6 +329,12 @@ pub const Index = struct {
     pub fn count(self: *const Index) usize {
         return if (self.root) |root| root.count else 0;
     }
+    pub fn coverageDigest(self: *const Index) Digest {
+        return if (self.root) |root| root.coverage else @splat(0);
+    }
+    pub fn allStrong(self: *const Index) bool {
+        return self.count() == (if (self.root) |root| root.strong_count else 0);
+    }
     pub fn rows(self: *const Index) u64 {
         return if (self.root) |root| root.rows else 0;
     }
@@ -228,6 +349,22 @@ pub const Index = struct {
     pub fn acquireChunk(self: *const Index, key: [32]u8) ?decoded.Lease {
         const position = self.by_key.get(key) orelse return null;
         return self.chunks[position].lease.retain();
+    }
+    pub fn positionOf(self: *const Index, id: []const u8) ?usize {
+        var current = self.root;
+        var rank: usize = 0;
+        while (current) |node| {
+            const left = if (node.left) |child| child.count else 0;
+            switch (std.mem.order(u8, id, node.file.file_id)) {
+                .eq => return rank + left,
+                .lt => current = node.left,
+                .gt => {
+                    rank += left + 1;
+                    current = node.right;
+                },
+            }
+        }
+        return null;
     }
     pub fn find(self: *const Index, id: []const u8) ?*const external.FileEntry {
         var current = self.root;
@@ -524,6 +661,14 @@ test "external lake metadata navigation persistent catalogs reuse chunks and def
     try std.testing.expectEqual(@as(usize, 1), next.new_files);
     try std.testing.expect(old.find("file-0001") == next.find("file-0001"));
     try std.testing.expectEqual(@as(usize, 201), next.count());
+    var positions: Positions = .{ .catalog = next };
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try positions.ensureTotalCapacity(none.allocator(), 1_000_000);
+    var ordered_files = next.iterator();
+    var rank: usize = 0;
+    while (try ordered_files.next()) |file| : (rank += 1) try std.testing.expectEqual(@as(?usize, rank), positions.get(file.file_id));
+    try std.testing.expect(positions.get("absent") == null);
+    try std.testing.expectEqual(@as(u32, 0), positions.map.count());
     try std.testing.expect(next.ordering.load(.acquire) == null);
     const unchanged = try Index.build(a, next, next.chunks, .{});
     defer unchanged.release();

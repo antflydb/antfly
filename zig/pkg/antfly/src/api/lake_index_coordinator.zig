@@ -522,6 +522,14 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     try std.testing.expect(try durableDirectoryAvailable(a, &store, recovered.value.published.?, .none));
     // A complete older directory is still a refresh obligation after a
     // reader-format upgrade, even when every source signature is unchanged.
+    const legacy_inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);
+    defer a.free(legacy_inventory_bytes);
+    var legacy_store = store.artifactStore();
+    legacy_store.upload_scope = try @import("../serverless/artifacts/store.zig").uploadScopeFromArtifactId(recovered.value.published.?.inventory.artifact_id);
+    var legacy_inventory = try legacy_store.putWithCancellation(legacy_inventory_bytes, .none);
+    defer legacy_inventory.deinit(a);
+    recovered.value.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
+    recovered.value.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
     recovered.value.published.?.reader_protocol = 33;
     recovered.value.published.?.source_navigation = null;
     const historical = try catalog.encode(a, recovered.value);
@@ -582,6 +590,8 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         var forced = refreshed.value;
         forced.published.?.reader_protocol = 31;
         forced.published.?.source_navigation = null;
+        forced.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
+        forced.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
         const forced_catalog = try catalog.encode(a, forced);
         a.free(mock.owned.?);
         mock.owned = forced_catalog;
@@ -694,6 +704,8 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             var forced = ordered_resumed.value;
             forced.published.?.reader_protocol = 31;
             forced.published.?.source_navigation = null;
+            forced.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
+            forced.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
             const forced_catalog = try catalog.encode(a, forced);
             a.free(mock.owned.?);
             mock.owned = forced_catalog;

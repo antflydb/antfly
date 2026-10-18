@@ -1955,3 +1955,35 @@ unchanged-chunk sharing, and cold search/SQL count with an old file chunk
 unavailable. It also covers saved public IDs through first index publication,
 index removal and restart, for both plain and dictionary Parquet DOUBLE values
 exposed as SQL REAL. All 61 Parquet/Iceberg cases passed on the final executable.
+
+### Publication metadata and bounded cold discovery (protocol 53)
+
+Ordinary native publication writes an `ANLIP001` inventory descriptor containing
+only the source header, reclamation domain, file count, and authenticated file-tree
+root. The source-navigation root retains the same tree through the existing GC,
+reader-lease, cloud-generation, and retention-certificate closure. Inventory
+metadata version 1 requires reader protocol 53 and a source-navigation root;
+older flat inventory artifacts remain readable. Explicit legacy row-group delete
+vectors retain flat encoding, because their validation needs row-group metadata.
+Full inventory reconstruction is reserved for compatibility/reconciliation paths
+and preserves provider failures and cancellation while walking authenticated pages.
+
+Persistent immutable file catalogs reduce canonical data coverage through a
+Cartesian Merkle tree over file IDs. Path-copy updates recompute only changed
+branches; a bounded stack computes the same digest for uncached plans. Immutable
+committed Parquet with strong provider selectors can use that root directly.
+Iceberg's unresolved synthetic selectors still require provider qualification;
+mutable data keeps fresh checks. Delete-object evidence is always qualified
+independently. Pre-53 readers retain the earlier canonical data proof algorithm.
+Publication consumers borrow the catalog's existing file-rank directory, with a
+bounded tree lookup fallback, rather than copying an independent hash table for
+every builder. Compact mutable producer state arrays remain linear in file count.
+
+Committed Parquet chunk discovery and schema-footer inference use at most three
+jobs on the shared I/O scheduler. Each private speculative decode admits 8 MiB;
+shared chunk decoding retains its independent node-wide loading/residency limits.
+Large private metadata falls back to serial decoding under the original limits.
+Results merge in source order, request allocators are synchronized while jobs are
+active, and every error/cancellation drains outstanding jobs before releasing
+source or allocator ownership. Schema inference drains the batch before allocating
+into its returned arena. Scheduler saturation keeps required reads synchronous.

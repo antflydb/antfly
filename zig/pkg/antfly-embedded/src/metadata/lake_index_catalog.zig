@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 52;
+pub const native_reader_protocol: u16 = 53;
 
 // Catalog envelopes must remain readable so reconciliation can replace older
 // derived formats. Serving still requires the current reader protocol.
@@ -169,6 +169,9 @@ pub const Publication = struct {
         }
         try artifactValid(self.inventory);
         if (self.inventory.kind != .external_base_source) return error.InvalidLakeIndexCatalog;
+        // Paged inventory closure is reachable through the mandatory source
+        // navigation root. Older readers cannot interpret its descriptor.
+        if (self.inventory.metadata_version > 1 or (self.inventory.metadata_version == 1 and (self.reader_protocol < 53 or self.source_navigation == null))) return error.InvalidLakeIndexCatalog;
         const source = switch (self.base_source) {
             .external_parquet, .external_iceberg => |v| v,
             else => unreachable,
@@ -448,6 +451,14 @@ test "metadata.lake index publication preserves ready roots and fences changed d
         .inventory = inventory,
         .declarations = &.{},
     };
+    var paged = publication;
+    paged.inventory.metadata_version = 1;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, paged.validate());
+    paged.namespace = @splat(1);
+    paged.source_navigation = .{ .kind = .doc_values, .metadata_version = 4, .artifact_id = "navigation", .byte_len = 42, .checksum = inventory.checksum };
+    try paged.validate();
+    paged.reader_protocol = 52;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, paged.validate());
     // A reader upgrade must parse both historical pending attempts and ready
     // publications before it can rebuild them under the current protocol.
     for (24..native_reader_protocol + 1) |protocol| {

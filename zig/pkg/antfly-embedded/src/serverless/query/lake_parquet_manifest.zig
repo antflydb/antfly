@@ -107,6 +107,38 @@ const Loader = struct {
         item.payload = .{ .iceberg_chunk = try readChunk(item.budget.allocator(), self.request, self.chunk) };
     }
 };
+const scheduler = @import("../../sql/parallel_scheduler.zig");
+const LoadedChunk = union(enum) {
+    serial,
+    lease: decoded.Lease,
+    private: external.Inventory,
+    fn release(self: *LoadedChunk, a: A) void {
+        switch (self.*) {
+            .serial => {},
+            .lease => |lease| lease.release(),
+            .private => |*inventory| inventory.deinit(a),
+        }
+    }
+};
+fn loadPlanChunk(a: A, request: Request, chunk: Chunk, prior: ?*catalogs.Index) anyerror!LoadedChunk {
+    try request.context.ensureActive();
+    if (request.chunks) |cache| {
+        const key = chunkKey(request, chunk);
+        if (prior) |index| if (index.acquireChunk(key)) |lease| return .{ .lease = lease };
+        var loader: Loader = .{ .request = request, .chunk = chunk };
+        return .{ .lease = try cache.acquire(key, 64 * 1024 * 1024, request.context, .{ .ptr = &loader, .load = Loader.load }) };
+    }
+    return .{ .private = try readChunk(a, request, chunk) };
+}
+fn loadPlanChunkBounded(a: A, request: Request, chunk: Chunk, prior: ?*catalogs.Index) anyerror!LoadedChunk {
+    // Shared decodes have their own node-wide loading/residency admission.
+    if (request.chunks != null) return loadPlanChunk(a, request, chunk, prior);
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+    return loadPlanChunk(budget.allocator(), request, chunk, prior) catch |err| {
+        if (err == error.OutOfMemory and budget.isLocallyExhausted()) return .serial;
+        return err;
+    };
+}
 fn readChunk(a: A, request: Request, chunk: Chunk) !external.Inventory {
     try request.context.ensureActive();
     var client = request.client;
@@ -181,32 +213,69 @@ pub fn plan(a: A, request: Request, bytes: []const u8) !iceberg.SnapshotWithDele
     const prior = if (request.catalogs) |cache| cache.get(family) else null;
     defer if (prior) |index| index.release();
     var residency: usize = 0;
-    for (parsed.value.chunks) |chunk| {
-        try request.context.ensureActive();
-        if (request.chunks) |cache| {
-            const key = chunkKey(request, chunk);
-            var loader: Loader = .{ .request = request, .chunk = chunk };
-            const lease = if (prior) |index| index.acquireChunk(key) orelse try cache.acquire(key, 64 * 1024 * 1024, request.context, .{ .ptr = &loader, .load = Loader.load }) else try cache.acquire(key, 64 * 1024 * 1024, request.context, .{ .ptr = &loader, .load = Loader.load });
-            leases.append(a, lease) catch |err| {
-                lease.release();
-                return err;
+    // At most three decoded metadata chunks are in flight. The shared I/O
+    // scheduler admits 8 MiB per job; shared decodes have independent
+    // loading admission and larger private chunks fall back to serial reads.
+    // A request allocator may be an arena; synchronize every allocation made
+    // while workers are active, including result-list growth on this thread.
+    var locked: scheduler.LockedAllocator = .{ .backing = a };
+    const work = locked.allocator();
+    var offset: usize = 0;
+    while (offset < parsed.value.chunks.len) {
+        const count = @min(3, parsed.value.chunks.len - offset);
+        var tasks: [3]?scheduler.Task(anyerror!LoadedChunk) = @splat(null);
+        var ready: [3]?LoadedChunk = @splat(null);
+        defer {
+            for (&tasks) |*task| if (task.*) |pending| {
+                var running = pending;
+                if (running.cancel(request.context.io.?)) |result| {
+                    var loaded = result;
+                    loaded.release(work);
+                } else |_| {}
             };
-            residency +|= lease.item.budget.live;
-            if (residency > 256 * 1024 * 1024) return error.ExternalSourceSnapshotTooLarge;
-            try chunks.append(a, .{ .key = key, .lease = lease });
-        } else {
-            var part = try readChunk(a, request, chunk);
-            owned.append(a, part) catch |err| {
-                part.deinit(a);
-                return err;
-            };
+            for (&ready) |*result| if (result.*) |*loaded| loaded.release(work);
         }
+        for (parsed.value.chunks[offset..][0..count], 0..) |chunk, slot| {
+            try request.context.ensureActive();
+            if (request.context.io) |io| tasks[slot] = scheduler.global().submitIoTransient(io, 8 * 1024 * 1024, loadPlanChunkBounded, .{ work, request, chunk, prior });
+            if (tasks[slot] == null) ready[slot] = try loadPlanChunkBounded(work, request, chunk, prior);
+        }
+        // Deterministic head order also defines which provider failure wins.
+        for (parsed.value.chunks[offset..][0..count], 0..) |chunk, slot| {
+            if (tasks[slot]) |pending| {
+                var running = pending;
+                tasks[slot] = null;
+                ready[slot] = try running.await(request.context.io.?);
+            }
+            try request.context.ensureActive();
+            if (ready[slot].? == .serial) ready[slot] = try loadPlanChunk(work, request, chunk, prior);
+            switch (ready[slot].?) {
+                .serial => unreachable,
+                .lease => |lease| {
+                    residency +|= lease.item.budget.live;
+                    if (residency > 256 * 1024 * 1024) return error.ExternalSourceSnapshotTooLarge;
+                    try leases.append(work, lease);
+                    ready[slot] = null;
+                    try chunks.append(work, .{ .key = chunkKey(request, chunk), .lease = lease });
+                },
+                .private => |part| {
+                    try owned.append(work, part);
+                    ready[slot] = null;
+                },
+            }
+        }
+        offset += count;
     }
     if (request.catalogs) |cache| {
-        const index = try cache.build(family, prior, chunks.items, request.context);
-        errdefer index.release();
-        if (index.count() != parsed.value.file_count) return error.InvalidExternalSourceSnapshot;
-        return .{ .inventory = inventory, .catalog = index };
+        const catalog = cache.build(family, prior, chunks.items, request.context) catch |err| switch (err) {
+            error.OutOfMemory => null,
+            else => return err,
+        };
+        if (catalog) |index| {
+            errdefer index.release();
+            if (index.count() != parsed.value.file_count) return error.InvalidExternalSourceSnapshot;
+            return .{ .inventory = inventory, .catalog = index };
+        }
     }
     const files = try a.alloc(external.FileEntry, parsed.value.file_count);
     var count: usize = 0;
@@ -262,11 +331,17 @@ test "external lake metadata navigation Parquet commits check chunks reuse catal
     defer chunks.deinit();
     var cache: catalogs.Cache = .{ .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 } };
     defer cache.deinit();
-    var request: Request = .{ .client = client, .source = "s", .uri = "object://antfly/head.parquet-manifest.json", .schema = "schema", .chunks = &chunks, .catalogs = &cache, .scope = @splat(1) };
+    var request: Request = .{ .client = client, .source = "s", .uri = "object://antfly/head.parquet-manifest.json", .schema = "schema", .chunks = &chunks, .catalogs = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
     var first = try plan(a, request, bytes);
     defer first.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), first.inventory.files.len);
     try std.testing.expectEqual(@as(usize, 1), first.catalog.?.count());
+    try std.testing.expect(first.catalog.?.allStrong());
+    var proof: catalogs.CoverageBuilder = .{};
+    var proof_files = first.catalog.?.iterator();
+    while (try proof_files.next()) |file| try proof.add(file.*);
+    try std.testing.expectEqualDeep(proof.finish(), first.catalog.?.coverageDigest());
+
     const CensusHash = struct {
         calls: usize = 0,
         fn get(raw: *anyopaque, id: []const u8) ![32]u8 {
@@ -299,13 +374,28 @@ test "external lake metadata navigation Parquet commits check chunks reuse catal
     defer changed.release();
     try std.testing.expectEqual(@as(usize, 1), hasher.calls);
     try std.testing.expectEqual(@as(u64, 2), changed.summary().?.count);
+    proof = .{};
+    proof_files = refreshed.catalog.?.iterator();
+    while (try proof_files.next()) |file| try proof.add(file.*);
+    try std.testing.expectEqualDeep(proof.finish(), refreshed.catalog.?.coverageDigest());
+
     try std.testing.expectEqual(@as(u64, 1), initial.summary().?.count);
+    // Eviction cannot reclaim catalogs held by older cuts. Admission remains
+    // optional and falls back to a private plan from the already pinned chunks.
+    cache.budget.limit = cache.budget.live;
+    var fallback = try plan(a, request, next_bytes);
+    defer fallback.deinit(a);
+    try std.testing.expect(fallback.catalog == null);
+    try std.testing.expectEqual(@as(usize, 2), fallback.inventory.files.len);
+    try std.testing.expectEqualStrings("part", fallback.inventory.files[0].file_id);
+    try std.testing.expectEqual(@as(usize, 1), first.catalog.?.count());
     request.catalogs = null;
     var full = try plan(a, request, bytes);
     defer full.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), full.inventory.files.len);
     try std.testing.expectEqualStrings("part", full.inventory.files[0].file_id);
     request.chunks = null;
+    request.context.io = null;
     const Failure = struct {
         fn run(alloc: A, req: Request, head_bytes: []const u8) !void {
             var snapshot = try plan(alloc, req, head_bytes);

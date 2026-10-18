@@ -5986,6 +5986,16 @@ def test_real_join_filters_and_source_ids_survive_index_lifecycle(tmp_path, dict
 
         def verify():
             assert sql("SELECT id, _id FROM real_identity ORDER BY id") == original
+            # Static pushed filters share the same declared REAL boundary as
+            # projection and join filters, including DOUBLE-backed dictionaries.
+            rounded = "0.10000000149011612"
+            for op in ["=", "<>", "<", "<=", ">", ">="]:
+                assert sql(
+                    f"SELECT id FROM real_identity WHERE n {op} {rounded} ORDER BY id"
+                ) == sql(
+                    f"SELECT id FROM real_identity WHERE n + 0 {op} {rounded} ORDER BY id"
+                )
+            assert len(sql(f"SELECT id FROM real_identity WHERE n = {rounded}")) == 38
             expected = sql(
                 "SELECT t.id, t.n FROM real_identity t "
                 "JOIN (VALUES (0.1::real)) v(k) ON t.n + 0 = v.k ORDER BY t.id"

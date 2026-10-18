@@ -46,7 +46,7 @@ pub const Provider = struct {
     pub const Statistics = struct {
         ptr: *anyopaque,
         columns: []const []const u8,
-        files: *const std.StringHashMapUnmanaged(usize),
+        files: *const local.serverless_query_lake_inventory_catalog.Positions,
         needed: *const fn (*anyopaque, usize) bool,
         save: *const fn (*anyopaque, usize, []const local.sql_catalog.StatisticsSketch) anyerror!void,
     };

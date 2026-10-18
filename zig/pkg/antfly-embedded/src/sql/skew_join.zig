@@ -20,6 +20,8 @@ const spill = @import("spill.zig");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
 pub const Pair = struct { left: ?[]const scalar.Datum, right: ?[]const scalar.Datum, match: ?usize = null };
+pub const NativeRow = struct { block: *spill.Sequential.OwnedBlock, index: usize };
+pub const NativePair = struct { left: ?NativeRow, right: ?NativeRow, match: ?usize = null };
 pub const Join = struct {
     a: A,
     manager: *spill.Manager,
@@ -103,9 +105,14 @@ pub const Join = struct {
     }
     pub fn next(self: *Join, build: *spill.Sequential, probes: ?*spill.Sequential) !?Pair {
         _ = self.output.reset(.{ .retain_with_limit = 8192 });
+        const a = self.output.allocator();
+        const pair = try self.nextNative(build, probes, true) orelse return null;
+        return .{ .left = if (pair.left) |row| (try row.block.row(a, row.index)).values else null, .right = if (pair.right) |row| (try row.block.row(a, row.index)).values else null, .match = pair.match };
+    }
+    /// Returned rows borrow one probe/build block pair until the next advancing pull.
+    pub fn nextNative(self: *Join, build: *spill.Sequential, probes: ?*spill.Sequential, may_advance: bool) !?NativePair {
         self.last_match = null;
         self.last_probe = null;
-        const a = self.output.allocator();
         while (true) {
             try self.manager.check();
             if (self.probe_done) {
@@ -115,12 +122,14 @@ pub const Join = struct {
                 while (self.build_row < block.count()) {
                     const row = self.build_row;
                     self.build_row += 1;
-                    if (self.build_matches[row] == 0) return .{ .left = null, .right = (try block.row(a, row)).values };
+                    if (self.build_matches[row] == 0) return .{ .left = null, .right = .{ .block = block, .index = row } };
                 }
+                if (!may_advance) return null;
                 try self.releaseBuild();
                 continue;
             }
             if (self.probe_input == null) {
+                if (!may_advance) return null;
                 if (probes == null or self.probe_next == probes.?.size) {
                     self.probe_done = true;
                     try self.releaseBuild();
@@ -142,8 +151,9 @@ pub const Join = struct {
                 if (self.outer_left) while (self.unmatched_probe < probe_block.count()) {
                     const row = self.unmatched_probe;
                     self.unmatched_probe += 1;
-                    if (!self.probe_matches[row]) return .{ .left = (try probe_block.row(a, row)).values, .right = null };
+                    if (!self.probe_matches[row]) return .{ .left = .{ .block = probe_block, .index = row }, .right = null };
                 };
+                if (!may_advance) return null;
                 self.probe_input.?.deinit();
                 self.probe_input = null;
                 continue;
@@ -168,11 +178,12 @@ pub const Join = struct {
                     const index = @as(usize, @intCast(self.build_first)) + self.build_row;
                     self.last_match = index;
                     self.last_probe = row;
-                    return .{ .left = (try probe_block.row(a, row)).values, .right = (try build_block.row(a, self.build_row)).values, .match = index };
+                    return .{ .left = .{ .block = probe_block, .index = row }, .right = .{ .block = build_block, .index = self.build_row }, .match = index };
                 }
                 self.probe_row = 0;
                 self.build_row += 1;
             }
+            if (!may_advance) return null;
             try self.releaseBuild();
         }
     }

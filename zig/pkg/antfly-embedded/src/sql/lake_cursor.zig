@@ -1096,7 +1096,7 @@ pub fn matchesColumns(page: catalog.ColumnPage, alloc: Allocator, table: catalog
         }
         if (cell.sql_null or condition.value == .null) return false;
         const column = try table.column(condition.column);
-        const stored = try @import("lake_values.zig").comparisonDatum(alloc, cell, column);
+        const stored = try @import("lake_values.zig").storedComparisonDatum(alloc, cell, column);
         const literal = try @import("lake_values.zig").comparisonDatum(alloc, condition.datum(), column);
         const order = try scalar.compareDatums(stored, literal);
         const match = switch (condition.op) {
@@ -2841,4 +2841,25 @@ test "lake SQL selected projections decode survivors across misaligned page boun
     // Both predicate and projected payload now materialize only survivors.
     try std.testing.expectEqual(count * 2, owner.stream.page_cursor.?.selected_values_decoded);
     try std.testing.expectEqual(@as(usize, 4), owner.stream.page_cursor.?.encoded_predicate_pages);
+}
+
+test "lake SQL pushed REAL masks normalize stored DOUBLE values without narrowing operands" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "real", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .float32 }} };
+    const rounded: f64 = @as(f32, 0.1);
+    for ([_]@import("../storage/rowsource/types.zig").ColumnVector{
+        .{ .name = "n", .values = .{ .f64 = &.{ 0.1, 0.2 } } },
+        .{ .name = "n", .values = .{ .dictionary_f64 = .{ .values = &.{ 0.1, 0.2 }, .indices = &.{ 0, 1 } } } },
+    }) |vector| {
+        const batch: @import("../storage/rowsource/types.zig").ColumnBatch = .{ .snapshot = .{ .table_id = "s", .snapshot_id = "c" }, .columns = &.{vector}, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" } } };
+        const page: catalog.ColumnPage = .{ .batch = batch, .selection = &.{0} };
+        var mask = [_]bool{ true, true };
+        const condition: catalog.Condition = .{ .column = "n", .op = .eq, .value = .{ .float = rounded } };
+        try std.testing.expect(!try @import("lake_predicate_kernel.zig").apply(arena.allocator(), batch, table, condition, &mask));
+        try std.testing.expect(try matchesColumns(page, arena.allocator(), table, &.{condition}));
+        try std.testing.expect(!try matchesColumns(page, arena.allocator(), table, &.{.{ .column = "n", .op = .eq, .value = .{ .float = 0.1 } }}));
+        try std.testing.expect(try matchesColumns(page, arena.allocator(), table, &.{.{ .column = "n", .op = .gt, .value = .{ .float = 0.1 } }}));
+    }
 }

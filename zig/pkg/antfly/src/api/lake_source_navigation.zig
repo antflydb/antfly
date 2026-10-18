@@ -68,6 +68,121 @@ pub fn dependencies(root: Root) [4 + max_costing_columns]?tree.Ref {
     for (root.costing, 0..) |column, i| refs[i + 4] = column.files;
     return refs;
 }
+// Protocol 53 publishes an inventory header plus the authenticated file tree.
+// Its pages are also reached through source_navigation by every GC/retention
+// walker. Full inventory decoding is a compatibility fallback, not publication.
+const inventory_magic = "ANLIP001";
+pub fn inventoryVersion(bytes: []const u8) u16 {
+    return if (std.mem.startsWith(u8, bytes, inventory_magic)) 1 else 0;
+}
+const InventoryDescriptor = struct {
+    header: Inventory,
+    domain: [32]u8,
+    files: ?tree.Ref,
+    count: u32,
+};
+pub fn encodeInventory(a: A, provider: *Provider, root: Root) ![]u8 {
+    var header = provider.source.inventory;
+    if (header.deleted_row_groups.len != 0) {
+        const files = try a.alloc(local.serverless_external_source_types.FileEntry, header.files.len);
+        defer a.free(files);
+        for (header.files, files) |file, *out| {
+            out.* = qualified(provider, file);
+            out.row_groups = file.row_groups;
+        }
+        header.files = files;
+        return local.serverless_external_source_mod.encodeInventoryAlloc(a, header);
+    }
+    if (root.count != header.files.len or !std.mem.eql(u8, root.source, header.source_id) or !std.mem.eql(u8, root.snapshot, header.snapshot_id) or !std.mem.eql(u8, root.schema, header.schema_fingerprint) or root.public_identity_version != header.row_identity_version) return error.InvalidNativeLakeFileState;
+    header.files = &.{};
+    const bytes = try std.json.Stringify.valueAlloc(a, InventoryDescriptor{ .header = header, .domain = root.domain, .files = root.files, .count = root.count }, .{});
+    defer a.free(bytes);
+    return std.mem.concat(a, u8, &.{ inventory_magic, bytes });
+}
+pub fn decodeInventory(a: A, store: stores.ArtifactStore, bytes: []const u8, token: Token) !Inventory {
+    const codec = local.serverless_external_source_mod;
+    if (!std.mem.startsWith(u8, bytes, inventory_magic)) return codec.decodeInventoryAlloc(a, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidNativeLakeFileState,
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const descriptor = std.json.parseFromSliceLeaky(InventoryDescriptor, work, bytes[inventory_magic.len..], .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidNativeLakeFileState,
+    };
+    if (descriptor.header.files.len != 0 or descriptor.header.deleted_row_groups.len != 0 or descriptor.count > 1_000_000 or ((descriptor.files == null) != (descriptor.count == 0))) return error.InvalidNativeLakeFileState;
+    if (descriptor.files) |ref| {
+        try ref.validate();
+        if (ref.records != descriptor.count) return error.InvalidNativeLakeFileState;
+    }
+    const encoded_header = codec.encodeInventoryAlloc(work, descriptor.header) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidNativeLakeFileState,
+    };
+    var inventory = codec.decodeInventoryAlloc(a, encoded_header) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidNativeLakeFileState,
+    };
+    errdefer inventory.deinit(a);
+    const files = try a.alloc(local.serverless_external_source_types.FileEntry, descriptor.count);
+    var count: usize = 0;
+    errdefer {
+        for (files[0..count]) |*file| file.deinit(a);
+        a.free(files);
+    }
+    var reads: u64 = (local.serverless_external_source_mod.codec.DecodeLimits{}).max_artifact_bytes;
+    var writes: u64 = 0;
+    var artifacts_ = store;
+    var pages: pages_mod.PageStore = .{ .domain = descriptor.domain, .artifacts = &artifacts_, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var cursor = try tree.Cursor.init(a, pages.store(), descriptor.files, "", null);
+    defer cursor.deinit();
+    var row_arena = std.heap.ArenaAllocator.init(a);
+    defer row_arena.deinit();
+    while (try cursor.next()) |entry| {
+        try token.check();
+        if (count == files.len) return error.InvalidNativeLakeFileState;
+        _ = row_arena.reset(.retain_capacity);
+        const ra = row_arena.allocator();
+        const record = std.json.parseFromSliceLeaky(Record, ra, entry.value, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidNativeLakeFileState,
+        };
+        if (!std.mem.eql(u8, entry.key, &key(record.file.file_id))) return error.InvalidNativeLakeFileState;
+        var one = descriptor.header;
+        one.files = @constCast(&[_]local.serverless_external_source_types.FileEntry{record.file});
+        const encoded = codec.encodeInventoryAlloc(ra, one) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidNativeLakeFileState,
+        };
+        var owned = codec.decodeInventoryAlloc(a, encoded) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidNativeLakeFileState,
+        };
+        defer owned.deinit(a);
+        files[count] = owned.files[0];
+        a.free(owned.files);
+        owned.files = &.{};
+        count += 1;
+    }
+    if (count != files.len) return error.InvalidNativeLakeFileState;
+    std.mem.sort(local.serverless_external_source_types.FileEntry, files, {}, struct {
+        fn less(_: void, l: local.serverless_external_source_types.FileEntry, r: local.serverless_external_source_types.FileEntry) bool {
+            return std.mem.lessThan(u8, l.file_id, r.file_id);
+        }
+    }.less);
+    var view = inventory;
+    view.files = files;
+    view.validateAlloc(a) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidNativeLakeFileState,
+    };
+    a.free(inventory.files);
+    inventory.files = files;
+    count = 0;
+    return inventory;
+}
 const Proof = struct { id: [32]u8, digest: [32]u8, index: usize };
 pub const Summary = struct {
     first: [32]u8,
@@ -140,7 +255,7 @@ pub const Delta = struct {
     files: []native.File,
     changed: []bool,
     prior_changed: []const native.File,
-    by_id: std.StringHashMapUnmanaged(usize),
+    by_id: local.serverless_query_lake_inventory_catalog.Positions,
 };
 fn qualified(provider: *Provider, file: local.serverless_external_source_types.FileEntry) local.serverless_external_source_types.FileEntry {
     var result = file;
@@ -276,7 +391,7 @@ const Batch = struct {
     }
 };
 pub const BuildStats = struct { prior_pages: usize = 0, prior_records: usize = 0, skipped_subtrees: usize = 0, rehashed_files: usize = 0, cached_census: bool = false };
-pub const Built = struct { ref: Ref, delta: Delta, stats: BuildStats };
+pub const Built = struct { ref: Ref, root: Root, delta: Delta, stats: BuildStats };
 pub fn build(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, prior: ?Root, token: Token) !Built {
     return buildProven(a, out, store, provider, prior, token, null);
 }
@@ -306,7 +421,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     var private: Batch = .{ .arena = .init(a) };
     defer private.arena.deinit();
     const PublicEntry = struct { digest: [32]u8, file: []const u8 };
-    var native_by_id: std.StringHashMapUnmanaged(usize) = .empty;
+    var native_by_id: local.serverless_query_lake_inventory_catalog.Positions = .{ .catalog = provider.source.catalog() };
     const current = try out.alloc(native.File, inv.files.len);
     const changed = try out.alloc(bool, inv.files.len);
     @memset(changed, true);
@@ -335,7 +450,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
         const Fingerprints = struct {
             a: A,
             provider: *Provider,
-            positions: *std.StringHashMapUnmanaged(usize),
+            positions: *local.serverless_query_lake_inventory_catalog.Positions,
             calls: usize = 0,
             fn get(raw: *anyopaque, id: []const u8) ![32]u8 {
                 const self: *@This() = @ptrCast(@alignCast(raw));
@@ -413,7 +528,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
             file_storage: tree.Store,
             provider: *Provider,
             census: ?*Census.Census,
-            by_id: *const std.StringHashMapUnmanaged(usize),
+            by_id: *const local.serverless_query_lake_inventory_catalog.Positions,
             proofs: []const Proof,
             prefix: []const [32]u8,
             current: []const native.File,
@@ -565,7 +680,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     defer a.free(bytes);
     var uploaded = try store.putWithCancellation(bytes, token);
     defer uploaded.deinit(store.allocator);
-    return .{ .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = root.version, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .public_navigation = .{ .identity_version = root.public_identity_version, .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
+    return .{ .root = root, .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = root.version, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .public_navigation = .{ .identity_version = root.public_identity_version, .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
 }
 /// Incremental per-column, per-file sketches piggyback on native replay.
 /// Each changed leaf replaces its previous sketch; HLLs are never subtracted.
@@ -1027,7 +1142,7 @@ fn navigationRefreshScenario(identity_version: u8) !void {
     store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
     const entries = try ca.alloc(local.serverless_external_source_types.FileEntry, 256);
     for (entries, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d}", .{i}), .object_uri = try std.fmt.allocPrint(ca, "file:///source-{d}.parquet", .{i}), .etag = @constCast("exact"), .byte_len = 128, .row_count = 0, .row_groups = &.{} };
-    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .inventory = undefined, .scanner = undefined };
     source.inventory = .{ .format = .iceberg, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("before"), .row_identity_version = identity_version, .schema_fingerprint = @constCast("schema"), .files = entries };
     source.verified_files = null;
     source.prepared_deletes = null;
@@ -1037,6 +1152,18 @@ fn navigationRefreshScenario(identity_version: u8) !void {
     source.plan_identity = @splat(8);
     const first = try buildProven(a, ca, &store, &provider, null, .none, @splat(9));
     const old = try load(ca, store, first.ref, .none, null);
+    const descriptor = try encodeInventory(a, &provider, old);
+    defer a.free(descriptor);
+    try std.testing.expect(descriptor.len < 8192);
+    var decoded_inventory = try decodeInventory(a, store, descriptor, .none);
+    defer decoded_inventory.deinit(a);
+    try std.testing.expectEqual(entries.len, decoded_inventory.files.len);
+    try std.testing.expectEqualStrings("source", decoded_inventory.source_id);
+    for (decoded_inventory.files) |file| {
+        const original_file = source.inventory.fileById(file.file_id) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(original_file.object_uri, file.object_uri);
+        try std.testing.expectEqualStrings(original_file.etag, file.etag);
+    }
     try std.testing.expectEqualDeep(@as([32]u8, @splat(8)), old.coverage.?.plan.?);
     try std.testing.expectEqualDeep(@as([32]u8, @splat(9)), old.coverage.?.data);
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
@@ -1243,7 +1370,7 @@ test "external lake durable costing reuses unchanged leaves and removes replaced
     store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
     const files = try ca.alloc(local.serverless_external_source_types.FileEntry, 3);
     for (files, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d}", .{i}), .object_uri = try std.fmt.allocPrint(ca, "file:///source-{d}.parquet", .{i}), .etag = @constCast("exact"), .byte_len = 128, .row_count = 100, .row_groups = &.{} };
-    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .inventory = undefined, .scanner = undefined };
     source.inventory = .{ .format = .iceberg, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("before"), .schema_fingerprint = @constCast("schema"), .files = files };
     source.verified_files = null;
     source.prepared_deletes = null;

@@ -236,6 +236,30 @@ pub const Row = struct {
             if (self.columnar != null) return self.layout.names.len;
             return self.values.len;
         }
+        pub fn frozenJson(self: TypedCells, ordinal: usize) !?@import("execution_batch.zig").FrozenJson {
+            if (ordinal >= self.count()) return error.InvalidSqlBackendResponse;
+            const source = self.columnar orelse return null;
+            if (self.values.len != 0) return error.InvalidSqlBackendResponse;
+            if (self.presence) |flags| if (!flags[ordinal]) return null;
+            var first: usize = 0;
+            for (source.blocks) |block| {
+                if (ordinal - first < block.values.len) return block.frozenJson(source.row, ordinal - first, false);
+                first += block.values.len;
+            }
+            return error.InvalidSqlBackendResponse;
+        }
+        pub fn encodedJson(self: TypedCells, ordinal: usize) !?[]const u8 {
+            if (ordinal >= self.count()) return error.InvalidSqlBackendResponse;
+            const source = self.columnar orelse return null;
+            if (self.values.len != 0) return error.InvalidSqlBackendResponse;
+            if (self.presence) |flags| if (!flags[ordinal]) return null;
+            var first: usize = 0;
+            for (source.blocks) |block| {
+                if (ordinal - first < block.values.len) return block.encodedJson(source.row, ordinal - first, false);
+                first += block.values.len;
+            }
+            return error.InvalidSqlBackendResponse;
+        }
         pub fn at(self: TypedCells, ordinal: usize) !Cell {
             if (self.columnar) |source| {
                 if (self.values.len != 0 or ordinal >= self.layout.names.len) return error.InvalidSqlBackendResponse;
@@ -290,6 +314,20 @@ pub const Row = struct {
 
     /// Decoding is explicit about the SQL/JSON null boundary. The native
     /// projection's field names are literal names, never dotted JSON paths.
+    pub fn frozenJson(self: Row, name: []const u8) !?@import("execution_batch.zig").FrozenJson {
+        if (std.mem.eql(u8, name, "_id")) return null;
+        const cells = self.typed_cells orelse return null;
+        try self.validateTyped();
+        const ordinal = cells.layout.ordinals.get(name) orelse return null;
+        return cells.frozenJson(ordinal);
+    }
+    pub fn encodedJson(self: Row, name: []const u8) !?[]const u8 {
+        if (std.mem.eql(u8, name, "_id")) return null;
+        const cells = self.typed_cells orelse return null;
+        try self.validateTyped();
+        const ordinal = cells.layout.ordinals.get(name) orelse return null;
+        return cells.encodedJson(ordinal);
+    }
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
         if (self.typed_cells) |cells| {
@@ -434,6 +472,20 @@ pub const ColumnPage = struct {
             }
         };
         return self.cell(alloc, row, name);
+    }
+    pub fn frozenJson(self: ColumnPage, row: usize, name: []const u8) !?@import("execution_batch.zig").FrozenJson {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        if (self.native) |native| {
+            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.frozenJson(self.selection[row], ordinal);
+        }
+        return null;
+    }
+    pub fn encodedJson(self: ColumnPage, row: usize, name: []const u8) !?[]const u8 {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        if (self.native) |native| {
+            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.encodedJson(self.selection[row], ordinal);
+        }
+        return null;
     }
     pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;

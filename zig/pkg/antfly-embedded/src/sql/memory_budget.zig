@@ -53,6 +53,34 @@ pub fn isLocallyExhausted(self: *Budget) bool {
     defer self.mutex.unlock();
     return self.exhausted or self.admission_exhausted;
 }
+/// Temporary owners may bypass standard arenas without bypassing this budget
+/// or any enclosing budget/failure allocator. Returned objects must be freed
+/// through this allocator, never through the original region allocator.
+pub fn reclaimingAllocator(a: std.mem.Allocator) std.mem.Allocator {
+    return reclaiming(a, 0);
+}
+fn reclaiming(a: std.mem.Allocator, depth: usize) std.mem.Allocator {
+    if (depth == 16) return a;
+    const unwrapped = @import("antfly_platform").allocator.reclaimingScratch(a);
+    if (unwrapped.ptr != a.ptr or unwrapped.vtable != a.vtable) return reclaiming(unwrapped, depth + 1);
+    if (a.vtable.alloc != alloc) return a;
+    const self: *Budget = @ptrCast(@alignCast(a.ptr));
+    const backing = reclaiming(self.backing, depth + 1);
+    if (backing.ptr == self.backing.ptr and backing.vtable == self.backing.vtable) return a;
+    return .{ .ptr = self, .vtable = &.{ .alloc = scratchAlloc, .resize = scratchResize, .remap = scratchRemap, .free = scratchFree } };
+}
+fn scratchAlloc(p: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+    return allocate(true, p, n, alignment, ra);
+}
+fn scratchResize(p: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, n: usize, ra: usize) bool {
+    return resizeMode(true, p, bytes, alignment, n, ra);
+}
+fn scratchRemap(p: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+    return remapMode(true, p, bytes, alignment, n, ra);
+}
+fn scratchFree(p: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+    freeMode(true, p, bytes, alignment, ra);
+}
 pub fn isExhausted(self: *Budget) bool {
     self.lock();
     const exhausted = self.exhausted or self.admission_exhausted;
@@ -65,7 +93,7 @@ pub fn isExhausted(self: *Budget) bool {
 fn allocatorExhausted(a: std.mem.Allocator) bool {
     if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return allocatorExhausted(parent);
     if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return allocatorExhausted(parent);
-    if (a.vtable.alloc != alloc) return false;
+    if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return false;
     const parent: *Budget = @ptrCast(@alignCast(a.ptr));
     return parent.isExhausted();
 }
@@ -81,13 +109,38 @@ pub fn footprint(self: *Budget) usize {
 pub fn headroom(a: std.mem.Allocator) ?usize {
     if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
     if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return headroom(parent);
-    if (a.vtable.alloc != alloc) return null;
+    if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
     self.lock();
     const available = self.limit -| if (self.monotonic) self.spent else self.live;
     const backing = self.backing;
     self.mutex.unlock();
     return if (headroom(backing)) |parent| @min(available, parent) else available;
+}
+/// Optional acceleration must not speculate through an opaque quota wrapper.
+/// Recognize only our complete budget chain and standard unbounded backings;
+/// mandatory allocations continue to use the normal allocator error contract.
+pub fn optionalHeadroom(a: std.mem.Allocator) ?usize {
+    if (a.vtable.alloc == alloc or a.vtable.alloc == scratchAlloc) {
+        const self: *Budget = @ptrCast(@alignCast(a.ptr));
+        self.lock();
+        const available = self.limit -| if (self.monotonic) self.spent else self.live;
+        const backing = self.backing;
+        const shared_admission = self.admission != null;
+        self.mutex.unlock();
+        // An external reservation owner can impose another, opaque cap.
+        if (shared_admission) return null;
+        const parent = optionalHeadroom(backing) orelse return null;
+        return @min(available, parent);
+    }
+    if (a.vtable == std.heap.page_allocator.vtable) return std.math.maxInt(usize);
+    if (comptime !@import("builtin").single_threaded) {
+        if (a.vtable == std.heap.smp_allocator.vtable) return std.math.maxInt(usize);
+    }
+    if (comptime @import("builtin").link_libc) {
+        if (a.vtable == std.heap.c_allocator.vtable) return std.math.maxInt(usize);
+    }
+    return null;
 }
 fn admit(self: *Budget, growth: usize) bool {
     if (growth > self.limit -| if (self.monotonic) self.spent else self.live) {
@@ -109,11 +162,15 @@ fn account(self: *Budget, old: usize, new: usize) void {
     self.peak = @max(self.peak, self.live);
 }
 fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+    return allocate(false, ptr, len, alignment, ra);
+}
+fn allocate(comptime scratch: bool, ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
     const self: *Budget = @ptrCast(@alignCast(ptr));
     self.lock();
     defer self.mutex.unlock();
+    const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
     if (!self.admit(len)) return null;
-    const result = self.backing.rawAlloc(len, alignment, ra) orelse {
+    const result = backing.rawAlloc(len, alignment, ra) orelse {
         self.releaseAdmission(len);
         return null;
     };
@@ -121,11 +178,15 @@ fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?
     return result;
 }
 fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+    return resizeMode(false, ptr, bytes, alignment, len, ra);
+}
+fn resizeMode(comptime scratch: bool, ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
     const self: *Budget = @ptrCast(@alignCast(ptr));
     self.lock();
     defer self.mutex.unlock();
+    const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
     if (!self.admit(len -| bytes.len)) return false;
-    if (!self.backing.rawResize(bytes, alignment, len, ra)) {
+    if (!backing.rawResize(bytes, alignment, len, ra)) {
         self.releaseAdmission(len -| bytes.len);
         return false;
     }
@@ -134,19 +195,23 @@ fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize
     return true;
 }
 fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+    return remapMode(false, ptr, bytes, alignment, len, ra);
+}
+fn remapMode(comptime scratch: bool, ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
     const self: *Budget = @ptrCast(@alignCast(ptr));
     self.lock();
     defer self.mutex.unlock();
+    const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
     if (!self.admit(len -| bytes.len)) return null;
     const result = if (self.monotonic) blk: {
         // A moving remap may leave the old allocation in a parent arena.
         // Force allocator fallback to reserve the complete replacement.
-        if (!self.backing.rawResize(bytes, alignment, len, ra)) {
+        if (!backing.rawResize(bytes, alignment, len, ra)) {
             self.releaseAdmission(len -| bytes.len);
             return null;
         }
         break :blk bytes.ptr;
-    } else self.backing.rawRemap(bytes, alignment, len, ra) orelse {
+    } else backing.rawRemap(bytes, alignment, len, ra) orelse {
         self.releaseAdmission(len -| bytes.len);
         return null;
     };
@@ -155,10 +220,14 @@ fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize,
     return result;
 }
 fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+    return freeMode(false, ptr, bytes, alignment, ra);
+}
+fn freeMode(comptime scratch: bool, ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
     const self: *Budget = @ptrCast(@alignCast(ptr));
     self.lock();
     defer self.mutex.unlock();
-    self.backing.rawFree(bytes, alignment, ra);
+    const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
+    backing.rawFree(bytes, alignment, ra);
     self.releaseAdmission(bytes.len);
     self.account(bytes.len, 0);
 }
@@ -246,6 +315,32 @@ test "SQL memory headroom follows synchronization and spill allocator parents" {
     child.allocator().free(bytes);
     try std.testing.expectEqual(@as(?usize, 512), headroom(locked.allocator()));
     try std.testing.expect(headroom(a) == null);
+}
+
+test "SQL reclaimable scratch preserves nested quotas and failure allocators across regions" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var parent: Budget = .{ .backing = a, .limit = 4096 };
+            var region = std.heap.ArenaAllocator.init(parent.allocator());
+            defer region.deinit();
+            var child: Budget = .{ .backing = region.allocator(), .limit = 1024 };
+            const scratch = reclaimingAllocator(child.allocator());
+            var bytes = try scratch.alloc(u8, 512);
+            defer scratch.free(bytes);
+            try std.testing.expectEqual(@as(usize, 512), child.live);
+            try std.testing.expectEqual(child.live, parent.live);
+            bytes = try scratch.realloc(bytes, 768);
+            try std.testing.expectEqual(@as(usize, 768), child.live);
+            try std.testing.expectEqual(child.live, parent.live);
+            try std.testing.expectError(error.OutOfMemory, scratch.alloc(u8, 512));
+            // A shared parent also retains admission authority after unwrapping.
+            parent.limit = parent.live;
+            try std.testing.expectError(error.OutOfMemory, scratch.alloc(u8, 1));
+            try std.testing.expectEqual(@as(usize, 768), child.live);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "SQL memory budget reports parent admission without misclassifying allocator OOM" {

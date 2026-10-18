@@ -27,6 +27,7 @@ test {
     _ = @import("antfly_local_sources").sql_parameter_frame;
     _ = @import("antfly_local_sources").sql_bound_scalars;
     _ = @import("antfly_local_sources").sql_replay_rows;
+    _ = @import("antfly_local_sources").sql_result_cursor;
     _ = @import("antfly_local_sources").sql_array_value;
     _ = @import("antfly_local_sources").sql_numeric_value;
     _ = @import("antfly_local_sources").sql_numeric_binary;
