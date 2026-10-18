@@ -2587,12 +2587,13 @@ test "certified numeric consolidation releases unpublished rows on allocation fa
             var fixed: FixedAllocation = .{ .backing = backing };
             const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
             var diagnostic: c.Diagnostic = .{};
-            var compiled = try c.compile(a, "UNWIND [1,2,1] AS x MATCH (a:Document {id:'a'}) WITH x,a MATCH (a)-[:CITES]->(b) RETURN sum(x)", .{}, &diagnostic);
+            var compiled = try c.compile(a, "UNWIND [1,2,1] AS x MATCH (a:Document {id:'a'}) WITH x,a MATCH (a)-[:CITES]->(b) RETURN sum(x),sum(size([(a)-[:CITES]->(c)|c.id]))", .{}, &diagnostic);
             defer compiled.deinit();
             var fixture: Fixture = .{};
             var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
             defer result.deinit();
             try std.testing.expectEqual(@as(i64, 8), result.rows[0][0].integer);
+            try std.testing.expectEqual(@as(i64, 12), result.rows[0][1].integer);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
@@ -2604,7 +2605,7 @@ test "adaptive suffix reachability releases every failed allocation" {
             var fixed: FixedAllocation = .{ .backing = backing };
             const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
             var diagnostic: c.Diagnostic = .{};
-            var compiled = try c.compile(a, "MATCH REPEATABLE ELEMENTS (a:Document {id:'a'})-[:CITES*14..14]->(b:Document) WHERE b.rank+0<0 RETURN b.rank LIMIT 1", .{}, &diagnostic);
+            var compiled = try c.compile(a, "MATCH REPEATABLE ELEMENTS (a:Document {id:'a'})-[:CITES*14..14]->(b:Document) WITH b.rank AS rank WHERE rank+0<0 RETURN rank LIMIT 1", .{}, &diagnostic);
             defer compiled.deinit();
             var fixture: Fixture = .{};
             var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });

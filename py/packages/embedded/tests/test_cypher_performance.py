@@ -2662,3 +2662,65 @@ def test_late_qualified_windows_and_repeated_apply_keep_physical_work_bounded(gr
     query = "MATCH (s:D {id:'branch-root'})-[:R*34..34]->(b:D) WHERE CASE WHEN b.score=999 THEN 1/0=0 ELSE false END RETURN b.score LIMIT 1"
     with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
         db.cypher_json("g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 20000}})
+
+
+def test_row_local_continuations_and_certification_share_captured_work(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    base = "MATCH (s:D {id:'start'})-[:R*32..32]->(b:D) "
+    for tail in (
+        "WITH b WHERE b.score+0<0 RETURN b.score LIMIT 1",
+        "WITH b.score AS score WHERE score+0<0 RETURN score LIMIT 1",
+        "WITH b UNWIND [1,2] AS x WITH b,x WHERE b.score+x<0 RETURN x LIMIT 1",
+    ):
+        result = db.cypher_json(
+            "g", {"query": base + tail, "limits": {"explored_edges": 1000, "intermediate_states": 20000}}
+        )
+        assert result["rows"] == []
+    child = "CALL { WITH s MATCH (s)-[:R*32..32]->(b:D) WHERE b.score+0<0 RETURN b } "
+    for prefix, tail in (
+        ("MATCH (s:D {id:'start'}) ", "RETURN b.score LIMIT 1"),
+        ("UNWIND range(1,100) AS i MATCH (s:D {id:'start'}) ", "RETURN i,b.score LIMIT 100"),
+    ):
+        result = db.cypher_json(
+            "g", {"query": prefix + child + tail, "limits": {"explored_edges": 1000, "intermediate_states": 20000}}
+        )
+        assert result["rows"] == []
+    # A parent filter cannot cause an intrinsically nonempty child to be cached
+    # as empty for a later parent whose unrelated i binding qualifies.
+    query = (
+        "UNWIND [1,2] AS i MATCH (s:D {id:'start'}) "
+        "CALL { WITH s MATCH (s)-[:R*32..32]->(b:D) RETURN b } "
+        "WITH i,b WHERE i=2 RETURN i,b.score LIMIT 1"
+    )
+    result = db.cypher_json("g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 20000}})
+    assert [cell["value"] for cell in result["rows"][0]] == ["2", "32"]
+    query = (
+        "UNWIND range(1,100) AS i MATCH (s:D {id:'start'}) WITH i,s MATCH (s) "
+        "RETURN sum(size([(s)-[:R*32..32]->(b:D)|b.score])),sum(i)"
+    )
+    result = db.cypher_json("g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 20000}})
+    assert [cell["value"] for cell in result["rows"][0]] == [str(100 * 2**32), "5050"]
+    assert result["stats"]["explored_edges"] == 126
+    with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
+        db.cypher_json("g", {"query": base + "WITH b,1/0 AS err WHERE false RETURN err LIMIT 1"})
+
+
+def test_dense_dag_suffixes_collapse_nonbinding_hop_bounds(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    size = 64
+    db.cypher_json("g", {"query": "CREATE " + ",".join(f"(w{i}:D {{id:'wide{i}',score:{i}}})" for i in range(size))})
+    edges = [f"(w{i})-[:R]->(w{j})" for i in range(size) for j in range(i + 1, size)]
+    match = "MATCH " + ",".join(f"(w{i}:D {{id:'wide{i}'}})" for i in range(size)) + " CREATE "
+    for begin in range(0, len(edges), 200):
+        db.cypher_json("g", {"query": match + ",".join(edges[begin : begin + 200])})
+    base = "MATCH (s:D {id:'wide0'})-[:R*1..63]->(b:D) "
+    for tail in (
+        "WHERE b.score+0<0 RETURN b.score LIMIT 1",
+        "WITH b.score AS score WHERE score+0<0 RETURN score LIMIT 1",
+    ):
+        result = db.cypher_json(
+            "g", {"query": base + tail, "limits": {"explored_edges": 10000, "intermediate_states": 50000}}
+        )
+        assert result["rows"] == []

@@ -1541,6 +1541,10 @@ Nonpositive groups and nonnegative groups can coexist across aggregate states.
 Successful attempts publish owned rows and exact weights. Mixed signs, floating
 point or checked arithmetic failures retry ordinary execution with cumulative
 work accounting; intermediate overflow and floating-point order stay observable.
+Owned, statement-local pattern-expression memoization remains available during
+these private attempts. Certification never turns identical captured pattern
+expressions into repeated graph traversals, and cached values do not borrow
+private evaluation scratch.
 Weighted MATCH fuses row-local stages into their actual finite window or
 reduction, carrying parent multiplicities through the fold. Small unordered
 windows retain demand-driven traversal across subsequent MATCH stages: each
@@ -1553,16 +1557,27 @@ DISTINCT, ordering and windows retain their own stage barriers. Filters and
 OPTIONAL null extension remain in their own MATCH scopes; no prefix is truncated
 before its continuation qualifies. After 64 unsuccessful routes, an endpoint-local
 filtered window builds a lazy suffix reachability memo over node, pattern
-segment and hop states.
+segment and hop states. Admissibility follows pure row-local WITH projections,
+filters and UNWIND stages, including renamed columns and returning CALL scope
+merges. Child producers inherit finite demand from the enclosing continuation;
+they do not need an artificial LIMIT attached to their own RETURN. Only actual
+consumer progress disables a restart; OPTIONAL retains its separate MATCH
+success flag. Speculative projection/filter errors leave a suffix unknown.
 It resumes the original DFS while pruning impossible suffixes, including when
 one late branch qualifies after an exponentially large rejected branch. The
 reachability graph ignores trail/simple uniqueness as a conservative superset;
 DFS still enforces exact histories and output order. An explicit postorder
 stack avoids recursion proportional to graph depth. Unbounded segments require
 a finite domain-DAG depth proof before quotienting; cyclic unbounded trails keep
-the ordinary producer. Speculative predicate errors mark a suffix unknown rather than exposing errors early. Constant residuals,
-read authority and statement budgets remain mandatory; unproved shapes retain
+the ordinary producer. Speculative predicate errors mark a suffix unknown
+rather than exposing errors early. Constant residuals, read authority and
+statement budgets remain mandatory; unproved shapes retain
 the ordinary producer. First successful rows keep lazy traversal.
+Repeated product-state work can trigger a bounded DAG depth proof. When a
+single variable segment's lower bound is satisfied and its remaining upper
+bound covers the proved suffix depth, hop states share one reachability entry
+per node. Cycles and unknown adjacency at the read horizon retain exact hop
+states. The depth proof never treats an unloaded boundary as an empty suffix.
 Returning CALL bodies inherit proven row goals through unfiltered projections,
 capped by their own existing limits; child SKIP and aggregate/sort barriers remain
 inside the child scope. An outer
@@ -1574,6 +1589,9 @@ bags across parent continuations. Keys preserve binding representations and
 implicit prebound MATCH aliases. Cache admission can decline
 without failing the query; writes, procedures, volatile functions and unit CALL
 remain barriers. Cached children own their payloads and preserve parent weights.
+A completed empty streaming child can be memoized without retaining its routes.
+Speculative child rows conservatively prevent empty-child admission when a
+parent filter rejects them, so unrelated parent bindings cannot poison the memo.
 Pattern dependency analysis follows query WITH scopes and lexical shadowing;
 only captured outer bindings stay live. Unobserved path aliases therefore do
 not force route production merely because a later expression contains a pattern.
