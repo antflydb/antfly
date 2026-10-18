@@ -22,6 +22,7 @@ const scalar = @import("scalar.zig");
 const json_order = @import("json_order.zig");
 const operators = @import("operators.zig");
 const MemoryBudget = @import("memory_budget.zig");
+const native_ops = @import("array_native.zig");
 const Allocator = std.mem.Allocator;
 pub const Element = scalar.Datum;
 pub const Budget = json_order.Budget;
@@ -236,6 +237,10 @@ pub const Value = struct {
             .float32 => .float64,
             else => self.element_type,
         }, scalar_value, work);
+        if (self.stored) |view| if (native_ops.supported(view.*)) {
+            _ = try self.knownNonNullCount();
+            return native_ops.quantified(view.*, scalar_value, comparison, quantifier, work);
+        };
         var saw_null = false;
         for (0..self.cardinality()) |array_cell_0| {
             const element = self.flatCell(array_cell_0);
@@ -587,6 +592,13 @@ pub const Value = struct {
     pub fn compare(self: Value, other: Value, budget: *Budget) !std.math.Order {
         try budget.consume(1);
         if (self.element_type != other.element_type) return error.SqlTypeMismatch;
+        if (self.stored) |left| if (other.stored) |right| if (native_ops.supported(left.*) and native_ops.supported(right.*)) {
+            _ = try self.knownNonNullCount();
+            _ = try other.knownNonNullCount();
+            const result = try native_ops.orderPrefix(left.*, right.*, budget, false);
+            if (result != .eq) return result;
+            return compareShape(self.cardinality(), other.cardinality(), self.dimensions, other.dimensions, budget);
+        };
         for (0..@min(self.cardinality(), other.cardinality())) |index| {
             const a = self.flatCell(index);
             const b = other.flatCell(index);
@@ -611,6 +623,11 @@ pub const Value = struct {
             std.mem.writeInt(i32, bytes[4..8], dimension.lower, .little);
             hash.update(&bytes);
         }
+        if (self.stored) |view| if (native_ops.supported(view.*)) {
+            _ = try self.knownNonNullCount();
+            try native_ops.hashElements(view.*, &hash, budget);
+            return hash.final();
+        };
         for (0..self.cardinality()) |array_cell_0| {
             const element = self.flatCell(array_cell_0);
             std.mem.writeInt(u64, &bytes, try hashElement(self.element_type, element, budget), .little);
