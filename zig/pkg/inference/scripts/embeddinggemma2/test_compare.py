@@ -195,5 +195,77 @@ class ComparisonContracts(unittest.TestCase):
                 compare.compare_reference(bad, expected)
 
 
+class CudaRouteTests(unittest.TestCase):
+    def test_qualification_requires_executed_routes(self):
+        routes = compare.cuda_routes(
+            "extended_flash_launches_total=3 extended_flash_launches_total=9 embedding_graph_replays_total=4 native_vision_launches_total=2 media_batches_total=1 fused_backbone_launches_total=96 packed_ple_groups_total=2 packed_head_launches_total=24 packed_gelu_launches_total=24 tuned_gemm_calls_total=100 vision_residual_launches_total=32 vision_graph_replays_total=2 spatial_pool_launches_total=4 short_cudnn_attention_launches_total=2 audio_constant_hits_total=12 patch_rows_written_total=3600"
+        )
+        self.assertEqual(routes["extended_flash"], 9)
+        with self.assertRaisesRegex(ValueError, "tuned_gemm"):
+            compare.require_cuda_routes(
+                compare.cuda_routes(
+                    "gemm_tuning_declines_total=9 cublaslt_matmuls_total=9"
+                ),
+                ["tuned_gemm"],
+            )
+        compare.require_cuda_routes(
+            routes,
+            [
+                "extended_flash",
+                "graph_replay",
+                "native_vision",
+                "media_batch",
+                "fused_backbone",
+                "packed_ple",
+                "packed_heads",
+                "packed_gelu",
+                "tuned_gemm",
+                "vision_residual",
+                "vision_graph",
+                "spatial_pool",
+                "short_attention",
+                "audio_constants",
+                "patch_into",
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "fused_vision"):
+            compare.require_cuda_routes(routes, ["fused_vision"])
+        self.assertEqual(
+            compare.cuda_routes("extended_flash_launches_total=9garbage")[
+                "extended_flash"
+            ],
+            0,
+        )
+
+
+class PrecisionTests(unittest.TestCase):
+    def test_bf16_reference_requires_declared_pooling(self):
+        result = {
+            "suite_sha256": "suite",
+            "checkpoint_receipt_sha256": "weights",
+            "precision": "bfloat16",
+            "status": "pass",
+            "cases": {},
+            "measurement_mode": "encoder",
+            "decision": {"status": "not_run"},
+        }
+        with self.assertRaisesRegex(ValueError, "F32 pooling"):
+            compare.compare_reference(result, result)
+        result["pooling_precision"] = "float32"
+        self.assertEqual(
+            compare.compare_reference(result, result)["decision_status"], "not_run"
+        )
+
+    def test_backend_precision_is_explicit_and_cannot_cross_recipes(self):
+        for backend in ("cuda", "torch-cuda"):
+            self.assertEqual(compare.execution_precision(backend), "bfloat16")
+            with self.assertRaises(ValueError):
+                compare.execution_precision(backend, "float32")
+        for backend in ("native", "metal", "cpu", "mps"):
+            self.assertEqual(compare.execution_precision(backend), "float32")
+            with self.assertRaises(ValueError):
+                compare.execution_precision(backend, "bfloat16")
+
+
 if __name__ == "__main__":
     unittest.main()
