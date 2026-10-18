@@ -901,7 +901,9 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn(f"pub const abi_version: u32 = {abi[1]};", implementation)
             cc = shutil.which("cc")
             self.assertIsNotNone(cc, "Homebrew smoke regression requires a C compiler")
-            smoke = rendered.split('(testpath/"smoke.c").write <<~C\n', 1)[1].split(
+            # Ruby must preserve C escapes rather than interpret them in an
+            # interpolating heredoc before the C compiler sees the program.
+            smoke = rendered.split("(testpath/\"smoke.c\").write <<~'C'\n", 1)[1].split(
                 "\n    C", 1
             )[0]
             (root / "smoke.c").write_text(smoke)

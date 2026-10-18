@@ -129,7 +129,7 @@ class Antfly < Formula
 
   test do
     system "#{{bin}}/antfly", "--help"
-    (testpath/"smoke.c").write <<~C
+    (testpath/"smoke.c").write <<~'C'
       #include <antfly.h>
       #include <stdio.h>
       int main(void) {{
