@@ -3,6 +3,12 @@
 Tools for the Antenna encoder plan
 ([`models/antenna/ANTENNA.md`](../../models/antenna/ANTENNA.md)).
 
+The [Decide-1B span-head experiment](../../models/antenna/SPAN_PROBE.md) reuses
+these datasets and the shared native trainer to test frozen-encoder projection
+repair. `prepare_span_probe.py` adds pinned FewRel gold relation endpoints to
+CrossNER AI rows. Its modest held-out quality does not qualify a serving model;
+further shared encoder/head training belongs in the Antenna recipe.
+
 ## Datasets
 
 `antenna_datasets.py` is the single place that loads the classification and

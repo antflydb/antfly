@@ -215,7 +215,7 @@ pub fn spanRepresentations(cb: *const compute.ComputeBackend, a: std.mem.Allocat
     return markerMlp(cb, a, activated, span_count, H * 2, H, "span_rep.span_rep_layer.out_project");
 }
 
-fn markerMlp(cb: *const compute.ComputeBackend, a: std.mem.Allocator, input: CT, rows: usize, input_width: usize, H: usize, prefix: []const u8) !CT {
+pub fn markerMlp(cb: *const compute.ComputeBackend, a: std.mem.Allocator, input: CT, rows: usize, input_width: usize, H: usize, prefix: []const u8) !CT {
     const w0 = try cb.getWeight(try std.fmt.allocPrint(a, "{s}.0.weight", .{prefix}));
     defer cb.free(w0);
     const b0 = try cb.getWeight(try std.fmt.allocPrint(a, "{s}.0.bias", .{prefix}));

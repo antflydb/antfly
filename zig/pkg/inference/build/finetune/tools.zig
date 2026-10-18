@@ -23,6 +23,22 @@ const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 
 pub const specs = [_]common.CommandSpec{
     .{
+        .name = "eval-gliner25-span",
+        .root_source_file = "src/finetune/train/eval_gliner_span.zig",
+        .description = "Evaluate decoded ModernBERT span artifact outputs against Antenna rows",
+        .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
+        .name = "train-gliner25-span",
+        .root_source_file = "src/finetune/train/train_gliner_span.zig",
+        .description = "Train frozen-encoder ModernBERT GLiNER span task heads with resume and export",
+        .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
         .name = "train-laya",
         .root_source_file = "src/finetune/train/train_laya.zig",
         .description = "Finetune native Laya typed decisions with resumable optimizer state and serving export",

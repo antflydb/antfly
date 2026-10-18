@@ -1,5 +1,11 @@
 # Antenna
 
+The [Decide-1B span-head experiment](SPAN_PROBE.md) for issue #1083 reuses
+Antenna's dataset, optimizer, checkpoint, and supervision infrastructure.
+It is a frozen-encoder ablation, with separate artifact and quality evidence.
+Further shared encoder/extraction training belongs in this plan; it does not
+create another general training stack or qualify the original Decide weights.
+
 Antenna is a proposed Antfly-owned encoder model. It reads a text once and
 serves several learned heads from that one encoding: GLiNER2.5-style
 extraction (entities, relations, records), classification, Laya typed

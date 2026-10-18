@@ -25,6 +25,13 @@ pub const inference_overlap_filters: []const []const u8 = &.{
 
 pub const specs = [_]common.TestSpec{
     .{
+        .step_name = "test-gliner-span-training",
+        .root_source_file = "src/finetune/test/test_gliner_span_training.zig",
+        .description = "Test ModernBERT span head objectives, updates and resume",
+        .imports = &.{ .build_options, .ml, .inference_internal },
+        .native_link = .default,
+    },
+    .{
         .step_name = "test-layoutlmv3-finetune",
         .root_source_file = "src/finetune/test/test_layoutlmv3_finetune.zig",
         .description = "Run isolated LayoutLMv3 finetune tests",
