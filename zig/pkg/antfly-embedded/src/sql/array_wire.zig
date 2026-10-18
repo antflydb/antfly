@@ -43,6 +43,9 @@ pub const Inspection = struct {
     values: []const Json,
     nulls: []const Json,
     admission: Admission,
+    /// Exact prepared footprint from the existing admission walk. NUMERIC
+    /// limbs are measured later, after their bounded parser owns them.
+    prepared_footprint: ?usize = null,
 };
 
 const View = struct {
@@ -347,6 +350,7 @@ fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection 
         .values = values,
         .nulls = nulls,
         .admission = .{ .work = options.values.work - work.remaining, .wire_bytes = @intCast(wire_size.count) },
+        .prepared_footprint = if (kind == .numeric) null else bytes,
     };
 }
 
@@ -365,8 +369,8 @@ fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, inpu
         cell.* = if (own_payloads) try operators.cloneDatum(a, decoded) else decoded;
     }
     const owned_dimensions = try a.dupe(arrays.Dimension, inspected.dimensions[0..inspected.rank]);
-    const value: arrays.Value = .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells };
-    if (kind == .numeric) _ = try arrays.Value.initWithBudget(kind, value.dimensions, value.elements, options.values, &work);
+    var value: arrays.Value = .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells, .prepared_footprint = inspected.prepared_footprint };
+    if (kind == .numeric) value = try arrays.Value.initWithBudget(kind, value.dimensions, value.elements, options.values, &work);
     return .{ .value = value, .work = options.values.work - work.remaining, .wire_bytes = inspected.admission.wire_bytes };
 }
 
@@ -540,8 +544,8 @@ fn decodeBytesImpl(a: A, kind: arrays.ElementType, input: []const u8, options: O
             cells[index] = if (kind == .numeric and !flag) try @import("scalar.zig").numericTextLeaky(a, value.string, &work) else try operators.cloneDatum(a, try readElement(kind, value, flag));
         }
     }
-    const result = if (compact) try builder.finish(a, options.values) else arrays.Value{ .element_type = kind, .dimensions = try a.dupe(arrays.Dimension, dimensions[0..rank]), .elements = cells };
-    if (kind == .numeric) _ = try arrays.Value.initWithBudget(kind, result.dimensions, result.elements, options.values, &work);
+    var result = if (compact) try builder.finish(a, options.values) else arrays.Value{ .element_type = kind, .dimensions = try a.dupe(arrays.Dimension, dimensions[0..rank]), .elements = cells, .prepared_footprint = if (kind == .numeric) null else bytes };
+    if (kind == .numeric) result = try arrays.Value.initWithBudget(kind, result.dimensions, result.elements, options.values, &work);
     return .{ .value = result, .work = options.values.work - work.remaining, .wire_bytes = wire_size };
 }
 fn jsonSize(value: Json) !usize {
@@ -1063,4 +1067,31 @@ test "SQL streaming document array malformed envelopes preserve legacy diagnosti
     var none = std.heap.FixedBufferAllocator.init(&.{});
     var context: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .checkpoint = Cancel.poll };
     try std.testing.expectError(error.Canceled, decodeBytesLeakyMeasured(none.allocator(), .int64, "", .{ .context = &context }));
+}
+
+test "SQL prepared array envelope decoders retain exact footprint without another validation walk" {
+    const a = std.testing.allocator;
+    const Case = struct { kind: arrays.ElementType, text: []const u8 };
+    const cases = [_]Case{
+        .{ .kind = .int64, .text = "{\"dimensions\":[{\"length\":2,\"lower_bound\":-3}],\"values\":[\"7\",null],\"sql_nulls\":[false,true]}" },
+        .{ .kind = .jsonb, .text = "{\"dimensions\":[{\"length\":2,\"lower_bound\":-3}],\"values\":[{\"x\":\"é\"},null],\"sql_nulls\":[false,true]}" },
+        .{ .kind = .numeric, .text = "{\"dimensions\":[{\"length\":2,\"lower_bound\":-3}],\"values\":[\"1.2300\",null],\"sql_nulls\":[false,true]}" },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(Json, a, case.text, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        var borrowed = try decodeBorrowed(a, case.kind, parsed.value, .{});
+        defer borrowed.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const direct = try decodeLeaky(arena.allocator(), case.kind, parsed.value, .{});
+        const text = (try decodeBytesLeakyMeasured(arena.allocator(), case.kind, case.text, .{})).value;
+        for ([_]arrays.Value{ borrowed.value, direct, text }) |value| {
+            try std.testing.expect(value.stored != null or value.prepared_footprint != null);
+            var uncached = value;
+            uncached.prepared_footprint = null;
+            try std.testing.expectEqual(try uncached.retainedBytes(), try value.retainedBytes());
+            try std.testing.expectError(error.SqlProgramLimitExceeded, value.validate(.{ .elements = 1 }));
+        }
+    }
 }

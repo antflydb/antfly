@@ -2199,12 +2199,14 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
             return Datum.typedArray(owned);
         }
         const elements = try alloc.alloc(Datum, array.cardinality());
+        var footprint: usize = @sizeOf(@import("array_value.zig").Value) + dimensions.len * @sizeOf(@import("array_value.zig").Dimension);
         for (0..array.cardinality(), elements) |array_cell_0, *out| {
             const element = array.flatCell(array_cell_0);
             if (element.array != null) return error.SqlTypeMismatch;
             out.* = try cloneDatum(alloc, element);
+            if (array.prepared_footprint == null) footprint +|= try datumBytes(out.*);
         }
-        owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .elements = elements };
+        owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .elements = elements, .prepared_footprint = array.prepared_footprint orelse footprint };
         return Datum.typedArray(owned);
     }
     return .{ .value = try cloneJson(alloc, value.value, 0), .sql_null = value.sql_null, .patterns = value.patterns };
@@ -2232,16 +2234,7 @@ fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, Sq
 }
 pub fn datumBytes(value: Datum) anyerror!usize {
     if (value.numeric) |number| return @sizeOf(Datum) + @sizeOf(@import("numeric_value.zig").Value) + number.digits.len * 2;
-    if (value.array) |array| {
-        if (array.stored) |stored| return @sizeOf(Datum) + @sizeOf(@import("array_value.zig").Value) + array.dimensions.len * @sizeOf(@import("array_value.zig").Dimension) + @sizeOf(@import("../common/sql_array_layout.zig").View) + stored.bytes.len;
-        var bytes: usize = @sizeOf(Datum) + @sizeOf(@import("array_value.zig").Value) + array.dimensions.len * @sizeOf(@import("array_value.zig").Dimension);
-        for (0..array.cardinality()) |array_cell_0| {
-            const element = array.flatCell(array_cell_0);
-            if (element.array != null) return error.SqlTypeMismatch;
-            bytes +|= try datumBytes(element);
-        }
-        return bytes;
-    }
+    if (value.array) |array| return @sizeOf(Datum) +| try array.retainedBytes();
     return jsonBytes(value.value, 0);
 }
 fn jsonBytes(value: Json, depth: usize) error{SqlProgramLimitExceeded}!usize {

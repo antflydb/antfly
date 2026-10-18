@@ -174,12 +174,21 @@ pub const Store = struct {
                         break :decoded &view.?.value;
                     };
                     if ((value.array != null and value.value != .null) or array.element_type != definition.element_type) return error.InvalidResult;
-                    _ = try array.validate(.{});
                     if (value.array) |native| {
                         const key: PayloadMemo.Key = .{ .pointer = @intFromPtr(native), .length = 0, .kind = .array };
-                        values[row] = if (memo.get(key)) |cached| cached.array.? else (try sources.sql_operators.cloneDatum(a, .{ .array = array, .sql_null = false })).array.?;
-                        memo.put(key, .{ .array = values[row], .sql_null = false });
-                    } else values[row] = (try sources.sql_operators.cloneDatum(a, .{ .array = array, .sql_null = false })).array.?;
+                        if (memo.get(key)) |cached| {
+                            // One immutable append lease owns this identity.
+                            // Shape/type checks above still apply to every cell.
+                            values[row] = cached.array.?;
+                        } else {
+                            const validated = try array.validate(.{});
+                            values[row] = (try sources.sql_operators.cloneDatum(a, .{ .array = &validated, .sql_null = false })).array.?;
+                            memo.put(key, .{ .array = values[row], .sql_null = false });
+                        }
+                    } else {
+                        const validated = try array.validate(.{});
+                        values[row] = (try sources.sql_operators.cloneDatum(a, .{ .array = &validated, .sql_null = false })).array.?;
+                    }
                 },
                 .numeric => |values| {
                     if (value.sql_null) {
@@ -462,4 +471,65 @@ test "pgwire cursor spool owns frozen JSON leases and unwinds allocation failure
     };
     try Fixture.run(std.testing.allocator, true);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{false});
+}
+
+test "pgwire prepared array validation memo checks each cell and expires at append boundary" {
+    const sources = @import("antfly_local_sources");
+    const Element = sources.sql_array_value.Element;
+    var elements = [_]Element{Element.json(.{ .integer = 7 })};
+    const array = try sources.sql_array_value.Value.init(.int64, &.{.{ .length = 1 }}, &elements, .{});
+    const Reader = struct {
+        array: *const sources.sql_array_value.Value,
+        malformed_second: bool = false,
+        fn read(raw: *anyopaque, _: std.mem.Allocator, row: usize, _: usize) !backend.Cell {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .array = self.array, .sql_null = false, .value = if (self.malformed_second and row == 1) .{ .integer = 1 } else .null };
+        }
+    };
+    var reader: Reader = .{ .array = &array };
+    var budget: Budget = .{ .child = std.testing.allocator, .limit = 1024 * 1024 };
+    var spool = Store.init(&budget);
+    defer spool.deinit();
+    const result: backend.Result = .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .int64 }}, .command_tag = "SELECT", .cells = .{ .context = &reader, .count = 2, .width = 1, .read = Reader.read } };
+    try spool.append(result, 100);
+    try std.testing.expect((try spool.cell(0, 0)).array.? == (try spool.cell(1, 0)).array.?);
+    reader.malformed_second = true;
+    try std.testing.expectError(error.InvalidResult, spool.append(result, 100));
+    try std.testing.expectEqual(@as(usize, 2), spool.row_count);
+    reader.malformed_second = false;
+    // Reusing a source address in a new lease must not reuse prior validation.
+    elements[0] = Element.json(.{ .string = "invalid" });
+    try std.testing.expectError(error.SqlTypeMismatch, spool.append(result, 100));
+    try std.testing.expectEqual(@as(usize, 2), spool.row_count);
+    try std.testing.expectEqual(@as(i64, 7), (try spool.cell(0, 0)).array.?.flatCell(0).value.integer);
+}
+
+test "pgwire prepared array validation memo measurement" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    const elements = try a.alloc(sources.sql_array_value.Element, 65536);
+    defer a.free(elements);
+    for (elements, 0..) |*element, i| element.* = .{ .value = .{ .integer = @intCast(i) }, .sql_null = false };
+    const array: sources.sql_array_value.Value = .{ .element_type = .int64, .dimensions = &.{.{ .length = 65536 }}, .elements = elements };
+    const Reader = struct {
+        array: *const sources.sql_array_value.Value,
+        fn read(raw: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !backend.Cell {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .array = self.array, .sql_null = false };
+        }
+    };
+    var reader: Reader = .{ .array = &array };
+    for ([_]usize{ 1, 64 }) |count| {
+        var elapsed: i128 = 0;
+        for (0..5) |_| {
+            var budget: Budget = .{ .child = a, .limit = 32 * 1024 * 1024 };
+            var spool = Store.init(&budget);
+            defer spool.deinit();
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            try spool.append(.{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .int64 }}, .command_tag = "SELECT", .cells = .{ .context = &reader, .count = count, .width = 1, .read = Reader.read } }, count);
+            elapsed += std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+            try std.testing.expect((try spool.cell(0, 0)).array.? == (try spool.cell(count - 1, 0)).array.?);
+        }
+        std.debug.print("PGWIRE_PREPARED_ARRAY_MEMO rows={} elements=65536 iterations=5 elapsed_ns={} one_owned_copy=true\n", .{ count, elapsed });
+    }
 }
