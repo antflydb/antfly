@@ -1190,6 +1190,10 @@ pub const OwnerDecision = struct {
         }
         if (request.operation != .fence or request.projection != .admission) return error.InvalidGenerationPublication;
         const header = try self.raftAdmission();
+        return self.requireRaftManifest(alloc, header, command);
+    }
+
+    fn requireRaftManifest(self: OwnerDecision, alloc: Allocator, header: raft_control.Admission, command: raft_control.Control) !void {
         if (!header.eql(raft_control.Admission.fromBinding(command.binding))) return error.PrivateIndexOwnerJobChanged;
         const input = self.inputs orelse return error.InvalidGenerationPublication;
         var manifest = try input.prepareManifest(alloc, self.head);
@@ -1500,6 +1504,7 @@ pub const OwnerDecision = struct {
             .group_id = self.owner.owner.group_id,
             .id = self.head.plan_id,
             .operation = .cancel,
+            .raft_reporter = if (self.raft_signing) |view| .{ .node_id = view.identity.node_id, .store_id = view.identity.store_id } else null,
         }, authority);
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
         const intent: native_control.Admission = .{
@@ -1536,6 +1541,31 @@ pub const OwnerDecision = struct {
         const grant = self.cancellation_release orelse return error.InvalidCatalogRecord;
         try self.requireRetainedRaftBinding(grant.canceled.binding);
         return grant.intent();
+    }
+
+    pub fn requireRaftCancellationProposal(self: OwnerDecision, alloc: Allocator, table_name: []const u8, request: OwnerRequest, command: raft_control.Command) !void {
+        _ = try self.raftExecutionIdentity(request);
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, table_name, dispatch.table_name)) return error.GenerationPublicationChanged;
+        try command.validate();
+        if (request.operation == .cancel_release) {
+            if (command != .cancel_release or !std.meta.eql(command.cancel_release, try self.raftCancellationReleaseIntent(request))) return error.InvalidGenerationPublication;
+            return;
+        }
+        if (request.operation != .cancel) return error.InvalidGenerationPublication;
+        switch (command) {
+            .cancel_intent => |intent| if (!intent.eql(try self.raftCancellationIntent())) return error.PrivateIndexOwnerJobChanged,
+            .cancel_control => |control| {
+                try self.requireRetainedRaftBinding(control.binding);
+                if (control.effect == .admitted) {
+                    if (request.projection != .admission) return error.InvalidGenerationPublication;
+                    try self.requireRaftManifest(alloc, try self.raftCancellationAdmission(), control);
+                }
+            },
+            .cancel_cleanup, .cancel_complete => |binding| try self.requireRetainedRaftBinding(binding),
+            inline .cancel_artifacts, .cancel_claims => |selection| try self.requireRetainedRaftBinding(selection.binding),
+            else => return error.InvalidGenerationPublication,
+        }
     }
 
     pub fn signRaftCancellation(self: OwnerDecision, request: OwnerRequest, record: local.storage_db_relational_index_owner_job.Canceled, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {

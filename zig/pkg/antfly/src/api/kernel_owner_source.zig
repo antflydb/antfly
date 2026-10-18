@@ -3776,6 +3776,17 @@ pub const ProvisionedKernelOwnerSource = struct {
             return self.lease.owner().raftIndexOwnerLifecycle(alloc, self.table_name, request, prepare_work, root, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
         }
 
+        pub fn rootGeneration(self: *const @This()) u64 {
+            return self.lease.entry.generation;
+        }
+
+        pub fn cancelStep(self: *@This(), alloc: std.mem.Allocator, request: raft_index_control.CancellationRequest, prepare_work: bool) !std.json.Parsed(raft_index_control.CancellationPreparation) {
+            if (!std.meta.eql(request.identity(), self.identity)) return error.PrivateIndexOwnerJobChanged;
+            const normalized = if (prepare_work) try platformDeadlineContext(self.context) else request_operation.RequestContext{};
+            var cancellation = normalized.cancellation;
+            return self.lease.owner().raftIndexOwnerCancellation(alloc, self.table_name, request, prepare_work, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        }
+
         pub fn audit(self: *@This(), alloc: std.mem.Allocator, request: raft_index_control.BuildRequest, root: native_index_control.AuditRoot, recover_committed: bool) !std.json.Parsed(raft_index_control.BuildPreparation) {
             if (!std.meta.eql(request.identity, self.identity)) return error.PrivateIndexOwnerJobChanged;
             try root.validate();

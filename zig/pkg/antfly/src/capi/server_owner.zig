@@ -4406,6 +4406,94 @@ pub fn storageOwnerRaftIndexLifecycleJson(owner: ?*anyopaque, request: *const ke
     return .ok;
 }
 
+pub fn storageOwnerRaftIndexCancellationJson(owner: ?*anyopaque, request: *const kernel_owner_abi.RaftIndexOwnerCancellationRequest, out_response: *kernel_owner_abi.OwnedBytes, out_failure: *kernel_owner_abi.FailureIdentity) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const local = @import("antfly_local_sources");
+    const contract = local.storage_db_relational_index_raft_contract;
+    const gc = local.storage_db_relational_index_gc;
+    const claims = local.storage_db_relational_index_owner_job.private_claims;
+    const Failure = struct {
+        fn result(err: anyerror, out: *kernel_owner_abi.FailureIdentity) kernel_owner_abi.Status {
+            out.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.RaftIndexOwnerCancellationRequest.operation);
+            return out.status;
+        }
+    };
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.prepare > 1 or request.request_json.ptr == null or request.request_json.len == 0 or request.request_json.len > contract.CancellationPreparation.max_request_bytes or
+        request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
+    const context: local.api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    const handle = asHandle(owner) orelse return Failure.result(error.InvalidArgument, out_failure);
+    _ = storageOwnerTableName(handle, request.table_name) orelse return Failure.result(error.InvalidArgument, out_failure);
+    const resources = local.storage_resource_manager;
+    var budget = if (handle.db.core.index_manager.resource_manager) |manager| resources.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, handle.alloc, 1) else null;
+    defer if (budget) |*value| value.deinit();
+    const alloc = if (budget) |*value| value.allocator() else handle.alloc;
+    const Work = struct {
+        fn run(a: std.mem.Allocator, h: *Handle, req: *const kernel_owner_abi.RaftIndexOwnerCancellationRequest, ctx: local.api_operation.RequestContext, output: *kernel_owner_abi.OwnedBytes) !void {
+            var parsed = std.json.parseFromSlice(contract.CancellationRequest, a, req.request_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidArgument;
+            defer parsed.deinit();
+            try parsed.value.validate();
+            const state = try h.db.raftIndexOwnerCancellationState(h.storage_owner_group_id, parsed.value.identity());
+            var result: contract.CancellationPreparation = undefined;
+            var physical_page: ?gc.Page = null;
+            defer if (physical_page) |*value| value.deinit();
+            var claim_page: ?claims.GcPage = null;
+            defer if (claim_page) |*value| value.deinit();
+            switch (parsed.value) {
+                .cancel => |intent| {
+                    result = .{ .progress = .{ .cancel = state } };
+                    if (req.prepare == 1 and state.completed == null) {
+                        if (state.intent == null) {
+                            result.command = .{ .cancel_intent = intent };
+                        } else if (state.binding) |binding| {
+                            if (state.fenced == null or state.reserved == null) {
+                                var original = binding;
+                                original.phase = .fencing;
+                                result.command = .{ .cancel_control = .{ .effect = if (state.fenced == null) .fenced else .reserved, .binding = original } };
+                            } else if (state.cleanup == null) {
+                                result.command = .{ .cancel_cleanup = binding };
+                            } else if (!state.artifacts_retired) {
+                                physical_page = try gc.Page.prepareGeneration(a, null, h.db.core, binding.index);
+                                result.command = .{ .cancel_artifacts = try (physical_page orelse return error.PrivateIndexCancellationPending).command(binding) };
+                            } else if (!state.claims_retired) {
+                                var read = try h.db.core.store.beginReadTxn();
+                                defer read.abort();
+                                claim_page = try claims.GcPage.prepare(a, null, &read, binding);
+                                result.command = .{ .cancel_claims = try (claim_page orelse return error.PrivateIndexCancellationPending).command() };
+                            } else result.command = .{ .cancel_complete = binding };
+                        }
+                        // An untouched owner needs immutable admission inputs.
+                        // Return only its state; the receiver uses the existing
+                        // raw-manifest/binding-only preparation entry point.
+                    }
+                },
+                .release => |intent| {
+                    var read = try h.db.core.store.beginReadTxn();
+                    defer read.abort();
+                    const record = try contract.Release.CancellationRecord.load(&read, intent);
+                    if (record == null) try intent.requireCurrent(&read) else try contract.Release.CancellationRecord.verifyRecovery(&read);
+                    result = .{ .progress = .{ .release = record }, .command = if (req.prepare == 1 and record == null) .{ .cancel_release = intent } else null };
+                },
+            }
+            try result.validateFor(parsed.value);
+            try ctx.ensureActive();
+            var response = try BoundedOwnerJsonResponse(contract.CancellationPreparation.max_response_bytes).initSized(result);
+            defer response.deinit();
+            const used = try response.encode(result);
+            try ctx.ensureActive();
+            output.* = response.detach(used);
+        }
+    };
+    Work.run(alloc, handle, request, context, out_response) catch |err| {
+        if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
+        return Failure.result(err, out_failure);
+    };
+    return .ok;
+}
+
 const RaftSchemaPreparation = struct {
     owner_id: *anyopaque,
     owner: *Handle,

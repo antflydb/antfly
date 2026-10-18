@@ -1307,6 +1307,16 @@ pub const NativeIndexOwnerControlRequest = extern struct {
     control: ControlledJsonOperationRequest = .{},
 };
 
+pub const RaftIndexOwnerCancellationRequest = extern struct {
+    pub const operation: u32 = 7;
+    version: u32 = abi_version,
+    prepare: u32 = 1,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_index_cancellation_json(owner: ?*anyopaque, request: *const RaftIndexOwnerCancellationRequest, out_response: *OwnedBytes, out_failure: *FailureIdentity) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_native_index_control_json(
     owner: ?*anyopaque,
     request: *const NativeIndexOwnerControlRequest,

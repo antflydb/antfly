@@ -84,6 +84,7 @@ pub const Result = union(enum) {
     raft_build: RaftBuildControlResponse,
     raft_validation: RaftValidationControlResponse,
     raft_lifecycle: RaftLifecycleControlResponse,
+    raft_cancellation: RaftCancellationControlResponse,
     raft_source: RaftSourceResult,
     recovered: struct {
         /// Copied from the lease that recovered the committed physical cut;
@@ -114,7 +115,7 @@ pub const Result = union(enum) {
 
     pub fn deinit(self: *Result) void {
         switch (self.*) {
-            .acknowledged, .raft, .raft_build, .raft_validation, .raft_lifecycle => {},
+            .acknowledged, .raft, .raft_build, .raft_validation, .raft_lifecycle, .raft_cancellation => {},
             .recovered => |value| value.deinit(),
             .applied => |value| value.deinit(),
             .controlled => |value| value.outcome.deinit(),
@@ -131,7 +132,7 @@ pub const Result = union(enum) {
     /// Borrowed until deinit; copying an outcome does not own error_name.
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
-            .acknowledged, .raft, .raft_build, .raft_validation, .raft_lifecycle, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .raft_build, .raft_validation, .raft_lifecycle, .raft_cancellation, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
             .controlled => |value| value.outcome.value,
@@ -146,6 +147,7 @@ pub const Result = union(enum) {
             .raft_build => |value| value.root_generation,
             .raft_validation => |value| value.root_generation,
             .raft_lifecycle => |value| value.root_generation,
+            .raft_cancellation => |value| value.root_generation,
             .recovered => |value| value.root_generation,
             .controlled => |value| value.root_generation,
             .building => |value| value.root_generation,
@@ -166,7 +168,7 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .controlled => |*value| &value.signing,
             .recovered => |*value| &value.signing,
-            .acknowledged, .raft, .raft_build, .raft_validation, .raft_lifecycle, .applied, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .raft_build, .raft_validation, .raft_lifecycle, .raft_cancellation, .applied, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
         };
     }
 
@@ -292,6 +294,7 @@ pub const Result = union(enum) {
             .raft_build => |value| .{ .raft_build = value },
             .raft_validation => |value| .{ .raft_validation = value },
             .raft_lifecycle => |value| .{ .raft_lifecycle = value },
+            .raft_cancellation => |value| .{ .raft_cancellation = value },
             .applied => |value| .{ .admitted = value.value },
             .controlled => |value| .{ .controlled = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
@@ -477,6 +480,39 @@ pub const RaftBuildControlResponse = struct {
     }
 };
 
+pub const RaftCancellationControlResponse = struct {
+    root_generation: u64,
+    input: local.storage_db_relational_index_raft_contract.CancellationRequest,
+    progress: local.storage_db_relational_index_raft_contract.CancellationProgress,
+    signed_ack: ?publication.Ack = null,
+    signing_failure: ?SigningFailure = null,
+
+    pub fn validate(self: @This(), request: Request) !void {
+        try request.validate(request.group_id);
+        try self.progress.validateFor(self.input);
+        const identity = self.input.identity();
+        if (self.root_generation == 0 or !std.mem.eql(u8, &identity.id, &request.id) or identity.namespace.table_id != request.table_id or identity.owner_group_id != request.group_id or
+            (self.input == .cancel and request.operation != .cancel and request.operation != .cancel_complete) or
+            (self.input == .release and request.operation != .cancel_release)) return error.InvalidPrivateIndexCancellation;
+        if (self.signed_ack) |ack| {
+            try ack.validate();
+            if (self.signing_failure != null or ack.table_id != request.table_id or ack.signed.proof.authority != .raft or ack.signed.proof.root_generation != self.root_generation) return error.InvalidIndexOwnerReceipt;
+            const receipt = switch (self.progress) {
+                .cancel => |state| blk: {
+                    const record = state.completed orelse return error.PrivateIndexCancellationPending;
+                    if (!std.meta.eql((ack.cancellation orelse return error.InvalidIndexOwnerReceipt).record, record)) return error.InvalidIndexOwnerReceipt;
+                    break :blk try record.receipt();
+                },
+                .release => |record| blk: {
+                    const value = record orelse return error.PrivateIndexCancellationPending;
+                    break :blk try value.intent.receiptAt(value.position);
+                },
+            };
+            if (!std.meta.eql(receipt, ack.signed.receipt)) return error.InvalidIndexOwnerReceipt;
+        }
+    }
+};
+
 pub const RaftLifecycleControlResponse = struct {
     root_generation: u64,
     input: local.storage_db_relational_index_raft_contract.LifecycleRequest,
@@ -549,6 +585,7 @@ pub const ControlResponse = union(enum) {
     raft_build: RaftBuildControlResponse,
     raft_validation: RaftValidationControlResponse,
     raft_lifecycle: RaftLifecycleControlResponse,
+    raft_cancellation: RaftCancellationControlResponse,
     admitted: native.Outcome,
     controlled: RootedOutcome,
     recovered: RootedOutcome,
@@ -561,6 +598,7 @@ pub const ControlResponse = union(enum) {
 
     pub fn cancellationAck(self: @This(), request: Request) !?publication.Ack {
         try self.validate(request);
+        if (self == .raft_cancellation) return self.raft_cancellation.signed_ack;
         return if (self == .canceling) self.canceling.signed_ack else null;
     }
 
@@ -607,6 +645,7 @@ pub const ControlResponse = union(enum) {
             .raft_build => |value| return value.validate(request),
             .raft_validation => |value| return value.validate(request),
             .raft_lifecycle => |value| return value.validate(request),
+            .raft_cancellation => |value| return value.validate(request),
             .source => |value| return value.validate(request),
             .raft_source => |value| return value.validateRaft(request),
             .installing => |value| return value.validate(request),

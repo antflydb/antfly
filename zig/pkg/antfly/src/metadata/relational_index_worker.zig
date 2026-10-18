@@ -451,12 +451,12 @@ const Job = struct {
                     self.retireOwner(index);
                     return;
                 }
-                if (response.value != .canceling) return error.InvalidPrivateIndexNativeReceipt;
+                if (response.value != .canceling and response.value != .raft_cancellation) return error.InvalidPrivateIndexNativeReceipt;
                 if (try response.value.cancellationAck(request)) |ack| {
                     if (!std.meta.eql(ack.signed.receipt.owner, identity)) return error.InvalidIndexOwnerReceipt;
                     owner.ack = ack;
                     owner.stage = .acknowledge;
-                } else if (response.value.canceling.step == .retired) {
+                } else if (if (response.value == .raft_cancellation) response.value.raft_cancellation.progress == .cancel and response.value.raft_cancellation.progress.cancel.artifacts_retired and response.value.raft_cancellation.progress.cancel.claims_retired else response.value.canceling.step == .retired) {
                     owner.stage = .cleanup_complete;
                 } else owner.retry_at_ns = now_ns +| retry_ns;
             },

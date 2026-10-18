@@ -149,6 +149,74 @@ pub const Control = struct {
 };
 
 pub const BuildRequest = @import("relational_index_owner_control.zig").BuildRequest;
+pub const CancellationRequest = union(enum) {
+    cancel: Admission,
+    release: @import("relational_index_release.zig").CancellationIntent,
+    pub fn identity(self: @This()) Identity {
+        const intent = switch (self) {
+            .cancel => |value| value,
+            .release => |value| Admission.fromBinding(value.canceled.binding),
+        };
+        return .{ .id = intent.id, .plan_digest = intent.plan_digest, .owner_digest = intent.owner_digest, .ordinal = intent.ordinal, .namespace = intent.fence.namespace, .owner_group_id = intent.fence.owner_group_id };
+    }
+    pub fn validate(self: @This()) !void {
+        try self.identity().validate();
+        switch (self) {
+            .cancel => |value| try value.validate(),
+            .release => |value| {
+                try value.validate();
+                if (value.canceled.position != .raft) return error.InvalidControlReceiptPosition;
+            },
+        }
+    }
+};
+pub const CancellationProgress = union(enum) {
+    cancel: jobs.RaftCancellationState,
+    release: ?@import("relational_index_release.zig").CancellationRecord,
+    pub fn validateFor(self: @This(), request: CancellationRequest) !void {
+        try request.validate();
+        if ((self == .cancel) != (request == .cancel)) return error.InvalidArgument;
+        switch (self) {
+            .cancel => |state| {
+                try state.validate(request.identity());
+                if (state.intent) |record| if (!record.intent.eql(request.cancel)) return error.PrivateIndexOwnerJobChanged;
+                if (state.binding) |binding| if (!Admission.fromBinding(binding).eql(request.cancel)) return error.PrivateIndexOwnerJobChanged;
+            },
+            .release => |record| if (record) |value| {
+                _ = try value.intent.receiptAt(value.position);
+                if (value.position != .raft or !std.meta.eql(value.intent, request.release)) return error.PrivateIndexOwnerJobChanged;
+            },
+        }
+    }
+};
+pub const CancellationPreparation = struct {
+    pub const max_request_bytes = 32 * 1024;
+    pub const max_response_bytes = @import("relational_index_gc.zig").Page.Replay.max_wire_bytes + 64 * 1024;
+    progress: CancellationProgress,
+    command: ?Command = null,
+    pub fn validateFor(self: @This(), request: CancellationRequest) !void {
+        try self.progress.validateFor(request);
+        if (self.command) |command| {
+            try command.validate();
+            if (request == .release) {
+                if (command != .cancel_release or self.progress.release != null or !std.meta.eql(command.cancel_release, request.release)) return error.InvalidPrivateIndexCancellation;
+            } else {
+                if (self.progress.cancel.completed != null) return error.InvalidPrivateIndexCancellation;
+                const intent = switch (command) {
+                    .cancel_intent => |value| value,
+                    .cancel_control => |value| blk: {
+                        if (value.effect == .admitted) return error.InvalidPrivateIndexCancellation;
+                        break :blk Admission.fromBinding(value.binding);
+                    },
+                    .cancel_cleanup, .cancel_complete => |value| Admission.fromBinding(value),
+                    inline .cancel_artifacts, .cancel_claims => |value| Admission.fromBinding(value.binding),
+                    else => return error.InvalidPrivateIndexCancellation,
+                };
+                if (!intent.eql(request.cancel)) return error.PrivateIndexOwnerJobChanged;
+            }
+        }
+    }
+};
 const installation = @import("relational_index_validation.zig");
 const release = @import("relational_index_release.zig");
 pub const Release = release;

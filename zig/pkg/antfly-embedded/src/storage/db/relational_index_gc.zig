@@ -154,7 +154,7 @@ pub const Page = struct {
     };
 
     arena: std.heap.ArenaAllocator,
-    pinned: catalog.WriteSnapshot,
+    pinned: ?catalog.WriteSnapshot,
     namespace: u64,
     owner: [32]u8,
     id: records.Id,
@@ -165,7 +165,7 @@ pub const Page = struct {
     consumed: bool = false,
 
     pub fn deinit(self: *Page) void {
-        self.pinned.deinit();
+        if (self.pinned) |*value| value.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -195,9 +195,15 @@ pub const Page = struct {
     fn prepareSelected(alloc: Allocator, io: ?std.Io, core: anytype, selected: ?records.Id, replay: ?Replay) !?Page {
         if (io) |runtime| try runtime.checkCancel();
         const namespace = core.schemaNamespaceGeneration();
-        var pinned = core.relational_indexes.acquire() orelse return null;
+        // No published indexes is a valid pinned state, not an empty queue.
+        // Private cancellation and dropping the last public index both need
+        // retirement while this controller is absent. stage() CASes absence
+        // as well as the namespace generation and durable owner preimage.
+        var pinned = core.relational_indexes.acquire();
         var owned = true;
-        defer if (owned) pinned.deinit();
+        defer if (owned) {
+            if (pinned) |*value| value.deinit();
+        };
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer if (owned) arena.deinit();
         const page_alloc = arena.allocator();
@@ -220,7 +226,7 @@ pub const Page = struct {
             break :blk .{ .id = try records.Id.decode(entry.key[prefix.len..]), .value = entry.value };
         };
         const id = pending.id;
-        for (pinned.plan.boundIndexes()) |index| if (index.id().mapKey() == id.mapKey())
+        if (pinned) |value| for (value.plan.boundIndexes()) |index| if (index.id().mapKey() == id.mapKey())
             return error.ActiveRelationalIndexRetirement;
         const expected = try page_alloc.dupe(u8, pending.value);
         if (replay) |fixed| if (!std.mem.eql(u8, fixed.expected, expected)) return error.VersionConflict;

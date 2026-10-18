@@ -165,8 +165,17 @@ still required. A shared bounded inspection reads the same intent, phase slots,
 retirement objectives and completion record for Native and Raft owners; the
 Native adapter keeps native cuts and the Raft projection keeps tagged cuts,
 validating every cut against the durable Raft watermark rather than a clock.
-This is not complete public activation: the worker's Raft cohort guard,
-cancellation receiver paths and root-adoption recovery
+The authenticated cancellation receiver now advances intent, untouched-owner
+admission, drain/reserve, selected artifact/claim cleanup, completion and cohort
+release through the same leased owner and ordered proposal path. Each request
+proposes at most one effect; canceled requests recover only bounded retained
+state after commit. Missing signing identity preserves unsigned progress.
+Untouched owners reuse raw-manifest admission rather than copying a schema-sized
+command back through the compiled-owner interface. GC can pin an absent public
+index snapshot, so retiring the first private index or last public index does
+not stall; commit still checks absence, namespace generation and durable owner.
+This is not complete public activation: the worker's Raft cohort guard and
+root-adoption recovery
 remain unfinished, and public CREATE remains guarded. No original case is
 closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's

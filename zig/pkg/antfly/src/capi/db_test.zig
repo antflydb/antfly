@@ -1768,6 +1768,79 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
     var sealed_retry = try Build.call(id, audit_input, validation_request);
     defer sealed_retry.deinit();
     try std.testing.expectEqualDeep(sealed.value.audit, sealed_retry.value.audit);
+    for ([_]bool{ false, true }) |visited_owner| {
+        const CancellationProbe = struct {
+            fn call(owner: ?*anyopaque, work: contract.CancellationRequest, prepare_work: bool) !std.json.Parsed(contract.CancellationPreparation) {
+                const cancel_encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, work, .{});
+                defer std.testing.allocator.free(cancel_encoded);
+                var cancel_output: kernel_owner_abi.OwnedBytes = .{};
+                defer freeRawBuffer(cancel_output.ptr, cancel_output.len);
+                var cancel_failure: kernel_owner_abi.FailureIdentity = .{};
+                try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerRaftIndexCancellationJson(owner, &.{ .table_name = .fromSlice("items"), .request_json = .fromSlice(cancel_encoded), .prepare = @intFromBool(prepare_work) }, &cancel_output, &cancel_failure));
+                var cancel_parsed = try std.json.parseFromSlice(contract.CancellationPreparation, std.testing.allocator, cancel_output.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+                errdefer cancel_parsed.deinit();
+                try cancel_parsed.value.validateFor(work);
+                return cancel_parsed;
+            }
+        };
+        var cancel_directory = try TestDirectory.init("raft-index-capi-cancel");
+        defer cancel_directory.cleanup();
+        const cancel_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace };
+        {
+            var seed = try db_mod.DB.open(a, cancel_directory.path(), cancel_options);
+            defer seed.close();
+            if (visited_owner) {
+                var source_read = try handle.db.core.store.beginReadTxn();
+                defer source_read.abort();
+                var source_cursor = try source_read.openCursor();
+                defer source_cursor.close();
+                var destination = try seed.core.store.runtime_store.beginWrite();
+                errdefer destination.abort();
+                var item = try source_cursor.first();
+                while (item) |kv| : (item = try source_cursor.next()) try destination.put(kv.key, kv.value);
+                try destination.commit();
+            } else {
+                try seed.setSchemaJson(a, before);
+                try seed.core.store.putBatch(&.{.{ .key = local.storage_db_relational_integrity_catalog.key, .value = prior.value }}, &.{});
+            }
+        }
+        var cancel_handle: Handle = .{ .alloc = a, .db = try db_mod.DB.open(a, cancel_directory.path(), cancel_options), .storage_owner_table_name = @constCast("items"), .storage_owner_group_id = 11 };
+        defer cancel_handle.db.close();
+        const cancel_id = try registerTestHandle(&cancel_handle);
+        defer unregisterTestHandle(cancel_id);
+        const cancel_input: contract.CancellationRequest = .{ .cancel = header };
+        var cancel_index = next_index + 2;
+        var cancel_turns: usize = 0;
+        const canceled_record = completed: while (cancel_turns < 32) : (cancel_turns += 1) {
+            var cancel_step = try CancellationProbe.call(cancel_id, cancel_input, true);
+            defer cancel_step.deinit();
+            if (cancel_step.value.progress.cancel.completed) |record| break :completed record;
+            const selected = cancel_step.value.command orelse cold: {
+                try std.testing.expect(cancel_step.value.progress.cancel.intent != null and cancel_step.value.progress.cancel.binding == null);
+                const cold_preparation = try Prepare.call(cancel_id, prepare_request, header, local.storage_db_relational_index_inputs.digest(candidate.inputs.bytes));
+                break :cold contract.Command{ .cancel_control = .{ .effect = .admitted, .binding = cold_preparation.binding, .inputs_b64 = admission.command.inputs_b64 } };
+            };
+            try @import("../storage/server_db_adapter.zig").applyOrderedGroup(&cancel_handle.db, 11, .{ .relational_index_owner_control = selected }, .{ .term = 20, .index = cancel_index });
+            cancel_index += 1;
+            if (cancel_turns == 0) {
+                cancel_handle.db.close();
+                cancel_handle.db = try db_mod.DB.open(a, cancel_directory.path(), cancel_options);
+            }
+        } else return error.TestUnexpectedResult;
+        try std.testing.expect(cancel_turns > 2);
+        const cancel_release_input: contract.CancellationRequest = .{ .release = .{ .canceled = canceled_record, .metadata_decision = @splat(13) } };
+        var terminal_step = try CancellationProbe.call(cancel_id, cancel_release_input, true);
+        defer terminal_step.deinit();
+        const terminal_command = terminal_step.value.command orelse return error.TestUnexpectedResult;
+        try @import("../storage/server_db_adapter.zig").applyOrderedGroup(&cancel_handle.db, 11, .{ .relational_index_owner_control = terminal_command }, .{ .term = 20, .index = cancel_index });
+        cancel_handle.db.close();
+        cancel_handle.db = try db_mod.DB.open(a, cancel_directory.path(), cancel_options);
+        try @import("../storage/server_db_adapter.zig").applyOrderedGroup(&cancel_handle.db, 11, .{ .relational_index_owner_control = terminal_command }, .{ .term = 21, .index = cancel_index + 1 });
+        var terminal_retry = try CancellationProbe.call(cancel_id, cancel_release_input, false);
+        defer terminal_retry.deinit();
+        try std.testing.expectEqual(cancel_index, terminal_retry.value.progress.release.?.position.raft.index);
+        try std.testing.expect(terminal_retry.value.command == null);
+    }
     const Lifecycle = struct {
         fn call(owner: ?*anyopaque, work: contract.LifecycleRequest, prepare: bool, root_bytes: []const u8) !std.json.Parsed(contract.LifecyclePreparation) {
             const lifecycle_encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, work, .{});
