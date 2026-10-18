@@ -312,6 +312,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
             };
     }
     var navigation = try navigation_api.buildProven(a, na, &scoped, &provider, prior_navigation, cancellation, pinned.data);
+    defer navigation.deinit();
     provider.native_delta = navigation.delta;
     const inventory_bytes = try navigation_api.encodeInventory(a, &provider, navigation.root);
     defer a.free(inventory_bytes);

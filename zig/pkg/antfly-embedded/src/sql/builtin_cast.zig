@@ -128,11 +128,7 @@ pub fn floatValue(comptime T: type, value: std.json.Value) !f64 {
             nonzero = integer != 0;
             break :blk @floatFromInt(integer);
         },
-        .float => |number| blk: {
-            nonzero = number != 0;
-            special = !std.math.isFinite(number);
-            break :blk @floatCast(number);
-        },
+        .float => |number| return @import("../common/float_domain.zig").normalize(number, if (T == f32) .float32 else .float64),
         .string, .number_string => |input| blk: {
             const text = std.mem.trim(u8, input, whitespace);
             const positive = if (text.len != 0 and (text[0] == '+' or text[0] == '-')) text[1..] else text;

@@ -25,7 +25,10 @@ const rebuild = @import("../serverless/build/lake_rebuild.zig");
 const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
-pub const metadata_version: u16 = 2;
+pub const metadata_version: u16 = 3;
+pub fn supportsMetadata(version: u16) bool {
+    return version == 2 or version == metadata_version;
+}
 pub const Root = struct {
     version: u16 = metadata_version,
     binding: local.serverless_segment_source_binding.Binding,
@@ -33,16 +36,21 @@ pub const Root = struct {
     generation: files.Root,
     recipe: [32]u8 = @splat(0),
     file_states: []const state.File = &.{},
+    file_directory: ?@import("../serverless/graph_segment/page_tree.zig").Ref = null,
 };
 pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .sparse_segment or ref.metadata_version != metadata_version or ref.byte_len > files.max_root_bytes) return error.InvalidNativeLakeSparseRoot;
+    if (ref.kind != .sparse_segment or !supportsMetadata(ref.metadata_version) or ref.byte_len > files.max_root_bytes) return error.InvalidNativeLakeSparseRoot;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
-    if (root.version != metadata_version or root.binding.sidecar_kind != .sparse or root.binding.column_bindings.len != 1 or root.config_json.len > 256 * 1024) return error.InvalidNativeLakeSparseRoot;
+    if (root.version != ref.metadata_version or root.binding.sidecar_kind != .sparse or root.binding.column_bindings.len != 1 or root.config_json.len > 256 * 1024) return error.InvalidNativeLakeSparseRoot;
     try root.binding.validate();
     try root.generation.validate();
     try state.validate(root.file_states, root.generation.domain);
+    if (root.file_directory) |directory| {
+        try directory.validate();
+        if (root.version < 3 or root.file_states.len != 0) return error.InvalidNativeLakeFileState;
+    }
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeSparseRoot;
     if (!std.mem.eql(u8, &scope.domain, &root.generation.domain)) return error.InvalidNativeLakeSparseRoot;
     return root;
@@ -70,7 +78,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer producer.deinit();
         producer.memo = provider.vector_memo;
         const prior = for (reusable) |declaration| {
-            if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, wanted.name) and rebuild.bindingsEqual(binding, declaration.binding)) break declaration;
+            if (declaration.artifact.kind == .sparse_segment and supportsMetadata(declaration.artifact.metadata_version) and std.mem.eql(u8, declaration.name, wanted.name) and rebuild.bindingsEqual(binding, declaration.binding)) break declaration;
         } else null;
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
@@ -80,7 +88,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         const seed: ?Root = for (candidates) |declaration| {
-            if (declaration.artifact.kind != .sparse_segment or declaration.artifact.metadata_version != metadata_version or !std.mem.eql(u8, declaration.name, wanted.name)) continue;
+            if (declaration.artifact.kind != .sparse_segment or !supportsMetadata(declaration.artifact.metadata_version) or !std.mem.eql(u8, declaration.name, wanted.name)) continue;
             var previous_binding = declaration.binding;
             previous_binding.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(binding, previous_binding)) continue;
@@ -88,7 +96,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (!std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.generation.domain, &store.upload_scope.?.domain)) continue;
             break root;
         } else null;
-        var plan = try state.Plan.init(a, ca, provider, if (seed) |root| root.file_states else &.{});
+        const previous_states = if (seed) |root| if (root.file_directory != null and !state.canUseDelta(provider, root.binding.snapshot_id)) try state.directoryFiles(ca, store.*, root.file_directory.?, root.generation.domain, cancellation) else root.file_states else &.{};
+        var plan = try state.Plan.initPaged(a, ca, provider, previous_states, if (seed) |root| root.file_directory else null, seed != null, if (seed) |root| state.canUseDelta(provider, root.binding.snapshot_id) else false);
         defer plan.deinit();
         var tracker = try state.Tracker.init(a, ca, &plan, store, cancellation);
         defer tracker.deinit();
@@ -109,7 +118,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var finished = false;
         defer if (!finished and seed == null) index.abortBulkIngestSession();
         if (seed) |root| {
-            var deletes: state.Deletes = .{ .files = root.file_states, .current = &plan };
+            var deletes: state.Deletes = .{ .files = if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan };
+            defer deletes.deinit();
             while (try deletes.next(a, store.*, cancellation)) |keys| {
                 defer a.free(keys);
                 const ids = try a.alloc([]const u8, keys.len / deletes.key_width);
@@ -146,7 +156,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         var input_provider = provider.*;
-        input_provider.only_files = plan.changed;
+        input_provider.only_plan = &plan;
         input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
         const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
         defer rows.deinit(a);
@@ -192,7 +202,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer checkpoint.deinit();
         var output_bytes: u64 = 1024 * 1024 * 1024;
         const generation = try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, &output_bytes, if (seed) |root| .{ .root = root.generation } else null);
-        const root: Root = .{ .binding = binding, .config_json = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{}), .generation = generation, .recipe = recipe, .file_states = plan.files };
+        const root: Root = .{ .binding = binding, .config_json = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{}), .generation = generation, .recipe = recipe, .file_states = if (plan.selection == null) plan.files else &.{}, .file_directory = if (plan.selection != null) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > files.max_root_bytes) return error.NativeLakeFilesTooLarge;
         var uploaded = try store.putWithCancellation(bytes, cancellation);

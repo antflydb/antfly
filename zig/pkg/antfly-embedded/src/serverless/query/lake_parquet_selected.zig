@@ -158,18 +158,18 @@ fn bytes(self: *Self, position: usize) ![]const u8 {
     const length = std.mem.readInt(u32, self.data[offset..][0..4], .little);
     return self.data[offset + 4 ..][0..length];
 }
-fn predicateValue(self: *Self, comptime T: type, position: usize) !T {
+fn predicateValue(self: *Self, comptime T: type, position: usize, domain: types.FloatDomain) !T {
     if (T == i64) {
         const factor: i64 = if (std.mem.eql(u8, self.chunk.logical_type, "timestamp_millis")) 1_000_000 else if (std.mem.eql(u8, self.chunk.logical_type, "timestamp_micros")) 1_000 else 1;
         return std.math.mul(i64, try self.integer(position), factor) catch error.InvalidParquetPage;
     }
-    if (T == f64) return self.number(position);
+    if (T == f64) return @import("../../common/float_domain.zig").normalize(try self.number(position), domain);
     if (T == []const u8) return self.bytes(position);
     if (T == bool) return self.data[position / 8] & (@as(u8, 1) << @as(u3, @intCast(position % 8))) != 0;
     unreachable;
 }
 fn comparePredicate(comptime T: type, comptime op: types.EncodedOp, value: T, literal: T) bool {
-    const order = if (T == []const u8) std.mem.order(u8, value, literal) else if (T == bool) std.math.order(@intFromBool(value), @intFromBool(literal)) else std.math.order(value, literal);
+    const order = if (T == []const u8) std.mem.order(u8, value, literal) else if (T == bool) std.math.order(@intFromBool(value), @intFromBool(literal)) else if (T == f64) @import("../../common/float_domain.zig").order(value, literal) else std.math.order(value, literal);
     return switch (op) {
         .eq => order == .eq,
         .neq => order != .eq,
@@ -188,11 +188,11 @@ fn predicateMask(self: *Self, comptime T: type, begin: usize, keep: []bool, lite
         if (active and position != absent and !std.math.isFinite(try self.number(position))) return false;
     };
     switch (op) {
-        inline else => |operation| try self.predicateMaskOp(T, operation, begin, keep, literal),
+        inline else => |operation| try self.predicateMaskOp(T, operation, begin, keep, literal, .finite),
     }
     return true;
 }
-fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, begin: usize, keep: []bool, literal: T) !void {
+fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, begin: usize, keep: []bool, literal: T, domain: types.FloatDomain) !void {
     var memo: [8192]u8 = @splat(0);
     var identities: [8192]u32 = undefined;
     var cached: usize = 0;
@@ -203,10 +203,11 @@ fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, 
             const position = self.lanePosition(begin + lane);
             const dense = !timestamp and self.dictionary == null and lane + 4 <= keep.len and position != absent and for (keep[lane..][0..4], 0..) |active, offset| {
                 if (!active or self.lanePosition(begin + lane + offset) != position + offset) break false;
+                if (T == f64) if (!std.math.isFinite(try self.number(position + offset)) or !std.math.isFinite(literal)) break false;
             } else true;
             if (dense) {
                 var native: [4]T = undefined;
-                for (&native, 0..) |*value, offset| value.* = try self.predicateValue(T, position + offset);
+                for (&native, 0..) |*value, offset| value.* = try self.predicateValue(T, position + offset, domain);
                 const left: @Vector(4, T) = native;
                 const right: @Vector(4, T) = @splat(literal);
                 keep[lane..][0..4].* = switch (op) {
@@ -233,7 +234,7 @@ fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, 
         if (self.indices) |index| if (index.runAt(position)) |run| if (run.repeated != null) {
             const definition_end = if (self.definitions) |definitions| definitions.intervalEnd(begin + lane) - begin else keep.len;
             const end = @min(definition_end, @min(keep.len, lane + run.first + run.count - position));
-            const matches = comparePredicate(T, op, try self.predicateValue(T, position), literal);
+            const matches = comparePredicate(T, op, try self.predicateValue(T, position, domain), literal);
             if (!matches) @memset(keep[lane..end], false);
             lane = end - 1;
             continue;
@@ -249,13 +250,22 @@ fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, 
                 continue;
             }
         }
-        keep[lane] = comparePredicate(T, op, try self.predicateValue(T, position), literal);
+        keep[lane] = comparePredicate(T, op, try self.predicateValue(T, position, domain), literal);
         if (self.dictionary != null and cached < 4096) {
             identities[slot] = id;
             memo[slot] = if (keep[lane]) 2 else 1;
             cached += 1;
         }
     }
+}
+fn encodedNumberMask(raw: *const anyopaque, begin: usize, keep: []bool, literal: f64, op: types.EncodedOp, domain: types.FloatDomain) !bool {
+    const self: *Self = @ptrCast(@alignCast(@constCast(raw)));
+    if (self.kind != .number) return false;
+    if (begin > self.count or keep.len > self.count - begin) return error.InvalidParquetPage;
+    switch (op) {
+        inline else => |operation| try self.predicateMaskOp(f64, operation, begin, keep, literal, domain),
+    }
+    return true;
 }
 fn encodedMask(raw: *const anyopaque, begin: usize, keep: []bool, literal: std.json.Value, op: types.EncodedOp) !bool {
     const self: *Self = @ptrCast(@alignCast(@constCast(raw)));
@@ -302,6 +312,7 @@ pub fn evidence(self: *Self, a: A, begin: usize, count: usize) !?types.ColumnVec
         },
         .read = encodedValue,
         .mask = encodedMask,
+        .mask_number = encodedNumberMask,
         .dictionary_id = if (self.dictionary != null) encodedId else null,
     } } };
 }

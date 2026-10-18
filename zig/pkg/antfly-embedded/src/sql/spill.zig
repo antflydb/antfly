@@ -3031,6 +3031,11 @@ pub const Sequential = struct {
                         else => unreachable,
                     }, .element = if (kind_ == .f64) .float64 else null };
                 }
+                fn decimal(raw: *anyopaque, alloc: Allocator, column: usize, selected: ?[]const usize) anyerror!?@import("execution_batch.zig").DecimalColumn {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    if (view.keys) return null;
+                    return view.block.decimalColumn(alloc, column, selected);
+                }
                 fn dictionary(raw: *anyopaque, alloc: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
                     const view: *@This() = @ptrCast(@alignCast(raw));
                     const encoded = view.block.encoded orelse return null;
@@ -3039,7 +3044,47 @@ pub const Sequential = struct {
             };
             const view = try a.create(View);
             view.* = .{ .block = self, .keys = keys };
-            return .{ .reader = .{ .ptr = view, .read = View.cell, .read_physical = View.physical, .read_identity = View.identity, .read_json = if (keys) null else View.json, .read_frozen = if (keys) null else View.frozen, .read_dictionary = View.dictionary, .count = self.count(), .width = if (keys) self.keyWidth() else self.width() } };
+            return .{ .reader = .{ .ptr = view, .read = View.cell, .read_physical = View.physical, .read_decimal_selected = View.decimal, .read_identity = View.identity, .read_json = if (keys) null else View.json, .read_frozen = if (keys) null else View.frozen, .read_dictionary = View.dictionary, .count = self.count(), .width = if (keys) self.keyWidth() else self.width() } };
+        }
+        pub fn decimalColumn(self: *const OwnedBlock, a: Allocator, column: usize, selected: ?[]const usize) !?@import("execution_batch.zig").DecimalColumn {
+            const count_rows = if (selected) |indices| indices.len else self.count();
+            var coefficients: []i128 = &.{};
+            var scales: []u16 = &.{};
+            var nulls: []u8 = &.{};
+            var keep = false;
+            defer if (!keep) {
+                a.free(coefficients);
+                a.free(scales);
+                a.free(nulls);
+            };
+            coefficients = try a.alloc(i128, count_rows);
+            scales = try a.alloc(u16, count_rows);
+            nulls = try a.alloc(u8, count_rows);
+            for (coefficients, scales, nulls, 0..) |*coefficient, *scale, *flag, row_index| {
+                const source_row = if (selected) |indices| indices[row_index] else row_index;
+                // Optional decimal views must never materialize unrelated JSON.
+                if (self.encoded) |encoded| if (try encoded.frozenJson(source_row, column, false) != null) return null;
+                const datum = try self.cell(source_row, column);
+                flag.* = @intFromBool(datum.sql_null);
+                coefficient.* = 0;
+                scale.* = 0;
+                if (datum.sql_null) continue;
+                const numeric = @import("numeric_value.zig");
+                var parsed: ?numeric.Owned = null;
+                defer if (parsed) |*owned| owned.deinit();
+                const number = datum.numeric orelse blk: {
+                    if (datum.value != .number_string) return null;
+                    var context: numeric.Context = .{ .alloc = a };
+                    parsed = try numeric.parse(&context, datum.value.number_string);
+                    break :blk &parsed.?.value;
+                };
+                if (number.kind != .finite or number.scale > 38) return null;
+                scale.* = number.scale;
+                coefficient.* = @import("numeric_value.zig").coefficientAtScale(number.*, number.scale) orelse return null;
+                if (@abs(coefficient.*) >= @as(u128, 100000000000000000000000000000000000000)) return null;
+            }
+            keep = true;
+            return .{ .physical = .{ .vector = .{ .name = "", .values = .{ .decimal128 = .{ .values = coefficients, .precision = 38, .scale = 0 } }, .nulls = .{ .bytes = nulls } }, .range = .{ .count = count_rows }, .kind = .number, .element = .numeric }, .scales = scales };
         }
         /// Export a typed column directly from validated spill buffers. Strings
         /// and string dictionaries borrow the block; numeric wire values are
@@ -8863,4 +8908,31 @@ test "SQL compact delivery compressed text keys verify with fixed headroom and r
     const bad_copy = [_]u8{ 1, 0 };
     try pages.file.writeRaw(key_offset + 8 + prefix, &bad_copy);
     try std.testing.expectError(error.InvalidSqlSpill, pages.lookupNativeBody(key));
+}
+
+test "SQL native spill decimal views retain selected coefficients display scales and NULLs" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 4096);
+    defer file.close();
+    const numeric = @import("numeric_value.zig");
+    var numbers: numeric.Context = .{ .alloc = a };
+    var first = try numeric.parse(&numbers, "1.2300");
+    defer first.deinit();
+    var second = try numeric.parse(&numbers, "-4.5");
+    defer second.deinit();
+    for ([_]Datum{ Datum.typedNumeric(&first.value), .{}, Datum.typedNumeric(&second.value) }, 0..) |datum, i| _ = try file.append(.{ .values = &.{datum}, .keys = &.{}, .ordinal = i }, none);
+    try file.seal();
+    var block = try file.readInputBlock(0);
+    defer block.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const view = (try block.view().decimalColumn(arena.allocator(), 0, &.{ 2, 1, 0, 2 })).?;
+    try std.testing.expectEqualSlices(i128, &.{ -45, 0, 12300, -45 }, view.physical.vector.values.decimal128.values);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 0, 4, 1 }, view.scales);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, view.physical.vector.nulls.bytes);
 }

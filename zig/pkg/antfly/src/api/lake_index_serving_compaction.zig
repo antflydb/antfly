@@ -358,7 +358,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
             if (group.segments.len != 1 or group.sources.len == 0) return error.InvalidNativeLakeTextCorpus;
             var sources: std.ArrayList(Span) = .empty;
             for (group.sources) |span| if (plan.by_id.get(span.file.id)) |ordinal| {
-                if (!std.mem.eql(u8, &span.file.digest, &plan.files[ordinal].digest)) continue;
+                if (!std.mem.eql(u8, &span.file.digest, &(try plan.stateAt(ordinal)).digest)) continue;
                 try sources.append(sa, span);
             };
             try builder.removed.append(ca, ref.*);

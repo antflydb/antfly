@@ -160,6 +160,7 @@ pub const Decimal128 = struct {
 /// Borrowed encoded page evidence. Callbacks interpret only requested lanes;
 /// producers materialize survivors before returning an owning result batch.
 pub const EncodedOp = enum { eq, neq, lt, lte, gt, gte };
+pub const FloatDomain = @import("../../common/float_domain.zig").Domain;
 pub const EncodedValues = struct {
     ptr: *const anyopaque,
     begin: usize,
@@ -168,6 +169,9 @@ pub const EncodedValues = struct {
     read: *const fn (*const anyopaque, usize) anyerror!std.json.Value,
     dictionary_id: ?*const fn (*const anyopaque, usize) ?u32 = null,
     mask: ?*const fn (*const anyopaque, usize, []bool, std.json.Value, EncodedOp) anyerror!bool = null,
+    /// Exact numeric masks carry the consumer's comparison domain. Encoded
+    /// producers normalize dictionary/repeated values once and keep operands wide.
+    mask_number: ?*const fn (*const anyopaque, usize, []bool, f64, EncodedOp, FloatDomain) anyerror!bool = null,
     pub fn at(self: @This(), row: usize) !std.json.Value {
         if (row >= self.count) return error.RowSourceColumnLengthMismatch;
         return self.read(self.ptr, std.math.add(usize, self.begin, row) catch return error.RowSourceColumnLengthMismatch);

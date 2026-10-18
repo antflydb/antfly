@@ -10558,3 +10558,110 @@ test "external lake page prefetch bounds mixed header discovery to four columns"
     for (batch.columns) |column| for (0..batch.rowCount()) |row| try std.testing.expectEqual(@as(i64, 2), try column.integerAt(row));
     try std.testing.expect((try cursor.next()) == null);
 }
+
+test "external lake optional OffsetIndex local admission falls back to bounded sequential pages" {
+    const a = std.testing.allocator;
+    const storage = @import("../../storage/object_storage.zig");
+    for ([_]bool{false}) |dictionary| for (0..1) |fault| {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(a);
+        if (dictionary) try appendPlainI64DictionaryPage(&bytes, a, &.{ 10, 20 });
+        var starts: [256]usize = undefined;
+        var lengths: [256]usize = undefined;
+        for (&starts, &lengths) |*start, *len| {
+            start.* = bytes.items.len;
+            if (dictionary) try appendDictionaryI64DataPage(&bytes, a, 1, 1, &.{ 0x80, 0x02, 1 }) else try appendPlainI64DataPage(&bytes, a, &@as([1]i64, @splat(20)));
+            len.* = bytes.items.len - start.*;
+        }
+        const data_end = bytes.items.len;
+        var field: i16 = 0;
+        try appendField(&bytes, a, &field, 1, .list);
+        try appendListHeader(&bytes, a, .struct_, 256);
+        for (starts, lengths, 0..) |start, len, index| {
+            var id: i16 = 0;
+            try appendField(&bytes, a, &id, 1, .i64);
+            try appendI64(&bytes, a, @intCast(start));
+            try appendField(&bytes, a, &id, 2, .i32);
+            try appendI32(&bytes, a, @intCast(len - @intFromBool(fault == 1 and index == 0)));
+            try appendField(&bytes, a, &id, 3, .i64);
+            try appendI64(&bytes, a, @intCast(index * 1 + @intFromBool(fault == 2 and index == 1)));
+            try appendStop(&bytes, a);
+        }
+        if (fault == 3) {
+            // A valid optional extension makes the index larger than the
+            // admitted data-page read. Fall back without fetching this index.
+            try appendField(&bytes, a, &field, 4, .binary);
+            try appendBinary(&bytes, a, &@as([4096]u8, @splat(0)));
+        }
+        try appendStop(&bytes, a);
+        var memory = storage.MemoryObjectStorage.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("bucket");
+        var put = try client.putObject("bucket", "data", bytes.items, .{});
+        defer put.deinit(a);
+        const Provider = struct {
+            base: storage.ObjectStorage,
+            vtable: storage.ObjectStorage.VTable,
+            calls: usize = 0,
+            bytes: usize = 0,
+            fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                var base = self.base;
+                base.allocator = alloc;
+                const result = try base.getObject(bucket, key, options);
+                self.bytes += result.body.len;
+                return result;
+            }
+        };
+        var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+        provider.vtable.get_object = Provider.get;
+        var reader = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+        var chunks = [_]external_source.ColumnChunk{.{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = data_end, .uncompressed_len = data_end, .physical_type = @constCast("int64"), .encoding = @constCast(if (dictionary) "rle_dictionary" else "plain"), .offset_index_offset = data_end, .offset_index_length = @intCast(bytes.items.len - data_end) }};
+        var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 256, .file_offset = 0, .total_byte_len = data_end, .column_chunks = &chunks }};
+        var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 256, .row_groups = &groups }};
+        const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.parquetReader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = 64 * 1024 });
+        defer cursor.deinit();
+        if (fault == 1 or fault == 2) {
+            try std.testing.expectError(error.InvalidParquetMetadata, cursor.next());
+            continue;
+        }
+        var rows: usize = 0;
+        while (try cursor.next()) |batch| {
+            for (0..batch.rowCount()) |index| try std.testing.expectEqual(@as(i64, 20), try batch.columns[0].integerAt(index));
+            rows += batch.rowCount();
+        }
+        try std.testing.expectEqual(@as(usize, 256), rows);
+        try std.testing.expectEqual(@as(usize, 257), provider.calls);
+        try std.testing.expectEqual(@as(usize, 256), cursor.pages_decoded);
+        if (fault != 0) continue;
+        // Evict all encoded residency while retaining immutable decoded pages.
+        // Warm scans must not refetch payloads, including async lookahead.
+        const shared = @import("lake_serving_cache.zig");
+        var cache = shared.Cache.initWithMemoryLimit(a, 0);
+        defer cache.deinit();
+        cache.decoded.max_loading_bytes = 8192;
+        var shared_reader: shared.Reader = .{ .cache = &cache, .base = reader, .scope = @splat(0), .context = .{} };
+        for (0..1) |pass| {
+            if (pass == 2) shared_reader.context.io = std.testing.io;
+            const before = provider.bytes;
+            var warm = try @import("lake_parquet_cursor.zig").Cursor.init(a, shared_reader.reader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = 64 * 1024 });
+            defer warm.deinit();
+            warm.shared_reader = &shared_reader;
+            var warm_rows: usize = 0;
+            while (try warm.next()) |batch| {
+                warm_rows += batch.rowCount();
+                for (0..batch.rowCount()) |index| try std.testing.expectEqual(@as(i64, 20), try batch.columns[0].integerAt(index));
+            }
+            shared_reader.drain(false);
+            try std.testing.expectEqual(@as(usize, 256), warm_rows);
+            if (pass != 0) {
+                try std.testing.expectEqual(@as(usize, 0), warm.pages_decoded);
+                // A dictionary prelude can still require its bounded probe.
+                try std.testing.expect(provider.bytes - before <= (if (dictionary) @as(usize, 512) else 0));
+            }
+        }
+    };
+}

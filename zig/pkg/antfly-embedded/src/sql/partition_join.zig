@@ -83,6 +83,8 @@ pub const Join = struct {
     hash: ?*operators.HashJoin = null,
     skew: ?*@import("skew_join.zig").Join = null,
     skew_blocks_read: usize = 0,
+    vector_residual_batches: usize = 0,
+    scalar_residual_rows: usize = 0,
     probe: ?operators.HashJoin.Probe = null,
     left: ?[]const Datum = null,
     matched: bool = false,
@@ -655,6 +657,20 @@ pub const Join = struct {
                 .values => null,
             };
         }
+        fn same(self: NativeRow, other: NativeRow) bool {
+            return switch (self.source) {
+                .probe => |block| other.source == .probe and block == other.source.probe,
+                .build => |store| other.source == .build and store == other.source.build,
+                else => false,
+            };
+        }
+        fn batch(self: NativeRow, a: A) !?Batch {
+            return switch (self.source) {
+                .probe => |block| try @constCast(block).batch(a, false),
+                .build => |store| .{ .retained = .{ .store = store, .begin = 0, .count = store.len } },
+                else => null,
+            };
+        }
         fn row(self: NativeRow, a: A) ![]const Datum {
             const values = try a.alloc(Datum, self.width);
             for (values, 0..) |*value, column| value.* = try self.cell(a, column);
@@ -675,7 +691,7 @@ pub const Join = struct {
                 return .{ .source = .{ .probe = block }, .index = self.source.disk.row, .width = self.width };
             }
             // Disk-chain matches borrow the decoder until the next candidate.
-            // Copy only accepted fallback rows, including nested payloads.
+            // Retain staged fallback rows, including nested payloads.
             if (self.source == .values) {
                 const values = try a.alloc(Datum, self.source.values.len);
                 for (values, self.source.values) |*dest, value| dest.* = try operators.cloneDatum(a, value);
@@ -725,29 +741,62 @@ pub const Join = struct {
             const location = try self.locate(row, column);
             return if (location.source) |source| source.frozen(location.column) else null;
         }
+        fn selectedSource(self: *@This(), a: A, column: usize, selected: ?[]const usize) !?struct { batch: Batch, column: usize, rows: []usize } {
+            const count = if (selected) |indices| indices.len else self.rows.len;
+            if (count == 0) return null;
+            const first = try self.locate(if (selected) |indices| indices[0] else 0, column);
+            const source = first.source orelse return null;
+            const batch_ = (try source.batch(a)) orelse return null;
+            const rows = try a.alloc(usize, count);
+            var retained = false;
+            defer if (!retained) a.free(rows);
+            for (rows, 0..) |*row, lane| {
+                const current = try self.locate(if (selected) |indices| indices[lane] else lane, column);
+                const value = current.source orelse return null;
+                if (current.column != first.column or !source.same(value)) return null;
+                row.* = value.index;
+            }
+            retained = true;
+            return .{ .batch = batch_, .column = first.column, .rows = rows };
+        }
+        fn physical(raw: *anyopaque, a: A, column: usize, selected: ?[]const usize) !?@import("execution_batch.zig").PhysicalColumn {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const source = (try self.selectedSource(a, column, selected)) orelse return null;
+            return source.batch.physicalColumnSelected(a, source.column, source.rows);
+        }
+        fn decimal(raw: *anyopaque, a: A, column: usize, selected: ?[]const usize) !?@import("execution_batch.zig").DecimalColumn {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const source = (try self.selectedSource(a, column, selected)) orelse return null;
+            return source.batch.decimalColumnSelected(a, source.column, source.rows);
+        }
         fn batch(self: *@This()) Batch {
-            return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .count = self.rows.len, .width = self.evaluation.left_width + self.evaluation.right_width } };
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .read_physical_selected = physical, .read_decimal_selected = decimal, .count = self.rows.len, .width = self.evaluation.left_width + self.evaluation.right_width } };
         }
     };
     fn nativeProbe(self: *Join) NativeRow {
         return .{ .source = .{ .probe = self.probe_input.?.view() }, .index = self.probe_input_index - 1, .width = self.probe_input.?.view().width() };
     }
-    fn acceptNative(self: *Join, a: A, view: *NativeRows, match: ?usize) !bool {
-        if (match) |index| {
-            if (view.evaluation.condition) |program| {
-                const cells = try self.scalar_row.prepare(self.a, view.evaluation.left_width + view.evaluation.right_width);
-                for (program.required_columns) |logical| {
-                    if (logical >= cells.len) return error.InvalidSqlBackendResponse;
-                    const original = if (view.evaluation.output_order) |order| order[logical] else logical;
-                    const physical = if (!view.evaluation.flipped) original else if (original < view.evaluation.right_width) view.evaluation.left_width + original else original - view.evaluation.right_width;
-                    cells[logical] = try NativeRows.cell(view, a, 0, physical);
-                }
-                const accepted = try program.evaluate(a, cells, view.evaluation.parameters, view.evaluation.limits);
-                if (accepted.sql_null) return false;
-                if (accepted.value != .bool) return error.SqlTypeMismatch;
-                if (!accepted.value.bool) return false;
+    fn vectorResidualAllowed(limits: @import("scalar.zig").EvalLimits) bool {
+        const defaults: @import("scalar.zig").EvalLimits = .{};
+        // Native kernels retain the ordinary expression budgets. Custom scalar
+        // budgets and decision execution must use the evaluator that owns them.
+        return limits.steps == defaults.steps and limits.input_bytes == defaults.input_bytes and
+            limits.output_bytes == defaults.output_bytes and limits.depth == defaults.depth and
+            limits.decision_values == null and limits.decision_demand == null;
+    }
+    fn evaluateNative(self: *Join, a: A, view: *NativeRows) !bool {
+        if (view.evaluation.condition) |program| {
+            const cells = try self.scalar_row.prepare(self.a, view.evaluation.left_width + view.evaluation.right_width);
+            for (program.required_columns) |logical| {
+                if (logical >= cells.len) return error.InvalidSqlBackendResponse;
+                const original = if (view.evaluation.output_order) |order| order[logical] else logical;
+                const physical = if (!view.evaluation.flipped) original else if (original < view.evaluation.right_width) view.evaluation.left_width + original else original - view.evaluation.right_width;
+                cells[logical] = try NativeRows.cell(view, a, 0, physical);
             }
-            try self.accept(index);
+            const accepted = try program.evaluate(a, cells, view.evaluation.parameters, view.evaluation.limits);
+            if (accepted.sql_null) return false;
+            if (accepted.value != .bool) return error.SqlTypeMismatch;
+            if (!accepted.value.bool) return false;
         }
         return true;
     }
@@ -781,53 +830,124 @@ pub const Join = struct {
             child.close();
             self.active_join = null;
         };
-        var rows: std.ArrayList(NativePair) = .empty;
-        var bytes: usize = 0;
-        while (rows.items.len < maximum) {
-            const pair = (self.nextNativePair(rows.items.len == 0) catch |err| {
-                if (failure) |out| {
-                    out.* = err;
+        while (true) {
+            _ = self.candidate.reset(.{ .retain_with_limit = @min(64 * 1024, self.limits.bytes / 16) });
+            const work = self.candidate.allocator();
+            var candidates: std.ArrayList(NativePair) = .empty;
+            var candidate_bytes: usize = 0;
+            var upstream: ?anyerror = null;
+            while (candidates.items.len < maximum) {
+                const pair = (self.nextNativePair(candidates.items.len == 0) catch |err| {
+                    upstream = err;
                     break;
+                }) orelse break;
+                pair.append(work, &candidates, self) catch |err| {
+                    upstream = err;
+                    break;
+                };
+                candidate_bytes +|= @sizeOf(NativePair);
+                for ([_]?NativeRow{ pair.left, pair.right }) |side| if (side) |value| {
+                    if (value.source == .values) {
+                        for (value.source.values) |cell_| candidate_bytes +|= try @import("typed_store.zig").retainedCellBytes(cell_);
+                    }
+                };
+                var retained_bytes = candidate_bytes;
+                for (self.native_disk_leases.items) |block| retained_bytes +|= block.retainedBytes();
+                if (candidates.items.len * @sizeOf(NativePair) >= self.limits.bytes / 64 or retained_bytes >= @max(4096, self.limits.bytes / 8)) break;
+            }
+            if (candidates.items.len == 0) {
+                if (upstream) |err| {
+                    if (failure) |out| out.* = err else return err;
                 }
-                return err;
-            }) orelse break;
-            _ = self.scratch.reset(.retain_capacity);
-            const scratch = self.scratch.allocator();
-            var candidate: NativeRows = .{ .rows = &.{pair}, .evaluation = self.evaluation.? };
-            const accepted = self.acceptNative(scratch, &candidate, pair.match) catch |err| {
+                return .{ .rows = &.{} };
+            }
+            var candidate: NativeRows = .{ .rows = candidates.items, .evaluation = self.evaluation.? };
+            var inner: std.ArrayList(usize) = .empty;
+            for (candidates.items, 0..) |pair, row| if (pair.match != null) try inner.append(work, row);
+            var decisions: ?Batch = null;
+            if (self.evaluation.?.condition) |program| if (inner.items.len >= 2 and vectorResidualAllowed(self.evaluation.?.limits)) {
+                if (self.evaluation.?.limits.checkpoint) |check| try check(self.evaluation.?.limits.checkpoint_context);
+                const source_batch = try work.create(Batch);
+                source_batch.* = candidate.batch();
+                const physical = try work.create(Batch);
+                physical.* = try source_batch.select(work, inner.items);
+                const width = physical.width();
+                const ordinals = try work.alloc(usize, width);
+                const types = try work.alloc(@import("scalar.zig").Type, width);
+                const definitions = try work.alloc(@import("scalar.zig").Column, width);
+                const names = try work.alloc([]const u8, width);
+                const selection = try work.alloc(usize, inner.items.len);
+                for (selection, 0..) |*row, i| row.* = i;
+                for (ordinals, types, definitions, names, 0..) |*ordinal, *type_, *definition, *name, logical| {
+                    const original = if (self.evaluation.?.output_order) |order| order[logical] else logical;
+                    ordinal.* = if (!self.evaluation.?.flipped) original else if (original < self.evaluation.?.right_width) self.evaluation.?.left_width + original else original - self.evaluation.?.right_width;
+                    type_.* = .{ .kind = .json };
+                    for (program.instructions) |instruction| if (instruction.operation == .column and instruction.operation.column == logical) {
+                        type_.* = instruction.type;
+                        break;
+                    };
+                    name.* = try std.fmt.allocPrint(work, "c{d}", .{logical});
+                    definition.* = .{ .name = name.*, .type = type_.kind orelse .json, .element_type = type_.element_type };
+                }
+                const logical_batch = try work.create(Batch);
+                logical_batch.* = .{ .mapped = .{ .source = physical, .ordinals = ordinals, .types = types, .selection = selection } };
+                const page: @import("catalog.zig").ColumnPage = .{ .native = .{ .values = logical_batch, .names = names }, .selection = selection };
+                const outputs = @import("vector_eval.zig").evaluateColumnsEncodedMany(work, &.{program}, page, definitions, self.evaluation.?.parameters, null) catch |err| blk: {
+                    if (!@import("errors.zig").isRowEvaluationError(err)) return err;
+                    break :blk null;
+                };
+                if (outputs) |values| if (values[0]) |value| {
+                    decisions = value;
+                    self.vector_residual_batches += 1;
+                };
+            };
+            var rows: std.ArrayList(NativePair) = .empty;
+            var lane: usize = 0;
+            for (candidates.items) |pair| {
+                if (pair.match) |index| {
+                    var accepted = true;
+                    if (decisions) |values| {
+                        const value = try values.cell(work, lane, 0);
+                        if (!value.sql_null and value.value != .bool) return error.SqlTypeMismatch;
+                        accepted = !value.sql_null and value.value.bool;
+                    } else if (self.evaluation.?.condition != null) {
+                        self.scalar_residual_rows += 1;
+                        var one: NativeRows = .{ .rows = &.{pair}, .evaluation = self.evaluation.? };
+                        // Scalar fallback preserves the first demanded error and prefix.
+                        accepted = self.evaluateNative(work, &one) catch |err| {
+                            upstream = err;
+                            break;
+                        };
+                    }
+                    lane += 1;
+                    if (!accepted) continue;
+                    if (self.skew) |skew| try skew.acceptAt(index, pair.left.?.index) else try self.accept(index);
+                }
+                rows.append(a, pair) catch |err| {
+                    upstream = err;
+                    break;
+                };
+            }
+            if (upstream) |err| {
+                if (failure) |out| out.* = err else return err;
+            }
+            if (rows.items.len == 0 and upstream == null) {
+                self.releaseNativeDiskLeases();
+                continue;
+            }
+            if (rows.items.len == 0) return .{ .rows = &.{} };
+            const view = a.create(NativeRows) catch |err| {
                 if (failure) |out| {
                     out.* = err;
-                    break;
+                    return .{ .rows = &.{} };
                 }
                 return err;
             };
-            if (!accepted) continue;
-            const batch = candidate.batch();
-            var cost: usize = @sizeOf(NativePair);
-            const copied = if (pair.right) |right| right.source == .values or right.source == .disk else false;
-            for (0..if (copied) batch.width() else 0) |column| cost +|= batch.cellBytes(scratch, 0, column) catch |err| {
-                if (failure) |out| {
-                    out.* = err;
-                    break;
-                }
-                return err;
-            };
-            if (failure) |out| if (out.* != null) break;
-            pair.append(a, &rows, self) catch |err| {
-                if (failure) |out| {
-                    out.* = err;
-                    break;
-                }
-                return err;
-            };
-            bytes +|= cost;
-            if (bytes >= self.limits.bytes / 32) break;
+            view.* = .{ .rows = rows.items, .evaluation = self.evaluation.? };
+            return view.batch();
         }
-        if (rows.items.len == 0) return .{ .rows = &.{} };
-        const view = try a.create(NativeRows);
-        view.* = .{ .rows = rows.items, .evaluation = self.evaluation.? };
-        return view.batch();
     }
+
     pub fn next(self: *Join) anyerror!?Pair {
         self.releaseNativeDiskLeases();
         try self.finishInputs();
@@ -857,6 +977,7 @@ pub const Join = struct {
             }
             if (self.probe) |*probe| {
                 if (try probe.next()) |match| return .{ .left = self.nativeProbe(), .right = NativeRow.build(match), .match = match.index };
+                if (!may_advance) return null;
                 self.probe = null;
                 if (!self.matched and self.outer_left) return .{ .left = self.nativeProbe(), .right = null };
             }
@@ -1760,4 +1881,45 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
     for ([_]bool{ false, true }) |disk| try Fixture.run(std.testing.allocator, disk, false);
     try Fixture.run(std.testing.allocator, true, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ false, false });
+}
+
+test "SQL partitioned vector residual batches preserve skew outer matches" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var compiled = try @import("compiler.zig").compileScalar(a, "l = r", .{});
+    defer compiled.deinit();
+    var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "l", .type = .integer }, .{ .name = "r", .type = .integer } }, &.{}, .{});
+    defer condition.deinit();
+    const join = try Join.create(a, &manager, 32 * 1024, 2000, 0, true, true);
+    defer join.close();
+    join.evaluation = .{ .condition = &condition, .left_width = 1, .right_width = 1 };
+    const key = Datum.json(.{ .integer = 7 });
+    for (0..1200) |i| try join.add(true, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    for (0..40) |i| try join.add(false, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    var accepted: usize = 0;
+    var unmatched: usize = 0;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    while (true) {
+        _ = arena.reset(.free_all);
+        const batch = try join.nextBatch(arena.allocator(), 64, null);
+        if (batch.len() == 0) break;
+        for (0..batch.len()) |row| {
+            const left = try batch.cell(arena.allocator(), row, 0);
+            const right = try batch.cell(arena.allocator(), row, 1);
+            if (left.sql_null or right.sql_null) unmatched += 1 else {
+                try std.testing.expectEqual(left.value.integer, right.value.integer);
+                accepted += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 40), accepted);
+    try std.testing.expectEqual(@as(usize, 1160), unmatched);
+    try std.testing.expect(join.skew_blocks_read > 0);
+    try std.testing.expect(join.vector_residual_batches > 0);
+    try std.testing.expect(join.scalar_residual_rows < 1200 * 40 / 2);
 }

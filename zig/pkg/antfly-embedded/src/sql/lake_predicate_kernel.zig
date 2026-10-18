@@ -132,6 +132,77 @@ fn encoded(values: types.EncodedValues, nulls: types.NullBitmap, keep: []bool, l
         }
     }
 }
+fn numberMask(vector: types.ColumnVector, keep: []bool, literal: f64, op: Op, domain: types.FloatDomain) !bool {
+    const floating = @import("../common/float_domain.zig");
+    if (vector.values == .encoded) if (vector.values.encoded.mask_number) |run| {
+        const values = vector.values.encoded;
+        return run(values.ptr, values.begin, keep, literal, std.meta.stringToEnum(types.EncodedOp, @tagName(op)).?, domain);
+    };
+    switch (vector.values) {
+        .f64, .dictionary_f64, .encoded => {},
+        else => return false,
+    }
+    var identities: [8192]u32 = undefined;
+    var memo: [8192]u8 = @splat(0);
+    var cached: usize = 0;
+    var row: usize = 0;
+    while (row < keep.len) : (row += 1) {
+        if (vector.values == .f64 and row + 4 <= keep.len and std.math.isFinite(literal)) {
+            const dense = for (keep[row..][0..4], row..) |active, index| {
+                if (!active or vector.nulls.isNull(index) or !std.math.isFinite(vector.values.f64[index])) break false;
+            } else true;
+            if (dense) {
+                var normalized: [4]f64 = undefined;
+                for (&normalized, vector.values.f64[row..][0..4]) |*value, raw| value.* = try floating.normalize(raw, domain);
+                const left: @Vector(4, f64) = normalized;
+                const right: @Vector(4, f64) = @splat(literal);
+                keep[row..][0..4].* = switch (op) {
+                    .eq => left == right,
+                    .neq => left != right,
+                    .lt => left < right,
+                    .lte => left <= right,
+                    .gt => left > right,
+                    .gte => left >= right,
+                    else => return false,
+                };
+                row += 3;
+                continue;
+            }
+        }
+        if (!keep[row]) continue;
+        if (vector.nulls.isNull(row)) {
+            keep[row] = false;
+            continue;
+        }
+        const id = try vector.dictionaryId(row);
+        var slot: usize = 0;
+        if (id) |identity| {
+            slot = (identity *% 2654435761) & (memo.len - 1);
+            while (memo[slot] != 0 and identities[slot] != identity) slot = (slot + 1) & (memo.len - 1);
+            if (memo[slot] != 0) {
+                keep[row] = memo[slot] == 2;
+                continue;
+            }
+        }
+        const raw: f64 = switch (vector.values) {
+            .f64 => |v| v[row],
+            .dictionary_f64 => |v| if (v.indices[row] < v.values.len) v.at(row) else return error.InvalidSqlBackendResponse,
+            .encoded => |v| blk: {
+                const value = try v.at(row);
+                if (value != .float) return error.InvalidSqlBackendResponse;
+                break :blk value.float;
+            },
+            else => unreachable,
+        };
+        keep[row] = accepts(op, floating.order(try floating.normalize(raw, domain), literal));
+        if (id != null and cached < 4096) {
+            identities[slot] = id.?;
+            memo[slot] = if (keep[row]) 2 else 1;
+            cached += 1;
+        }
+    }
+    return true;
+}
 pub fn apply(a: A, batch: types.ColumnBatch, table: catalog.Table, condition: catalog.Condition, keep: []bool) !bool {
     if (keep.len != batch.rowCount()) return error.InvalidSqlBackendResponse;
     const vector = batch.findColumn(condition.column) orelse return false;
@@ -142,9 +213,22 @@ pub fn apply(a: A, batch: types.ColumnBatch, table: catalog.Table, condition: ca
         return true;
     }
     const definition = try table.column(condition.column);
-    // Physical callbacks do not carry the SQL width. Use the typed cell
-    // boundary for REAL, including lazy encoded/dictionary lanes.
-    if (definition.element_type == .float32) return false;
+    if (definition.type == .number and (definition.element_type == .float32 or definition.element_type == .float64)) {
+        if (condition.datum().sql_null) {
+            @memset(keep, false);
+            return true;
+        }
+        const nonnull = for (keep, 0..) |active, row| {
+            if (active and !vector.nulls.isNull(row)) break true;
+        } else false;
+        if (!nonnull) {
+            @memset(keep, false);
+            return true;
+        }
+        const literal = (try @import("lake_values.zig").comparisonDatum(a, condition.datum(), definition)).value;
+        if (literal != .float) return false;
+        return numberMask(vector, keep, literal.float, condition.op, if (definition.element_type == .float32) .float32 else .float64);
+    }
     if (definition.element_type == .numeric) {
         if (vector.values != .decimal128 or definition.numeric_modifier != null) return false;
         if (condition.datum().sql_null) {

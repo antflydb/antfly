@@ -50,7 +50,7 @@ pub const Job = union(enum) {
     text_directory: artifacts.ChunkRef,
     text_root: artifacts.ChunkRef,
     text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool = false },
-    page: struct { ref: tree.Ref, ordered_rows: bool, contributions: bool = false, text_files: ?struct { seekable: bool, maintenance_only: bool } = null },
+    page: struct { ref: tree.Ref, ordered_rows: bool, native_files: bool = false, contributions: bool = false, text_files: ?struct { seekable: bool, maintenance_only: bool } = null },
 };
 pub const Progress = struct {
     collector: *gc.Collector,
@@ -158,19 +158,25 @@ pub const Progress = struct {
             },
             .page => |job_page| {
                 const page = job_page.ref;
-                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.text_files) |files| (if (files.maintenance_only) "text-maintenance-file-page" else "text-serving-file-page") else if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
+                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.text_files) |files| (if (files.maintenance_only) "text-maintenance-file-page" else "text-serving-file-page") else if (job_page.native_files) "native-file-state-page" else if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
                 var write_bytes: u64 = 0;
                 var pages: page_store.PageStore = .{ .domain = self.value.domain, .artifacts = &collector.store, .cancellation = collector.cancellation(), .remaining_read_bytes = &collector.remaining_reads, .remaining_write_bytes = &write_bytes };
                 const Visitor = struct {
                     progress: *Progress,
                     ordered: bool,
                     contributions: bool,
+                    native_files: bool,
                     text_files: @FieldType(@FieldType(Job, "page"), "text_files"),
                     a: A,
                     pub fn child(visitor: *@This(), ref: tree.Ref) !void {
-                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered, .contributions = visitor.contributions, .text_files = visitor.text_files } });
+                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered, .native_files = visitor.native_files, .contributions = visitor.contributions, .text_files = visitor.text_files } });
                     }
                     pub fn record(visitor: *@This(), key: []const u8, bytes: []const u8) !void {
+                        if (visitor.native_files) {
+                            const file = try @import("lake_index_native_state.zig").decodeDirectoryFile(visitor.a, key, bytes, visitor.progress.value.domain);
+                            for (file.docs) |ref| try visitor.progress.enqueue(.{ .chunk = ref });
+                            return;
+                        }
                         if (visitor.text_files) |files| {
                             if (key.len != 36 or std.mem.readInt(u32, key[32..36], .big) != 0) return error.InvalidNativeLakeGcReference;
                             const record_ = try @import("lake_index_text_directory.zig").decodeFileRecord(visitor.a, key[0..32].*, bytes, visitor.progress.value.domain);
@@ -188,7 +194,7 @@ pub const Progress = struct {
                         if (try @import("lake_index_ordered_rows.zig").coverReference(visitor.a, visitor.progress.value.domain, bytes)) |cover| try visitor.progress.enqueue(.{ .chunk = cover.block });
                     }
                 };
-                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .contributions = job_page.contributions, .text_files = job_page.text_files, .a = a };
+                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .native_files = job_page.native_files, .contributions = job_page.contributions, .text_files = job_page.text_files, .a = a };
                 try tree.walkPage(a, pages.store(), page, &visitor);
             },
         }
@@ -479,7 +485,7 @@ test "external lake global frontier cloud retirement keeps locked stores and dra
     try std.testing.expectEqual(serial, provider.serial);
 }
 
-test "external lake global frontier resumable GC retains delete-version pages until the last reader retires" {
+test "external lake global frontier resumable GC retains delete-version and native file-state pages until the last reader retires" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -505,6 +511,19 @@ test "external lake global frontier resumable GC retains delete-version pages un
     var inventory = try store.put("inventory");
     defer inventory.deinit(a);
     var publication: local.metadata_lake_index_catalog.Publication = .{ .reader_protocol = local.metadata_lake_index_catalog.native_reader_protocol, .generation = 1, .token = store.upload_scope.?.attempt, .signature = .{ .desired = @splat(1), .source = @splat(5), .credentials = @splat(2), .store = identity }, .published_at_ms = 1, .base_source = .{ .external_iceberg = .{ .format = .iceberg, .source_uri = "s3://bucket/table", .snapshot_id = "first", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }, .source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = nav_ref.artifact_id, .checksum = nav_ref.checksum, .byte_len = nav_ref.byte_len } };
+    var document = try store.put(&@as([96]u8, @splat('x')));
+    defer document.deinit(a);
+    const native = @import("lake_index_native_state.zig");
+    const state_file: native.File = .{ .id = "file", .digest = @splat(3), .count = 1, .docs = &.{.{ .artifact_id = document.artifact_id, .checksum = document.checksum, .byte_len = document.byte_len }} };
+    var file_builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store() };
+    defer file_builder.deinit();
+    try file_builder.add(&native.Selection.idKey(state_file.id), try std.json.Stringify.valueAlloc(ca, state_file, .{}));
+    const file_directory = (try file_builder.finish()).?;
+    const sparse_binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .sparse, .source_kind = .external_iceberg, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "first", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"embedding"} };
+    const sparse_root: @import("lake_index_native_sparse.zig").Root = .{ .binding = sparse_binding, .config_json = "{}", .generation = .{ .domain = domain, .files = &.{} }, .file_directory = file_directory };
+    var sparse_ref = try store.put(try std.json.Stringify.valueAlloc(ca, sparse_root, .{}));
+    defer sparse_ref.deinit(a);
+    publication.declarations = &.{.{ .name = "sparse", .binding = sparse_binding, .artifact = .{ .kind = .sparse_segment, .metadata_version = 3, .artifact_id = sparse_ref.artifact_id, .checksum = sparse_ref.checksum, .byte_len = sparse_ref.byte_len } }};
     const Harness = struct {
         a: A,
         state: lifecycle.State,
@@ -534,6 +553,7 @@ test "external lake global frontier resumable GC retains delete-version pages un
     var next_ref = try store.put(try std.json.Stringify.valueAlloc(ca, next, .{}));
     defer next_ref.deinit(a);
     publication.generation = 2;
+    publication.declarations = &.{};
     publication.token = store.upload_scope.?.attempt;
     publication.source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = next_ref.artifact_id, .checksum = next_ref.checksum, .byte_len = next_ref.byte_len };
     publication.base_source.external_iceberg.snapshot_id = "second";
@@ -542,7 +562,10 @@ test "external lake global frontier resumable GC retains delete-version pages un
     const selector_id = try page_store.PageStore.identity(domain, versions);
     const retained = try store.getAlloc(&selector_id);
     a.free(retained);
+    const kept_document = try store.getAlloc(document.artifact_id);
+    a.free(kept_document);
     harness.state = try harness.state.release(ca, @splat(9));
     try harness.collect(store, identity, @splat(8));
     try std.testing.expectError(error.FileNotFound, store.getAlloc(&selector_id));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(document.artifact_id));
 }

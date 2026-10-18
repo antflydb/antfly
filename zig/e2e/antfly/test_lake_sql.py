@@ -6182,3 +6182,114 @@ def test_parquet_snapshot_manifest_refresh_and_cold_native_navigation(tmp_path):
         if held.exists():
             held.rename(first_path)
         server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize(
+    "physical,declared",
+    [("float", "float32"), ("double", "float32"), ("double", "float64")],
+)
+def test_typed_floating_pruning_skips_pages_and_preserves_nan(
+    tmp_path, physical, declared
+):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "floating.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "n": pa.array(
+                    [0.1, float("nan")],
+                    type=pa.float32() if physical == "float" else pa.float64(),
+                )
+            }
+        ),
+        path,
+        use_dictionary=False,
+        compression=None,
+        write_page_index=True,
+    )
+    payload = path.read_bytes()
+    assert pq.read_table(path).num_rows == 2
+    footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+    damaged = payload[:4] + b"\xff" * (footer - 4) + payload[footer:]
+    for name, data in (("valid", payload), ("unreadable", damaged)):
+        objects = tmp_path / name / "buckets" / "antfly" / "objects"
+        objects.mkdir(parents=True)
+        (objects / "part.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(data), 0)
+            + hashlib.sha256(data).hexdigest().encode()
+            + data
+        )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+        for name in ("valid", "unreadable"):
+            response = _request_with_idle_ddl_retry(
+                server,
+                "POST",
+                f"/tables/floating_{name}",
+                {
+                    "num_shards": 1,
+                    "indexes": {},
+                    "schema": {
+                        "storage_mode": "relational",
+                        "default_type": "row",
+                        "base_source": {
+                            "kind": "external",
+                            "table_id": f"floating-{name}",
+                            "format": "parquet",
+                            "uri": (tmp_path / name).as_uri(),
+                        },
+                        "document_schemas": {
+                            "row": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "n": {
+                                            "type": "number",
+                                            "x-antfly-sql-type": declared,
+                                        }
+                                    },
+                                    "additionalProperties": False,
+                                }
+                            }
+                        },
+                    },
+                },
+                retry_ddl=True,
+            )
+            assert response.ok, response.text + server.debug_logs()
+
+        def count(name, predicate):
+            return _request_with_idle_ddl_retry(
+                server,
+                "POST",
+                "/sql",
+                {
+                    "statement": f"SELECT COUNT(*) FROM floating_{name} WHERE {predicate}"
+                },
+            )
+
+        # Footer bounds suffice even though every data and page-index byte is corrupt.
+        response = count("unreadable", "n < 0")
+        assert response.ok, response.text + server.debug_logs()
+        assert response.json()["rows"] == [["0"]]
+        if declared == "float32":
+            response = count("unreadable", "n = 0.1")
+            assert response.ok, response.text + server.debug_logs()
+            assert response.json()["rows"] == [["0"]]
+        # NaN compares above finite values despite being absent from footer extrema.
+        response = count("valid", "n > 2")
+        assert response.ok, response.text + server.debug_logs()
+        assert response.json()["rows"] == [["1"]]
+        assert not count("unreadable", "n > 2").ok
+        matching = "0.10000000149011612" if declared == "float32" else "0.1"
+        assert not count("unreadable", f"n = {matching}").ok
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

@@ -28,11 +28,12 @@ const Allocator = std.mem.Allocator;
 
 /// Conservative pruning contract. Unsupported physical comparisons remain
 /// residuals; no approximate numeric conversion can exclude matching rows.
+pub const FloatBound = struct { value: f64, domain: @import("../../common/float_domain.zig").Domain };
 pub const Predicate = struct {
     pub const Op = enum { eq, neq, lt, lte, gt, gte };
     column: []const u8,
     op: Op,
-    value: union(enum) { integer: i64, bytes: []const u8, boolean: bool, decimal: struct { coefficient: i128, scale: u16, max_physical_scale: ?u16 = null }, timestamp: i128 },
+    value: union(enum) { number: FloatBound, integer: i64, bytes: []const u8, boolean: bool, decimal: struct { coefficient: i128, scale: u16, max_physical_scale: ?u16 = null }, timestamp: i128 },
 };
 pub const Limits = struct {
     max_examined_rows: u64 = 100_000_000,
@@ -388,6 +389,10 @@ pub const Stream = struct {
         for (self.groupPredicates()) |predicate| {
             if (!std.mem.eql(u8, predicate.column, chunk.column_id)) continue;
             if (page.all_null) return false;
+            if (predicate.value == .number) {
+                if (!floatBytesMayMatch(chunk, page.min, page.max, predicate.value.number, predicate.op)) return false;
+                continue;
+            }
             if (predicate.value == .decimal or predicate.value == .timestamp) {
                 if (!typedBoundsMayMatch(chunk, page.min, page.max, predicate)) return false;
                 continue;
@@ -409,7 +414,7 @@ pub const Stream = struct {
                     if (std.mem.order(u8, min, max) == .gt) continue;
                     break :blk rangeMayMatch([]const u8, min, max, value, predicate.op);
                 },
-                .decimal, .timestamp => unreachable,
+                .number, .decimal, .timestamp => unreachable,
                 .boolean => |value| blk: {
                     if (min.len != 1 or max.len != 1 or max[0] > 1 or min[0] > max[0]) continue;
                     break :blk rangeMayMatch(u8, min[0], max[0], @intFromBool(value), predicate.op);
@@ -1476,6 +1481,43 @@ fn orderMayMatch(low: std.math.Order, high: std.math.Order, op: Predicate.Op) bo
         .gte => high != .lt,
     };
 }
+fn metricFloat(bytes: []const u8, physical: []const u8) ?f64 {
+    if (std.mem.eql(u8, physical, "float") and bytes.len == 4) return @as(f32, @bitCast(std.mem.readInt(u32, bytes[0..4], .little)));
+    if (std.mem.eql(u8, physical, "double") and bytes.len == 8) return @as(f64, @bitCast(std.mem.readInt(u64, bytes[0..8], .little)));
+    return null;
+}
+/// Statistics exclude NaNs. Upper-side predicates must therefore retain the
+/// group unless separate evidence proves NaN absence. Narrowed extrema are
+/// monotone, but failed conversions and underflow-crossing ranges stay residual.
+pub fn floatBoundsMayMatch(minimum: f64, maximum: f64, bound: FloatBound, op: Predicate.Op) bool {
+    const floating = @import("../../common/float_domain.zig");
+    if (!std.math.isFinite(bound.value) or std.math.isNan(minimum) or std.math.isNan(maximum) or minimum > maximum) return true;
+    if (op == .gt or op == .gte or op == .neq or bound.domain == .finite) return true;
+    if (bound.domain == .float32 and ((!std.math.isFinite(minimum) or !std.math.isFinite(maximum)) or (minimum <= 0 and maximum >= 0 and minimum != maximum))) return true;
+    const low = floating.normalize(minimum, bound.domain) catch return true;
+    const high = floating.normalize(maximum, bound.domain) catch return true;
+    return orderMayMatch(floating.order(low, bound.value), floating.order(high, bound.value), op);
+}
+fn floatBytesMayMatch(chunk: external.ColumnChunk, minimum: ?[]const u8, maximum: ?[]const u8, bound: FloatBound, op: Predicate.Op) bool {
+    if (chunk.logical_type.len != 0) return true;
+    const low = metricFloat(minimum orelse return true, chunk.physical_type) orelse return true;
+    const high = metricFloat(maximum orelse return true, chunk.physical_type) orelse return true;
+    return floatBoundsMayMatch(low, high, bound, op);
+}
+fn floatBloomBytes(bound: FloatBound, physical: []const u8, buffer: *[8]u8) ?[]const u8 {
+    if (!std.math.isFinite(bound.value) or bound.value == 0 or bound.domain == .finite) return null;
+    if (std.mem.eql(u8, physical, "float")) {
+        const value: f32 = @floatCast(bound.value);
+        if (@as(f64, value) != bound.value) return null;
+        std.mem.writeInt(u32, buffer[0..4], @bitCast(value), .little);
+        return buffer[0..4];
+    }
+    if (std.mem.eql(u8, physical, "double") and bound.domain == .float64) {
+        std.mem.writeInt(u64, buffer, @bitCast(bound.value), .little);
+        return buffer;
+    }
+    return null;
+}
 fn typedBoundsMayMatch(chunk: external.ColumnChunk, minimum: ?[]const u8, maximum: ?[]const u8, predicate: Predicate) bool {
     const min = minimum orelse return true;
     const max = maximum orelse return true;
@@ -1515,6 +1557,12 @@ fn typedBoundsMayMatch(chunk: external.ColumnChunk, minimum: ?[]const u8, maximu
 pub fn groupMayMatch(group: external.RowGroup, predicates: []const Predicate) bool {
     for (predicates) |predicate| for (group.column_chunks) |chunk| {
         if (!std.mem.eql(u8, chunk.column_id, predicate.column)) continue;
+        if (predicate.value == .number) {
+            if (chunk.logical_type.len == 0 and (std.mem.eql(u8, chunk.physical_type, "float") or std.mem.eql(u8, chunk.physical_type, "double"))) {
+                if (!floatBoundsMayMatch(chunk.stats_min_f64 orelse continue, chunk.stats_max_f64 orelse continue, predicate.value.number, predicate.op)) return false;
+            }
+            continue;
+        }
         if (predicate.value == .decimal or predicate.value == .timestamp) {
             var low: [8]u8 = undefined;
             var high: [8]u8 = undefined;
@@ -1535,7 +1583,7 @@ pub fn groupMayMatch(group: external.RowGroup, predicates: []const Predicate) bo
         const matches = switch (predicate.value) {
             .integer => |value| if (chunk.stats_min_i64) |min| if (chunk.stats_max_i64) |max| rangeMayMatch(i64, min, max, value, predicate.op) else true else true,
             .bytes => |value| if (chunk.stats_min_bytes) |min| if (chunk.stats_max_bytes) |max| rangeMayMatch([]const u8, min, max, value, predicate.op) else true else true,
-            .decimal, .timestamp => unreachable,
+            .number, .decimal, .timestamp => unreachable,
             .boolean => |value| if (chunk.stats_min_bool) |min| if (chunk.stats_max_bool) |max| rangeMayMatch(u8, @intFromBool(min), @intFromBool(max), @intFromBool(value), predicate.op) else true else true,
         };
         if (!matches) return false;
@@ -1561,6 +1609,13 @@ pub fn icebergFileMayMatch(file: external.FileEntry, schema: []const @import("la
         const id = column.field_id orelse continue;
         const min = metricValue(file.lower_bounds, id) orelse continue;
         const max = metricValue(file.upper_bounds, id) orelse continue;
+        if (predicate.value == .number) {
+            if (!std.mem.eql(u8, column.kind, "number")) continue;
+            const low = metricFloat(min, column.iceberg_type) orelse continue;
+            const high = metricFloat(max, column.iceberg_type) orelse continue;
+            if (!floatBoundsMayMatch(low, high, predicate.value.number, predicate.op)) return false;
+            continue;
+        }
         if (predicate.value == .decimal or predicate.value == .timestamp) {
             var chunk: external.ColumnChunk = .{ .column_id = @constCast(predicate.column), .file_offset = 0, .compressed_len = 1, .physical_type = @constCast("int64") };
             const kind = column.iceberg_type;
@@ -1589,7 +1644,7 @@ pub fn icebergFileMayMatch(file: external.FileEntry, schema: []const @import("la
                 if (!std.mem.eql(u8, column.iceberg_type, "string") or std.mem.order(u8, min, max) == .gt) continue;
                 break :blk rangeMayMatch([]const u8, min, max, value, predicate.op);
             },
-            .decimal, .timestamp => unreachable,
+            .number, .decimal, .timestamp => unreachable,
             .boolean => |value| blk: {
                 if (!std.mem.eql(u8, column.kind, "boolean") or min.len != 1 or max.len != 1 or max[0] > 1 or min[0] > max[0]) continue;
                 break :blk rangeMayMatch(u8, min[0], max[0], @intFromBool(value), predicate.op);
@@ -1678,6 +1733,10 @@ fn bloomProbeUseful(chunk: external.ColumnChunk, predicate: Predicate) bool {
         .bytes => |value| std.mem.eql(u8, chunk.physical_type, "byte_array") and
             (chunk.logical_type.len == 0 or std.mem.eql(u8, chunk.logical_type, "string")) and
             !(chunk.stats_min_bytes != null and chunk.stats_max_bytes != null and std.mem.eql(u8, chunk.stats_min_bytes.?, value) and std.mem.eql(u8, chunk.stats_max_bytes.?, value)),
+        .number => |value| blk: {
+            var buffer: [8]u8 = undefined;
+            break :blk chunk.logical_type.len == 0 and floatBloomBytes(value, chunk.physical_type, &buffer) != null;
+        },
         .boolean, .decimal, .timestamp => false,
     };
 }
@@ -1709,6 +1768,7 @@ fn bloomGroupMayMatch(alloc: Allocator, reader: parquet.ObjectRangeReader, file:
                         (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string"))) continue;
                     break :text value;
                 },
+                .number => |value| if (chunk.logical_type.len == 0) floatBloomBytes(value, chunk.physical_type, &value_bytes) orelse continue else continue,
                 .boolean, .decimal, .timestamp => continue,
             };
             if (offset >= file.byte_len) continue;
@@ -1827,4 +1887,27 @@ test "lake SQL typed decimal and timestamp metrics prune only semantically compa
     chunks[0] = .{ .column_id = @constCast("v"), .file_offset = 0, .compressed_len = 16, .physical_type = @constCast("int64"), .logical_type = @constCast("timestamp_micros"), .stats_min_i64 = -1, .stats_max_i64 = 1 };
     try std.testing.expect(groupMayMatch(group, &.{.{ .column = "v", .op = .eq, .value = .{ .timestamp = -1 } }}));
     try std.testing.expect(!groupMayMatch(group, &.{.{ .column = "v", .op = .gt, .value = .{ .timestamp = 1000 } }}));
+}
+
+test "external lake floating pruning preserves REAL normalization NaNs and Bloom equivalence" {
+    const rounded: f64 = @as(f32, 0.1);
+    try std.testing.expect(floatBoundsMayMatch(0.1, 0.1, .{ .value = rounded, .domain = .float32 }, .eq));
+    try std.testing.expect(!floatBoundsMayMatch(0.1, 0.1, .{ .value = 0.1, .domain = .float32 }, .eq));
+    try std.testing.expect(!floatBoundsMayMatch(5, 10, .{ .value = 3, .domain = .float64 }, .lt));
+    // NaN values are absent from Parquet extrema and compare above all finite numbers.
+    try std.testing.expect(floatBoundsMayMatch(5, 10, .{ .value = 20, .domain = .float64 }, .gt));
+    try std.testing.expect(floatBoundsMayMatch(5, 5, .{ .value = 5, .domain = .float64 }, .neq));
+    try std.testing.expect(floatBoundsMayMatch(1e-300, 1e-300, .{ .value = 1, .domain = .float32 }, .eq));
+    var buffer: [8]u8 = undefined;
+    try std.testing.expect(floatBloomBytes(.{ .value = rounded, .domain = .float32 }, "double", &buffer) == null);
+    try std.testing.expect(floatBloomBytes(.{ .value = -0.0, .domain = .float64 }, "double", &buffer) == null);
+    try std.testing.expect(floatBloomBytes(.{ .value = rounded, .domain = .float32 }, "float", &buffer) != null);
+    try std.testing.expect(floatBloomBytes(.{ .value = 0.1, .domain = .float64 }, "double", &buffer) != null);
+    var lo: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(u64, &lo, @bitCast(@as(f64, 5)), .little);
+    std.mem.writeInt(u64, &hi, @bitCast(@as(f64, 10)), .little);
+    const chunk: external.ColumnChunk = .{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = 1, .physical_type = @constCast("double"), .stats_min_f64 = 5, .stats_max_f64 = 10 };
+    try std.testing.expect(!groupMayMatch(.{ .ordinal = 0, .row_count = 1, .file_offset = 0, .total_byte_len = 1, .column_chunks = @constCast(&[_]external.ColumnChunk{chunk}) }, &.{.{ .column = "n", .op = .eq, .value = .{ .number = .{ .value = 3, .domain = .float64 } } }}));
+    try std.testing.expect(!floatBytesMayMatch(chunk, &lo, &hi, .{ .value = 3, .domain = .float64 }, .eq));
 }

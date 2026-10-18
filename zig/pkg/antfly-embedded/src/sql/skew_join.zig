@@ -97,7 +97,12 @@ pub const Join = struct {
     }
     pub fn accept(self: *Join, index: usize) !void {
         if (self.last_match != index or self.last_probe == null or self.build_input == null) return error.InvalidSqlBackendResponse;
-        self.probe_matches[self.last_probe.?] = true;
+        return self.acceptAt(index, self.last_probe.?);
+    }
+    /// Batched residuals identify both rows within the still-pinned block pair.
+    pub fn acceptAt(self: *Join, index: usize, probe: usize) !void {
+        if (self.build_input == null or self.probe_input == null or probe >= self.probe_input.?.view().count() or index < self.build_first or index - self.build_first >= self.build_input.?.view().count()) return error.InvalidSqlBackendResponse;
+        self.probe_matches[probe] = true;
         if (self.outer_right) {
             self.build_matches[index - @as(usize, @intCast(self.build_first))] = 1;
             self.dirty = true;

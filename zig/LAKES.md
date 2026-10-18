@@ -137,7 +137,10 @@ so decoder reads reuse the versioned cache entries.
 The active page set retains the 32 MiB input/decoded budgets; oversized individual
 pages/dictionaries still fail. Iceberg file pruning uses spec/source field IDs
 and inclusive identity, bucket, truncate and temporal projections. Unknown
-transforms or values remain residual.
+transforms or values remain residual. Typed floating bounds respect REAL
+normalization and PostgreSQL NaN ordering; Bloom probes require identical physical
+equality bytes. Optional OffsetIndex decode-cache admission exhaustion falls back
+to sequential page scanning within the original statement budget.
 
 Window partition rows, peer/group directories and frame trees now share the
 statement spill quota, with small tracked caches. Separate cell records store
@@ -157,7 +160,12 @@ input. Floating-point, DISTINCT and pattern reductions retain ordered execution.
 Shared scheduling bounds all workers and releases
 speculative warming admission on completion. Sequential sort/join/group spills
 use typed, checksummed column blocks where multiple rows fit, compact records
-for wide rows, and optional Snappy compression.
+for wide rows, and optional Snappy compression. Spilled join residuals evaluate
+bounded pinned candidate cohorts through physical/decimal column views, updating
+outer matches before advancing probes. Exact decimal column comparisons retain
+per-lane scales and NULLs. Census-backed native producers borrow immutable source
+state and mutate sparse overlays; dense/sparse v3 file-state directories path-copy
+changed files and retain document chunks through both GC walkers (protocol 54).
 
 Borrowed operator batches preserve physical scan vectors and selection masks
 through simple filters, projections and join admission. Probe payloads are

@@ -29,7 +29,7 @@ pub const Collector = struct {
     // Artifact membership and dependency expansion have independent lifetimes.
     // Keep expansion bits beside the owned reference, within max_marked.
     const Marked = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, expanded: u8 = 0 };
-    const Expansion = enum(u3) { directory, maintenance, manifest, seekable_manifest, text_root, artifact };
+    const Expansion = enum(u3) { directory, maintenance, manifest, seekable_manifest, text_root, artifact, ordered_page, native_page };
 
     a: A,
     table: u64,
@@ -224,13 +224,13 @@ pub const Collector = struct {
     /// Collection must understand the preceding immutable root format after an
     /// upgrade, while serving and rebuild selection continue to require current metadata.
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
-        const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
+        const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else if (@hasDecl(native, "supportsMetadata")) native.supportsMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
         if (current) {
             if (@hasDecl(native, "loadRootLazy")) return native.loadRootLazy(a, self.store, ref, self.cancellation(), null);
             if (@hasDecl(native, "loadRootDirectory")) return native.loadRootDirectory(a, self.store, ref, self.cancellation(), null);
             return native.loadRoot(a, self.store, ref, self.cancellation(), null);
         }
-        const supported_old = if (@hasField(native.Root, "seekable")) ref.metadata_version >= 1 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "tuple_encoding")) ref.metadata_version >= 2 and ref.metadata_version < native.metadata_version else ref.metadata_version +| 1 == native.metadata_version;
+        const supported_old = if (@hasField(native.Root, "seekable")) ref.metadata_version >= 1 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "tuple_encoding")) ref.metadata_version >= 2 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "file_directory")) ref.metadata_version == 1 else ref.metadata_version +| 1 == native.metadata_version;
         if (!supported_old) return error.InvalidNativeLakeGcReference;
         const limit = if (@hasDecl(native, "max_root_bytes")) native.max_root_bytes else @import("lake_index_native_files.zig").max_root_bytes;
         if (ref.byte_len > limit) return error.InvalidNativeLakeGcReference;
@@ -438,9 +438,10 @@ pub const Collector = struct {
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .sparse_segment => {
-                if ((ref.metadata_version == @import("lake_index_native_sparse.zig").metadata_version or ref.metadata_version +| 1 == @import("lake_index_native_sparse.zig").metadata_version)) {
+                if ((@import("lake_index_native_sparse.zig").supportsMetadata(ref.metadata_version) or ref.metadata_version == 1)) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_sparse.zig"), ref);
+                    if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
                     for (root.file_states) |file| for (file.docs) |document_ref| {
                         _ = try self.mark(document_ref);
                     };
@@ -450,9 +451,10 @@ pub const Collector = struct {
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .vector_segment => {
-                if ((ref.metadata_version == @import("lake_index_native_dense.zig").metadata_version or ref.metadata_version +| 1 == @import("lake_index_native_dense.zig").metadata_version)) {
+                if ((@import("lake_index_native_dense.zig").supportsMetadata(ref.metadata_version) or ref.metadata_version == 1)) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_dense.zig"), ref);
+                    if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
                     for (root.file_states) |file| for (file.docs) |document_ref| {
                         _ = try self.mark(document_ref);
                     };
@@ -465,9 +467,15 @@ pub const Collector = struct {
             else => return error.InvalidNativeLakeGcReference,
         }
     }
+    pub fn markNativeFiles(self: *Collector, a: A, domain: [32]u8, root: @import("../serverless/graph_segment/page_tree.zig").Ref) !void {
+        return self.markPagesMode(a, domain, root, false, true);
+    }
     fn markPages(self: *Collector, a: A, domain: [32]u8, root: ?@import("../serverless/graph_segment/page_tree.zig").Ref, ordered_rows: bool) !void {
+        return self.markPagesMode(a, domain, root, ordered_rows, false);
+    }
+    fn markPagesMode(self: *Collector, a: A, domain: [32]u8, root: ?@import("../serverless/graph_segment/page_tree.zig").Ref, ordered_rows: bool, native_files: bool) !void {
         if (self.progress) |progress| {
-            if (root) |page| try progress.enqueue(.{ .page = .{ .ref = page, .ordered_rows = ordered_rows } });
+            if (root) |page| try progress.enqueue(.{ .page = .{ .ref = page, .ordered_rows = ordered_rows, .native_files = native_files } });
             return;
         }
         const page_store = @import("../serverless/graph_segment/page_store.zig");
@@ -478,8 +486,16 @@ pub const Collector = struct {
             collector: *Collector,
             domain: [32]u8,
             ordered_rows: bool,
+            native_files: bool,
             a: A,
-            pub fn visitRecord(w: *@This(), _: tree.Ref, _: []const u8, value: []const u8) !void {
+            pub fn visitRecord(w: *@This(), _: tree.Ref, key: []const u8, value: []const u8) !void {
+                if (w.native_files) {
+                    var arena = std.heap.ArenaAllocator.init(w.a);
+                    defer arena.deinit();
+                    const file = try @import("lake_index_native_state.zig").decodeDirectoryFile(arena.allocator(), key, value, w.domain);
+                    for (file.docs) |ref| _ = try w.collector.mark(ref);
+                    return;
+                }
                 if (!w.ordered_rows) return;
                 if (try @import("lake_index_ordered_rows.zig").coverReference(w.a, w.domain, value)) |cover| {
                     defer w.a.free(cover.block.artifact_id);
@@ -487,11 +503,14 @@ pub const Collector = struct {
                 }
             }
             pub fn skip(w: *@This(), child: tree.Ref) !bool {
-                return !try w.collector.mark(.{ .artifact_id = &try page_store.PageStore.identity(w.domain, child), .checksum = &std.fmt.bytesToHex(&child.digest, .lower), .byte_len = child.bytes });
+                const ref: artifacts.ChunkRef = .{ .artifact_id = &try page_store.PageStore.identity(w.domain, child), .checksum = &std.fmt.bytesToHex(&child.digest, .lower), .byte_len = child.bytes };
+                if (w.native_files) return !try w.collector.expand(ref, .native_page, "native-file-state-page");
+                if (w.ordered_rows) return !try w.collector.expand(ref, .ordered_page, "ordered-page");
+                return !try w.collector.mark(ref);
             }
             pub fn visit(_: *@This(), _: tree.Ref) !void {}
         };
-        var walker: Walker = .{ .collector = self, .domain = domain, .ordered_rows = ordered_rows, .a = a };
+        var walker: Walker = .{ .collector = self, .domain = domain, .ordered_rows = ordered_rows, .native_files = native_files, .a = a };
         if (root) |page| try tree.walkPostOrder(a, pages.store(), page, &walker, false);
     }
     fn visit(raw: *anyopaque, scope: stores.UploadScope, id: []const u8) !void {

@@ -2287,8 +2287,21 @@ fn Engine(comptime Context: type) type {
                     const retained_batch: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = self.build, .begin = 0, .count = self.build.len } };
                     return retained_batch.physicalColumnSelected(a, source.column, positions);
                 }
+                fn decimal(raw: *anyopaque, a: Allocator, column: usize, selected: ?[]const usize) anyerror!?@import("execution_batch.zig").DecimalColumn {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const count = if (selected) |indices| indices.len else self.rows.len;
+                    if (count == 0) return null;
+                    const source = try self.locate(if (selected) |indices| indices[0] else 0, column);
+                    const positions = try a.alloc(usize, count);
+                    for (positions, 0..) |*position, lane| {
+                        const location = try self.locate(if (selected) |indices| indices[lane] else lane, column);
+                        position.* = location.index orelse return null;
+                    }
+                    const build: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = self.build, .begin = 0, .count = self.build.len } };
+                    return (if (source.build) build else self.probe).decimalColumnSelected(a, source.column, positions);
+                }
                 fn batch(self: *@This()) @import("execution_batch.zig").Batch {
-                    return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .read_identity = identity, .read_physical_selected = physical, .count = self.rows.len, .width = self.width } };
+                    return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .read_identity = identity, .read_decimal_selected = decimal, .read_physical_selected = physical, .count = self.rows.len, .width = self.width } };
                 }
             };
             fn nextJoinRow(self: *Iterator, join: JoinPlan, may_advance: bool) anyerror!?JoinRow {

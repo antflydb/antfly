@@ -39,6 +39,7 @@ pub const Provider = struct {
     expected_delete_objects: ?[32]u8 = null,
     only_file: ?usize = null,
     only_files: ?[]const bool = null,
+    only_plan: ?*const @import("lake_index_native_state.zig").Plan = null,
     replay: ?*@import("lake_index_build_replay.zig").Replay = null,
     replay_recommended: bool = false,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
@@ -91,10 +92,10 @@ pub const Provider = struct {
             !std.mem.eql(u8, binding.source_id, inventory.source_id) or
             !std.mem.eql(u8, binding.snapshot_id, inventory.snapshot_id) or
             !std.mem.eql(u8, binding.schema_fingerprint, inventory.schema_fingerprint)) return error.SidecarSourceBindingMismatch;
-        if (self.only_files) |selected| {
-            if (selected.len != inventory.files.len or self.only_file != null) return error.InvalidNativeLakeFileState;
+        if (self.only_files != null or self.only_plan != null) {
+            if ((self.only_files != null and self.only_files.?.len != inventory.files.len) or (self.only_plan != null and self.only_plan.?.count() != inventory.files.len) or self.only_file != null) return error.InvalidNativeLakeFileState;
             const cursor = try a.create(FileCursor);
-            cursor.* = .{ .provider = self.*, .binding = binding, .cancellation = cancellation };
+            cursor.* = .{ .provider = self.*, .binding = binding, .cancellation = cancellation, .planned = if (self.only_plan) |plan| plan.iterator(true) else null };
             return .{ .kind = kind, .ctx = cursor, .next_batch = FileCursor.next, .deinit_fn = FileCursor.deinit };
         }
         if (!self.enrichment_columns) if (self.replay) |replay| if (try replay.open(a, binding, self.only_file, cancellation)) |source| return source;
@@ -146,6 +147,7 @@ const FileCursor = struct {
     binding: bindings.Binding,
     cancellation: Cancellation,
     file: usize = 0,
+    planned: ?@import("lake_index_native_state.zig").Plan.Iterator = null,
     active: ?rows.Source = null,
     fn next(raw: *anyopaque, a: A) !?rows.ColumnBatch {
         const self: *FileCursor = @ptrCast(@alignCast(raw));
@@ -157,12 +159,20 @@ const FileCursor = struct {
                 source.deinit(a);
                 self.active = null;
             }
-            while (self.file < self.provider.only_files.?.len and !self.provider.only_files.?[self.file]) self.file += 1;
-            if (self.file == self.provider.only_files.?.len) return null;
+            const ordinal = if (self.planned) |*planned| blk: {
+                break :blk ((try planned.next()) orelse return null).ordinal;
+            } else blk: {
+                const mask = self.provider.only_files.?;
+                while (self.file < mask.len and !mask[self.file]) self.file += 1;
+                if (self.file == mask.len) return null;
+                const index = self.file;
+                self.file += 1;
+                break :blk index;
+            };
             var input = self.provider;
             input.only_files = null;
-            input.only_file = self.file;
-            self.file += 1;
+            input.only_plan = null;
+            input.only_file = ordinal;
             self.active = try Provider.openCanceled(&input, a, self.binding, self.cancellation);
         }
     }

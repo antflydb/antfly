@@ -875,8 +875,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var file_arena = std.heap.ArenaAllocator.init(a);
         defer file_arena.deinit();
         var input_bytes: usize = 0;
-        const file_manifests = try ca.alloc(?artifacts.ChunkRef, plan.files.len);
-        @memset(file_manifests, null);
+        var file_manifests: std.AutoHashMapUnmanaged(usize, artifacts.ChunkRef) = .empty;
+        defer file_manifests.deinit(a);
         var checkpoint_files: ?statistics.Ref = if (seed) |old| old.checkpoint_files else null;
         var checkpoint_ids: std.StringHashMapUnmanaged(void) = .empty;
         defer checkpoint_ids.deinit(a);
@@ -905,7 +905,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var checkpoints_saved: usize = 0;
         var checkpoint_time = @import("antfly_platform").time.monotonicNs();
         for (records) |record| if (plan.by_id.get(record.file.id)) |index| {
-            file_manifests[index] = record.manifest;
+            try file_manifests.put(a, index, record.manifest);
         };
         var df_checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
         var df_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &df_checkpoint, .checkpoint = StatisticsCheckpoint.check };
@@ -923,7 +923,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         // global DF only once, including when recovering a partial refresh.
         if (seed) |old| for (old.file_groups) |group| {
             if (plan.by_id.get(group.file.id)) |index| {
-                file_manifests[index] = try publishFileManifest(a, ca, store, group, cancellation);
+                try file_manifests.put(a, index, try publishFileManifest(a, ca, store, group, cancellation));
             } else {
                 for (group.summaries) |ref| try df.add(df_pages.store(), ref, -1);
             }
@@ -934,7 +934,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const old = try loadRecordedFile(file_arena.allocator(), store.*, record, seed.?.domain, cancellation);
             for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
         };
-        for (plan.files, plan.changed, 0..) |file, changed, file_ordinal| {
+        var planned_files = plan.iterator(paged_seed or (baseline != null and reference_seed));
+        // Paged seeds need only changed files; legacy imports stream their full state once.
+        while (try planned_files.next()) |planned| {
+            const file = planned.file;
+            const file_ordinal = planned.ordinal;
+            const changed = plan.isChanged(file_ordinal);
             _ = file_arena.reset(.free_all);
             const fa = file_arena.allocator();
             var file_group: FileGroup = .{ .file = file, .segments = &.{} };
@@ -965,7 +970,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 }
                 if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
                 if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
-                file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
+                try file_manifests.put(a, file_ordinal, publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
                 continue;
             }
             var opening: @import("lake_index_text_opening_pack.zig").Collector = .{ .a = a, .out = fa, .store = store, .cancellation = cancellation };
@@ -1030,7 +1035,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             input_bytes = 0;
             if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
             try group.validate(store.upload_scope.?.domain);
-            file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
+            try file_manifests.put(a, file_ordinal, publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
             if (previous_refs.get(file.id)) |record| {
                 const old = try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation);
                 for (old.summaries) |summary| try df.add(df_pages.store(), summary, -1);
@@ -1041,7 +1046,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             // state. Save the first file, then at most 64 files or five seconds
             // of completed work; metadata traffic grows with the delta batch.
             if (provider.progress != null) {
-                try pending_files.append(a, .{ .file = .{ .id = file.id, .digest = file.digest, .key_width = file.key_width }, .manifest = file_manifests[file_ordinal].? });
+                try pending_files.append(a, .{ .file = .{ .id = file.id, .digest = file.digest, .key_width = file.key_width }, .manifest = file_manifests.get(file_ordinal).? });
                 const now = @import("antfly_platform").time.monotonicNs();
                 if (checkpoints_saved == 0 or pending_files.items.len >= 64 or now -| checkpoint_time >= 5 * std.time.ns_per_s) {
                     var checkpoint_arena = std.heap.ArenaAllocator.init(a);
@@ -1068,11 +1073,13 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var added_files: std.ArrayList(text_directory.FileRecord) = .empty;
         for (baseline_records) |record| {
             const index = plan.by_id.get(record.file.id);
-            if (index != null and std.mem.eql(u8, &record.file.digest, &plan.files[index.?].digest)) continue;
+            if (index != null and std.mem.eql(u8, &record.file.digest, &(try plan.stateAt(index.?)).digest)) continue;
             try removed_files.append(ca, record);
         }
-        for (plan.files, file_manifests, plan.changed) |file, slot, changed| {
-            if ((native_delta != null or inventory_delta != null) and !changed) continue;
+        var additions = plan.iterator(native_delta != null or inventory_delta != null);
+        while (try additions.next()) |item| {
+            const file = item.file;
+            const slot = file_manifests.get(item.ordinal);
             if (baseline_by_id.get(file.id)) |old| if (std.mem.eql(u8, &old.file.digest, &file.digest)) continue;
             try added_files.append(ca, .{ .file = file, .manifest = slot orelse return error.InvalidNativeLakeTextCorpus });
         }
@@ -1135,7 +1142,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
         const directories = try text_directory.publishManifests(a, store, current_refs.items, removed_refs.items, if (baseline) |old| old.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
-        var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
+        var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.count()), .segment_count = totals.segments, .collection = try totals.finish(ca) };
         root.source_layout_version = 1;
         root.source_routes_version = 1;
         root.inventory_delta_version = if (provider.native_delta != null) 2 else if (source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |deletes| deletes.files.len == 0 else true)) 1 else 0;
@@ -1197,7 +1204,7 @@ fn changedInventoryRecords(a: A, out: A, store: stores.ArtifactStore, baseline: 
     var changed: usize = 0;
     for (prior.files) |file| {
         const current = plan.by_id.get(file.file_id);
-        if (current == null or plan.changed[current.?]) changed += 1;
+        if (current == null or plan.isChanged(current.?)) changed += 1;
     }
     // Broad replacement is cheaper as one bounded sequential catalog walk.
     if (changed > 64 and changed * 4 >= prior.files.len)
@@ -1207,7 +1214,7 @@ fn changedInventoryRecords(a: A, out: A, store: stores.ArtifactStore, baseline: 
         try provider.context.ensureActive();
         try token.check();
         const current = plan.by_id.get(file.file_id);
-        if (current != null and !plan.changed[current.?]) continue;
+        if (current != null and !plan.isChanged(current.?)) continue;
         const record = try text_directory.lookupFileBudget(out, baseline, store, null, token, file.file_id, &remaining);
         const expected = try state.inventoryIdentity(a, prior, file, local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint());
         if (!std.mem.eql(u8, &record.file.digest, &expected)) return error.InvalidNativeLakeFileState;

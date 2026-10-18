@@ -1977,7 +1977,8 @@ mutable data keeps fresh checks. Delete-object evidence is always qualified
 independently. Pre-53 readers retain the earlier canonical data proof algorithm.
 Publication consumers borrow the catalog's existing file-rank directory, with a
 bounded tree lookup fallback, rather than copying an independent hash table for
-every builder. Compact mutable producer state arrays remain linear in file count.
+every builder. Protocol 54 below replaces the remaining mutable native producer
+arrays for census-backed publication.
 
 Committed Parquet chunk discovery and schema-footer inference use at most three
 jobs on the shared I/O scheduler. Each private speculative decode admits 8 MiB;
@@ -1987,3 +1988,43 @@ Results merge in source order, request allocators are synchronized while jobs ar
 active, and every error/cancellation drains outstanding jobs before releasing
 source or allocator ownership. Schema inference drains the batch before allocating
 into its returned arena. Scheduler saturation keeps required reads synchronous.
+
+### Sparse producer state and typed residuals (protocol 54)
+
+Census-backed publication borrows immutable file identities and represents unchanged
+subtrees with confirmed hash ranges. Changed-file iterators seek past those ranges;
+they do not clone the archive into mutable file descriptors and flags. Producers
+keep a sparse overlay for changed document counts, key widths and document-block
+references. Text construction likewise records only the reached file manifests.
+The complete read-only source inventory remains shared, and shared replay union
+planning still retains a compact file-selection mask. Legacy inputs and incompatible
+checkpoints use the full reconciliation path.
+
+Dense and sparse metadata v3 persist per-file state in authenticated page trees.
+Initial publication streams the census in hash order into a bottom-up tree builder;
+refresh path-copies changed entries and removes retired entries. A changed file's
+old document IDs are point-read from the previous directory for native deletion.
+Delta reuse requires the producer checkpoint to match the source delta's prior
+snapshot; older checkpoints reconcile their own complete state. Metadata v2 flat
+roots remain readable and migrate when a compatible delta is available. Protocol 54
+fences readers that cannot traverse the new state directories. Direct and resumable
+GC traverse directory leaves and their document chunks, with expansion roles
+independent of an earlier generic page mark.
+
+Spilled joins stage bounded candidate cohorts while probe/build blocks remain
+pinned. Eligible residual expressions consume physical and decimal column views;
+accepted lanes update outer-match state before the next probe advances. Unsupported
+or row-error-producing expressions replay through the scalar evaluator in source
+order to preserve delivered prefixes. Exact decimal column comparisons align
+coefficients in i256, retaining per-lane display scales and SQL NULLs.
+
+Floating masks normalize stored REAL values through the same checked conversion
+as scalar SQL, without narrowing comparison operands. Dense lanes use SIMD;
+dictionary/encoded lanes memoize referenced values. Typed FLOAT/DOUBLE file,
+row-group and page bounds use the declared SQL domain. NaNs are absent from
+Parquet extrema, so upper-side predicates and inequality remain conservative;
+REAL underflow/overflow and ambiguous zero-crossing ranges remain residual.
+Bloom probes require physically equivalent equality bytes and decline signed zero
+and narrowed DOUBLE-backed REAL. OffsetIndex cache admission exhaustion declines
+the optional index and retains sequential page scanning; allocator and provider
+failures remain errors.

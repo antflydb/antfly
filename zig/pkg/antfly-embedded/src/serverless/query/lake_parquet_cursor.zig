@@ -137,7 +137,10 @@ pub const Cursor = struct {
                 bounds: bool,
                 fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                     const value: *@This() = @ptrCast(@alignCast(raw));
-                    const decoded = try value.cursor.readIndex(value.column, item.arena.allocator(), value.bounds);
+                    const decoded = value.cursor.readIndex(value.column, item.arena.allocator(), value.bounds) catch |err| {
+                        if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.DecodedArtifactTooLarge;
+                        return err;
+                    };
                     item.payload = .{ .page_directory = decoded };
                 }
             }{ .cursor = self, .column = column, .bounds = bounds };

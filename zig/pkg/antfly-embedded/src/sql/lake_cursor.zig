@@ -81,6 +81,11 @@ fn typedPruning(a: Allocator, column: catalog.Column, op: catalog.Condition.Op, 
     const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
     const operator = std.meta.stringToEnum(Predicate.Op, @tagName(op)) orelse return null;
     if (raw.sql_null) return null;
+    if (column.type == .number and (column.element_type == .float32 or column.element_type == .float64)) {
+        const value = (try @import("lake_values.zig").comparisonDatum(a, raw, column)).value;
+        if (value != .float or !std.math.isFinite(value.float)) return null;
+        return .{ .column = column.path, .op = operator, .value = .{ .number = .{ .value = value.float, .domain = if (column.element_type == .float32) .float32 else .float64 } } };
+    }
     if (column.element_type == .numeric) {
         if (column.numeric_modifier) |modifier| if (modifier.scale < 0) return null;
         const datum = try @import("lake_values.zig").comparisonDatum(a, raw, column);
@@ -160,12 +165,12 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
         const column = try table.column(condition.column);
         out.value = try @import("lake_values.zig").conditionValue(owned, out.value, column);
         const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
-        if (column.element_type == .numeric or column.type == .datetime) {
+        if (column.element_type == .numeric or column.type == .datetime or (column.type == .number and (column.element_type == .float32 or column.element_type == .float64))) {
             if (try typedPruning(owned, column, condition.op, out.datum())) |predicate| {
                 try pruning.append(owned, predicate);
                 continue;
             }
-            if (column.type == .datetime) continue;
+            if (column.type == .datetime or column.element_type == .float32 or column.element_type == .float64) continue;
             // Raw integer metadata can prune exact NUMERIC comparisons. A
             // negative typmod scale rounds physical integers, so it cannot use
             // their uncoerced bounds. Text-backed decimals remain residual.
@@ -549,7 +554,7 @@ const Owner = struct {
         for (filter.columns, filter.domains) |key, domain| {
             const column = try self.table.column(key.name);
             if (domain.minimum == null) continue;
-            if (column.element_type == .numeric or column.type == .datetime) {
+            if (column.element_type == .numeric or column.type == .datetime or (column.type == .number and (column.element_type == .float32 or column.element_type == .float64))) {
                 if (try typedPruning(a, column, .gte, domain.minimum.?)) |predicate| try predicates.append(a, predicate);
                 if (try typedPruning(a, column, .lte, domain.maximum.?)) |predicate| try predicates.append(a, predicate);
                 continue;
@@ -2857,9 +2862,31 @@ test "lake SQL pushed REAL masks normalize stored DOUBLE values without narrowin
         const page: catalog.ColumnPage = .{ .batch = batch, .selection = &.{0} };
         var mask = [_]bool{ true, true };
         const condition: catalog.Condition = .{ .column = "n", .op = .eq, .value = .{ .float = rounded } };
-        try std.testing.expect(!try @import("lake_predicate_kernel.zig").apply(arena.allocator(), batch, table, condition, &mask));
+        try std.testing.expect(try @import("lake_predicate_kernel.zig").apply(arena.allocator(), batch, table, condition, &mask));
+        try std.testing.expectEqualSlices(bool, &.{ true, false }, &mask);
         try std.testing.expect(try matchesColumns(page, arena.allocator(), table, &.{condition}));
         try std.testing.expect(!try matchesColumns(page, arena.allocator(), table, &.{.{ .column = "n", .op = .eq, .value = .{ .float = 0.1 } }}));
         try std.testing.expect(try matchesColumns(page, arena.allocator(), table, &.{.{ .column = "n", .op = .gt, .value = .{ .float = 0.1 } }}));
     }
+}
+
+test "lake SQL typed floating masks preserve SIMD narrowing NaN order and NULL laziness" {
+    const a = std.testing.allocator;
+    const row_types = @import("../storage/rowsource/types.zig");
+    const table: catalog.Table = .{ .id = 1, .physical_name = "real", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .float32 }} };
+    const vector: row_types.ColumnVector = .{ .name = "n", .values = .{ .f64 = &.{ 0.1, 0.2, 0.1, 0.2, std.math.nan(f64), std.math.inf(f64) } } };
+    const batch: row_types.ColumnBatch = .{ .snapshot = .{ .table_id = "s", .snapshot_id = "c" }, .columns = &.{vector}, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" }, .{ .relational_key = "d" }, .{ .relational_key = "e" }, .{ .relational_key = "f" } } };
+    var mask: [6]bool = @splat(true);
+    try std.testing.expect(try @import("lake_predicate_kernel.zig").apply(a, batch, table, .{ .column = "n", .op = .eq, .value = .{ .float = @as(f32, 0.1) } }, &mask));
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, false, false, false }, &mask);
+    @memset(&mask, true);
+    try std.testing.expect(try @import("lake_predicate_kernel.zig").apply(a, batch, table, .{ .column = "n", .op = .gt, .value = .{ .float = 1 } }, &mask));
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, true, true }, &mask);
+    var all_null = vector;
+    all_null.nulls = .{ .bytes = &.{ 1, 1, 1, 1, 1, 1 } };
+    var null_batch = batch;
+    null_batch.columns = &.{all_null};
+    @memset(&mask, true);
+    try std.testing.expect(try @import("lake_predicate_kernel.zig").apply(a, null_batch, table, .{ .column = "n", .op = .eq, .value = .{ .string = "invalid" } }, &mask));
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, false, false }, &mask);
 }

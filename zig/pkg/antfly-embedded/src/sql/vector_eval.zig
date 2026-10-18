@@ -165,6 +165,9 @@ fn decimalComparison(a: std.mem.Allocator, program: *const scalar.Program, page:
         .gte => .gte,
         else => return null,
     };
+    if (decimalOperand(program, comparison_binary.left)) |left| if (decimalOperand(program, comparison_binary.right)) |right| {
+        return decimalColumnComparison(a, page, columns, left, right, op);
+    };
     var ordinal = decimalOperand(program, comparison_binary.left);
     var constant = comparison_binary.right;
     if (ordinal == null or !constantOperand(program, constant, 0)) {
@@ -220,6 +223,46 @@ fn decimalComparison(a: std.mem.Allocator, program: *const scalar.Program, page:
             const fixed = try numeric.ScaledInteger.init(coefficients.values[row], scale);
             break :general try numeric.order(&context, fixed.view(), number.?);
         };
+        value.* = switch (op) {
+            .eq => order == .eq,
+            .neq => order != .eq,
+            .lt => order == .lt,
+            .lte => order != .gt,
+            .gt => order == .gt,
+            .gte => order != .lt,
+            else => unreachable,
+        };
+    }
+    return try Batch.fromBoolean(a, values, nulls);
+}
+
+fn decimalColumnComparison(a: std.mem.Allocator, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, left: u32, right: u32, op: @import("catalog.zig").Condition.Op) !?@import("execution_batch.zig").Batch {
+    if (left >= columns.len or right >= columns.len) return error.InvalidSqlBackendResponse;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const Batch = @import("execution_batch.zig").Batch;
+    const source: Batch = .{ .columns = .{ .page = page, .definitions = columns } };
+    const l = (try source.decimalColumnSelected(scratch.allocator(), left, null)) orelse return null;
+    const r = (try source.decimalColumnSelected(scratch.allocator(), right, null)) orelse return null;
+    if (l.physical.len() != r.physical.len()) return error.InvalidSqlBackendResponse;
+    const values = try a.alloc(bool, l.physical.len());
+    errdefer a.free(values);
+    const nulls = try a.alloc(u8, values.len);
+    errdefer a.free(nulls);
+    const decimal = @import("../common/decimal128.zig");
+    for (values, nulls, 0..) |*value, *flag, lane| {
+        const li = l.physical.rowAt(lane);
+        const ri = r.physical.rowAt(lane);
+        flag.* = @intFromBool(l.physical.vector.nulls.isNull(li) or r.physical.vector.nulls.isNull(ri));
+        value.* = false;
+        if (flag.* != 0) continue;
+        const lc = l.physical.vector.values.decimal128;
+        const rc = r.physical.vector.values.decimal128;
+        const ls = try l.scaleAt(lane);
+        const rs = try r.scaleAt(lane);
+        try decimal.validateCoefficient(lc.values[li], lc.precision, ls);
+        try decimal.validateCoefficient(rc.values[ri], rc.precision, rs);
+        const order = decimal.order(lc.values[li], ls, rc.values[ri], rs);
         value.* = switch (op) {
             .eq => order == .eq,
             .neq => order != .eq,
@@ -2029,5 +2072,29 @@ fn fusedDecimalScenario(a: std.mem.Allocator) !void {
         const actual = try outputs[0].?.cell(sa, row, 0);
         var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
         try std.testing.expectEqualStrings(try @import("numeric_value.zig").format(&context, expected.numeric.?.*), try @import("numeric_value.zig").format(&context, actual.numeric.?.*));
+    }
+}
+
+test "lake SQL native decimal column comparisons preserve mixed scales and selected null lanes" {
+    const a = std.testing.allocator;
+    const definitions = [_]scalar.Column{ .{ .name = "l", .type = .number, .element_type = .numeric }, .{ .name = "r", .type = .number, .element_type = .numeric } };
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" } }, .columns = &.{ .{ .name = "l", .values = .{ .decimal128 = .{ .values = &.{ 12300, -12300, std.math.minInt(i128) }, .precision = 38, .scale = 4 } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } }, .{ .name = "r", .values = .{ .decimal128 = .{ .values = &.{ 123, -124, 0 }, .precision = 38, .scale = 2 } } } } }, .selection = &.{ 1, 0, 2, 1, 0 } };
+    for ([_][]const u8{ "l=r", "l<>r", "l<r", "l<=r", "l>r", "l>=r" }) |text| {
+        var compiled = try @import("compiler.zig").compileScalar(a, text, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+        defer program.deinit();
+        const outputs = try evaluateColumnsEncodedMany(a, &.{&program}, page, &definitions, &.{}, null);
+        defer freeEncodedMany(a, outputs);
+        const result = outputs[0] orelse return error.TestExpectedNativeDecimalComparison;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        for (0..page.selection.len) |row| {
+            const cells = [_]Datum{ try page.typedCell(arena.allocator(), row, "l", true), try page.typedCell(arena.allocator(), row, "r", true) };
+            const expected = try program.evaluate(arena.allocator(), &cells, &.{}, .{});
+            const actual = try result.cell(arena.allocator(), row, 0);
+            try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+            if (!actual.sql_null) try std.testing.expectEqual(expected.value.bool, actual.value.bool);
+        }
     }
 }

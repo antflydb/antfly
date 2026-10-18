@@ -1967,11 +1967,11 @@ const Execution = struct {
         const declarations = if (self.active_recent) if (self.recent_run) |run| run.declarations else self.recent_declarations else self.declarations;
         const entries = if (self.active_recent) &self.recent_dense_entries else &self.dense_entries;
         var count: usize = 0;
-        for (declarations) |declaration| if (declaration.artifact.kind == .vector_segment and declaration.artifact.metadata_version == native.metadata_version) {
+        for (declarations) |declaration| if (declaration.artifact.kind == .vector_segment and native.supportsMetadata(declaration.artifact.metadata_version)) {
             count += 1;
         };
         const selected = for (declarations) |declaration| {
-            if (declaration.artifact.kind == .vector_segment and declaration.artifact.metadata_version == native.metadata_version and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
+            if (declaration.artifact.kind == .vector_segment and native.supportsMetadata(declaration.artifact.metadata_version) and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
         if (entries.get(if (self.active_recent) selected.artifact.artifact_id else selected.name)) |entry| {
             for (self.runtimes.items) |runtime| if (runtime.dense_entry == entry) {
@@ -2328,11 +2328,11 @@ const Execution = struct {
         const declarations = if (self.active_recent) if (self.recent_run) |run| run.declarations else self.recent_declarations else self.declarations;
         const entries = if (self.active_recent) &self.recent_sparse_entries else &self.sparse_entries;
         var count: usize = 0;
-        for (declarations) |declaration| if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == native.metadata_version) {
+        for (declarations) |declaration| if (declaration.artifact.kind == .sparse_segment and native.supportsMetadata(declaration.artifact.metadata_version)) {
             count += 1;
         };
         const selected = for (declarations) |declaration| {
-            if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == native.metadata_version and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
+            if (declaration.artifact.kind == .sparse_segment and native.supportsMetadata(declaration.artifact.metadata_version) and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
         if (entries.get(if (self.active_recent) selected.artifact.artifact_id else selected.name)) |entry| {
             for (self.runtimes.items) |runtime| if (runtime.sparse_entry == entry) {

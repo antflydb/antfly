@@ -247,6 +247,7 @@ fn proofLower(proofs: []const Proof, id: [32]u8, inclusive: bool) usize {
 }
 const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8 };
 pub const Delta = struct {
+    selection: ?native.Selection = null,
     public_navigation: ?@import("lake_index_ordered_files.zig").Public = null,
     source: []const u8,
     schema: []const u8,
@@ -256,6 +257,15 @@ pub const Delta = struct {
     changed: []bool,
     prior_changed: []const native.File,
     by_id: local.serverless_query_lake_inventory_catalog.Positions,
+    pub fn count(self: Delta) usize {
+        return if (self.selection) |selection| selection.files.len else self.files.len;
+    }
+    pub fn file(self: Delta, index: usize) !native.File {
+        return if (self.selection) |selection| selection.file(index) else self.files[index];
+    }
+    pub fn isChanged(self: Delta, index: usize) bool {
+        return if (self.selection) |selection| selection.changed(index) else self.changed[index];
+    }
 };
 fn qualified(provider: *Provider, file: local.serverless_external_source_types.FileEntry) local.serverless_external_source_types.FileEntry {
     var result = file;
@@ -371,14 +381,14 @@ fn lookup(a: A, storage: tree.Store, root: ?tree.Ref, id: []const u8) !?[]u8 {
     if (!std.mem.eql(u8, found.key, id)) return null;
     return try a.dupe(u8, found.value);
 }
-const Batch = struct {
+pub const Batch = struct {
     arena: std.heap.ArenaAllocator,
     changes: std.ArrayList(tree.Mutation) = .empty,
-    fn add(self: *@This(), id: []const u8, value: ?[]const u8) !void {
+    pub fn add(self: *@This(), id: []const u8, value: ?[]const u8) !void {
         const a = self.arena.allocator();
         try self.changes.append(a, .{ .key = try a.dupe(u8, id), .value = if (value) |v| try a.dupe(u8, v) else null });
     }
-    fn flush(self: *@This(), storage: tree.Store, root: *?tree.Ref) !void {
+    pub fn flush(self: *@This(), storage: tree.Store, root: *?tree.Ref) !void {
         if (self.changes.items.len == 0) return;
         std.mem.sort(tree.Mutation, self.changes.items, {}, struct {
             fn less(_: void, l: tree.Mutation, r: tree.Mutation) bool {
@@ -391,7 +401,15 @@ const Batch = struct {
     }
 };
 pub const BuildStats = struct { prior_pages: usize = 0, prior_records: usize = 0, skipped_subtrees: usize = 0, rehashed_files: usize = 0, cached_census: bool = false };
-pub const Built = struct { ref: Ref, root: Root, delta: Delta, stats: BuildStats };
+pub const Built = struct {
+    ref: Ref,
+    root: Root,
+    delta: Delta,
+    stats: BuildStats,
+    pub fn deinit(self: Built) void {
+        if (self.delta.selection) |selection| selection.census.release();
+    }
+};
 pub fn build(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, prior: ?Root, token: Token) !Built {
     return buildProven(a, out, store, provider, prior, token, null);
 }
@@ -422,14 +440,8 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     defer private.arena.deinit();
     const PublicEntry = struct { digest: [32]u8, file: []const u8 };
     var native_by_id: local.serverless_query_lake_inventory_catalog.Positions = .{ .catalog = provider.source.catalog() };
-    const current = try out.alloc(native.File, inv.files.len);
-    const changed = try out.alloc(bool, inv.files.len);
-    @memset(changed, true);
     try native_by_id.ensureTotalCapacity(out, @intCast(inv.files.len));
-    for (inv.files, current, 0..) |file, *state, i| {
-        state.* = .{ .id = file.file_id, .digest = undefined };
-        native_by_id.putAssumeCapacity(file.file_id, i);
-    }
+    for (inv.files, 0..) |file, i| native_by_id.putAssumeCapacity(file.file_id, i);
     var stats: BuildStats = .{};
     const Census = local.serverless_query_lake_file_census;
     var census: ?*Census.Census = null;
@@ -468,13 +480,16 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
             error.OutOfMemory, error.SqlMemoryLimitExceeded => null,
             else => return err,
         };
-        if (census) |value| {
+        if (census != null) {
             stats.cached_census = true;
             stats.rehashed_files = fingerprints.calls;
-            var iterator = value.iterator();
-            while (try iterator.next()) |entry| current[native_by_id.get(entry.id) orelse return error.InvalidNativeLakeFileState].digest = entry.digest;
         }
     };
+    const current = try out.alloc(native.File, if (census == null) inv.files.len else 0);
+    const changed = try out.alloc(bool, current.len);
+    @memset(changed, true);
+    var selection: ?native.Selection = if (census) |value| .{ .files = inv.files, .census = value, .positions = native_by_id } else null;
+    for (current, inv.files[0..current.len]) |*state, file| state.* = .{ .id = file.file_id, .digest = undefined };
     const proofs = try a.alloc(Proof, if (census == null) inv.files.len else 0);
     defer a.free(proofs);
     const prefix = try a.alloc([32]u8, if (census == null) inv.files.len + 1 else 1);
@@ -482,13 +497,13 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     prefix[0] = @splat(0);
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    for (inv.files, current, 0..) |file, *state, i| {
+    if (census == null or !compatible) for (inv.files, 0..) |file, i| {
         try provider.context.ensureActive();
         try token.check();
         _ = scratch.reset(.retain_capacity);
         const sa = scratch.allocator();
-        const digest = if (census != null) state.digest else try native.identity(sa, provider, file);
-        state.digest = digest;
+        const digest = if (census) |value| (value.find(key(file.file_id)) orelse return error.InvalidNativeLakeFileState).digest else try native.identity(sa, provider, file);
+        if (census == null) current[i].digest = digest;
         if (census == null) {
             stats.rehashed_files += 1;
             proofs[i] = .{ .id = key(file.file_id), .digest = digest, .index = i };
@@ -505,7 +520,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
                 try private.flush(pages.store(), &root.private);
             }
         }
-    }
+    };
     var prior_changed: std.ArrayList(native.File) = .empty;
     std.mem.sort(Proof, proofs, {}, struct {
         fn less(_: void, l: Proof, r: Proof) bool {
@@ -533,21 +548,18 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
             prefix: []const [32]u8,
             current: []const native.File,
             changed: []bool,
+            selection: ?*native.Selection,
             prior_changed: *std.ArrayList(native.File),
             files: *Batch,
             private: *Batch,
             root: *Root,
             token: Token,
             stats: *BuildStats,
-            fn unchanged(self: *@This(), summary: Summary) bool {
+            fn unchanged(self: *@This(), summary: Summary) !bool {
                 if (self.census) |value| {
                     const found = value.range(summary.first, summary.last);
                     if (found.count != summary.count or !std.mem.eql(u8, &found.digest, &summary.digest)) return false;
-                    var it = value.iteratorFrom(summary.first);
-                    while (it.next() catch return false) |entry| {
-                        if (std.mem.order(u8, &entry.key, &summary.last) == .gt) break;
-                        self.changed[self.by_id.get(entry.id) orelse return false] = false;
-                    }
+                    try self.selection.?.unchanged.append(self.out, .{ .first = summary.first, .last = summary.last });
                     self.stats.skipped_subtrees += 1;
                     return true;
                 }
@@ -564,7 +576,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
             pub fn childSummary(self: *@This(), ref: tree.Ref, bytes: []const u8) anyerror!void {
                 try self.provider.context.ensureActive();
                 try self.token.check();
-                if (bytes.len != 0 and self.unchanged(try Summary.decode(bytes, ref.records))) return;
+                if (bytes.len != 0 and try self.unchanged(try Summary.decode(bytes, ref.records))) return;
                 self.stats.prior_pages += 1;
                 try tree.walkPage(self.a, self.storage, ref, self);
             }
@@ -578,10 +590,11 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
                 if (!std.mem.eql(u8, id, &old_id)) return error.InvalidNativeLakeFileState;
                 if (self.census) |value| {
                     if (value.find(old_id)) |entry| {
-                        const i = self.by_id.get(entry.id) orelse return error.InvalidNativeLakeFileState;
-                        if (!std.mem.eql(u8, old.file.file_id, self.current[i].id)) return error.InvalidNativeLakeFileState;
-                        self.changed[i] = !std.mem.eql(u8, &old.digest, &self.current[i].digest);
-                        if (!self.changed[i]) return;
+                        if (!std.mem.eql(u8, old.file.file_id, entry.id)) return error.InvalidNativeLakeFileState;
+                        if (std.mem.eql(u8, &old.digest, &entry.digest)) {
+                            try self.selection.?.unchanged.append(self.out, .{ .first = old_id, .last = old_id });
+                            return;
+                        }
                     }
                 }
                 const index = proofLower(self.proofs, old_id, false);
@@ -600,17 +613,21 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
                 }
             }
         };
-        var diff: Diff = .{ .a = a, .out = out, .storage = pages.store(), .file_storage = file_storage, .provider = provider, .census = census, .by_id = &native_by_id, .proofs = proofs, .prefix = prefix, .current = current, .changed = changed, .prior_changed = &prior_changed, .files = &files, .private = &private, .root = &root, .token = token, .stats = &stats };
+        var diff: Diff = .{ .a = a, .out = out, .storage = pages.store(), .file_storage = file_storage, .provider = provider, .census = census, .by_id = &native_by_id, .proofs = proofs, .prefix = prefix, .current = current, .changed = changed, .selection = if (selection) |*value| value else null, .prior_changed = &prior_changed, .files = &files, .private = &private, .root = &root, .token = token, .stats = &stats };
         if (prior.?.files) |ref| {
-            if (prior.?.file_summary == null or !diff.unchanged(prior.?.file_summary.?)) {
+            if (prior.?.file_summary == null or !try diff.unchanged(prior.?.file_summary.?)) {
                 stats.prior_pages += 1;
                 try tree.walkPage(a, pages.store(), ref, &diff);
             }
         }
         try files.flush(file_storage, &root.files);
         try private.flush(pages.store(), &root.private);
-        for (inv.files, current, changed) |file, state, is_changed| {
-            if (!is_changed) continue;
+        if (selection) |*value| value.finish();
+        var planned = native.Plan{ .a = a, .files = current, .changed = changed, .selection = selection, .by_id = native_by_id };
+        var changes = planned.iterator(true);
+        while (try changes.next()) |item| {
+            const file = inv.files[item.ordinal];
+            const state = item.file;
             _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
             const deletes = if (provider.source.prepared_deletes) |prepared| try prepared.fileFingerprint(file.file_id) else local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint();
@@ -641,8 +658,11 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
             try mutations.add(&local.storage_rowsource_identity.navigationDigest(2, inv.source_id, inv.snapshot_id, old.id), null);
             if (mutations.changes.items.len >= 64) try mutations.flush(pages.store(), &root.public);
         }
-        for (current, changed) |file, is_changed| {
-            if (!is_changed or replaced.contains(file.id)) continue;
+        var planned = native.Plan{ .a = a, .files = current, .changed = changed, .selection = selection, .by_id = native_by_id };
+        var changes = planned.iterator(true);
+        while (try changes.next()) |item| {
+            const file = item.file;
+            if (replaced.contains(file.id)) continue;
             try mutations.add(&local.storage_rowsource_identity.navigationDigest(2, inv.source_id, inv.snapshot_id, file.id), file.id);
             if (mutations.changes.items.len >= 64) try mutations.flush(pages.store(), &root.public);
         }
@@ -680,7 +700,10 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     defer a.free(bytes);
     var uploaded = try store.putWithCancellation(bytes, token);
     defer uploaded.deinit(store.allocator);
-    return .{ .root = root, .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = root.version, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .public_navigation = .{ .identity_version = root.public_identity_version, .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
+    const prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null;
+    const ref: Ref = .{ .kind = .doc_values, .metadata_version = root.version, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
+    if (selection) |value| _ = value.census.retain();
+    return .{ .root = root, .stats = stats, .ref = ref, .delta = .{ .public_navigation = .{ .identity_version = root.public_identity_version, .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = prior_snapshot, .selection = selection, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
 }
 /// Incremental per-column, per-file sketches piggyback on native replay.
 /// Each changed leaf replaces its previous sketch; HLLs are never subtracted.
@@ -1151,6 +1174,7 @@ fn navigationRefreshScenario(identity_version: u8) !void {
     source.immutable_objects = true;
     source.plan_identity = @splat(8);
     const first = try buildProven(a, ca, &store, &provider, null, .none, @splat(9));
+    defer first.deinit();
     const old = try load(ca, store, first.ref, .none, null);
     const descriptor = try encodeInventory(a, &provider, old);
     defer a.free(descriptor);
@@ -1229,10 +1253,11 @@ fn navigationRefreshScenario(identity_version: u8) !void {
     source.inventory.snapshot_id = @constCast("after");
     store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 2, std.testing.io);
     const next = try build(a, ca, &store, &provider, old, .none);
+    defer next.deinit();
     try std.testing.expectEqual(@as(usize, 1), next.delta.prior_changed.len);
     try std.testing.expect(next.stats.prior_records < entries.len / 2);
     try std.testing.expect(next.stats.skipped_subtrees > 0);
-    for (next.delta.changed, 0..) |changed, i| try std.testing.expectEqual(i == 0, changed);
+    for (0..next.delta.count()) |i| try std.testing.expectEqual(i == 0, next.delta.isChanged(i));
     const root = try load(ca, store, next.ref, .none, null);
     var newer: Resolver = .{ .root = root, .store = store, .cached = cached, .token = .none };
     defer newer.deinit();
@@ -1255,6 +1280,7 @@ fn navigationRefreshScenario(identity_version: u8) !void {
     provider.native_delta = null;
     store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 3, std.testing.io);
     const unchanged = try build(a, ca, &store, &provider, root, .none);
+    defer unchanged.deinit();
     try std.testing.expectEqual(@as(usize, 0), unchanged.stats.prior_pages);
     try std.testing.expectEqual(@as(usize, 0), unchanged.stats.prior_records);
     try std.testing.expectEqual(@as(usize, 0), unchanged.delta.prior_changed.len);
@@ -1264,6 +1290,7 @@ fn navigationRefreshScenario(identity_version: u8) !void {
         const same = try load(ca, store, unchanged.ref, .none, null);
         source.inventory.files = entries[0 .. entries.len - 1];
         const removal = try build(a, ca, &store, &provider, same, .none);
+        defer removal.deinit();
         const removed = try load(ca, store, removal.ref, .none, null);
         try std.testing.expectEqual(@as(u64, 255), removed.public.?.records);
         var removal_reader: Resolver = .{ .root = removed, .store = store, .cached = cached, .token = .none };
@@ -1272,6 +1299,7 @@ fn navigationRefreshScenario(identity_version: u8) !void {
         try std.testing.expect(try removal_reader.file(ca, removed_hex, true) == null);
         source.inventory.files = entries;
         const addition = try build(a, ca, &store, &provider, removed, .none);
+        defer addition.deinit();
         const added = try load(ca, store, addition.ref, .none, null);
         try std.testing.expectEqual(@as(u64, 256), added.public.?.records);
         var addition_reader: Resolver = .{ .root = added, .store = store, .cached = cached, .token = .none };
@@ -1380,6 +1408,7 @@ test "external lake durable costing reuses unchanged leaves and removes replaced
     source.plan_identity = @splat(8);
     var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .schema_contract = &.{.{ .name = "key", .kind = "integer", .required = true }} };
     const initial = try buildProven(a, ca, &store, &provider, null, .none, @splat(9));
+    defer initial.deinit();
     provider.native_delta = initial.delta;
     var builder = try CostingBuilder.init(a, ca, &store, &provider, initial.ref, null, &.{"key"}, .none);
     defer builder.deinit();
@@ -1410,9 +1439,10 @@ test "external lake durable costing reuses unchanged leaves and removes replaced
     files[0].etag = @constCast("replacement");
     provider.native_delta = null;
     const refreshed = try buildProven(a, ca, &store, &provider, before, .none, @splat(10));
+    defer refreshed.deinit();
     provider.native_delta = refreshed.delta;
-    try std.testing.expect(refreshed.delta.changed[0]);
-    try std.testing.expect(!refreshed.delta.changed[1]);
+    try std.testing.expect(refreshed.delta.isChanged(0));
+    try std.testing.expect(!refreshed.delta.isChanged(1));
     var next = try CostingBuilder.init(a, ca, &store, &provider, refreshed.ref, before, &.{"key"}, .none);
     defer next.deinit();
     try next.start();
@@ -1429,4 +1459,149 @@ test "external lake durable costing reuses unchanged leaves and removes replaced
         if (ref) |value| if (std.meta.eql(value, after.costing[0].files.?)) break true;
     } else false;
     try std.testing.expect(retained);
+}
+
+test "external lake bounded WAL sparse native file directories retain delta state and GC document edges" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-paged-file-state");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(1, @splat(7), null);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    const entries = try ca.alloc(local.serverless_external_source_types.FileEntry, 256);
+    var positions: local.serverless_query_lake_inventory_catalog.Positions = .empty;
+    defer positions.deinit(a);
+    for (entries, 0..) |*entry, i| {
+        entry.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d}", .{i}), .object_uri = @constCast("file:///source.parquet"), .byte_len = 128, .row_count = 1, .row_groups = &.{} };
+        try positions.put(a, entry.file_id, i);
+    }
+    const Hasher = struct {
+        fn get(_: *anyopaque, id: []const u8) ![32]u8 {
+            return native.Selection.idKey(id);
+        }
+    };
+    var dummy: u8 = 0;
+    const census = try local.serverless_query_lake_file_census.Census.build(a, domain, null, &.{}, &.{}, entries, .{ .ptr = &dummy, .get = Hasher.get }, .{});
+    defer census.release();
+    const selection: native.Selection = .{ .files = entries, .census = census, .positions = positions };
+    var initial: native.Plan = .{ .a = a, .selection = selection, .by_id = positions, .borrowed_positions = true, .force_all = true };
+    defer initial.deinit();
+    const old_digest = (try initial.stateAt(0)).digest;
+    const document = try std.fmt.allocPrint(ca, "lake2:{s}:00000000:0000000000000000", .{std.fmt.bytesToHex(&old_digest, .lower)});
+    var uploaded = try store.putWithCancellation(document, .none);
+    defer uploaded.deinit(a);
+    const docs = try ca.dupe(artifacts.ChunkRef, &.{.{ .artifact_id = uploaded.artifact_id, .checksum = uploaded.checksum, .byte_len = uploaded.byte_len }});
+    const first = try initial.mutable(0);
+    first.docs = docs;
+    first.count = 1;
+    const root = (try initial.publishDirectory(a, &store, domain, .none)).?;
+    try std.testing.expectEqual(@as(u64, entries.len), root.records);
+    try std.testing.expectEqual(@as(usize, 0), initial.files.len);
+    try std.testing.expectEqual(@as(usize, 1), initial.updates.count());
+    var delta_selection = selection;
+    var ordered = census.iterator();
+    var range: ?native.Selection.Range = null;
+    while (try ordered.next()) |entry| {
+        if (std.mem.eql(u8, entry.id, entries[0].file_id)) {
+            if (range) |value| try delta_selection.unchanged.append(ca, value);
+            range = null;
+        } else if (range) |*value| value.last = entry.key else range = .{ .first = entry.key, .last = entry.key };
+    }
+    if (range) |value| try delta_selection.unchanged.append(ca, value);
+    delta_selection.finish();
+    var delta: native.Plan = .{ .a = a, .selection = delta_selection, .by_id = positions, .borrowed_positions = true, .prior_directory = root };
+    defer delta.deinit();
+    const changed = try delta.mutable(0);
+    changed.digest[0] ^= 1;
+    var updates = delta.iterator(true);
+    try std.testing.expectEqual(@as(usize, 0), ((try updates.next()).?).ordinal);
+    try std.testing.expect((try updates.next()) == null);
+    try std.testing.expect(delta_selection.unchanged.items.len <= 2);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 2, std.testing.io);
+    const next = (try delta.publishDirectory(a, &store, domain, .none)).?;
+    const decoded = try native.directoryFiles(ca, store, next, domain, .none);
+    try std.testing.expectEqual(entries.len, decoded.len);
+    for (decoded) |entry| {
+        const ordinal = positions.get(entry.id).?;
+        try std.testing.expectEqual((try delta.stateAt(ordinal)).digest, entry.digest);
+        if (ordinal == 0) try std.testing.expectEqual(@as(u64, 0), entry.count);
+    }
+    var deletes: native.Deletes = .{ .files = &.{.{ .id = entries[0].file_id, .digest = old_digest }}, .current = &delta, .directory = root, .domain = domain };
+    defer deletes.deinit();
+    const deleted = (try deletes.next(a, store, .none)).?;
+    defer a.free(deleted);
+    try std.testing.expectEqualStrings(document, deleted);
+    try std.testing.expect((try deletes.next(a, store, .none)) == null);
+    // An earlier generic mark must not suppress native file-state expansion.
+    var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 1, .authority = undefined, .store = store, .identity = @splat(7), .context = .{}, .token = @splat(1), .audit_only = true, .remaining_reads = 16 * 1024 * 1024 };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |id| a.free(id.*);
+        collector.marked.deinit(a);
+    }
+    _ = try collector.mark(.{ .artifact_id = &try pages_mod.PageStore.identity(domain, root), .checksum = &std.fmt.bytesToHex(&root.digest, .lower), .byte_len = root.bytes });
+    try collector.markNativeFiles(a, domain, root);
+    try std.testing.expect(collector.marked.contains(uploaded.artifact_id));
+}
+
+test "external lake bounded WAL census delta borrows unchanged source state without flat native arrays" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-borrowed-census");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    var memory: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
+    defer memory.deinit();
+    const chunk = try memory.create(1024 * 1024);
+    defer chunk.release();
+    const ma = chunk.item.budget.allocator();
+    const inventory: Inventory = .{ .format = .iceberg, .source_id = try ma.dupe(u8, "source"), .source_uri = try ma.dupe(u8, "file:///source"), .snapshot_id = try ma.dupe(u8, "before"), .row_identity_version = 2, .schema_fingerprint = try ma.dupe(u8, "schema"), .files = try ma.alloc(local.serverless_external_source_types.FileEntry, 256) };
+    chunk.item.payload = .{ .iceberg_chunk = inventory };
+    for (inventory.files, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ma, "file-{d:0>4}", .{i}), .object_uri = try ma.dupe(u8, "file:///data.parquet"), .etag = try ma.dupe(u8, "immutable"), .byte_len = 128, .row_count = 1, .row_groups = &.{} };
+    const index = try local.serverless_query_lake_inventory_catalog.Index.build(a, null, &.{.{ .key = @splat(1), .lease = chunk }}, .{});
+    var snapshots: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
+    defer snapshots.deinit();
+    const snapshot = try snapshots.create(1024 * 1024);
+    defer snapshot.release();
+    // The snapshot owns the catalog; its descriptor is borrowed from the chunk
+    // only for this test, and cleared before the snapshot's ordinary teardown.
+    snapshot.item.payload = .{ .snapshot = .{ .inventory = inventory, .catalog = index } };
+    defer snapshot.item.payload.snapshot.inventory = .{ .format = .iceberg, .source_id = &.{}, .source_uri = &.{}, .snapshot_id = &.{}, .schema_fingerprint = &.{}, .files = &.{} };
+    var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .scanner = undefined, .inventory = inventory, .plan_lease = snapshot, .immutable_objects = true };
+    source.scanner.iceberg_delete_plan = null;
+    var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+    const first = try build(a, ca, &store, &provider, null, .none);
+    defer first.deinit();
+    try std.testing.expect(first.stats.cached_census);
+    try std.testing.expectEqual(@as(usize, 256), first.stats.rehashed_files);
+    source.inventory.snapshot_id = @constCast("after");
+    const next = try build(a, ca, &store, &provider, first.root, .none);
+    defer next.deinit();
+    try std.testing.expect(next.stats.cached_census);
+    try std.testing.expectEqual(@as(usize, 0), next.stats.rehashed_files);
+    try std.testing.expectEqual(@as(usize, 0), next.stats.prior_records);
+    try std.testing.expectEqual(@as(usize, 0), next.delta.files.len);
+    try std.testing.expectEqual(@as(usize, 0), next.delta.changed.len);
+    try std.testing.expectEqual(@as(usize, 1), next.delta.selection.?.unchanged.items.len);
+    var plan = try native.Plan.fromDelta(a, ca, next.delta);
+    defer plan.deinit();
+    var changed = plan.iterator(true);
+    try std.testing.expect((try changed.next()) == null);
+    try std.testing.expectEqual(@as(usize, 0), plan.updates.count());
+    provider.native_delta = next.delta;
+    var fresh = try native.Plan.initPaged(a, ca, &provider, &.{}, null, false, false);
+    defer fresh.deinit();
+    try std.testing.expectEqual(@as(usize, 256), fresh.count());
+    provider.native_delta.?.source = "another-source";
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, native.Plan.initPaged(a, ca, &provider, &.{}, null, false, false));
 }
