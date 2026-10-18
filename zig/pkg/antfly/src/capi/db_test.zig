@@ -1249,7 +1249,7 @@ fn testNativeIndexInstallationInterface(source: *db_mod.DB, intent: @import("ant
     }
     // Kernel-interface qualification only: metadata authorization and signing
     // are independently qualified by the server receiver and ACK tests.
-    const release_intent: @FieldType(native.ReleaseOutcome, "intent") = .{ .installed = .{ .command = committed.?.command, .position = committed.?.position }, .metadata_decision = @splat(88) };
+    const release_intent: @FieldType(native.ReleaseOutcome, "intent") = .{ .installed = .{ .command = committed.?.command, .position = .{ .native = committed.?.position } }, .metadata_decision = @splat(88) };
     const release_json = try std.json.Stringify.valueAlloc(a, release_intent, .{});
     defer a.free(release_json);
     request.operation = .release;
@@ -1539,6 +1539,62 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
     try std.testing.expectEqualDeep(observed.reserved, recovered.reserved);
     try std.testing.expectEqualDeep(observed.fenced, recovered.fenced);
     try std.testing.expectEqual(@as(u64, 4), recovered.applied.?.raft.index);
+    const build_request = try contract.BuildRequest.initRaft(identity, recovered.binding.?, .{ .records = 1, .time_ns = std.time.ns_per_s });
+    const build_json = try std.json.Stringify.valueAlloc(a, build_request, .{});
+    defer a.free(build_json);
+    const Build = struct {
+        fn call(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerBuildRequest, expected: contract.BuildRequest) !std.json.Parsed(contract.BuildPreparation) {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexBuildJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expect(response.len < 32 * 1024);
+            var parsed = try std.json.parseFromSlice(contract.BuildPreparation, std.testing.allocator, response.slice(), .{ .ignore_unknown_fields = false });
+            errdefer parsed.deinit();
+            try parsed.value.validateFor(expected);
+            return parsed;
+        }
+        fn reject(req: kernel_owner_abi.RaftIndexOwnerBuildRequest, name: []const u8) !void {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexBuildJson(null, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expect(status != .ok and response.ptr == null and response.len == 0);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expectEqual(kernel_owner_abi.RaftIndexOwnerBuildRequest.operation, failure.operation);
+            try std.testing.expectEqualStrings(name, failure.errorName());
+        }
+    };
+    const build_input: kernel_owner_abi.RaftIndexOwnerBuildRequest = .{ .table_name = .fromSlice("items"), .request_json = .fromSlice(build_json) };
+    var bad_build = build_input;
+    bad_build.request_json = .{ .ptr = @ptrFromInt(1), .len = contract.BuildPreparation.max_request_bytes + 1 };
+    try Build.reject(bad_build, "InvalidArgument");
+    bad_build = build_input;
+    bad_build.prepare = 2;
+    try Build.reject(bad_build, "InvalidArgument");
+    bad_build = build_input;
+    bad_build.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try Build.reject(bad_build, "DeadlineExceeded");
+    var page = try Build.call(id, build_input, build_request);
+    defer page.deinit();
+    try std.testing.expect(page.value == .page);
+    try std.testing.expectEqual(@as(u64, 4), (try handle.db.orderedApplyReceipt()).?.index);
+    var replay = try local.storage_db_relational_index_owner_control.PreparedBuild.replayPrepared(a, handle.db.core, page.value.page);
+    defer replay.deinit();
+    try handle.db.applyCommittedRaftIndexBuild(&replay, 11, .{ .term = 3, .index = 5 });
+    var complete = try Build.call(id, build_input, build_request);
+    defer complete.deinit();
+    try std.testing.expect(complete.value == .progress);
+    try std.testing.expectEqual(.ready, complete.value.progress.state);
+    try std.testing.expectEqual(@as(u64, 5), complete.value.progress.position.?.raft.index);
+    try std.testing.expectEqual(@as(u64, 1), handle.db.native_index_build_cache.compilations);
+    var read_input = build_input;
+    read_input.prepare = 0;
+    var reread = try Build.call(id, read_input, build_request);
+    defer reread.deinit();
+    try std.testing.expectEqualDeep(complete.value.progress, reread.value.progress);
 }
 
 test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {
@@ -2208,7 +2264,9 @@ test "storage owner native index raw admission and bounded controls preserve loc
     try std.testing.expect(status.value.claims_retired);
     try std.testing.expect(status.value.claim_allocation != null);
     try std.testing.expectEqual(cancel_position.sequence + 1, status.value.cleanup.?.sequence);
-    try std.testing.expectEqual(cancel_position, status.value.intent.?.position);
+    try status.value.validate(identity);
+    try std.testing.expect(status.value.intent.?.position == .native);
+    try std.testing.expectEqual(cancel_position, status.value.intent.?.position.native);
     try std.testing.expect(status.value.completed == null);
     const completion_native = local.storage_db_relational_index_owner_control;
     const signer = try local.storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, directory.path());
@@ -2316,7 +2374,8 @@ test "storage owner native index raw admission and bounded controls preserve loc
         defer released.deinit();
         try released.value.validate();
         try std.testing.expectEqual(attempt != 0, released.value.duplicate);
-        try std.testing.expectEqual(completed.?.position.sequence + 1, released.value.position.sequence);
+        try std.testing.expect(completed.?.position == .native);
+        try std.testing.expectEqual(completed.?.position.native.sequence + 1, released.value.position.sequence);
         try std.testing.expectEqual(.cancel_released, released.value.receipt.?.action);
     }
 }

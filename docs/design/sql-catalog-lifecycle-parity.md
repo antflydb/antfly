@@ -86,15 +86,20 @@ prepared execution paths. Borrowed JSON is size-checked before typed duplication
 the command supplies no execution cut. Dispatch joins actual group/namespace
 identity, skips old replay before preparation and rechecks replay after a raced
 preparation failure. Earlier branch-local flat control envelopes are unsupported.
-The authenticated data receiver now connects Raft admission/fence/reserve to
+The authenticated data receiver now connects Raft admission/fence/reserve/build to
 fresh metadata decisions, an enrolled reporter and one retained physical-owner
 lease through preparation, term-bound proposal, recovery and signing. Ordinary
 and forwarded batches cannot supply this process-local permission. The proposal
 uses the existing all-member decoder barrier and rechecks the descriptor's root
 generation. Responses retain explicit Raft positions; the shared worker can
 decode their ACKs. Cold admission also preserves the signing reporter in its
-internal metadata request. This is not complete public activation: the worker's
-Raft cohort guard, build/claim transport and later publication receiver paths
+internal metadata request. Build preparation crosses the compiled-owner boundary
+without mutation, reuses the same resource-accounted compilation cache for
+either authority, and pins its cache allocator through prepared-page destruction.
+The bounded ABI response allocates its actual encoded size, not the worst-case
+page limit. Committed progress reports the retained Raft cut; initial/physical
+completion is never a publication ACK. This is not complete public activation:
+the worker's Raft cohort guard, source/claim transport and later publication paths
 remain unfinished, and public CREATE remains guarded. No original case is
 closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's

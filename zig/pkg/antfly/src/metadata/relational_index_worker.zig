@@ -391,8 +391,13 @@ const Job = struct {
                         self.retireOwner(index);
                         return;
                     }
-                    if (response.value != .building) return error.InvalidPrivateIndexNativeReceipt;
-                    const pending = switch (response.value.building.outcome) {
+                    const pending = if (response.value == .raft_build) pending: {
+                        if (response.value.raft_build.progress.state == .failed) {
+                            try owner.requestCancellation(.invalid_candidate);
+                            return;
+                        }
+                        break :pending false;
+                    } else if (response.value == .building) switch (response.value.building.outcome) {
                         .inventory, .generation, .audit, .validated => return error.InvalidPrivateIndexNativeReceipt,
                         .advanced => |value| value.replication_pending,
                         .complete => |value| blk: {
@@ -403,7 +408,7 @@ const Job = struct {
                             }
                             break :blk value.replication_pending;
                         },
-                    };
+                    } else return error.InvalidPrivateIndexNativeReceipt;
                     if (pending) {
                         owner.retry_at_ns = now_ns +| retry_ns;
                         return;

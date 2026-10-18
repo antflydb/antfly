@@ -148,6 +148,48 @@ pub const Control = struct {
     }
 };
 
+pub const BuildRequest = @import("relational_index_owner_control.zig").BuildRequest;
+pub const BuildProgress = struct {
+    binding: jobs.Binding,
+    state: @import("relational_index_jobs.zig").State = .building,
+    failure: @import("relational_index_jobs.zig").Failure = .none,
+    rows_scanned: u64 = 0,
+    progress_digest: [32]u8 = @splat(0),
+    position: ?positions.Position = null,
+    claim_batches_pending: u64 = 0,
+    claim_bytes_pending: u64 = 0,
+
+    pub fn validateFor(self: @This(), request: BuildRequest) !void {
+        try request.requireRaftBinding(self.binding);
+        if (request.target_expectation != null or (self.state == .failed) != (self.failure != .none) or
+            self.claim_batches_pending > jobs.private_claims.SourceStream.max_pending or
+            self.claim_bytes_pending > jobs.private_claims.SourceStream.max_pending_bytes or
+            (self.claim_batches_pending == 0) != (self.claim_bytes_pending == 0)) return error.InvalidRelationalIndexProgress;
+        if (self.position) |position| {
+            try position.validate();
+            if (position != .raft or std.mem.allEqual(u8, &self.progress_digest, 0)) return error.InvalidControlReceiptPosition;
+        } else if (self.state != .building or self.rows_scanned != 0 or self.claim_batches_pending != 0 or
+            !std.mem.allEqual(u8, &self.progress_digest, 0)) return error.InvalidRelationalIndexProgress;
+    }
+};
+pub const BuildPreparation = union(enum) {
+    pub const max_request_bytes = 8 * 1024;
+    pub const max_response_bytes = @import("relational_index_jobs.zig").Page.PrivateCommand.max_wire_bytes + 1024;
+    page: @import("relational_index_jobs.zig").Page.PrivateCommand,
+    progress: BuildProgress,
+
+    pub fn validateFor(self: @This(), request: BuildRequest) !void {
+        switch (self) {
+            .page => |page| {
+                try page.validate();
+                try request.requireRaftBinding(page.binding);
+                if (request.target_expectation != null) return error.InvalidGenerationPublication;
+            },
+            .progress => |progress| try progress.validateFor(request),
+        }
+    }
+};
+
 /// Exactly one owned effect per committed entry. The execution position is
 /// absent: only the committed-entry callback can supply that authority cut.
 /// This replaces the earlier branch-local flat control framing.

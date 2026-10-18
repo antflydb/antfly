@@ -8562,6 +8562,38 @@ pub const DB = struct {
         return RaftIndexOwnerControl.observe(&txn, expected);
     }
 
+    /// Read-only bounded proposal preparation. The caller keeps its working
+    /// allocator alive until encoding/deinit; no apply lock or clock is taken.
+    pub fn prepareRaftIndexOwnerBuild(self: *DB, alloc: std.mem.Allocator, owner_group: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: @import("../../api/operation.zig").RequestContext) !?native_index_control.PreparedBuild {
+        try context.ensureActive();
+        try request.validate();
+        if (request.target_expectation != null) return error.InvalidGenerationPublication;
+        const binding = (try self.raftIndexOwnerState(owner_group, request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        try request.requireRaftBinding(binding);
+        const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
+        var lease = try self.native_index_build_cache.acquireRaft(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
+        errdefer lease.deinit();
+        var prepared = try native_index_control.PreparedBuild.prepareRaft(alloc, io, self.core, table_name, lease.raftReservation(), request.budget, context);
+        if (prepared) |*value| value.cache_lease = lease else lease.deinit();
+        return prepared;
+    }
+
+    pub fn raftIndexOwnerBuildProgress(self: *DB, owner_group: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_raft_contract.zig").BuildProgress {
+        try context.ensureActive();
+        try request.validate();
+        if (request.target_expectation != null) return error.InvalidGenerationPublication;
+        const binding = (try self.raftIndexOwnerState(owner_group, request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        try request.requireRaftBinding(binding);
+        const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
+        var lease = try self.native_index_build_cache.acquireRaft(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
+        defer lease.deinit();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const progress = try native_index_control.PreparedBuild.raftProgress(&read, table_name, lease.raftReservation());
+        try progress.validateFor(request);
+        return progress;
+    }
+
     fn requireRaftIndexOwnerIdentity(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !void {
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         try expected.validate();

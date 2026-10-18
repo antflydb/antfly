@@ -680,6 +680,26 @@ pub const Owner = struct {
     }
 
     /// Advisory physical binding, not a reservation, receipt or permission.
+    pub fn raftIndexOwnerBuild(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildRequest, prepare: bool, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildPreparation) {
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        try request.validate();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > contract.BuildPreparation.max_request_bytes) return error.InvalidPrivateIndexOwnerJob;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_build_json(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(encoded), .prepare = @intFromBool(prepare), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerBuildRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index owner build preparation");
+        if (response.bytes().len == 0 or response.bytes().len > contract.BuildPreparation.max_response_bytes) return error.InvalidRelationalIndexProgress;
+        var parsed = try std.json.parseFromSlice(contract.BuildPreparation, alloc, response.bytes(), .{ .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.validateFor(request);
+        if (!prepare and parsed.value != .progress) return error.InvalidRelationalIndexProgress;
+        return parsed;
+    }
+
     pub fn raftIndexOwnerAdmissionPreparation(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, admission: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Admission, manifest: []const u8, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_index_raft_contract.AdmissionPreparation {
         const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
         const limits = contract.AdmissionPreparation;

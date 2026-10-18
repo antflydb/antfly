@@ -727,6 +727,11 @@ pub const BuildRequest = struct {
         try result.requireBinding(binding);
         return result;
     }
+    pub fn initRaft(identity: Identity, binding: jobs.Binding, budget: pages.Budget) !BuildRequest {
+        const result: BuildRequest = .{ .identity = identity, .binding_digest = try bindingDigest(binding), .budget = budget };
+        try result.requireRaftBinding(binding);
+        return result;
+    }
     pub fn validate(self: BuildRequest) !void {
         try self.identity.validate();
         try self.budget.validate();
@@ -737,10 +742,16 @@ pub const BuildRequest = struct {
         }
     }
     pub fn requireBinding(self: BuildRequest, binding: jobs.Binding) !void {
+        return self.requireBindingAuthority(binding, .native);
+    }
+    pub fn requireRaftBinding(self: BuildRequest, binding: jobs.Binding) !void {
+        return self.requireBindingAuthority(binding, .raft);
+    }
+    fn requireBindingAuthority(self: BuildRequest, binding: jobs.Binding, authority: @import("relational_index_publication_progress.zig").Authority) !void {
         try self.validate();
         if (self.target_expectation) |expected| try expected.requireBinding(binding);
         const identity = self.identity;
-        if (binding.phase != .reserved or binding.authority != .native or
+        if (binding.phase != .reserved or binding.authority != authority or
             !std.mem.eql(u8, &binding.id, &identity.id) or !std.mem.eql(u8, &binding.plan_digest, &identity.plan_digest) or
             !std.mem.eql(u8, &binding.owner_digest, &identity.owner_digest) or binding.ordinal != identity.ordinal or
             !binding.fence.namespace.eql(identity.namespace) or binding.fence.owner_group_id != identity.owner_group_id or
@@ -1642,6 +1653,9 @@ pub const PreparedBuild = struct {
     command_digest: [32]u8,
     progress_digest: [32]u8,
     claim_batch: private_claims.SourceStream.PreparedSource,
+    /// A cloned plan still uses its compilation allocator. Keep that allocator
+    /// pinned through page destruction even if the resident cache is evicted.
+    cache_lease: ?BuildCache.Lease = null,
     context: RequestContext = .{},
     payload: ?[]u8 = null,
     prefix_len: usize = 0,
@@ -1714,6 +1728,7 @@ pub const PreparedBuild = struct {
         if (self.payload) |bytes| self.alloc.free(bytes);
         self.claim_batch.deinit();
         self.page.deinit();
+        if (self.cache_lease) |*lease| lease.deinit();
         self.* = undefined;
     }
     pub fn validate(self: *const PreparedBuild) !void {
@@ -1786,6 +1801,26 @@ pub const PreparedBuild = struct {
         const position = (try @import("receipt_position.zig").Position.decode(bytes[104..137])).native;
         const source = try private_claims.SourceStream.requireLatest(txn, binding, .{ .table_name = table_name, .generation = artifacts.unique.generation, .schema_version = binding.physical_candidate.schema_version, .tuple_fingerprint = artifacts.unique.tuple.fingerprint, .nulls_not_distinct = artifacts.unique.nulls_not_distinct }, position, bytes[72..104].*, bytes[144..176].*);
         return .{ .binding = binding, .state = if (progress.state == .ready) .ready else .failed, .failure = progress.failure, .rows_scanned = progress.rows_scanned, .progress_digest = bytes[72..104].*, .position = position, .claim_batches_pending = source.pending(), .claim_bytes_pending = source.pending_bytes };
+    }
+    /// A bounded coherent observation; the retained page cut, not the current
+    /// host term or watermark, identifies the physical work that committed.
+    pub fn raftProgress(txn: anytype, table_name: []const u8, reservation: *const @import("relational_index_raft_control.zig").Prepared) !@import("relational_index_raft_contract.zig").BuildProgress {
+        const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
+        var binding = reservation.command.binding;
+        binding.phase = .reserved;
+        if (binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        try jobs.requireReserved(txn, binding);
+        try verifyRecovery(txn, binding);
+        const bytes = (try checkpoint(txn, binding)) orelse return .{ .binding = binding };
+        const index = for (artifacts.addition.plan.boundIndexes()) |value| {
+            if (value.id().mapKey() == binding.index.mapKey()) break value;
+        } else return error.PrivateIndexOwnerJobChanged;
+        const owner = try pages.ownership(txn);
+        const progress = try pages.Progress.decode(try txn.get(&pages.progressKey(binding.index)));
+        if (!progress.matches(index, owner) or progress.phase != .primary) return error.InvalidRelationalIndexProgress;
+        const position = try @import("receipt_position.zig").Position.decode(bytes[104..137]);
+        const source = try private_claims.SourceStream.requireLatestOrdered(txn, binding, .{ .table_name = table_name, .generation = artifacts.unique.generation, .schema_version = binding.physical_candidate.schema_version, .tuple_fingerprint = artifacts.unique.tuple.fingerprint, .nulls_not_distinct = artifacts.unique.nulls_not_distinct }, position, bytes[72..104].*, bytes[144..176].*);
+        return .{ .binding = binding, .state = progress.state, .failure = progress.failure, .rows_scanned = progress.rows_scanned, .progress_digest = bytes[72..104].*, .position = position, .claim_batches_pending = source.pending(), .claim_bytes_pending = source.pending_bytes };
     }
     pub fn stage(self: *PreparedBuild, core: anytype, txn: anytype, replay: ?Native) !BuildOutcome {
         if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
@@ -1864,7 +1899,7 @@ pub const BuildCache = struct {
         budget: ?resources.BudgetedAllocator,
         refs: std.atomic.Value(usize) = .init(1),
         digest: [32]u8,
-        prepared: ?Prepared = null,
+        prepared: ?union(enum) { native: Prepared, raft: @import("relational_index_raft_control.zig").Prepared } = null,
         history: ?validation.Installed.History = null,
 
         fn create(backing: Allocator, manager: ?*resources.ResourceManager, binding_digest: [32]u8) !*Entry {
@@ -1880,7 +1915,9 @@ pub const BuildCache = struct {
         }
         fn release(self: *Entry) void {
             if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-            if (self.prepared) |*value| value.deinit();
+            if (self.prepared) |*value| switch (value.*) {
+                inline else => |*prepared| prepared.deinit(),
+            };
             if (self.history) |*value| value.deinit();
             if (self.budget) |*value| value.deinit();
             const backing = self.backing;
@@ -1897,7 +1934,10 @@ pub const BuildCache = struct {
     pub const Lease = struct {
         entry: *Entry,
         pub fn reservation(self: Lease) *const Prepared {
-            return &self.entry.prepared.?;
+            return &self.entry.prepared.?.native;
+        }
+        pub fn raftReservation(self: Lease) *const @import("relational_index_raft_control.zig").Prepared {
+            return &self.entry.prepared.?.raft;
         }
         pub fn installedHistory(self: Lease) ?*const validation.Installed.History {
             return if (self.entry.history) |*value| value else null;
@@ -1965,7 +2005,11 @@ pub const BuildCache = struct {
     /// Caller observes the actual durable reserved binding before acquisition;
     /// page preparation and commit must independently recheck it afterwards.
     pub fn acquire(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, binding: jobs.Binding, context: RequestContext) !Lease {
-        return self.acquireMode(io, backing, manager, core, request, binding, context, request.binding_digest, false);
+        return self.acquireMode(io, backing, manager, core, request, binding, context, request.binding_digest, false, .native);
+    }
+
+    pub fn acquireRaft(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, binding: jobs.Binding, context: RequestContext) !Lease {
+        return self.acquireMode(io, backing, manager, core, request, binding, context, request.binding_digest, false, .raft);
     }
 
     /// Audit-only acquisition: current installed state is checked even for
@@ -1981,12 +2025,12 @@ pub const BuildCache = struct {
             if (!std.meta.eql(record.command.intent(), intent)) return error.InvalidPrivateIndexNativeReceipt;
             break :digest try record.command.evidenceDigest();
         };
-        return self.acquireMode(io, backing, manager, core, request, intent.validation.command.binding, context, cache_digest, true);
+        return self.acquireMode(io, backing, manager, core, request, intent.validation.command.binding, context, cache_digest, true, .native);
     }
 
-    fn acquireMode(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, binding: jobs.Binding, context: RequestContext, cache_digest: [32]u8, comptime installed_audit: bool) !Lease {
+    fn acquireMode(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, binding: jobs.Binding, context: RequestContext, cache_digest: [32]u8, comptime installed_audit: bool, comptime authority: @import("relational_index_publication_progress.zig").Authority) !Lease {
         try context.ensureActive();
-        try request.requireBinding(binding);
+        if (comptime authority == .native) try request.requireBinding(binding) else try request.requireRaftBinding(binding);
         const epoch = while (true) {
             try self.mutex.lock(io);
             var locked = true;
@@ -2043,22 +2087,25 @@ pub const BuildCache = struct {
             defer view.release();
             var command: Command = .{ .effect = .reserved, .binding = binding };
             command.binding.phase = .fencing;
-            entry.prepared = Prepared.control(alloc, view, &historical, command) catch |err| {
+            const prepared = Prepared.control(alloc, view, &historical, command) catch |err| {
                 if (entry.budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
                 return err;
             };
+            entry.prepared = .{ .native = prepared };
         } else {
             var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
             defer view.release();
             var read = try core.store.beginReadTxn();
             defer read.abort();
             try jobs.requireReserved(&read, binding);
-            var command: Command = .{ .effect = .reserved, .binding = binding };
+            var command: if (authority == .native) Command else @import("relational_index_raft_control.zig").Command = .{ .effect = .reserved, .binding = binding };
             command.binding.phase = .fencing;
-            entry.prepared = Prepared.control(alloc, view, &read, command) catch |err| {
+            const Preparation = if (authority == .native) Prepared else @import("relational_index_raft_control.zig").Prepared;
+            const prepared = Preparation.control(alloc, view, &read, command) catch |err| {
                 if (entry.budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
                 return err;
             };
+            entry.prepared = if (authority == .native) .{ .native = prepared } else .{ .raft = prepared };
         }
         try context.ensureActive();
         if (entry.budget) |*value| _ = value.releaseUnusedCredit();

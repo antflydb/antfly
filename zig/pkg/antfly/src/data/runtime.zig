@@ -11666,7 +11666,7 @@ pub const DataServer = struct {
     fn raftIndexOwnerControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
         const execution = antfly.public_api.relational_index_owner_execution;
         const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
-        if (request.operation != .fence and request.operation != .reserve) return error.UnsupportedNativeIndexOwner;
+        if (request.operation != .fence and request.operation != .reserve and request.operation != .build) return error.UnsupportedNativeIndexOwner;
         const registration = self.store_registration orelse return error.IndexOwnerReceiptChanged;
         try self.waitDataReadSafeWithCancellation(group_id, "index-owner-control", 30_000, context.cancellation);
         var lookup = request.lookup(.permission);
@@ -11691,6 +11691,21 @@ pub const DataServer = struct {
         // Require current enrollment and reporter/root identity before any
         // effect, not merely when attempting post-commit decoration.
         try (try permission.value.raftSigningView(lookup)).requireLocal(scope);
+        if (request.operation == .build) {
+            const binding = rooted.observation.binding orelse return error.PrivateIndexRootRecoveryRequired;
+            const build = try permission.value.raftBuild(lookup, binding, request.build_budget orelse .{});
+            var prepared = try session.build(alloc, build, true);
+            defer prepared.deinit();
+            const progress = if (prepared.value == .page) committed: {
+                try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .build = prepared.value.page } }, route);
+                var recovered = try session.build(alloc, build, false);
+                defer recovered.deinit();
+                break :committed recovered.value.progress;
+            } else prepared.value.progress;
+            const response: execution.RaftBuildControlResponse = .{ .root_generation = rooted.root_generation, .progress = progress };
+            try response.validate(request);
+            return .{ .raft_build = response };
+        }
         const already = if (request.operation == .fence) rooted.observation.fenced else rooted.observation.reserved;
         if (already == null) {
             if (rooted.observation.binding) |binding| {
@@ -13049,8 +13064,12 @@ pub const DataServer = struct {
             const permission = route.index_owner_permission orelse return error.UnsupportedNativeIndexOwner;
             try permission.context.ensureActive();
             if (route.required_local_term == null or route.allow_remote_forward or permission.root_generation == 0 or
-                permission.request.group_id != group_id or command != .control) return error.InvalidGenerationPublication;
-            try permission.decision.requireRaftProposal(alloc, table_name, permission.request, command.control);
+                permission.request.group_id != group_id) return error.InvalidGenerationPublication;
+            switch (command) {
+                .control => |control| try permission.decision.requireRaftProposal(alloc, table_name, permission.request, control),
+                .build => |build| try permission.decision.requireRaftBuildProposal(table_name, permission.request, build),
+                else => return error.InvalidGenerationPublication,
+            }
         } else if (route.index_owner_permission != null) return error.InvalidGenerationPublication;
         // Do not allow a private/direct batch route to bypass the metadata
         // admission policy. This happens before a protocol barrier or a data

@@ -1212,6 +1212,20 @@ pub const OwnerDecision = struct {
         return native_control.BuildRequest.init(try self.nativeExecutionIdentity(request), observed, budget);
     }
 
+    pub fn raftBuild(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding, budget: local.storage_db_relational_index_jobs.Budget) !raft_control.BuildRequest {
+        if (request.operation != .build) return error.InvalidGenerationPublication;
+        const identity = try self.raftExecutionIdentity(request);
+        try self.requireRetainedBinding(observed, .raft);
+        return raft_control.BuildRequest.initRaft(identity, observed, budget);
+    }
+
+    pub fn requireRaftBuildProposal(self: OwnerDecision, table_name: []const u8, request: OwnerRequest, command: local.storage_db_relational_index_jobs.Page.PrivateCommand) !void {
+        try command.validate();
+        _ = try self.raftBuild(request, command.binding, .{});
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, dispatch.table_name, table_name) or !std.mem.eql(u8, command.source.table_name, table_name)) return error.GenerationPublicationChanged;
+    }
+
     /// Frozen metadata input only; a receiver must inspect the physical binding
     /// independently, then core must scan/seal the actual generation and claims.
     pub fn nativeTargetExpectation(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !local.storage_db_relational_index_owner_job.private_claims.TargetExpectation {
@@ -2786,6 +2800,35 @@ test "relational index publication Raft decisions bind immutable admission and e
     try std.testing.expectEqual(.fencing, reserve.binding.phase);
     try std.testing.expectEqual(.reserved, reserved.phase);
     try std.testing.expectEqualDeep(binding, reserve.binding);
+    const reserved_update = try progress.acknowledge(decision.head, decision.owner, decision.head.revision, .{
+        .owner = decision.owner.owner,
+        .action = .reserved,
+        .position = .{ .raft = .{ .term = 7, .index = 3 } },
+        .candidate_digest = admission.candidate_digest,
+        .reservation_digest = admission.reservation_digest,
+        .evidence_digest = @splat(8),
+    });
+    var building = decision;
+    building.head = reserved_update.head;
+    building.owner = reserved_update.owner;
+    var build_lookup = request;
+    build_lookup.operation = .build;
+    const build_request = try building.raftBuild(build_lookup, reserved, .{ .records = 1 });
+    try build_request.requireRaftBinding(reserved);
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, build_request.requireBinding(reserved));
+    var wrong_build = reserved;
+    wrong_build.inputs_digest[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, building.raftBuild(build_lookup, wrong_build, .{}));
+    const build_control: execution.Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .build };
+    var build_response: execution.ControlResponse = .{ .raft_build = .{ .root_generation = 6, .progress = .{ .binding = reserved } } };
+    try build_response.validate(build_control);
+    build_response.raft_build.progress.state = .ready;
+    try std.testing.expectError(error.InvalidRelationalIndexProgress, build_response.validate(build_control));
+    build_response.raft_build.progress.position = .{ .raft = .{ .term = 7, .index = 4 } };
+    build_response.raft_build.progress.progress_digest = @splat(9);
+    try build_response.validate(build_control);
+    build_response.raft_build.progress.position = .{ .native = .{ .namespace = reserved.fence.namespace, .sequence = 4 } };
+    try std.testing.expectError(error.InvalidControlReceiptPosition, build_response.validate(build_control));
     decision.disposition = .acknowledged;
     try std.testing.expectError(error.InvalidGenerationPublication, decision.raftControl(reserve_request, reserved));
     try dispatch.value.requireBinding(decision.head, decision.owner.owner, reserved, .raft, decision.metadata_incarnation);

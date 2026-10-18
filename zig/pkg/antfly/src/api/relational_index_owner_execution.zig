@@ -81,6 +81,7 @@ pub const Request = struct {
 pub const Result = union(enum) {
     acknowledged,
     raft: RaftControlResponse,
+    raft_build: RaftBuildControlResponse,
     recovered: struct {
         /// Copied from the lease that recovered the committed physical cut;
         /// never substitute a later current-root observation when signing.
@@ -110,7 +111,7 @@ pub const Result = union(enum) {
 
     pub fn deinit(self: *Result) void {
         switch (self.*) {
-            .acknowledged, .raft => {},
+            .acknowledged, .raft, .raft_build => {},
             .recovered => |value| value.deinit(),
             .applied => |value| value.deinit(),
             .controlled => |value| value.outcome.deinit(),
@@ -126,7 +127,7 @@ pub const Result = union(enum) {
     /// Borrowed until deinit; copying an outcome does not own error_name.
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
-            .acknowledged, .raft, .building, .source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .raft_build, .building, .source, .installing, .releasing, .canceling => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
             .controlled => |value| value.outcome.value,
@@ -138,6 +139,7 @@ pub const Result = union(enum) {
     pub fn rootGeneration(self: *const Result) ?u64 {
         return switch (self.*) {
             .raft => |value| value.root_generation,
+            .raft_build => |value| value.root_generation,
             .recovered => |value| value.root_generation,
             .controlled => |value| value.root_generation,
             .building => |value| value.root_generation,
@@ -157,7 +159,7 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .controlled => |*value| &value.signing,
             .recovered => |*value| &value.signing,
-            .acknowledged, .raft, .applied, .building, .source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .raft_build, .applied, .building, .source, .installing, .releasing, .canceling => null,
         };
     }
 
@@ -280,6 +282,7 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .acknowledged => .acknowledged,
             .raft => |value| .{ .raft = value },
+            .raft_build => |value| .{ .raft_build = value },
             .applied => |value| .{ .admitted = value.value },
             .controlled => |value| .{ .controlled = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
@@ -451,9 +454,23 @@ pub const RaftControlResponse = struct {
     }
 };
 
+pub const RaftBuildControlResponse = struct {
+    root_generation: u64,
+    progress: local.storage_db_relational_index_raft_contract.BuildProgress,
+
+    pub fn validate(self: @This(), request: Request) !void {
+        try request.validate(request.group_id);
+        if (request.operation != .build or self.root_generation == 0 or self.progress.binding.fence.namespace.table_id != request.table_id) return error.InvalidRelationalIndexProgress;
+        const b = self.progress.binding;
+        const build = try local.storage_db_relational_index_raft_contract.BuildRequest.initRaft(.{ .id = request.id, .plan_digest = b.plan_digest, .owner_digest = b.owner_digest, .ordinal = b.ordinal, .namespace = b.fence.namespace, .owner_group_id = request.group_id }, b, request.build_budget orelse .{});
+        try self.progress.validateFor(build);
+    }
+};
+
 pub const ControlResponse = union(enum) {
     acknowledged,
     raft: RaftControlResponse,
+    raft_build: RaftBuildControlResponse,
     admitted: native.Outcome,
     controlled: RootedOutcome,
     recovered: RootedOutcome,
@@ -505,6 +522,7 @@ pub const ControlResponse = union(enum) {
         const outcome: native.Outcome = switch (self) {
             .acknowledged => return,
             .raft => |value| return value.validate(request),
+            .raft_build => |value| return value.validate(request),
             .source => |value| return value.validate(request),
             .installing => |value| return value.validate(request),
             .releasing => |value| return value.validate(request),

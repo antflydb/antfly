@@ -1237,6 +1237,22 @@ pub extern fn antfly_storage_owner_raft_index_preparation_json(
     out_response: *OwnedBytes,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
+/// Read-only bounded page preparation or retained progress. No apply cut or
+/// permission bit crosses this boundary; consensus proposal is server-owned.
+pub const RaftIndexOwnerBuildRequest = extern struct {
+    pub const operation: u32 = 3;
+    version: u32 = abi_version,
+    prepare: u32 = 1,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_index_build_json(
+    owner: ?*anyopaque,
+    request: *const RaftIndexOwnerBuildRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
 pub const NativeIndexOwnerControlRequest = extern struct {
     version: u32 = abi_version,
     operation: NativeIndexOwnerOperation,

@@ -4142,6 +4142,58 @@ pub fn storageOwnerRaftIndexPreparationJson(
     return .ok;
 }
 
+pub fn storageOwnerRaftIndexBuildJson(owner: ?*anyopaque, request: *const kernel_owner_abi.RaftIndexOwnerBuildRequest, out_response: *kernel_owner_abi.OwnedBytes, out_failure: *kernel_owner_abi.FailureIdentity) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+    const Failure = struct {
+        fn result(err: anyerror, out: *kernel_owner_abi.FailureIdentity) kernel_owner_abi.Status {
+            out.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.RaftIndexOwnerBuildRequest.operation);
+            return out.status;
+        }
+        fn emit(value: contract.BuildPreparation, input: contract.BuildRequest, context: @import("antfly_local_sources").api_operation.RequestContext, output: *kernel_owner_abi.OwnedBytes) !void {
+            try value.validateFor(input);
+            try context.ensureActive();
+            var response = try BoundedOwnerJsonResponse(contract.BuildPreparation.max_response_bytes).initSized(value);
+            defer response.deinit();
+            const used = try response.encode(value);
+            try context.ensureActive();
+            output.* = response.detach(used);
+        }
+    };
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.prepare > 1 or request.request_json.ptr == null or request.request_json.len == 0 or request.request_json.len > contract.BuildPreparation.max_request_bytes or
+        request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    const handle = asHandle(owner) orelse return Failure.result(error.InvalidArgument, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse return Failure.result(error.InvalidArgument, out_failure);
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    var budget = if (handle.db.core.index_manager.resource_manager) |manager| resources.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, handle.alloc, 1) else null;
+    defer if (budget) |*value| value.deinit();
+    const alloc = if (budget) |*value| value.allocator() else handle.alloc;
+    var parsed = std.json.parseFromSlice(contract.BuildRequest, alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| {
+        if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
+        return Failure.result(if (err == error.OutOfMemory) err else error.InvalidArgument, out_failure);
+    };
+    defer parsed.deinit();
+    if (request.prepare != 0) {
+        var prepared = handle.db.prepareRaftIndexOwnerBuild(alloc, handle.storage_owner_group_id, table_name, parsed.value, context) catch |err| {
+            if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
+            return Failure.result(err, out_failure);
+        };
+        defer if (prepared) |*value| value.deinit();
+        if (prepared) |*value| {
+            Failure.emit(.{ .page = value.command }, parsed.value, context, out_response) catch |err| return Failure.result(err, out_failure);
+            return .ok;
+        }
+    }
+    const progress = handle.db.raftIndexOwnerBuildProgress(handle.storage_owner_group_id, table_name, parsed.value, context) catch |err| return Failure.result(err, out_failure);
+    Failure.emit(.{ .progress = progress }, parsed.value, context, out_response) catch |err| return Failure.result(err, out_failure);
+    return .ok;
+}
+
 const RaftSchemaPreparation = struct {
     owner_id: *anyopaque,
     owner: *Handle,
@@ -4672,6 +4724,16 @@ fn BoundedOwnerJsonResponse(comptime max_bytes: usize) type {
 
         fn init() !@This() {
             return .{ .buffer = try std.heap.c_allocator.alloc(u8, max_bytes) };
+        }
+
+        /// Large bounded pages allocate their actual encoded size rather than
+        /// their worst-case wire limit. Counting borrows the prepared page.
+        fn initSized(outcome: anytype) !@This() {
+            var scratch: [256]u8 = undefined;
+            var count = std.Io.Writer.Discarding.init(&scratch);
+            try std.json.Stringify.value(outcome, .{}, &count.writer);
+            if (count.fullCount() > max_bytes) return error.TransactionTooLarge;
+            return .{ .buffer = try std.heap.c_allocator.alloc(u8, @intCast(count.fullCount())) };
         }
 
         fn deinit(self: *@This()) void {

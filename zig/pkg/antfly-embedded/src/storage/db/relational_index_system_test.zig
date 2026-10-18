@@ -1973,7 +1973,20 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     const build = @import("relational_index_owner_control.zig").PreparedBuild;
     const source = @import("relational_index_private_claims.zig").SourceStream;
     const pages = @import("relational_index_jobs.zig");
-    var first = (try build.prepareRaft(alloc, null, db.core, "usage_records", &retry, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})).?;
+    const build_request = try @import("relational_index_owner_control.zig").BuildRequest.initRaft(identity, reserved_binding, .{ .records = 1, .time_ns = std.time.ns_per_s });
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, @import("relational_index_owner_control.zig").BuildRequest.init(identity, reserved_binding, .{}));
+    const idle_progress = try db.raftIndexOwnerBuildProgress(11, "usage_records", build_request, .{});
+    try std.testing.expect(idle_progress.position == null and idle_progress.rows_scanned == 0);
+    var first = preparation: {
+        var cached = (try db.prepareRaftIndexOwnerBuild(alloc, 11, "usage_records", build_request, .{})).?;
+        defer cached.deinit();
+        try std.testing.expectEqual(@as(u64, 1), db.native_index_build_cache.compilations);
+        try std.testing.expect(db.native_index_build_cache.hits >= 1);
+        db.native_index_build_cache.evict(db.backend_runtime.io().?);
+        // The prepared page pins its allocator across eviction. Persisted
+        // commands are copied before this physical owner closes/restarts.
+        break :preparation try build.replayPrepared(alloc, db.core, cached.command);
+    };
     defer first.deinit();
     try std.testing.expectEqual(@as(usize, 1), first.page.records_examined);
     try std.testing.expectEqual(pages.State.building, first.command.next.state);
@@ -2165,7 +2178,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         // Another page can already be queued before an earlier batch is
         // consumed in a newer term. Recovery compares producer order, not
         // the later consumption cut, and must retain that pending page.
-        var queued_terminal = (try build.prepareRaft(alloc, null, db.core, "usage_records", &retry, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})).?;
+        var queued_terminal = (try db.prepareRaftIndexOwnerBuild(alloc, 11, "usage_records", build_request, .{})).?;
         defer queued_terminal.deinit();
         var txn = try db.core.store.beginWriteTxn();
         defer txn.abort();
@@ -2217,12 +2230,21 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, Consumption.prepare(&db, .{ .binding = reserved_binding, .accepted = forged_decision }));
     // A producer must resume after its entire previous backlog was consumed:
     // the previous header now lives only in the retained consumption record.
-    var last = (try build.prepareRaft(alloc, null, db.core, "usage_records", &retry, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})).?;
+    var last = preparation: {
+        var cached = (try db.prepareRaftIndexOwnerBuild(alloc, 11, "usage_records", build_request, .{})).?;
+        defer cached.deinit();
+        break :preparation try build.replayPrepared(alloc, db.core, cached.command);
+    };
     defer last.deinit();
     try std.testing.expectEqual(@as(usize, 0), last.page.records_examined);
     try std.testing.expectEqual(pages.State.ready, last.command.next.state);
     try std.testing.expectError(error.InvalidControlReceiptPosition, db.applyCommittedRaftIndexBuild(&last, 11, .{ .term = 4, .index = 60 }));
     try db.applyCommittedRaftIndexBuild(&last, 11, .{ .term = 5, .index = 60 });
+    const terminal_progress = try db.raftIndexOwnerBuildProgress(11, "usage_records", build_request, .{});
+    try std.testing.expectEqual(pages.State.ready, terminal_progress.state);
+    try std.testing.expectEqual(@as(u64, 60), terminal_progress.position.?.raft.index);
+    try std.testing.expectEqual(@as(u64, 1), db.native_index_build_cache.compilations);
+    try std.testing.expect(db.native_index_build_cache.hits >= 1);
     db.close();
     db_live = false;
     db = try db_mod.DB.open(alloc, directory.path(), options);
