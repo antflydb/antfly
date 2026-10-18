@@ -5892,6 +5892,7 @@ class CliTests(unittest.TestCase):
                     "workspace_ready",
                     "workspace_invalidated",
                     "workspace_closed",
+                    "workspace_trimmed",
                 ):
                     return rows
 
@@ -6176,6 +6177,196 @@ class CliTests(unittest.TestCase):
             self.assertGreater(run(["--only=STOP"])["requests"], 0)
             self.assertGreater(run(["--no-cache"])["requests"], 0)
             self.assertEqual(run(["--cached-only"])["requests"], 0)
+
+    def test_workspace_typed_query_and_file_reuse_refresh_and_rerank(self):
+        first = self.write("src/a.txt", "STOP HIGH\n")
+        second = self.write("src/b.txt", "STOP LOW\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--threads=2",
+            "--max-result-files=1",
+            "--max-requests=unlimited",
+        ]
+
+        def summary(rows):
+            self.assertEqual(rows[-1]["exit_code"], 0, rows)
+            return next(row for row in rows if row["type"] == "summary")
+
+        def paths(rows):
+            return [
+                row["data"]["path"]["text"] for row in rows if row["type"] == "match"
+            ]
+
+        with self.workspace("src") as (ready, request):
+
+            def run(revision, extra=()):
+                return request("search", revision=revision, args=[*args, *extra])
+
+            initial = run(ready["revision"])
+            self.assertGreater(summary(initial)["requests"], 0)
+            warm = run(ready["revision"])
+            self.assertEqual(summary(warm)["stats"]["query_cache_hits"], 1)
+            self.assertEqual(summary(warm)["requests"], 0)
+            self.assertEqual(paths(initial), paths(warm))
+            # Previously rejected/losing files must be reconsidered after the
+            # old winner changes. No rendered top-k-only per-file cache suffices.
+            first.write_text("no relevant source\n")
+            second.write_text("STOP HIGH\n")
+            refreshed = request("refresh")[0]
+            changed = run(refreshed["revision"])
+            self.assertEqual(summary(changed)["stats"]["query_cache_hits"], 0)
+            self.assertIn("src/b.txt", paths(changed))
+            # Next refresh changes one file; the unchanged outcome is reused,
+            # but provenance describes the newly published snapshot.
+            first.write_text("new irrelevant source\n")
+            refreshed = request("refresh")[0]
+            changed = run(refreshed["revision"])
+            self.assertEqual(summary(changed)["stats"]["file_evaluation_cache_hits"], 1)
+            self.assertTrue(
+                all(
+                    row["source"]["snapshot"] == refreshed["revision"]
+                    for row in changed
+                    if row["type"] == "match"
+                )
+            )
+            # Auth, policy, output, budget, and explicit bypass changes cannot
+            # retrieve an incompatible complete-result entry.
+            for flags in (
+                ["--only=STOP"],
+                ["--before-context=1"],
+                ["--max-regions=1"],
+                ["--no-cache"],
+            ):
+                rows = run(refreshed["revision"], flags)
+                self.assertFalse(
+                    any(row["type"] == "workspace_error" for row in rows), (flags, rows)
+                )
+                stats = next(row["stats"] for row in rows if row["type"] == "summary")
+                self.assertEqual(stats["query_cache_hits"], 0)
+
+    def test_workspace_trim_releases_optional_state_preserves_snapshot_and_invalidation(
+        self,
+    ):
+        path = self.write("src/a.txt", "STOP HIGH\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--max-result-files=1",
+            "--threads=2",
+        ]
+        with self.workspace("src") as (ready, request):
+
+            def run():
+                rows = request("search", revision=ready["revision"], args=args)
+                self.assertEqual(rows[-1]["exit_code"], 0, rows)
+                return next(row for row in rows if row["type"] == "summary")
+
+            run()
+            self.assertEqual(run()["stats"]["query_cache_hits"], 1)
+            path.unlink()
+            trimmed = request("trim")[0]
+            self.assertEqual(trimmed["type"], "workspace_trimmed")
+            self.assertEqual(trimmed["retained_cache_bytes"], 0)
+            self.assertGreater(trimmed["released_cache_bytes"], 0)
+            self.assertEqual(trimmed["revision"], ready["revision"])
+            after = run()
+            self.assertEqual(after["stats"]["query_cache_hits"], 0)
+            self.assertEqual(after["requests"], 0)
+            self.assertEqual(run()["stats"]["query_cache_hits"], 1)
+            request("invalidate")
+            request("trim")
+            self.assertEqual(
+                request("search", revision=ready["revision"], args=args)[0]["message"],
+                "WorkspaceInvalidated",
+            )
+
+    def test_workspace_partial_results_are_never_complete_cache_hits(self):
+        self.write("src/a.txt", "STOP\n" * 8)
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--unit=line",
+            "--max-regions=1",
+            "--max-result-files=1",
+            "--threads=1",
+        ]
+        with self.workspace("src") as (ready, request):
+            for _ in range(2):
+                rows = request("search", revision=ready["revision"], args=args)
+                self.assertEqual(rows[-1]["exit_code"], 2)
+                summary = next(row for row in rows if row["type"] == "summary")
+                self.assertFalse(summary["stats"]["complete"])
+                self.assertEqual(summary["stats"]["query_cache_hits"], 0)
+
+    def test_workspace_complete_result_expires_with_older_rejected_evidence(self):
+        self.write("src/a.txt", "STOP HIGH\n")
+        self.write("src/b.txt", "irrelevant\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--unit=line",
+            "--threads=1",
+            "--cache-dir=scores",
+            "--cache-ttl=10",
+            "--max-result-files=1",
+        ]
+        self.raw_cli(*args, "src")
+        now = int(time.time())
+        rejected = 0
+        for path in (self.root / "scores").glob("batch-v10-*"):
+            data = read_batch(path)
+            for i, score in enumerate(data["scores"]):
+                if score is not None and score < 0.5:
+                    data["written"][i] = now - 8
+                    rejected += 1
+            write_batch(path, data)
+        self.assertGreater(rejected, 0)
+        with self.workspace("src") as (ready, request):
+
+            def run():
+                rows = request("search", revision=ready["revision"], args=args)
+                self.assertEqual(rows[-1]["exit_code"], 0, rows)
+                return next(row for row in rows if row["type"] == "summary")
+
+            first = run()
+            self.assertEqual(first["requests"], 0)
+            self.assertEqual(run()["stats"]["query_cache_hits"], 1)
+            time.sleep(2.1)
+            # The selected file is fresh. The rejected file's earlier expiry
+            # must invalidate the complete result and force reconsideration.
+            self.assertEqual(run()["stats"]["query_cache_hits"], 0)
+
+    def test_workspace_cached_outcomes_expire_and_no_cache_bypasses(self):
+        self.write("src/a.txt", "STOP HIGH\n")
+        self.write("src/b.txt", "irrelevant\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--max-result-files=1",
+            "--cache-ttl=1",
+            "--threads=1",
+        ]
+        with self.workspace("src") as (ready, request):
+
+            def run(extra=()):
+                rows = request(
+                    "search", revision=ready["revision"], args=[*args, *extra]
+                )
+                return rows, next(row for row in rows if row["type"] == "summary")
+
+            run()
+            self.assertEqual(run()[1]["stats"]["query_cache_hits"], 1)
+            time.sleep(1.1)
+            rows, summary = run(["--cached-only"])
+            self.assertEqual(rows[-1]["exit_code"], 2)
+            self.assertEqual(summary["requests"], 0)
+            self.assertEqual(summary["stats"]["query_cache_hits"], 0)
+            self.assertGreater(run()[1]["requests"], 0)
+            self.assertGreater(run(["--no-cache"])[1]["requests"], 0)
+            self.assertEqual(
+                run(["--no-cache"])[1]["stats"]["file_evaluation_cache_hits"], 0
+            )
 
     def test_workspace_explicit_binary_file_uses_native_input_semantics(self):
         self.write("binary.txt", b"STOP\0tail\n")

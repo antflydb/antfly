@@ -1775,7 +1775,8 @@ counts. Send one JSON object per line, with a numeric request ID:
 {"version":1,"id":1,"op":"search","revision":"COPY_READY_REVISION","args":["retry","--fixed-strings"]}
 {"version":1,"id":2,"op":"invalidate"}
 {"version":1,"id":3,"op":"refresh"}
-{"version":1,"id":4,"op":"close"}
+{"version":1,"id":4,"op":"trim"}
+{"version":1,"id":5,"op":"close"}
 ```
 
 Search emits `workspace_begin`, ordinary grep JSON events, and `workspace_end`
@@ -1906,7 +1907,7 @@ capture quota; failed capture releases acquired references. Identifiers retain o
 are owned independently and source kinds are interned within each blob. Refresh still rereads and hashes source bytes
 to establish content identity, and still follows the explicit snapshot contract.
 
-A disposable region-plan cache retains at most 32 MiB of allocator-accounted plans,
+A disposable region-plan cache retains at most 16 MiB of allocator-accounted plans,
 including construction and evicted plans still borrowed by active queries. Each
 plan is limited to 4 MiB; allocation failure falls back to ordinary evaluation.
 Plans retain region metadata and compatible decision keys, not copies of formatted
@@ -1972,3 +1973,109 @@ boundaries, generated compatibility and formatting. Linux runtime checks use
 an isolated two-CPU Docker VM; independent hardware performance, Windows runtime
 and live-provider quality remain outside this qualification. The source/binary
 identities and scope limits are in [validation](bench/results/session-validation.json).
+
+
+### Complete-query and per-file decision reuse
+
+Workspace sessions retain two additional bounded, typed caches. A 4 MiB cache
+reuses complete finite-top-k ranked decision results for identical query options
+and snapshot content. It retains selected evidence, ranking/omission counts and
+logical scan statistics. Hits skip file traversal and evaluation, then render
+through the normal budgeted output path with fresh timing, observation metadata,
+compact file IDs, request envelopes and transport counters. Cached logical
+`regions_evaluated` counts describe the result's evidence; `query_cache_hits: 1`
+and zero transport counters identify the work avoided by this invocation.
+Unranked/unlimited-output searches keep their existing streaming/spill paths.
+
+An independent 8 MiB cache retains completed per-file decision outcomes, including
+rejected previews/regions and files excluded by top-k. After refresh, unchanged
+content reuses those judgments while changed files are evaluated normally and
+all qualifying results are ranked again. It retains no source bytes, source
+indexes, generation leases or provider instances. Repeated selected/probability/
+line-score states use lossless runs preserving floating-point and NaN bits;
+highly variable outcomes use the smaller dense representation. Optional run construction uses a reclaiming allocator bounded to 2 MiB; failed admission leaves the completed search outcome intact. The
+`file_evaluation_cache_hits` counter reports this reuse. Finite global region
+budgets deliberately use ordinary per-file evaluation so partial-prefix behavior
+is preserved when another file grows after refresh.
+
+Cache identity hashes all effective options, including provider credentials,
+model/revision, policies, thresholds, rendering and budget options; document
+content and paths scope file entries, and the snapshot scopes complete queries.
+Both caches expire at the earliest contributing judgment timestamp, including
+negative evidence and omitted files, and reject excessive future clock skew.
+Reading does not extend expiry. Interrupted/failed/incomplete evaluations never
+become complete hits. `--no-cache`, zero TTL, cache-only provider restrictions,
+changed identities, eviction and allocation failures keep their ordinary
+fallback behavior. Individual entries use at most one quarter of their cache's
+budget, including construction headroom. Cache lookup/render scratch and
+allocator metadata are additional to retained-entry accounting.
+
+Region-key preparation now runs only after a batch reserves its region budget,
+and observes cancellation between regions. A new query with `--max-regions=0`
+therefore never formats or hashes unadmitted listings. Cancellation propagates
+instead of silently switching to uncached formatting.
+
+Send `{"version":1,"id":4,"op":"trim"}` to release optional caches, native/HTTP
+provider resources and idle file/provider threads. The `workspace_trimmed`
+response reports released cache-entry bytes, zero remaining cache-entry bytes, and retained source memory. Explicit trim also requests best-effort allocator pressure relief on macOS and glibc Linux; other targets safely omit that hint.
+The snapshot and invalidation state remain intact; later queries can reuse disk
+scores and rebuild disposable state. Released allocation and OS RSS differ:
+allocator arenas and the OS can retain freed pages, and captured sources remain
+resident until close. Combined retained cache caps are now 16 + 8 + 4 + 4 MiB
+(plans, file outcomes, complete queries, batch payloads), versus the previous
+32 + 4 MiB. Lexical-only sessions no longer initialize provider resources.
+
+Refresh continues to rediscover, reread and hash sources conservatively; this
+change does not add a filesystem watcher or claim live filesystem freshness.
+A watcher remains a separate optimization requiring fail-closed overflow and
+watch-loss handling before it can safely bypass reads. Cache hits eliminate
+repeated evaluation/provider billing while valid; parsing requests, lookup,
+rendering, output, retained snapshots and refresh still consume resources.
+
+
+The final native macOS campaign compares `c213e061` with this implementation,
+using the same saved inference fixture and 101 alternating resident queries per
+binary. Both paths verify identical selected evidence and logical scan counts;
+all timed queries make zero provider requests and perform zero source parses.
+
+| Workload | Baseline → candidate median | CPU/query, baseline → candidate |
+|---|---:|---:|
+| SDK, 75 files / 5.9 MB, **no selected results** | 17.95 → 0.14 ms | 18.12 → 0.10 ms |
+| Synthetic, 1,024 files, selected top-15 output | 4.96 → 2.89 ms | 3.47 → 0.59 ms |
+| 4,096 lines / 500 context lines, new query, zero-region budget | 89.38 → 0.21 ms | not sampled |
+
+The synthetic median paired speedup is 1.71× with approximately 83% less CPU.
+The empty-result SDK fast path is approximately 131× faster by paired median;
+its tiny elapsed times have 24% relative MAD, so this is a measured empty-result
+optimization, not an output-heavy or general search guarantee. The budget case
+is approximately 428× faster with zero evaluated regions and zero provider calls.
+Reports retain per-trial data, counters, host load, fixture/binary hashes and
+scope limits. CPU uses cumulative Darwin process time at 0.01-second resolution
+across each 101-query campaign. Capture and refresh are excluded from warm timings.
+
+The final SDK sample reports **92.1M physical footprint**, versus **97.8M** in the
+previous resource-reuse sample. Explicit trim releases **4.69 MB** of cache-entry
+allocation but the same process sample remains **92.1M** (92.2M recorded peak),
+so allocator relief is best effort and no proportional RSS reduction is claimed.
+The earlier `6fa6dbfb` sample was 79.9M; the current feature set still retains
+more memory than that older baseline. Source/index retention is approximately
+14.47 MB in this SDK capture. These samples do not establish cross-host or cold-
+capture memory guarantees.
+
+Evidence: [paired SDK](bench/results/reuse-sdk-paired-macos.json),
+[paired selected output](bench/results/reuse-synthetic-paired-macos.json),
+[budget admission](bench/results/reuse-budget-macos.json),
+[profile campaign](bench/results/reuse-sdk-profile-macos.json),
+[active sample](bench/results/reuse-sdk-profile.sample.txt),
+[trimmed sample](bench/results/reuse-sdk-trimmed.sample.txt), and
+[generated comparisons](bench/results/reuse-differential.json).
+
+
+Final qualification passes 204 CLI tests on macOS (two skips) and ARM64 Linux
+(one skip), native unit/hardening/tooling checks, 1,000 generated comparisons
+without mismatches/timeouts, Windows x86-64 cross-compilation, license boundaries,
+formatting and three actual release archive/hash checks. Linux runs in a two-CPU
+isolated Docker VM; Windows runtime, independent Linux hardware performance and
+live-model relevance/billing remain unqualified. See
+[validation/source hashes](bench/results/reuse-validation.json) and
+[release archive contents/hashes](bench/results/reuse-archives.json).

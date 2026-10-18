@@ -81,6 +81,7 @@ pub const Client = struct {
     stage: enum { target, directory, file, region, line } = .target,
     limits: ?*@import("budget.zig").Limits = null,
     cache_hits: usize = 0,
+    evidence_times: @import("reuse_cache.zig").Times = .{},
     allow_parallel: bool = true,
     cache_checked: bool = false,
     batch_store: ?*@import("batch_store.zig").Store = null,
@@ -164,6 +165,9 @@ pub const Client = struct {
         const keys = try a.alloc([64]u8, if (caching) inputs.len else 0);
         const written = try a.alloc(?i64, inputs.len);
         @memset(written, null);
+        defer for (written) |time| {
+            if (time) |t| self.evidence_times.add(t);
+        };
         const repairs = try a.alloc(bool, if (caching) std.math.divCeil(usize, inputs.len, self.options.batch_size) catch unreachable else 0);
         @memset(repairs, false);
         if (caching) try self.cachedWave(a, inputs, scores, keys, written, repairs);
@@ -403,6 +407,9 @@ pub const Client = struct {
         const batch_key = batchKey(keys);
         const written = try a.alloc(?i64, inputs.len);
         @memset(written, null);
+        defer for (written) |time| {
+            if (time) |t| self.evidence_times.add(t);
+        };
         defer if (created) |out| @memcpy(out, written);
         const batch_hit = if (self.cache_checked) false else try self.cachedBatch(a, &batch_key, probabilities, written);
         const has_missing = for (probabilities) |score| {

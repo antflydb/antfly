@@ -206,9 +206,16 @@ def main():
                     if evidence != expected:
                         raise RuntimeError("paired evidence differs")
                     pair[name] = result
-                if (
-                    pair["baseline"]["summary"]["stats"]
-                    != pair["candidate"]["summary"]["stats"]
+
+                def logical_stats(summary):
+                    return {
+                        key: value
+                        for key, value in summary["stats"].items()
+                        if key not in ("query_cache_hits", "file_evaluation_cache_hits")
+                    }
+
+                if logical_stats(pair["baseline"]["summary"]) != logical_stats(
+                    pair["candidate"]["summary"]
                 ):
                     raise RuntimeError("paired scan statistics differ")
                 runs.append(pair)
@@ -275,6 +282,12 @@ def main():
                                     "source_parses"
                                 ],
                                 "cache_hits": pair[name]["summary"]["cache_hits"],
+                                "query_cache_hits": pair[name]["summary"]["stats"].get(
+                                    "query_cache_hits", 0
+                                ),
+                                "file_evaluation_cache_hits": pair[name]["summary"][
+                                    "stats"
+                                ].get("file_evaluation_cache_hits", 0),
                             }
                             for name in binaries
                         },

@@ -27,6 +27,8 @@ pub const decision = @import("decision.zig");
 const Allocator = std.mem.Allocator;
 pub const Summary = struct {
     index_requests: usize = 0,
+    query_cache_hits: usize = 0,
+    file_evaluation_cache_hits: usize = 0,
     source_cache_hits: usize = 0,
     source_parses: usize = 0,
     files: usize = 0,
@@ -87,45 +89,94 @@ const Candidate = struct {
         a.destroy(self);
     }
 };
+const SavedCandidate = struct {
+    path: []const u8,
+    score: f64,
+    ordinal: usize,
+    provenance: @import("document.zig").Provenance,
+    rows: []RenderRow,
+    view: ?EvidenceView,
+    before: Summary,
+    summary: Summary,
+    filename: bool,
+    color: bool,
+};
+const SavedQuery = struct { summary: Summary, considered: usize, items: []SavedCandidate };
+const EvaluationRun = struct { end: usize, probability: f64, line_score: f64, selected: bool };
+const DenseEvaluation = struct { selected: []bool, probabilities: []f64, line_scores: []f64 };
+const SavedEvaluation = struct {
+    line_count: usize,
+    runs: []EvaluationRun,
+    dense: ?DenseEvaluation,
+    regions: []@import("evidence.zig").Region,
+    file_score: ?f64,
+    best: f64,
+    considered: usize,
+    evaluated: usize,
+    preview_rejected: bool,
+};
+fn evaluationRuns(a: Allocator, selected: []const bool, probabilities: []const f64, line_scores: []const f64) ![]EvaluationRun {
+    var runs: std.ArrayList(EvaluationRun) = .empty;
+    defer runs.deinit(a);
+    for (selected, probabilities, line_scores, 0..) |yes, p, score, i| {
+        if (runs.items.len > 0) {
+            const last = &runs.items[runs.items.len - 1];
+            // Preserve exact floating-point/NaN bits. No score quantization.
+            if (yes == last.selected and @as(u64, @bitCast(p)) == @as(u64, @bitCast(last.probability)) and @as(u64, @bitCast(score)) == @as(u64, @bitCast(last.line_score))) {
+                last.end = i + 1;
+                continue;
+            }
+        }
+        try runs.append(a, .{ .end = i + 1, .probability = p, .line_score = score, .selected = yes });
+        // A dense representation is smaller for highly variable decisions.
+        // Stop constructing runs as soon as that crossover is certain.
+        if (runs.items.len * @sizeOf(EvaluationRun) > selected.len * (1 + 2 * @sizeOf(f64))) return &.{};
+    }
+    return try runs.toOwnedSlice(a);
+}
+const WorkspaceReuse = struct {
+    queries: @import("reuse_cache.zig").Cache(SavedQuery, 32, 4 * 1024 * 1024),
+    files: @import("reuse_cache.zig").Cache(SavedEvaluation, 4096, 8 * 1024 * 1024),
+    pub fn init(a: Allocator, io: std.Io) WorkspaceReuse {
+        return .{ .queries = .{ .a = a, .io = io }, .files = .{ .a = a, .io = io } };
+    }
+    pub fn deinit(self: *WorkspaceReuse) void {
+        self.queries.deinit();
+        self.files.deinit();
+    }
+    // Hash effective field values, never ArrayList capacities or pointer bytes.
+    // This deliberately includes every option, including auth and policy, so a
+    // new option cannot accidentally reuse outcomes from an incompatible query.
+    pub fn identity(a: Allocator, o: *const Options) ![32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        inline for (@typeInfo(Options).@"struct".field_names) |name| {
+            const value = @field(o.*, name);
+            const T = @TypeOf(value);
+            const json = if (@typeInfo(T) == .@"struct" and @hasField(T, "items"))
+                try std.json.Stringify.valueAlloc(a, value.items, .{})
+            else
+                try std.json.Stringify.valueAlloc(a, value, .{});
+            defer a.free(json);
+            hash.update(name);
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, json.len, .little);
+            hash.update(&size);
+            hash.update(json);
+        }
+        var key: [32]u8 = undefined;
+        hash.final(&key);
+        return key;
+    }
+};
 const Ranking = @import("ranked.zig").Heap(Candidate);
 // Clone only retained output evidence; parsed source and page buffers can be released.
-fn retainedClone(comptime T: type, a: Allocator, value: T, depth: usize) error{ OutOfMemory, ResultNestingTooDeep }!T {
-    if (depth > 512) return error.ResultNestingTooDeep;
-    if (T == std.json.Value) return switch (value) {
-        .string => |v| .{ .string = try a.dupe(u8, v) },
-        .number_string => |v| .{ .number_string = try a.dupe(u8, v) },
-        .array => |v| blk: {
-            var out = std.json.Array.init(a);
-            for (v.items) |item| try out.append(try retainedClone(T, a, item, depth + 1));
-            break :blk .{ .array = out };
-        },
-        .object => |v| blk: {
-            var out: std.json.ObjectMap = .empty;
-            var it = v.iterator();
-            while (it.next()) |entry| try out.put(a, try a.dupe(u8, entry.key_ptr.*), try retainedClone(T, a, entry.value_ptr.*, depth + 1));
-            break :blk .{ .object = out };
-        },
-        else => value,
-    };
-    return switch (@typeInfo(T)) {
-        .optional => |o| if (value) |v| try retainedClone(o.child, a, v, depth + 1) else null,
-        .@"struct" => blk: {
-            var out: T = undefined;
-            inline for (@typeInfo(T).@"struct".field_names) |name| @field(out, name) = try retainedClone(@FieldType(T, name), a, @field(value, name), depth + 1);
-            break :blk out;
-        },
-        .pointer => |ptr| blk: {
-            if (ptr.size != .slice) @compileError("retained pointer must be a slice");
-            const out = try a.alloc(ptr.child, value.len);
-            for (value, out) |v, *dest| dest.* = try retainedClone(ptr.child, a, v, depth + 1);
-            break :blk out;
-        },
-        else => value,
-    };
-}
+const retainedClone = @import("reuse_cache.zig").retainedClone;
 const Region = @import("regions.zig").Region;
 const ExternalDictionary = @import("external_dictionary.zig").Shared;
 pub const Search = struct {
+    pub const Reuse = WorkspaceReuse;
+    reuse: ?*Reuse = null,
+    reuse_identity: ?[32]u8 = null,
     region_plans: ?*@import("region_plan.zig").Cache = null,
     executor: ?*@import("worker_pool.zig").Pool = null,
     workspace_generation: ?*const @import("workspace_store.zig").Generation = null,
@@ -217,6 +268,8 @@ pub const Search = struct {
         result.local_cwd = root.local_cwd;
         result.workspace_generation = root.workspace_generation;
         result.region_plans = root.region_plans;
+        result.reuse = root.reuse;
+        result.reuse_identity = root.reuse_identity;
         result.decider.shareCache(&root.decider);
         result.decider.coalescer = root.decider.coalescer;
         result.ranking = root.ranking;
@@ -310,6 +363,17 @@ pub const Search = struct {
             self.ranking = ranking;
             self.owns_ranking = true;
         }
+        const query_key = self.queryReuseKey();
+        if (query_key) |key| {
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            if (self.reuse.?.queries.get(arena.allocator(), key, self.options.cache_ttl_seconds) catch null) |hit| {
+                try self.restoreQuery(hit.value);
+                self.decider.evidence_times.merge(hit.times);
+                try self.emitRanked();
+                return self.finish(started);
+            }
+        }
         const single_regular_file = if (self.workspace_generation) |generation| generation.entries.items.len == 1 else self.options.paths.items.len == 1 and !self.hasStdinPath() and
             (if (std.Io.Dir.cwd().statFile(self.io, self.options.paths.items[0], .{})) |info| info.kind == .file else |_| false);
         self.single_source = single_regular_file and self.options.table_config == null;
@@ -397,6 +461,7 @@ pub const Search = struct {
             try self.reportError("<search>", error.Canceled);
         }
         if (self.discovery_decider) |client| {
+            self.decider.evidence_times.merge(client.evidence_times);
             self.decider.requests += client.requests;
             self.decider.cache_hits += client.cache_hits;
             self.decider.input_tokens += client.input_tokens;
@@ -405,6 +470,11 @@ pub const Search = struct {
             self.decider.request_inputs += client.request_inputs;
             self.decider.peak_request_bytes = @max(self.decider.peak_request_bytes, client.peak_request_bytes);
         }
+        const code = try self.finish(started);
+        if (query_key) |key| if (code <= 1 and self.summary.complete and !self.limits.cancel.load(.monotonic)) self.saveQuery(key);
+        return code;
+    }
+    fn finish(self: *Search, started: std.Io.Timestamp) !u8 {
         const elapsed = started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
         const seconds = @as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0;
         const human = try std.fmt.allocPrint(self.a, "{d:.6}s", .{seconds});
@@ -905,7 +975,7 @@ pub const Search = struct {
             ctx.mutex.lockUncancelable(root.io);
             defer ctx.mutex.unlock(root.io);
             root.summary.occurrences_exact = root.summary.occurrences_exact and local.summary.occurrences_exact;
-            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits", "source_parses" }) |field| @field(root.summary, field) += @field(local.summary, field);
+            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits", "source_parses", "file_evaluation_cache_hits" }) |field| @field(root.summary, field) += @field(local.summary, field);
             root.summary.complete = root.summary.complete and local.summary.complete;
             root.decider.requests += local.decider.requests;
             root.decider.input_tokens += local.decider.input_tokens;
@@ -914,6 +984,7 @@ pub const Search = struct {
             root.decider.request_inputs += local.decider.request_inputs;
             root.decider.peak_request_bytes = @max(root.decider.peak_request_bytes, local.decider.peak_request_bytes);
             root.decider.cache_hits += local.decider.cache_hits;
+            root.decider.evidence_times.merge(local.decider.evidence_times);
         }
         fn fail(ctx: *Parallel, err: anyerror) void {
             ctx.mutex.lockUncancelable(ctx.search.io);
@@ -1162,7 +1233,7 @@ pub const Search = struct {
         local.retaining_output = ranked;
         local.sink = if (ranked) &output.writer else &forward.writer;
         defer {
-            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits", "source_parses" }) |field| @field(self.summary, field) += @field(local.summary, field);
+            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits", "source_parses", "file_evaluation_cache_hits" }) |field| @field(self.summary, field) += @field(local.summary, field);
             self.summary.complete = self.summary.complete and local.summary.complete;
             self.summary.occurrences_exact = self.summary.occurrences_exact and local.summary.occurrences_exact;
             self.decider.requests += local.decider.requests;
@@ -1920,16 +1991,6 @@ pub const Search = struct {
             @memset(scores, std.math.nan(f64));
             evidence.* = .{ .index = prepared.?.index, .line_scores = scores };
             self.evidence = evidence;
-            if (self.options.jev_mode) {
-                const listing = try self.filePreview(a, path_name, bytes, lines, evidence.index);
-                const old = self.decider.stage;
-                self.decider.stage = .file;
-                defer self.decider.stage = old;
-                var score: [1]f64 = undefined;
-                try self.decider.search(&.{.{ .id = "file-preview", .input = listing }}, &score);
-                evidence.file_score = score[0];
-                if (score[0] < self.options.file_threshold and !self.options.broad) return;
-            }
         }
         var multiline_hits: std.ArrayList(@import("matcher.zig").Match) = .empty;
         var multiline_groups: usize = 0;
@@ -1970,12 +2031,14 @@ pub const Search = struct {
                 yes.* = !yes.*;
             };
         } else if (self.options.ask != null) {
-            self.evaluate(a, path_name, bytes, lines, selected, probabilities) catch |err| {
+            const admitted = self.evaluateFile(a, path_name, bytes, lines, selected, probabilities) catch |err| blk: {
                 try self.reportError(path_name, err);
                 // Keep successful earlier batches, but do not keep sending
                 // the rest of the tree to a failed or incompatible provider.
                 self.stop = true;
+                break :blk true;
             };
+            if (!admitted) return;
         } else {
             for (lines, 0..) |line, i| {
                 selected[i] = (try self.matcher.matches(bytes[line.start..line.end])) != self.options.invert;
@@ -2390,6 +2453,129 @@ pub const Search = struct {
         if (view.rows.len == 0 and view.regions.len == 0) try output.writer.writeAll("  [file qualified from its preview; no excerpt cleared the threshold]\n");
         try self.write(output.written());
     }
+    fn evaluationReuseKey(self: *Search, path: []const u8) ?[32]u8 {
+        if (self.reuse == null or self.reuse_identity == null or self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return null;
+        // A complete outcome cannot stand in for the prefix an interrupted
+        // finite-budget evaluation would have produced after another file grew.
+        if (self.options.max_regions != std.math.maxInt(usize)) return null;
+        const entry = self.workspace_entry orelse return null;
+        if (entry.prepared == null or self.options.crlf or self.options.null_data) return null;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&self.reuse_identity.?);
+        hash.update(&entry.revision);
+        hash.update(path);
+        var key: [32]u8 = undefined;
+        hash.final(&key);
+        return key;
+    }
+    fn evaluateFile(self: *Search, a: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !bool {
+        const evidence = self.evidence.?;
+        const key = self.evaluationReuseKey(path);
+        if (key) |k| if (self.reuse.?.files.get(a, k, self.options.cache_ttl_seconds) catch null) |hit| {
+            const v = hit.value;
+            if (v.line_count == selected.len) {
+                if (self.shared_limits) |limits| if (!Limits.reserve(&limits.regions, v.evaluated, self.options.max_regions)) return error.RegionBudgetExceeded;
+                if (v.dense) |dense| {
+                    @memcpy(selected, dense.selected);
+                    @memcpy(probabilities, dense.probabilities);
+                    @memcpy(evidence.line_scores, dense.line_scores);
+                } else {
+                    var start: usize = 0;
+                    for (v.runs) |span| {
+                        @memset(selected[start..span.end], span.selected);
+                        @memset(probabilities[start..span.end], span.probability);
+                        @memset(evidence.line_scores[start..span.end], span.line_score);
+                        start = span.end;
+                    }
+                }
+                evidence.regions = .empty;
+                try evidence.regions.appendSlice(a, v.regions);
+                evidence.file_score = v.file_score;
+                self.best_probability = v.best;
+                self.summary.regions_considered += v.considered;
+                self.summary.regions_evaluated += v.evaluated;
+                self.summary.file_evaluation_cache_hits += 1;
+                self.decider.evidence_times.merge(hit.times);
+                return !v.preview_rejected;
+            }
+        };
+        const previous_times = self.decider.evidence_times;
+        self.decider.evidence_times = .{};
+        defer self.decider.evidence_times.merge(previous_times);
+        const before = self.summary;
+        var preview_rejected = false;
+        if (self.options.jev_mode) {
+            const listing = try self.filePreview(a, path, bytes, lines, evidence.index);
+            self.decider.stage = .file;
+            var score: [1]f64 = undefined;
+            try self.decider.search(&.{.{ .id = "file-preview", .input = listing }}, &score);
+            evidence.file_score = score[0];
+            preview_rejected = score[0] < self.options.file_threshold and !self.options.broad;
+        }
+        if (!preview_rejected) try self.evaluate(a, path, bytes, lines, selected, probabilities);
+        if (key) |k| if (self.summary.errors == before.errors and self.summary.complete and evidence.complete and !self.stop and !(if (self.shared_limits) |limits| limits.cancel.load(.monotonic) else false)) {
+            // Cache admission must not add file-sized scratch retention to
+            // evaluation. Use a bounded, reclaiming allocator for run building.
+            var scratch: @import("antfly_regex").Budget = .{ .backing = self.a, .limit = 2 * 1024 * 1024 };
+            const runs = evaluationRuns(scratch.allocator(), selected, probabilities, evidence.line_scores) catch return !preview_rejected;
+            defer scratch.allocator().free(runs);
+            self.reuse.?.files.put(k, self.decider.evidence_times, .{
+                .line_count = selected.len,
+                .runs = runs,
+                .dense = if (selected.len != 0 and runs.len == 0) .{ .selected = selected, .probabilities = probabilities, .line_scores = evidence.line_scores } else null,
+                .regions = evidence.regions.items,
+                .file_score = evidence.file_score,
+                .best = self.best_probability,
+                .considered = self.summary.regions_considered - before.regions_considered,
+                .evaluated = self.summary.regions_evaluated - before.regions_evaluated,
+                .preview_rejected = preview_rejected,
+            });
+        };
+        return !preview_rejected;
+    }
+    fn queryReuseKey(self: *Search) ?[32]u8 {
+        if (self.reuse == null or self.reuse_identity == null or self.ranking == null or self.options.no_cache or self.options.cache_dir == null or self.options.cache_ttl_seconds == 0) return null;
+        const generation = self.workspace_generation orelse return null;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&self.reuse_identity.?);
+        hash.update(&generation.revision);
+        var key: [32]u8 = undefined;
+        hash.final(&key);
+        return key;
+    }
+    fn saveQuery(self: *Search, key: [32]u8) void {
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const ranking = self.ranking.?;
+        const items = arena.allocator().alloc(SavedCandidate, ranking.items.items.len) catch return;
+        for (items, ranking.items.items) |*saved, candidate| {
+            inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| @field(saved, name) = @field(candidate, name);
+        }
+        self.reuse.?.queries.put(key, self.decider.evidence_times, .{ .summary = self.summary, .considered = ranking.considered, .items = items });
+    }
+    fn restoreQuery(self: *Search, value: SavedQuery) !void {
+        self.summary = value.summary;
+        self.summary.query_cache_hits = 1;
+        self.summary.file_evaluation_cache_hits = 0;
+        const ranking = self.ranking.?;
+        for (value.items) |saved| {
+            if (self.limits.cancel.load(.monotonic)) return error.Canceled;
+            const candidate = try self.a.create(Candidate);
+            candidate.* = .{ .a = self.a, .budget = .{ .backing = self.a, .limit = self.options.max_pending_output }, .arena = undefined };
+            candidate.arena = .init(candidate.budget.allocator());
+            var transferred = false;
+            defer if (!transferred) candidate.deinit();
+            inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| @field(candidate, name) = try retainedClone(@FieldType(SavedCandidate, name), candidate.arena.allocator(), @field(saved, name), 0);
+            // Snapshot content can be identical after refresh; observation
+            // metadata must always describe the current published generation.
+            candidate.provenance.snapshot = &self.workspace_generation.?.revision;
+            candidate.provenance.observed_at = self.workspace_generation.?.captured_at;
+            candidate.elapsed_ns = 0;
+            transferred = true;
+            try ranking.offer(candidate);
+        }
+        ranking.considered = value.considered;
+    }
     fn evaluate(self: *Search, a: Allocator, path_name: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !void {
         var regions: std.ArrayList(Region) = .empty;
         if (self.options.semantic_files_only) return;
@@ -2399,7 +2585,6 @@ pub const Search = struct {
         } else null else null;
         defer if (plan) |value| value.release();
         self.decider.stage = if (self.options.chunk_lines == 1) .line else .region;
-        const planned_keys: ?bool = if (plan != null and self.options.patterns.items.len == 0) (plan.?.prepare(&self.decider, bytes, lines) catch null) else null;
         const built = if (plan) |value| value.regions else try @import("regions.zig").buildPrepared(a, bytes, lines, self.options.chunk_lines, self.evidence.?.index);
         for (built) |region| {
             var eligible = self.options.patterns.items.len == 0;
@@ -2422,6 +2607,13 @@ pub const Search = struct {
             var batch_arena = std.heap.ArenaAllocator.init(self.a);
             defer batch_arena.deinit();
             const ba = batch_arena.allocator();
+            const planned_keys: ?bool = if (plan != null and self.options.patterns.items.len == 0)
+                (plan.?.prepare(&self.decider, bytes, lines, offset, n) catch |err| switch (err) {
+                    error.Canceled => return err,
+                    else => null,
+                })
+            else
+                null;
             const inputs = try ba.alloc(decision.Input, n);
             for (regions.items[offset..][0..n], 0..) |region, i| {
                 if (planned_keys) |caching| {
@@ -3277,4 +3469,33 @@ test "inventory budget failure releases copied task paths" {
     try std.testing.expectError(error.SpillBudgetExceeded, search.file("example.py", "example.py"));
     try std.testing.expectEqual(@as(usize, 0), search.inventory_reserved);
     try std.testing.expectEqual(@as(u64, 0), search.inventory_bytes);
+}
+
+test "workspace reuse identity includes credentials and policies, not container capacities" {
+    const a = std.testing.allocator;
+    var o: Options = .{ .ask = "retry", .model = "fixture", .token = "secret-a" };
+    defer o.deinit(a);
+    const original = try WorkspaceReuse.identity(a, &o);
+    try o.only.ensureTotalCapacity(a, 32);
+    try std.testing.expectEqualSlices(u8, &original, &try WorkspaceReuse.identity(a, &o));
+    o.token = "secret-b";
+    try std.testing.expect(!std.mem.eql(u8, &original, &try WorkspaceReuse.identity(a, &o)));
+    o.token = "secret-a";
+    try o.only.append(a, "policy");
+    try std.testing.expect(!std.mem.eql(u8, &original, &try WorkspaceReuse.identity(a, &o)));
+}
+
+test "retained evaluation runs preserve NaN bits and fall back for variable scores" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const selected: [128]bool = @splat(false);
+    const probabilities: [128]f64 = @splat(std.math.nan(f64));
+    var scores: [128]f64 = @splat(0.1);
+    const runs = try evaluationRuns(a, &selected, &probabilities, &scores);
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(usize, 128), runs[0].end);
+    try std.testing.expectEqual(@as(u64, @bitCast(probabilities[0])), @as(u64, @bitCast(runs[0].probability)));
+    for (&scores, 0..) |*score, i| score.* = @floatFromInt(i);
+    try std.testing.expectEqual(@as(usize, 0), (try evaluationRuns(a, &selected, &probabilities, &scores)).len);
 }

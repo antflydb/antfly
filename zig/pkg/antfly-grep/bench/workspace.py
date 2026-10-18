@@ -60,6 +60,11 @@ def main():
         help="macOS sample output, sampled from this exact binary",
     )
     parser.add_argument("--profile-queries", type=int, default=100)
+    parser.add_argument(
+        "--trim-profile",
+        type=Path,
+        help="sample idle footprint after releasing optional workspace resources",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.files < 1 or args.rounds < 3 or args.profile_queries < 1:
@@ -264,6 +269,31 @@ def main():
                 profiler.wait(timeout=10)
                 if profiler.returncode:
                     raise RuntimeError("sample failed")
+            trimmed = None
+            if args.trim_profile:
+                process.stdin.write(b'{"version":1,"id":0,"op":"trim"}\n')
+                trimmed = read()
+                if (
+                    trimmed["type"] != "workspace_trimmed"
+                    or trimmed["revision"] != ready["revision"]
+                    or trimmed["retained_cache_bytes"]
+                ):
+                    raise RuntimeError(trimmed)
+                args.trim_profile.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    [
+                        "sample",
+                        str(process.pid),
+                        "1",
+                        "1",
+                        "-file",
+                        str(args.trim_profile.resolve()),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                    timeout=10,
+                )
             refresh_start = time.monotonic()
             process.stdin.write(b'{"version":1,"id":0,"op":"refresh"}\n')
             refreshed = read()
@@ -309,6 +339,7 @@ def main():
                     for kind, samples in runs.items()
                 },
                 "profile_queries": profiled_queries,
+                "trimmed": trimmed,
                 "limitations": "Warm filesystem on this host, explicit immutable snapshot, native constant-score fixture. Pinned query latency excludes capture/refresh; ordinary latency includes process startup. Both timers include consumer JSON decoding. Both paths read and return the same selected evidence. Retained memory excludes per-query scratch and the old generation during transactional refresh. No live-model quality, billing or independent Linux hardware claims.",
             }
             args.output.parent.mkdir(parents=True, exist_ok=True)

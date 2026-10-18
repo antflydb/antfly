@@ -32,6 +32,8 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     defer generation.deinit();
     var session = @import("session.zig").Session.init(a, io);
     defer session.deinit();
+    var reuse = Search.Reuse.init(a, io);
+    defer reuse.deinit();
     var valid = true;
     try ready(a, io, generation, null);
     // A frame cannot grow with repository size. Source bytes are captured by
@@ -57,6 +59,16 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
         if (std.mem.eql(u8, request.op, "invalidate")) {
             valid = false;
             try emit(a, io, .{ .type = "workspace_invalidated", .id = request.id, .revision = generation.revision });
+        } else if (std.mem.eql(u8, request.op, "trim")) {
+            // Protocol requests are serial and every search joins its workers.
+            // Drop optional state without changing the published source lease.
+            const released = session.plans.physical.load(.monotonic) + reuse.files.bytes + reuse.queries.bytes + (if (session.memo) |memo| memo.bytes else @as(usize, 0));
+            session.deinit();
+            session = @import("session.zig").Session.init(a, io);
+            reuse.deinit();
+            reuse = Search.Reuse.init(a, io);
+            @import("memory_pressure.zig").trim();
+            try emit(a, io, .{ .type = "workspace_trimmed", .id = request.id, .revision = generation.revision, .retained_source_bytes = generation.retainedBytes(), .retained_cache_bytes = @as(usize, 0), .released_cache_bytes = released });
         } else if (std.mem.eql(u8, request.op, "refresh")) {
             valid = false;
             const next = Generation.capture(a, io, base, generation) catch |err| {
@@ -73,7 +85,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                 continue;
             }
             try emit(a, io, .{ .type = "workspace_begin", .id = request.id, .revision = generation.revision });
-            const code = search(Search, a, io, base, generation, &session, request.args) catch |err| blk: {
+            const code = search(Search, a, io, base, generation, &session, &reuse, request.args) catch |err| blk: {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 break :blk @as(u8, 2);
             };
@@ -88,7 +100,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
 fn ready(a: A, io: std.Io, generation: *const Generation, id: ?u64) !void {
     try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused });
 }
-fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, args: []const []const u8) !u8 {
+fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, args: []const []const u8) !u8 {
     var o: Options = .{};
     defer o.deinit(a);
     // Provider identity and credentials remain process-owned. Requests may
@@ -122,12 +134,14 @@ fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generat
     try o.paths.append(a, ".");
     var searcher = try Search.init(a, io, &o);
     defer searcher.deinit();
-    try session.configure(&o);
+    if (o.ask != null) try session.configure(&o);
     searcher.workspace_generation = generation;
+    searcher.reuse = reuse;
+    if (o.ask != null and !o.no_cache and o.cache_dir != null and o.cache_ttl_seconds != 0) searcher.reuse_identity = try Search.Reuse.identity(a, &o);
     searcher.executor = &session.files;
     searcher.region_plans = &session.plans;
     searcher.decider.executor = &session.providers;
-    searcher.decider.shared_http = &session.http.?;
+    if (session.http) |*http| searcher.decider.shared_http = http;
     searcher.decider.shared_local = session.local;
     if (!o.no_cache and o.cache_dir != null) searcher.decider.batch_store = &session.batches;
     const interrupt = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);

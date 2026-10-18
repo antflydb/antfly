@@ -29,6 +29,7 @@ pub const Plan = struct {
     regions: []Region = &.{},
     ids: [][]const u8 = &.{},
     keys: [][64]u8 = &.{},
+    prepared: []bool = &.{},
     path: []const u8 = "",
     context: usize = 0,
     identity: ?[64]u8 = null,
@@ -40,24 +41,28 @@ pub const Plan = struct {
         self.arena.deinit();
         a.destroy(self);
     }
-    pub fn prepare(self: *Plan, client: *@import("decision.zig").Client, bytes: []const u8, lines: []const @import("source_cache.zig").Line) !bool {
+    // Called only after this window has reserved its evaluation budget. Keys
+    // outside the admitted window remain unmaterialized, even on a cold query.
+    pub fn prepare(self: *Plan, client: *@import("decision.zig").Client, bytes: []const u8, lines: []const @import("source_cache.zig").Line, start: usize, count: usize) !bool {
         self.mutex.lockUncancelable(client.io);
         defer self.mutex.unlock(client.io);
+        if (client.limits) |limits| if (limits.cancel.load(.monotonic)) return error.Canceled;
         if (client.options.no_cache or client.options.cache_dir == null or client.options.cache_ttl_seconds == 0) return false;
-        // The empty-input identity includes all query, policy, model, stage and
-        // document fields. Full on-disk keys remain byte-for-byte compatible.
         const identity = client.key(.{ .id = "", .input = "" });
         if (self.identity == null or !std.mem.eql(u8, &identity, &self.identity.?)) {
-            self.identity = null;
-            var scratch = std.heap.ArenaAllocator.init(client.a);
-            defer scratch.deinit();
-            for (self.keys, 0..) |*key, i| {
-                defer _ = scratch.reset(.{ .retain_with_limit = 1024 * 1024 });
-                var materialized = self.input(i, bytes, lines, false);
-                materialized.input = try materialized.deferred.?.render(scratch.allocator());
-                key.* = client.key(materialized);
-            }
+            @memset(self.prepared, false);
             self.identity = identity;
+        }
+        var scratch = std.heap.ArenaAllocator.init(client.a);
+        defer scratch.deinit();
+        for (start..start + count) |i| {
+            if (client.limits) |limits| if (limits.cancel.load(.monotonic)) return error.Canceled;
+            if (self.prepared[i]) continue;
+            defer _ = scratch.reset(.{ .retain_with_limit = 1024 * 1024 });
+            var materialized = self.input(i, bytes, lines, false);
+            materialized.input = try materialized.deferred.?.render(scratch.allocator());
+            self.keys[i] = client.key(materialized);
+            self.prepared[i] = true;
         }
         return true;
     }
@@ -65,7 +70,7 @@ pub const Plan = struct {
         return .{ .id = self.ids[i], .input = "", .derived_key = if (caching) self.keys[i] else null, .deferred = .{ .path = self.path, .bytes = bytes, .lines = lines, .region = self.regions[i], .context = self.context } };
     }
     fn queryInputs(self: *Plan, a: A, client: *@import("decision.zig").Client, bytes: []const u8, lines: []const @import("source_cache.zig").Line) ![]Input {
-        const caching = try self.prepare(client, bytes, lines);
+        const caching = try self.prepare(client, bytes, lines, 0, self.regions.len);
         const inputs = try a.alloc(Input, self.regions.len);
         for (inputs, 0..) |*item, i| item.* = self.input(i, bytes, lines, caching);
         return inputs;
@@ -79,7 +84,7 @@ pub const Cache = struct {
     bytes: usize = 0,
     physical: std.atomic.Value(usize) = .init(0),
     clock: usize = 0,
-    pub const limit = 32 * 1024 * 1024;
+    pub const limit = 16 * 1024 * 1024;
     const plan_limit = 4 * 1024 * 1024;
     pub fn deinit(self: *Cache) void {
         for (self.slots) |plan| if (plan) |value| value.release();
@@ -138,6 +143,8 @@ pub const Cache = struct {
         plan.regions = try @import("regions.zig").buildPrepared(a, bytes, lines, chunk, index);
         plan.ids = try a.alloc([]const u8, plan.regions.len);
         plan.keys = try a.alloc([64]u8, plan.regions.len);
+        plan.prepared = try a.alloc(bool, plan.regions.len);
+        @memset(plan.prepared, false);
         plan.path = try a.dupe(u8, path);
         plan.context = context;
         for (plan.regions, plan.ids, 0..) |*region, *id, i| {
@@ -165,6 +172,14 @@ test "plan leases survive eviction and derived keys track the complete query ide
     var client = @import("decision.zig").Client.init(a, io, &options);
     defer client.deinit();
     client.stage = .region;
+    try std.testing.expect(try plan.prepare(&client, bytes, lines, 0, 0));
+    try std.testing.expect(!plan.prepared[0]);
+    var limits: @import("budget.zig").Limits = .{};
+    client.limits = &limits;
+    limits.cancel.store(true, .monotonic);
+    try std.testing.expectError(error.Canceled, plan.prepare(&client, bytes, lines, 0, 1));
+    try std.testing.expect(!plan.prepared[0]);
+    limits.cancel.store(false, .monotonic);
     const first = try plan.queryInputs(temp, &client, bytes, lines);
     const original = first[0].derived_key.?;
     var unplanned = first[0];
