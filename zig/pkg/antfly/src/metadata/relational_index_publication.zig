@@ -953,11 +953,13 @@ pub fn requireCancellationReleaseReceipt(group: u64, incarnation: local.metadata
         canceled.signed.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
 }
 
-pub const RaftControlRecovery = struct {
+pub const RaftRecoveryGrant = struct {
     table_name: []const u8,
     intent: raft_control.Admission,
     accepted: SignedReceipt,
     signing: RaftSigningView,
+    validation: ?local.storage_db_relational_index_validation.Seal = null,
+    installation: ?local.storage_db_relational_index_validation.Installed = null,
 
     pub fn init(incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, accepted: SignedReceipt, signing: RaftSigningView) !@This() {
         try dispatch.requireOwner(owner.owner);
@@ -965,6 +967,22 @@ pub const RaftControlRecovery = struct {
         try result.validateFor(incarnation, head, owner);
         return result;
     }
+
+    pub fn initPhysical(incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, retained: StoredProof.Decoded, signing: RaftSigningView) !@This() {
+        try dispatch.requireOwner(owner.owner);
+        var result: @This() = .{ .table_name = dispatch.table_name, .intent = .{ .id = head.plan_id, .plan_digest = head.plan_digest, .owner_digest = owner.owner.fence_digest, .ordinal = owner.owner.ordinal, .fence = try privateIndexFence(dispatch.id, dispatch.owner), .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest }, .accepted = retained.signed, .signing = signing };
+        if (retained.validation) |witness| {
+            try witness.verifyFor(retained.signed);
+            result.validation = .{ .command = try witness.outcome.logicalCommand(), .position = retained.signed.receipt.position };
+        }
+        if (retained.installation) |witness| {
+            try witness.verifyFor(retained.signed);
+            result.installation = .{ .command = witness.command, .position = retained.signed.receipt.position };
+        }
+        try result.validateFor(incarnation, head, owner);
+        return result;
+    }
+
     pub fn identity(self: @This()) raft_control.Identity {
         return (raft_control.CancellationRequest{ .cancel = self.intent }).identity();
     }
@@ -973,13 +991,49 @@ pub const RaftControlRecovery = struct {
         try self.accepted.verifySignature();
         try self.signing.validate(incarnation, owner.owner);
         const action = self.accepted.receipt.action;
-        if ((action != .fenced and action != .reserved) or self.table_name.len == 0 or !std.meta.eql(self.accepted.receipt.owner, owner.owner) or
+        if ((action != .fenced and action != .reserved and action != .validated and action != .installed) or self.table_name.len == 0 or !std.meta.eql(self.accepted.receipt.owner, owner.owner) or
             (try owner.latestReceiptAction()) != action or !std.mem.eql(u8, &try self.accepted.receipt.digest(), &owner.receipts[@backingInt(action)]) or
             !std.mem.eql(u8, &try self.accepted.commitment(), &owner.attestations[@backingInt(action)]) or
             !std.mem.eql(u8, &self.intent.id, &head.plan_id) or !std.mem.eql(u8, &self.intent.plan_digest, &head.plan_digest) or
             !std.mem.eql(u8, &self.intent.owner_digest, &owner.owner.fence_digest) or self.intent.ordinal != owner.owner.ordinal or
             !self.intent.fence.namespace.eql(owner.owner.namespace) or self.intent.fence.owner_group_id != owner.owner.group_id or
             !std.mem.eql(u8, &self.intent.candidate_digest, &head.candidate_digest) or !std.mem.eql(u8, &self.intent.reservation_digest, &head.reservation_digest)) return error.InvalidCatalogRecord;
+        if ((action == .validated) != (self.validation != null) or (action == .installed) != (self.installation != null)) return error.InvalidCatalogRecord;
+        if (self.validation) |seal| if (!std.meta.eql(try seal.command.receiptAt(seal.position), self.accepted.receipt)) return error.InvalidCatalogRecord;
+        if (self.installation) |installed| if (!std.meta.eql(try installed.command.receiptAt(installed.position), self.accepted.receipt)) return error.InvalidCatalogRecord;
+    }
+
+    pub fn auditRequest(self: @This(), budget: local.storage_db_relational_index_jobs.Budget) !raft_control.BuildRequest {
+        const seal = if (self.validation) |seal| seal else (self.installation orelse return error.InvalidCatalogRecord).command.validation;
+        var result = try raft_control.BuildRequest.initRaft(self.identity(), seal.command.binding, budget);
+        result.target_expectation = seal.command.expected;
+        try result.validate();
+        return result;
+    }
+
+    /// Only a freshly completed root-local audit plus the original retained
+    /// validation/installation cut may refresh a physical stage. This grants
+    /// neither a seal/install proposal nor permission to release the fence.
+    pub fn signPhysical(self: @This(), revision: u64, audit: native_control.AuditOutcome, seal: ?local.storage_db_relational_index_validation.Seal, installed: ?local.storage_db_relational_index_validation.Installed, physical_root_incarnation: u128, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {
+        try self.signing.requireLocal(actual);
+        try audit.validateForRaft(try self.auditRequest(.{}));
+        if (physical_root_incarnation == 0 or audit.audit.physical_root_incarnation != physical_root_incarnation or audit.audit.root_incarnation != self.signing.identity.root_incarnation) return error.IndexOwnerReceiptChanged;
+        const canonical = audit.audit.canonical_position orelse return error.PrivateIndexTargetValidationRequired;
+        if (canonical != .raft or canonical.raft.term > actual.leader_term or canonical.raft.index > actual.completed_index or
+            self.accepted.receipt.position.raft.term > actual.leader_term or self.accepted.receipt.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        const logical = try audit.logicalCommand();
+        if (self.validation) |accepted| {
+            if (installed != null or !std.meta.eql(seal orelse return error.PrivateIndexTargetValidationRequired, accepted) or !std.meta.eql(logical, accepted.command)) return error.PrivateIndexAuditScopeChanged;
+        } else {
+            const accepted = self.installation orelse return error.InvalidCatalogRecord;
+            if (seal != null or !std.meta.eql(installed orelse return error.PrivateIndexTargetValidationRequired, accepted) or !std.meta.eql(logical, accepted.command.validation.command)) return error.PrivateIndexAuditScopeChanged;
+        }
+        const proof: RootProof = .{ .identity = self.signing.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined };
+        const physical: SignedAudit = .{ .outcome_digest = try audit.readyDigest(), .proof = try proof.sign(root, try audit.readyDigest()) };
+        var ack: Ack = .{ .table_id = self.accepted.receipt.owner.namespace.table_id, .expected_revision = revision, .signed = .{ .receipt = self.accepted.receipt, .proof = try proof.sign(root, try self.accepted.receipt.digest()) } };
+        if (self.validation != null) ack.validation = .{ .outcome = audit, .signed = physical } else ack.installation = .{ .outcome = audit, .command = self.installation.?.command, .signed = physical };
+        try ack.validate();
+        return ack;
     }
 
     /// The inspection is returned by the held physical owner lease. Matching
@@ -1032,7 +1086,7 @@ pub const OwnerDecision = struct {
     /// Read-only recovery of an already accepted latest stage. This is never
     /// execution permission, schema input, or an index allocation request.
     attestation: ?Attestation = null,
-    raft_recovery: ?RaftControlRecovery = null,
+    raft_recovery: ?RaftRecoveryGrant = null,
 
     pub fn requireRequest(self: OwnerDecision, request: OwnerRequest) !void {
         try request.validate();
@@ -3038,7 +3092,7 @@ test "relational index publication Raft decisions bind immutable admission and e
         accepted_owner.attestations[@backingInt(progress.Action.fenced)] = try signed.signed.commitment();
         var new_view = signing.raft_signing.?;
         new_view.root_generation += 1;
-        const grant = try RaftControlRecovery.init(decision.metadata_incarnation, accepted_state.head, accepted_owner, dispatch.value, signed.signed, new_view);
+        const grant = try RaftRecoveryGrant.init(decision.metadata_incarnation, accepted_state.head, accepted_owner, dispatch.value, signed.signed, new_view);
         var recover_request = sign_request;
         recover_request.operation = .reserve;
         const readonly: OwnerDecision = .{ .metadata_group_id = decision.metadata_group_id, .metadata_incarnation = decision.metadata_incarnation, .head = accepted_state.head, .owner = accepted_owner, .disposition = .execute, .raft_recovery = grant };

@@ -11813,29 +11813,7 @@ pub const DataServer = struct {
         lookup.raft_reporter = .{ .node_id = registration.node_id, .store_id = registration.store_id };
         var permission = try execution.raftDecision(alloc, &self.status_source, lookup, context);
         defer permission.deinit();
-        if (permission.value.raft_recovery) |grant| {
-            if (!std.mem.eql(u8, grant.table_name, table_name)) return error.GenerationPublicationChanged;
-            const owners = try self.ensureKernelOwnerSource();
-            var session = try owners.acquireRaftIndexOwnerSession(group_id, table_name, grant.identity(), context);
-            defer session.deinit();
-            var observed = try session.cancelStep(alloc, .{ .cancel = grant.intent }, false);
-            defer observed.deinit();
-            var response: execution.RaftRecoveryControlResponse = .{ .root_generation = session.rootGeneration(), .accepted = grant.accepted, .state = observed.value.progress.cancel };
-            try response.validate(request);
-            const scope = try self.raftIndexLocalScopeAtRoot(group_id, grant.identity(), session.rootGeneration(), context);
-            const runtime = try self.ensureBackendRuntime();
-            const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
-            const root = @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir) catch {
-                response.signing_failure = .identity_unavailable;
-                return .{ .raft_recovery = response };
-            };
-            response.signed_ack = grant.sign(permission.value.head.revision, response.state, scope, root) catch |err| failure: {
-                response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
-                break :failure null;
-            };
-            try response.validate(request);
-            return .{ .raft_recovery = response };
-        }
+        if (permission.value.raft_recovery != null) return self.raftIndexRecoverControl(alloc, table_name, group_id, request, &permission.value, context);
         if (permission.value.disposition == .acknowledged) return .acknowledged;
         const identity = try permission.value.raftExecutionIdentity(lookup);
         const dispatch = permission.value.dispatch orelse return error.InvalidGenerationPublication;
@@ -11932,6 +11910,71 @@ pub const DataServer = struct {
         }
         try response.validate(request);
         return .{ .raft = response };
+    }
+
+    /// Recovery is read-only with respect to replicated state. Root-local
+    /// audit cursors are bounded and disposable; no prepared command from this
+    /// path is ever sent to Raft, including an already installed owner's retry.
+    fn raftIndexRecoverControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
+        const execution = antfly.public_api.relational_index_owner_execution;
+        const local = @import("antfly_local_sources");
+        const grant = permission.raft_recovery orelse return error.PrivateIndexRootRecoveryRequired;
+        if (!std.mem.eql(u8, grant.table_name, table_name)) return error.GenerationPublicationChanged;
+        const owners = try self.ensureKernelOwnerSource();
+        var session = try owners.acquireRaftIndexOwnerSession(group_id, table_name, grant.identity(), context);
+        defer session.deinit();
+        var response: execution.RaftRecoveryControlResponse = .{ .root_generation = session.rootGeneration(), .accepted = grant.accepted };
+        const scope = try self.raftIndexLocalScopeAtRoot(group_id, grant.identity(), session.rootGeneration(), context);
+        try grant.signing.requireLocal(scope);
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const control = grant.validation == null and grant.installation == null;
+        if (control) {
+            var observed = try session.cancelStep(alloc, .{ .cancel = grant.intent }, false);
+            defer observed.deinit();
+            response.state = observed.value.progress.cancel;
+        }
+        const root = local.storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir) catch |err| {
+            if (!control) return err;
+            response.signing_failure = .identity_unavailable;
+            try response.validate(request);
+            return .{ .raft_recovery = response };
+        };
+        const root_scope: local.storage_db_relational_index_owner_control.AuditRoot = .{ .root_dir = self.write_source.replica_root_dir, .root_incarnation = root.root_incarnation };
+        if (grant.installation) |installed| {
+            var observed = try session.lifecycle(alloc, .{ .install = .{ .intent = installed.command.intent(), .budget = request.build_budget orelse .{} } }, true, root_scope);
+            defer observed.deinit();
+            response.installation = observed.value.progress.install;
+        } else if (grant.validation != null) {
+            const build = try grant.auditRequest(request.build_budget orelse .{});
+            var observed: ?std.json.Parsed(local.storage_db_relational_index_raft_contract.BuildPreparation) = session.audit(alloc, build, root_scope, false) catch |err| historical: {
+                if (err != error.PrivateIndexOwnerJobChanged) return err;
+                // Installation can have committed before its ACK was observed.
+                // Its audited predecessor is the same frozen validation; never
+                // reconstruct the retired preimage from current mutable rows.
+                const intent: local.storage_db_relational_index_validation.InstallIntent = .{ .validation = grant.validation.?, .metadata_decision = try @import("../metadata/relational_index_publication.zig").InstallGrant.decisionDigest(permission.metadata_group_id, permission.metadata_incarnation, permission.head) };
+                var installed = try session.lifecycle(alloc, .{ .install = .{ .intent = intent, .budget = request.build_budget orelse .{} } }, true, root_scope);
+                defer installed.deinit();
+                const physical = installed.value.progress.install;
+                const retained = physical.installed orelse return error.PrivateIndexRootRecoveryRequired;
+                response.audit = .{ .outcome = physical.physical orelse return error.PrivateIndexTargetValidationRequired, .seal = if (physical.command != null) retained.command.validation else null };
+                break :historical null;
+            };
+            if (observed) |*value| {
+                defer value.deinit();
+                response.audit = value.value.audit;
+            }
+        }
+        const ready = if (response.audit) |audit| audit.seal != null else if (response.installation) |installed| installed.command != null and installed.installed != null else true;
+        if (ready) response.signed_ack = signed: {
+            const ack = if (response.state) |state| grant.sign(permission.head.revision, state, scope, root) else if (response.audit) |audit| grant.signPhysical(permission.head.revision, audit.outcome, audit.seal, null, audit.outcome.audit.physical_root_incarnation, scope, root) else grant.signPhysical(permission.head.revision, response.installation.?.physical.?, null, response.installation.?.installed, response.installation.?.physical.?.audit.physical_root_incarnation, scope, root);
+            break :signed ack catch |err| {
+                response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
+                break :signed null;
+            };
+        };
+        try response.validate(request);
+        return .{ .raft_recovery = response };
     }
 
     fn raftIndexValidationControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.relational_index_owner_execution.Request, lookup: @import("../metadata/relational_index_publication.zig").OwnerRequest, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, original_route: DataRaftBatchRoute) !antfly.public_api.relational_index_owner_execution.Result {
