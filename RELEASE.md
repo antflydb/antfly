@@ -369,6 +369,16 @@ logs, memory summaries, and linker maps are uploaded on failure as separate
 diagnostic artifacts, without compiler caches. macOS cross builds resolve the
 versioned LLVM linker directory and check linker/nm availability before compiling.
 
+All archive targets use the bounded runner's detected memory budget (80% of the
+container limit by default), including Linux on the larger release builders.
+Project objects share the checkout's `.zig-cache/release` across server, embedded,
+and standalone inference builds. Product install/staging directories are still
+reset before assembly; the shared cache is retained and Zig invalidates entries
+when source, compiler, target, or compile options change. This enables reuse
+within a checkout, including local rebuilds, without sharing writable project
+objects between independent CI jobs. `make gc` cleans this cache with the rest
+of the checkout's Zig caches.
+
 ## Version Behavior
 
 Stable tags use `vX.Y.Z`; prerelease tags use the canonical
