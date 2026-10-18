@@ -414,7 +414,7 @@ layout:
 
 | Repository | Immutable layout revision | Current typed Decide contract |
 | --- | --- | --- |
-| [`antflydb/GLiNER2.5-Decide-1B`](https://huggingface.co/antflydb/GLiNER2.5-Decide-1B) | `98ce73668cea4b940299396920671ec0a8abc57f` | Native/Metal, one item, 64 sequences, 1024 complete prompt tokens per sequence |
+| [`antflydb/GLiNER2.5-Decide-1B`](https://huggingface.co/antflydb/GLiNER2.5-Decide-1B) | `ef47cca0f42f554e146cd9ab3ce870741c98daa5` | Native/Metal, one item, 64 sequences, 1024 complete prompt tokens per sequence |
 | [`antflydb/GLiNER2.5-Decide`](https://huggingface.co/antflydb/GLiNER2.5-Decide) | `358ae4b1263cedb79faf9e8b7984c3b4e5586874` | Not qualified; the DeBERTa Q8 exporter strips `decide` |
 
 The previous `gliner2.5-decide-1B-gguf` and `gliner2.5-decide-gguf` URLs redirect
@@ -432,6 +432,11 @@ resolved immutable Hub commit. This supports the historical mixed-suffix
 layout as well as canonical paired filenames, rejects missing or unsafe
 references, and never substitutes an unrelated GGUF for a missing component.
 An explicitly requested quantization must match the declared encoder.
+
+The 1B layout migration was published at `98ce73668cea4b940299396920671ec0a8abc57f`.
+The current revision adds the [immutable capacity receipts](https://huggingface.co/antflydb/GLiNER2.5-Decide-1B/blob/ef47cca0f42f554e146cd9ab3ce870741c98daa5/qualification/2026-10-17-capacity/manifest.json)
+and requires runtime commit `10e6c371d5` or later for the larger classification
+limits. Both GGUF weight hashes remain identical to the migration revision.
 
 Unversioned pulls of reviewed Fastino GLiNER2.5 checkpoints use the immutable
 revisions in `src/registry/gliner_catalog.zig`, including base-v1, multi-v1,
