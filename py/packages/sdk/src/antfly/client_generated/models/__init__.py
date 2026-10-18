@@ -229,6 +229,12 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
+from .decider_config import DeciderConfig
+from .decider_config_decision_method import DeciderConfigDecisionMethod
+from .decider_config_embedding_options import DeciderConfigEmbeddingOptions
+from .decider_config_embedding_options_dimensions import DeciderConfigEmbeddingOptionsDimensions
+from .decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
+from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
@@ -697,6 +703,10 @@ from .graph_relationship_filter import GraphRelationshipFilter
 from .graph_relationship_property_predicate import GraphRelationshipPropertyPredicate
 from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
 from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
+from .graph_resolver_adjudication_acceptance import GraphResolverAdjudicationAcceptance
+from .graph_resolver_adjudication_config import GraphResolverAdjudicationConfig
+from .graph_resolver_adjudication_config_description_inputs import GraphResolverAdjudicationConfigDescriptionInputs
+from .graph_resolver_adjudication_config_on_failure import GraphResolverAdjudicationConfigOnFailure
 from .graph_resolver_config import GraphResolverConfig
 from .graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
@@ -1772,6 +1782,12 @@ __all__ = (
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
+    "DeciderConfig",
+    "DeciderConfigDecisionMethod",
+    "DeciderConfigEmbeddingOptions",
+    "DeciderConfigEmbeddingOptionsDimensions",
+    "DeciderConfigEmbeddingOptionsTaskType",
+    "DeciderConfigProvider",
     "DecisionBatchItem",
     "DecisionChoice",
     "DecisionChoiceProbability",
@@ -2232,6 +2248,10 @@ __all__ = (
     "GraphRelationshipPropertyPredicate",
     "GraphRelationshipPropertyPredicateOp",
     "GraphRelationshipPropertyPredicateValueType",
+    "GraphResolverAdjudicationAcceptance",
+    "GraphResolverAdjudicationConfig",
+    "GraphResolverAdjudicationConfigDescriptionInputs",
+    "GraphResolverAdjudicationConfigOnFailure",
     "GraphResolverConfig",
     "GraphResolverConfigAliasesItem",
     "GraphResolverConfigCandidateSearch",

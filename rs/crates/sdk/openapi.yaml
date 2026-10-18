@@ -28073,6 +28073,257 @@ components:
             review:
               type: number
               format: double
+    DeciderConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - provider
+      properties:
+        provider:
+          type: string
+          enum:
+            - antfly
+            - jev
+            - openai
+        decision_method:
+          type: string
+          enum:
+            - typed
+            - embedding_similarity
+          default: typed
+          description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma
+            2 choice and multi_choice questions; rejects score and predicate requests and returns raw
+            cosine similarities.
+        model:
+          type: string
+          description: Required for Antfly and OpenAI; Jev defaults to jev-latest.
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
+        embedding_options:
+          type: object
+          additionalProperties: false
+          description: EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto
+            each question and can be overridden per question. Other models reject these options. Raw cosine
+            similarities never represent probabilities.
+          properties:
+            calibration_id:
+              type: string
+              pattern: ^[A-Za-z0-9_-]{1,64}$
+              description: Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the
+                exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive
+                with manual thresholds. Does not produce probabilities.
+            task_type:
+              type: string
+              enum:
+                - CLUSTERING
+                - CLASSIFICATION
+              default: CLUSTERING
+            dimensions:
+              type: integer
+              enum:
+                - 768
+                - 512
+                - 256
+                - 128
+              default: 768
+            min_similarity:
+              type: number
+              minimum: -1
+              maximum: 1
+            min_margin:
+              type: number
+              minimum: 0
+              maximum: 2
+        url:
+          type: string
+          description: Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1
+            and appends /decisions.
+        api_key:
+          type: string
+          description: API key or secret reference. Defaults to the provider environment variable.
+        max_rows:
+          type: integer
+          minimum: 1
+          default: 10000
+        max_input_tokens:
+          type: integer
+          minimum: 1
+          default: 1000000
+        rate_limit:
+          $ref: '#/components/schemas/RateLimitConfig'
+        batch_size:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 32
+    DecisionChoice:
+      type: object
+      additionalProperties: false
+      required:
+        - value
+      properties:
+        value:
+          type: string
+          minLength: 1
+        description:
+          type: string
+          minLength: 1
+        examples:
+          type: array
+          items:
+            type: string
+            minLength: 1
+          minItems: 1
+          maxItems: 32
+      description: Local decision models use string choice identifiers. Embedding category examples replace
+        the description with their normalized centroid; trained models reject examples.
+    EmbeddingDecisionAcceptance:
+      type: object
+      additionalProperties: false
+      properties:
+        calibration_id:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{1,64}$
+          description: Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json.
+            The server verifies qualification and the exact asset identity, prompt profile, dimensions,
+            renderer and this question's label/prototype set. Mutually exclusive with manual thresholds;
+            never produces probabilities.
+        min_similarity:
+          type: number
+          minimum: -1
+          maximum: 1
+          description: For a single choice, abstain when the highest cosine similarity is below this value.
+            It is a similarity threshold, not an accuracy or probability estimate.
+        min_margin:
+          type: number
+          minimum: 0
+          maximum: 2
+          description: For a single choice, require this gap between the highest and second-highest cosine
+            similarities. For multi_choice, require every score to be at least this distance from its
+            own selection threshold; otherwise abstain.
+      description: Question-specific acceptance policy for embedding similarity. Trained decision models
+        reject it.
+    ChoiceDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - name
+        - instructions
+        - choices
+      properties:
+        type:
+          type: string
+          enum:
+            - choice
+        name:
+          type: string
+          minLength: 1
+        instructions:
+          type: string
+          minLength: 1
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionChoice'
+          minItems: 2
+          maxItems: 64
+        embedding_options:
+          $ref: '#/components/schemas/EmbeddingDecisionAcceptance'
+    GraphResolverAdjudicationAcceptance:
+      type: object
+      additionalProperties: false
+      required:
+        - choice
+        - min_probability
+      properties:
+        choice:
+          type: string
+          minLength: 1
+          description: A choice identifier in the configured question. Accept and reject must differ.
+        min_probability:
+          type: number
+          minimum: 0.5
+          maximum: 1
+          description: Require this typed probability and a strict majority. Raw cosine is not a probability.
+    GraphResolverAdjudicationConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - decider
+        - template
+        - question
+        - accept
+      description: Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and
+        NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of
+        work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions,
+        not global key merges.
+      properties:
+        decider:
+          $ref: '#/components/schemas/DeciderConfig'
+          description: Frozen provider configuration. Requires decision_method=typed.
+        template:
+          type: string
+          minLength: 1
+          maxLength: 65536
+          description: Bounded interpolation of m.text, m.canonical_text, m.label, m.description, c.canonical_name,
+            c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
+        question:
+          $ref: '#/components/schemas/ChoiceDecisionQuestion'
+        accept:
+          $ref: '#/components/schemas/GraphResolverAdjudicationAcceptance'
+        reject:
+          $ref: '#/components/schemas/GraphResolverAdjudicationAcceptance'
+          description: Optional confident negative choice. Without it, non-acceptance stays REVIEW.
+        on_failure:
+          type: string
+          enum:
+            - review
+            - mint
+          default: review
+          description: Failure or budget fallback. REVIEW remains unpromoted; mint explicitly permits
+            a new identity.
+        description_inputs:
+          type: object
+          additionalProperties: false
+          description: Optional asset bindings. Resolution reads available data without waiting for promotion
+            or producers.
+          properties:
+            mention_artifact:
+              type: string
+              minLength: 1
+              maxLength: 256
+              description: Source-document asset containing a JSON object mapping local mention ids to
+                description strings. Publication re-drives asset-scoped resolution.
+            candidate_artifact:
+              type: string
+              minLength: 1
+              maxLength: 256
+              description: Candidate-document text asset, such as a generated summary. Changes affect
+                future decisions; explicitly re-resolve to revisit committed evidence.
+        budget_ms:
+          type: integer
+          minimum: 1
+          maximum: 300000
+          default: 10000
+          description: Total model-time budget per source artifact. Each call also obeys timeout_ms.
+        max_pairs:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 32
+        max_input_bytes:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          default: 16384
+        timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 300000
+          default: 10000
     GraphResolverConfig:
       type: object
       additionalProperties: false
@@ -28138,6 +28389,8 @@ components:
         scorer:
           $ref: '#/components/schemas/GraphResolverScorerConfig'
           description: Typed matcher scorer. Cannot be combined with scorer_json.
+        adjudicate:
+          $ref: '#/components/schemas/GraphResolverAdjudicationConfig'
         scorer_json:
           type: string
           deprecated: true
@@ -42173,80 +42426,6 @@ components:
           maximum: 128
           default: 128
           x-go-type-skip-optional-pointer: false
-    DecisionChoice:
-      type: object
-      additionalProperties: false
-      required:
-        - value
-      properties:
-        value:
-          type: string
-          minLength: 1
-        description:
-          type: string
-          minLength: 1
-        examples:
-          type: array
-          items:
-            type: string
-            minLength: 1
-          minItems: 1
-          maxItems: 32
-      description: Local decision models use string choice identifiers. Embedding category examples replace
-        the description with their normalized centroid; trained models reject examples.
-    EmbeddingDecisionAcceptance:
-      type: object
-      additionalProperties: false
-      properties:
-        calibration_id:
-          type: string
-          pattern: ^[A-Za-z0-9_-]{1,64}$
-          description: Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json.
-            The server verifies qualification and the exact asset identity, prompt profile, dimensions,
-            renderer and this question's label/prototype set. Mutually exclusive with manual thresholds;
-            never produces probabilities.
-        min_similarity:
-          type: number
-          minimum: -1
-          maximum: 1
-          description: For a single choice, abstain when the highest cosine similarity is below this value.
-            It is a similarity threshold, not an accuracy or probability estimate.
-        min_margin:
-          type: number
-          minimum: 0
-          maximum: 2
-          description: For a single choice, require this gap between the highest and second-highest cosine
-            similarities. For multi_choice, require every score to be at least this distance from its
-            own selection threshold; otherwise abstain.
-      description: Question-specific acceptance policy for embedding similarity. Trained decision models
-        reject it.
-    ChoiceDecisionQuestion:
-      type: object
-      additionalProperties: false
-      required:
-        - type
-        - name
-        - instructions
-        - choices
-      properties:
-        type:
-          type: string
-          enum:
-            - choice
-        name:
-          type: string
-          minLength: 1
-        instructions:
-          type: string
-          minLength: 1
-        choices:
-          type: array
-          items:
-            $ref: '#/components/schemas/DecisionChoice'
-          minItems: 2
-          maxItems: 64
-        embedding_options:
-          $ref: '#/components/schemas/EmbeddingDecisionAcceptance'
     MultiChoiceDecisionQuestion:
       type: object
       additionalProperties: false

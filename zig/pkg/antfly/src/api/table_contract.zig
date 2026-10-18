@@ -582,6 +582,12 @@ fn appendNormalizedGraphResolversField(alloc: std.mem.Allocator, out: *std.Array
     for (value.array.items, 0..) |item, i| {
         if (i != 0) try out.append(alloc, ',');
         if (item != .object) return error.InvalidCreateIndexRequest;
+        if (item.object.get("adjudicate")) |policy| if (policy != .null) {
+            const raw = try stringifyJsonAlloc(alloc, policy);
+            defer alloc.free(raw);
+            @import("antfly_local_sources").functions_resolver_adjudication.validate(alloc, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCreateIndexRequest;
+            if (item.object.get("scorer") == null and item.object.get("scorer_json") == null) return error.InvalidCreateIndexRequest;
+        };
         const scorer = item.object.get("scorer");
         if (scorer == null or scorer.? == .null) {
             if (item.object.get("scorer_json")) |legacy| {
@@ -1012,6 +1018,25 @@ fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Valu
     if (std.mem.eql(u8, field, "neighbor_context")) {
         validatePublicCreatedShape(value, .enrichment_neighbor_context) catch return error.InvalidArtifactEnrichmentRequest;
     }
+}
+
+test "resolver adjudication public policy validates and redacts frozen credentials" {
+    const a = std.testing.allocator;
+    const request =
+        \\{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"{{_entity.text}}","scorer":{"comparisons":[]},"adjudicate":{"decider":{"provider":"antfly","model":"fixture","api_key":"private-key"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}}]}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), request, .{});
+    const normalized = try normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true });
+    defer a.free(normalized);
+    const public = try indexes_api.encodeCreatedIndexConfig(a, "g", normalized);
+    defer a.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "private-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"adjudicate\":") != null);
+    const resolver = &value.object.getPtr("resolvers").?.array.items[0];
+    try resolver.object.getPtr("adjudicate").?.object.put(arena.allocator(), "silent_typo", .{ .bool = true });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true }));
 }
 
 test "typed enrichment producer and graph scorer normalize to legacy storage fields" {

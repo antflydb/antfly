@@ -11,6 +11,7 @@ from ..models.graph_resolver_config_source_artifact_kind import GraphResolverCon
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_resolver_adjudication_config import GraphResolverAdjudicationConfig
     from ..models.graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
     from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
 
@@ -40,6 +41,10 @@ class GraphResolverConfig:
             routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
         type_must_match (bool | Unset):  Default: True.
         scorer (GraphResolverScorerConfig | Unset):
+        adjudicate (GraphResolverAdjudicationConfig | Unset): Adjudicate the best deterministic REVIEW candidate with a
+            typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained
+            independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves
+            mentions, not global key merges.
         scorer_json (str | Unset):
         candidate_search (GraphResolverConfigCandidateSearch | Unset):
         candidate_ann_index (str | Unset):
@@ -68,6 +73,7 @@ class GraphResolverConfig:
     labels: list[str] | Unset = UNSET
     type_must_match: bool | Unset = True
     scorer: GraphResolverScorerConfig | Unset = UNSET
+    adjudicate: GraphResolverAdjudicationConfig | Unset = UNSET
     scorer_json: str | Unset = UNSET
     candidate_search: GraphResolverConfigCandidateSearch | Unset = UNSET
     candidate_ann_index: str | Unset = UNSET
@@ -114,6 +120,10 @@ class GraphResolverConfig:
         scorer: dict[str, Any] | Unset = UNSET
         if not isinstance(self.scorer, Unset):
             scorer = self.scorer.to_dict()
+
+        adjudicate: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.adjudicate, Unset):
+            adjudicate = self.adjudicate.to_dict()
 
         scorer_json = self.scorer_json
 
@@ -166,6 +176,8 @@ class GraphResolverConfig:
             field_dict["type_must_match"] = type_must_match
         if scorer is not UNSET:
             field_dict["scorer"] = scorer
+        if adjudicate is not UNSET:
+            field_dict["adjudicate"] = adjudicate
         if scorer_json is not UNSET:
             field_dict["scorer_json"] = scorer_json
         if candidate_search is not UNSET:
@@ -195,6 +207,7 @@ class GraphResolverConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_resolver_adjudication_config import GraphResolverAdjudicationConfig
         from ..models.graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
         from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
 
@@ -237,6 +250,13 @@ class GraphResolverConfig:
             scorer = UNSET
         else:
             scorer = GraphResolverScorerConfig.from_dict(_scorer)
+
+        _adjudicate = d.pop("adjudicate", UNSET)
+        adjudicate: GraphResolverAdjudicationConfig | Unset
+        if isinstance(_adjudicate, Unset):
+            adjudicate = UNSET
+        else:
+            adjudicate = GraphResolverAdjudicationConfig.from_dict(_adjudicate)
 
         scorer_json = d.pop("scorer_json", UNSET)
 
@@ -284,6 +304,7 @@ class GraphResolverConfig:
             labels=labels,
             type_must_match=type_must_match,
             scorer=scorer,
+            adjudicate=adjudicate,
             scorer_json=scorer_json,
             candidate_search=candidate_search,
             candidate_ann_index=candidate_ann_index,

@@ -655,6 +655,7 @@ comptime {
 }
 pub const functions_query_eval = @import("functions/query_eval.zig");
 pub const functions_runtime = @import("functions/runtime.zig");
+pub const functions_resolver_adjudication = @import("functions/resolver_adjudication.zig");
 pub const functions_materialization = @import("functions/materialization.zig");
 pub const functions_decisions = @import("functions/decisions.zig");
 pub const functions_expressions = @import("functions/expressions.zig");

@@ -4,6 +4,8 @@
 const std = @import("std");
 const antfly_audio_openapi = @import("antfly_audio_openapi");
 const antfly_chunking_openapi = @import("antfly_chunking_openapi");
+const antfly_common_openapi = @import("antfly_common_openapi");
+const antfly_decision_openapi = @import("antfly_decision_openapi");
 const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_graph_identifier_openapi = @import("antfly_graph_identifier_openapi");
@@ -8002,6 +8004,98 @@ pub const GraphRelationshipPropertyPredicate = struct {
     }
 };
 
+pub const GraphResolverAdjudicationAcceptance = struct {
+    /// A choice identifier in the configured question. Accept and reject must differ.
+    choice: []const u8,
+    /// Require this typed probability and a strict majority. Raw cosine is not a probability.
+    min_probability: f64,
+};
+
+/// Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges.
+pub const GraphResolverAdjudicationConfig = struct {
+    /// Frozen provider configuration. Requires decision_method=typed.
+    decider: antfly_common_openapi.DeciderConfig,
+    /// Bounded interpolation of m.text, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
+    template: []const u8,
+    question: antfly_decision_openapi.ChoiceDecisionQuestion,
+    accept: GraphResolverAdjudicationAcceptance,
+    /// Optional confident negative choice. Without it, non-acceptance stays REVIEW.
+    reject: ?GraphResolverAdjudicationAcceptance = null,
+    /// Failure or budget fallback. REVIEW remains unpromoted; mint explicitly permits a new identity.
+    on_failure: ?[]const u8 = null,
+    /// Optional asset bindings. Resolution reads available data without waiting for promotion or producers.
+    description_inputs: ?std.json.Value = null,
+    /// Total model-time budget per source artifact. Each call also obeys timeout_ms.
+    budget_ms: ?i64 = null,
+    max_pairs: ?i64 = null,
+    max_input_bytes: ?i64 = null,
+    timeout_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "decider", "decider", false },
+        .{ "template", "template", false },
+        .{ "question", "question", false },
+        .{ "accept", "accept", false },
+        .{ "reject", "reject", true },
+        .{ "on_failure", "on_failure", true },
+        .{ "description_inputs", "description_inputs", true },
+        .{ "budget_ms", "budget_ms", true },
+        .{ "max_pairs", "max_pairs", true },
+        .{ "max_input_bytes", "max_input_bytes", true },
+        .{ "timeout_ms", "timeout_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("decider");
+        try jw.write(self.decider);
+        try jw.objectField("template");
+        try jw.write(self.template);
+        try jw.objectField("question");
+        try jw.write(self.question);
+        try jw.objectField("accept");
+        try jw.write(self.accept);
+        if (self.reject) |value| {
+            try jw.objectField("reject");
+            try jw.write(value);
+        }
+        if (self.on_failure) |value| {
+            try jw.objectField("on_failure");
+            try jw.write(value);
+        }
+        if (self.description_inputs) |value| {
+            try jw.objectField("description_inputs");
+            try jw.write(value);
+        }
+        if (self.budget_ms) |value| {
+            try jw.objectField("budget_ms");
+            try jw.write(value);
+        }
+        if (self.max_pairs) |value| {
+            try jw.objectField("max_pairs");
+            try jw.write(value);
+        }
+        if (self.max_input_bytes) |value| {
+            try jw.objectField("max_input_bytes");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Versioned entity resolver attached to an artifact-backed graph index.
 pub const GraphResolverConfig = struct {
     name: []const u8,
@@ -8019,6 +8113,7 @@ pub const GraphResolverConfig = struct {
     type_must_match: ?bool = null,
     /// Typed matcher scorer. Cannot be combined with scorer_json.
     scorer: ?GraphResolverScorerConfig = null,
+    adjudicate: ?GraphResolverAdjudicationConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
@@ -8046,6 +8141,7 @@ pub const GraphResolverConfig = struct {
         .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer", "scorer", true },
+        .{ "adjudicate", "adjudicate", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
@@ -8102,6 +8198,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.scorer) |value| {
             try jw.objectField("scorer");
+            try jw.write(value);
+        }
+        if (self.adjudicate) |value| {
+            try jw.objectField("adjudicate");
             try jw.write(value);
         }
         if (self.scorer_json) |value| {

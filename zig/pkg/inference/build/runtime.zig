@@ -711,7 +711,10 @@ fn addInferenceApiModule(
 }
 
 fn addDecisionOpenApiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, paths: Paths) *std.Build.Module {
-    return b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig")), .target = target, .optimize = optimize });
+    _ = target;
+    _ = optimize;
+    if (b.modules.get("antfly_decision_openapi")) |existing| return existing;
+    return b.addModule("antfly_decision_openapi", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig")) });
 }
 
 fn addChunkingApiOpenApiModule(

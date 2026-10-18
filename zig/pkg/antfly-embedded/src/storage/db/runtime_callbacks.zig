@@ -104,6 +104,8 @@ pub const CandidateSource = struct {
         finish: *const fn (*anyopaque, bool) void,
     };
     pub const VTable = struct {
+        get_description: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!?[]u8 = null,
+        adjudicate: ?*const fn (*anyopaque, std.mem.Allocator, @import("antfly_resolver").adjudication.Request) anyerror![]u8 = null,
         /// Root-source caches join the resolution transaction. Other physical
         /// stores flush one optional shared-cache batch after resolution commit.
         embedding_cache_prepare: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!?CacheBatch = null,
@@ -128,6 +130,16 @@ pub const CandidateSource = struct {
         /// The nearest entities in `table` for a named dense index.
         nearest: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, query: NearestQuery, ctx: *anyopaque, consume: Consume) anyerror!void = null,
     };
+
+    pub fn getDescription(self: CandidateSource, a: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8) !?[]u8 {
+        const method = self.vtable.get_description orelse return null;
+        return NativeBoundary.call("get_description", self.callback_dispatch, method, .{ self.ptr, a, table, key, artifact });
+    }
+
+    pub fn adjudicate(self: CandidateSource, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) ![]u8 {
+        const method = self.vtable.adjudicate orelse return error.MissingAdjudicator;
+        return NativeBoundary.call("adjudicate", self.callback_dispatch, method, .{ self.ptr, a, request });
+    }
 
     pub fn get(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
         return NativeBoundary.call("get", self.callback_dispatch, self.vtable.get, .{ self.ptr, allocator, table, key });
@@ -182,6 +194,8 @@ pub const CandidateSource = struct {
         vtable: VTable = undefined,
         pub fn sourceView(self: *Receiver) CandidateSource {
             self.vtable = .{ .get = Receiver.get };
+            if (self.source.vtable.get_description != null) self.vtable.get_description = Receiver.get_description;
+            if (self.source.vtable.adjudicate != null) self.vtable.adjudicate = Receiver.adjudicate;
             if (self.source.vtable.bound_table != null) self.vtable.bound_table = bound_table;
             if (self.source.vtable.embed_mention != null) self.vtable.embed_mention = embed_mention;
             if (self.source.vtable.revisions != null) self.vtable.revisions = revisions;
@@ -196,6 +210,12 @@ pub const CandidateSource = struct {
         fn original(raw: *anyopaque) CandidateSource {
             const self: *Receiver = @ptrCast(@alignCast(raw));
             return self.source;
+        }
+        fn get_description(raw: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8) anyerror!?[]u8 {
+            return original(raw).getDescription(a, table, key, artifact);
+        }
+        fn adjudicate(raw: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
+            return original(raw).adjudicate(a, request);
         }
         fn get(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
             return original(raw).get(alloc, table, key);

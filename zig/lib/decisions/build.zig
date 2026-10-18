@@ -21,3 +21,10 @@ pub fn create(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
     if (b.modules.get("antfly_decisions")) |existing| return existing;
     return b.addModule("antfly_decisions", .{ .root_source_file = root });
 }
+
+/// Generated decision wire types are std-only, so one source identity can
+/// inherit each consumer's target without duplicate generated-file ownership.
+pub fn createOpenApi(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
+    if (b.modules.get("antfly_decision_openapi")) |existing| return existing;
+    return b.addModule("antfly_decision_openapi", .{ .root_source_file = root });
+}

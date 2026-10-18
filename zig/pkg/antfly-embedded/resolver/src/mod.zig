@@ -37,6 +37,8 @@ const matcher = @import("antfly_matcher");
 /// A reference to a document in some table. Phase 1 only hydrates same-table,
 /// but threading `DocRef` now keeps cross-table entity graphs from being a
 /// later redesign.
+pub const adjudication = @import("adjudication.zig");
+
 pub const DocRef = struct {
     table: []const u8,
     /// Trusted execution binding persisted for deferred promotion. Logical
@@ -53,6 +55,8 @@ pub const ExtractedEntity = struct {
     text: []const u8,
     /// Optional query embedding (e.g. a name embedding) for cosine/ANN scoring.
     embedding: ?[]const f32 = null,
+    description: ?[]const u8 = null,
+    description_embedding: ?[]const f32 = null,
     /// Extractor's asserted confidence in this mention, in [0, 1]. Defaults to
     /// 1.0 when the extractor omits it (legacy mentions are fully trusted). Fed
     /// into provenance-edge confidence fusion.
@@ -145,6 +149,9 @@ pub const ResolvedEntity = struct {
     /// Original mention text. The promoter unions this as an alias so mention
     /// variants do not clobber an existing entity's canonical name.
     surface_form: []const u8 = "",
+    adjudication: ?adjudication.Evidence = null,
+    /// Transient proposal from the pure scorer; never serialized as evidence.
+    review_candidate: ?usize = null,
 };
 
 /// The resolution artifact: the durable record of identity decisions for one
@@ -200,6 +207,12 @@ pub const Resolution = struct {
             if (e.surface_form.len > 0) {
                 try out.appendSlice(allocator, ",\"surface_form\":");
                 try writeJsonString(allocator, &out, e.surface_form);
+            }
+            if (e.adjudication) |evidence| {
+                try out.appendSlice(allocator, ",\"adjudication\":");
+                const bytes = try std.json.Stringify.valueAlloc(allocator, evidence, .{});
+                defer allocator.free(bytes);
+                try out.appendSlice(allocator, bytes);
             }
             try out.append(allocator, '}');
         }
@@ -419,6 +432,8 @@ pub const Resolver = struct {
         var fields: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer fields.deinit(a);
         if (self.scorer) |scorer| for (scorer.comparisons) |comparison| {
+            // ANN hydrates only its own name-vector space. Description vectors
+            // must be supplied separately; never substitute a name vector.
             if (!std.mem.eql(u8, comparison.left, "name_embedding")) continue;
             var duplicate = false;
             for (fields.items) |field| if (std.mem.eql(u8, field, comparison.right)) {
@@ -538,21 +553,15 @@ pub const Resolver = struct {
 
         if (self.scorer) |*scorer| {
             if (candidates.len > 0) {
-                var mention_fields = [_]matcher.Field{
-                    .{ .name = "label", .value = .{ .text = entity.label } },
-                    .{ .name = "text", .value = .{ .text = entity.text } },
-                    .{ .name = "canonical_text", .value = .{ .text = entity.text } },
-                    .{ .name = "name_embedding", .value = if (entity.embedding) |emb| .{ .vector = emb } else .none },
-                };
-                const mention = matcher.Record{ .fields = mention_fields[0..if (entity.embedding != null) @as(usize, 4) else 3] };
-
+                var mention_fields: [6]matcher.Field = undefined;
+                const mention = mentionRecord(entity, &mention_fields);
                 var best_prob: f64 = -1;
                 var best: ?usize = null;
                 var best_outcome: matcher.Outcome = .no_match;
                 for (candidates, 0..) |cand, ci| {
                     if (self.type_must_match and !std.mem.eql(u8, cand.label, entity.label)) continue;
                     const r = if (cand.features) |features| scorer.scoreFeatures(features) else scorer.score(scratch, mention, cand.record);
-                    if (r.probability > best_prob) {
+                    if (r.probability > best_prob or (r.probability == best_prob and best != null and candidateBefore(cand, candidates[best.?]))) {
                         best_prob = r.probability;
                         best = ci;
                         best_outcome = r.outcome;
@@ -598,6 +607,7 @@ pub const Resolver = struct {
                         .doc_ref = try self.mintRef(a, entity),
                         .confidence = best_prob,
                         .decision = if (best_outcome == .review) .review else .new,
+                        .review_candidate = if (best_outcome == .review) bi else null,
                         .label = try a.dupe(u8, entity.label),
                         .canonical_name = try a.dupe(u8, entity.text),
                         .surface_form = try a.dupe(u8, entity.text),
@@ -964,6 +974,7 @@ pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedRe
             .label = if (o.get("label")) |v| try a.dupe(u8, jsonString(v) orelse "") else "",
             .canonical_name = canonical_name,
             .surface_form = surface_form,
+            .adjudication = if (o.get("adjudication")) |value| try std.json.parseFromSliceLeaky(adjudication.Evidence, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{ .allocate = .alloc_always }) else null,
         };
     }
     return .{ .arena = arena, .config_generation = config_generation, .entities = out };
@@ -1174,6 +1185,8 @@ fn parseExtractedEntityObject(a: std.mem.Allocator, o: std.json.ObjectMap, array
         .label = try a.dupe(u8, jsonString(o.get("label") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
         .text = try a.dupe(u8, jsonString(o.get("text") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
         .embedding = try parseEmbedding(a, o.get("embedding")),
+        .description = if (o.get("description")) |v| if (jsonString(v)) |text| try a.dupe(u8, text) else null else null,
+        .description_embedding = try parseEmbedding(a, o.get("description_embedding")),
         // "score" is the GLiNER extractor's spelling of the same measure.
         .confidence = switch (o.get("confidence") orelse o.get("score") orelse std.json.Value{ .float = 1.0 }) {
             .float => |f| f,
@@ -1502,14 +1515,258 @@ test "candidate vector fields transfer exact slice ownership and unwind allocati
     try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
 }
 
-fn mentionRecord(entity: ExtractedEntity, fields: *[4]matcher.Field) matcher.Record {
+fn candidateBefore(left: Candidate, right: Candidate) bool {
+    const table_order = std.mem.order(u8, left.doc_ref.table, right.doc_ref.table);
+    return table_order == .lt or (table_order == .eq and std.mem.order(u8, left.doc_ref.key, right.doc_ref.key) == .lt);
+}
+
+fn fingerprintHex(a: std.mem.Allocator, value: anytype) ![]const u8 {
+    const digest = try fingerprint(a, value);
+    return std.fmt.allocPrint(a, "{x}", .{&digest});
+}
+
+fn cloneResolvedEntity(a: std.mem.Allocator, entity: ResolvedEntity) !ResolvedEntity {
+    const raw = try std.json.Stringify.valueAlloc(a, entity, .{});
+    return try std.json.parseFromSliceLeaky(ResolvedEntity, a, raw, .{ .allocate = .alloc_always });
+}
+
+fn mentionRecord(entity: ExtractedEntity, fields: *[6]matcher.Field) matcher.Record {
     fields.* = .{
         .{ .name = "label", .value = .{ .text = entity.label } },
         .{ .name = "text", .value = .{ .text = entity.text } },
         .{ .name = "canonical_text", .value = .{ .text = entity.text } },
         .{ .name = "name_embedding", .value = if (entity.embedding) |v| .{ .vector = v } else .none },
+        .{ .name = "description", .value = if (entity.description) |v| .{ .text = v } else .none },
+        .{ .name = "description_embedding", .value = if (entity.description_embedding) |v| .{ .vector = v } else .none },
     };
-    return .{ .fields = fields[0..if (entity.embedding != null) @as(usize, 4) else 3] };
+    return .{ .fields = fields };
+}
+
+const adjudication_test_config =
+    \\{"decider":{"provider":"antfly","model":"fixture"},"template":"A: {{ m.text }} {{ m.description }} B: {{ c.canonical_name }} {{ c.description }}","question":{"type":"choice","name":"same","instructions":"Do these refer to the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"reject":{"choice":"different","min_probability":0.9}}
+;
+
+test "description cosine uses explicit vectors and never hydrates from the name ANN space" {
+    const a = testing.allocator;
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[{"name":"name","left":"m.name_embedding","right":"c.canonical_vector","levels":[{"when":"cosine > 0.9","weight":4},{"else":true,"weight":-4}]},{"name":"description","left":"m.description_embedding","right":"c.description_embedding","levels":[{"when":"cosine > 0.9","weight":4},{"else":true,"weight":0}]}],"decision":{"match":0.99,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    const fields = try resolver.candidateVectorFields(a);
+    defer a.free(fields);
+    try testing.expectEqual(@as(usize, 1), fields.len);
+    try testing.expectEqualStrings("canonical_vector", fields[0]);
+    const mention: ExtractedEntity = .{ .local_id = "e", .label = "concept", .text = "Antfly database", .embedding = &.{ 0, 1 }, .description_embedding = &.{ 1, 0 } };
+    const candidate: Candidate = .{
+        .doc_ref = .{ .table = "entities", .key = "concept/antfly" },
+        .label = "concept",
+        .record = .{ .fields = &.{
+            .{ .name = "canonical_vector", .value = .{ .vector = &.{ 0, 1 } } },
+            .{ .name = "description_embedding", .value = .{ .vector = &.{ 1, 0 } } },
+        } },
+    };
+    var matched = try resolver.resolve(a, 1, &.{mention}, &.{&.{candidate}});
+    defer matched.deinit();
+    try testing.expectEqual(Decision.match, matched.entities[0].decision);
+    var missing = mention;
+    missing.description_embedding = null;
+    var names_only = try resolver.resolve(a, 1, &.{missing}, &.{&.{candidate}});
+    defer names_only.deinit();
+    try testing.expectEqual(Decision.review, names_only.entities[0].decision);
+}
+const adjudication_test_response =
+    \\{"model":"fixture@revision","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.97},{"value":"different","probability":0.03}]}],"usage":{"input_tokens":9,"output_tokens":0}}
+;
+const AdjudicationFixture = struct {
+    calls: usize = 0,
+    candidate_calls: usize = 0,
+    fail: ?anyerror = null,
+    response: []const u8 = adjudication_test_response,
+    expected_input: ?[]const u8 = null,
+    fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: adjudication.Request) anyerror![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (self.expected_input) |expected| try testing.expectEqualStrings(expected, request.input);
+        if (self.fail) |err| return err;
+        return a.dupe(u8, self.response);
+    }
+    fn candidates(ptr: *anyopaque, a: std.mem.Allocator, _: ExtractedEntity, out: *std.ArrayListUnmanaged(Candidate)) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.candidate_calls += 1;
+        try out.append(a, .{ .doc_ref = .{ .table = "entities", .key = "concept/antfly" }, .label = "concept", .record = .{ .fields = &.{ .{ .name = "canonical_name", .value = .{ .text = "Antfly" } }, .{ .name = "description", .value = .{ .text = "A database" } } } } });
+    }
+    fn provider(self: *@This()) CandidateProvider {
+        return .{ .ptr = self, .vtable = &.{ .candidates_for = candidates } };
+    }
+    fn executor(self: *@This()) adjudication.Executor {
+        return .{ .ptr = self, .execute = execute };
+    }
+};
+
+test "REVIEW adjudication persists authoritative receipts without work caches" {
+    const a = testing.allocator;
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    const config = try adjudication.Config.parse(a, adjudication_test_config);
+    defer config.deinit();
+    var fixture: AdjudicationFixture = .{ .expected_input = "A: Antfly database An indexed store B: Antfly A database" };
+    var map: MapStore = .{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\",\"description\":\"An indexed store\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    const bytes = (try map.store().get(a, "resolution")).?;
+    defer a.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "_resolution_work") == null);
+    var result = try parseResolution(a, bytes);
+    defer result.deinit();
+    try testing.expectEqual(Decision.match, result.entities[0].decision);
+    try testing.expectEqualStrings("concept/antfly", result.entities[0].doc_ref.key);
+    try testing.expectEqual(adjudication.Status.accepted, result.entities[0].adjudication.?.status);
+    try testing.expect(result.entities[0].confidence < 0.9); // preserve deterministic score
+    // Reopen-equivalent: a new stage with no executor or candidate provider uses
+    // only the durable artifact, even after destination state has changed.
+    stage.adjudicator = null;
+    try testing.expectEqual(RunResult.unchanged, try stage.run(a, map.store(), null, "source", "resolution"));
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+    try testing.expectEqual(@as(usize, 1), fixture.candidate_calls);
+    // A deliberate generation change makes new evidence, and committed failure
+    // is itself replay stable rather than a random identity flip on retry.
+    stage.config_generation = 2;
+    stage.adjudicator = fixture.executor();
+    fixture.fail = error.Timeout;
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqual(RunResult.unchanged, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 2), fixture.calls);
+    const failed = (try map.store().get(a, "resolution")).?;
+    defer a.free(failed);
+    var failure = try parseResolution(a, failed);
+    defer failure.deinit();
+    try testing.expectEqual(Decision.review, failure.entities[0].decision);
+    try testing.expectEqualStrings("Timeout", failure.entities[0].adjudication.?.failure.?);
+    stage.config_generation += 1;
+    stage.adjudicate.?.on_failure = .mint;
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    const minted = (try map.store().get(a, "resolution")).?;
+    defer a.free(minted);
+    var explicit_fallback = try parseResolution(a, minted);
+    defer explicit_fallback.deinit();
+    try testing.expectEqual(Decision.new, explicit_fallback.entities[0].decision);
+    try testing.expectEqual(adjudication.Status.failed, explicit_fallback.entities[0].adjudication.?.status);
+}
+
+test "REVIEW adjudication abstains rejects bounds work and propagates cancellation" {
+    const a = testing.allocator;
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    const config = try adjudication.Config.parse(a, adjudication_test_config);
+    defer config.deinit();
+    var fixture: AdjudicationFixture = .{ .response =
+        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","probabilities":[{"value":"same","probability":0.4},{"value":"different","probability":0.6}]}]}
+    };
+    var map: MapStore = .{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"},{\"id\":\"f\",\"label\":\"concept\",\"text\":\"Another database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor() };
+    stage.adjudicate.?.max_pairs = 1;
+    const raw = (try stage.computeAlloc(a, map.store(), fixture.provider(), "source")).?;
+    defer a.free(raw);
+    var result = try parseResolution(a, raw);
+    defer result.deinit();
+    try testing.expectEqual(Decision.review, result.entities[0].decision);
+    try testing.expectEqual(adjudication.Status.abstained, result.entities[0].adjudication.?.status);
+    try testing.expectEqual(adjudication.Status.budget_exhausted, result.entities[1].adjudication.?.status);
+    fixture.response =
+        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","probabilities":[{"value":"same","probability":0.02},{"value":"different","probability":0.98}]}]}
+    ;
+    const rejected = (try stage.computeAlloc(a, map.store(), fixture.provider(), "source")).?;
+    defer a.free(rejected);
+    var rejection = try parseResolution(a, rejected);
+    defer rejection.deinit();
+    try testing.expectEqual(Decision.new, rejection.entities[0].decision);
+    fixture.fail = error.Cancelled;
+    try testing.expectError(error.Cancelled, stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expect(map.map.get("resolution") == null);
+    // Definitive deterministic bands never execute the model.
+    fixture.fail = null;
+    const calls = fixture.calls;
+    for ([_]f64{ 10, -10 }) |bias| {
+        resolver.scorer.?.bias = bias;
+        const deterministic = (try stage.computeAlloc(a, map.store(), fixture.provider(), "source")).?;
+        a.free(deterministic);
+    }
+    try testing.expectEqual(calls, fixture.calls);
+}
+
+test "REVIEW candidate proposals break ties independently of provider order" {
+    const a = testing.allocator;
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    const left: Candidate = .{ .doc_ref = .{ .table = "entities", .key = "concept/a" }, .label = "concept", .record = .{ .fields = &.{} } };
+    var right = left;
+    right.doc_ref.key = "concept/z";
+    const mention: ExtractedEntity = .{ .local_id = "e", .label = "concept", .text = "Antfly" };
+    const forward = [_]Candidate{ left, right };
+    const reverse = [_]Candidate{ right, left };
+    for ([_][]const Candidate{ &forward, &reverse }) |candidates| {
+        var result = try resolver.resolve(a, 1, &.{mention}, &.{candidates});
+        defer result.deinit();
+        const selected = result.entities[0].review_candidate.?;
+        try testing.expectEqualStrings("concept/a", candidates[selected].doc_ref.key);
+    }
+}
+
+test "REVIEW adjudication descriptions overrides and full work replay retain identity" {
+    const a = testing.allocator;
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    const config = try adjudication.Config.parse(a, adjudication_test_config);
+    defer config.deinit();
+    var fixture: AdjudicationFixture = .{ .expected_input = "A: Antfly database External description B: Antfly A database" };
+    var map: MapStore = .{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .mention_descriptions_json = "{\"e\":\"External description\"}" };
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqual(RunResult.unchanged, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+    stage.mention_descriptions_json = "{\"e\":\"Changed description\"}";
+    fixture.expected_input = "A: Antfly database Changed description B: Antfly A database";
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 2), fixture.calls);
+    stage.sibling_resolutions_json = "{\"participant\":{\"table\":\"entities\",\"key\":\"concept/canonical\"}}";
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 3), fixture.calls);
+    var curator: FixedOverride = .{ .local_id = "e", .override = .{ .decision = .match, .table = "entities", .key = "concept/curated" } };
+    stage.overrides = curator.provider();
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 3), fixture.calls);
+    const raw = (try map.store().get(a, "resolution")).?;
+    defer a.free(raw);
+    var result = try parseResolution(a, raw);
+    defer result.deinit();
+    try testing.expectEqualStrings("concept/curated", result.entities[0].doc_ref.key);
+    try testing.expect(result.entities[0].adjudication == null);
+    // A changed source/candidate during a slow call retries without publishing.
+    stage.overrides = null;
+    stage.config_generation += 1;
+    stage.candidate_validator = .{ .ptr = &fixture, .validate = struct {
+        fn validate(_: *anyopaque, _: std.mem.Allocator, _: Candidate) anyerror!void {
+            return error.Busy;
+        }
+    }.validate };
+    try testing.expectError(error.Busy, stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    const unchanged = (try map.store().get(a, "resolution")).?;
+    defer a.free(unchanged);
+    try testing.expectEqualStrings(raw, unchanged);
 }
 
 /// One resolution replay stage: read a changed extraction artifact, resolve its
@@ -1520,10 +1777,24 @@ fn mentionRecord(entity: ExtractedEntity, fields: *[4]matcher.Field) matcher.Rec
 /// (class `.maintenance`, keyed by the shard's owner id) and submits it on the
 /// shard's `BackendRuntime.durable_jobs` lane; crash recovery is the normal
 /// replay path (the change journal re-emits the extraction artifact key).
+pub const CandidateValidator = struct {
+    ptr: *anyopaque,
+    validate: *const fn (*anyopaque, std.mem.Allocator, Candidate) anyerror!void,
+};
+
 pub const ResolutionStage = struct {
     doc_ref_binding: ?struct { ptr: *anyopaque, bind: *const fn (*anyopaque, []const u8) anyerror!?[]const u8 } = null,
     resolver: *const Resolver,
     config_generation: u64,
+    adjudicate: ?adjudication.Config = null,
+    adjudicator: ?adjudication.Executor = null,
+    candidate_validator: ?CandidateValidator = null,
+    now_ns: ?*const fn () u64 = null,
+    /// A sibling asset mapping local mention ids to descriptions, read under the
+    /// source transaction/read set. No producer is awaited from resolution.
+    mention_descriptions_json: ?[]const u8 = null,
+    /// Covers the full execution contract, including scorer and input bindings.
+    execution_dependency: []const u8 = "",
     /// A destination/model revision and blocking/index revision supplied by the
     /// runtime. Null forbids reuse for that stage (remote sources may lack a
     /// snapshot-wide revision). Neither is the resolver generation.
@@ -1587,6 +1858,21 @@ pub const ResolutionStage = struct {
         // sibling resolver that owns those labels resolves them from the same
         // extraction artifact into its own resolution artifact.
         parsed.entities = self.resolver.filterEntitiesByLabel(parsed.entities);
+        if (self.adjudicate != null) {
+            var ids: std.StringHashMapUnmanaged(void) = .empty;
+            for (parsed.entities) |entity| {
+                const slot = try ids.getOrPut(parsed.arena.allocator(), entity.local_id);
+                if (slot.found_existing) return error.InvalidExtraction;
+            }
+        }
+        if (self.mention_descriptions_json) |raw| {
+            const descriptions = try std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), raw, .{ .allocate = .alloc_always });
+            if (descriptions != .object) return error.InvalidAdjudicationDescriptions;
+            for (parsed.entities) |*entity| if (descriptions.object.get(entity.local_id)) |description| {
+                if (description != .string) return error.InvalidAdjudicationDescriptions;
+                entity.description = description.string;
+            };
+        }
 
         // Reject only the unkeyable mention before blocking; keep its siblings.
         // Invalid templates and resource failures still fail the operation.
@@ -1609,6 +1895,26 @@ pub const ResolutionStage = struct {
         parsed.entities = parsed.entities[0..kept];
 
         const arena = parsed.arena.allocator();
+        const receipt_hash = if (self.adjudicate) |config| try fingerprintHex(arena, .{ self.config_generation, self.execution_dependency, config, extraction.?, self.mention_descriptions_json, self.sibling_resolutions_json }) else "";
+        const receipts = if (self.adjudicate != null and existing != null) try parseResolution(gpa, existing.?) else null;
+        defer if (receipts) |value| {
+            var owner = value;
+            owner.deinit();
+        };
+        const reused = try arena.alloc(?ResolvedEntity, parsed.entities.len);
+        for (parsed.entities, 0..) |entity, i| {
+            reused[i] = null;
+            if (alias_mask[i] or (if (self.overrides) |overrides| overrides.overrideFor(entity.local_id) != null else false)) continue;
+            if (receipts) |prior_resolution| {
+                if (prior_resolution.config_generation != self.config_generation) continue;
+                for (prior_resolution.entities) |prior_entity| {
+                    if (!std.mem.eql(u8, prior_entity.local_id, entity.local_id)) continue;
+                    if (prior_entity.adjudication) |evidence| {
+                        if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, receipt_hash)) reused[i] = prior_entity;
+                    }
+                }
+            }
+        }
         const previous: ?WorkCache = cache: {
             const raw = existing orelse break :cache null;
             const root = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch |err| switch (err) {
@@ -1636,7 +1942,7 @@ pub const ResolutionStage = struct {
         const prior = try arena.alloc(?MentionWork, kept);
         for (parsed.entities, 0..) |entity, i| {
             prior[i] = previous_mentions.get(entity.local_id) orelse null;
-            work[i] = .{ .local_id = entity.local_id, .embedding_input = try fingerprint(arena, entity.text), .embedding_dependency = self.embedding_dependency };
+            work[i] = if (reused[i] != null and prior[i] != null) prior[i].? else .{ .local_id = entity.local_id, .embedding_input = try fingerprint(arena, entity.text), .embedding_dependency = self.embedding_dependency };
         }
 
         // Backfill name embeddings for mentions that arrived without one, using
@@ -1644,7 +1950,7 @@ pub const ResolutionStage = struct {
         // non-fatal: the mention simply scores without a vector.
         if (if (self.resolver.scorer != null) self.embedder else null) |embedder| {
             for (parsed.entities, 0..) |*entity, i| {
-                if (alias_mask[i] or entity.embedding != null or entity.text.len == 0) continue;
+                if (alias_mask[i] or reused[i] != null or entity.embedding != null or entity.text.len == 0) continue;
                 const cache_key: ?[32]u8 = if (self.embedding_dependency) |dependency| try fingerprint(arena, .{ dependency, work[i].embedding_input }) else null;
                 if (self.embedding_cache) |cache| if (cache_key) |key| {
                     if (cache.get(cache.ptr, arena, key) catch null) |vector| {
@@ -1681,6 +1987,7 @@ pub const ResolutionStage = struct {
             var pending: std.ArrayListUnmanaged(ExtractedEntity) = .empty;
             var indices: std.ArrayListUnmanaged(usize) = .empty;
             for (parsed.entities, 0..) |entity, i| {
+                if (reused[i] != null) continue;
                 work[i].embedding = entity.embedding;
                 if (alias_mask[i]) continue;
                 if (self.candidate_dependency) |dep| work[i].candidate_dependency = try fingerprint(a, .{ dep, entity });
@@ -1708,9 +2015,10 @@ pub const ResolutionStage = struct {
         // input fields participate in a feature digest. New/deleted candidates
         // and changed vectors cannot borrow another candidate's work.
         for (parsed.entities, 0..) |entity, i| {
+            if (reused[i] != null) continue;
             const candidates = try a.dupe(Candidate, lists[i]);
             if (self.resolver.scorer) |*scorer| {
-                var fields: [4]matcher.Field = undefined;
+                var fields: [6]matcher.Field = undefined;
                 const mention = mentionRecord(entity, &fields);
                 for (candidates) |*candidate| {
                     var old_features: []const matcher.Feature = &.{};
@@ -1736,11 +2044,20 @@ pub const ResolutionStage = struct {
         defer resolution.deinit();
         resolution.skipped_mentions += admitted_count - kept;
 
+        // Committed model verdicts survive optional-cache eviction and destination
+        // changes. Only a new execution/source identity explicitly re-resolves them.
+        const result_arena = resolution.arena.allocator();
+        for (@constCast(resolution.entities), 0..) |*entity, i| {
+            if (reused[i]) |receipt| {
+                entity.* = try cloneResolvedEntity(result_arena, receipt);
+            }
+        }
+        if (self.adjudicate) |config| try self.adjudicateReviews(result_arena, config, &resolution, parsed.entities, lists, reused, receipt_hash);
+
         // Apply human-curation overrides: a reviewed mention takes the curator's
         // decision and endpoint (strings copied into the resolution arena so they
         // outlive the override provider).
         if (self.overrides) |ov| {
-            const result_arena = resolution.arena.allocator();
             const ents = @constCast(resolution.entities);
             for (ents) |*e| {
                 const o = ov.overrideFor(e.local_id) orelse continue;
@@ -1754,6 +2071,7 @@ pub const ResolutionStage = struct {
 
         if (self.doc_ref_binding) |binding| {
             for (@constCast(resolution.entities)) |*entity| {
+                if (entity.doc_ref.storage_table != null) continue;
                 if (try binding.bind(binding.ptr, entity.doc_ref.table)) |physical| {
                     entity.doc_ref.storage_table = try resolution.arena.allocator().dupe(u8, physical);
                 }
@@ -1768,6 +2086,129 @@ pub const ResolutionStage = struct {
             resolution.work = .{ .mentions = work, .promotion_enabled = self.promotion_enabled };
         }
         return try resolution.toJson(gpa);
+    }
+
+    fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, execution_hash: []const u8) !void {
+        const specification = try config.producerSpecification(a);
+        const specification_hash = try fingerprintHex(a, config);
+        var calls: u32 = 0;
+        const deadline = if (self.now_ns) |now| now() + @as(u64, config.budget_ms) * std.time.ns_per_ms else null;
+        for (@constCast(resolution.entities), 0..) |*entity, i| {
+            if (entity.decision != .review or reused[i] != null) continue;
+            if (self.overrides) |overrides| if (overrides.overrideFor(entity.local_id) != null) continue;
+            const mention = mentions[i];
+            // The pure scorer supplies the proposal. Adjudication cannot choose
+            // a different candidate or turn an integrity REVIEW into a match.
+            const selected = entity.review_candidate orelse continue;
+            const candidate = lists[i][selected];
+            const best_probability = entity.confidence;
+            // Operational redirect reviews cannot be adjudicated into valid links.
+            if (recordTextField(candidate.record, "merged_into") != null and candidate.resolved_record == null) continue;
+            const canonical_record = candidate.resolved_record orelse candidate.record;
+            const target = candidate.resolved_doc_ref orelse candidate.doc_ref;
+            var candidate_description = recordTextField(canonical_record, "description");
+            var description_observed = false;
+            const within_budget = calls < config.max_pairs and (if (deadline) |end| self.now_ns.?() < end else true);
+            if (within_budget) if (config.description_inputs.candidate_artifact) |artifact| {
+                if (self.adjudicator) |executor| if (executor.get_description) |get| {
+                    description_observed = true;
+                    if (try get(executor.ptr, a, target.table, target.key, artifact)) |raw| {
+                        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .allocate = .alloc_always });
+                        if (value != .string) return error.InvalidAdjudicationDescriptions;
+                        candidate_description = value.string;
+                    }
+                };
+            };
+            const inputs: adjudication.Inputs = .{ .mention = mention.text, .label = mention.label, .mention_description = mention.description, .candidate = recordTextField(canonical_record, "canonical_name") orelse mention.text, .candidate_label = candidate.label, .candidate_description = candidate_description };
+            var evidence: adjudication.Evidence = .{
+                .execution_hash = execution_hash,
+                .specification_hash = specification_hash,
+                .input_hash = try fingerprintHex(a, inputs),
+                .candidate_table = try a.dupe(u8, target.table),
+                .candidate_key = try a.dupe(u8, target.key),
+                .candidate_hash = try fingerprintHex(a, candidate),
+                .deterministic_probability = best_probability,
+                .status = .failed,
+            };
+            execute: {
+                var timeout_ms = config.timeout_ms;
+                if (deadline) |end| {
+                    const now = self.now_ns.?();
+                    if (now >= end) {
+                        evidence.status = .budget_exhausted;
+                        break :execute;
+                    }
+                    timeout_ms = @intCast(@min(timeout_ms, @max(1, (end - now) / std.time.ns_per_ms)));
+                }
+                if (calls >= config.max_pairs) {
+                    evidence.status = .budget_exhausted;
+                    break :execute;
+                }
+                const input = inputs.render(a, config) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        evidence.failure = @errorName(err);
+                        break :execute;
+                    },
+                };
+                const executor = self.adjudicator orelse {
+                    evidence.failure = "MissingAdjudicator";
+                    break :execute;
+                };
+                calls += 1;
+                const raw = executor.execute(executor.ptr, a, .{ .specification_json = specification, .input = input, .source_fingerprint = evidence.input_hash, .timeout_ms = timeout_ms }) catch |err| switch (err) {
+                    error.OutOfMemory, error.Cancelled, error.Canceled, error.Busy, error.WriterLocked, error.PromotionWriterFenceReleased => return err,
+                    else => {
+                        evidence.failure = @errorName(err);
+                        break :execute;
+                    },
+                };
+                if (raw.len > 1024 * 1024) {
+                    evidence.failure = "AdjudicationResponseTooLarge";
+                    break :execute;
+                }
+                const response = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        evidence.failure = "InvalidAdjudicationOutput";
+                        break :execute;
+                    },
+                };
+                evidence.status = adjudication.classify(a, config, response) catch |err| {
+                    evidence.failure = @errorName(err);
+                    break :execute;
+                };
+                evidence.response = response;
+            }
+            if (self.candidate_validator) |validator| try validator.validate(validator.ptr, a, candidate);
+            // A generated description can change without a primary-document
+            // revision. Re-read the selected asset after inference as well.
+            if (description_observed) if (config.description_inputs.candidate_artifact) |artifact| {
+                if (self.adjudicator) |executor| if (executor.get_description) |get| {
+                    const current = try get(executor.ptr, a, target.table, target.key, artifact);
+                    const value: ?[]const u8 = if (current) |raw| blk: {
+                        const parsed_value = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+                        if (parsed_value != .string) return error.InvalidAdjudicationDescriptions;
+                        break :blk parsed_value.string;
+                    } else recordTextField(canonical_record, "description");
+                    if ((value == null) != (candidate_description == null)) return error.Busy;
+                    if (value != null and !std.mem.eql(u8, value.?, candidate_description.?)) return error.Busy;
+                };
+            };
+            switch (evidence.status) {
+                .accepted => {
+                    entity.decision = .match;
+                    entity.doc_ref = .{ .table = try a.dupe(u8, target.table), .key = try a.dupe(u8, target.key) };
+                    entity.canonical_name = try a.dupe(u8, inputs.candidate);
+                },
+                .rejected => entity.decision = .new,
+                .failed, .budget_exhausted => if (config.on_failure == .mint) {
+                    entity.decision = .new;
+                },
+                .abstained => {},
+            }
+            entity.adjudication = evidence;
+        }
     }
 
     fn hydrateCachedCandidates(self: ResolutionStage, a: std.mem.Allocator, cached: []const Candidate) !?[]const Candidate {

@@ -31,7 +31,7 @@ pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
 
 /// Read-only candidate seam also used by ephemeral query resolution.
 pub fn candidateSource(handle: *h.Handle) callbacks.CandidateSource {
-    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .revisions = candidateRevisions, .embedding_cache_prepare = embeddingCachePrepare, .embedding_cache_flush = embeddingCacheFlush, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
+    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .adjudicate = adjudicate, .get_description = getDescription, .revisions = candidateRevisions, .embedding_cache_prepare = embeddingCachePrepare, .embedding_cache_flush = embeddingCacheFlush, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
 }
 
 fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, index: []const u8, embedding: []const u8) anyerror!callbacks.CandidateSource.Revisions {
@@ -429,6 +429,39 @@ pub fn collectEmbeddingCache(root: *h.Handle, force: bool) !void {
     defer root.alloc.free(usage);
     try write.put(embedding_cache_bytes_key, usage);
     try write.commit();
+}
+
+fn getDescription(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8) anyerror!?[]u8 {
+    const handle: *h.Handle = @ptrCast(@alignCast(ptr));
+    const database = try tables.get(handle, table);
+    const field = try std.fmt.allocPrint(a, "_artifacts.{s}", .{artifact});
+    defer a.free(field);
+    var row = (try database.lookup(a, key, .{ .fields = &.{field}, .include_all_fields = false })) orelse return null;
+    defer row.deinit(a);
+    return @import("../functions/resolver_adjudication.zig").projectedDescription(a, row.json, artifact);
+}
+
+fn adjudicate(ptr: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
+    const handle: *h.Handle = @ptrCast(@alignCast(ptr));
+    const database = handle.database();
+    const io = database.backend_runtime.io() orelse return error.MissingAdjudicator;
+    // The ordinary asset producer owns provider policy, credentials, local model
+    // routing and deadline propagation. No resolver-specific provider client.
+    const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+    handle.query_producer_mutex.lockUncancelable(io);
+    const cached = if (handle.query_producer) |runtime| runtime.producer() else null;
+    handle.query_producer_mutex.unlock(io);
+    if (cached) |producer| return producer.withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
+    if (database.enrichment_runtime) |runtime| if (runtime.config.asset_producer) |producer| {
+        return producer.withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
+    };
+    handle.query_producer_mutex.lockUncancelable(io);
+    const producer = blk: {
+        defer handle.query_producer_mutex.unlock(io);
+        if (handle.query_producer == null) handle.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() });
+        break :blk handle.query_producer.?.producer();
+    };
+    return producer.withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
 }
 
 fn embedMention(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
@@ -1427,6 +1460,86 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     for (readonly_entities) |entity| try std.testing.expectEqualStrings("new", entity.object.get("decision").?.string);
 }
 
+test "capi resolver REVIEW adjudication publishes promotes queries and reopens durable evidence" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    const producer = @import("../storage/db/enrichment/asset_producer.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        fn memory(_: *anyopaque, _: std.mem.Allocator, _: []const producer.Request) !@import("antfly_inference_work").InvocationMemoryPlan {
+            return .{ .attachment_transport = .data_uri, .fixed_bytes = 1 << 20, .allocator_limit_bytes = 1 << 20, .max_result_bytes_per_item = 1 << 20, .max_result_bytes = 1 << 20 };
+        }
+        fn produce(ptr: *anyopaque, alloc: std.mem.Allocator, request: producer.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.producer_type == .copy) return alloc.dupe(u8, request.source_text);
+            try std.testing.expectEqual(producer.ProducerType.decision, request.producer_type);
+            try std.testing.expect(std.mem.indexOf(u8, request.source_text, "Antfly database") != null);
+            self.calls += 1;
+            return alloc.dupe(u8,
+                \\{"model":"fixture@revision","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.98},{"value":"different","probability":0.02}]}],"usage":{"input_tokens":8,"output_tokens":0}}
+            );
+        }
+    };
+    var fixture: Fixture = .{};
+    var tmp = try api.TestDirectory.init("review-adjudication");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .hosted, .externally_locked = true }, true, null, null);
+    var opened = true;
+    defer if (opened) h.closeHandle(handle);
+    try tables.create(handle, "entities", "{}", false);
+    const entities = try tables.get(handle, "entities");
+    try entities.addEnrichment(.{ .name = "description_text", .kind = .asset, .field = "description", .content_type = "text/plain" });
+    try entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
+    try entities.batch(.{ .writes = &.{.{ .key = "concept/antfly", .value = "{\"entity_type\":\"concept\",\"canonical_name\":\"Antfly\",\"description\":\"A database\"}" }} });
+    try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = Fixture.memory } } });
+    const policy =
+        \\{"decider":{"provider":"antfly","model":"fixture"},"template":"A: {{m.text}} {{m.description}} B: {{c.canonical_name}} {{c.description}}","question":{"type":"choice","name":"same","instructions":"Do these refer to the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"description_inputs":{"candidate_artifact":"description_text"}}
+    ;
+    const declaration = try std.fmt.allocPrint(a,
+        \\{{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{{{ uslug _entity.text }}}}","candidate_search":"prefix","scorer":{{"comparisons":[],"combine":{{"bias":1}},"decision":{{"match":0.95,"review":0.6}}}},"adjudicate":{s}}}
+    , .{policy});
+    defer a.free(declaration);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, declaration, .{});
+    defer parsed.deinit();
+    const config = try h.db_mod.ResolverConfig.parseValue(a, parsed.value);
+    defer config.deinit();
+    try handle.db.addResolver(config.value);
+    try handle.db.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "kg", .content_type = "application/json" });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"kg\":{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\",\"description\":\"An indexed database\"}]}}" }} });
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    const description = (try candidateSource(handle).getDescription(a, "entities", "concept/antfly", "description_text")) orelse return error.TestUnexpectedResult;
+    defer a.free(description);
+    try std.testing.expectEqualStrings("\"A database\"", description);
+    try std.testing.expect((try entities.lookup(a, "concept/antfly_database", .{})) == null);
+    var canonical = (try entities.lookup(a, "concept/antfly", .{})).?;
+    defer canonical.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, canonical.json, "Antfly database") != null); // promoted alias
+    const query = try @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionAlloc(a, &.{config.value}, &config.value,
+        \\{"entities":[{"id":"q","label":"concept","text":"Antfly database"}]}
+    , candidateSource(handle), null);
+    defer a.free(query);
+    try std.testing.expect(std.mem.indexOf(u8, query, "concept/antfly\"") != null);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
+    try std.testing.expectEqual(catalog.adjudication_reader_version, handle.db.core.index_manager.minimum_reader_version.load(.acquire));
+    const resolution_key = try @import("../storage/internal_keys.zig").resolutionArtifactKeyAlloc(a, "source", "resolved");
+    defer a.free(resolution_key);
+    const before = try handle.db.core.store.get(a, resolution_key);
+    defer a.free(before);
+    h.closeHandle(handle);
+    opened = false;
+    const reopened = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .hosted, .externally_locked = true }, false, null, null);
+    defer h.closeHandle(reopened);
+    try runUntilIdle(reopened);
+    const after = try reopened.db.core.store.get(a, resolution_key);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
 test "capi resolver render and merge rekey existing edges without entity promotion" {
     const api = @import("db.zig");
     const a = std.testing.allocator;
@@ -1616,14 +1729,21 @@ test "capi resolver config merge config advances revisions and protects key name
 }
 
 test "capi native text queries overlap writer commits and retain retired providers" {
-    try testNativeTextQueryConcurrentCommit(false);
+    try testNativeTextQueryConcurrentCommit(false, false);
 }
 
 test "capi native text queries return busy after a concurrent merge" {
-    try testNativeTextQueryConcurrentCommit(true);
+    try testNativeTextQueryConcurrentCommit(true, false);
 }
 
-fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
+test "capi resolver REVIEW adjudication queries overlap writers" {
+    try testNativeTextQueryConcurrentCommit(false, true);
+}
+test "capi resolver REVIEW adjudication queries reject concurrent merges" {
+    try testNativeTextQueryConcurrentCommit(true, true);
+}
+
+fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: bool) !void {
     const api = @import("db.zig");
     const extracting = @import("antfly_extracting");
     const managed = @import("../inference/managed_embedder.zig");
@@ -1639,6 +1759,14 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
             try self.release.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } });
             return .{ .allocator = alloc, .json = try alloc.dupe(u8, "{\"object\":\"extraction\",\"model\":\"test-extractor\",\"data\":[{\"entities\":[{\"text\":\"Antfly\",\"label\":\"company\"}],\"relations\":[]}]}") };
         }
+        fn decide(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?managed.RequestContext) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.entered.fetchAdd(1, .acq_rel) == 1) self.both_entered.set(h.handleLockIo());
+            try self.release.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } });
+            return alloc.dupe(u8,
+                \\{"model":"test-decision","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","confidence":0.98,"confidence_method":"max_probability","probabilities":[{"value":"same","probability":0.98},{"value":"different","probability":0.02}]}],"usage":{"input_tokens":8,"output_tokens":0}}
+            );
+        }
         fn embedDense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
             return error.TestUnexpectedResult;
         }
@@ -1648,13 +1776,21 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
     };
     const Query = struct {
         id: ?*anyopaque,
+        adjudication: bool = false,
         code: h.capi.ErrorCode = .internal,
         done: std.Io.Event = .unset,
+        response: [2048]u8 = undefined,
+        response_len: usize = 0,
         fn run(self: *@This()) void {
             defer self.done.set(h.handleLockIo());
             var result: h.capi.Buffer = .{};
             defer api.antfly_buffer_free(&result);
-            self.code = api.antfly_db_resolve_query_json(self.id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Antfly\"}"), &result);
+            const request = if (self.adjudication) "{\"extraction\":{\"entities\":[{\"id\":\"q\",\"label\":\"company\",\"text\":\"Antfly database\"}]}}" else "{\"text\":\"Antfly\"}";
+            self.code = api.antfly_db_resolve_query_json(self.id, .fromSlice("concepts"), .fromSlice(request), &result);
+            if (result.ptr) |bytes| {
+                self.response_len = @min(result.len, self.response.len);
+                @memcpy(self.response[0..self.response_len], bytes[0..self.response_len]);
+            }
         }
     };
     const Writer = struct {
@@ -1683,7 +1819,38 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
     const config =
         \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly","model":"test-extractor","schema":{"entities":["company"]}}}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","promote":false,"source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ uslug _entity.text }}","config_generation":1}]}
     ;
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(writer, .fromSlice(config)));
+    const admitted_config = if (adjudication_mode) blk: {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, config, .{});
+        const resolver = &value.object.getPtr("resolvers").?.array.items[0];
+        try resolver.object.put(scratch, "table", .{ .string = "entities" });
+        try resolver.object.put(scratch, "candidate_search", .{ .string = "prefix" });
+        try resolver.object.put(scratch, "scorer", try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+            \\{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}
+        , .{}));
+        try resolver.object.put(scratch, "adjudicate", try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+            \\{"decider":{"provider":"antfly","model":"test-decision"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+        , .{}));
+        break :blk try std.json.Stringify.valueAlloc(a, value, .{});
+    } else try a.dupe(u8, config);
+    defer a.free(admitted_config);
+    var entities: ?*anyopaque = null;
+    defer api.antfly_db_close(entities);
+    if (adjudication_mode) {
+        // Canonical candidates are not source documents. Keeping them in their
+        // own table also prevents background extraction retries from refreshing
+        // the provider snapshot before the concurrent queries have entered it.
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_create_table_json(writer, .fromSlice("entities"), .fromSlice("{}")));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(writer, .fromSlice("entities"), &entities));
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(writer, .fromSlice(admitted_config)));
+    if (adjudication_mode) {
+        var result: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free(&result);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(entities, .fromSlice("{\"inserts\":{\"concept/antfly\":{\"entity_type\":\"company\",\"canonical_name\":\"Antfly\"}}}"), &result));
+    }
     var sql_output: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&sql_output);
     for ([_][]const u8{
@@ -1715,19 +1882,24 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
         try std.testing.expectEqual(@as(?h.capi.ErrorCode, null), setup.entry_error);
         const snapshot = setup.handle;
         snapshot.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(snapshot.alloc, snapshot.database().backend_runtime.io().?, .{
-            .antfly_provider = managed.AntflyProvider{ .ptr = &state, .owns_invocation_admission = true, .embed_dense_texts = State.embedDense, .embed_sparse_texts = State.embedSparse, .extract = State.extract },
+            .antfly_provider = managed.AntflyProvider{ .ptr = &state, .owns_invocation_admission = true, .embed_dense_texts = State.embedDense, .embed_sparse_texts = State.embedSparse, .extract = State.extract, .decide_json = State.decide },
         });
         break :blk snapshot;
     };
-    var first: Query = .{ .id = reader };
-    var second: Query = .{ .id = reader };
+    var first: Query = .{ .id = reader, .adjudication = adjudication_mode };
+    var second: Query = .{ .id = reader, .adjudication = adjudication_mode };
     const first_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Query.run, .{&first});
     defer first_thread.join();
     defer state.release.set(h.handleLockIo());
     const second_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Query.run, .{&second});
     defer second_thread.join();
     defer state.release.set(h.handleLockIo());
-    try state.both_entered.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    state.both_entered.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } }) catch |err| {
+        std.debug.print("query provider calls: {d}\n", .{state.entered.load(.acquire)});
+        if (first.done.isSet()) std.debug.print("first query: {s} {s}\n", .{ @tagName(first.code), first.response[0..first.response_len] });
+        if (second.done.isSet()) std.debug.print("second query: {s} {s}\n", .{ @tagName(second.code), second.response[0..second.response_len] });
+        return err;
+    };
     var write: Writer = .{ .id = writer, .state = &state, .change_config = change_config };
     const writer_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Writer.run, .{&write});
     defer writer_thread.join();

@@ -8326,6 +8326,96 @@ pub const DateRangeStringQuery = struct {
     }
 };
 
+pub const DeciderConfig = struct {
+    provider: []const u8,
+    /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+    decision_method: ?[]const u8 = null,
+    /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
+    model: ?[]const u8 = null,
+    /// Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
+    model_identity: ?[]const u8 = null,
+    /// EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
+    embedding_options: ?std.json.Value = null,
+    /// Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
+    url: ?[]const u8 = null,
+    /// API key or secret reference. Defaults to the provider environment variable.
+    api_key: ?[]const u8 = null,
+    max_rows: ?i64 = null,
+    max_input_tokens: ?i64 = null,
+    rate_limit: ?RateLimitConfig = null,
+    batch_size: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "decision_method", "decision_method", true },
+        .{ "model", "model", true },
+        .{ "model_identity", "model_identity", true },
+        .{ "embedding_options", "embedding_options", true },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "max_rows", "max_rows", true },
+        .{ "max_input_tokens", "max_input_tokens", true },
+        .{ "rate_limit", "rate_limit", true },
+        .{ "batch_size", "batch_size", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.decision_method) |value| {
+            try jw.objectField("decision_method");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
+            try jw.write(value);
+        }
+        if (self.embedding_options) |value| {
+            try jw.objectField("embedding_options");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.max_rows) |value| {
+            try jw.objectField("max_rows");
+            try jw.write(value);
+        }
+        if (self.max_input_tokens) |value| {
+            try jw.objectField("max_input_tokens");
+            try jw.write(value);
+        }
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DecisionBatchItem = struct {
     input_index: i64,
     id: ?[]const u8 = null,
@@ -20529,6 +20619,98 @@ pub const GraphRelationshipPropertyPredicate = struct {
     }
 };
 
+pub const GraphResolverAdjudicationAcceptance = struct {
+    /// A choice identifier in the configured question. Accept and reject must differ.
+    choice: []const u8,
+    /// Require this typed probability and a strict majority. Raw cosine is not a probability.
+    min_probability: f64,
+};
+
+/// Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges.
+pub const GraphResolverAdjudicationConfig = struct {
+    /// Frozen provider configuration. Requires decision_method=typed.
+    decider: DeciderConfig,
+    /// Bounded interpolation of m.text, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
+    template: []const u8,
+    question: ChoiceDecisionQuestion,
+    accept: GraphResolverAdjudicationAcceptance,
+    /// Optional confident negative choice. Without it, non-acceptance stays REVIEW.
+    reject: ?GraphResolverAdjudicationAcceptance = null,
+    /// Failure or budget fallback. REVIEW remains unpromoted; mint explicitly permits a new identity.
+    on_failure: ?[]const u8 = null,
+    /// Optional asset bindings. Resolution reads available data without waiting for promotion or producers.
+    description_inputs: ?std.json.Value = null,
+    /// Total model-time budget per source artifact. Each call also obeys timeout_ms.
+    budget_ms: ?i64 = null,
+    max_pairs: ?i64 = null,
+    max_input_bytes: ?i64 = null,
+    timeout_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "decider", "decider", false },
+        .{ "template", "template", false },
+        .{ "question", "question", false },
+        .{ "accept", "accept", false },
+        .{ "reject", "reject", true },
+        .{ "on_failure", "on_failure", true },
+        .{ "description_inputs", "description_inputs", true },
+        .{ "budget_ms", "budget_ms", true },
+        .{ "max_pairs", "max_pairs", true },
+        .{ "max_input_bytes", "max_input_bytes", true },
+        .{ "timeout_ms", "timeout_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("decider");
+        try jw.write(self.decider);
+        try jw.objectField("template");
+        try jw.write(self.template);
+        try jw.objectField("question");
+        try jw.write(self.question);
+        try jw.objectField("accept");
+        try jw.write(self.accept);
+        if (self.reject) |value| {
+            try jw.objectField("reject");
+            try jw.write(value);
+        }
+        if (self.on_failure) |value| {
+            try jw.objectField("on_failure");
+            try jw.write(value);
+        }
+        if (self.description_inputs) |value| {
+            try jw.objectField("description_inputs");
+            try jw.write(value);
+        }
+        if (self.budget_ms) |value| {
+            try jw.objectField("budget_ms");
+            try jw.write(value);
+        }
+        if (self.max_pairs) |value| {
+            try jw.objectField("max_pairs");
+            try jw.write(value);
+        }
+        if (self.max_input_bytes) |value| {
+            try jw.objectField("max_input_bytes");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Versioned entity resolver attached to an artifact-backed graph index.
 pub const GraphResolverConfig = struct {
     name: []const u8,
@@ -20546,6 +20728,7 @@ pub const GraphResolverConfig = struct {
     type_must_match: ?bool = null,
     /// Typed matcher scorer. Cannot be combined with scorer_json.
     scorer: ?GraphResolverScorerConfig = null,
+    adjudicate: ?GraphResolverAdjudicationConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
@@ -20573,6 +20756,7 @@ pub const GraphResolverConfig = struct {
         .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer", "scorer", true },
+        .{ "adjudicate", "adjudicate", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
@@ -20629,6 +20813,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.scorer) |value| {
             try jw.objectField("scorer");
+            try jw.write(value);
+        }
+        if (self.adjudicate) |value| {
+            try jw.objectField("adjudicate");
             try jw.write(value);
         }
         if (self.scorer_json) |value| {

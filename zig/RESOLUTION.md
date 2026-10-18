@@ -44,8 +44,8 @@ recovery protocol is introduced.
   scoring model, and a curator can record an override through the resolution
   API (see "Sync and visibility contract"), but a queue / UI / label-capture
   surface on top of that is not built.
-- No learned (model-backed) resolver. The deterministic scorer ships first and
-  doubles as the label factory for a future learned one.
+- No learned scorer weights. Optional model adjudication of REVIEW uses a frozen
+  typed-decision policy; the deterministic matcher and its weights remain explicit.
 - No two-phase-commit coupling of entity writes and edge writes. Entity and
   edge writes are decoupled and fail closed on hydration (see "Cross-Shard
   Placement").
@@ -200,8 +200,8 @@ to the `else` level.
 ### 3. Decision
 
 `probability >= match` -> MATCH (link to best candidate).
-`probability >= review` -> REVIEW (recorded for curator override; produces no
-durable canonical link until a curator resolves it).
+`probability >= review` -> REVIEW (eligible for configured model adjudication or
+curator override; produces no durable canonical link while it remains REVIEW).
 otherwise -> NO_MATCH (mint a new entity).
 
 `Scorer.explain()` returns the matched level per comparison, which is both the
@@ -218,6 +218,160 @@ blocking already cuts candidates to ~k, so the model would only score
 mention x k. The hard part is labels: the deterministic resolver already
 bootstraps high-confidence matches/non-matches, which is the intended label
 source once human review is added on top.
+
+### Model adjudication of REVIEW (#1176)
+
+A resolver can attach a frozen `adjudicate` policy to its deterministic scorer.
+The matcher stays pure and nominates its best candidate. The managed resolution
+stage calls the ordinary decision asset producer through an injected executor.
+The same implementation serves embedded Lite, Directory, distributed resolution,
+and ephemeral query resolution. There is no second model/provider client.
+
+```json
+{
+  "name": "concepts",
+  "table": "concepts",
+  "source_artifact": "mentions",
+  "resolution_artifact": "resolved",
+  "key_template": "concept/{{ uslug _entity.text }}",
+  "candidate_search": "prefix",
+  "scorer": {
+    "comparisons": [{
+      "name": "name",
+      "left": "m.text",
+      "right": "c.canonical_name",
+      "levels": [
+        {"when": "exact", "weight": 8},
+        {"when": "jaro_winkler > 0.85", "weight": 1},
+        {"else": true, "weight": -8}
+      ]
+    }],
+    "combine": {"bias": 0},
+    "decision": {"match": 0.95, "review": 0.6}
+  },
+  "adjudicate": {
+    "decider": {"provider": "antfly", "model": "convaiinnovations/laya"},
+    "template": "A: {{m.text}} — {{m.description}}\nB: {{c.canonical_name}} — {{c.description}}",
+    "question": {
+      "type": "choice",
+      "name": "same",
+      "instructions": "Do these names and descriptions identify the same entity? Different products and different versions are different entities.",
+      "choices": [{"value": "same"}, {"value": "different"}]
+    },
+    "accept": {"choice": "same", "min_probability": 0.9},
+    "reject": {"choice": "different", "min_probability": 0.9},
+    "on_failure": "review",
+    "max_pairs": 32,
+    "max_input_bytes": 16384,
+    "timeout_ms": 10000,
+    "budget_ms": 10000
+  }
+}
+```
+
+This is a resolver declaration nested in a graph config, not a complete graph
+index request. ANN blocking still requires the normal candidate index and mention
+embedding configuration. The model name is an example, not an identity-precision
+qualification. Measure false merges and abstention on your own held-out pairs.
+Neither cosine similarity nor a typed model's confidence is a measured precision
+guarantee. `embedding_similarity` cannot satisfy this probability-based policy.
+
+**Selection and outcomes.** The resolver retains its best deterministic candidate
+policy. Equal scores use table/key order, independent of provider enumeration.
+MATCH and NO_MATCH do not call the model. Only the best scored REVIEW pair is
+judged, at most once per mention in a source execution. A REVIEW caused by an
+unavailable redirect survivor cannot be repaired by model judgment. Type/label
+admission, explicit aliases, durable merges and curator overrides retain priority;
+curated mentions do not incur adjudication calls.
+
+An accepted choice links through the same validated survivor and canonical fields
+as MATCH. A confident configured rejection produces `new`. A response below both
+thresholds abstains and stays REVIEW. Without `reject`, every non-accepted answer
+stays REVIEW. Failure and exhausted budgets default to REVIEW; `on_failure: mint`
+explicitly opts into a new identity on those outcomes. Cancellation and ownership
+errors propagate without publishing a fallback. REVIEW has a provisional key but
+is withheld from promotion; `listPendingReviews` provides the existing internal
+listing, not a public paginated review service.
+
+**Authoritative evidence.** Each judged entity carries `adjudication` alongside its
+final decision. Evidence records the policy hash, complete execution/source hash,
+input and candidate fingerprints, candidate endpoint, original deterministic
+probability, outcome/failure, and the normalized decision response (resolved model,
+full distribution, usage and producer provenance when supplied). The original
+resolution confidence remains the deterministic score; model probabilities are
+separate evidence. Frozen provider credentials are never included in evidence or
+public identity inspection. A provider's mutable model name is not an exact asset
+revision; use a pinned identity where the provider supports one.
+
+The receipt is outside `_resolution_work` and survives disabled retention, cache
+loss and portable backup. Recovery of the same source/execution reuses committed
+identity and evidence without candidate search, embedding, or model inference.
+The existing source transaction publishes the decision and downstream replay
+handoff atomically. A crash before publication may repeat inference; execution is
+not exactly-once. A committed failure is replay-stable too. Retry it by explicitly
+re-resolving, rather than relying on a later drain to flip identity.
+
+Policy changes participate in material config comparison, advance the effective
+resolver generation, and use ordinary bounded corpus backfill and inline graph
+replacement. A generation bump explicitly revisits committed evidence. Changed
+source extraction also creates a new execution. Destination edits affect future
+decisions; they do not silently revise committed model verdicts. Candidate/survivor
+identity fields and selected description assets are rechecked after model execution;
+concurrent changes return Busy for retry. Existing source/config/override read-set
+and ordered-publication checks fence stale publication. Databases using this policy
+require reader epoch 5; older readers must reject the database before parsing.
+
+**Description inputs.** Extraction mentions may supply `description` and a numeric
+`description_embedding`; candidate document fields supply the corresponding text
+and vector. The existing cosine comparator handles explicitly supplied description vectors.
+ANN hydration remains scoped to name vectors; it never substitutes a name vector
+for a missing description vector. Supply both description vectors in a compatible
+model space; description-vector generation is an upstream/application concern.
+Missing description comparisons should use a neutral `else` weight when the desired
+fallback is name-only. Templates interpolate `m.text`, `m.canonical_text`, `m.label`,
+`m.description`, `c.canonical_name`, `c.label`, and `c.description`; absent text
+renders empty. This interpolation language does not execute helpers or scripts.
+
+Optional `description_inputs` binds asset artifacts explicitly:
+
+```json
+{"description_inputs": {
+  "mention_artifact": "mention_descriptions",
+  "candidate_artifact": "concept_description"
+}}
+```
+
+Place this object inside `adjudicate`. The mention asset belongs to the source
+document and contains a JSON object such as `{"e0":"A search database"}`, keyed
+by extraction-local ids. It is supported for asset-scoped resolvers and cannot be
+the extraction or resolution stream itself. Its publication/deletion re-drives the
+owning extraction through the existing resolution journal, with its contents or
+absence included in the execution fingerprint. The candidate asset is a text
+asset on the canonical candidate document, such as a generator enrichment output.
+It is projected explicitly and rechecked after inference. Missing assets fall back
+to directly supplied description fields, then names. Candidate asset updates affect
+future decisions; bump the resolver generation to revisit earlier decisions.
+
+Resolution never waits for a description producer or its own future entity's
+promotion. Mention context must already be available; candidate descriptions may
+come from previously promoted entities. This avoids a promotion/description
+readiness cycle. No automatic retrospective candidate-dependency scan is introduced.
+
+**Bounded execution and queries.** `max_pairs` bounds model invocations per source,
+`max_input_bytes` bounds rendered text, `timeout_ms` bounds an individual call, and
+`budget_ms` bounds the source's total model-time allowance. Calls use the shared
+decision executor's token, memory, rate, and provider capability limits. Query
+resolution applies the same policy against an ephemeral store and returns evidence
+without writing artifacts, promoting entities or recording curator overrides. Its
+model costs are bounded by the resolver policy too.
+
+This extension resolves mentions; it does not infer a global merge of established
+keys, reconsider every old mention after a new description, or merge a transitive
+component of positive model pairs. Use the existing explicit key-merge API or an
+explicit corpus re-resolution for those operations. A rejected homonym still uses
+the configured key template: identical rendered keys are not disambiguated by a
+pairwise model rejection. Multi-candidate arbitration and a public curation queue
+remain separate extensions.
 
 ### Why not a general scripting language
 

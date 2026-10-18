@@ -12064,7 +12064,7 @@ pub const IndexManager = struct {
         const declarations = parsed.value.object.get("resolvers") orelse return;
         if (declarations != .array) return error.InvalidResolverConfig;
         for (declarations.array.items) |item| {
-            var input = try std.json.parseFromValue(ResolverConfig, self.alloc, item, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+            var input = try ResolverConfig.parseValue(self.alloc, item);
             defer input.deinit();
             var next = input.value;
             next.inline_managed = true;
@@ -12783,6 +12783,7 @@ pub const IndexManager = struct {
             existing.retain_work != next.retain_work or
             existing.max_work_bytes != next.max_work_bytes or
             !std.mem.eql(u8, existing.scorer_json, next.scorer_json) or
+            !std.mem.eql(u8, existing.adjudicate_json, next.adjudicate_json) or
             !std.mem.eql(u8, existing.candidate_search, next.candidate_search) or
             !std.mem.eql(u8, existing.candidate_ann_index, next.candidate_ann_index) or
             existing.candidate_limit != next.candidate_limit or

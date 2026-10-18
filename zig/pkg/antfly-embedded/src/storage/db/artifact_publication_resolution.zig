@@ -98,6 +98,7 @@ pub fn process(
     const scratch = arena.allocator();
     var sources: std.ArrayList([]const u8) = .empty;
     for (changed_keys) |key| {
+        try runtime.appendDescriptionSources(scratch, resolvers, key, &sources);
         const source_key = if (try runtime.parseSourceArtifactKeyAlloc(scratch, key) != null) key else blk: {
             const source = (try runtime.sourceExtractionKeyForResolutionKeyAlloc(scratch, resolvers, key)) orelse continue;
             // Retirement deletes do not re-drive and resurrect their output.

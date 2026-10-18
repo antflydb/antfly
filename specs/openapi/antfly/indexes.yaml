@@ -329,6 +329,8 @@ components:
         scorer:
           $ref: "#/components/schemas/GraphResolverScorerConfig"
           description: "Typed matcher scorer. Cannot be combined with scorer_json."
+        adjudicate:
+          $ref: "#/components/schemas/GraphResolverAdjudicationConfig"
         scorer_json:
           type: string
           deprecated: true
@@ -358,6 +360,89 @@ components:
             withheld. The cheap post-extraction junk filter for
             score-carrying extractors; 0 (the default) admits everything.
         config_generation: { type: integer, format: uint64, minimum: 0 }
+    GraphResolverAdjudicationConfig:
+      type: object
+      additionalProperties: false
+      required: [decider, template, question, accept]
+      description: >-
+        Adjudicate the best deterministic REVIEW candidate with a typed decision.
+        MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution
+        data, retained independently of work caches and reused on recovery. Changes
+        trigger versioned re-resolution. This resolves mentions, not global key merges.
+      properties:
+        decider:
+          $ref: "config.yaml#/components/schemas/DeciderConfig"
+          description: Frozen provider configuration. Requires decision_method=typed.
+        template:
+          type: string
+          minLength: 1
+          maxLength: 65536
+          description: >-
+            Bounded interpolation of m.text, m.canonical_text, m.label,
+            m.description, c.canonical_name, c.label and c.description.
+            Missing descriptions render empty text, allowing name-only decisions.
+        question:
+          $ref: "../ai/decision.yaml#/components/schemas/ChoiceDecisionQuestion"
+        accept:
+          $ref: "#/components/schemas/GraphResolverAdjudicationAcceptance"
+        reject:
+          $ref: "#/components/schemas/GraphResolverAdjudicationAcceptance"
+          description: Optional confident negative choice. Without it, non-acceptance stays REVIEW.
+        on_failure:
+          type: string
+          enum: [review, mint]
+          default: review
+          description: Failure or budget fallback. REVIEW remains unpromoted; mint explicitly permits a new identity.
+        description_inputs:
+          type: object
+          additionalProperties: false
+          description: Optional asset bindings. Resolution reads available data without waiting for promotion or producers.
+          properties:
+            mention_artifact:
+              type: string
+              minLength: 1
+              maxLength: 256
+              description: Source-document asset containing a JSON object mapping local mention ids to description strings. Publication re-drives asset-scoped resolution.
+            candidate_artifact:
+              type: string
+              minLength: 1
+              maxLength: 256
+              description: Candidate-document text asset, such as a generated summary. Changes affect future decisions; explicitly re-resolve to revisit committed evidence.
+        budget_ms:
+          type: integer
+          minimum: 1
+          maximum: 300000
+          default: 10000
+          description: Total model-time budget per source artifact. Each call also obeys timeout_ms.
+        max_pairs:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 32
+        max_input_bytes:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          default: 16384
+        timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 300000
+          default: 10000
+    GraphResolverAdjudicationAcceptance:
+      type: object
+      additionalProperties: false
+      required: [choice, min_probability]
+      properties:
+        choice:
+          type: string
+          minLength: 1
+          description: A choice identifier in the configured question. Accept and reject must differ.
+        min_probability:
+          type: number
+          minimum: 0.5
+          maximum: 1
+          description: Require this typed probability and a strict majority. Raw cosine is not a probability.
     GraphResolverScorerConfig:
       type: object
       required: [comparisons]

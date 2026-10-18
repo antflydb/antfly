@@ -14036,6 +14036,112 @@ export interface components {
                 review?: number;
             };
         };
+        DeciderConfig: {
+            /** @enum {string} */
+            provider: "antfly" | "jev" | "openai";
+            /**
+             * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+             * @default typed
+             * @enum {string}
+             */
+            decision_method?: "typed" | "embedding_similarity";
+            /** @description Required for Antfly and OpenAI; Jev defaults to jev-latest. */
+            model?: string;
+            /** @description Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity. */
+            model_identity?: string;
+            /** @description EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities. */
+            embedding_options?: {
+                /** @description Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities. */
+                calibration_id?: string;
+                /**
+                 * @default CLUSTERING
+                 * @enum {string}
+                 */
+                task_type?: "CLUSTERING" | "CLASSIFICATION";
+                /**
+                 * @default 768
+                 * @enum {integer}
+                 */
+                dimensions?: 768 | 512 | 256 | 128;
+                min_similarity?: number;
+                min_margin?: number;
+            };
+            /** @description Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions. */
+            url?: string;
+            /** @description API key or secret reference. Defaults to the provider environment variable. */
+            api_key?: string;
+            /** @default 10000 */
+            max_rows?: number;
+            /** @default 1000000 */
+            max_input_tokens?: number;
+            rate_limit?: components["schemas"]["RateLimitConfig"];
+            /** @default 32 */
+            batch_size?: number;
+        };
+        /** @description Local decision models use string choice identifiers. Embedding category examples replace the description with their normalized centroid; trained models reject examples. */
+        DecisionChoice: {
+            value: string;
+            description?: string;
+            examples?: string[];
+        };
+        /** @description Question-specific acceptance policy for embedding similarity. Trained decision models reject it. */
+        EmbeddingDecisionAcceptance: {
+            /** @description Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json. The server verifies qualification and the exact asset identity, prompt profile, dimensions, renderer and this question's label/prototype set. Mutually exclusive with manual thresholds; never produces probabilities. */
+            calibration_id?: string;
+            /** @description For a single choice, abstain when the highest cosine similarity is below this value. It is a similarity threshold, not an accuracy or probability estimate. */
+            min_similarity?: number;
+            /** @description For a single choice, require this gap between the highest and second-highest cosine similarities. For multi_choice, require every score to be at least this distance from its own selection threshold; otherwise abstain. */
+            min_margin?: number;
+        };
+        ChoiceDecisionQuestion: {
+            /** @enum {string} */
+            type: "choice";
+            name: string;
+            instructions: string;
+            choices: components["schemas"]["DecisionChoice"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
+        };
+        GraphResolverAdjudicationAcceptance: {
+            /** @description A choice identifier in the configured question. Accept and reject must differ. */
+            choice: string;
+            /** @description Require this typed probability and a strict majority. Raw cosine is not a probability. */
+            min_probability: number;
+        };
+        /** @description Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges. */
+        GraphResolverAdjudicationConfig: {
+            /** @description Frozen provider configuration. Requires decision_method=typed. */
+            decider: components["schemas"]["DeciderConfig"];
+            /** @description Bounded interpolation of m.text, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions. */
+            template: string;
+            question: components["schemas"]["ChoiceDecisionQuestion"];
+            accept: components["schemas"]["GraphResolverAdjudicationAcceptance"];
+            /** @description Optional confident negative choice. Without it, non-acceptance stays REVIEW. */
+            reject?: components["schemas"]["GraphResolverAdjudicationAcceptance"];
+            /**
+             * @description Failure or budget fallback. REVIEW remains unpromoted; mint explicitly permits a new identity.
+             * @default review
+             * @enum {string}
+             */
+            on_failure?: "review" | "mint";
+            /** @description Optional asset bindings. Resolution reads available data without waiting for promotion or producers. */
+            description_inputs?: {
+                /** @description Source-document asset containing a JSON object mapping local mention ids to description strings. Publication re-drives asset-scoped resolution. */
+                mention_artifact?: string;
+                /** @description Candidate-document text asset, such as a generated summary. Changes affect future decisions; explicitly re-resolve to revisit committed evidence. */
+                candidate_artifact?: string;
+            };
+            /**
+             * @description Total model-time budget per source artifact. Each call also obeys timeout_ms.
+             * @default 10000
+             */
+            budget_ms?: number;
+            /** @default 32 */
+            max_pairs?: number;
+            /** @default 16384 */
+            max_input_bytes?: number;
+            /** @default 10000 */
+            timeout_ms?: number;
+        };
         /** @description Versioned entity resolver attached to an artifact-backed graph index. */
         GraphResolverConfig: {
             name: string;
@@ -14064,6 +14170,7 @@ export interface components {
             type_must_match?: boolean;
             /** @description Typed matcher scorer. Cannot be combined with scorer_json. */
             scorer?: components["schemas"]["GraphResolverScorerConfig"];
+            adjudicate?: components["schemas"]["GraphResolverAdjudicationConfig"];
             /** @deprecated */
             scorer_json?: string;
             /** @enum {string} */
@@ -21462,29 +21569,6 @@ export interface components {
             overlap_words?: number;
             /** @default 128 */
             max_windows?: number;
-        };
-        /** @description Local decision models use string choice identifiers. Embedding category examples replace the description with their normalized centroid; trained models reject examples. */
-        DecisionChoice: {
-            value: string;
-            description?: string;
-            examples?: string[];
-        };
-        /** @description Question-specific acceptance policy for embedding similarity. Trained decision models reject it. */
-        EmbeddingDecisionAcceptance: {
-            /** @description Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json. The server verifies qualification and the exact asset identity, prompt profile, dimensions, renderer and this question's label/prototype set. Mutually exclusive with manual thresholds; never produces probabilities. */
-            calibration_id?: string;
-            /** @description For a single choice, abstain when the highest cosine similarity is below this value. It is a similarity threshold, not an accuracy or probability estimate. */
-            min_similarity?: number;
-            /** @description For a single choice, require this gap between the highest and second-highest cosine similarities. For multi_choice, require every score to be at least this distance from its own selection threshold; otherwise abstain. */
-            min_margin?: number;
-        };
-        ChoiceDecisionQuestion: {
-            /** @enum {string} */
-            type: "choice";
-            name: string;
-            instructions: string;
-            choices: components["schemas"]["DecisionChoice"][];
-            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
         };
         /** @description Antfly multi-label extension for embedding similarity; selected, empty and abstained are distinct results. */
         MultiChoiceDecisionQuestion: {

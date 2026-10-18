@@ -229,7 +229,10 @@ pub const Runtime = struct {
                 job.* = .{ .runtime = self, .request = request, .cfg = try self.registry.getDeciderConfig(request.decider), .arena = undefined, .budget = .{ .backing = std.heap.smp_allocator, .limit = 8 * 1024 * 1024 } };
                 job.arena = std.heap.ArenaAllocator.init(job.budget.allocator());
                 initialized += 1;
-                try group.concurrent(self.io, Job.run, .{job});
+                // A single decision already runs on its caller's execution
+                // lane. Requiring another worker can reject otherwise valid
+                // concurrent queries on a bounded backend IO runtime.
+                if (jobs.len == 1) job.run() else try group.concurrent(self.io, Job.run, .{job});
             }
             try group.await(self.io);
             self.batches += 1;
@@ -263,6 +266,52 @@ pub const Runtime = struct {
         return out;
     }
 };
+
+test "decision functions single embedded decision needs no additional IO worker" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("local", .{ .provider = .antfly, .model = "test-model" });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fake = struct {
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+        fn extract(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_extracting").Request) !@import("antfly_extracting").Response {
+            return error.TestUnexpectedResult;
+        }
+        fn decide(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?managed.RequestContext) ![]u8 {
+            return alloc.dupe(u8,
+                \\{"model":"test-model","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","confidence":0.98,"confidence_method":"max_probability","probabilities":[{"value":"same","probability":0.98},{"value":"different","probability":0.02}]}],"usage":{"input_tokens":8,"output_tokens":0}}
+            );
+        }
+    };
+    var token: u8 = 0;
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io, .antfly_provider = .{
+        .ptr = &token,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Fake.dense,
+        .embed_sparse_texts = Fake.sparse,
+        .extract = Fake.extract,
+        .decide_json = Fake.decide,
+    } };
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same entity?","criteria":{"same":"Same entity","different":"Different entities"}}}
+    , .{});
+    const results = try runtime.provider().evaluateBatch(scratch, &.{.{ .decider = "local", .questions = questions, .input = "Antfly / Antfly database" }});
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(u64, 1), runtime.rows);
+}
 
 test "decision functions concurrent batches preserve one input per wire request credentials and usage" {
     const a = std.testing.allocator;

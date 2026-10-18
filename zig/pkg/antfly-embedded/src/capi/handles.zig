@@ -114,7 +114,7 @@ pub const Handle = struct {
     // this caller intent across its own reconfigure passes -- see its doc
     // comment.
     lite_generated_enrichment_replay: bool = false,
-    /// Lazy foreground producer for read-only text queries. The mutex covers
+    /// Lazy shared producer for query extraction and resolver adjudication. The mutex covers
     /// construction; each call uses a scoped invocation context.
     query_producer: ?*@import("../asset_producer_runtime.zig").Runtime = null,
     query_producer_mutex: std.Io.Mutex = .init,

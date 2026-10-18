@@ -39,6 +39,13 @@ const CandidateSource = db_mod.CandidateSource;
 /// it must not outlive the read source it wraps.
 pub const DistributedCandidateSource = struct {
     reads: table_reads.TableReadSource,
+    io: ?std.Io = null,
+    /// Consult current serving configuration at execution, including provider
+    /// replacement, process-isolated inference endpoints and the keystore.
+    producer_options: ?struct {
+        ptr: *anyopaque,
+        get: *const fn (*anyopaque) @import("antfly_local_sources").asset_producer_runtime.Runtime.Options,
+    } = null,
     catalog_binding: ?@import("antfly_local_sources").system_catalog_domain.BindingSource = null,
     /// Read consistency for blocking queries. Resolution runs leader-only, so
     /// `read_index` keeps candidates consistent with committed writes; callers
@@ -51,11 +58,36 @@ pub const DistributedCandidateSource = struct {
 
     const vtable = CandidateSource.VTable{
         .begin_batch = beginBatch,
+        .adjudicate = adjudicate,
+        .get_description = getDescription,
         .get_many = getManyFn,
         .get = getFn,
         .scan_prefix = scanPrefixFn,
         .nearest = nearestFn,
     };
+
+    fn getDescription(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8) anyerror!?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const field = try std.fmt.allocPrint(a, "_artifacts.{s}", .{artifact});
+        defer a.free(field);
+        const physical = if (self.catalog_binding) |binding| try binding.bindOne(a, table) else table;
+        defer if (self.catalog_binding != null) a.free(physical);
+        var row = (try self.reads.lookup(a, physical, key, .{ .fields = &.{field}, .include_all_fields = false }, self.consistency)) orelse return null;
+        defer row.deinit(a);
+        return @import("antfly_local_sources").functions_resolver_adjudication.projectedDescription(a, row.json, artifact);
+    }
+
+    fn adjudicate(ptr: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const io = self.io orelse return error.MissingAdjudicator;
+        var runtime = try @import("antfly_local_sources").asset_producer_runtime.Runtime.createOwned(a, io, if (self.producer_options) |options| options.get(options.ptr) else .{});
+        defer {
+            runtime.deinit();
+            a.destroy(runtime);
+        }
+        const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+        return runtime.producer().withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
+    }
 
     const BoundBatch = struct {
         arena: std.heap.ArenaAllocator,
@@ -109,7 +141,15 @@ pub const DistributedCandidateSource = struct {
             self.arena.deinit();
             alloc.destroy(self);
         }
-        const vtable: CandidateSource.VTable = .{ .get = get, .get_many = getMany, .scan_prefix = scan, .nearest = nearest, .bound_table = boundTable };
+        fn descriptionBound(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return getDescription(&self.raw, a, (try boundTable(ptr, table)) orelse return error.TableNotFound, key, artifact);
+        }
+        fn adjudicateBound(ptr: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return adjudicate(&self.raw, a, request);
+        }
+        const vtable: CandidateSource.VTable = .{ .get_description = descriptionBound, .adjudicate = adjudicateBound, .get = get, .get_many = getMany, .scan_prefix = scan, .nearest = nearest, .bound_table = boundTable };
     };
 
     fn beginBatch(ptr: *anyopaque, alloc: std.mem.Allocator, names: []const []const u8) anyerror!CandidateSource.Batch {
@@ -121,7 +161,7 @@ pub const DistributedCandidateSource = struct {
         errdefer arena.deinit();
         const owned = try arena.allocator().alloc([]const u8, names.len);
         for (names, owned) |name, *copy| copy.* = try arena.allocator().dupe(u8, name);
-        batch.* = .{ .arena = arena, .raw = .{ .reads = self.reads, .consistency = self.consistency }, .binding = binding, .names = owned };
+        batch.* = .{ .arena = arena, .raw = .{ .reads = self.reads, .consistency = self.consistency, .io = self.io, .producer_options = self.producer_options }, .binding = binding, .names = owned };
         return .{ .source = .{ .ptr = batch, .vtable = &BoundBatch.vtable }, .release = BoundBatch.release };
     }
 

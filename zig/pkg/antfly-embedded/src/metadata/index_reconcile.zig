@@ -681,10 +681,7 @@ pub fn collectDesiredResolvers(
                 if (resolvers == .array) {
                     for (resolvers.array.items) |item| {
                         if (item != .object) continue;
-                        const parsed = try std.json.parseFromValue(db_mod.ResolverConfig, alloc, item, .{
-                            .allocate = .alloc_always,
-                            .ignore_unknown_fields = true,
-                        });
+                        const parsed = try db_mod.ResolverConfig.parseValue(alloc, item);
                         // `parsed.value` is owned by the parse arena; clone with
                         // `alloc` so `out`'s entries free correctly (and so they
                         // outlive the arena).

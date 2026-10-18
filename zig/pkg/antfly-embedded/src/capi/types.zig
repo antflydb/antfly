@@ -400,6 +400,8 @@ fn classifyError(err: anyerror) ErrorCode {
         error.ResolverSourceArtifactImmutable,
         error.ResolverArtifactImmutable,
         error.InvalidResolverConfig,
+        error.InvalidAdjudicationConfig,
+        error.InvalidAdjudicationDescriptions,
         error.ResolverIdentityActive,
         error.EmptyEntityKey,
         error.InvalidArgument,

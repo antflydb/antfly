@@ -6842,7 +6842,7 @@ pub const DataServer = struct {
         // shard owns the entity table, then hand it to the write source(s) that
         // open managed DBs. Captures `read_source.source()` (ptr+vtable), so
         // later read-source mutations remain visible.
-        self.distributed_candidate_source = .{ .reads = self.read_source.source(), .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
+        self.distributed_candidate_source = .{ .io = self.dataRaftIo(), .producer_options = .{ .ptr = self, .get = resolverAdjudicationOptions }, .reads = self.read_source.source(), .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const candidate_source = self.distributed_candidate_source.?.candidateSource();
         _ = self.write_source.withResolutionCandidateSource(candidate_source);
         if (self.data_raft_apply) |apply_sm| {
@@ -8929,6 +8929,11 @@ pub const DataServer = struct {
                 api_server_cfg.hot_standby_internal_executor = self.hot_standby_internal_server.?.operationExecutor();
             }
         }
+    }
+
+    fn resolverAdjudicationOptions(ptr: *anyopaque) @import("antfly_local_sources").asset_producer_runtime.Runtime.Options {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return .{ .antfly_provider = self.read_source.antfly_provider, .inference_api_url = self.read_source.inference_api_url, .secret_store = self.read_source.secret_store };
     }
 
     pub fn setAntflyProvider(
