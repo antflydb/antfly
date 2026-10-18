@@ -8594,6 +8594,72 @@ pub const DB = struct {
         return progress;
     }
 
+    pub const RaftIndexValidationPreparation = struct {
+        work: union(enum) {
+            inventory: @import("relational_index_private_claims.zig").InventoryValidation.Command,
+            generation: native_index_control.PreparedGenerationValidation,
+            progress: @import("relational_index_raft_contract.zig").ValidationProgress,
+        },
+        cache_lease: ?native_index_control.BuildCache.Lease = null,
+        pub fn deinit(self: *@This()) void {
+            if (self.work == .generation) self.work.generation.deinit();
+            if (self.cache_lease) |*lease| lease.deinit();
+            self.* = undefined;
+        }
+        pub fn view(self: *const @This()) @import("relational_index_raft_contract.zig").BuildPreparation {
+            return switch (self.work) {
+                .inventory => |command| .{ .inventory_page = command },
+                .generation => |value| .{ .generation_page = value.page.command },
+                .progress => |value| .{ .validation = value },
+            };
+        }
+    };
+
+    pub fn prepareRaftIndexOwnerValidation(self: *DB, alloc: Allocator, owner_group: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: @import("../../api/operation.zig").RequestContext) !RaftIndexValidationPreparation {
+        try context.ensureActive();
+        try request.validate();
+        const expected = request.target_expectation orelse return error.PrivateIndexTargetValidationRequired;
+        if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
+        const binding = (try self.raftIndexOwnerState(owner_group, request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        try request.requireRaftBinding(binding);
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            if (try @import("relational_index_private_claims.zig").InventoryValidation.Prepared.prepare(alloc, &read, binding, expected, request.budget, context)) |page|
+                return .{ .work = .{ .inventory = page.command } };
+        }
+        const progress = try self.raftIndexOwnerValidationProgress(alloc, owner_group, table_name, request, context);
+        const inventory = progress.inventory orelse return error.PrivateIndexTargetValidationRequired;
+        if (inventory.fields.phase != .ready) return .{ .work = .{ .progress = progress } };
+        const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
+        var lease = try self.native_index_build_cache.acquireRaft(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
+        errdefer lease.deinit();
+        if (try native_index_control.PreparedGenerationValidation.prepareRaft(alloc, self.core, lease.raftReservation(), expected, request.budget, context)) |page|
+            return .{ .work = .{ .generation = page }, .cache_lease = lease };
+        const recovered = try self.raftIndexOwnerValidationProgress(alloc, owner_group, table_name, request, context);
+        lease.deinit();
+        return .{ .work = .{ .progress = recovered } };
+    }
+
+    pub fn raftIndexOwnerValidationProgress(self: *DB, alloc: Allocator, owner_group: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_raft_contract.zig").ValidationProgress {
+        try context.ensureActive();
+        try self.requireRaftIndexOwnerIdentity(owner_group, request.identity);
+        try request.validate();
+        const expected = request.target_expectation orelse return error.PrivateIndexTargetValidationRequired;
+        if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const binding = (try RaftIndexOwnerControl.inspect(&read, request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        try request.requireRaftBinding(binding);
+        try native_index_control.PreparedBuild.verifyRecovery(&read, binding);
+        var loaded = try @import("relational_index_validation.zig").load(alloc, &read, binding);
+        defer if (loaded) |*value| value.deinit();
+        const result: @import("relational_index_raft_contract.zig").ValidationProgress = .{ .binding = binding, .inventory = try @import("relational_index_private_claims.zig").InventoryValidation.load(alloc, &read, binding), .generation = if (loaded) |value| value.summary else null, .seal = try @import("relational_index_validation.zig").Seal.load(alloc, &read, binding) };
+        try result.validateFor(request);
+        try context.ensureActive();
+        return result;
+    }
+
     fn requireRaftIndexOwnerIdentity(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !void {
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         try expected.validate();

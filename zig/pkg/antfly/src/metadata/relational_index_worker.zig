@@ -529,6 +529,23 @@ const Job = struct {
                     self.retireOwner(index);
                     return;
                 }
+                if (response.value == .raft_validation) {
+                    const value = response.value.raft_validation;
+                    const failed = switch (value.state) {
+                        .progress => |state| (state.inventory != null and state.inventory.?.fields.phase == .failed) or (state.generation != null and state.generation.?.fields.phase == .failed),
+                        .audit => |state| state.outcome.audit.inventory.phase == .failed or (state.outcome.audit.generation != null and state.outcome.audit.generation.?.phase == .failed),
+                    };
+                    if (failed) {
+                        try owner.requestCancellation(.invalid_candidate);
+                        return;
+                    }
+                    if (try response.value.validationAck(request)) |ack| {
+                        if (!std.meta.eql(ack.signed.receipt.owner, identity)) return error.InvalidIndexOwnerReceipt;
+                        owner.ack = ack;
+                        owner.stage = .acknowledge;
+                    } else if (value.signing_failure != null) owner.retry_at_ns = now_ns +| retry_ns;
+                    return;
+                }
                 if (response.value != .building) return error.InvalidPrivateIndexNativeReceipt;
                 const outcome = response.value.building.outcome;
                 const pending = switch (outcome) {

@@ -4162,7 +4162,9 @@ pub fn storageOwnerRaftIndexBuildJson(owner: ?*anyopaque, request: *const kernel
         }
     };
     if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
-    if (request.prepare > 1 or request.request_json.ptr == null or request.request_json.len == 0 or request.request_json.len > contract.BuildPreparation.max_request_bytes or
+    if (request.prepare > 2 or request.request_json.ptr == null or request.request_json.len == 0 or request.request_json.len > contract.BuildPreparation.max_request_bytes or
+        request.audit_root_json.len > @import("antfly_local_sources").storage_db_relational_index_owner_control.AuditRoot.max_wire_bytes or
+        (request.prepare == 2) != (request.audit_root_json.len != 0) or (request.audit_root_json.len != 0 and request.audit_root_json.ptr == null) or
         request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
         request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
@@ -4178,6 +4180,34 @@ pub fn storageOwnerRaftIndexBuildJson(owner: ?*anyopaque, request: *const kernel
         return Failure.result(if (err == error.OutOfMemory) err else error.InvalidArgument, out_failure);
     };
     defer parsed.deinit();
+    if (parsed.value.target_expectation != null) {
+        if (request.prepare == 2) {
+            const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+            var root = std.json.parseFromSlice(native.AuditRoot, alloc, request.audit_root_json.slice(), .{ .ignore_unknown_fields = false, .max_value_len = native.AuditRoot.max_wire_bytes }) catch |err| return Failure.result(err, out_failure);
+            defer root.deinit();
+            root.value.validate() catch |err| return Failure.result(err, out_failure);
+            const progress = handle.db.raftIndexOwnerValidationProgress(alloc, handle.storage_owner_group_id, table_name, parsed.value, context) catch |err| return Failure.result(err, out_failure);
+            progress.requireReady() catch |err| return Failure.result(err, out_failure);
+            const summary = handle.db.stepRaftIndexOwnerAudit(handle.storage_owner_group_id, table_name, parsed.value, root.value.root_dir, root.value.root_incarnation, context) catch |err| return Failure.result(err, out_failure);
+            const ready = summary.inventory.phase == .ready and summary.generation != null and summary.generation.?.phase == .ready;
+            const audit: contract.AuditProgress = .{ .outcome = .{ .binding = progress.binding, .expected = parsed.value.target_expectation.?, .audit = summary }, .seal = if (ready) progress.seal else null };
+            Failure.emit(.{ .audit = audit }, parsed.value, context, out_response) catch |err| return Failure.result(err, out_failure);
+            return .ok;
+        }
+        if (request.prepare == 1) {
+            var prepared = handle.db.prepareRaftIndexOwnerValidation(alloc, handle.storage_owner_group_id, table_name, parsed.value, context) catch |err| {
+                if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
+                return Failure.result(err, out_failure);
+            };
+            defer prepared.deinit();
+            Failure.emit(prepared.view(), parsed.value, context, out_response) catch |err| return Failure.result(err, out_failure);
+            return .ok;
+        }
+        const progress = handle.db.raftIndexOwnerValidationProgress(alloc, handle.storage_owner_group_id, table_name, parsed.value, context) catch |err| return Failure.result(err, out_failure);
+        Failure.emit(.{ .validation = progress }, parsed.value, context, out_response) catch |err| return Failure.result(err, out_failure);
+        return .ok;
+    }
+    if (request.prepare == 2) return Failure.result(error.InvalidArgument, out_failure);
     if (request.prepare != 0) {
         var prepared = handle.db.prepareRaftIndexOwnerBuild(alloc, handle.storage_owner_group_id, table_name, parsed.value, context) catch |err| {
             if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);

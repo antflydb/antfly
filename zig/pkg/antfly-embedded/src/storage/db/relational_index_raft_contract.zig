@@ -172,11 +172,61 @@ pub const BuildProgress = struct {
             !std.mem.allEqual(u8, &self.progress_digest, 0)) return error.InvalidRelationalIndexProgress;
     }
 };
+pub const ValidationProgress = struct {
+    binding: jobs.Binding,
+    inventory: ?jobs.private_claims.InventoryValidation.Record = null,
+    generation: ?@import("relational_index_validation.zig").Summary = null,
+    seal: ?@import("relational_index_validation.zig").Seal = null,
+
+    pub fn validateFor(self: @This(), request: BuildRequest) !void {
+        try request.requireRaftBinding(self.binding);
+        const expected = request.target_expectation orelse return error.InvalidGenerationPublication;
+        if (self.inventory) |record| {
+            try record.validate();
+            if (record.position != .raft or !std.mem.eql(u8, &try record.expected.digest(), &try expected.digest())) return error.InvalidPrivateIndexClaimInventory;
+        }
+        if (self.generation) |record| {
+            try record.validate();
+            const inventory = self.inventory orelse return error.PrivateIndexTargetValidationRequired;
+            if (inventory.fields.phase != .ready or record.position != .raft or !record.position.strictlyAfter(inventory.position) or
+                !std.mem.eql(u8, &try record.expected.digest(), &try expected.digest())) return error.InvalidRelationalIndexValidation;
+        }
+        if (self.seal) |seal| {
+            try seal.command.validate();
+            const generation = self.generation orelse return error.PrivateIndexTargetValidationRequired;
+            if (generation.fields.phase != .ready or seal.position != .raft or !seal.position.strictlyAfter(generation.position) or
+                !std.meta.eql(seal.command.generation_position, generation.position) or
+                !std.mem.eql(u8, &try seal.command.binding.encode(), &try self.binding.encode()) or
+                !std.mem.eql(u8, &try seal.command.expected.digest(), &try expected.digest())) return error.InvalidRelationalIndexValidation;
+        }
+    }
+    pub fn requireReady(self: @This()) !void {
+        if (self.inventory == null or self.inventory.?.fields.phase != .ready or
+            self.generation == null or self.generation.?.fields.phase != .ready) return error.PrivateIndexTargetValidationRequired;
+    }
+};
+
+pub const AuditProgress = struct {
+    outcome: @import("relational_index_owner_control.zig").AuditOutcome,
+    seal: ?@import("relational_index_validation.zig").Seal = null,
+    pub fn validateFor(self: @This(), request: BuildRequest) !void {
+        try self.outcome.validateForRaft(request);
+        if (self.seal) |seal| {
+            if (seal.position != .raft or !std.meta.eql(seal.command, try self.outcome.logicalCommand()) or
+                !seal.position.strictlyAfter(seal.command.generation_position)) return error.InvalidRelationalIndexValidation;
+        }
+    }
+};
+
 pub const BuildPreparation = union(enum) {
     pub const max_request_bytes = 8 * 1024;
-    pub const max_response_bytes = @import("relational_index_jobs.zig").Page.PrivateCommand.max_wire_bytes + 1024;
+    pub const max_response_bytes = @max(@import("relational_index_jobs.zig").Page.PrivateCommand.max_wire_bytes, @import("relational_index_validation.zig").max_wire_bytes) + 32 * 1024;
     page: @import("relational_index_jobs.zig").Page.PrivateCommand,
     progress: BuildProgress,
+    inventory_page: jobs.private_claims.InventoryValidation.Command,
+    generation_page: @import("relational_index_validation.zig").Command,
+    validation: ValidationProgress,
+    audit: AuditProgress,
 
     pub fn validateFor(self: @This(), request: BuildRequest) !void {
         switch (self) {
@@ -186,6 +236,14 @@ pub const BuildPreparation = union(enum) {
                 if (request.target_expectation != null) return error.InvalidGenerationPublication;
             },
             .progress => |progress| try progress.validateFor(request),
+            inline .inventory_page, .generation_page => |page| {
+                try page.validate();
+                try request.requireRaftBinding(page.binding);
+                const expected = request.target_expectation orelse return error.InvalidGenerationPublication;
+                if (!std.mem.eql(u8, &try expected.digest(), &try page.expected.digest())) return error.InvalidGenerationPublication;
+            },
+            .validation => |value| try value.validateFor(request),
+            .audit => |value| try value.validateFor(request),
         }
     }
 };

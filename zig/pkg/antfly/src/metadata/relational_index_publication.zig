@@ -1320,6 +1320,32 @@ pub const OwnerDecision = struct {
         return result;
     }
 
+    pub fn requireRaftValidationProposal(self: OwnerDecision, table_name: []const u8, request: OwnerRequest, command: raft_control.Command, audited: ?local.storage_db_relational_index_validation.SealCommand) !void {
+        const binding, const expected = switch (command) {
+            inline .inventory_validation, .generation_validation, .validation_seal => |value| .{ value.binding, value.expected },
+            else => return error.InvalidGenerationPublication,
+        };
+        try command.validate();
+        const authorized = try self.raftInventoryValidation(request, binding, .{});
+        if (!std.mem.eql(u8, &try expected.digest(), &try authorized.target_expectation.?.digest())) return error.GenerationPublicationChanged;
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, dispatch.table_name, table_name)) return error.GenerationPublicationChanged;
+        if (command == .validation_seal and !std.meta.eql(command.validation_seal, audited orelse return error.PrivateIndexTargetValidationRequired)) return error.PrivateIndexAuditScopeChanged;
+    }
+
+    pub fn signRaftValidation(self: OwnerDecision, request: OwnerRequest, audited: raft_control.AuditProgress, physical_root_incarnation: u128, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {
+        const validation_request = try self.raftInventoryValidation(request, audited.outcome.binding, .{});
+        try audited.validateFor(validation_request);
+        const seal = audited.seal orelse return error.PrivateIndexTargetValidationRequired;
+        if (seal.position.raft.term > actual.leader_term or seal.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        const physical = try self.signRaftAudit(request, audited.outcome, physical_root_incarnation, actual, root);
+        const view = try self.raftSigningView(request);
+        const receipt = try seal.command.receiptAt(seal.position);
+        const ack: Ack = .{ .table_id = request.table_id, .expected_revision = self.head.revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) }, .validation = .{ .outcome = audited.outcome, .signed = physical } };
+        try ack.validate();
+        return ack;
+    }
+
     pub fn signRaftAudit(self: OwnerDecision, request: OwnerRequest, outcome: native_control.AuditOutcome, physical_root_incarnation: u128, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !SignedAudit {
         const validation_request = try self.raftInventoryValidation(request, outcome.binding, .{});
         try outcome.validateForRaft(validation_request);

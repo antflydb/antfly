@@ -82,6 +82,7 @@ pub const Result = union(enum) {
     acknowledged,
     raft: RaftControlResponse,
     raft_build: RaftBuildControlResponse,
+    raft_validation: RaftValidationControlResponse,
     raft_source: RaftSourceResult,
     recovered: struct {
         /// Copied from the lease that recovered the committed physical cut;
@@ -112,7 +113,7 @@ pub const Result = union(enum) {
 
     pub fn deinit(self: *Result) void {
         switch (self.*) {
-            .acknowledged, .raft, .raft_build => {},
+            .acknowledged, .raft, .raft_build, .raft_validation => {},
             .recovered => |value| value.deinit(),
             .applied => |value| value.deinit(),
             .controlled => |value| value.outcome.deinit(),
@@ -129,7 +130,7 @@ pub const Result = union(enum) {
     /// Borrowed until deinit; copying an outcome does not own error_name.
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
-            .acknowledged, .raft, .raft_build, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .raft_build, .raft_validation, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
             .controlled => |value| value.outcome.value,
@@ -142,6 +143,7 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .raft => |value| value.root_generation,
             .raft_build => |value| value.root_generation,
+            .raft_validation => |value| value.root_generation,
             .recovered => |value| value.root_generation,
             .controlled => |value| value.root_generation,
             .building => |value| value.root_generation,
@@ -162,7 +164,7 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .controlled => |*value| &value.signing,
             .recovered => |*value| &value.signing,
-            .acknowledged, .raft, .raft_build, .applied, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .raft_build, .raft_validation, .applied, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
         };
     }
 
@@ -286,6 +288,7 @@ pub const Result = union(enum) {
             .acknowledged => .acknowledged,
             .raft => |value| .{ .raft = value },
             .raft_build => |value| .{ .raft_build = value },
+            .raft_validation => |value| .{ .raft_validation = value },
             .applied => |value| .{ .admitted = value.value },
             .controlled => |value| .{ .controlled = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
@@ -471,10 +474,43 @@ pub const RaftBuildControlResponse = struct {
     }
 };
 
+pub const RaftValidationControlResponse = struct {
+    root_generation: u64,
+    state: union(enum) { progress: local.storage_db_relational_index_raft_contract.ValidationProgress, audit: local.storage_db_relational_index_raft_contract.AuditProgress },
+    signed_ack: ?publication.Ack = null,
+    signing_failure: ?SigningFailure = null,
+
+    pub fn validate(self: @This(), request: Request) !void {
+        try request.validate(request.group_id);
+        if (request.operation != .validate or self.root_generation == 0) return error.InvalidRelationalIndexValidation;
+        const binding, const expected = switch (self.state) {
+            .progress => |value| .{ value.binding, if (value.inventory) |record| record.expected else return error.PrivateIndexTargetValidationRequired },
+            .audit => |value| .{ value.outcome.binding, value.outcome.expected },
+        };
+        if (binding.fence.namespace.table_id != request.table_id) return error.PrivateIndexOwnerJobChanged;
+        var validation_request = try native.BuildRequest.initRaft(.{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id }, binding, request.build_budget orelse .{});
+        validation_request.target_expectation = expected;
+        switch (self.state) {
+            .progress => |value| try value.validateFor(validation_request),
+            .audit => |value| try value.validateFor(validation_request),
+        }
+        if (self.signed_ack) |ack| {
+            if (self.signing_failure != null or self.state != .audit or ack.table_id != request.table_id or
+                ack.signed.proof.authority != .raft or ack.signed.proof.root_generation != self.root_generation) return error.InvalidIndexOwnerReceipt;
+            const seal = self.state.audit.seal orelse return error.InvalidIndexOwnerReceipt;
+            const witness = ack.validation orelse return error.InvalidIndexOwnerReceipt;
+            if (!std.meta.eql(try seal.command.receiptAt(seal.position), ack.signed.receipt) or
+                !std.mem.eql(u8, &try witness.outcome.readyDigest(), &try self.state.audit.outcome.readyDigest())) return error.InvalidIndexOwnerReceipt;
+            try ack.validate();
+        }
+    }
+};
+
 pub const ControlResponse = union(enum) {
     acknowledged,
     raft: RaftControlResponse,
     raft_build: RaftBuildControlResponse,
+    raft_validation: RaftValidationControlResponse,
     admitted: native.Outcome,
     controlled: RootedOutcome,
     recovered: RootedOutcome,
@@ -506,6 +542,7 @@ pub const ControlResponse = union(enum) {
     /// accepting metadata transaction rechecks scope, signatures and liveness.
     pub fn validationAck(self: @This(), request: Request) !?publication.Ack {
         try self.validate(request);
+        if (self == .raft_validation) return self.raft_validation.signed_ack;
         if (self != .building or self.building.outcome != .validated) return null;
         const value = self.building;
         const receipt = value.signed_receipt orelse return null;
@@ -528,6 +565,7 @@ pub const ControlResponse = union(enum) {
             .acknowledged => return,
             .raft => |value| return value.validate(request),
             .raft_build => |value| return value.validate(request),
+            .raft_validation => |value| return value.validate(request),
             .source => |value| return value.validate(request),
             .raft_source => |value| return value.validateRaft(request),
             .installing => |value| return value.validate(request),

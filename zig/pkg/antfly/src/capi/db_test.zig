@@ -1342,6 +1342,7 @@ test "storage owner native index receipt snapshot guards every durable outbox fo
 test "storage owner Raft index observations preserve coherent cuts and reject caller positions" {
     const a = std.testing.allocator;
     const local = @import("antfly_local_sources");
+    const Integrity = local.storage_db_relational_integrity_contract;
     const contract = local.storage_db_relational_index_raft_contract;
     const before =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
@@ -1697,6 +1698,76 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
     defer consumed_retry.deinit();
     try std.testing.expectEqualDeep(retained_consumption, consumed_retry.value.consumed.?);
     try std.testing.expectEqual(@as(u64, 9), (try handle.db.orderedApplyReceipt()).?.index);
+    var validation_request = build_request;
+    const expected = expected: {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        const address = try Integrity.Address.init(decoded_source.batch.?.scope.generation, "target-tuple");
+        const claim = try Integrity.Claim.decode(&address.claimKey(), try read.get(&address.claimKey()));
+        const head = (try Source.load(&read, recovered.binding.?)).?;
+        break :expected local.storage_db_relational_index_owner_job.private_claims.TargetExpectation{ .metadata_incarnation = accepted.metadata_incarnation, .binding_digest = accepted.binding_digest, .generation = address.generation, .completion_revision = 1, .source_consumption_digest = try retained_consumption.prefix().digest(), .source_progress_digest = head.progress_digest, .table_name_digest = Integrity.hash("items"), .rows = 1, .inventory_xor = claim.memberDigest(), .provenance = @splat(9) };
+    };
+    validation_request.target_expectation = expected;
+    const validation_json = try std.json.Stringify.valueAlloc(a, validation_request, .{});
+    defer a.free(validation_json);
+    const validation_input: kernel_owner_abi.RaftIndexOwnerBuildRequest = .{ .table_name = .fromSlice("items"), .request_json = .fromSlice(validation_json) };
+    var next_index: u64 = 10;
+    var validation_turns: usize = 0;
+    while (validation_turns < 32) : (validation_turns += 1) {
+        var validation_step = try Build.call(id, validation_input, validation_request);
+        defer validation_step.deinit();
+        const entry: local.storage_db_apply_receipts.OrderedApplyReceipt = .{ .term = 6, .index = next_index };
+        switch (validation_step.value) {
+            .inventory_page => |command| {
+                const batch = batch: {
+                    var read = try handle.db.core.store.beginReadTxn();
+                    defer read.abort();
+                    break :batch try local.storage_db_relational_index_owner_job.private_claims.InventoryValidation.Prepared.replay(a, &read, command);
+                };
+                var prepared: native.PreparedInventoryValidation = .{ .alloc = a, .batch = batch };
+                defer prepared.deinit();
+                try handle.db.applyCommittedRaftIndexInventory(&prepared, 11, entry);
+            },
+            .generation_page => |command| {
+                var prepared = try native.PreparedGenerationValidation.replay(a, handle.db.core, command);
+                defer prepared.deinit();
+                try handle.db.applyCommittedRaftIndexGeneration(&prepared, 11, entry);
+            },
+            .validation => |progress| {
+                try progress.requireReady();
+                break;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        next_index += 1;
+    }
+    try std.testing.expect(validation_turns < 32);
+    var audit_dir = try TestDirectory.init("raft-index-capi-audit");
+    defer audit_dir.cleanup();
+    const root = try local.storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, audit_dir.path());
+    const root_json = try std.json.Stringify.valueAlloc(a, native.AuditRoot{ .root_dir = audit_dir.path(), .root_incarnation = root.root_incarnation }, .{});
+    defer a.free(root_json);
+    var audit_input = validation_input;
+    audit_input.prepare = 2;
+    audit_input.audit_root_json = .fromSlice(root_json);
+    var audit_turns: usize = 0;
+    const logical = audited: while (audit_turns < 32) : (audit_turns += 1) {
+        var audit_step = try Build.call(id, audit_input, validation_request);
+        defer audit_step.deinit();
+        if (audit_step.value.audit.outcome.audit.generation) |fields| if (fields.phase == .ready) break :audited try audit_step.value.audit.outcome.logicalCommand();
+    } else return error.TestUnexpectedResult;
+    var seal: native.PreparedValidationSeal = .{ .alloc = a, .command = logical };
+    defer seal.deinit();
+    try handle.db.applyCommittedRaftIndexValidation(&seal, 11, .{ .term = 7, .index = next_index });
+    var sealed = try Build.call(id, audit_input, validation_request);
+    defer sealed.deinit();
+    try std.testing.expectEqual(@as(u64, next_index), sealed.value.audit.seal.?.position.raft.index);
+    try handle.db.applyCommittedRaftIndexValidation(&seal, 11, .{ .term = 8, .index = next_index + 1 });
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    var sealed_retry = try Build.call(id, audit_input, validation_request);
+    defer sealed_retry.deinit();
+    try std.testing.expectEqualDeep(sealed.value.audit, sealed_retry.value.audit);
 }
 
 test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {

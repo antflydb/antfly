@@ -1245,6 +1245,9 @@ pub const RaftIndexOwnerBuildRequest = extern struct {
     prepare: u32 = 1,
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
+    /// Mode 2 performs a bounded root-local audit; only its receiving server
+    /// supplies this local signing-root scope, never a public RPC body.
+    audit_root_json: BorrowedBytes = .{},
     control: ControlledJsonOperationRequest = .{},
 };
 pub extern fn antfly_storage_owner_raft_index_build_json(

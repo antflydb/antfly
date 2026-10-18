@@ -3767,6 +3767,14 @@ pub const ProvisionedKernelOwnerSource = struct {
             return self.lease.owner().raftIndexOwnerBuild(alloc, self.table_name, request, prepare_page, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
         }
 
+        pub fn audit(self: *@This(), alloc: std.mem.Allocator, request: raft_index_control.BuildRequest, root: native_index_control.AuditRoot, recover_committed: bool) !std.json.Parsed(raft_index_control.BuildPreparation) {
+            if (!std.meta.eql(request.identity, self.identity)) return error.PrivateIndexOwnerJobChanged;
+            try root.validate();
+            const normalized = if (recover_committed) request_operation.RequestContext{} else try platformDeadlineContext(self.context);
+            var cancellation = normalized.cancellation;
+            return self.lease.owner().raftIndexOwnerStep(alloc, self.table_name, request, 2, root, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        }
+
         pub fn prepare(self: *@This(), alloc: std.mem.Allocator, header: raft_index_control.Admission, manifest: []const u8) !raft_index_control.AdmissionPreparation {
             try header.validate();
             const identity = self.identity;

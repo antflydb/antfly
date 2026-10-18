@@ -129,8 +129,17 @@ generation audit passes and signed root-local restart checkpoints; auditing
 does not advance the replicated apply marker. Metadata requires a physical
 witness for validated ACKs of either authority and independently verifies both
 the audited canonical cut and the later logical seal against current ownership.
+The receiver now prepares one bounded inventory/generation page through the
+existing compiled-owner interface, proposes the selected command under fresh
+frozen metadata permission, and recovers retained progress on the same lease.
+Generation preparation pins the shared compilation cache until encoding ends.
+After canonical readiness, the same interface advances the root-local audit;
+only its exact audited command can authorize a seal proposal. Post-commit
+recovery reads the retained seal without an uncancellable filesystem audit.
+Validation responses carry explicit Raft cuts and mandatory physical witnesses;
+the worker recognizes progress, permanent failures and signed validation ACKs.
 This is not complete public activation: the worker's Raft cohort guard,
-validation-page/audit receiver wiring and later publication receiver paths
+installation/release/cancellation receiver paths and root-adoption recovery
 remain unfinished, and public CREATE remains guarded. No original case is
 closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's
