@@ -679,10 +679,14 @@ fn appendDeclaredGlinerBundle(
         !managed_receipt.artifactPathIsSafe(head.string) or
         !isGgufFile(encoder.string) or !isGgufFile(head.string) or
         std.mem.eql(u8, encoder.string, head.string)) return error.InvalidInferenceBundle;
-    if (!hasFile(files, encoder.string) or !hasFile(files, head.string)) return error.MissingModelArtifact;
     if (quant_filter) |quant| {
-        if (!ggufQuantSuffixMatches(encoder.string, quant)) return false;
+        // The descriptor selects the default, not the only available variant.
+        // Limit fallback to a complete GLiNER pair: a generic GGUF may belong
+        // to an unrelated model in the same repository.
+        if (!ggufQuantSuffixMatches(encoder.string, quant))
+            return try appendGlinerSplitGgufBundleForQuant(allocator, selected, files, quant);
     }
+    if (!hasFile(files, encoder.string) or !hasFile(files, head.string)) return error.MissingModelArtifact;
     _ = try appendMatchingFileIfMissing(allocator, selected, files, encoder.string);
     _ = try appendMatchingFileIfMissing(allocator, selected, files, head.string);
     return true;
@@ -5299,4 +5303,23 @@ test "Hub snapshot downloads both declared GLiNER components at the resolved com
     try exerciseHubSnapshot("gliner-split", "gguf", "gguf", null);
     try exerciseHubSnapshot("gliner-split", "gguf:Q8_0", "gguf", null);
     try exerciseHubSnapshot("gliner-split", "gguf:Q4_K", null, error.NoModelFilesFound);
+}
+
+test "declared GLiNER default preserves explicit nondefault quantization" {
+    const a = std.testing.allocator;
+    const files = [_]HubFile{
+        .{ .name = "gliner2-encoder.Q8_0.gguf" },
+        .{ .name = "gliner2-head.Q8_0.gguf" },
+        .{ .name = "gliner2-encoder.Q4_K.gguf" },
+        .{ .name = "gliner2-head.Q4_K.gguf" },
+    };
+    const descriptor = "{\"family\":\"gliner2_split_bundle/v1\",\"encoder\":\"gliner2-encoder.Q8_0.gguf\",\"head\":\"gliner2-head.Q8_0.gguf\"}";
+    var baseline: std.ArrayListUnmanaged(HubFile) = .empty;
+    defer baseline.deinit(a);
+    try std.testing.expect(try appendBestRequestedGgufPayload(a, &baseline, &files, "Q4_K", .auto));
+    var selected: std.ArrayListUnmanaged(HubFile) = .empty;
+    defer selected.deinit(a);
+    const declared = try appendDeclaredGlinerBundle(a, &selected, &files, descriptor, "Q4_K");
+    const found = declared orelse try appendBestRequestedGgufPayload(a, &selected, &files, "Q4_K", .auto);
+    try std.testing.expect(found);
 }
