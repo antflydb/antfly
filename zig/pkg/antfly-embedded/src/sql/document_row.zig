@@ -73,6 +73,45 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
     return columns;
 }
 
+/// One declared-column derivation for query caches and durable dependency
+/// admission. Output and partial allocations belong to the caller's arena.
+pub fn deriveRelationalColumnsLeaky(owned: std.mem.Allocator, temporary: std.mem.Allocator, parsed: anytype, native: anytype) ![]const catalog.Column {
+    if (native.storage_mode != .relational) return error.UnsupportedSqlExecution;
+    var generated: std.StringHashMapUnmanaged(void) = .empty;
+    defer generated.deinit(temporary);
+    if (parsed.generated_columns) |items| {
+        if (items.value != .array) return error.InvalidSqlBackendResponse;
+        for (items.value.array.items) |item| {
+            if (item != .object) return error.InvalidSqlBackendResponse;
+            const name = item.object.get("column") orelse return error.InvalidSqlBackendResponse;
+            if (name != .string) return error.InvalidSqlBackendResponse;
+            try generated.put(temporary, name.string, {});
+        }
+    }
+    const columns = try owned.alloc(catalog.Column, native.relational_columns.len);
+    for (native.relational_columns, columns) |column, *out| out.* = .{
+        .name = try owned.dupe(u8, column.name),
+        .path = try owned.dupe(u8, column.path),
+        .nullable = !column.required or column.allows_null,
+        .generated = generated.contains(column.name),
+        .defaulted = catalog.hasColumnDefault(parsed, column.name),
+        .element_type = column.sql_element_type,
+        .numeric_modifier = column.numeric_modifier,
+        .type = relationalType(parsed, column.name, switch (column.column_type) {
+            .string => .string,
+            .integer => .integer,
+            .number => .number,
+            .numeric => .number,
+            .boolean => .boolean,
+            .datetime => .datetime,
+            .json => .json,
+            .sql_array => .array,
+            else => return error.UnsupportedSqlExecution,
+        }),
+    };
+    return columns;
+}
+
 /// Recover logical UUID semantics without changing the physical keyword layout.
 pub fn relationalType(schema: anytype, name: []const u8, physical: ast.ColumnType) ast.ColumnType {
     if (physical != .string) return physical;

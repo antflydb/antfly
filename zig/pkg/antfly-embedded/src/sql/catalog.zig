@@ -30,7 +30,56 @@ pub const Column = struct {
     generated: bool = false,
     /// Native row preparation fills absent DEFAULT cells after SQL evaluation.
     defaulted: bool = false,
+
+    /// A view dependency binds a logical SQL domain, not the spelling of its
+    /// name/path, nullability, generation expression, or DEFAULT clause.
+    pub fn identitySignature(self: Column, a: std.mem.Allocator) ![32]u8 {
+        const Kind = @import("../common/sql_builtin_type.zig").Type;
+        const identity: ?Kind = self.element_type orelse switch (self.type) {
+            .integer => Kind.int64,
+            .number => Kind.float64,
+            .string => Kind.text,
+            .uuid => Kind.uuid,
+            .boolean => Kind.boolean,
+            .json => Kind.jsonb,
+            .datetime => null,
+            .array => return error.InvalidSqlBackendResponse,
+        };
+        if (self.numeric_modifier) |modifier| {
+            if (identity != .numeric or (self.type != .number and self.type != .array)) return error.InvalidSqlBackendResponse;
+            try modifier.validate();
+        }
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .kind = self.type, .identity = identity, .numeric_modifier = self.numeric_modifier }, .{});
+        defer a.free(bytes);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly:sql-column-domain:v1\x00");
+        hash.update(bytes);
+        return hash.finalResult();
+    }
 };
+
+test "SQL column identity signatures normalize defaults and retain exact builtin array and numeric domains" {
+    const a = std.testing.allocator;
+    const base: Column = .{ .name = "a", .path = "a", .type = .integer };
+    var renamed = base;
+    renamed.name = "renamed";
+    renamed.path = "physical";
+    renamed.nullable = false;
+    renamed.defaulted = true;
+    renamed.element_type = .int64;
+    const signature = try base.identitySignature(a);
+    try std.testing.expectEqual(signature, try renamed.identitySignature(a));
+    renamed.element_type = .int32;
+    try std.testing.expect(!std.mem.eql(u8, &signature, &try renamed.identitySignature(a)));
+    const text_array: Column = .{ .name = "a", .path = "a", .type = .array, .element_type = .text };
+    var json_array = text_array;
+    json_array.element_type = .jsonb;
+    try std.testing.expect(!std.mem.eql(u8, &try text_array.identitySignature(a), &try json_array.identitySignature(a)));
+    const numeric: Column = .{ .name = "a", .path = "a", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 20, .scale = 4 } };
+    var wide = numeric;
+    wide.numeric_modifier = .{ .precision = 22, .scale = 4 };
+    try std.testing.expect(!std.mem.eql(u8, &try numeric.identitySignature(a), &try wide.identitySignature(a)));
+}
 
 pub fn hasColumnDefault(schema: anytype, name: []const u8) bool {
     const entries = schema.column_defaults orelse return false;

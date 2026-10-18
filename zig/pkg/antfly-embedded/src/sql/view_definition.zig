@@ -24,6 +24,9 @@ const describe = @import("describe.zig");
 const scalar = @import("scalar.zig");
 const Budget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
+test {
+    _ = @import("../system_catalog/column_identities.zig");
+}
 pub const max_query_bytes = 64 * 1024;
 pub const max_sources = 64;
 pub const max_columns = 1024;
@@ -34,6 +37,9 @@ pub const Principal = struct { name: []const u8, instance_id: [16]u8 };
 pub const Owner = union(enum) { auth_disabled, user: Principal, role: Principal };
 pub const Security = enum { owner, invoker };
 pub const Output = struct { name: []const u8, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, numeric_modifier: ?scalar.NumericModifier = null };
+/// Names are resolved to durable attribute IDs by catalog publication in the
+/// same transaction as source-epoch admission; they are not execution identity.
+pub const ColumnDependency = struct { name: []const u8, signature: [32]u8 };
 pub const Source = struct {
     reference: ast.Name,
     database: []const u8,
@@ -44,6 +50,7 @@ pub const Source = struct {
     /// Publication guards at preparation, not permanent schema-change bans.
     schema_version: u32,
     schema_digest: [32]u8,
+    columns: []const ColumnDependency = &.{},
 };
 pub const Definition = struct {
     format: u8,
@@ -131,6 +138,9 @@ fn cloneSource(a: A, source: Source) !Source {
     result.namespace = try a.dupe(u8, source.namespace);
     result.name = try a.dupe(u8, source.name);
     result.physical_name = try a.dupe(u8, source.physical_name);
+    const columns = try a.dupe(ColumnDependency, source.columns);
+    for (columns) |*column| column.name = try a.dupe(u8, column.name);
+    result.columns = columns;
     return result;
 }
 fn lessSource(_: void, left: Source, right: Source) bool {
@@ -220,7 +230,11 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
     if (compiled.statement != .select or compiled.parameter_count != 0) return error.InvalidSqlViewDefinition;
     var preparation: Preparation = .{ .resolver = resolver };
     const backend: catalog.Backend = .{ .ptr = &preparation, .settings_view = options.settings, .vtable = &.{ .resolve = Preparation.resolve, .scan = Preparation.scan, .mutate = Preparation.mutate, .checkpoint = Preparation.checkpoint } };
-    const bound = try describe.bind(a, backend, &compiled, &.{});
+    const relations = @import("relation_binding.zig");
+    const relation = try relations.bindDefinition(a, backend, compiled.statement.select);
+    var adapter: relations.ResolveAdapter = .{ .backend = backend, .table = relation.table };
+    const lowered: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = relation.statement }, .parameter_count = 0 };
+    const bound = try describe.bind(a, adapter.iface(), &lowered, &.{});
     if (bound.columns.len == 0 or bound.columns.len > max_columns or options.columns.len > bound.columns.len) return error.InvalidSqlViewDefinition;
     const columns = try output.alloc(Output, bound.columns.len);
     for (bound.columns, columns, 0..) |column, *out, index| {
@@ -231,7 +245,30 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
         out.* = .{ .name = try output.dupe(u8, name), .type = column.type, .element_type = scalar.columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
     }
     const sources = try output.alloc(Source, preparation.sources.items.len);
-    for (preparation.sources.items, sources) |source, *out| out.* = try cloneSource(output, source);
+    for (preparation.sources.items, sources) |source, *out| {
+        out.* = try cloneSource(output, source);
+        var unique: std.StringHashMapUnmanaged([32]u8) = .empty;
+        for (relation.column_dependencies) |dependency| {
+            if (dependency.table_id != source.table_id) continue;
+            const signature = try dependency.column.identitySignature(a);
+            const entry = try unique.getOrPut(a, dependency.column.name);
+            if (entry.found_existing) {
+                if (!std.mem.eql(u8, &entry.value_ptr.*, &signature)) return error.InvalidSqlBackendResponse;
+            } else entry.value_ptr.* = signature;
+        }
+        const dependencies = try output.alloc(ColumnDependency, unique.count());
+        var iterator = unique.iterator();
+        for (dependencies) |*dependency| {
+            const entry = iterator.next().?;
+            dependency.* = .{ .name = try output.dupe(u8, entry.key_ptr.*), .signature = entry.value_ptr.* };
+        }
+        std.mem.sort(ColumnDependency, dependencies, {}, struct {
+            fn less(_: void, left: ColumnDependency, right: ColumnDependency) bool {
+                return std.mem.lessThan(u8, left.name, right.name);
+            }
+        }.less);
+        out.columns = dependencies;
+    }
     std.mem.sort(Source, sources, {}, lessSource);
     try resolver.checkpoint(resolver.ptr);
     return .{ .format = 1, .query = try output.dupe(u8, query), .owner = owner, .security = options.security, .security_barrier = options.security_barrier, .catalog_revision = preparation.revision, .setting_epoch = if (options.settings) |settings| settings.epoch else null, .columns = columns, .sources = sources };
@@ -321,6 +358,39 @@ test "SQL view definition binds derived array relations and canonical qualified 
     try std.testing.expectEqualStrings("public", definition.value.sources[1].reference.namespace.?);
     try std.testing.expectEqualStrings("a", definition.value.sources[1].reference.table);
     try std.testing.expectEqual(.int16, definition.value.columns[0].element_type.?);
+}
+
+test "SQL view definition retains semantic column dependencies independently of scan demand" {
+    const Case = struct { query: []const u8, names: []const []const u8 };
+    for ([_]Case{
+        .{ .query = "SELECT COUNT(*) FROM things", .names = &.{} },
+        .{ .query = "SELECT COUNT(id) FROM things", .names = &.{"id"} },
+        .{ .query = "SELECT 42 AS answer FROM things", .names = &.{} },
+        .{ .query = "SELECT * FROM things", .names = &.{ "amount", "id", "items" } },
+        .{ .query = "SELECT CASE WHEN FALSE THEN id ELSE 0 END AS value FROM things", .names = &.{"id"} },
+        .{ .query = "SELECT a.id FROM things a JOIN things b ON a.amount=b.amount", .names = &.{ "amount", "id" } },
+        .{ .query = "SELECT a.id FROM things a JOIN things b USING (items)", .names = &.{ "id", "items" } },
+        .{ .query = "WITH x AS (SELECT id, amount FROM things) SELECT id FROM x", .names = &.{ "amount", "id" } },
+        .{ .query = "WITH unused AS (SELECT amount FROM things) SELECT 42 AS answer FROM things", .names = &.{"amount"} },
+        .{ .query = "SELECT a.id FROM things a WHERE EXISTS (SELECT 1 FROM things b WHERE b.amount=a.amount)", .names = &.{ "amount", "id" } },
+        .{ .query = "SELECT _id FROM things", .names = &.{"_id"} },
+        .{ .query = "SELECT id FROM things WHERE FALSE AND amount > 0", .names = &.{ "amount", "id" } },
+        .{ .query = "SELECT SUM(amount) FILTER (WHERE id > 0) AS total FROM things", .names = &.{ "amount", "id" } },
+        .{ .query = "SELECT id, ROW_NUMBER() OVER (ORDER BY amount) AS position FROM things", .names = &.{ "amount", "id" } },
+        .{ .query = "SELECT id FROM things ORDER BY amount", .names = &.{ "amount", "id" } },
+        .{ .query = "SELECT u.item FROM things t, LATERAL UNNEST(t.items) AS u(item)", .names = &.{"items"} },
+    }) |case| {
+        var resolver: TestResolver = .{};
+        var definition = try prepare(std.testing.allocator, resolver.resolver(), case.query, .{ .owner = .auth_disabled });
+        defer definition.deinit();
+        try std.testing.expectEqual(@as(usize, 1), definition.value.sources.len);
+        const columns = definition.value.sources[0].columns;
+        try std.testing.expectEqual(case.names.len, columns.len);
+        for (case.names, columns) |name, column| {
+            try std.testing.expectEqualStrings(name, column.name);
+            try std.testing.expect(!std.mem.allEqual(u8, &column.signature, 0));
+        }
+    }
 }
 
 test "SQL view definition rejects writable parameterized and ambiguous output contracts" {

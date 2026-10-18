@@ -22,6 +22,7 @@ const secret_collection = @import("../../common/secret_collection.zig");
 const metadata_store_observer = @import("../store_observer.zig");
 const store_report_update = @import("../store_report_update.zig");
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
+const column_identities = @import("antfly_local_sources").system_catalog_column_identities;
 // Qualified restore admission identities encode the full logical target.
 // Accommodate their bounded envelope as well as ordinary 255-byte names.
 const catalog_name_key_buffer_bytes = 2048;
@@ -1130,6 +1131,165 @@ test "system catalog relation namespace transaction live replay authenticates pr
         try std.testing.expectEqual(@as(u64, 2), registry.live.?.root.sequence);
         try std.testing.expect((try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "after" })) != null);
         try std.testing.expect((try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "injected" })) == null);
+    }
+}
+
+test "system catalog SQL column identities publish with source schemas reject stale apply and survive snapshots and cold reopen" {
+    const T = struct {
+        const schema1 =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"status":{"type":"keyword"}},"additionalProperties":false}}}}
+        ;
+        const schema2 =
+            \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"status":{"type":"keyword"},"note":{"type":"keyword"}},"additionalProperties":false}}}}
+        ;
+        fn apply(s: *RaftApplyStore, group: u64, index: u64, command: TransitionCommand, replicated: bool) !void {
+            if (!replicated) {
+                if (command == .upsert_table) return s.updateStandaloneCatalog(group, try s.standaloneRevision(), .{ .tables = &.{command.upsert_table}, .auxiliary_json = "{}" });
+                return s.applyStandaloneCommand(group, command);
+            }
+            const encoded = try encodeTransitionCommand(s.alloc, command);
+            defer s.alloc.free(encoded);
+            const entries = try raft_state_machine.encodeCommittedEntries(s.alloc, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = encoded }});
+            defer s.alloc.free(entries);
+            try s.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = index, .entries_bytes = entries });
+        }
+        fn load(s: *RaftApplyStore, group: u64) !std.json.Parsed(column_identities.State) {
+            var read = try s.store.beginReadTxn();
+            defer read.abort();
+            const registry: column_identities.Store(docstore.DocStore.Txn) = .{ .txn = &read, .group_id = group };
+            return (try registry.load(s.alloc, 7)) orelse error.TestMissingColumnIdentities;
+        }
+        fn find(state: column_identities.State, name: []const u8) !column_identities.Column {
+            for (state.columns) |column| if (std.mem.eql(u8, name, column.name)) return column;
+            return error.TestMissingColumnIdentity;
+        }
+    };
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| {
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/column-identities-{s}", .{ tmp.sub_path, if (replicated) "raft" else "native" });
+        defer a.free(root);
+        const target_root = try std.fmt.allocPrint(a, "{s}-snapshot", .{root});
+        defer a.free(target_root);
+        var status: struct { id: u64, signature: [32]u8 } = undefined;
+        var high_water: u64 = undefined;
+        {
+            var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+            defer store.deinit();
+            try T.apply(&store, group, 1, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* }, replicated);
+            const initial: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = T.schema1 };
+            try T.apply(&store, group, 2, .{ .upsert_table = initial }, replicated);
+            {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                const registry: column_identities.Store(docstore.DocStore.Txn) = .{ .txn = &read, .group_id = group };
+                try std.testing.expect((try registry.load(a, 7)) == null);
+            }
+            // Explicit trusted publication bootstrap, not an allocating read.
+            // The stored-view publication command will own this same txn.
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                try store.initializeColumnIdentitiesTxn(&txn, group, initial);
+                try txn.commit();
+            }
+            {
+                var first = try T.load(&store, group);
+                defer first.deinit();
+                const found = try T.find(first.value, "status");
+                status = .{ .id = found.id, .signature = found.signature };
+            }
+            var updated = initial;
+            updated.schema_json = T.schema2;
+            try T.apply(&store, group, 3, .{ .upsert_table = updated }, replicated);
+            {
+                var after = try T.load(&store, group);
+                defer after.deinit();
+                try std.testing.expectEqual(@as(u32, 2), after.value.epoch.version);
+                try std.testing.expectEqual(status.id, (try T.find(after.value, "status")).id);
+                _ = try after.value.requireDependency(status.id, status.signature);
+                high_water = after.value.next_id;
+                const revision = try store.standaloneRevision();
+                if (replicated) {
+                    // The stale command advances apply, but cannot roll back
+                    // either the table schema or its attribute high-water.
+                    try T.apply(&store, group, 4, .{ .upsert_table = initial }, true);
+                } else {
+                    try std.testing.expectError(error.TableLifecycleConflict, T.apply(&store, group, 4, .{ .upsert_table = initial }, false));
+                    try std.testing.expectEqual(revision, try store.standaloneRevision());
+                }
+                var current = try T.load(&store, group);
+                defer current.deinit();
+                try std.testing.expectEqualDeep(after.value, current.value);
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                var buf: [160]u8 = undefined;
+                const actual = try decodeTableRecord(a, try read.get(try tableKeyForGroup(&buf, group, 7)));
+                defer metadata_table_manager.freeTable(a, actual);
+                try std.testing.expectEqualStrings(T.schema2, actual.schema_json);
+            }
+            const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+            defer a.free(snapshot);
+            {
+                var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+                defer target.deinit();
+                try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group, 4, snapshot));
+                var copied = try T.load(&target, group);
+                defer copied.deinit();
+                try std.testing.expectEqual(high_water, copied.value.next_id);
+                _ = try copied.value.requireDependency(status.id, status.signature);
+            }
+            {
+                var current = try T.load(&store, group);
+                defer current.deinit();
+                var table_buf: [160]u8 = undefined;
+                const column_key = try column_identities.key(.{ .group = group, .table = 7 });
+                var rows = [_]docstore.OwnedKVPair{
+                    .{ .key = try a.dupe(u8, try tableKeyForGroup(&table_buf, group, 7)), .value = try encodeTableRecord(a, updated) },
+                    .{ .key = try a.dupe(u8, &column_key), .value = try current.value.encode(a) },
+                };
+                defer for (rows) |row| {
+                    a.free(row.key);
+                    a.free(row.value);
+                };
+                try validateMetadataSnapshotRows(a, group, &rows);
+                const columns = try a.dupe(column_identities.Column, current.value.columns);
+                defer a.free(columns);
+                columns[0].signature = @splat(9);
+                var substituted = current.value;
+                substituted.columns = columns;
+                const invalid = try substituted.encode(a);
+                a.free(rows[1].value);
+                rows[1].value = invalid;
+                try std.testing.expectError(error.InvalidMetadataSnapshot, validateMetadataSnapshotRows(a, group, &rows));
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                try txn.put(&column_key, invalid);
+                try std.testing.expectError(error.InvalidColumnIdentityState, store.prepareTrackedColumnIdentitiesTxn(&txn, group, updated));
+            }
+        }
+        for ([_][]const u8{ root, target_root }) |path| {
+            var recovered = try RaftApplyStore.init(a, .{ .root_dir = path });
+            defer recovered.deinit();
+            var current = try T.load(&recovered, group);
+            defer current.deinit();
+            try std.testing.expectEqual(high_water, current.value.next_id);
+            _ = try current.value.requireDependency(status.id, status.signature);
+            try std.testing.expectEqualStrings("note", (try T.find(current.value, "note")).name);
+            const generation = blk: {
+                var read = try recovered.store.beginReadTxn();
+                defer read.abort();
+                break :blk (try recovered.loadTableTransitionFenceTxn(&read, group, 7)).generation;
+            };
+            try T.apply(&recovered, group, 5, .{ .remove_table = .{ .table_id = 7, .expected_transition_generation = generation } }, replicated);
+            var read = try recovered.store.beginReadTxn();
+            defer read.abort();
+            const registry: column_identities.Store(docstore.DocStore.Txn) = .{ .txn = &read, .group_id = group };
+            try std.testing.expect((try registry.load(a, 7)) == null);
+            try verifyColumnIdentityCheckpointTxn(a, &read);
+        }
     }
 }
 
@@ -24096,6 +24256,7 @@ pub const RaftApplyStore = struct {
         index_delivery_source,
         index_delivery_target,
         standalone_native_owner,
+        sql_column_identities,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -24106,6 +24267,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .sql_column_identities, .key = .{ .prefix = column_identities.prefixForGroup } },
         .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
@@ -24266,7 +24428,7 @@ pub const RaftApplyStore = struct {
         };
         // Table publication and DROP update lifecycle roots in the same cut.
         return if ((mask & metadataSnapshotProjectionBit(.table)) != 0)
-            mask | metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_delivery_target) |
+            mask | metadataSnapshotProjectionBit(.sql_column_identities) | metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_delivery_target) |
                 metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.index_publication_inputs) | metadataSnapshotProjectionBit(.index_publication_dispatch) | metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
                 metadataSnapshotProjectionBit(.relation_reconciliation) | metadataSnapshotProjectionBit(.relation_candidates) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) | metadataSnapshotProjectionBit(.relation_source)
@@ -27581,6 +27743,7 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         var fingerprint_key_buf: [192]u8 = undefined;
+        try self.deleteColumnIdentitiesTxn(txn, group_id, table_id);
         txn.delete(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, table_id)) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -28695,6 +28858,7 @@ pub const RaftApplyStore = struct {
                             var key_buf: [256]u8 = undefined;
                             const old_key = try tableKeyForGroup(&key_buf, group_id, old.table.table_id);
                             try txn.delete(old_key);
+                            try self.deleteColumnIdentitiesTxn(txn, group_id, old.table.table_id);
                             try self.deleteTableNameIndexTxn(txn, group_id, old.table.name);
                             try self.advanceTableTransitionGenerationWithRangeChangesTxn(txn, group_id, old.table.table_id, &.{}, removed.items);
                             self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = old_key });
@@ -28959,6 +29123,7 @@ pub const RaftApplyStore = struct {
                 }
                 try self.removeSystemCatalogTableTxn(txn, group_id, drop.table_id);
                 try txn.delete(table_key);
+                try self.deleteColumnIdentitiesTxn(txn, group_id, drop.table_id);
                 try relation_reconciliation.advanceTrackedSource(txn, group_id);
                 var fingerprint_key_buf: [192]u8 = undefined;
                 txn.delete(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, drop.table_id)) catch |err| switch (err) {
@@ -29618,6 +29783,7 @@ pub const RaftApplyStore = struct {
         value: []u8,
         previous_name: ?[]u8,
         lake_value: ?[]u8,
+        column_identity_value: ?[]u8,
         source_changed: bool,
         fingerprint: [32]u8,
 
@@ -29625,6 +29791,7 @@ pub const RaftApplyStore = struct {
             alloc.free(self.value);
             if (self.previous_name) |name| alloc.free(name);
             if (self.lake_value) |bytes| alloc.free(bytes);
+            if (self.column_identity_value) |bytes| alloc.free(bytes);
             self.* = undefined;
         }
     };
@@ -29684,6 +29851,11 @@ pub const RaftApplyStore = struct {
         }
         const lake_value = try self.prepareLakeIndexLifecycleTxn(txn, group_id, record);
         errdefer if (lake_value) |bytes| self.alloc.free(bytes);
+        const column_value = self.prepareTrackedColumnIdentitiesTxn(txn, group_id, record) catch |err| switch (err) {
+            error.ColumnIdentityDefinitionRejected => return null,
+            else => return err,
+        };
+        errdefer if (column_value) |bytes| self.alloc.free(bytes);
         const value = try encodeTableRecord(self.alloc, record);
         const source_changed = if (source_tracked) changed: {
             const digest = relationTableSourceDigest(record.table_id, record.name, record.schema_json);
@@ -29694,6 +29866,7 @@ pub const RaftApplyStore = struct {
             .value = value,
             .previous_name = previous_name,
             .lake_value = lake_value,
+            .column_identity_value = column_value,
             .source_changed = source_changed,
             .fingerprint = policyTableSchemaRecordDigest(record),
         };
@@ -29703,6 +29876,11 @@ pub const RaftApplyStore = struct {
     /// here abort the containing transaction, including its catalog/outbox.
     fn writePreparedTableRecordTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, key: []const u8, prepared: PreparedTableRecordWrite) !void {
         const record = prepared.identity;
+        if (prepared.column_identity_value) |bytes| {
+            const column_key = try column_identities.key(.{ .group = group_id, .table = record.table_id });
+            try txn.put(&column_key, bytes);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = &column_key });
+        }
         if (prepared.previous_name) |name| try self.deleteTableNameIndexTxn(txn, group_id, name);
         if (prepared.lake_value) |bytes| {
             var buffer: [160]u8 = undefined;
@@ -29720,6 +29898,85 @@ pub const RaftApplyStore = struct {
             .table_name = record.name,
             .table_id = record.table_id,
         });
+    }
+
+    fn columnIdentityValue(alloc: std.mem.Allocator, record: metadata.TableRecord, previous: ?column_identities.State, renames: []const column_identities.Rename) ![]u8 {
+        if (record.schema_json.len > column_identities.max_encoded_bytes * 4) return error.ColumnIdentityLimitExceeded;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const sources = @import("antfly_local_sources");
+        const parsed = try sources.schema_mod.parseValidatedTableSchema(a, if (record.schema_json.len == 0) "{}" else record.schema_json);
+        const columns = if (parsed.storage_mode == .document)
+            try sources.sql_document_row.deriveColumns(a, parsed)
+        else relational: {
+            const native = try sources.schema_mod.deriveRuntimeTableSchema(a, parsed);
+            break :relational try sources.sql_document_row.deriveRelationalColumnsLeaky(a, a, parsed, native);
+        };
+        const table: sources.sql_catalog.Table = .{ .id = record.table_id, .physical_name = record.name, .schema_version = parsed.version, .storage_mode = if (parsed.storage_mode == .document) .document else .relational, .columns = columns };
+        const virtual = table.virtualColumns();
+        if (columns.len + virtual.len > column_identities.max_columns) return error.ColumnIdentityLimitExceeded;
+        const declarations = try a.alloc(column_identities.Declaration, columns.len + virtual.len);
+        for (columns, declarations[0..columns.len]) |column, *out| out.* = .{ .name = column.name, .signature = try column.identitySignature(a) };
+        for (virtual, declarations[columns.len..]) |column, *out| out.* = .{ .name = column.name, .signature = try column.identitySignature(a) };
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(record.schema_json, &digest, .{});
+        var prepared = try column_identities.prepare(alloc, record.table_id, previous, .{ .version = parsed.version, .digest = digest }, declarations, renames);
+        defer prepared.deinit();
+        return prepared.value.encode(alloc);
+    }
+
+    /// Only a containing catalog publication may bootstrap IDs. Ordinary
+    /// schema writes maintain already registered sources, never allocate an
+    /// identity registry merely because a query or status read touched them.
+    fn initializeColumnIdentitiesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !void {
+        var buf: [160]u8 = undefined;
+        const bytes = try txn.get(try tableKeyForGroup(&buf, group_id, record.table_id));
+        const actual = try decodeTableRecord(self.alloc, bytes);
+        defer metadata_table_manager.freeTable(self.alloc, actual);
+        if (actual.table_id != record.table_id or !std.mem.eql(u8, actual.name, record.name) or !std.mem.eql(u8, actual.schema_json, record.schema_json)) return error.ColumnIdentityEpochChanged;
+        const registry: column_identities.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group_id = group_id };
+        var previous = try registry.load(self.alloc, record.table_id);
+        defer if (previous) |*loaded| loaded.deinit();
+        const value = try columnIdentityValue(self.alloc, record, if (previous) |loaded| loaded.value else null, &.{});
+        defer self.alloc.free(value);
+        const column_key = try column_identities.key(.{ .group = group_id, .table = record.table_id });
+        if (try stagingGet(txn, &column_key)) |old| if (std.mem.eql(u8, old, value)) return;
+        try txn.put(&column_key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = &column_key });
+    }
+
+    fn deleteColumnIdentitiesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !void {
+        const column_key = try column_identities.key(.{ .group = group_id, .table = table_id });
+        if (try stagingGet(txn, &column_key) == null) return;
+        try txn.delete(&column_key);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = &column_key });
+    }
+
+    fn prepareTrackedColumnIdentitiesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !?[]u8 {
+        const registry: column_identities.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group_id = group_id };
+        var previous = (try registry.load(self.alloc, record.table_id)) orelse return null;
+        defer previous.deinit();
+        const column_key = try column_identities.key(.{ .group = group_id, .table = record.table_id });
+        var table_buf: [160]u8 = undefined;
+        const old_table = try txn.get(try tableKeyForGroup(&table_buf, group_id, record.table_id));
+        validateColumnIdentityRecord(self.alloc, .{ .group = group_id, .table = record.table_id }, try txn.get(&column_key), old_table) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidColumnIdentityState,
+        };
+        // Stored-state corruption above is fatal. A proposed incompatible or
+        // malformed successor is instead normal catalog nonadmission; a
+        // committed stale command must not wedge ordered Raft apply.
+        const value = columnIdentityValue(self.alloc, record, previous.value, &.{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.ColumnIdentityDefinitionRejected,
+        };
+        errdefer self.alloc.free(value);
+        if (std.mem.eql(u8, try txn.get(&column_key), value)) {
+            self.alloc.free(value);
+            return null;
+        }
+        return value;
     }
 
     fn loadTableTransitionFenceTxn(
@@ -36820,10 +37077,47 @@ fn validateMetadataSnapshotRowsCancelable(alloc: std.mem.Allocator, group_id: u6
         error.OutOfMemory, error.SnapshotBuildCancelled => return err,
         else => return error.InvalidMetadataSnapshot,
     };
+    for (rows) |row| {
+        if (column_identities.decodeKey(row.key) catch return error.InvalidMetadataSnapshot) |identity| {
+            if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+            var buf: [160]u8 = undefined;
+            const table = seen.get(try tableKeyForGroup(&buf, group_id, identity.table)) orelse return error.InvalidMetadataSnapshot;
+            validateColumnIdentityRecord(alloc, identity, row.value, table) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataSnapshot,
+            };
+        }
+    }
     validateRelationSnapshotCut(alloc, group_id, rows, &seen, cancelled) catch |err| switch (err) {
         error.OutOfMemory, error.SnapshotBuildCancelled => return err,
         else => return error.InvalidMetadataSnapshot,
     };
+}
+
+fn validateColumnIdentityRecord(alloc: std.mem.Allocator, identity: column_identities.Key, bytes: []const u8, table_bytes: []const u8) !void {
+    var state = try column_identities.State.decode(alloc, bytes);
+    defer state.deinit();
+    if (state.value.table_id != identity.table) return error.InvalidColumnIdentityState;
+    const table = try decodeTableRecord(alloc, table_bytes);
+    defer metadata_table_manager.freeTable(alloc, table);
+    if (table.table_id != identity.table) return error.InvalidColumnIdentityState;
+    const expected = try RaftApplyStore.columnIdentityValue(alloc, table, state.value, &.{});
+    defer alloc.free(expected);
+    if (!std.mem.eql(u8, bytes, expected)) return error.InvalidColumnIdentityState;
+}
+
+fn verifyColumnIdentityCheckpointTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn) !void {
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const prefix = column_identities.allGroupsPrefix();
+    var current = try cursor.seekAtOrAfter(prefix);
+    while (current) |row| : (current = try cursor.next()) {
+        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+        const identity = (try column_identities.decodeKey(row.key)) orelse return error.InvalidColumnIdentityState;
+        var buf: [160]u8 = undefined;
+        const table = try txn.get(try tableKeyForGroup(&buf, identity.group, identity.table));
+        try validateColumnIdentityRecord(alloc, identity, row.value, table);
+    }
 }
 
 /// Reuse the snapshot's existing borrowed-row index. Only active store headers
@@ -37415,6 +37709,7 @@ fn verifyRelationCheckpointTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore
 }
 
 fn verifyRelationCheckpointGroupsTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn) !void {
+    try verifyColumnIdentityCheckpointTxn(alloc, txn);
     try verifyReconciliationCheckpointTxn(txn);
     var cursor = try txn.openCursor();
     defer cursor.close();

@@ -202,39 +202,7 @@ fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned
     }
     const native = try schema.deriveRuntimeTableSchema(alloc, parsed);
     defer native_schema.freeSchema(alloc, native);
-    if (native.storage_mode != .relational) return error.UnsupportedSqlExecution;
-    var generated = std.StringHashMap(void).init(alloc);
-    if (parsed.generated_columns) |items| {
-        if (items.value != .array) return error.InvalidSqlBackendResponse;
-        for (items.value.array.items) |item| {
-            if (item != .object) return error.InvalidSqlBackendResponse;
-            const name = item.object.get("column") orelse return error.InvalidSqlBackendResponse;
-            if (name != .string) return error.InvalidSqlBackendResponse;
-            try generated.put(name.string, {});
-        }
-    }
-    const columns = try owned.alloc(catalog.Column, native.relational_columns.len);
-    for (native.relational_columns, columns) |column, *out| out.* = .{
-        .name = try owned.dupe(u8, column.name),
-        .path = try owned.dupe(u8, column.path),
-        .nullable = !column.required or column.allows_null,
-        .generated = generated.contains(column.name),
-        .defaulted = catalog.hasColumnDefault(parsed, column.name),
-        .element_type = column.sql_element_type,
-        .numeric_modifier = column.numeric_modifier,
-        .type = @import("antfly_local_sources").sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
-            .string => .string,
-            .integer => .integer,
-            .number => .number,
-            .numeric => .number,
-            .boolean => .boolean,
-            .datetime => .datetime,
-            .json => .json,
-            .sql_array => .array,
-            else => return error.UnsupportedSqlExecution,
-        }),
-    };
-    layout.columns = columns;
+    layout.columns = try @import("antfly_local_sources").sql_document_row.deriveRelationalColumnsLeaky(owned, alloc, parsed, native);
     if (native.external_base_source) |source| {
         layout.external_base_source = try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(owned, source);
         layout.version = native.version;

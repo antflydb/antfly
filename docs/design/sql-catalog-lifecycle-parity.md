@@ -9722,6 +9722,49 @@ PostgreSQL 18.6 experiment in
 alias lists, exact integer/array/NUMERIC descriptors, duplicate output rejection
 and excess-alias rejection. It did not qualify stored-view execution or RLS.
 
+### Stored-view dependency admission foundation (not activation)
+
+Tracked SQL sources now have a durable, bounded column-identity registry.
+Stable IDs survive trusted renames and reordering; dropped/recreated names
+receive new IDs through a persisted high-water counter. Exact builtin, array
+element and NUMERIC domain signatures distinguish incompatible type changes
+without treating DEFAULT, nullability or unrelated-column changes as new
+identities. Schema and identity changes share the existing metadata transaction,
+standalone publication and committed-Raft apply machinery. Snapshot import and
+cold checkpoint validation join identities to the actual source schema and
+reject corruption rather than silently repairing it. Ordinary tables do not
+create registry state merely because a reader resolves their schema.
+
+View preparation now uses definition-mode relational binding to capture source
+column references before constant folding and projection pruning. Stars capture
+their creation-time shape; COUNT(*) retains table dependency without depending
+on every column. Referenced and unused CTE projections retain their semantic
+dependencies. This collection is disabled for ordinary executable binding.
+Prepared names/signatures still require transactional resolution to durable
+attribute IDs during view publication; they are not execution credentials.
+
+The PostgreSQL oracle in scripts/test_sql_view_catalog.py verifies dependency
+behavior and the distinction between owner authorization and session identity.
+The owner selects underlying permission checks and RLS policy selection by
+default; SQL current_user still evaluates as the caller, including inside the
+selected RLS policy. SECURITY INVOKER uses caller authorization. Live owner and
+caller grants must be checked at execution, not captured as permanent grants.
+Globally impersonating the view owner would implement the wrong semantics.
+
+Public CREATE VIEW, namespace admission, dependency-aware source mutation,
+view expansion and owner/RLS delegation are **not active**. No original case
+dispositions change; the unresolved inventory remains 771.
+
+Validation: the Debug SQL and metadata identity gates passed all 76 build steps
+in /private/tmp/antfly-sql-view-column-identities-full-debug.log, including 931
+core SQL tests (four explicitly opt-in benchmark skips), 234 extracted SQL
+tests, five identity-model tests and four metadata/import tests. The later
+definition-mode changes passed nine focused Debug tests without skips or leaks
+in /private/tmp/antfly-sql-view-semantic-dependencies-final-debug.log. Five
+independent PostgreSQL 18.6 oracle tests passed in
+/private/tmp/antfly-sql-view-semantic-dependencies-postgres.log. These component
+gates do not qualify stored-view execution.
+
 ### Captured Apply prefix replay
 
 Invariant captured inputs under Apply now retain one suspended iterator instead

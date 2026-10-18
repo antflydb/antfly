@@ -155,7 +155,8 @@ pub const Node = struct {
     },
 };
 pub const virtual_table_name = "$sql_relation";
-pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select, prepared_fields: []const []const u8 = &.{}, access_graph: ?*const @import("relation_access.zig").Graph = null };
+pub const ColumnDependency = struct { table_id: u64, column: catalog.Column };
+pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select, prepared_fields: []const []const u8 = &.{}, access_graph: ?*const @import("relation_access.zig").Graph = null, column_dependencies: []const ColumnDependency = &.{} };
 pub const prepared_scope_name = "$sql_prepared_scope";
 
 fn qualified(node: *const ast.Scalar) bool {
@@ -331,6 +332,11 @@ const Builder = struct {
     prepared_scope: ?[]const Column = null,
     prepared_demands: std.StringHashMapUnmanaged(void) = .empty,
     scans: std.ArrayList(catalog.StatementScan) = .empty,
+    /// Definition binding records semantic references before scalar folding or
+    /// scan pruning. Ordinary executable bindings allocate neither map.
+    capture_dependencies: bool = false,
+    dependency_origins: std.StringHashMapUnmanaged(ColumnDependency) = .empty,
+    dependency_references: std.StringHashMapUnmanaged(void) = .empty,
     identities: std.StringHashMapUnmanaged(catalog.Table) = .empty,
     outer_references: ?*std.StringHashMapUnmanaged(void) = null,
     next_column: usize = 0,
@@ -857,6 +863,7 @@ const Builder = struct {
     }
     fn resolveField(self: *Builder, columns: []const Column, name: []const u8) !Column {
         const column = try field(columns, name);
+        try self.referenceColumn(column);
         for (0..32) |id| if (column.outer_dependencies & (@as(u32, 1) << @intCast(id)) != 0) {
             self.outer_used[id] = true;
         };
@@ -865,6 +872,10 @@ const Builder = struct {
             if (self.outer_references) |references| try references.put(self.alloc, column.internal, {});
         }
         return column;
+    }
+    fn referenceColumn(self: *Builder, column: Column) !void {
+        if (self.capture_dependencies and self.dependency_origins.contains(column.internal))
+            try self.dependency_references.put(self.alloc, column.internal, {});
     }
     fn scalarNode(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
         if (self.shape_only) {
@@ -969,6 +980,7 @@ const Builder = struct {
                 try projections.append(self.alloc, .{ .expression = try self.expression(source.columns, node_, &.{}), .alias = projection.alias });
             } else {
                 const column = if (projection.bound_column) |ordinal| source.columns[ordinal] else try self.resolveField(source.columns, projection.field);
+                try self.referenceColumn(column);
                 if (column.outer_frame) |id| self.outer_used[id] = true;
                 for (0..32) |id| if (column.outer_dependencies & (@as(u32, 1) << @intCast(id)) != 0) {
                     self.outer_used[id] = true;
@@ -1172,6 +1184,18 @@ const Builder = struct {
         @memcpy(ctes[0..scope.len], scope);
         @memcpy(ctes[scope.len..], statement.ctes);
         for (statement.ctes, 0..) |cte, index| for (statement.ctes[0..index]) |prior| if (std.mem.eql(u8, cte.name, prior.name)) return error.DuplicateSqlColumn;
+        // PostgreSQL stores the analyzed WITH tree, including unused CTEs.
+        // Bind their dependencies without making them executable row demand.
+        if (self.capture_dependencies) for (statement.ctes, demand, 0..) |cte, references, index| {
+            if (references != 0) continue;
+            try self.backend.vtable.checkpoint(self.backend.ptr);
+            const prefix = ctes[0 .. scope.len + index];
+            if (cte.recursive and try @import("recursive_shape.zig").references(cte.query.*, cte.name, 0) != 0) {
+                _ = try self.recursiveCte(cte, cte.name, prefix, depth + 1);
+            } else {
+                _ = try self.derived(cte.query, cte.name, cte.columns, prefix, depth + 1);
+            }
+        };
         if (statement.values_arms.len != 0) {
             if (!statement.generated_values or statement.set_operation != null or statement.values_arms.len > 1000) return error.InvalidSqlBackendResponse;
             const common = if (self.shape_only) &.{} else try self.inferValues(statement, scope, depth + 1);
@@ -1591,10 +1615,12 @@ const Builder = struct {
                     out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
                     source_name.* = column.name;
                     field_name.* = column.path;
+                    if (self.capture_dependencies) try self.dependency_origins.put(self.alloc, out.internal, .{ .table_id = table.id, .column = column });
                 }
                 for (virtual_columns, table.columns.len..) |column, position| {
                     columns[position] = .{ .name = column.name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .visible = reference.search != null and std.mem.eql(u8, column.name, "_id") };
                     source_columns[position] = column.name;
+                    if (self.capture_dependencies) try self.dependency_origins.put(self.alloc, columns[position].internal, .{ .table_id = table.id, .column = column });
                 }
                 for (@import("joined_mutation.zig").metadata_fields[0..metadata_count], 0..) |name, i| {
                     columns[table.columns.len + virtual_count + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };
@@ -1739,6 +1765,8 @@ const Builder = struct {
             for (names[0..index]) |prior| if (std.mem.eql(u8, prior, name)) return error.DuplicateSqlColumn;
             const l = try keyColumn(left.columns, name, keys == .natural);
             const r = try keyColumn(right.columns, name, keys == .natural);
+            try self.referenceColumn(l);
+            try self.referenceColumn(r);
             const l_expr = try self.scalarNode(.{ .column = l.internal });
             const r_expr = try self.scalarNode(.{ .column = r.internal });
             const equal = try self.scalarNode(.{ .binary = .{ .op = .eq, .left = l_expr, .right = r_expr } });
@@ -2107,6 +2135,12 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, p
     return bindWithPreparedScope(alloc, backend, statement, parameters, null);
 }
 
+/// Stored definitions need semantic dependencies, not only the physical
+/// projection left after optimization. This uses the executable name binder.
+pub fn bindDefinition(alloc: Allocator, backend: catalog.Backend, statement: ast.Select) anyerror!Bound {
+    return bindWithPurpose(alloc, backend, statement, &.{}, null, true);
+}
+
 /// Only a mutation owner may supply this already-authorized scope. It is an
 /// input relation of prepared target images and coherent captured source rows,
 /// not a physical catalog name or an authorization shortcut for child scans.
@@ -2115,7 +2149,11 @@ pub fn bindPreparedScope(alloc: Allocator, backend: catalog.Backend, statement: 
 }
 
 fn bindWithPreparedScope(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType, columns: ?[]const Column) anyerror!Bound {
-    var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .prepared_scope = columns, .node_limit = if (statement.generated_values) 8192 else 256 };
+    return bindWithPurpose(alloc, backend, statement, parameters, columns, false);
+}
+
+fn bindWithPurpose(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType, columns: ?[]const Column, capture_dependencies: bool) anyerror!Bound {
+    var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .prepared_scope = columns, .capture_dependencies = capture_dependencies, .node_limit = if (statement.generated_values) 8192 else 256 };
     const normalized = try builder.lowerSubqueries(statement, &.{}, 0);
     if (std.mem.indexOfScalar(?ast.ColumnType, parameters, null) != null) {
         var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .identities = builder.identities, .shape_only = true, .prepared_scope = columns, .node_limit = if (statement.generated_values) 8192 else 256 };
@@ -2142,7 +2180,10 @@ fn bindWithPreparedScope(alloc: Allocator, backend: catalog.Backend, statement: 
     var iterator = builder.prepared_demands.keyIterator();
     for (prepared_fields) |*field| field.* = iterator.next().?.*;
     const scans = try builder.scans.toOwnedSlice(alloc);
-    return .{ .root = root, .scans = scans, .table = try builder.virtualTable(root.columns), .statement = lowered, .prepared_fields = prepared_fields, .access_graph = try @import("relation_access.zig").prepareGraph(alloc, root, scans, backend) };
+    const dependencies = try alloc.alloc(ColumnDependency, builder.dependency_references.count());
+    var references = builder.dependency_references.keyIterator();
+    for (dependencies) |*dependency| dependency.* = builder.dependency_origins.get(references.next().?.*).?;
+    return .{ .root = root, .scans = scans, .table = try builder.virtualTable(root.columns), .statement = lowered, .prepared_fields = prepared_fields, .access_graph = try @import("relation_access.zig").prepareGraph(alloc, root, scans, backend), .column_dependencies = dependencies };
 }
 
 /// Assignment types cross arbitrary derived/CTE/set boundaries before binding
