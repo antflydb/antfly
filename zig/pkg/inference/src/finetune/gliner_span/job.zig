@@ -31,7 +31,7 @@ const file = @import("../../util/c_file.zig");
 const publication = @import("../../gliner_boundary_export.zig");
 const Budget = @import("../../runtime/bounded_allocator.zig").BoundedAllocator;
 const A = std.mem.Allocator;
-const Best = @import("../early_stopping.zig").EarlyStoppingState;
+const Selection = @import("selection.zig").Selection;
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
 const prefixes = [_][]const u8{ "classifier.2", "count_pred.2", "span_rep.span_rep_layer.out_project.3" };
 const sidecars = [_][]const u8{ "config.json", "encoder_config/config.json", "tokenizer.json", "tokenizer_config.json" };
@@ -73,6 +73,27 @@ fn digest(bytes: []const u8) [32]u8 {
     std.crypto.hash.sha2.Sha256.hash(bytes, &result, .{});
     return result;
 }
+fn runIdentity(a: A, source_sha256: [64]u8, train_bytes: []const u8, eval_bytes: []const u8, c: Config) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    // Version change deliberately rejects checkpoints using the ambiguous v1
+    // concatenation and checkpoints without persisted selection history.
+    hash.update("antfly.modernbert.span-head-training/v2");
+    hash.update(&source_sha256);
+    hash.update(&digest(train_bytes));
+    hash.update(&digest(eval_bytes));
+    var normalized = c;
+    normalized.output_dir = "";
+    normalized.resume_from = null;
+    normalized.stop_after_microbatches = null;
+    const bytes = try std.json.Stringify.valueAlloc(a, normalized, .{});
+    defer a.free(bytes);
+    hash.update(bytes);
+    return hash.finalResult();
+}
+fn selectionScore(metrics: Metrics, spans: bool) f32 {
+    return @floatCast(if (spans) metrics.span_f1 else @as(f64, @floatFromInt(metrics.categorical_correct)) / @as(f64, @floatFromInt(@max(metrics.categorical_tasks, 1))));
+}
+
 fn writeJson(a: A, io: std.Io, name: []const u8, value: anytype) !void {
     const data = try std.json.Stringify.valueAlloc(a, value, .{ .whitespace = .indent_2 });
     defer a.free(data);
@@ -238,18 +259,7 @@ pub fn execute(backing: A, io: std.Io, c: Config, control: Control) !void {
         for (tensor.shape, dims) |dim, *out| out.* = @intCast(dim);
         try parameters.append(p, .{ .name = name, .values = try p.dupe(f32, tensor.asFloat32()), .dimensions = dims, .group = 0 });
     };
-    var identity_hash = std.crypto.hash.sha2.Sha256.init(.{});
-    identity_hash.update("antfly.modernbert.span-head-training/v1");
-    identity_hash.update(&source_digest.sha256);
-    identity_hash.update(train_bytes);
-    identity_hash.update(eval_bytes);
-    var identity_config = c;
-    identity_config.output_dir = "";
-    identity_config.resume_from = null;
-    identity_config.stop_after_microbatches = null;
-    identity_hash.update(try std.json.Stringify.valueAlloc(p, identity_config, .{}));
-    var run: [32]u8 = undefined;
-    identity_hash.final(&run);
+    const run = try runIdentity(p, source_digest.sha256, train_bytes, eval_bytes, c);
     const groups = [_]head.controller.Group{.{ .schedule = .{ .constant = c.learning_rate }, .optimizer = .{ .weight_decay = 0 } }};
     const opts = head.controller.Config{ .groups = &groups, .max_grad_norm = c.max_grad_norm, .limits = .{ .max_state_bytes = c.max_host_bytes, .max_transaction_bytes = c.max_host_bytes } };
     var trainer = if (c.resume_from) |resume_path| try head.controller.Trainer.initRestored(a, &cb, parameters.items, opts, resume_path, run, control) else try head.controller.Trainer.init(a, &cb, parameters.items, opts);
@@ -257,15 +267,15 @@ pub fn execute(backing: A, io: std.Io, c: Config, control: Control) !void {
     const initial = try evaluate(a, &trainer, caches[1], c.positive_weight);
     try std.Io.Dir.cwd().createDir(io, c.output_dir, .default_dir);
     const checkpoint_path = try path(p, c.output_dir, "latest.safetensors");
-    const best_path = try path(p, c.output_dir, "best.safetensors");
     const has_span_targets = for (caches[1]) |example| {
         if (std.mem.startsWith(u8, example.prefix, "span_rep.")) break true;
     } else false;
-    var best = Best.init(.{ .direction = .maximize, .patience = std.math.maxInt(u32) });
-    const initial_score: f32 = @floatCast(if (has_span_targets) initial.span_f1 else @as(f64, @floatFromInt(initial.categorical_correct)) / @as(f64, @floatFromInt(@max(initial.categorical_tasks, 1))));
-    _ = best.observe(initial_score);
-    var selected_epoch: usize = 0;
-    try trainer.save(best_path, run, control);
+    const initial_score = selectionScore(initial, has_span_targets);
+    var selection = if (c.resume_from) |resume_path|
+        try Selection.restore(a, io, &trainer, resume_path, c.output_dir, run, control)
+    else
+        try Selection.init(a, io, &trainer, c.output_dir, run, initial_score, control);
+    defer selection.deinit();
     const total_steps = try std.math.mul(u64, c.epochs, caches[0].len);
     const resumed = trainer.identity().microbatch_step;
     if (resumed > total_steps) return error.InvalidSpanTrainingResume;
@@ -281,7 +291,7 @@ pub fn execute(backing: A, io: std.Io, c: Config, control: Control) !void {
             const ordinal = epoch * order.len + position;
             if (ordinal < resumed) continue;
             if (c.stop_after_microbatches) |stop| if (step >= stop) {
-                try trainer.save(checkpoint_path, run, control);
+                try selection.save(&trainer, checkpoint_path, run, control);
                 try writeJson(a, io, try path(p, c.output_dir, "report.json"), .{ .status = "paused", .run_sha256 = std.fmt.bytesToHex(run, .lower), .optimizer = trainer.identity() });
                 return;
             };
@@ -291,21 +301,15 @@ pub fn execute(backing: A, io: std.Io, c: Config, control: Control) !void {
             _ = try program.step(a, &trainer, example.example, example.objective, c.positive_weight);
             step += 1;
         }
-        if ((epoch + 1) % c.checkpoint_every_epochs == 0) try trainer.save(checkpoint_path, run, control);
         const metrics = try evaluate(a, &trainer, caches[1], c.positive_weight);
-        const score: f32 = @floatCast(if (has_span_targets) metrics.span_f1 else @as(f64, @floatFromInt(metrics.categorical_correct)) / @as(f64, @floatFromInt(@max(metrics.categorical_tasks, 1))));
-        const previous_best = best.best;
-        _ = best.observe(score);
-        if (best.best > previous_best) {
-            try trainer.save(best_path, run, control);
-            selected_epoch = epoch + 1;
-        }
+        try selection.observe(&trainer, c.output_dir, run, selectionScore(metrics, has_span_targets), epoch + 1, control);
+        if ((epoch + 1) % c.checkpoint_every_epochs == 0) try selection.save(&trainer, checkpoint_path, run, control);
         std.debug.print("GLiNER span epoch {d}: eval_loss={d:.6}, span_cell_f1={d:.4}\n", .{ epoch + 1, metrics.loss, metrics.span_f1 });
     }
-    try trainer.save(checkpoint_path, run, control);
+    try selection.save(&trainer, checkpoint_path, run, control);
     const completed_optimizer = trainer.identity();
     const last_eval = try evaluate(a, &trainer, caches[1], c.positive_weight);
-    try trainer.restore(best_path, run, control);
+    try selection.restoreBest(&trainer, c.output_dir, run, control);
     const final = try evaluate(a, &trainer, caches[1], c.positive_weight);
     const stage = try path(p, c.output_dir, "model.partial");
     try std.Io.Dir.cwd().createDir(io, stage, .default_dir);
@@ -338,7 +342,7 @@ pub fn execute(backing: A, io: std.Io, c: Config, control: Control) !void {
     const output_digest = qualification.Digest.of(exported.data);
     const source_after_export = qualification.Digest.of(source.file_bytes);
     if (!std.meta.eql(source_after_export, source_digest)) return error.SpanTrainingSourceChanged;
-    const report = .{ .family = "modernbert_span_head_training/v1", .status = "complete", .source_sha256 = source_digest.sha256[0..], .weights_sha256 = output_digest.sha256[0..], .weights_bytes = output_digest.size_bytes, .run_sha256 = std.fmt.bytesToHex(run, .lower), .train_sha256 = std.fmt.bytesToHex(digest(train_bytes), .lower), .eval_sha256 = std.fmt.bytesToHex(digest(eval_bytes), .lower), .train_records = train.len, .eval_records = eval.len, .content_disjoint = true, .resume_microbatch_step = resumed, .completed_optimizer = completed_optimizer, .exported_optimizer = trainer.identity(), .selection_metric = if (has_span_targets) "heldout_span_cell_f1" else "heldout_categorical_accuracy", .selected_epoch = selected_epoch, .selection_start_microbatch_step = resumed, .initial_eval = initial, .last_eval = last_eval, .final_eval = final, .encoder_frozen = true, .selected_layers = prefixes, .host_peak_allocator_bytes = budget.peak, .runtime_qualified = false };
+    const report = .{ .family = "modernbert_span_head_training/v1", .status = "complete", .source_sha256 = source_digest.sha256[0..], .weights_sha256 = output_digest.sha256[0..], .weights_bytes = output_digest.size_bytes, .run_sha256 = std.fmt.bytesToHex(run, .lower), .train_sha256 = std.fmt.bytesToHex(digest(train_bytes), .lower), .eval_sha256 = std.fmt.bytesToHex(digest(eval_bytes), .lower), .train_records = train.len, .eval_records = eval.len, .content_disjoint = true, .resume_microbatch_step = resumed, .completed_optimizer = completed_optimizer, .exported_optimizer = trainer.identity(), .selection_metric = if (has_span_targets) "heldout_span_cell_f1" else "heldout_categorical_accuracy", .selected_epoch = selection.epoch, .selection_start_microbatch_step = resumed, .initial_eval = initial, .last_eval = last_eval, .final_eval = final, .encoder_frozen = true, .selected_layers = prefixes, .host_peak_allocator_bytes = budget.peak, .runtime_qualified = false };
     try writeJson(a, io, try path(p, stage, "antfly_gliner_span_training.json"), report);
     try publication.syncDirectory(io, stage);
     try publication.publishDirectory(a, io, stage, try path(p, c.output_dir, "model"));
@@ -381,4 +385,86 @@ pub fn testSoftTargetGold() !void {
     const metrics = try evaluate(a, &trainer, &examples, 1);
     try std.testing.expectEqual(@as(usize, 1), metrics.categorical_tasks);
     try std.testing.expectEqual(@as(usize, 0), metrics.categorical_correct);
+}
+
+pub fn testRunIdentity() !void {
+    const a = std.testing.allocator;
+    const c = Config{ .model_dir = "/model", .train_file = "/train", .eval_file = "/eval", .output_dir = "/out" };
+    const first = try runIdentity(a, @splat('0'), "row-a\n", "row-b\nrow-c\n", c);
+    const moved = try runIdentity(a, @splat('0'), "row-a\nrow-b\n", "row-c\n", c);
+    try std.testing.expect(!std.mem.eql(u8, &first, &moved));
+    var resumed = c;
+    resumed.output_dir = "/new-out";
+    resumed.resume_from = "/out/latest.safetensors";
+    resumed.stop_after_microbatches = 10;
+    try std.testing.expectEqual(first, try runIdentity(a, @splat('0'), "row-a\n", "row-b\nrow-c\n", resumed));
+    resumed.learning_rate *= 2;
+    try std.testing.expect(!std.mem.eql(u8, &first, &try runIdentity(a, @splat('0'), "row-a\n", "row-b\nrow-c\n", resumed)));
+}
+
+pub fn testSelectionResume() !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const control = Control{ .io = io };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const p = scratch.allocator();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realPathFileAlloc(io, ".", p);
+    const continued = try path(p, root, "continued");
+    try std.Io.Dir.cwd().createDir(io, continued, .default_dir);
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const parameters = [_]head.controller.Parameter{
+        .{ .name = "probe.weight", .values = &.{0.2}, .dimensions = &.{ 1, 1 }, .group = 0 },
+        .{ .name = "probe.bias", .values = &.{0}, .dimensions = &.{1}, .group = 0 },
+    };
+    const opts = head.controller.Config{ .groups = &.{.{ .schedule = .{ .constant = 0.01 }, .optimizer = .{ .weight_decay = 0 } }} };
+    const run: [32]u8 = @splat(17);
+    var trainer = try head.controller.Trainer.init(a, &cb, &parameters, opts);
+    defer trainer.deinit();
+    var program = try head.Program.init(a, "probe", .{ .rows = 1, .features = 1, .outputs = 1 });
+    defer program.deinit();
+    const example = head.Example{ .features = &.{1}, .targets = &.{1} };
+    var selected = try Selection.init(a, io, &trainer, root, run, 0.1, control);
+    defer selected.deinit();
+    _ = try program.step(a, &trainer, example, .binary, 1);
+    try selected.observe(&trainer, root, run, 0.8, 1, control);
+    const best_fingerprint = try trainer.stateFingerprint(run, control);
+    _ = try program.step(a, &trainer, example, .binary, 1);
+    try selected.observe(&trainer, root, run, 0.4, 2, control);
+    const checkpoint_path = try path(p, root, "latest.safetensors");
+    try selected.save(&trainer, checkpoint_path, run, control);
+    var restored = try head.controller.Trainer.initRestored(a, &cb, &parameters, opts, checkpoint_path, run, control);
+    defer restored.deinit();
+    var resumed = try Selection.restore(a, io, &restored, checkpoint_path, continued, run, control);
+    defer resumed.deinit();
+    try std.testing.expectEqual(@as(f32, 0.8), resumed.best.best);
+    try std.testing.expectEqual(selected.epoch, resumed.epoch);
+    _ = try program.step(a, &trainer, example, .binary, 1);
+    _ = try program.step(a, &restored, example, .binary, 1);
+    try selected.observe(&trainer, root, run, 0.5, 3, control);
+    try resumed.observe(&restored, continued, run, 0.5, 3, control);
+    try selected.restoreBest(&trainer, root, run, control);
+    try resumed.restoreBest(&restored, continued, run, control);
+    try std.testing.expectEqual(best_fingerprint, try trainer.stateFingerprint(run, control));
+    try std.testing.expectEqual(best_fingerprint, try restored.stateFingerprint(run, control));
+    // Later improvements must not invalidate selection in an older checkpoint.
+    _ = try program.step(a, &trainer, example, .binary, 1);
+    try selected.observe(&trainer, root, run, 0.9, 4, control);
+    var older = try head.controller.Trainer.initRestored(a, &cb, &parameters, opts, checkpoint_path, run, control);
+    defer older.deinit();
+    var older_selection = try Selection.restore(a, io, &older, checkpoint_path, root, run, control);
+    defer older_selection.deinit();
+    try std.testing.expectEqual(@as(f32, 0.8), older_selection.best.best);
+    try older_selection.restoreBest(&older, root, run, control);
+    try std.testing.expectEqual(best_fingerprint, try older.stateFingerprint(run, control));
+    // A best checkpoint changed on disk is never silently accepted.
+    try restored.restore(checkpoint_path, run, control);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try path(p, root, older_selection.best_name), .data = "corrupt" });
+    try std.testing.expectError(error.SpanBestCheckpointChanged, Selection.restore(a, io, &restored, checkpoint_path, root, run, control));
 }

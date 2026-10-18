@@ -31,3 +31,10 @@ test "GLiNER span gradient matrix layouts match independent scalar contractions"
 test "GLiNER span soft-target evaluation retains human gold" {
     try internal.finetune.gliner_span_job.testSoftTargetGold();
 }
+
+test "GLiNER span resume binds each dataset partition" {
+    try internal.finetune.gliner_span_job.testRunIdentity();
+}
+test "GLiNER span resume preserves best selection and rejects changed checkpoints" {
+    try internal.finetune.gliner_span_job.testSelectionResume();
+}

@@ -61,15 +61,24 @@ cells and uses explicit positive weighting. The shared optimizer supplies
 clipping, transactional updates, cancellation checks, and checkpoint resume.
 The Native graph contraction uses BLAS for the gradient's dense matrix layouts.
 
-`latest.safetensors` preserves the final optimizer state for resume.
-`best.safetensors` selects held-out span-cell F1 (categorical accuracy for a
-classification-only run). The exported model restores that selected checkpoint,
-and the receipt distinguishes completed and exported optimizer counters.
-`resume_from` binds source, exact train/eval bytes, and training configuration;
-only output directory, resume path, and `stop_after_microbatches` are excluded
-from that identity. Selection on a resumed invocation includes its initial
-checkpoint and the subsequent epochs; earlier validation history is not
-reconstructed. Cell F1 is a selection proxy, not decoded entity/relation F1.
+`latest.safetensors` atomically preserves both final optimizer state and
+selection metadata for resume. Each improved model is saved as an immutable
+`best-<microbatch_step>.safetensors` sibling, pinned by SHA-256 in that metadata.
+Keep the referenced best file with the latest checkpoint when moving a run.
+Resuming into another output directory verifies and copies that file; missing,
+changed, or legacy selection state fails rather than silently resetting the
+best model. Best versions are retained so a later improvement cannot invalidate
+an earlier saved resume checkpoint; allow disk space for these small head
+checkpoints as well as the full exported model.
+
+Selection uses held-out span-cell F1 (categorical accuracy for a classification-
+only run). The exported model restores the best checkpoint across all resumed
+invocations, and the receipt distinguishes completed and exported optimizer
+counters. `resume_from` binds the source, separate fixed-size hashes of the exact
+train and validation bytes, and normalized training configuration. Only output
+directory, resume path, and `stop_after_microbatches` are excluded from that
+identity. The v2 identity rejects older checkpoints that lack this guarantee.
+Cell F1 is a selection proxy, not decoded entity/relation F1.
 
 The output contains all 199 FP32 tensors and the unchanged sidecars, with the six
 selected tensors overlaid. Publication uses a staged directory and atomic rename.
