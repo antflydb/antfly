@@ -102,6 +102,16 @@ pub const Value = struct {
         return if (self.elements.len == 0 and self.dimensions.len == 0) 0 else null;
     }
 
+    /// The validated text directory already identifies the complete payload.
+    pub fn knownTextBytes(self: Value) !?usize {
+        if (self.element_type != .text) return null;
+        if (try self.knownNonNullCount() != null) {
+            if (self.stored) |view| return view.bytes.len - view.payload_start;
+            return 0;
+        }
+        return null;
+    }
+
     pub fn flatCell(self: Value, index: usize) Element {
         if (self.stored) |view| {
             const raw = view.cell(index) catch unreachable;
@@ -265,23 +275,33 @@ pub const Value = struct {
         if (replacement == null and self.dimensions.len > 1) return error.UnsupportedSqlShape;
         try validateElement(self.element_type, needle, work);
         if (replacement) |value| try validateElement(self.element_type, value, work);
-        var count = self.cardinality();
-        var non_null = try self.knownNonNullCount();
-        if (replacement == null) for (0..self.cardinality()) |array_cell_0| {
-            const element = self.flatCell(array_cell_0);
-            if (try compareElement(self.element_type, element, needle, work) == .eq) {
-                count -= 1;
-                if (!element.sql_null and non_null != null) non_null.? -= 1;
+        // A fixed bitmap covers the default maximum without heap allocation.
+        // Custom larger inputs use bounded replay instead of growing scratch.
+        var local: [8192]u8 = undefined;
+        const plan_size = (self.cardinality() + 7) / 8;
+        const matches: ?[]u8 = if (plan_size <= local.len) local[0..plan_size] else null;
+        if (matches) |bitmap| @memset(bitmap, 0);
+        var changed = false;
+        var count: usize = 0;
+        var non_null: usize = 0;
+        var text_bytes: usize = 0;
+        for (0..self.cardinality()) |i| {
+            const element = self.flatCell(i);
+            const matched = try compareElement(self.element_type, element, needle, work) == .eq;
+            if (matched) {
+                changed = true;
+                if (matches) |bitmap| bitmap[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+                if (replacement == null) continue;
             }
-        };
-        if (replacement) |value| {
-            if (needle.sql_null) {
-                if (!value.sql_null and non_null != null) non_null = count;
-            } else if (value.sql_null) {
-                if (non_null) |present| if (present != 0) {
-                    non_null = null;
-                };
+            const emitted = if (matched) replacement.? else element;
+            count += 1;
+            if (!emitted.sql_null) {
+                non_null += 1;
+                if (self.element_type == .text) text_bytes = std.math.add(usize, text_bytes, emitted.value.string.len) catch return error.SqlProgramLimitExceeded;
             }
+        }
+        if (!changed and self.cardinality() <= limits.elements and try self.admissionBytes() <= limits.bytes) {
+            return self.validateWithBudget(limits, work);
         }
         const rank_: usize = if (count == 0) 0 else self.dimensions.len;
         var axes: [6]Dimension = undefined;
@@ -289,12 +309,12 @@ pub const Value = struct {
         const dimensions = axes[0..rank_];
         @memcpy(dimensions, self.dimensions[0..rank_]);
         if (replacement == null and count != 0) dimensions[0].length = @intCast(count);
-        var output = try @import("array_compact.zig").ResultBuilder.initKnown(alloc, self.element_type, dimensions, count, non_null, limits);
-        for (0..self.cardinality()) |array_cell_0| {
-            const element = self.flatCell(array_cell_0);
-            const matches = try compareElement(self.element_type, element, needle, work) == .eq;
-            if (matches and replacement == null) continue;
-            try output.append(if (matches) replacement.? else element, work);
+        var output = try @import("array_compact.zig").ResultBuilder.initPlanned(alloc, self.element_type, dimensions, count, non_null, if (self.element_type == .text) text_bytes else null, limits);
+        for (0..self.cardinality()) |i| {
+            try work.consume(1);
+            const matched = if (matches) |bitmap| bitmap[i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0 else try compareElement(self.element_type, self.flatCell(i), needle, work) == .eq;
+            if (matched and replacement == null) continue;
+            try output.append(if (matched) replacement.? else self.flatCell(i), work);
         }
         return output.finish(alloc, limits, work);
     }
@@ -309,9 +329,10 @@ pub const Value = struct {
         const lower_bound: i32 = if (self.dimensions.len == 0) 1 else self.dimensions[0].lower;
         if (@as(i64, lower_bound) + @as(i64, @intCast(count)) > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
         const non_null = if (try self.knownNonNullCount()) |present| present + @intFromBool(!element.sql_null) else null;
-        var output = try @import("array_compact.zig").ResultBuilder.initKnown(alloc, self.element_type, &.{.{ .length = @intCast(count), .lower = lower_bound }}, count, non_null, limits);
+        const text_bytes = if (try self.knownTextBytes()) |bytes| std.math.add(usize, bytes, if (element.sql_null) 0 else element.value.string.len) catch return error.SqlProgramLimitExceeded else null;
+        var output = try @import("array_compact.zig").ResultBuilder.initPlanned(alloc, self.element_type, &.{.{ .length = @intCast(count), .lower = lower_bound }}, count, non_null, text_bytes, limits);
         if (prepend) try output.append(element, work);
-        for (0..self.cardinality()) |i| try output.append(self.flatCell(i), work);
+        try output.appendValue(self, work);
         if (!prepend) try output.append(element, work);
         return output.finish(alloc, limits, work);
     }
@@ -346,9 +367,13 @@ pub const Value = struct {
         if (try self.knownNonNullCount()) |left| if (try other.knownNonNullCount()) |right| {
             non_null = left + right;
         };
-        var output = try @import("array_compact.zig").ResultBuilder.initKnown(alloc, self.element_type, dimensions, count, non_null, limits);
-        for (0..self.cardinality()) |i| try output.append(self.flatCell(i), work);
-        for (0..other.cardinality()) |i| try output.append(other.flatCell(i), work);
+        var text_bytes: ?usize = null;
+        if (try self.knownTextBytes()) |left| if (try other.knownTextBytes()) |right| {
+            text_bytes = std.math.add(usize, left, right) catch return error.SqlProgramLimitExceeded;
+        };
+        var output = try @import("array_compact.zig").ResultBuilder.initPlanned(alloc, self.element_type, dimensions, count, non_null, text_bytes, limits);
+        try output.appendValue(self, work);
+        try output.appendValue(other, work);
         return output.finish(alloc, limits, work);
     }
 
@@ -938,4 +963,66 @@ test "SQL prepared array footprint page sizing measurement" {
     }
     try std.testing.expectEqual(totals[0], totals[1]);
     std.debug.print("SQL_PREPARED_ARRAY_SIZING elements=65536 calls=1280 uncached_ns={} cached_ns={} sizing_allocations=0\n", .{ elapsed[0], elapsed[1] });
+}
+
+test "SQL native transform plans retain sparse sizing no-op reuse and exact text ownership" {
+    const a = std.testing.allocator;
+    const compact = @import("array_compact.zig");
+    const Fixture = struct {
+        fn run(backing: Allocator) !void {
+            var source_arena = std.heap.ArenaAllocator.init(backing);
+            defer source_arena.deinit();
+            var work: Budget = .{};
+            var builder = try compact.ResultBuilder.initKnown(source_arena.allocator(), .int64, &.{.{ .length = 32768, .lower = -7 }}, 32768, 1, .{});
+            for (0..32768) |i| try builder.append(if (i == 9) .json(.{ .integer = 42 }) else .{}, &work);
+            const source = try builder.finish(source_arena.allocator(), .{}, &work);
+            const same = try source.transform(std.testing.failing_allocator, .json(.{ .integer = 99 }), null, .{ .bytes = 64 * 1024 }, &work);
+            try std.testing.expect(same.stored == source.stored);
+            const same_replace = try source.transform(std.testing.failing_allocator, .json(.{ .integer = 99 }), .{}, .{ .bytes = 64 * 1024 }, &work);
+            try std.testing.expect(same_replace.stored == source.stored);
+            var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = backing, .limit = 64 * 1024 };
+            {
+                var arena = std.heap.ArenaAllocator.init(counter.allocator());
+                defer arena.deinit();
+                var nr: @import("../storage/lite/test_allocator.zig").NoResizeAllocator = .{ .backing = arena.allocator() };
+                const result = try source.transform(nr.allocator(), .json(.{ .integer = 42 }), .{}, .{ .bytes = 64 * 1024 }, &work);
+                try std.testing.expectEqual(@as(?usize, 0), try result.knownNonNullCount());
+                try std.testing.expect(result.flatCell(9).sql_null);
+                try std.testing.expectEqual(@as(i32, -7), result.dimensions[0].lower);
+                _ = try @import("../common/sql_array_layout.zig").View.open(.int64, result.stored.?.bytes, .{});
+            }
+            try std.testing.expectEqual(@as(usize, 0), counter.live);
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            var text_builder = try compact.CheckedBuilder.init(source_arena.allocator(), .text, &.{.{ .length = 129, .lower = -3 }}, 129, 1, 5, .{});
+            for (0..129) |i| try text_builder.appendChecked(if (i == 7) .json(.{ .string = "é☺" }) else .{}, .text, .{}, &work);
+            const text = try text_builder.finish(source_arena.allocator(), .{});
+            const result = try text.transform(arena.allocator(), .{}, .json(.{ .string = "new" }), .{}, &work);
+            try std.testing.expect(result.stored != null);
+            try std.testing.expectEqual(@as(?usize, 129), try result.knownNonNullCount());
+            _ = source_arena.reset(.free_all);
+            try std.testing.expectEqualStrings("é☺", result.flatCell(7).value.string);
+            try std.testing.expectEqualStrings("new", result.flatCell(8).value.string);
+            var denied: Budget = .{ .remaining = 0 };
+            try std.testing.expectError(error.SqlProgramLimitExceeded, result.transform(std.testing.failing_allocator, .json(.{ .string = "missing" }), null, .{}, &denied));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{});
+}
+
+test "SQL native transform custom larger inputs retain bounded scratch replay" {
+    const a = std.testing.allocator;
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    const cells = try source_arena.allocator().alloc(Element, 65537);
+    @memset(cells, .{});
+    cells[65536] = .json(.{ .integer = 42 });
+    var work: Budget = .{};
+    const source = try Value.initWithBudget(.int64, &.{.{ .length = 65537, .lower = -7 }}, cells, .{ .elements = 65537 }, &work);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = try source.transform(arena.allocator(), .json(.{ .integer = 42 }), null, .{}, &work);
+    try std.testing.expectEqual(@as(usize, 65536), result.cardinality());
+    try std.testing.expectEqual(@as(?usize, 0), try result.knownNonNullCount());
+    _ = try @import("../common/sql_array_layout.zig").View.open(.int64, result.stored.?.bytes, .{});
 }

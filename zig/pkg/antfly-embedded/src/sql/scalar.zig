@@ -3830,12 +3830,18 @@ const Evaluator = struct {
         };
         var admitted: @import("../common/sql_array_layout.zig").StackShape = .{};
         var non_null: ?usize = 0;
+        var text_bytes: ?usize = if (kind == .text) 0 else null;
         for (args, children) |arg, *child| {
             child.* = try self.runDatum(arg, depth);
             const shape: []const arrays.Dimension = if (child.sql_null) &.{} else (child.array orelse return error.SqlTypeMismatch).dimensions;
             var context = self.numericContext();
             try context.charge(1 + shape.len);
             try admitted.append(shape);
+            if (!child.sql_null and text_bytes != null) {
+                if (try child.array.?.knownTextBytes()) |bytes| {
+                    text_bytes = std.math.add(usize, text_bytes.?, bytes) catch return error.SqlProgramLimitExceeded;
+                } else text_bytes = null;
+            }
             if (!child.sql_null and non_null != null) {
                 const array = child.array.?;
                 // These casts preserve NULLs; JSONB conversions can create them.
@@ -3850,11 +3856,16 @@ const Evaluator = struct {
         const rank: usize = stacked.rank;
         const results = @import("array_compact.zig").ResultBuilder;
         const shape = stacked.axes[0..rank];
-        try self.charge(try results.allocationBytesKnown(kind, count, rank, non_null));
+        try self.charge(try results.allocationBytesPlanned(kind, count, rank, non_null, text_bytes));
         const limits: arrays.Limits = .{ .bytes = @min((arrays.Limits{}).bytes, self.limits.output_bytes) };
-        var output = try results.initKnown(self.alloc, kind, shape, count, non_null, limits);
+        var output = try results.initPlanned(self.alloc, kind, shape, count, non_null, text_bytes, limits);
         var work = self.workBudget();
         for (children) |child| if (child.array) |array| {
+            if (array.element_type == kind and array.stored != null and array.stored.?.validation != null) {
+                try self.workOwner().charge(array.cardinality());
+                try output.appendValue(array.*, &work);
+                continue;
+            }
             for (0..array.cardinality()) |array_cell_0| {
                 const element = array.flatCell(array_cell_0);
                 try self.workOwner().charge(1);
@@ -5764,5 +5775,33 @@ test "SQL sparse native array scalar paths fit bounded allocator and exact outpu
             unproven.stored = &view;
             try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.failing_allocator, &.{Datum.typedArray(&unproven)}, &.{}, .{ .output_bytes = 64 * 1024, .steps = 1_048_576 }));
         }
+    }
+}
+
+test "SQL native text scalar producers fit bounded memory through nested arrays concat and append" {
+    const a = std.testing.allocator;
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    const count = 8192;
+    var builder = try @import("array_compact.zig").CheckedBuilder.init(source_arena.allocator(), .text, &.{.{ .length = count, .lower = -7 }}, count, count / 16, count / 16 * 5, .{});
+    var work: arrays.Budget = .{};
+    for (0..count) |i| try builder.appendChecked(if (i % 16 == 0) .json(.{ .string = "é☺" }) else .{}, .text, .{}, &work);
+    const source = try builder.finish(source_arena.allocator(), .{});
+    for ([_][]const u8{ "a || a", "ARRAY[a,a]", "array_append(a, 'é☺')", "array_prepend('é☺', a)", "array_replace(a, 'é☺', 'new')", "array_remove(a, 'é☺')" }) |expression| {
+        var compiled = try @import("compiler.zig").compileScalar(a, expression, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .text }}, &.{}, .{});
+        defer program.deinit();
+        var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 128 * 1024 };
+        {
+            var arena = std.heap.ArenaAllocator.init(counter.allocator());
+            defer arena.deinit();
+            const result = (try program.evaluate(arena.allocator(), &.{Datum.typedArray(&source)}, &.{}, .{ .output_bytes = 128 * 1024 })).array.?;
+            try std.testing.expect(result.stored != null);
+            _ = try @import("../common/sql_array_layout.zig").View.open(.text, result.stored.?.bytes, .{});
+            const bounds = result.dimensions[result.dimensions.len - 1];
+            try std.testing.expectEqual(@as(i32, -7), bounds.lower);
+        }
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
     }
 }

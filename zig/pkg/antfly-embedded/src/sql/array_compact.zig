@@ -75,6 +75,7 @@ pub const Builder = struct {
                 if (text.len > self.bytes.len - self.payload - self.payload_at) return error.InvalidSqlArrayShape;
                 @memcpy(self.bytes[self.payload + self.payload_at ..][0..text.len], text);
                 self.payload_at += text.len;
+                self.non_null += 1;
             }
             return;
         }
@@ -150,8 +151,8 @@ pub const CheckedBuilder = struct {
     }
 };
 
-/// Region-owned computed results. Fixed-width arrays avoid a Datum vector;
-/// small/variable-width results preserve the existing borrowed-cell contract.
+/// Region-owned computed results. Fixed-width arrays and size-planned text
+/// avoid a Datum vector; small/unsized results keep borrowed-cell semantics.
 /// The region owns partial and completed allocations, including unused dense
 /// capacity after sparse finalization. No borrowed allocator escapes finish.
 pub const ResultBuilder = union(enum) {
@@ -167,22 +168,32 @@ pub const ResultBuilder = union(enum) {
     /// Counts come from immutable validated native views or producer semantics.
     /// Unknown counts reserve dense staging; known counts reserve exact bytes.
     pub fn allocationBytesKnown(kind: arrays.ElementType, count: usize, rank: usize, non_null: ?usize) !usize {
+        return allocationBytesPlanned(kind, count, rank, non_null, null);
+    }
+    pub fn allocationBytesPlanned(kind: arrays.ElementType, count: usize, rank: usize, non_null: ?usize, text_bytes: ?usize) !usize {
         if (rank > 6 or count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
         if ((rank == 0) != (count == 0)) return error.InvalidSqlArrayShape;
         if (non_null) |present| if (present > count) return error.InvalidSqlArrayShape;
         const metadata = @sizeOf(arrays.Value) + rank * @sizeOf(arrays.Dimension);
-        if (usesFixed(kind, count)) return std.math.add(usize, metadata + @sizeOf(layout.View), try layout.encodedSectionSize(kind, rank, count, non_null orelse count)) catch error.SqlProgramLimitExceeded;
+        if (usesFixed(kind, count) or (kind == .text and count >= 32 and text_bytes != null)) {
+            const section = try layout.encodedSectionSize(kind, rank, count, non_null orelse count);
+            const size = std.math.add(usize, section, text_bytes orelse 0) catch return error.SqlProgramLimitExceeded;
+            return std.math.add(usize, metadata + @sizeOf(layout.View), size) catch error.SqlProgramLimitExceeded;
+        }
         return std.math.add(usize, metadata, std.math.mul(usize, count, @sizeOf(arrays.Element)) catch return error.SqlProgramLimitExceeded) catch error.SqlProgramLimitExceeded;
     }
     pub fn init(a: A, kind: arrays.ElementType, dimensions: []const arrays.Dimension, count: usize, limits: arrays.Limits) !ResultBuilder {
         return initKnown(a, kind, dimensions, count, null, limits);
     }
     pub fn initKnown(a: A, kind: arrays.ElementType, dimensions: []const arrays.Dimension, count: usize, non_null: ?usize, limits: arrays.Limits) !ResultBuilder {
+        return initPlanned(a, kind, dimensions, count, non_null, null, limits);
+    }
+    pub fn initPlanned(a: A, kind: arrays.ElementType, dimensions: []const arrays.Dimension, count: usize, non_null: ?usize, text_bytes: ?usize, limits: arrays.Limits) !ResultBuilder {
         const empty = try arrays.validateShape(dimensions, count, limits);
         const axes = if (empty) &.{} else dimensions;
-        const capacity_bytes = try allocationBytesKnown(kind, count, axes.len, non_null);
+        const capacity_bytes = try allocationBytesPlanned(kind, count, axes.len, non_null, text_bytes);
         if (capacity_bytes > limits.bytes) return error.SqlProgramLimitExceeded;
-        if (usesFixed(kind, count)) return .{ .fixed = .{ .builder = try CheckedBuilder.init(a, kind, axes, count, non_null orelse count, 0, limits), .expected_non_null = non_null, .capacity_bytes = capacity_bytes } };
+        if (usesFixed(kind, count) or (kind == .text and count >= 32 and text_bytes != null)) return .{ .fixed = .{ .builder = try CheckedBuilder.init(a, kind, axes, count, non_null orelse count, text_bytes orelse 0, limits), .expected_non_null = non_null, .capacity_bytes = capacity_bytes } };
         const owned_axes = try a.dupe(arrays.Dimension, axes);
         const elements = try a.alloc(arrays.Element, count);
         return .{ .cells = .{ .kind = kind, .dimensions = owned_axes, .elements = elements } };
@@ -202,6 +213,107 @@ pub const ResultBuilder = union(enum) {
             },
         }
     }
+    /// Copy immutable, validated native inputs in physical order. Each block
+    /// ends at a destination checkpoint; mixed dense/packed layouts copy runs.
+    /// Authentication-only inputs retain the checked scalar fallback.
+    pub fn appendValue(self: *ResultBuilder, value: arrays.Value, work: *arrays.Budget) !void {
+        if (self.* == .fixed) if (value.stored) |view| if (view.validation != null and view.kind == self.fixed.builder.state.kind) {
+            _ = try value.knownNonNullCount();
+            try self.appendNative(view.*, work);
+            return;
+        };
+        for (0..value.cardinality()) |i| try self.append(value.flatCell(i), work);
+    }
+
+    fn copyBytes(destination: []u8, source: []const u8, work: *arrays.Budget, payload_work: bool) !void {
+        if (destination.len != source.len) return error.InvalidSqlArrayShape;
+        var at: usize = 0;
+        while (at < source.len) {
+            const end = at + @min(4096, source.len - at);
+            try work.consume(if (payload_work) end - at else 0);
+            @memcpy(destination[at..end], source[at..end]);
+            at = end;
+        }
+    }
+
+    fn nullBits(view: layout.View, begin: usize, count: usize) u64 {
+        var bits: u64 = 0;
+        var at: usize = 0;
+        while (at < count) {
+            const index = begin + at;
+            const take = @min(count - at, 8 - index % 8);
+            const mask: u8 = @intCast((@as(u16, 1) << @intCast(take)) - 1);
+            bits |= @as(u64, (view.bytes[view.bitmap_start + index / 8] >> @intCast(index % 8)) & mask) << @intCast(at);
+            at += take;
+        }
+        return bits;
+    }
+
+    fn appendNative(self: *ResultBuilder, view: layout.View, work: *arrays.Budget) !void {
+        const fixed = &self.fixed;
+        const state = &fixed.builder.state;
+        const present = view.validation.?.non_null;
+        if (view.count > state.count - state.index) return error.InvalidSqlArrayShape;
+        if (fixed.expected_non_null) |expected| if (present > expected -| state.non_null) return error.InvalidSqlArrayShape;
+        const text = view.kind == .text;
+        if (text and view.bytes.len - view.payload_start > state.bytes.len - state.payload - state.payload_at) return error.InvalidSqlArrayShape;
+        const width = layout.width(view.kind);
+        var source_index: usize = 0;
+        var source_physical: usize = 0;
+        while (source_index < view.count) {
+            const count = @min(@as(usize, view.count) - source_index, 64 - state.index % 64);
+            try work.consume(count);
+            const bits = nullBits(view, source_index, count);
+            const non_null = count - @popCount(bits);
+            if (state.compact and state.index % 64 == 0) std.mem.writeInt(u32, state.bytes[state.slots + state.index / 64 * 4 ..][0..4], @intCast(state.non_null), .little);
+            var bit_at: usize = 0;
+            while (bit_at < count) {
+                const index = state.index + bit_at;
+                const take = @min(count - bit_at, 8 - index % 8);
+                const mask = (@as(u64, 1) << @intCast(take)) - 1;
+                state.bytes[state.bitmap + index / 8] |= @as(u8, @intCast((bits >> @intCast(bit_at)) & mask)) << @intCast(index % 8);
+                bit_at += take;
+            }
+            if (text) {
+                const base = std.mem.readInt(u32, view.bytes[view.slots_start + source_index * 4 ..][0..4], .little);
+                const end = std.mem.readInt(u32, view.bytes[view.slots_start + (source_index + count) * 4 ..][0..4], .little);
+                for (0..count) |i| {
+                    const offset = std.mem.readInt(u32, view.bytes[view.slots_start + (source_index + i) * 4 ..][0..4], .little);
+                    std.mem.writeInt(u32, state.bytes[state.slots + (state.index + i) * 4 ..][0..4], @intCast(state.payload_at + offset - base), .little);
+                }
+                const length = end - base;
+                try copyBytes(state.bytes[state.payload + state.payload_at ..][0..length], view.bytes[view.payload_start + base ..][0..length], work, true);
+                state.payload_at += length;
+            } else if (view.compact == state.compact) {
+                const slots = if (view.compact) non_null else count;
+                const destination = if (state.compact) state.non_null else state.index;
+                try copyBytes(state.bytes[state.values + destination * width ..][0 .. slots * width], view.bytes[view.payload_start + source_physical * width ..][0 .. slots * width], work, false);
+            } else {
+                // Consecutive present runs permit memcpy even when one side
+                // has NULL slots and the other stores only present values.
+                var i: usize = 0;
+                var packed_at: usize = 0;
+                while (i < count) {
+                    if (bits & (@as(u64, 1) << @intCast(i)) != 0) {
+                        i += 1;
+                        continue;
+                    }
+                    const begin = i;
+                    while (i < count and bits & (@as(u64, 1) << @intCast(i)) == 0) : (i += 1) {}
+                    const length = (i - begin) * width;
+                    const destination = if (state.compact) state.non_null + packed_at else state.index + begin;
+                    const source = source_physical + if (view.compact) packed_at else begin;
+                    try copyBytes(state.bytes[state.values + destination * width ..][0..length], view.bytes[view.payload_start + source * width ..][0..length], work, false);
+                    packed_at += i - begin;
+                }
+            }
+            state.index += count;
+            state.non_null += non_null;
+            source_index += count;
+            source_physical += if (view.compact) non_null else count;
+        }
+    }
+
     pub fn finish(self: *ResultBuilder, a: A, limits: arrays.Limits, work: *arrays.Budget) !arrays.Value {
         try work.consume(0);
         return switch (self.*) {
@@ -673,6 +785,152 @@ test "SQL sparse native array construction peak and admission measurement" {
                 }
                 try std.testing.expectEqual(@as(usize, 0), counter.live);
             }
+        }
+    }
+}
+
+test "SQL native span construction preserves mixed layouts offsets ownership and canonical wire" {
+    const a = std.testing.allocator;
+    for ([_]arrays.ElementType{ .boolean, .int16, .int32, .int64, .float32, .float64, .text }) |kind| {
+        for ([_]usize{ 1, 7, 31, 63, 65, 129 }) |count| {
+            for (0..3) |density| {
+                for ([_]usize{ 0, 1, 7, 63 }) |prefix| {
+                    var arena = std.heap.ArenaAllocator.init(a);
+                    defer arena.deinit();
+                    var source_arena = std.heap.ArenaAllocator.init(a);
+                    defer source_arena.deinit();
+                    const region = arena.allocator();
+                    var work: arrays.Budget = .{ .remaining = 1_000_000 };
+                    var sources: [2]arrays.Value = undefined;
+                    var present: usize = 0;
+                    var text_bytes: usize = 0;
+                    for (&sources, 0..) |*source, which| {
+                        const cells = try source_arena.allocator().alloc(arrays.Element, count);
+                        var source_present: usize = 0;
+                        var source_text: usize = 0;
+                        for (cells, 0..) |*cell, i| {
+                            const missing = switch ((density + which) % 3) {
+                                0 => false,
+                                1 => i % 16 != 0,
+                                else => true,
+                            };
+                            cell.* = if (missing) .{} else .json(switch (kind) {
+                                .boolean => .{ .bool = i % 2 == 0 },
+                                .float32, .float64 => .{ .float = if (i % 3 == 0) -0.0 else if (i % 3 == 1) std.math.nan(f64) else std.math.inf(f64) },
+                                .text => .{ .string = if (i % 2 == 0) "é☺" else "" },
+                                else => .{ .integer = @intCast(i) },
+                            });
+                            if (!cell.sql_null) {
+                                source_present += 1;
+                                if (kind == .text) source_text += cell.value.string.len;
+                            }
+                        }
+                        var builder = try CheckedBuilder.init(source_arena.allocator(), kind, &.{.{ .length = @intCast(count), .lower = -7 }}, count, source_present, source_text, .{});
+                        for (cells) |cell| try builder.appendChecked(cell, kind, .{}, &work);
+                        source.* = try builder.finish(source_arena.allocator(), .{});
+                        present += source_present;
+                        text_bytes += source_text;
+                    }
+                    const total = prefix + 2 * count + 1;
+                    const shape = &[_]arrays.Dimension{.{ .length = @intCast(total), .lower = -13 }};
+                    var fast = try ResultBuilder.initPlanned(region, kind, shape, total, present, if (kind == .text) text_bytes else null, .{});
+                    // Scalar reconstruction remains an independent path.
+                    var slow = try ResultBuilder.initKnown(region, kind, shape, total, present, .{});
+                    for (0..prefix) |_| {
+                        try fast.append(.{}, &work);
+                        try slow.append(.{}, &work);
+                    }
+                    for (sources) |source| {
+                        try fast.appendValue(source, &work);
+                        for (0..source.cardinality()) |i| try slow.append(source.flatCell(i), &work);
+                    }
+                    try fast.append(.{}, &work);
+                    try slow.append(.{}, &work);
+                    const result = try fast.finish(region, .{}, &work);
+                    const reference = try slow.finish(region, .{}, &work);
+                    const expected = try @import("array_storage.zig").encodeAlloc(region, reference, .{});
+                    if (result.stored != null) _ = source_arena.reset(.free_all);
+                    const actual = try @import("array_storage.zig").encodeAlloc(region, result, .{});
+                    try std.testing.expectEqualSlices(u8, expected, actual);
+                    _ = try layout.View.open(kind, actual, .{});
+                    var fast_wire: std.Io.Writer.Allocating = .init(a);
+                    defer fast_wire.deinit();
+                    var slow_wire: std.Io.Writer.Allocating = .init(a);
+                    defer slow_wire.deinit();
+                    // Reference text payloads borrow sources; decode the owned oracle.
+                    const decoded = try @import("array_storage.zig").borrowLeaky(region, kind, expected, .{});
+                    try @import("array_binary.zig").encode(decoded, &slow_wire.writer, .{});
+                    try @import("array_binary.zig").encode(result, &fast_wire.writer, .{});
+                    try std.testing.expectEqualSlices(u8, slow_wire.written(), fast_wire.written());
+                }
+            }
+        }
+    }
+}
+
+test "SQL native span construction retains work cancellation count and text payload bounds" {
+    const Fixture = struct {
+        fn run(a: A) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const region = arena.allocator();
+            var work: arrays.Budget = .{};
+            var source_builder = try CheckedBuilder.init(region, .text, &.{.{ .length = 65 }}, 65, 65, 65 * 5, .{});
+            for (0..65) |_| try source_builder.appendChecked(.json(.{ .string = "é☺" }), .text, .{}, &work);
+            const source = try source_builder.finish(region, .{});
+            var short = try ResultBuilder.initPlanned(region, .text, source.dimensions, 65, 65, 0, .{});
+            try std.testing.expectError(error.InvalidSqlArrayShape, short.appendValue(source, &work));
+            var count = try ResultBuilder.initPlanned(region, .text, source.dimensions, 65, 0, 325, .{});
+            try std.testing.expectError(error.InvalidSqlArrayShape, count.appendValue(source, &work));
+            var output = try ResultBuilder.initPlanned(region, .text, source.dimensions, 65, 65, 325, .{});
+            var denied: arrays.Budget = .{ .remaining = 64 };
+            try std.testing.expectError(error.SqlProgramLimitExceeded, output.appendValue(source, &denied));
+            try std.testing.expectError(error.InvalidSqlArrayShape, output.finish(region, .{}, &work));
+            const Cancel = struct {
+                fn poll(_: ?*anyopaque) !void {
+                    return error.Canceled;
+                }
+            };
+            var parent: @import("numeric_value.zig").Context = .{ .alloc = region, .checkpoint = Cancel.poll };
+            var canceled: arrays.Budget = .{ .shared = &parent };
+            try std.testing.expectError(error.Canceled, output.appendValue(source, &canceled));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL native span construction text and fixed measurement" {
+    const a = std.testing.allocator;
+    for ([_]arrays.ElementType{ .int64, .text }) |kind| {
+        var source_arena = std.heap.ArenaAllocator.init(a);
+        defer source_arena.deinit();
+        const count = 8192;
+        var builder = try CheckedBuilder.init(source_arena.allocator(), kind, &.{.{ .length = count }}, count, count / 16, if (kind == .text) count / 16 * 5 else 0, .{});
+        var work: arrays.Budget = .{};
+        for (0..count) |i| try builder.appendChecked(if (i % 16 != 0) .{} else if (kind == .text) .json(.{ .string = "é☺" }) else .json(.{ .integer = @intCast(i) }), kind, .{}, &work);
+        const source = try builder.finish(source_arena.allocator(), .{});
+        var oracle: ?[]u8 = null;
+        defer if (oracle) |bytes| a.free(bytes);
+        for (0..2) |mode| {
+            var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+            var elapsed: i96 = 0;
+            for (0..20) |_| {
+                var arena = std.heap.ArenaAllocator.init(counter.allocator());
+                defer arena.deinit();
+                var operation_work: arrays.Budget = .{};
+                const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+                const result = if (mode == 1) try source.concatenate(arena.allocator(), source, .{}, &operation_work) else scalar: {
+                    var output = try ResultBuilder.initKnown(arena.allocator(), kind, &.{.{ .length = count * 2 }}, count * 2, count / 8, .{});
+                    for (0..2) |_| for (0..count) |i| try output.append(source.flatCell(i), &operation_work);
+                    break :scalar try output.finish(arena.allocator(), .{}, &operation_work);
+                };
+                elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+                const bytes = try @import("array_storage.zig").encodeAlloc(a, result, .{});
+                defer a.free(bytes);
+                if (oracle) |expected| try std.testing.expectEqualSlices(u8, expected, bytes) else oracle = try a.dupe(u8, bytes);
+            }
+            try std.testing.expectEqual(@as(usize, 0), counter.live);
+            std.debug.print("SQL_NATIVE_SPANS kind={s} native={} output_cells={} peak={} repetitions=20 elapsed_ns={} identical_canonical=true\n", .{ @tagName(kind), mode == 1, count * 2, counter.peak, elapsed });
         }
     }
 }
