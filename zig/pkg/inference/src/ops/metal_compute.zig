@@ -16092,6 +16092,249 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         return error.AudioScheduleUnknownOperand;
     }
+    fn audioDropPersistentCt(ct: CT) void {
+        const buf = toBuf(ct);
+        std.debug.assert(buf.weight_handle_name == null and buf.lazy_entry == null);
+        if (buf.metal_tensor) |*mt| mt.deinit();
+        if (buf.logical_shape) |shape| buf.allocator.free(shape);
+        buf.allocator.destroy(buf);
+    }
+    fn audioPersistentCt(self: *MetalCompute, plan: *audio_tape.Plan, tensor: MetalTensor) !CT {
+        const cache = if (self.data.tier_cache) |*v| v else return error.AudioScheduleAdmission;
+        const bytes = @sizeOf(Buf) + tensor.shape().len * @sizeOf(i64);
+        self.data.prefetch.lock();
+        cache.reserve(.host, bytes) catch |err| {
+            self.data.prefetch.unlock();
+            return err;
+        };
+        self.data.prefetch.unlock();
+        errdefer {
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, bytes);
+            self.data.prefetch.unlock();
+        }
+        const a = std.heap.c_allocator;
+        const buf = try a.create(Buf);
+        errdefer a.destroy(buf);
+        const shape = try a.alloc(i64, tensor.shape().len);
+        for (tensor.shape(), shape) |d, *dest| dest.* = d;
+        buf.* = .{ .data = @as([*]f32, @ptrFromInt(@alignOf(f32)))[0..0], .allocator = a, .owned = false, .logical_shape = shape, .metal_tensor = tensor };
+        plan.host_bytes += bytes;
+        plan.drop_ct = audioDropPersistentCt;
+        return @ptrCast(buf);
+    }
+    fn audioPlanBuffer(self: *MetalCompute, plan: *audio_tape.Plan, bytes: usize, shared: bool) !?MetalTensor {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        const admitted = metal_runtime.antfly_metal_audio_allocation_bytes(runtime, bytes, @intFromBool(shared));
+        if (admitted == 0) return null;
+        const cache = if (self.data.tier_cache) |*v| v else return null;
+        const ref_bytes = metal_tensor_mod.device_buffer_ref_bytes;
+        self.data.prefetch.lock();
+        cache.reserve(.host, ref_bytes) catch {
+            self.data.prefetch.unlock();
+            return null;
+        };
+        cache.reserve(.backend, admitted) catch {
+            cache.noteRelease(.host, ref_bytes);
+            self.data.prefetch.unlock();
+            return null;
+        };
+        self.data.prefetch.unlock();
+        var committed = false;
+        defer if (!committed) {
+            self.data.prefetch.lock();
+            cache.noteRelease(.backend, admitted);
+            cache.noteRelease(.host, ref_bytes);
+            self.data.prefetch.unlock();
+        };
+        var tensor = try MetalTensor.deviceAllocateFreshWithAllocator(std.heap.c_allocator, runtime, bytes, if (shared) .shared else .private, &.{@intCast(bytes / 4)});
+        errdefer tensor.deinit();
+        const actual = metal_runtime.antfly_metal_audio_buffer_bytes(tensor.deviceHandle());
+        if (actual > admitted) {
+            tensor.deinit();
+            return null;
+        }
+        self.data.prefetch.lock();
+        cache.noteRelease(.backend, admitted - actual);
+        self.data.prefetch.unlock();
+        plan.backend_bytes += actual;
+        plan.host_bytes += ref_bytes;
+        committed = true;
+        return tensor;
+    }
+    fn audioUnpreparePlan(self: *MetalCompute, plan: *audio_tape.Plan) void {
+        plan.deinit();
+        if (self.data.tier_cache) |*cache| {
+            self.data.prefetch.lock();
+            defer self.data.prefetch.unlock();
+            cache.noteRelease(.host, plan.host_bytes - @sizeOf(audio_tape.Plan));
+            cache.noteRelease(.backend, plan.backend_bytes);
+        }
+        plan.host_bytes = @sizeOf(audio_tape.Plan);
+        plan.backend_bytes = 0;
+        plan.arena_size = 0;
+        plan.drop_ct = null;
+        plan.prepared = false;
+        for (plan.constants[0..plan.constant_count]) |*c| c.required = true;
+        for (plan.nodes[0..plan.count]) |*node| {
+            node.prepared_slot = null;
+            node.arena_offset = null;
+        }
+    }
+    fn audioPreparePlan(self: *MetalCompute, plan: *audio_tape.Plan) !void {
+        const p = self.provider_impl;
+        const cb = self.computeBackend();
+        // Bind only model-owned immutable slots. Request-local slots are never
+        // published into a schedule and may still use the normal named route.
+        for (plan.nodes[0..plan.count]) |*node| {
+            try cb.checkExecutionControl();
+            const dims = node.linearDimensions() orelse continue;
+            switch (node.args) {
+                .linearNoBias, .clippedLinear => {
+                    const id: u16 = switch (node.args) {
+                        .linearNoBias => |a| a.weight,
+                        .clippedLinear => |a| a.weight,
+                        else => unreachable,
+                    };
+                    for (plan.constants[0..plan.constant_count]) |c| if (c.id == id and !c.model) {
+                        if (p.embeddinggemma2_linear_cache.get(c.name[0..c.len])) |entry| {
+                            if (entry.in_dim == dims.in_dim and entry.out_dim == dims.out_dim and metal_runtime.decoderRuntimeLinearSlotPrepared(p, entry.slot, dims.in_dim, dims.out_dim)) node.prepared_slot = entry.slot;
+                        }
+                        break;
+                    };
+                },
+                .linearPackedNamed => |a| {
+                    var names: [3][]const u8 = undefined;
+                    for (0..a.name_count) |i| names[i] = a.names_storage[i][0..a.names_lengths[i]];
+                    const joined = try std.mem.join(self.allocator, "|", names[0..a.name_count]);
+                    defer self.allocator.free(joined);
+                    const key = try std.mem.concat(self.allocator, u8, &.{ joined, ".linear.weight" });
+                    defer self.allocator.free(key);
+                    if (p.embeddinggemma2_linear_cache.get(key)) |entry| if (entry.in_dim == dims.in_dim and entry.out_dim == dims.out_dim and metal_runtime.decoderRuntimeLinearSlotPrepared(p, entry.slot, dims.in_dim, dims.out_dim)) {
+                        node.prepared_slot = entry.slot;
+                    };
+                },
+                else => {},
+            }
+        }
+        for (plan.constants[0..plan.constant_count]) |*c| {
+            c.required = false;
+            for (plan.nodes[0..plan.count]) |node| for (node.inputs[0..node.input_count]) |id| if (id == c.id) {
+                const is_prepared_weight = node.prepared_slot != null and switch (node.args) {
+                    .linearNoBias => |a| a.weight == id,
+                    .clippedLinear => |a| a.weight == id,
+                    else => false,
+                };
+                if (!is_prepared_weight) c.required = true;
+            };
+        }
+        var offsets: [512]usize = @splat(0);
+        var counts: [512]usize = @splat(0);
+        var total: usize = 0;
+        for (plan.constants[0..plan.constant_count], 0..) |c, i| {
+            if (!c.required or c.model) continue;
+            try cb.checkExecutionControl();
+            const weight = try getWeightOp(self, c.name[0..c.len]);
+            defer freeOp(self, weight);
+            const n = bufElemCount(toBuf(weight));
+            // Only small immutable coefficients get a new packed snapshot.
+            // Matrix weights remain in their existing model-owned slots.
+            if (n == 0 or n > 16384) continue;
+            offsets[i] = total;
+            counts[i] = n;
+            total = try std.math.add(usize, total, std.mem.alignForward(usize, n, 64));
+        }
+        var storage: ?MetalTensor = null;
+        defer if (storage) |*mt| mt.deinit();
+        if (total > 0 and total <= 1024 * 1024) {
+            storage = try self.audioPlanBuffer(plan, total * 4, true);
+            if (storage != null) {
+                const host = try self.allocator.alloc(f32, total);
+                defer self.allocator.free(host);
+                @memset(host, 0);
+                for (plan.constants[0..plan.constant_count], 0..) |c, i| if (counts[i] > 0) {
+                    const weight = try getWeightOp(self, c.name[0..c.len]);
+                    defer freeOp(self, weight);
+                    const data = try toFloat32Op(self, weight, self.allocator);
+                    defer self.allocator.free(data);
+                    @memcpy(host[offsets[i]..][0..counts[i]], data);
+                };
+                try storage.?.uploadBytes(std.mem.sliceAsBytes(host));
+            }
+        }
+        for (plan.constants[0..plan.constant_count], 0..) |*c, i| {
+            if (!c.required) continue;
+            var tensor: ?MetalTensor = null;
+            if (c.model) {
+                if (p.embeddinggemma2_constant_cache.getPtr(c.name[0..c.len])) |entry| tensor = try entry.tensor.retainedCopy();
+            } else if (storage != null and counts[i] > 0) {
+                const weight = try getWeightOp(self, c.name[0..c.len]);
+                defer freeOp(self, weight);
+                var shape: [metal_tensor_mod.max_dims]i32 = undefined;
+                const logical = toBuf(weight).logical_shape orelse continue;
+                if (logical.len > shape.len) continue;
+                for (logical, 0..) |d, j| shape[j] = @intCast(d);
+                tensor = try storage.?.retainedView(offsets[i] * 4, counts[i] * 4, shape[0..logical.len]);
+            }
+            if (tensor) |mt| {
+                c.bound = self.audioPersistentCt(plan, mt) catch |err| {
+                    var owned = mt;
+                    owned.deinit();
+                    return err;
+                };
+            }
+        }
+        const arena_size = try plan.layout();
+        if (arena_size > 0 and arena_size <= 64 * 1024 * 1024) {
+            if (try self.audioPlanBuffer(plan, arena_size, false)) |mt| {
+                plan.arena = self.audioPersistentCt(plan, mt) catch |err| {
+                    var owned = mt;
+                    owned.deinit();
+                    return err;
+                };
+                plan.arena_size = arena_size;
+            }
+        }
+        plan.prepared = true;
+    }
+    fn audioArenaViewOp(ctx: *anyopaque, arena: CT, offset: usize, rows: usize, dim: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const mt = denseDeviceF32(arena) orelse return error.InvalidTensorShape;
+        return self.ownedDeviceView(&mt, offset, rows * dim * 4, &.{ @intCast(rows), @intCast(dim) });
+    }
+    fn audioPreparedLinearOp(ctx: *anyopaque, input: CT, slot: usize, rows: usize, in_dim: usize, out_dim: usize, clip: ?ops.ClippedLinearParams, output: ?CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, slot, in_dim, out_dim)) return null;
+        var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer x.deinit();
+        if (x.elemCount() != rows * in_dim) return error.InvalidTensorShape;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var mt = if (output) |ct| try denseDeviceF32(ct).?.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * out_dim * 4, .private, &.{ @intCast(rows), @intCast(out_dim) });
+        var moved = false;
+        defer if (!moved) mt.deinit();
+        var fused = false;
+        if (clip) |p| {
+            const rc = metal_runtime.antfly_metal_clipped_linear(runtime, x.deviceHandle(), x.deviceByteOffset(), slot, &p, mt.deviceHandle(), mt.deviceByteOffset());
+            if (rc != 0 and rc != -1) return error.MetalKernelFailed;
+            fused = rc == 0;
+        }
+        if (!fused) {
+            var clipped: ?CT = null;
+            defer if (clipped) |ct| freeOp(ctx, ct);
+            if (clip) |p| if (p.flags & 3 != 0) {
+                clipped = try clampScalarOp(ctx, input, if (p.flags & 1 != 0) p.input_min else null, if (p.flags & 2 != 0) p.input_max else null);
+            };
+            const operand = if (clipped) |ct| denseDeviceF32(ct).? else x;
+            if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, slot, operand, rows, in_dim, out_dim, mt)) return error.AudioSchedulePreparedSlotMissing;
+            if (clip) |p| if (p.flags & 28 != 0) {
+                if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, mt, mt, (p.flags >> 2) & 3, p.output_min, p.output_max, p.flags & 16 != 0)) return error.AudioScheduleRouteChanged;
+            };
+        }
+        if (output) |ct| return ct;
+        const ct = try self.ctFromOwnedMetalTensor(mt);
+        moved = true;
+        return ct;
+    }
     fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.require_f32_linears or disableRuntimeElementwise() or self.shared_provider_lease_io == null or self.audio_capture != null or inputs.len == 0 or inputs.len > 20 or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN")) return null;
@@ -16142,9 +16385,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (bound != cache) return null;
             }
             if (p.audio_schedules[victim]) |old| {
+                old.deinit();
+                cache.noteRelease(.host, old.host_bytes);
+                cache.noteRelease(.backend, old.backend_bytes);
                 std.heap.c_allocator.destroy(old);
                 p.audio_schedules[victim] = null;
-                cache.noteRelease(.host, @sizeOf(audio_tape.Plan));
             }
             cache.reserve(.host, @sizeOf(audio_tape.Plan)) catch return null;
             const plan = std.heap.c_allocator.create(audio_tape.Plan) catch {
@@ -16171,13 +16416,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return out;
         }
         if (plan.ready) {
-            const out = try plan.replay(&cb, inputs);
+            const replay = plan.selection.useReplay();
+            var out: CT = undefined;
+            const stats = audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS");
+            const before_encoders = if (stats) metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count else 0;
+            if (replay) {
+                const previous_scope = metal_runtime.antfly_metal_audio_replay_scope(p.raw_decode_runtime, 1);
+                defer _ = metal_runtime.antfly_metal_audio_replay_scope(p.raw_decode_runtime, previous_scope);
+                const scope = if (metal_runtime.hasActiveFrame(p.raw_decode_runtime)) try self.beginPlannedGraphScopeForSelf(.ffn) else PlannedGraphScope{};
+                var ended = false;
+                defer if (!ended) self.endPlannedGraphScopeForSelf(scope) catch {};
+                out = try plan.replay(&cb, inputs);
+                errdefer freeOp(ctx, out);
+                try self.endPlannedGraphScopeForSelf(scope);
+                ended = true;
+            } else out = try run(context, inputs);
             const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
-            if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS")) std.debug.print("metal_audio_schedule replays={d} eager_encode_ns={d} replay_encode_ns={d}\n", .{ plan.replays, plan.eager_ns, elapsed });
-            plan.replay_ns = elapsed;
-            // This measures host encoding only; GPU work and arithmetic are
-            // unchanged. Stop replay if host scheduling loses substantially.
-            if (plan.replays >= 3 and elapsed > plan.eager_ns + plan.eager_ns / 4) plan.disabled = true;
+            plan.selection.record(replay, elapsed);
+            if (replay) plan.replay_ns = elapsed else plan.eager_ns = elapsed;
+            if (stats) std.debug.print("metal_audio_schedule replay={} replays={d} encode_ns={d} encoders={d} arena_bytes={d} backend_bytes={d}\n", .{ replay, plan.replays, elapsed, metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count -| before_encoders, plan.arena_size, plan.backend_bytes });
             return out;
         }
         var capture = audio_tape.Capture.init(plan, inputs);
@@ -16189,9 +16446,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         self.audio_capture = null;
         capture.finish(out);
-        if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS")) std.debug.print("metal_audio_schedule ready={} nodes={d} constants={d} bytes={d}\n", .{ plan.ready, plan.count, plan.constant_count, @sizeOf(audio_tape.Plan) });
+        errdefer freeOp(ctx, out);
+        if (plan.ready) self.audioPreparePlan(plan) catch |err| {
+            // Optional preparation must not discard a valid eager result.
+            self.audioUnpreparePlan(plan);
+            switch (err) {
+                error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => {},
+                else => return err,
+            }
+        };
+        if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS")) {
+            var slots: usize = 0;
+            var bindings: usize = 0;
+            var named: usize = 0;
+            for (plan.nodes[0..plan.count]) |node| if (node.prepared_slot != null) {
+                slots += 1;
+            };
+            for (plan.constants[0..plan.constant_count]) |c| {
+                if (c.bound != null) bindings += 1 else if (c.required) named += 1;
+            }
+            std.debug.print("metal_audio_schedule ready={} nodes={d} constants={d} host_bytes={d} slots={d} bindings={d} named={d} arena_bytes={d}\n", .{ plan.ready, plan.count, plan.constant_count, plan.host_bytes, slots, bindings, named, plan.arena_size });
+        }
         if (!plan.ready and audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_AUDIO_PLAN")) {
-            freeOp(ctx, out);
             return error.AudioScheduleUnqualified;
         }
         return out;
@@ -16331,6 +16607,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const x = denseDeviceF32(input) orelse return null;
         const res = denseDeviceF32(residual) orelse return null;
         if (dim == 0 or x.elemCount() == 0 or x.elemCount() % dim != 0 or x.elemCount() != res.elemCount() or bufElemCount(toBuf(weight)) != dim) return error.InvalidTensorShape;
+        if (denseDeviceF32(weight)) |w| {
+            const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+            var mt = try MetalTensor.deviceAllocate(runtime, x.elemCount() * 4, .private, x.shape());
+            errdefer mt.deinit();
+            if (metal_runtime.antfly_metal_norm_residual_weight(runtime, x.deviceHandle(), x.deviceByteOffset(), w.deviceHandle(), w.deviceByteOffset(), res.deviceHandle(), res.deviceByteOffset(), x.elemCount() / dim, dim, eps, norm_scale, output_scale, mt.deviceHandle(), mt.deviceByteOffset()) != 0) return error.MetalRuntimeUnavailable;
+            return self.ctFromOwnedMetalTensor(mt);
+        }
         const slot = (try self.ensureDynamicRmsNormSlot(weight, dim)) orelse return null;
         const result = (try metal_runtime.decoderRuntimeRmsNormResidual(self.provider_impl, x, res, slot, dim, eps, norm_scale, output_scale)) orelse return null;
         return self.ctFromOwnedMetalTensor(result);
@@ -33966,6 +34249,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.clampSilu = audioTapeClampSilu;
         vt.clippedLinear = audioTapeClippedLinear;
         vt.rmsNormClamped = audioTapeRmsNormClamped;
+        vt.audioPreparedLinear = audioPreparedLinearOp;
+        vt.audioArenaView = audioArenaViewOp;
         vt.audioSetControl = audioSetControlOp;
         vt.audioStorage = audioStorageOp;
         vt.audioExecution = audioExecutionOp;
@@ -44634,7 +44919,7 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
         defer a.free(actual);
         const z = value + 1;
         for (actual) |v| try std.testing.expectApproxEqAbs(2 * z / (1 + @exp(-z)), v, 1e-5);
-        if (request >= 3) {
+        if (request >= 4) {
             var replays: u64 = 0;
             for (compute.provider_impl.audio_schedules) |entry| if (entry) |plan| {
                 replays += plan.replays;
@@ -44642,7 +44927,8 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
             try std.testing.expect(replays > 0);
         }
     }
-    // Four geometries remain bounded and pressure returns every metadata byte.
+    // Sixteen geometries cover singleton and twelve frame groups; all bytes
+    // return under pressure. One-off geometries do not displace hot schedules.
     {
         var compute = try MetalCompute.init(a, &store, null);
         defer compute.deinit();
@@ -44663,6 +44949,7 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
         var checks: usize = 0;
         for (compute.provider_impl.audio_schedules) |entry| if (entry) |plan| {
             plan.disabled = false;
+            plan.selection = .{ .eager_count = 5, .replay_count = 5 };
         };
         var cancelled = cb;
         cancelled.execution_control = .{ .ptr = &checks, .check_fn = Check.call, .native_call_policy = .in_process };
@@ -44676,18 +44963,185 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
         try cb.decoderRuntimeSubmitAndWaitFrame();
         // Alias relationships are part of the learned schedule contract.
         try std.testing.expect(try cb.audioExecution(42, &.{ x, x }, &run, Run.call) == null);
-        for (100..108) |key| try std.testing.expect(try cb.audioExecution(key, &.{ x, y }, &run, Run.call) == null);
-        for (100..108) |key| if (try cb.audioExecution(key, &.{ x, y }, &run, Run.call)) |out| cb.free(out);
+        for (100..132) |key| try std.testing.expect(try cb.audioExecution(key, &.{ x, y }, &run, Run.call) == null);
+        for (100..132) |key| if (try cb.audioExecution(key, &.{ x, y }, &run, Run.call)) |out| cb.free(out);
         var count: usize = 0;
         for (compute.provider_impl.audio_schedules) |entry| if (entry != null) {
             count += 1;
         };
-        try std.testing.expectEqual(@as(usize, 4), count);
-        try std.testing.expectEqual(4 * @sizeOf(audio_tape.Plan), store.tier_cache.?.host_bytes);
+        try std.testing.expectEqual(@as(usize, 16), count);
+        try std.testing.expectEqual(16 * @sizeOf(audio_tape.Plan), store.tier_cache.?.host_bytes);
     }
     const p = store.shared_metal_native_provider.?;
     try std.testing.expect(try p.reclaimEmbeddingGemma2Weights(.audio) > 0);
     for (p.audio_schedules) |entry| try std.testing.expect(entry == null);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+}
+
+test "embeddinggemma2 Metal audio replay survives fused selector eviction after partial execution" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    compute.require_f32_linears = true;
+    var table = compute.computeBackend().vtable.*;
+    const Decline = struct {
+        fn call(_: *anyopaque, _: CT, _: CT, _: ops.ClippedLinearParams) anyerror!?CT {
+            return null;
+        }
+    };
+    table.clippedLinear = Decline.call;
+    var cb = compute.computeBackend();
+    cb.vtable = &table;
+    const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2 }, &.{ 1, 2 }));
+    defer cb.free(x);
+    const w = try cb.fromFloat32Shape(&.{ 1, 0, 0, 1 }, &.{ 2, 2 });
+    defer cb.free(w);
+    const plan = try a.create(audio_tape.Plan);
+    defer a.destroy(plan);
+    plan.* = .{ .count = 2, .output = 3 };
+    plan.nodes[0] = .{ .output = 2, .inputs = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .args = .{ .silu = .{ .input = 0 } } };
+    plan.nodes[1] = .{ .output = 3, .inputs = .{ 2, 1, 0, 0, 0, 0, 0, 0 }, .input_count = 2, .args = .{ .clippedLinear = .{ .input = 2, .weight = 1, .p = .{ .rows = 1, .in_dim = 2, .out_dim = 2, .flags = 2 | 8 | 16, .input_min = 0, .input_max = 1, .output_min = 0, .output_max = 0.8 } } } };
+    plan.last_use[2] = 1;
+    for (0..2) |_| {
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer cb.decoderRuntimeCancelFrame() catch {};
+        const out = try plan.replay(&cb, &.{ x, w });
+        defer cb.free(out);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        const actual = try cb.toFloat32(out, a);
+        defer a.free(actual);
+        for (actual, [_]f32{ 1, 2 }) |value, input| {
+            const z = @min(@as(f32, 0.8), input / (1 + @exp(-input)));
+            try std.testing.expectApproxEqAbs(z / (1 + @exp(-z)), value, 1e-5);
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 2), plan.replays);
+}
+
+test "embeddinggemma2 Metal audio prepared storage rolls back admission and releases bindings" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{ .backend_limit_bytes = 1024 * 1024 });
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const plan = try a.create(audio_tape.Plan);
+    defer a.destroy(plan);
+    const cache = &store.tier_cache.?;
+    for ([_]bool{ false, true }) |deny| {
+        plan.* = .{};
+        try cache.reserve(.host, @sizeOf(audio_tape.Plan));
+        var mt = (try compute.audioPlanBuffer(plan, 4096, false)).?;
+        if (deny) {
+            cache.budget.host_limit_bytes = cache.host_bytes;
+            try std.testing.expectError(error.MemoryBudgetExceeded, compute.audioPersistentCt(plan, mt));
+            mt.deinit();
+        } else {
+            plan.arena = try compute.audioPersistentCt(plan, mt);
+            plan.constant_count = 1;
+            plan.constants[0] = .{ .id = 0, .model = true, .name = undefined, .len = 0, .bound = try compute.audioPersistentCt(plan, try mt.retainedCopy()) };
+        }
+        compute.audioUnpreparePlan(plan);
+        try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+        try std.testing.expectEqual(@sizeOf(audio_tape.Plan), cache.host_bytes);
+        cache.noteRelease(.host, @sizeOf(audio_tape.Plan));
+        cache.budget.host_limit_bytes = 0;
+    }
+    plan.* = .{};
+    cache.budget.backend_limit_bytes = 1;
+    try std.testing.expect(try compute.audioPlanBuffer(plan, 4096, false) == null);
+    try std.testing.expectEqual(@as(usize, 0), cache.host_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+}
+
+test "embeddinggemma2 Metal audio prepared slots reuse arenas without mutating returned outputs" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{});
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    compute.require_f32_linears = true;
+    const cb = compute.computeBackend();
+    const width = 64;
+    var weight: [width * width]f32 = @splat(0);
+    for (0..width) |i| weight[i * width + i] = 1;
+    const w = try cb.fromFloat32Shape(&weight, &.{ width, width });
+    defer cb.free(w);
+    const bias = try cb.fromFloat32Shape(&@as([width]f32, @splat(0)), &.{width});
+    defer cb.free(bias);
+    try std.testing.expect(try cb.decoderRuntimePrepareLinear(&.{ .slot = 0, .weight = w, .bias = bias, .in_dim = width, .out_dim = width, .prefer_f32_mps_fallback = true }));
+    const plan = try a.create(audio_tape.Plan);
+    defer a.destroy(plan);
+    plan.* = .{ .count = 2, .output = 2 };
+    plan.nodes[0] = .{ .prepared_slot = 0, .output = 1, .inputs = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .args = .{ .clippedLinear = .{ .input = 0, .weight = 0, .p = .{ .rows = 3, .in_dim = width, .out_dim = width, .flags = 16, .input_min = 0, .input_max = 0, .output_min = 0, .output_max = 0 } } } };
+    plan.nodes[1] = .{ .prepared_slot = 0, .output = 2, .inputs = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .args = .{ .linearNoBias = .{ .input = 1, .weight = 0, .rows = 3, .in_dim = width, .out_dim = width } } };
+    plan.last_use[1] = 1;
+    try store.tier_cache.?.reserve(.host, @sizeOf(audio_tape.Plan));
+    defer store.tier_cache.?.noteRelease(.host, @sizeOf(audio_tape.Plan));
+    defer compute.audioUnpreparePlan(plan);
+    const bytes = try plan.layout();
+    try std.testing.expect(plan.nodes[0].arena_offset != null);
+    try std.testing.expect(plan.nodes[1].arena_offset == null);
+    plan.arena = try compute.audioPersistentCt(plan, (try compute.audioPlanBuffer(plan, bytes, false)).?);
+    var previous: ?CT = null;
+    defer if (previous) |ct| cb.free(ct);
+    for (0..3) |iteration| {
+        const value: f32 = @floatFromInt(iteration + 1);
+        const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&@as([3 * width]f32, @splat(value)), &.{ 3, width }));
+        defer cb.free(x);
+        // Also exercise the standalone prepared-slot fallback without a frame.
+        if (iteration != 2) try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer cb.decoderRuntimeCancelFrame() catch {};
+        const runtime = compute.provider_impl.raw_decode_runtime;
+        const previous_scope = metal_runtime_mod.antfly_metal_audio_replay_scope(runtime, 1);
+        defer _ = metal_runtime_mod.antfly_metal_audio_replay_scope(runtime, previous_scope);
+        const out = plan.replay(&cb, &.{x}) catch |err| {
+            _ = metal_runtime_mod.antfly_metal_audio_replay_scope(runtime, previous_scope);
+            return err;
+        };
+        errdefer cb.free(out);
+        // The final prepared linear is MPS and closes the encoder. Two audio
+        // kernels must reopen and share exactly one encoder afterward.
+        const before = metal_runtime_mod.runtimeMemorySnapshot(runtime).compute_encoder_count;
+        const first = (try cb.clampScalar(out, 0, null)).?;
+        defer cb.free(first);
+        const second = (try cb.clampScalar(first, 0, null)).?;
+        defer cb.free(second);
+        const after = metal_runtime_mod.runtimeMemorySnapshot(runtime).compute_encoder_count;
+        _ = metal_runtime_mod.antfly_metal_audio_replay_scope(runtime, previous_scope);
+        if (iteration != 2) try std.testing.expectEqual(@as(u64, 1), after - before);
+        if (iteration != 2) try cb.decoderRuntimeSubmitAndWaitFrame();
+        const actual = try cb.toFloat32(out, a);
+        defer a.free(actual);
+        for (actual) |v| try std.testing.expectApproxEqAbs(value / (1 + @exp(-value)), v, 1e-5);
+        if (previous) |ct| {
+            const held = try cb.toFloat32(ct, a);
+            defer a.free(held);
+            const old = value - 1;
+            for (held) |v| try std.testing.expectApproxEqAbs(old / (1 + @exp(-old)), v, 1e-5);
+            cb.free(ct);
+        }
+        previous = out;
+    }
 }

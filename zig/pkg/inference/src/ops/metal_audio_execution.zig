@@ -13,14 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// A bounded host instruction tape. It retains names and scalar parameters,
-// never request tensors, allocators, activations, or weight pins. Replay binds
-// current inputs and immutable model entries, then frees temporaries at last use.
+// A bounded host instruction tape. Prepared plans retain model-owned bindings
+// and an admitted activation arena, never request tensors, allocators, or pins.
+// Replay binds current inputs and frees temporary wrappers at last use.
 const std = @import("std");
 const ops = @import("ops.zig");
 const CT = ops.CT;
 pub const capacity = 2048;
-pub const Constant = struct { id: u16, model: bool, name: [256]u8, len: u16 };
+pub const Constant = struct { id: u16, model: bool, name: [256]u8, len: u16, required: bool = true, bound: ?CT = null };
 pub const Plan = struct {
     key: u64 = 0,
     stamp: u64 = 0,
@@ -30,6 +30,13 @@ pub const Plan = struct {
     replays: u64 = 0,
     eager_ns: u64 = 0,
     replay_ns: u64 = 0,
+    selection: Selection = .{},
+    host_bytes: usize = @sizeOf(Plan),
+    backend_bytes: usize = 0,
+    arena: ?CT = null,
+    arena_size: usize = 0,
+    drop_ct: ?*const fn (CT) void = null,
+    prepared: bool = false,
     nodes: [1024]Node = undefined,
     count: usize = 0,
     constants: [512]Constant = undefined,
@@ -37,6 +44,60 @@ pub const Plan = struct {
     last_use: [capacity]u16 = @splat(0),
     next_id: u16 = 0,
     output: u16 = 0,
+    pub fn deinit(self: *Plan) void {
+        if (self.drop_ct) |drop| {
+            for (self.constants[0..self.constant_count]) |*c| if (c.bound) |ct| {
+                drop(ct);
+                c.bound = null;
+            };
+            if (self.arena) |ct| drop(ct);
+        }
+        self.arena = null;
+    }
+    /// Assign non-overlapping lifetimes to linear outputs. Escaping values
+    /// and their view ancestors remain independently owned by the caller.
+    pub fn layout(self: *Plan) !usize {
+        var ends = self.last_use;
+        var escaping: [capacity]bool = @splat(false);
+        escaping[self.output] = true;
+        var n = self.count;
+        while (n > 0) {
+            n -= 1;
+            const node = &self.nodes[n];
+            switch (node.args) {
+                .sliceLastDim => |a| {
+                    ends[a.tensor] = @max(ends[a.tensor], ends[node.output]);
+                    if (escaping[node.output]) escaping[a.tensor] = true;
+                },
+                else => {},
+            }
+        }
+        const Range = struct { offset: usize, bytes: usize, end: u16 };
+        var ranges: [1024]Range = undefined;
+        var used: usize = 0;
+        var peak: usize = 0;
+        for (self.nodes[0..self.count], 0..) |*node, i| {
+            node.arena_offset = null;
+            if (node.prepared_slot == null or escaping[node.output]) continue;
+            const d = node.linearDimensions() orelse continue;
+            const bytes = try std.math.mul(usize, try std.math.mul(usize, d.rows, d.out_dim), 4);
+            const size = std.mem.alignForward(usize, bytes, 4096);
+            var best: ?usize = null;
+            for (ranges[0..used], 0..) |range, j| if (range.end < i and range.bytes >= size) {
+                if (best == null or range.bytes < ranges[best.?].bytes) best = j;
+            };
+            if (best) |j| {
+                node.arena_offset = ranges[j].offset;
+                ranges[j].end = ends[node.output];
+            } else {
+                node.arena_offset = peak;
+                ranges[used] = .{ .offset = peak, .bytes = size, .end = ends[node.output] };
+                used += 1;
+                peak = try std.math.add(usize, peak, size);
+            }
+        }
+        return peak;
+    }
     pub fn replay(self: *Plan, cb: *const ops.ComputeBackend, inputs: []const CT) !CT {
         var values: [capacity]?CT = @splat(null);
         var owned: [capacity]bool = @splat(false);
@@ -45,13 +106,30 @@ pub const Plan = struct {
         };
         for (inputs, 0..) |ct, i| values[i] = ct;
         for (self.constants[0..self.constant_count]) |c| {
+            if (!c.required) continue;
+            if (c.bound) |bound| {
+                values[c.id] = bound;
+                continue;
+            }
             const name = c.name[0..c.len];
             values[c.id] = if (c.model) (try cb.modelConstant(name, null)) orelse return error.AudioScheduleConstantMissing else try cb.getWeight(name);
             owned[c.id] = true;
         }
         for (self.nodes[0..self.count], 0..) |*node, i| {
             try cb.checkExecutionControl();
-            values[node.output] = try node.run(cb, &values);
+            var hint: ?CT = null;
+            if (self.arena) |arena| if (node.arena_offset) |offset| {
+                const d = node.linearDimensions().?;
+                if (cb.vtable.audioArenaView) |view| hint = try view(cb.ptr, arena, offset, d.rows, d.out_dim);
+            };
+            const result = node.run(cb, &values, hint) catch |err| {
+                if (hint) |ct| cb.free(ct);
+                return err;
+            };
+            if (hint) |ct| if (result != ct) {
+                cb.free(ct);
+            };
+            values[node.output] = result;
             owned[node.output] = true;
             for (node.inputs[0..node.input_count]) |id| {
                 if (id != self.output and self.last_use[id] == i and owned[id]) {
@@ -123,7 +201,10 @@ pub const Capture = struct {
         self.plan.disabled = !self.plan.ready;
     }
 };
+pub const LinearDimensions = struct { rows: usize, in_dim: usize, out_dim: usize };
 pub const Node = struct {
+    prepared_slot: ?usize = null,
+    arena_offset: ?usize = null,
     output: u16 = 0,
     inputs: [8]u16 = @splat(0),
     input_count: u8 = 0,
@@ -144,7 +225,33 @@ pub const Node = struct {
         sliceLastDim: struct { tensor: u16, start: usize, stop: usize },
         linearPackedNamed: struct { input: u16, names_storage: [3][192]u8, names_lengths: [3]u16, name_count: u8, widths: [3]usize, rows: usize, in_dim: usize },
     },
-    fn run(self: *const Node, cb: *const ops.ComputeBackend, values: *[capacity]?CT) !CT {
+    pub fn linearDimensions(self: *const Node) ?LinearDimensions {
+        return switch (self.args) {
+            .linearNoBias => |a| .{ .rows = a.rows, .in_dim = a.in_dim, .out_dim = a.out_dim },
+            .clippedLinear => |a| .{ .rows = a.p.rows, .in_dim = a.p.in_dim, .out_dim = a.p.out_dim },
+            .linearPackedNamed => |a| blk: {
+                var width: usize = 0;
+                for (a.widths[0..a.name_count]) |w| width += w;
+                break :blk .{ .rows = a.rows, .in_dim = a.in_dim, .out_dim = width };
+            },
+            else => null,
+        };
+    }
+    fn run(self: *const Node, cb: *const ops.ComputeBackend, values: *[capacity]?CT, hint: ?CT) !CT {
+        if (self.prepared_slot) |slot| if (cb.vtable.audioPreparedLinear) |linear| {
+            const d = self.linearDimensions().?;
+            const id = switch (self.args) {
+                .linearNoBias => |a| a.input,
+                .clippedLinear => |a| a.input,
+                .linearPackedNamed => |a| a.input,
+                else => unreachable,
+            };
+            const p: ?ops.ClippedLinearParams = switch (self.args) {
+                .clippedLinear => |a| a.p,
+                else => null,
+            };
+            return (try linear(cb.ptr, values[id].?, slot, d.rows, d.in_dim, d.out_dim, p, hint)) orelse error.AudioSchedulePreparedSlotMissing;
+        };
         switch (self.args) {
             .rmsNorm => |a| {
                 return (try cb.vtable.rmsNorm(cb.ptr, values[a.input].?, values[a.weight].?, a.dim, a.eps));
@@ -159,7 +266,8 @@ pub const Node = struct {
                 return (try cb.vtable.linearNoBias(cb.ptr, values[a.input].?, values[a.weight].?, a.rows, a.in_dim, a.out_dim));
             },
             .clippedLinear => |a| {
-                return (try cb.vtable.clippedLinear.?(cb.ptr, values[a.input].?, values[a.weight].?, a.p)) orelse error.AudioScheduleRouteChanged;
+                if (try cb.clippedLinear(values[a.input].?, values[a.weight].?, a.p)) |out| return out;
+                return stagedClippedLinear(cb, values[a.input].?, values[a.weight].?, a.p);
             },
             .clampScalar => |a| {
                 return (try cb.vtable.clampScalar.?(cb.ptr, values[a.input].?, a.min_value, a.max_value)) orelse error.AudioScheduleRouteChanged;
@@ -232,4 +340,132 @@ test "embeddinggemma2 audio schedule rejects an unrecorded output without retain
     capture.finish(@ptrFromInt(1));
     try std.testing.expect(plan.disabled);
     try std.testing.expect(!plan.ready);
+}
+
+/// A declining optional route must not invalidate a correctly recorded request.
+pub fn stagedClippedLinear(cb: *const ops.ComputeBackend, input: CT, weight: CT, p: ops.ClippedLinearParams) !CT {
+    const lo = if (p.flags & 1 != 0) @as(?f32, p.input_min) else null;
+    const hi = if (p.flags & 2 != 0) @as(?f32, p.input_max) else null;
+    const clipped = if (p.flags & 3 != 0) (try cb.clampScalar(input, lo, hi)) orelse return error.AudioScheduleRouteChanged else input;
+    defer if (clipped != input) cb.free(clipped);
+    const result = try cb.linearNoBias(clipped, weight, p.rows, p.in_dim, p.out_dim);
+    errdefer cb.free(result);
+    const omin = if (p.flags & 4 != 0) @as(?f32, p.output_min) else null;
+    const omax = if (p.flags & 8 != 0) @as(?f32, p.output_max) else null;
+    if (p.flags & 16 != 0) {
+        if (try cb.clampSilu(result, omin, omax)) |out| {
+            cb.free(result);
+            return out;
+        }
+    }
+    const bounded = if (p.flags & 12 != 0) (try cb.clampScalar(result, omin, omax)) orelse return error.AudioScheduleRouteChanged else result;
+    if (p.flags & 16 != 0) {
+        errdefer if (bounded != result) cb.free(bounded);
+        const out = try cb.silu(bounded);
+        if (bounded != result) cb.free(bounded);
+        cb.free(result);
+        return out;
+    }
+    if (bounded != result) cb.free(result);
+    return bounded;
+}
+
+/// Five interleaved pairs reject isolated scheduler outliers. A losing plan
+/// cools down for eight visits, then requalifies; successful plans periodically
+/// resample. A request is executed exactly once, with its own control.
+pub const Selection = struct {
+    eager: [5]u64 = @splat(0),
+    replay: [5]u64 = @splat(0),
+    eager_count: usize = 0,
+    replay_count: usize = 0,
+    cooldown: u8 = 0,
+    steady: u8 = 0,
+    sampling: bool = false,
+    pub fn useReplay(self: *Selection) bool {
+        self.sampling = false;
+        if (self.cooldown > 0) {
+            self.cooldown -= 1;
+            return false;
+        }
+        if (self.eager_count < 5 or self.replay_count < 5) {
+            self.sampling = true;
+            return self.eager_count > self.replay_count;
+        }
+        self.steady += 1;
+        if (self.steady < 64) return true;
+        self.* = .{ .sampling = true };
+        return false;
+    }
+    fn median(values: [5]u64) u64 {
+        var sorted = values;
+        std.mem.sort(u64, &sorted, {}, std.sort.asc(u64));
+        return sorted[2];
+    }
+    pub fn record(self: *Selection, replayed: bool, ns: u64) void {
+        if (ns == 0 or !self.sampling) return;
+        if (replayed and self.replay_count < 5) {
+            self.replay[self.replay_count] = ns;
+            self.replay_count += 1;
+        }
+        if (!replayed and self.eager_count < 5) {
+            self.eager[self.eager_count] = ns;
+            self.eager_count += 1;
+        }
+        if (self.eager_count == 5 and self.replay_count == 5) {
+            const baseline = median(self.eager);
+            if (median(self.replay) > baseline + baseline / 20) self.* = .{ .cooldown = 8 };
+        }
+    }
+};
+
+test "embeddinggemma2 audio selection rejects isolated outliers and retries after cooldown" {
+    var selection = Selection{};
+    for (0..5) |i| {
+        try std.testing.expect(!selection.useReplay());
+        selection.record(false, if (i == 0) 1 else 100);
+        try std.testing.expect(selection.useReplay());
+        selection.record(true, if (i == 0) 10000 else 80);
+    }
+    try std.testing.expect(selection.useReplay());
+    selection = .{};
+    for (0..5) |_| {
+        try std.testing.expect(!selection.useReplay());
+        selection.record(false, 100);
+        try std.testing.expect(selection.useReplay());
+        selection.record(true, 300);
+    }
+    for (0..8) |_| {
+        try std.testing.expect(!selection.useReplay());
+        selection.record(false, 1);
+    }
+    for (0..5) |_| {
+        try std.testing.expect(!selection.useReplay());
+        selection.record(false, 100);
+        try std.testing.expect(selection.useReplay());
+        selection.record(true, 70);
+    }
+    try std.testing.expect(selection.useReplay());
+}
+
+test "embeddinggemma2 audio arena extends view lifetimes and excludes escaping storage" {
+    const plan = try std.testing.allocator.create(Plan);
+    defer std.testing.allocator.destroy(plan);
+    plan.* = .{ .count = 4, .output = 5 };
+    plan.nodes[0] = .{ .output = 2, .prepared_slot = 0, .args = .{ .linearNoBias = .{ .input = 0, .weight = 1, .rows = 1, .in_dim = 2, .out_dim = 2 } } };
+    plan.nodes[1] = .{ .output = 3, .args = .{ .sliceLastDim = .{ .tensor = 2, .start = 0, .stop = 1 } } };
+    plan.nodes[2] = .{ .output = 4, .prepared_slot = 1, .args = .{ .linearNoBias = .{ .input = 0, .weight = 1, .rows = 1, .in_dim = 2, .out_dim = 2 } } };
+    plan.nodes[3] = .{ .output = 5, .args = .{ .add = .{ .a = 3, .b = 4 } } };
+    plan.last_use[2] = 1;
+    plan.last_use[3] = 3;
+    plan.last_use[4] = 3;
+    try std.testing.expectEqual(@as(usize, 8192), try plan.layout());
+    try std.testing.expect(plan.nodes[0].arena_offset != plan.nodes[2].arena_offset);
+    // A returned view keeps its backing allocation outside the mutable arena.
+    plan.output = 3;
+    try std.testing.expectEqual(@as(usize, 4096), try plan.layout());
+    try std.testing.expect(plan.nodes[0].arena_offset == null);
+    plan.output = 5;
+    plan.nodes[1].args = .{ .silu = .{ .input = 2 } };
+    try std.testing.expectEqual(@as(usize, 4096), try plan.layout());
+    try std.testing.expectEqual(plan.nodes[0].arena_offset, plan.nodes[2].arena_offset);
 }

@@ -1327,25 +1327,41 @@ first normalization, preserving the shorter clip's second-convolution boundary.
 Compaction uses the padded batch stride and returns each clip's original rows
 and mask. Existing exact-length CUDA batching is preserved.
 
-A bounded Metal host instruction schedule binds current request inputs and
-immutable model entries by name. It stores no request tensors or weight pins;
-last-use tracking releases replay intermediates, and every node checks the
-current request control. Schedule metadata uses host-tier admission after recurrence. Four geometry
-entries preserve hot plans during shape churn and yield to pressure.
-Unsupported captures use eager execution; replay can decline when host encoding
-is slower. This is host schedule reuse: GPU commands are still encoded on each
-execution. Audio cohorts retain their existing pipelined frame groups. Transposed depthwise
-coefficients use the model preparation cache across weight-source paths.
-`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.
+Metal audio schedules bind current inputs to prepared immutable model slots
+and coefficient buffers. They retain no request tensors, allocators, or weight
+pins. Sixteen admitted geometry/range entries cover singleton execution and all
+twelve possible cohort frame groups; recurrent shapes receive priority over
+one-off requests. Model pressure releases schedules before their model entries.
+Small coefficients share a packed buffer (at most 4 MiB per plan). Non-escaping
+linear outputs share a lifetime-planned private arena (at most 64 MiB per plan);
+view ancestors extend lifetimes and returned storage remains independently owned.
+Host metadata and physical device allocations are admitted before retention,
+including driver padding. Denied optional preparation preserves eager results.
+
+Replay checks current request control at every instruction and uses shared
+compute encoders within each existing command frame. Cohorts keep their bounded
+pipelined frame groups and cancellation fences. Prepared fused linear routes
+are independent of the evictable tuning cache; unprepared routes can complete
+with staged device operations if fusion declines. Five interleaved warm pairs
+compare median encoding times, rejecting isolated outliers. A slower plan cools
+down for eight visits before retrying; a winning plan resamples after 64 visits.
+Commands are still encoded per execution; this is not a GPU command graph.
+Transposed depthwise coefficients use the model preparation cache across weight
+sources. `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.
 
 The optional `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_AUDIO_PLAN=1` ordered-media oracle
-run repeats singleton audio embeddings, checks each vector against the pinned
+run repeats singleton and cohort audio embeddings, checks every vector against the pinned
 checkpoint oracle, and rejects unsupported schedule capture. Route counters
 must demonstrate replay before treating the run as replay qualification.
 
-An M4 Max Debug qualification run recorded 492 instructions, 216 immutable
-bindings and seven actual replays, with all repeated audio vectors passing the
-pretrained oracle. The schedule occupied 818,240 host bytes. Observed host
-encoding was 6.516 ms for the warm eager sample and 5.176 ms median for replay;
-completed replay embeddings were 30.9–33.9 ms. This is an illustrative
-qualification run, not a paired full-pipeline throughput or PyTorch comparison.
+Pretrained Metal qualification covers a 492-instruction singleton schedule
+with 96 prepared linear slots, 132 retained coefficient bindings and zero named
+lookups during replay. Its linear arena is 400 KiB. Three four-layer cohort
+schedules each prepare 32 slots and 44 coefficient bindings, with zero named
+lookups and an 800 KiB arena. Repeated singleton and cohort vectors must pass
+the same pinned checkpoint oracle. Encoding diagnostics report actual compute
+encoder counts; completed embedding latency includes the backbone. A local
+M4 Max Debug run reduced singleton compute encoders from 372 to 109 and cohort
+encoders from 124 to 37 per group. Interleaved eager/replay completed medians
+were 34.5/27.9 ms for singleton and 32.1/29.1 ms for two clips. Debug qualification
+timings do not establish production throughput or PyTorch parity.

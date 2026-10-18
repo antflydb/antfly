@@ -27565,7 +27565,13 @@ pub fn decoderRuntimeBorrowNomicEncoderHiddenScratch(
 /// Encode one prepared dense projection into a caller-owned private device
 /// tensor. This is intentionally active-frame-only: it avoids an otherwise
 /// short-lived Metal allocation in encoder hot paths.
-pub fn decoderRuntimeApplyDenseLinearInto(
+pub fn decoderRuntimeApplyDenseLinearInto(self: anytype, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output: MetalTensor) !bool {
+    if (!hasActiveFrame(self.raw_decode_runtime)) return false;
+    return decoderRuntimeApplyAudioLinearInto(self, slot, input, rows, in_dim, out_dim, output);
+}
+
+/// Prepared audio slots also support execution without an active frame.
+pub fn decoderRuntimeApplyAudioLinearInto(
     self: anytype,
     slot: usize,
     input: MetalTensor,
@@ -27575,7 +27581,7 @@ pub fn decoderRuntimeApplyDenseLinearInto(
     output: MetalTensor,
 ) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
-    if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(runtime)) return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or in_dim == 0 or out_dim == 0) return false;
     if (self.raw_linear_slot_kinds[slot] != .dense or
         self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim)
@@ -49497,7 +49503,7 @@ pub fn decoderRuntimeClippedLinear(self: anytype, input: MetalTensor, slot: usiz
     errdefer out.deinit();
     return finishDeviceOutput(&out, antfly_metal_clipped_linear(runtime, input.deviceHandle(), input.deviceByteOffset(), slot, &p, out.deviceHandle(), out.deviceByteOffset()));
 }
-extern fn antfly_metal_clipped_linear(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, slot: usize, params: *const @import("../ops/ops.zig").ClippedLinearParams, out: ?*anyopaque, out_offset: usize) c_int;
+pub extern fn antfly_metal_clipped_linear(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, slot: usize, params: *const @import("../ops/ops.zig").ClippedLinearParams, out: ?*anyopaque, out_offset: usize) c_int;
 
 pub extern fn antfly_metal_audio_storage_scope(runtime: ?*RawMetalDecodeRuntime, begin: c_int) c_int;
 pub extern fn antfly_metal_audio_storage_clear(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -49524,3 +49530,15 @@ pub extern fn antfly_metal_audio_norm_clamp_launches(runtime: ?*RawMetalDecodeRu
 pub extern fn antfly_metal_audio_storage_admission(runtime: ?*RawMetalDecodeRuntime, context: ?*anyopaque, admit: ?*const fn (?*anyopaque, usize) callconv(.c) c_int, release: ?*const fn (?*anyopaque, usize) callconv(.c) void) void;
 
 pub extern fn antfly_metal_audio_pad(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, params: *const @import("../ops/ops.zig").AudioPadParams) c_int;
+
+pub extern fn antfly_metal_audio_allocation_bytes(runtime: ?*RawMetalDecodeRuntime, bytes: usize, shared: c_int) usize;
+pub extern fn antfly_metal_audio_buffer_bytes(buffer: ?*anyopaque) usize;
+pub extern fn antfly_metal_norm_residual_weight(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, residual: ?*anyopaque, residual_offset: usize, rows: usize, dim: usize, eps: f32, norm_scale: f32, output_scale: f32, out: ?*anyopaque, out_offset: usize) c_int;
+
+pub fn decoderRuntimeAudioClampInto(self: anytype, input: MetalTensor, output: MetalTensor, flags: u32, lo: f32, hi: f32, silu: bool) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    const rc = if (silu) termite_metal_decode_runtime_clamp_silu_device(runtime, input.deviceHandle(), input.deviceByteOffset(), input.elemCount(), flags, lo, hi, output.deviceHandle(), output.deviceByteOffset()) else termite_metal_decode_runtime_gemma4_audio_clamp_device(runtime, input.deviceHandle(), input.deviceByteOffset(), input.elemCount(), flags, lo, hi, output.deviceHandle(), output.deviceByteOffset());
+    return rc == 0;
+}
+
+pub extern fn antfly_metal_audio_replay_scope(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;

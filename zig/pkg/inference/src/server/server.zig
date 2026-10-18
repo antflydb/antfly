@@ -37281,7 +37281,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
     // backbone execution, and checks every vector against the pinned oracle.
     if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_AUDIO_PLAN")) {
         const reference = parsed.value.object.get("cases").?.array.items[1];
-        for (0..8) |iteration| {
+        for (0..14) |iteration| {
             const start = platform.time.monotonicNs();
             const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
             defer a.free(result.vector);
@@ -37308,6 +37308,21 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, @as(f32, if (metal) 1e-3 else 1e-4));
         const similarity = try @import("antfly_decisions").scoring.cosine(vector, &audio_expected, 768);
         try std.testing.expect(similarity >= @as(f64, if (metal) 0.9999 else 0.99999));
+    }
+    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_AUDIO_PLAN")) {
+        for (0..14) |iteration| {
+            const start = platform.time.monotonicNs();
+            const batch = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
+            defer {
+                freeDirectDenseVectors(a, batch.vectors);
+                a.free(batch.input_tokens);
+            }
+            for (batch.vectors, audio_errors) |vector, err| {
+                try std.testing.expectEqual(@as(?anyerror, null), err);
+                for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+            }
+            std.debug.print("embeddinggemma2 audio_cohort_schedule iteration={d} completed_ns={d}\n", .{ iteration, platform.time.monotonicNs() -| start });
+        }
     }
     // Qualify real batched raster execution against the encoded-image path.
     // Use different aspect ratios and padded renderer strides, preserving the

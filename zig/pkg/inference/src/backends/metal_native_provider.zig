@@ -105,7 +105,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_linear_cache_bytes: usize = 0,
     embeddinggemma2_vision_linear_cache_bytes: usize = 0,
     embeddinggemma2_audio_linear_cache_bytes: usize = 0,
-    audio_schedules: [4]?*@import("../ops/metal_audio_execution.zig").Plan = @splat(null),
+    audio_schedules: [16]?*@import("../ops/metal_audio_execution.zig").Plan = @splat(null),
     audio_schedule_clock: u64 = 0,
     audio_schedule_history: @import("../ops/metal_audio_execution.zig").History = .{},
     embeddinggemma2_audio_pending_release: usize = 0,
@@ -203,11 +203,15 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     fn clearAudioSchedules(self: *MetalNativeProvider) usize {
         var bytes: usize = 0;
         for (&self.audio_schedules) |*entry| if (entry.*) |plan| {
-            bytes += @sizeOf(@import("../ops/metal_audio_execution.zig").Plan);
+            bytes += plan.host_bytes + plan.backend_bytes;
+            plan.deinit();
+            if (self.embeddinggemma2_cache_admission) |cache| {
+                cache.noteRelease(.host, plan.host_bytes);
+                cache.noteRelease(.backend, plan.backend_bytes);
+            }
             std.heap.c_allocator.destroy(plan);
             entry.* = null;
         };
-        if (self.embeddinggemma2_cache_admission) |cache| cache.noteRelease(.host, bytes);
         return bytes;
     }
     /// Caller owns the shared provider execution lease and residency lock.

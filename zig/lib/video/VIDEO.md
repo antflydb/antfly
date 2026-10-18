@@ -689,13 +689,24 @@ first normalization, preserving the shorter clip's second-convolution boundary.
 Compaction uses the padded batch stride and returns each clip's original rows
 and mask. Existing exact-length CUDA batching is preserved.
 
-A bounded Metal host instruction schedule binds current request inputs and
-immutable model entries by name. It stores no request tensors or weight pins;
-last-use tracking releases replay intermediates, and every node checks the
-current request control. Schedule metadata uses host-tier admission after recurrence. Four geometry
-entries preserve hot plans during shape churn and yield to pressure.
-Unsupported captures use eager execution; replay can decline when host encoding
-is slower. This is host schedule reuse: GPU commands are still encoded on each
-execution. Audio cohorts retain their existing pipelined frame groups. Transposed depthwise
-coefficients use the model preparation cache across weight-source paths.
-`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.
+Metal audio schedules bind current inputs to prepared immutable model slots
+and coefficient buffers. They retain no request tensors, allocators, or weight
+pins. Sixteen admitted geometry/range entries cover singleton execution and all
+twelve possible cohort frame groups; recurrent shapes receive priority over
+one-off requests. Model pressure releases schedules before their model entries.
+Small coefficients share a packed buffer (at most 4 MiB per plan). Non-escaping
+linear outputs share a lifetime-planned private arena (at most 64 MiB per plan);
+view ancestors extend lifetimes and returned storage remains independently owned.
+Host metadata and physical device allocations are admitted before retention,
+including driver padding. Denied optional preparation preserves eager results.
+
+Replay checks current request control at every instruction and uses shared
+compute encoders within each existing command frame. Cohorts keep their bounded
+pipelined frame groups and cancellation fences. Prepared fused linear routes
+are independent of the evictable tuning cache; unprepared routes can complete
+with staged device operations if fusion declines. Five interleaved warm pairs
+compare median encoding times, rejecting isolated outliers. A slower plan cools
+down for eight visits before retrying; a winning plan resamples after 64 visits.
+Commands are still encoded per execution; this is not a GPU command graph.
+Transposed depthwise coefficients use the model preparation cache across weight
+sources. `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.

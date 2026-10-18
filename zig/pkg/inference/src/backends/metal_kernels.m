@@ -1930,6 +1930,7 @@ typedef struct termite_metal_decode_runtime {
     bool audio_linear_choices[32];
     uint64_t audio_linear_clock;
     uint64_t audio_reuse_hits;
+    bool audio_replay_scope;
     uint64_t audio_fused_linear_launches;
     uint64_t audio_parallel_attention_launches;
     uint64_t audio_linear_tunes;
@@ -54555,6 +54556,14 @@ static int termite_metal_decode_runtime_gemma4_audio_dispatch(
                 return -7;
             }
         }
+        // MPS and unscoped helpers close the shared encoder. Reopen at the
+        // next audio dispatch, after validating bindings and before recording
+        // dependencies. Never open an empty encoder immediately before MPS.
+        if (runtime->audio_replay_scope &&
+            termite_metal_should_coalesce_planned_compute_encoder(runtime) &&
+            runtime->active_planned_compute_encoder == nil &&
+            termite_metal_decode_runtime_begin_planned_compute_scope(runtime,
+                TERMITE_METAL_COMPUTE_SOURCE_FFN, TERMITE_METAL_COMPUTE_REGION_FFN) != 0) return -7;
         if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, binding_count, -7) != 0) return -7;
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, func_name, &frame_owned);
@@ -70093,4 +70102,44 @@ int antfly_metal_audio_pad(termite_metal_decode_runtime *r,void *x,size_t xo,voi
         {(__bridge id<MTLBuffer>)x,xo,(size_t)p->batch*p->channels*p->rows*p->width*4,false},
         {(__bridge id<MTLBuffer>)y,yo,(size_t)n*4,true}};
     return termite_metal_decode_runtime_gemma4_audio_dispatch(r,r->audio_pad_pipeline,b,2,p,sizeof(*p),(size_t)n,0,0,__func__);
+}
+
+// Admission queries precede allocation; actual charges include driver padding.
+size_t antfly_metal_audio_allocation_bytes(termite_metal_decode_runtime *r,size_t bytes,int shared) {
+    if(!r || !bytes)return 0;
+    // Shared heaps are unavailable on some supported Intel devices. Reserve
+    // conservatively and verify the actual driver allocation before retaining.
+    size_t n=bytes;
+    if(!shared) {
+        MTLSizeAndAlign sa=[r->device heapBufferSizeAndAlignWithLength:bytes options:MTLResourceStorageModePrivate];
+        n=MAX(bytes,(size_t)sa.size);
+    } else {
+        if(bytes>SIZE_MAX-65535)return 0;
+        n=(bytes+65535)&~(size_t)65535;
+    }
+    if(n>SIZE_MAX-16383)return 0;
+    return (n+16383)&~(size_t)16383;
+}
+size_t antfly_metal_audio_buffer_bytes(void *handle) {
+    return handle ? antfly_audio_buffer_charge((__bridge id<MTLBuffer>)handle) : 0;
+}
+int antfly_metal_norm_residual_weight(termite_metal_decode_runtime *r,void *input,size_t io,void *weight,size_t wo,void *residual,size_t ro,size_t rows,size_t dim,float eps,float norm_scale,float output_scale,void *out,size_t oo) {
+    if(!r || !r->precise_library_safe || !rows || !dim || rows>UINT32_MAX || dim>UINT32_MAX)return -1;
+    size_t bytes;
+    if(!termite_metal_size_mul3(rows,dim,4,&bytes) || bytes/4>UINT32_MAX)return -1;
+    const termite_metal_gemma4_audio_binding b[4]={
+        {(__bridge id<MTLBuffer>)input,io,bytes,false},
+        {(__bridge id<MTLBuffer>)weight,wo,dim*4,false},
+        {(__bridge id<MTLBuffer>)residual,ro,bytes,false},
+        {(__bridge id<MTLBuffer>)out,oo,bytes,true}};
+    const termite_metal_norm_residual_params p={(uint32_t)dim,eps,norm_scale,output_scale};
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(r,r->norm_residual_pipeline,b,4,&p,sizeof(p),rows,1,rows>=256 && dim<=512 ? 32 : 128,__func__);
+}
+
+// The request restores the previous value on every exit, including cancellation.
+int antfly_metal_audio_replay_scope(termite_metal_decode_runtime *r,int enabled) {
+    if(!r)return 0;
+    const int previous=r->audio_replay_scope;
+    r->audio_replay_scope=(enabled!=0);
+    return previous;
 }

@@ -1256,13 +1256,17 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
         cb.free(hidden);
         hidden = next;
     }
-    if (planned == null) for (0..cfg.block_count) |layer| {
+    var layer: usize = 0;
+    if (planned == null) while (layer < cfg.block_count) {
         try cb.checkExecutionControl();
         if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame_active = try cb.decoderRuntimeBeginFrame();
-        const next = try audioLayer(cb, allocator, store, cfg, hidden, &layer_inputs, layer);
+        const end = if (cohort and cb.kind() == .metal and !profile_enabled and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null) @min(cfg.block_count, layer + frame_plan.layers) else layer + 1;
+        const grouped = if (cohort and cb.kind() == .metal) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end) else null;
+        const next = grouped orelse try runAudioLayers(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end);
         cb.free(hidden);
         hidden = next;
-        if (cohort and frame_active and ((layer + 1) % frame_plan.layers == 0 or layer + 1 == cfg.block_count)) {
+        layer = end;
+        if (cohort and frame_active and (layer % frame_plan.layers == 0 or layer == cfg.block_count)) {
             if (pipelined) {
                 try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
                 if (pending_frame) {
@@ -1281,7 +1285,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
         store.releaseCompletedNativeLayer();
         if (store.gguf == null) {
             var name_buf: [128]u8 = undefined;
-            try embeddingGemma2StageTensor(cb, allocator, try fmt(&name_buf, "audio_layer_{d}", .{layer}), hidden);
+            try embeddingGemma2StageTensor(cb, allocator, try fmt(&name_buf, "audio_layer_{d}", .{layer - 1}), hidden);
         }
     };
 
@@ -3356,7 +3360,23 @@ fn gemma4AudioEncoderFrameEnabled() bool {
     return !platform.env.getenvBool("TERMITE_GEMMA4_AUDIO_DISABLE_ENCODER_FRAME");
 }
 
+fn runAudioLayers(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize) !CT {
+    var state = hidden;
+    var owned = false;
+    errdefer if (owned) cb.free(state);
+    for (start..end) |layer| {
+        try cb.checkExecutionControl();
+        const next = try audioLayer(cb, a, store, cfg, state, inputs, layer);
+        if (owned) cb.free(state);
+        state = next;
+        owned = true;
+    }
+    return state;
+}
 fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs) !?CT {
+    return tryAudioExecutionRange(cb, a, store, cfg, hidden, inputs, 0, 12);
+}
+fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize) !?CT {
     if ((cb.kind() != .cuda and cb.kind() != .metal) or cb.vtable.audioExecution == null or !store.huggingface or !std.meta.eql(audioHostOps(), AudioHostOps{}) or cfg.block_count != 12 or inputs.scales.len != 12 or (cb.kind() == .cuda and (inputs.segment_starts == null or inputs.segment_valid == null)) or platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") != null) return null;
     const Run = struct {
         cb: *const ComputeBackend,
@@ -3364,6 +3384,8 @@ fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Pr
         store: *ProjectorWeights,
         cfg: AudioConfig,
         inputs: *AudioLayerInputs,
+        start: usize,
+        end: usize,
         fn call(raw: *anyopaque, values: []const CT) !CT {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var layer_inputs = self.inputs.*;
@@ -3374,20 +3396,10 @@ fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Pr
             var scales: [12]CT = undefined;
             @memcpy(&scales, values[5..17]);
             layer_inputs.scales = &scales;
-            var state = values[0];
-            var owned = false;
-            errdefer if (owned) self.cb.free(state);
-            for (0..12) |layer| {
-                try self.cb.checkExecutionControl();
-                const next = try audioLayer(self.cb, self.a, self.store, self.cfg, state, &layer_inputs, layer);
-                if (owned) self.cb.free(state);
-                state = next;
-                owned = true;
-            }
-            return state;
+            return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[0], &layer_inputs, self.start, self.end);
         }
     };
-    var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs };
+    var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .start = start, .end = end };
     var values: [17]CT = undefined;
     values[0] = hidden;
     values[1] = inputs.rel_in;
@@ -3397,6 +3409,7 @@ fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Pr
     @memcpy(values[5..17], inputs.scales);
     var key = std.hash.Wyhash.init(0x616e74666c796175);
     key.update(std.mem.sliceAsBytes(inputs.segments));
+    std.hash.autoHash(&key, .{ start, end });
     std.hash.autoHash(&key, .{ cfg.audio_hidden, cfg.intermediate_size, cfg.head_count, cfg.conv_kernel_size, @as(u32, @bitCast(cfg.layer_norm_eps)), @as(u32, @bitCast(cfg.residual_weight)), cfg.attention_chunk_size, cfg.attention_context_left, @as(u32, @bitCast(cfg.attention_logit_cap)), @as(u32, @bitCast(cfg.attention_invalid_logits_value)), cfg.exclude_farthest_key });
     return cb.audioExecution(key.final(), &values, &run, Run.call);
 }
