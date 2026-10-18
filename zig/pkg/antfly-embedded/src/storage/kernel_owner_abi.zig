@@ -1256,6 +1256,8 @@ pub extern fn antfly_storage_owner_raft_index_build_json(
 pub const RaftIndexOwnerSourceRequest = extern struct {
     pub const operation: u32 = 4;
     version: u32 = abi_version,
+    consumed_only: u8 = 0,
+    _reserved: [3]u8 = @splat(0),
     table_name: BorrowedBytes = .{},
     identity_json: BorrowedBytes = .{},
     control: ControlledJsonOperationRequest = .{},

@@ -2257,6 +2257,12 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expect(wire_read.consumed != null and wire_read.batch != null);
         try std.testing.expectEqual(@as(u64, 60), (try wire_read.batch.?.header.orderedPosition()).raft.index);
         _ = try wire_read.digest();
+        // A queued payload must not be loaded just to recover consumption.
+        // The projection succeeds even when every body allocation is denied.
+        var consumed_only = try db.readRaftIndexSourceProjected(std.testing.failing_allocator, 11, identity, .{}, true);
+        defer consumed_only.deinit();
+        try std.testing.expect(consumed_only.batch == null);
+        try std.testing.expectEqualDeep(wire_read.consumed.?, consumed_only.consumed.?);
     }
     {
         var read = try db.core.store.beginReadTxn();

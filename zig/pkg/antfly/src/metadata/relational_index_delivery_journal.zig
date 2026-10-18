@@ -16,7 +16,7 @@
 //! Ordered complete-delivery acceptance postimages. One source head and one
 //! inventory per touched target, not a historical row/body log. This module
 //! never commits transactions or enables source deletion. Metadata acceptance
-//! and native consumption are separate durable decisions.
+//! and data-owner consumption are separate durable decisions.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const jobs = local.storage_db_relational_index_owner_job;
@@ -88,7 +88,7 @@ fn optional(reader: anytype, key: []const u8) !?[]const u8 {
     };
 }
 
-/// A native consumer must derive this statement from its retained consumption
+/// A consumer must derive this statement from its retained consumption
 /// journal, never from a request or a mirror ACK. Signature verification here
 /// is not current ownership: metadata repeats enrollment/cut checks separately.
 pub const Consumed = struct {
@@ -98,23 +98,22 @@ pub const Consumed = struct {
     batch_digest: Digest,
     decision_digest: Digest,
     rows: u64,
-    position: positions.Native,
+    position: positions.Position,
     proof: publication.RootProof,
 
     pub fn fromRecord(record: Source.Consumption, proof: publication.RootProof) !Consumed {
-        // This adapter still attests native consumers only. A Raft journal
-        // record is not proof of enrolled replicated execution.
-        if (record.position != .native) return error.InvalidPrivateIndexClaimReceipt;
         const consumed_prefix = record.prefix();
-        return .{ .metadata_incarnation = consumed_prefix.metadata_incarnation, .binding_digest = consumed_prefix.binding_digest, .ordinal = consumed_prefix.ordinal, .batch_digest = consumed_prefix.batch_digest, .decision_digest = consumed_prefix.decision_digest, .rows = consumed_prefix.rows, .position = consumed_prefix.position.native, .proof = proof };
+        const result: Consumed = .{ .metadata_incarnation = consumed_prefix.metadata_incarnation, .binding_digest = consumed_prefix.binding_digest, .ordinal = consumed_prefix.ordinal, .batch_digest = consumed_prefix.batch_digest, .decision_digest = consumed_prefix.decision_digest, .rows = consumed_prefix.rows, .position = consumed_prefix.position, .proof = proof };
+        _ = try result.digest();
+        return result;
     }
 
     pub fn digest(self: Consumed) !Digest {
-        if (self.ordinal == 0 or self.proof.authority != .native or
+        if (self.ordinal == 0 or (self.proof.authority == .native) != (self.position == .native) or
             !nonzero(&self.metadata_incarnation) or !nonzero(&self.binding_digest) or
             !nonzero(&self.batch_digest) or !nonzero(&self.decision_digest) or
             !equal(self.metadata_incarnation, self.proof.identity.metadata_incarnation)) return error.InvalidPrivateIndexClaimReceipt;
-        return (Source.ConsumedPrefix{ .metadata_incarnation = self.metadata_incarnation, .binding_digest = self.binding_digest, .ordinal = self.ordinal, .batch_digest = self.batch_digest, .decision_digest = self.decision_digest, .rows = self.rows, .position = .{ .native = self.position } }).digest();
+        return (Source.ConsumedPrefix{ .metadata_incarnation = self.metadata_incarnation, .binding_digest = self.binding_digest, .ordinal = self.ordinal, .batch_digest = self.batch_digest, .decision_digest = self.decision_digest, .rows = self.rows, .position = self.position }).digest();
     }
     pub fn verify(self: Consumed) !void {
         self.proof.verify(try self.digest()) catch return error.InvalidPrivateIndexClaimReceipt;
@@ -124,9 +123,24 @@ pub const Consumed = struct {
         if (head.state != .ready or !equal(self.metadata_incarnation, head.metadata_incarnation) or
             !equal(self.binding_digest, head.binding_digest) or self.ordinal != head.ordinal or self.rows != head.rows or
             !equal(self.batch_digest, head.batch_digest) or !equal(self.decision_digest, head.decision_digest) or
-            self.position.sequence <= head.source_sequence) return error.InvalidPrivateIndexClaimReceipt;
+            orderedValue(self.position) <= head.source_sequence) return error.InvalidPrivateIndexClaimReceipt;
+    }
+    pub fn requireSource(self: Consumed, binding: jobs.Binding, header: Source.Header) !void {
+        if ((binding.authority == .native) != (self.position == .native) or
+            !equal(self.binding_digest, try bindingDigest(binding)) or
+            !self.position.strictlyAfter(try header.orderedPosition())) return error.InvalidPrivateIndexClaimReceipt;
+        self.position.requireNamespace(binding.fence.namespace) catch return error.InvalidPrivateIndexClaimReceipt;
     }
 };
+
+/// The head's ordered scalar is interpreted only with its authority-bound
+/// binding/header. This never constructs a native clock from a Raft index.
+pub fn orderedValue(position: positions.Position) u64 {
+    return switch (position) {
+        .native => |cut| cut.sequence,
+        .raft => |cut| cut.index,
+    };
+}
 
 pub const Head = struct {
     pub const encoded_len = 416;
@@ -246,7 +260,7 @@ pub const SourceRecord = struct {
         const raw = &data.header.bytes;
         if (!equal(head.metadata_incarnation, signed.proof.identity.metadata_incarnation) or !equal(head.binding_digest, try bindingDigest(data.source)) or
             !equal(head.scope_digest, raw[40..72].*) or head.ordinal != std.mem.readInt(u64, raw[104..112], .little) or
-            head.batch_rows != std.mem.readInt(u32, raw[96..100], .little) or head.source_sequence != (try data.header.position()).sequence or
+            head.batch_rows != std.mem.readInt(u32, raw[96..100], .little) or head.source_sequence != orderedValue(try data.header.orderedPosition()) or
             @backingInt(head.state) != raw[184] or !equal(head.batch_digest, data.header.digest()) or !equal(head.logical_digest, try data.logicalDigest()) or
             !equal(head.accepted_root, try signed.proof.commitment(try data.digest()))) return error.InvalidCatalogRecord;
     }
@@ -267,7 +281,7 @@ pub const SourceRecord = struct {
         if (!equal(head.binding_digest, try bindingDigest(binding))) return error.InvalidCatalogRecord;
         const header = try Source.Header.decode(bytes[Head.encoded_len + jobs.Binding.encoded_len ..][0..Source.header_len], binding, head.ordinal);
         if (!equal(head.batch_digest, header.digest()) or !equal(head.scope_digest, header.bytes[40..72].*) or head.batch_rows != std.mem.readInt(u32, header.bytes[96..100], .little) or
-            head.source_sequence != (try header.position()).sequence or @backingInt(head.state) != header.bytes[184]) return error.InvalidCatalogRecord;
+            head.source_sequence != orderedValue(try header.orderedPosition()) or @backingInt(head.state) != header.bytes[184]) return error.InvalidCatalogRecord;
         const len = std.mem.readInt(u32, bytes[prefix_len - 4 ..][0..4], .little);
         if (len > max_completion_bytes or len >= bytes.len - prefix_len) return error.InvalidCatalogRecord;
         var complete: ?Consumed = null;
@@ -277,7 +291,7 @@ pub const SourceRecord = struct {
             complete = parsed.value;
             try complete.?.verify();
             try complete.?.requireHead(head);
-            if (!complete.?.position.namespace.eql(binding.fence.namespace)) return error.InvalidCatalogRecord;
+            complete.?.requireSource(binding, header) catch return error.InvalidCatalogRecord;
             const canonical = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
             defer alloc.free(canonical);
             if (!std.mem.eql(u8, canonical, bytes[prefix_len..][0..len])) return error.InvalidCatalogRecord;
@@ -289,7 +303,7 @@ pub const SourceRecord = struct {
     pub fn completed(alloc: std.mem.Allocator, bytes: []const u8, consumed: Consumed) ![]u8 {
         const prefix_ = try peek(alloc, bytes);
         try consumed.requireHead(prefix_.head);
-        if (!consumed.position.namespace.eql(prefix_.binding.fence.namespace)) return error.InvalidPrivateIndexClaimReceipt;
+        try consumed.requireSource(prefix_.binding, prefix_.header);
         try consumed.verify();
         const json = try std.json.Stringify.valueAlloc(alloc, consumed, .{});
         defer alloc.free(json);
@@ -320,7 +334,7 @@ pub const TargetRecord = struct {
     binding: jobs.Binding,
     inventory: Inventory,
     pub fn encode(self: TargetRecord) ![encoded_len]u8 {
-        if (!equal(try bindingDigest(self.binding), self.inventory.binding_digest) or self.binding.authority != .native or self.binding.phase != .reserved) return error.InvalidCatalogRecord;
+        if (!equal(try bindingDigest(self.binding), self.inventory.binding_digest) or self.binding.phase != .reserved) return error.InvalidCatalogRecord;
         var bytes: [encoded_len]u8 = undefined;
         @memcpy(bytes[0..jobs.Binding.encoded_len], &try self.binding.encode());
         @memcpy(bytes[jobs.Binding.encoded_len..], &try self.inventory.encode());
@@ -375,7 +389,7 @@ pub const CompletionRequest = struct {
     pub fn validate(self: CompletionRequest) !void {
         try self.query.validate();
         try self.consumed.verify();
-        if (self.consumed.position.namespace.table_id != self.query.table_id) return error.InvalidPrivateIndexClaimReceipt;
+        if (self.consumed.position == .native and self.consumed.position.native.namespace.table_id != self.query.table_id) return error.InvalidPrivateIndexClaimReceipt;
     }
 };
 
@@ -423,7 +437,7 @@ pub fn prepareCompletion(alloc: std.mem.Allocator, txn: anytype, group: u64, req
         owner.source_completed != (prefix_.completion != null) or
         (owner.source_completed and head.completed_sources == 0) or (!owner.source_completed and head.completed_sources == head.owner_count)) return error.InvalidCatalogRecord;
     try request.consumed.requireHead(prefix_.head);
-    if (!request.consumed.position.namespace.eql(prefix_.binding.fence.namespace)) return error.InvalidPrivateIndexClaimReceipt;
+    try request.consumed.requireSource(prefix_.binding, prefix_.header);
     var next = head;
     var source_bytes: ?[]u8 = null;
     errdefer if (source_bytes) |bytes| alloc.free(bytes);
@@ -481,13 +495,17 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, group: u64, request: Requ
     const logical_digest = try data.logicalDigest();
     const raw = &data.header.bytes;
     const ordinal = std.mem.readInt(u64, raw[104..112], .little);
-    const sequence = (try data.header.position()).sequence;
+    const sequence = orderedValue(try data.header.orderedPosition());
     var buf: [192]u8 = undefined;
     var source_owner = try progress.OwnerState.decode(try txn.get(try publication.ownerKey(&buf, group, data.source.fence.namespace.table_id, data.source.ordinal)));
     // Decode/hash borrowed native buffers before the next read.
+    var previous_header: ?Source.Header = null;
     const previous = if (try optional(txn, try sourceKey(&buf, group, data.source.fence.namespace.table_id, data.source.ordinal))) |bytes| blk: {
         if (bytes.len <= SourceRecord.prefix_len or bytes.len > SourceRecord.max_bytes or !equal(hash(bytes), source_owner.source_delivery)) return error.InvalidCatalogRecord;
-        break :blk try Head.decode(bytes[0..Head.encoded_len]);
+        const retained = try Head.decode(bytes[0..Head.encoded_len]);
+        previous_header = try Source.Header.decode(bytes[Head.encoded_len + jobs.Binding.encoded_len ..][0..Source.header_len], data.source, retained.ordinal);
+        if (!equal(previous_header.?.digest(), retained.batch_digest)) return error.InvalidCatalogRecord;
+        break :blk retained;
     } else blk: {
         if (nonzero(&source_owner.source_delivery)) return error.InvalidCatalogRecord;
         break :blk null;
@@ -498,13 +516,15 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, group: u64, request: Requ
             if (!equal(head.batch_digest, data.header.digest()) or !equal(head.logical_digest, logical_digest)) return error.GenerationPublicationChanged;
             return .{ .alloc = alloc, .table_id = data.source.fence.namespace.table_id, .ordinal = data.source.ordinal, .head = head, .head_bytes = try head.encode(), .targets = try alloc.alloc(TargetUpdate, 0), .changed = false };
         }
-        if (head.state != .building or head.ordinal == std.math.maxInt(u64) or ordinal != head.ordinal + 1 or sequence <= head.source_sequence or !equal(raw[256..288].*, head.batch_digest)) return error.GenerationPublicationChanged;
+        if (head.state != .building or head.ordinal == std.math.maxInt(u64) or ordinal != head.ordinal + 1 or
+            !(try data.header.orderedPosition()).strictlyAfter(try previous_header.?.orderedPosition()) or !equal(raw[256..288].*, head.batch_digest)) return error.GenerationPublicationChanged;
         const consumed = request.consumed orelse return error.PrivateIndexSourceConsumptionRequired;
         if (!equal(consumed.metadata_incarnation, incarnation) or !equal(consumed.binding_digest, binding_digest) or consumed.ordinal != head.ordinal or
             !equal(consumed.batch_digest, head.batch_digest) or !equal(consumed.decision_digest, head.decision_digest) or consumed.rows != head.rows or
-            consumed.position.sequence <= head.source_sequence or !consumed.position.namespace.eql(data.source.fence.namespace) or
+            orderedValue(consumed.position) <= head.source_sequence or
             !std.meta.eql(consumed.proof.identity, request.signed.proof.identity) or consumed.proof.root_generation != request.signed.proof.root_generation or
             consumed.proof.reporter_incarnation != request.signed.proof.reporter_incarnation or !std.meta.eql(consumed.proof.authority, request.signed.proof.authority)) return error.InvalidPrivateIndexClaimReceipt;
+        try consumed.requireSource(data.source, previous_header.?);
         try authority.verifyConsumption(txn, group, data.source, consumed);
     } else if (ordinal != 1 or nonzero(raw[256..288]) or request.consumed != null) return error.GenerationPublicationChanged;
     const previous_rows = if (previous) |head| head.rows else 0;
@@ -599,7 +619,7 @@ fn requireRetainedBinding(alloc: std.mem.Allocator, reader: anytype, group: u64,
     if (owner.owner.namespace.table_id != head.table_id) return error.InvalidCatalogRecord;
     var dispatch = try publication.readDispatch(alloc, reader, group, owner.owner);
     defer dispatch.deinit();
-    try dispatch.value.requireBinding(head, owner.owner, binding, .native, incarnation);
+    try dispatch.value.requireBinding(head, owner.owner, binding, owner.owner.authority, incarnation);
 }
 
 /// O(1) final-input projection. EOF completion freezes metadata acceptance;
@@ -653,7 +673,8 @@ pub fn frozenTargetForRecovery(alloc: std.mem.Allocator, reader: anytype, group:
         result.provenance = target.inventory.provenance;
     }
     try result.requireBinding(prefix_.binding);
-    return .{ .expected = result, .source_members = complete.rows, .source_position = complete.position };
+    if (complete.position != .native) return error.InvalidCatalogRecord;
+    return .{ .expected = result, .source_members = complete.rows, .source_position = complete.position.native };
 }
 fn requireEnrollment(alloc: std.mem.Allocator, reader: anytype, group: u64, proof: publication.RootProof, incarnation: Digest) !void {
     const enrollment = @import("store_root_enrollment.zig");

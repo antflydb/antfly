@@ -116,8 +116,15 @@ also checks the actual completed Raft prefix at the retained physical root.
 Byte-split partitions for one target retain identical bindings and disjoint
 row masks. Metadata combines their inventory contributions in one target
 update, with one target-batch count and O(parts + destinations) work.
+Metadata acceptance and EOF completion share the same journal for both
+authorities, retaining tagged consumption cuts and checking producer/consumer
+term monotonicity. The receiver independently reads metadata's accepted head
+before proposing consumption through the existing member/term barrier. Exact
+retries recover the original consumption record from the same owner lease.
+The existing source ABI has a consumed-only projection: receipt recovery
+verifies the checkpoint without loading or base64-encoding the next payload.
 This is not complete public activation: the worker's Raft cohort guard,
-metadata source acceptance/consumption and later publication paths
+validation/audit and later publication receiver paths
 remain unfinished, and public CREATE remains guarded. No original case is
 closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's

@@ -4205,7 +4205,7 @@ pub fn storageOwnerRaftIndexSourceJson(owner: ?*anyopaque, request: *const kerne
         }
     };
     if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
-    if (request.identity_json.ptr == null or request.identity_json.len == 0 or request.identity_json.len > native.Identity.max_json_bytes or
+    if (request.consumed_only > 1 or !std.mem.allEqual(u8, &request._reserved, 0) or request.identity_json.ptr == null or request.identity_json.len == 0 or request.identity_json.len > native.Identity.max_json_bytes or
         request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
         request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
@@ -4219,7 +4219,7 @@ pub fn storageOwnerRaftIndexSourceJson(owner: ?*anyopaque, request: *const kerne
     var parsed = std.json.parseFromSlice(native.Identity, alloc, request.identity_json.slice(), .{ .ignore_unknown_fields = false }) catch |err|
         return Failure.result(if (err == error.OutOfMemory) err else error.InvalidArgument, out_failure);
     defer parsed.deinit();
-    var result = handle.db.readRaftIndexClaimSource(alloc, handle.storage_owner_group_id, parsed.value, context) catch |err| {
+    var result = handle.db.readRaftIndexSourceProjected(alloc, handle.storage_owner_group_id, parsed.value, context, request.consumed_only != 0) catch |err| {
         if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
         return Failure.result(err, out_failure);
     };

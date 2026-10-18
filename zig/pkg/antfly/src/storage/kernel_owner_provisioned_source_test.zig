@@ -724,7 +724,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(root_generation, consumed.root_generation);
         // The resumed producer performed the first physical consumption.
         try std.testing.expect(consumed.outcome.value.duplicate and !consumed.outcome.value.replication_pending);
-        try std.testing.expectEqual(producer_result.advanced.consumed.position, consumed.outcome.value.position);
+        try std.testing.expectEqualDeep(producer_result.advanced.consumed.position, @import("antfly_local_sources").storage_db_receipt_position.Position{ .native = consumed.outcome.value.position });
         try std.testing.expect(consumed.outcome.value.position.sequence > accepted.source_sequence);
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, consumed_result.response().requireSignedConsumption(consume_request));
         consumed_result.consumed.outcome.value.replication_pending = true;

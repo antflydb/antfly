@@ -173,7 +173,7 @@ fn splitDelivery(authority: progress.Authority) !void {
     var complete = try source_delivery.prepare(alloc, &read, &subset, closure, .{});
     defer complete.deinit();
     _ = try complete.data.digest();
-    if (authority == .native) {
+    {
         // Qualify bounded inventory aggregation, not live owner enrollment;
         // the metadata-store integration tests verify that independently.
         const journal = @import("../metadata/relational_index_delivery_journal.zig");
@@ -196,7 +196,10 @@ fn splitDelivery(authority: progress.Authority) !void {
                 return error.InvalidPrivateIndexClaimReceipt;
             }
         };
-        var state: progress.OwnerState = .{ .owner = owner, .flags = 3, .position = .{ .native = .{ .namespace = owner.namespace, .sequence = 3 } } };
+        var state: progress.OwnerState = .{ .owner = owner, .flags = 3, .position = switch (authority) {
+            .native => .{ .native = .{ .namespace = owner.namespace, .sequence = 3 } },
+            .raft => .{ .raft = .{ .term = 2, .index = 3 } },
+        } };
         state.receipts[0] = @splat(1);
         state.receipts[1] = @splat(2);
         var key_buf: [192]u8 = undefined;
@@ -214,6 +217,25 @@ fn splitDelivery(authority: progress.Authority) !void {
             byte.* ^= contribution;
         };
         try std.testing.expectEqual(expected, inventory.inventory_xor);
+        var retained = try journal.SourceRecord.decode(alloc, accepted.source_bytes.?);
+        defer retained.deinit();
+        const record: Source.Consumption = .{ .accepted = accepted.head.accepted(), .header = view.header, .position = switch (authority) {
+            .native => .{ .native = .{ .namespace = owner.namespace, .sequence = 10 } },
+            .raft => .{ .raft = .{ .term = 3, .index = 10 } },
+        }, .previous_digest = @splat(0) };
+        try record.requireFor(binding);
+        const consumed = try journal.Consumed.fromRecord(record, try signed.proof.sign(root, try record.prefix().digest()));
+        try consumed.verify();
+        const completed = try journal.SourceRecord.completed(alloc, accepted.source_bytes.?, consumed);
+        defer alloc.free(completed);
+        const prefix_ = try journal.SourceRecord.peek(alloc, completed);
+        try std.testing.expectEqualDeep(record.position, prefix_.completion.?.position);
+        var wrong_cut = consumed;
+        wrong_cut.position = if (authority == .raft) .{ .raft = .{ .term = 1, .index = 10 } } else .{ .native = .{ .namespace = owner.namespace, .sequence = 4 } };
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, wrong_cut.requireSource(binding, view.header));
+        wrong_cut = consumed;
+        wrong_cut.position = if (authority == .raft) .{ .native = .{ .namespace = owner.namespace, .sequence = 10 } } else .{ .raft = .{ .term = 3, .index = 10 } };
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, wrong_cut.digest());
     }
     var incomplete = closure;
     incomplete.targets.items = delivered[0..1];
@@ -347,7 +369,7 @@ test "relational index publication maximum typed delivery footprint fits its tra
     const signed = widestJson(complete.Signed, .{ .data = .{ .source = binding, .header = .{ .bytes = @splat(0) }, .routes_digest = @splat(1), .parts = .{ .items = &parts } }, .proof = proof });
     const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, signed, .{});
     defer std.testing.allocator.free(bytes);
-    const command: journal.Request = .{ .signed = signed, .consumed = widestJson(journal.Consumed, .{ .metadata_incarnation = @splat(1), .binding_digest = @splat(1), .ordinal = 1, .batch_digest = @splat(1), .decision_digest = @splat(1), .rows = 1, .position = .{ .namespace = binding.fence.namespace, .sequence = 1 }, .proof = proof }) };
+    const command: journal.Request = .{ .signed = signed, .consumed = widestJson(journal.Consumed, .{ .metadata_incarnation = @splat(1), .binding_digest = @splat(1), .ordinal = 1, .batch_digest = @splat(1), .decision_digest = @splat(1), .rows = 1, .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 1 } }, .proof = proof }) };
     const command_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, command, .{});
     defer std.testing.allocator.free(command_bytes);
     std.debug.print("typed delivery upper bound: {d} bytes; acceptance {d} bytes\n", .{ bytes.len, command_bytes.len });

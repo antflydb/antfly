@@ -3751,9 +3751,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
 
         pub fn claimSource(self: *@This(), alloc: std.mem.Allocator) !std.json.Parsed(native_index_control.SourceWire) {
-            const normalized = try platformDeadlineContext(self.context);
+            return self.sourceProjected(alloc, false, false);
+        }
+
+        pub fn sourceProjected(self: *@This(), alloc: std.mem.Allocator, consumed_only: bool, recover_committed: bool) !std.json.Parsed(native_index_control.SourceWire) {
+            const normalized = if (recover_committed) request_operation.RequestContext{} else try platformDeadlineContext(self.context);
             var cancellation = normalized.cancellation;
-            return self.lease.owner().raftIndexClaimSource(alloc, self.table_name, self.identity, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+            return self.lease.owner().raftIndexSourceProjected(alloc, self.table_name, self.identity, consumed_only, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
         }
 
         pub fn build(self: *@This(), alloc: std.mem.Allocator, request: raft_index_control.BuildRequest, prepare_page: bool) !std.json.Parsed(raft_index_control.BuildPreparation) {

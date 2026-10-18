@@ -120,11 +120,13 @@ pub const Producer = struct {
         defer response.deinit();
         try response.value.validate(request);
         if (response.value == .acknowledged) return null;
-        if (response.value != .consumed) return error.InvalidPrivateIndexClaimReceipt;
-        const value = response.value.consumed;
-        if (value.outcome.replication_pending or value.outcome.error_name != null or value.proof == null) return null;
+        switch (response.value) {
+            .consumed => |value| if (value.outcome.replication_pending or value.outcome.error_name != null or value.proof == null) return null,
+            .raft_consumed => |value| if (value.proof == null) return null,
+            else => return error.InvalidPrivateIndexClaimReceipt,
+        }
         const consumed = try response.value.requireSignedConsumption(request);
-        if (consumed.ordinal != head.ordinal or consumed.rows != head.rows or consumed.position.sequence <= head.source_sequence or
+        if (consumed.ordinal != head.ordinal or consumed.rows != head.rows or journal.orderedValue(consumed.position) <= head.source_sequence or
             !std.mem.eql(u8, &consumed.metadata_incarnation, &head.metadata_incarnation) or !std.mem.eql(u8, &consumed.binding_digest, &head.binding_digest) or
             !std.mem.eql(u8, &consumed.batch_digest, &head.batch_digest) or !std.mem.eql(u8, &consumed.decision_digest, &head.decision_digest)) return error.InvalidPrivateIndexClaimReceipt;
         return consumed;

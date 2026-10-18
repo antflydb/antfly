@@ -1602,6 +1602,7 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
             const status = server_api.storageOwnerRaftIndexSourceJson(owner, &input, &response, &failure);
             defer freeRawBuffer(response.ptr, response.len);
             try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            if (input.consumed_only != 0) try std.testing.expect(response.len < 32 * 1024);
             try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
             var parsed = try std.json.parseFromSlice(local.storage_db_relational_index_owner_control.SourceWire, std.testing.allocator, response.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
             errdefer parsed.deinit();
@@ -1621,6 +1622,9 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
     };
     const source_input: kernel_owner_abi.RaftIndexOwnerSourceRequest = .{ .table_name = .fromSlice("items"), .identity_json = .fromSlice(encoded) };
     var bad_source = source_input;
+    bad_source.consumed_only = 2;
+    try SourceRead.reject(bad_source, "InvalidArgument");
+    bad_source = source_input;
     bad_source.identity_json = .{ .ptr = @ptrFromInt(1), .len = contract.Identity.max_json_bytes + 1 };
     try SourceRead.reject(bad_source, "InvalidArgument");
     bad_source = source_input;
@@ -1670,6 +1674,29 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
     const retained_delivery = (try Claims.call(id, claim_input, claim_command)).?;
     try std.testing.expectEqualDeep(delivered, retained_delivery);
     try std.testing.expectEqual(@as(u64, 7), (try handle.db.orderedApplyReceipt()).?.index);
+    // Synthetic accepted metadata qualifies actual consumption/recovery, not
+    // the receiver's separate live metadata authorization.
+    const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
+    const eof = decoded_source.batch.?.header;
+    var accepted: Source.Accepted = .{ .metadata_incarnation = @splat('1'), .binding_digest = local.storage_db_relational_integrity_contract.hash(&try recovered.binding.?.encode()), .scope_digest = eof.bytes[40..72].*, .ordinal = 1, .rows = 0, .batch_rows = 0, .source_sequence = 5, .batch_digest = eof.digest(), .logical_digest = @splat(1), .previous_decision = @splat(0), .decision_digest = @splat(0), .state = .ready };
+    accepted.decision_digest = accepted.computedDigest();
+    var consumption = try handle.db.prepareNativeIndexSourceConsumption(.{ .binding = recovered.binding.?, .accepted = accepted });
+    defer consumption.deinit();
+    try handle.db.applyCommittedRaftIndexConsumption(&consumption, 11, .{ .term = 4, .index = 8 });
+    var projected_input = source_input;
+    projected_input.consumed_only = 1;
+    var consumed = try SourceRead.call(id, projected_input, identity);
+    defer consumed.deinit();
+    try std.testing.expect(consumed.value.header == null and consumed.value.payload_b64 == null);
+    const retained_consumption = consumed.value.consumed.?;
+    try std.testing.expectEqual(@as(u64, 8), retained_consumption.position.raft.index);
+    try handle.db.applyCommittedRaftIndexConsumption(&consumption, 11, .{ .term = 5, .index = 9 });
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    var consumed_retry = try SourceRead.call(id, projected_input, identity);
+    defer consumed_retry.deinit();
+    try std.testing.expectEqualDeep(retained_consumption, consumed_retry.value.consumed.?);
+    try std.testing.expectEqual(@as(u64, 9), (try handle.db.orderedApplyReceipt()).?.index);
 }
 
 test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {

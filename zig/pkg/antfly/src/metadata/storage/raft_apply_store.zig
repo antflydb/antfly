@@ -4416,6 +4416,77 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         }
     }
 
+    fn testRaftSourceAcceptance(store: *RaftApplyStore, group: u64, head: index_progress.Head, owner: index_progress.OwnerState, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, proof: index_publication.RootProof) !void {
+        const local = @import("antfly_local_sources");
+        const control = local.storage_db_relational_index_owner_control;
+        const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
+        const complete = @import("../relational_index_source_delivery.zig");
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var dispatch = try index_publication.readDispatch(store.alloc, &txn, group, owner.owner);
+        defer dispatch.deinit();
+        var inputs = try index_publication.readInputs(store.alloc, &txn, group, head);
+        defer inputs.deinit();
+        const decision: index_publication.OwnerDecision = .{ .metadata_group_id = group, .metadata_incarnation = proof.identity.metadata_incarnation, .head = head, .owner = owner, .disposition = .execute, .dispatch = dispatch.value, .inputs = inputs.value };
+        const intent = try decision.raftAdmission();
+        const binding: local.storage_db_relational_index_owner_job.Binding = .{ .id = intent.id, .plan_digest = intent.plan_digest, .owner_digest = intent.owner_digest, .ordinal = intent.ordinal, .authority = .raft, .phase = .reserved, .fence = intent.fence, .integrity_before = intent.fence.catalog_digest, .integrity_reserved = intent.reservation_digest, .integrity_candidate = intent.candidate_digest, .schema_before = dispatch.value.native_schema_digest, .physical_before = null, .physical_reserved = .{ .revision = 2, .schema_version = 1, .blob_digest = @splat(4) }, .physical_candidate = .{ .revision = 2, .schema_version = 2, .blob_digest = @splat(5) }, .index = .{ .generation = 2, .slot = 0 }, .inputs_digest = dispatch.value.native_inputs_digest };
+        var state: index_progress.Update = .{ .head = head, .owner = owner, .changed = false };
+        var buf: [192]u8 = undefined;
+        for ([_]index_progress.Action{ .fenced, .reserved }, 0..) |action, i| {
+            const receipt: index_progress.Receipt = .{ .owner = owner.owner, .action = action, .position = .{ .raft = .{ .term = 2, .index = 5 + i } }, .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest, .evidence_digest = @splat(8) };
+            state = try index_progress.acknowledge(state.head, state.owner, state.head.revision, receipt);
+            const signed: index_publication.SignedReceipt = .{ .receipt = receipt, .proof = try proof.sign(root, try receipt.digest()) };
+            state.owner.attestations[@backingInt(action)] = try signed.commitment();
+            try txn.put(try index_publication.proofKey(&buf, group, head.table_id, owner.owner.ordinal, action), &try signed.encode());
+        }
+        try txn.put(try index_publication.headKey(&buf, group, head.table_id), &try state.head.encode());
+        try txn.put(try index_publication.ownerKey(&buf, group, head.table_id, owner.owner.ordinal), &try state.owner.encode());
+        // Synthetic owner rows qualify metadata acceptance, not physical build
+        // correctness; compiled-owner tests independently exercise that path.
+        var page = try Source.PreparedSource.init(store.alloc, binding, .{ .table_name = dispatch.value.table_name, .generation = @splat(1), .schema_version = 2, .tuple_fingerprint = @splat(2), .nulls_not_distinct = false }, @splat(9), .ready, &.{.{ .key = "row", .tuple = "raft-tuple" }});
+        defer page.deinit();
+        std.mem.writeInt(u64, page.header[104..112], 1, .little);
+        @memcpy(page.header[112..145], &try (local.storage_db_receipt_position.Position{ .raft = .{ .term = 2, .index = 7 } }).encode());
+        std.crypto.hash.Blake3.hash(page.header[0..288], page.header[288..320], .{});
+        var read: control.SourceRead = .{ .binding = binding, .batch = try Source.OwnedBatch.takePayload(store.alloc, binding, .{ .bytes = page.header }, try store.alloc.dupe(u8, page.payload)) };
+        defer read.deinit();
+        var subset = try local.storage_db_relational_index_owner_job.private_claims.delivery.Subset.init(store.alloc, owner.owner, head.owner_count, &.{.{ .owner = owner.owner }});
+        defer subset.deinit();
+        const command: control.ClaimCommand = .{ .binding = binding, .claims = &.{.{ .tuple = "raft-tuple", .parent_table = dispatch.value.table_name, .parent_key = "row", .schema_version = 2 }} };
+        const delivered: control.DeliveredClaims = .{ .binding = binding, .claims_digest = try command.digest(), .position = .{ .raft = .{ .term = 2, .index = 8 } }, .duplicate = true };
+        var closed = try complete.prepare(store.alloc, &read, &subset, .{ .ordinal = 1, .batch_digest = read.batch.?.header.digest(), .targets = .{ .items = &.{.{ .index = 0, .signed = .{ .outcome = delivered, .proof = try proof.sign(root, try delivered.deliveryDigest()) } }} } }, .{});
+        defer closed.deinit();
+        const signed: complete.Signed = .{ .data = closed.data, .proof = try proof.sign(root, try closed.data.digest()) };
+        const initial = try store.buildMetadataSnapshotTxn(store.alloc, &txn, group, null);
+        defer store.alloc.free(initial);
+        try testDurableSourceAcceptance(store.alloc, group, initial, .{ .signed = signed });
+        var accepted = try store.prepareRelationalIndexSourceAcceptanceTxn(&txn, group, .{ .signed = signed });
+        defer accepted.deinit();
+        try accepted.stage(&txn, group);
+        const record: Source.Consumption = .{ .accepted = accepted.head.accepted(), .header = read.batch.?.header, .position = .{ .raft = .{ .term = 2, .index = 9 } }, .previous_digest = @splat(0) };
+        var consumed = try index_delivery.Consumed.fromRecord(record, try proof.sign(root, try record.prefix().digest()));
+        const query = index_delivery.Query.from(.{ .signed = signed });
+        var bad = consumed;
+        bad.position.raft.term = 1;
+        bad.proof = try proof.sign(root, try bad.digest());
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, index_delivery.prepareCompletion(store.alloc, &txn, group, .{ .query = query, .consumed = bad }, RaftApplyStore.SourceDeliveryAuthority{ .store = store }));
+        bad = consumed;
+        bad.position.raft.index = 11;
+        bad.proof = try proof.sign(root, try bad.digest());
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, index_delivery.prepareCompletion(store.alloc, &txn, group, .{ .query = query, .consumed = bad }, RaftApplyStore.SourceDeliveryAuthority{ .store = store }));
+        consumed.proof.signature[0] ^= 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, index_delivery.prepareCompletion(store.alloc, &txn, group, .{ .query = query, .consumed = consumed }, RaftApplyStore.SourceDeliveryAuthority{ .store = store }));
+        consumed.proof.signature[0] ^= 1;
+        var completed = try index_delivery.prepareCompletion(store.alloc, &txn, group, .{ .query = query, .consumed = consumed }, RaftApplyStore.SourceDeliveryAuthority{ .store = store });
+        defer completed.deinit();
+        try completed.stage(&txn, group);
+        const finished = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, head.table_id)));
+        try std.testing.expectEqual(@as(u16, 1), finished.completed_sources);
+        try std.testing.expect(finished.completion_revision != 0);
+        const snapshot = try store.buildMetadataSnapshotTxn(store.alloc, &txn, group, null);
+        defer store.alloc.free(snapshot);
+    }
+
     fn testNativeAcceptance(store: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, signed: @import("../relational_index_source_delivery.zig").Signed, read: *const @import("antfly_local_sources").storage_db_relational_index_owner_control.SourceRead, subset: *@import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.delivery.Subset, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, proof: index_publication.RootProof) !void {
         const journal = @import("../relational_index_delivery_journal.zig");
         const complete = @import("../relational_index_source_delivery.zig");
@@ -4528,7 +4599,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             .batch_digest = first.head.batch_digest,
             .decision_digest = first.head.decision_digest,
             .rows = first.head.rows,
-            .position = .{ .namespace = binding.fence.namespace, .sequence = 9 },
+            .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 9 } },
             .proof = proof,
         };
         consumed.proof = try proof.sign(root, try consumed.digest());
@@ -4545,7 +4616,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         forged.proof.signature[0] ^= 1;
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed, .consumed = forged }));
         forged = consumed;
-        forged.position.sequence = 11;
+        forged.position.native.sequence = 11;
         forged.proof = try proof.sign(root, try forged.digest());
         try std.testing.expectError(error.IndexOwnerReceiptChanged, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed, .consumed = forged }));
         var second = try store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed, .consumed = consumed });
@@ -4575,7 +4646,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         eof.batch_digest = second.head.batch_digest;
         eof.decision_digest = second.head.decision_digest;
         eof.rows = second.head.rows;
-        eof.position.sequence = 10;
+        eof.position.native.sequence = 10;
         eof.proof = try proof.sign(root, try eof.digest());
         const completion: index_delivery.CompletionRequest = .{ .query = index_delivery.Query.from(.{ .signed = next_signed }), .consumed = eof };
         try testDurableSourceCompletion(store.alloc, group, initial_snapshot, .{ .signed = signed }, .{ .signed = next_signed, .consumed = consumed }, completion, root);
@@ -4664,8 +4735,8 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     0 => bad.consumed.proof.signature[0] ^= 1,
                     1 => bad.consumed.rows += 1,
                     2 => bad.query.id[0] ^= 1,
-                    3 => bad.consumed.position.sequence = (try second.signed.data.header.position()).sequence,
-                    4 => bad.consumed.position.sequence = 11,
+                    3 => bad.consumed.position.native.sequence = (try second.signed.data.header.position()).sequence,
+                    4 => bad.consumed.position.native.sequence = 11,
                     else => unreachable,
                 }
                 if (fault != 0) bad.consumed.proof = try bad.consumed.proof.sign(.{ .seed = @splat(9), .public_key = request.consumed.proof.identity.public_key, .root_incarnation = request.consumed.proof.identity.root_incarnation }, try bad.consumed.digest());
@@ -4721,7 +4792,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = path });
         var reopened_active = true;
         defer if (reopened_active) reopened.deinit();
-        const canonical_sequence = request.consumed.position.sequence + 1;
+        const canonical_sequence = request.consumed.position.native.sequence + 1;
         {
             var update = try reopened.store.beginWriteTxn();
             errdefer update.abort();
@@ -4797,7 +4868,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                             changed.audit.source_members.? += 1;
                             changed.audit.generation.?.counts = @splat(changed.audit.source_members.?);
                         },
-                        2 => changed.audit.canonical_position.?.sequence = request.consumed.position.sequence,
+                        2 => changed.audit.canonical_position.?.sequence = request.consumed.position.native.sequence,
                         else => unreachable,
                     }
                     const changed_digest = try changed.readyDigest();
@@ -6086,6 +6157,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 try std.testing.expectEqual(before_enrollment.projection_revision, after_enrollment.projection_revision);
                 try store.validateRelationalIndexOwnerAck(group, bytes);
                 if (authority == .native) try testNativeClaimDelivery(&store, group, prepared.head, prepared.owners[0], current, root, ack.signed.proof);
+                if (authority == .raft) try testRaftSourceAcceptance(&store, group, prepared.head, prepared.owners[0], root, ack.signed.proof);
                 {
                     const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
                     defer a.free(reply);
@@ -18773,7 +18845,7 @@ pub const RaftApplyStore = struct {
         pub fn verifyConsumption(self: @This(), txn: *docstore.DocStore.Txn, group: u64, binding: @import("antfly_local_sources").storage_db_relational_index_owner_job.Binding, consumed: @import("../relational_index_delivery_journal.zig").Consumed) !void {
             try consumed.verify();
             const current = try self.store.currentIndexBuildOwnerTxn(txn, group, binding, null);
-            try self.store.requireIndexOwnerRootProofTxn(txn, group, current.owner, .{ .native = consumed.position }, consumed.proof, current.head.reader_requirements, false);
+            try self.store.requireIndexOwnerRootProofTxn(txn, group, current.owner, consumed.position, consumed.proof, current.head.reader_requirements, false);
         }
     };
 

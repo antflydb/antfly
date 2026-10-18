@@ -1260,6 +1260,29 @@ pub const OwnerDecision = struct {
         if (!std.mem.eql(u8, dispatch.table_name, table_name)) return error.GenerationPublicationChanged;
     }
 
+    /// The receiver supplies only a decision it independently read from the
+    /// metadata journal. This process-local permission is never forwarded.
+    pub fn requireRaftConsumptionProposal(self: OwnerDecision, table_name: []const u8, request: OwnerRequest, command: native_control.ConsumeCommand, accepted: local.storage_db_relational_index_owner_job.private_claims.SourceStream.Accepted) !void {
+        _ = try self.raftBuild(request, command.binding, .{});
+        try command.validate();
+        try accepted.validate();
+        if (!std.mem.eql(u8, &try command.accepted.encode(), &try accepted.encode()) or
+            !std.mem.eql(u8, &accepted.metadata_incarnation, &self.metadata_incarnation) or
+            std.mem.allEqual(u8, &self.owner.source_delivery, 0)) return error.InvalidPrivateIndexClaimReceipt;
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, dispatch.table_name, table_name)) return error.GenerationPublicationChanged;
+    }
+
+    pub fn signRaftConsumption(self: OwnerDecision, request: OwnerRequest, binding: local.storage_db_relational_index_owner_job.Binding, record: local.storage_db_relational_index_owner_job.private_claims.SourceStream.Consumption, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !RootProof {
+        _ = try self.raftBuild(request, binding, .{});
+        try record.requireFor(binding);
+        if (!std.mem.eql(u8, &record.accepted.metadata_incarnation, &self.metadata_incarnation)) return error.InvalidPrivateIndexClaimReceipt;
+        const view = try self.raftSigningView(request);
+        try view.requireLocal(actual);
+        if (record.position != .raft or record.position.raft.term > actual.leader_term or record.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        return (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try record.prefix().digest());
+    }
+
     pub fn signRaftClaims(self: OwnerDecision, request: OwnerRequest, command: native_control.ClaimCommand, outcome: native_control.DeliveredClaims, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !RootProof {
         _ = try self.raftClaims(request, command.binding, command.claims);
         try outcome.validateFor(command);
@@ -2937,6 +2960,25 @@ test "relational index publication Raft decisions bind immutable admission and e
     try (source_delivery.Signed{ .data = closed.data, .proof = closure_proof }).verify();
     source_scope.completed_index = 3;
     try std.testing.expectError(error.IndexOwnerReceiptChanged, source_permission.signRaftClosure(build_lookup, closed.data, source_scope, root));
+    const journal = @import("relational_index_delivery_journal.zig");
+    var accepted: Source.Accepted = .{ .metadata_incarnation = source_permission.metadata_incarnation, .binding_digest = try journal.bindingDigest(reserved), .scope_digest = wire.header.?.bytes[40..72].*, .ordinal = 1, .rows = 0, .batch_rows = 0, .source_sequence = 4, .batch_digest = wire.header.?.digest(), .logical_digest = try closed.data.logicalDigest(), .previous_decision = @splat(0), .decision_digest = @splat(0), .state = .ready };
+    accepted.decision_digest = accepted.computedDigest();
+    source_permission.owner.source_delivery = @splat(1);
+    const consume_command: native_control.ConsumeCommand = .{ .binding = reserved, .accepted = accepted };
+    try source_permission.requireRaftConsumptionProposal(dispatch.value.table_name, build_lookup, consume_command, accepted);
+    var different_accepted = accepted;
+    different_accepted.logical_digest[0] ^= 1;
+    different_accepted.decision_digest = different_accepted.computedDigest();
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, source_permission.requireRaftConsumptionProposal(dispatch.value.table_name, build_lookup, consume_command, different_accepted));
+    const consumed: Source.Consumption = .{ .accepted = accepted, .header = wire.header.?, .position = .{ .raft = .{ .term = 7, .index = 5 } }, .previous_digest = @splat(0) };
+    source_scope.completed_index = 5;
+    const consumed_proof = try source_permission.signRaftConsumption(build_lookup, reserved, consumed, source_scope, root);
+    const consume_request: execution.ClaimRequest = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .consume = .{ .ordinal = 1, .batch_digest = accepted.batch_digest } };
+    const consume_response: execution.ClaimResponse = .{ .raft_consumed = .{ .root_generation = source_scope.root_generation, .binding = reserved, .record = consumed, .proof = consumed_proof } };
+    try consume_response.validate(consume_request);
+    try (try consume_response.requireSignedConsumption(consume_request)).verify();
+    source_scope.completed_index = 4;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, source_permission.signRaftConsumption(build_lookup, reserved, consumed, source_scope, root));
     decision.disposition = .acknowledged;
     try std.testing.expectError(error.InvalidGenerationPublication, decision.raftControl(reserve_request, reserved));
     try dispatch.value.requireBinding(decision.head, decision.owner.owner, reserved, .raft, decision.metadata_incarnation);

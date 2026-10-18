@@ -701,6 +701,10 @@ pub const Owner = struct {
     }
 
     pub fn raftIndexClaimSource(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").storage_db_relational_index_owner_control.Identity, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire) {
+        return self.raftIndexSourceProjected(alloc, table_name, identity, false, options);
+    }
+
+    pub fn raftIndexSourceProjected(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").storage_db_relational_index_owner_control.Identity, consumed_only: bool, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire) {
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
         try identity.validate();
         const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
@@ -709,13 +713,14 @@ pub const Owner = struct {
         var response: Response = .{};
         defer response.deinit();
         var failure: abi.FailureIdentity = .{};
-        const status = abi.antfly_storage_owner_raft_index_source_json(self.handle, &.{ .table_name = .fromSlice(table_name), .identity_json = .fromSlice(encoded), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        const status = abi.antfly_storage_owner_raft_index_source_json(self.handle, &.{ .consumed_only = @intFromBool(consumed_only), .table_name = .fromSlice(table_name), .identity_json = .fromSlice(encoded), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
         if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerSourceRequest.operation)) return error.InvalidBoundaryFailureIdentity;
         try acceptStorageOwnerFailure(status, failure, "Raft index claim source");
-        if (response.bytes().len == 0 or response.bytes().len > native.SourceWire.max_wire_bytes) return error.InvalidPrivateIndexClaimInventory;
+        if (response.bytes().len == 0 or response.bytes().len > (if (consumed_only) @as(usize, 32 * 1024) else native.SourceWire.max_wire_bytes)) return error.InvalidPrivateIndexClaimInventory;
         var parsed = try std.json.parseFromSlice(native.SourceWire, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
         errdefer parsed.deinit();
         try parsed.value.requireRaftIdentity(identity);
+        if (consumed_only and (parsed.value.header != null or parsed.value.payload_b64 != null)) return error.InvalidPrivateIndexClaimInventory;
         return parsed;
     }
 

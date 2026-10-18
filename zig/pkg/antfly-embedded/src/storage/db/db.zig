@@ -8670,13 +8670,18 @@ pub const DB = struct {
     /// read from one actual Raft-owner snapshot. No native clock or mirror
     /// status can stand in for its committed-entry provenance.
     pub fn readRaftIndexClaimSource(self: *DB, alloc: Allocator, owner_group: u64, identity: NativeIndexOwnerIdentity, context: @import("../../api/operation.zig").RequestContext) !native_index_control.SourceRead {
+        return self.readRaftIndexSourceProjected(alloc, owner_group, identity, context, false);
+    }
+
+    pub fn readRaftIndexSourceProjected(self: *DB, alloc: Allocator, owner_group: u64, identity: NativeIndexOwnerIdentity, context: @import("../../api/operation.zig").RequestContext, consumed_only: bool) !native_index_control.SourceRead {
         try context.ensureActive();
         try self.requireRaftIndexOwnerIdentity(owner_group, identity);
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
         const binding = (try RaftIndexOwnerControl.inspect(&read, identity)) orelse return error.PrivateIndexRootRecoveryRequired;
         try @import("relational_index_owner_job.zig").requireReserved(&read, binding);
-        var result: native_index_control.SourceRead = .{ .binding = binding, .batch = try PreparedNativeIndexOwnerBuild.peekClaimSource(alloc, &read, binding) };
+        if (consumed_only) try PreparedNativeIndexOwnerBuild.verifyRecovery(&read, binding);
+        var result: native_index_control.SourceRead = .{ .binding = binding, .batch = if (consumed_only) null else try PreparedNativeIndexOwnerBuild.peekClaimSource(alloc, &read, binding) };
         errdefer result.deinit();
         const Source = @import("relational_index_private_claims.zig").SourceStream;
         if (try Source.load(&read, binding)) |head| result.consumed = try Source.loadConsumption(&read, binding, head);

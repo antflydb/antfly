@@ -843,9 +843,18 @@ pub const RaftClaimResponse = struct {
     signing_failure: ?SigningFailure = null,
 };
 
+pub const RaftConsumptionResponse = struct {
+    root_generation: u64,
+    binding: jobs.Binding,
+    record: jobs.private_claims.SourceStream.Consumption,
+    proof: ?publication.RootProof = null,
+    signing_failure: ?SigningFailure = null,
+};
+
 pub const ClaimResponse = union(enum) {
     acknowledged,
     raft_applied: RaftClaimResponse,
+    raft_consumed: RaftConsumptionResponse,
     consumed: struct { root_generation: u64, outcome: native.ConsumeOutcome, proof: ?publication.RootProof = null, signing_failure: ?SigningFailure = null },
     closed: struct { data: source_delivery.Data, root_generation: u64, proof: ?publication.RootProof = null, signing_failure: ?SigningFailure = null },
     applied: struct {
@@ -871,6 +880,12 @@ pub const ClaimResponse = union(enum) {
 
     pub fn requireSignedConsumption(self: ClaimResponse, request: ClaimRequest) !delivery_journal.Consumed {
         try self.validate(request);
+        if (self == .raft_consumed) {
+            const value = self.raft_consumed;
+            const result = try delivery_journal.Consumed.fromRecord(value.record, value.proof orelse return error.InvalidPrivateIndexClaimReceipt);
+            try result.verify();
+            return result;
+        }
         if (self != .consumed) return error.InvalidPrivateIndexClaimReceipt;
         const value = self.consumed;
         if (value.outcome.replication_pending or value.outcome.error_name != null) return error.InvalidPrivateIndexClaimReceipt;
@@ -883,6 +898,18 @@ pub const ClaimResponse = union(enum) {
         try request.validate(request.group_id);
         switch (self) {
             .acknowledged => {},
+            .raft_consumed => |value| {
+                const wanted = request.consume orelse return error.InvalidPrivateIndexClaimReceipt;
+                try value.record.requireFor(value.binding);
+                if (value.root_generation == 0 or value.binding.authority != .raft or value.record.position != .raft or
+                    value.binding.fence.owner_group_id != request.group_id or value.binding.fence.namespace.table_id != request.table_id or
+                    !std.mem.eql(u8, &value.binding.id, &request.id) or value.record.accepted.ordinal != wanted.ordinal or
+                    !std.mem.eql(u8, &value.record.accepted.batch_digest, &wanted.batch_digest)) return error.InvalidPrivateIndexClaimReceipt;
+                if (value.proof) |proof| {
+                    if (value.signing_failure != null or proof.authority != .raft or proof.root_generation != value.root_generation) return error.InvalidPrivateIndexClaimReceipt;
+                    try (try delivery_journal.Consumed.fromRecord(value.record, proof)).verify();
+                }
+            },
             .raft_applied => |value| {
                 const b = value.outcome.binding;
                 if (request.closure != null or request.consume != null or value.root_generation == 0 or b.authority != .raft or
@@ -956,6 +983,7 @@ pub const ClaimPort = struct {
 pub const ClaimResult = union(enum) {
     acknowledged,
     raft_applied: RaftClaimResponse,
+    raft_consumed: RaftConsumptionResponse,
     raft_closed: struct { root_generation: u64, owned: source_delivery.Owned, proof: ?publication.RootProof = null, signing_failure: ?SigningFailure = null },
     consumed: struct {
         root_generation: u64,
@@ -977,7 +1005,7 @@ pub const ClaimResult = union(enum) {
 
     pub fn needsSigning(self: *const ClaimResult) bool {
         return switch (self.*) {
-            .acknowledged, .raft_applied, .raft_closed => false,
+            .acknowledged, .raft_applied, .raft_consumed, .raft_closed => false,
             .consumed => |value| value.expected_digest != null and value.proof == null and !value.outcome.value.replication_pending and value.outcome.value.error_name == null,
             .closed => |value| value.proof == null,
             .applied => |value| value.signing != null and value.signed_delivery == null and
@@ -1048,7 +1076,7 @@ pub const ClaimResult = union(enum) {
 
     pub fn deinit(self: *ClaimResult) void {
         switch (self.*) {
-            .acknowledged, .raft_applied => {},
+            .acknowledged, .raft_applied, .raft_consumed => {},
             .raft_closed => |*value| value.owned.deinit(),
             .closed => |*value| value.owned.deinit(),
             .consumed => |value| value.outcome.deinit(),
@@ -1061,6 +1089,7 @@ pub const ClaimResult = union(enum) {
         return switch (self.*) {
             .acknowledged => .acknowledged,
             .raft_applied => |value| .{ .raft_applied = value },
+            .raft_consumed => |value| .{ .raft_consumed = value },
             .raft_closed => |*value| .{ .closed = .{ .root_generation = value.root_generation, .data = value.owned.data, .proof = value.proof, .signing_failure = value.signing_failure } },
             .consumed => |value| .{ .consumed = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .proof = value.proof, .signing_failure = value.signing_failure } },
             .closed => |*value| .{ .closed = .{ .root_generation = value.root_generation, .data = value.owned.data, .proof = value.proof, .signing_failure = value.signing_failure } },

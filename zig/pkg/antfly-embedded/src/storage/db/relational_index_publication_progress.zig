@@ -186,7 +186,7 @@ pub const Head = struct {
     pub fn completeSource(self: Head, owner: OwnerState) !Head {
         try self.validate();
         try owner.validate();
-        if (self.phase != .building or owner.owner.authority != .native or
+        if (self.phase != .building or
             !equal(owner.owner.plan_digest, self.plan_digest) or !std.mem.eql(u8, &owner.owner.plan_id, &self.plan_id) or
             owner.owner.namespace.table_id != self.table_id or owner.owner.ordinal >= self.owner_count or
             !owner.has(.reserved) or !nonzero(&owner.source_delivery) or owner.source_completed or
@@ -326,7 +326,7 @@ pub const OwnerState = struct {
             (self.has(.installed) and (!self.has(.validated) or self.has(.canceled))) or
             (self.has(.released) and !self.has(.installed)) or (self.has(.canceled) and !self.has(.reserved)) or
             (self.has(.cancel_released) and !self.has(.canceled))) return error.InvalidGenerationPublication;
-        if ((nonzero(&self.source_delivery) or nonzero(&self.target_inventory)) and (self.owner.authority != .native or !self.has(.reserved))) return error.InvalidGenerationPublication;
+        if ((nonzero(&self.source_delivery) or nonzero(&self.target_inventory)) and !self.has(.reserved)) return error.InvalidGenerationPublication;
         if (self.source_completed and !nonzero(&self.source_delivery)) return error.InvalidGenerationPublication;
     }
 
