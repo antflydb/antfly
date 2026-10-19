@@ -84,7 +84,7 @@ jobs:
           zig version > .benchmark-results/apple-video/zig.txt
           zig build --build-file zig/lib/video/build.zig test-video -Dvideo-test-filter='Apple WebM' -Doptimize=safe -Dtarget=aarch64-macos.15.0 --summary all 2>&1 | tee .benchmark-results/apple-video/video.log
           zig build --build-file zig/pkg/inference/build.zig test-video-model test-media-chunking -Dmetal=false -Doptimize=safe -Dtarget=aarch64-macos.15.0 --summary all 2>&1 | tee .benchmark-results/apple-video/model.log
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: apple-video-${{ matrix.os }}

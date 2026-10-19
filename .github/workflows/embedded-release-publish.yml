@@ -67,7 +67,7 @@ jobs:
             --workflow-json "$RUNNER_TEMP/embedded-build-workflow.json" \
             --repository "$GITHUB_REPOSITORY" --default-branch main
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-release-request
           path: dist/release-request
@@ -95,7 +95,7 @@ jobs:
             "${tag_args[@]}" --github-output "$GITHUB_OUTPUT"
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: ${{ steps.identity.outputs.publish == 'true' }}
         with:
           name: antfly-embedded-package-snapshot
@@ -103,7 +103,7 @@ jobs:
           run-id: ${{ steps.producer.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: ${{ steps.identity.outputs.publish == 'true' }}
         with:
           pattern: antfly-zig-*
@@ -131,7 +131,7 @@ jobs:
             --commit "${{ steps.identity.outputs.commit }}" \
             --npm-tag "${{ steps.identity.outputs.npm_tag }}"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ steps.identity.outputs.publish == 'true' }}
         with:
           name: verified-antfly-embedded-snapshot
@@ -178,7 +178,7 @@ jobs:
           python scripts/release/embedded_cargo.py preflight \
             --version "$VERSION" --commit "$SOURCE_COMMIT" --snapshot dist/cargo-snapshot \
             --github-output "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verified-antfly-embedded-cargo-snapshot
           path: dist/cargo-snapshot/
@@ -201,7 +201,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: verified-antfly-embedded-cargo-snapshot
           path: dist/cargo-snapshot
@@ -236,7 +236,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: verified-antfly-embedded-snapshot
           path: dist/lite-snapshot
@@ -285,11 +285,11 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: verified-antfly-embedded-snapshot
           path: dist/lite-snapshot
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
           registry-url: https://registry.npmjs.org/
