@@ -13896,7 +13896,7 @@ export interface components {
             /** @default 16384 */
             max_bytes?: number;
             /**
-             * @description Earlier segments available for context and the maximum later segments invalidated by an original source change. Recomputed outputs never extend that interval.
+             * @description Earlier segments available for context and the maximum later segments invalidated at each affected position of an original source change. A move invalidates the old and new neighborhoods independently; recomputed outputs never extend either interval.
              * @default 8
              */
             horizon_segments?: number;

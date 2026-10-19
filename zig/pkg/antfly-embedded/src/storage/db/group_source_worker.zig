@@ -46,7 +46,7 @@ pub const Ports = struct {
     /// Nonblocking ordinary producer/graph visibility observation.
     settled_fn: *const fn (*anyopaque, u64, []const []const u8) anyerror!bool,
 };
-pub const EventStatus = struct { source_revision: u64, propagated: bool, frontier: u64, settled: bool };
+pub const EventStatus = struct { source_revision: u64, propagated: bool, frontier: u64, settled: bool, retire_ready: bool = false };
 pub const Status = struct {
     owner: state.Owner,
     namespace: [24]u8 = @splat(0),
@@ -149,7 +149,9 @@ pub const Worker = struct {
                         try ports.submit_fn(ports.ptr, .{ .action = .acknowledge, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .acknowledge = .{ .document = event.document, .key_base64 = pointer.key_base64, .observed_base64 = pointer.value_base64, .delivery = true } });
                         continue;
                     }
-                    if (receipt.propagated) continue;
+                    // Poll providers without appending empty Raft controls.
+                    // Once a dependency is accepted, retire a bounded page.
+                    if (receipt.propagated and !receipt.retire_ready) continue;
                 }
             } else if (event.delivered) {
                 // A replaced/restored coordinator must enroll the event again.

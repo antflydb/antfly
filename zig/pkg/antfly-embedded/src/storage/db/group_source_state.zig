@@ -178,23 +178,53 @@ pub fn invalidate(a: A, txn: anytype, owner: Owner, event: index.Invalidation) !
 /// context invalidation cannot transitively spread through a whole group.
 pub fn invalidateContext(a: A, txn: anytype, group: Group, later: []const struct { partition: index.Partition, ordinal: i64 }, horizon: u16) !void {
     if (horizon == 0 or horizon > 128 or later.len > horizon) return error.InvalidGroupedPriorContext;
+    for (later) |value| _ = try invalidateContextHorizons(a, txn, group, value.partition, value.ordinal, &.{horizon});
+}
+const HorizonEpoch = struct { horizon: u16, revision: u64 };
+const ContextEpoch = struct { revision: u64, horizons: []const HorizonEpoch = &.{} };
+/// Persist only the configured policies affected by this original event. The
+/// legacy epoch invalidates pre-upgrade receipts once; new receipts observe
+/// their own horizon key and remain reusable outside that horizon.
+pub fn invalidateContextHorizons(a: A, txn: anytype, group: Group, partition: index.Partition, ordinal: i64, horizons: []const u16) !u64 {
+    if (!std.mem.eql(u8, group.key, partition.group) or horizons.len > 128) return error.InvalidGroupedPriorContext;
     const head_key = try key(a, group, 1, "");
     var head = (try load(Head, a, txn, head_key)) orelse Head{};
-    for (later) |value| {
-        if (!std.mem.eql(u8, group.key, value.partition.group)) return error.InvalidGroupedPriorContext;
-        _ = try enqueue(a, txn, group, &head, value.partition, value.ordinal, false);
-        const clock_key = try leaseClockKey(a, group.definition.table_incarnation);
-        const revision = try std.math.add(u64, (try load(u64, a, txn, clock_key)) orelse 0, 1);
-        try store(a, txn, clock_key, revision);
-        try store(a, txn, try contextEpochKey(a, group, value.partition), .{ .revision = revision });
-        if (try readSnapshot(a, txn, group, value.partition)) |snapshot| for (snapshot.units) |unit| {
-            const epoch = try std.json.Stringify.valueAlloc(a, .{ .revision = revision }, .{});
-            try txn.put(try identity.unitContextEpochKey(a, unit), epoch);
+    const pending_revision = try enqueue(a, txn, group, &head, partition, ordinal, false);
+    const clock_key = try leaseClockKey(a, group.definition.table_incarnation);
+    const revision = try std.math.add(u64, (try load(u64, a, txn, clock_key)) orelse 0, 1);
+    try store(a, txn, clock_key, revision);
+    const selected = try contextEpochKey(a, group, partition);
+    const old = try load(ContextEpoch, a, txn, selected);
+    var policies: std.ArrayList(HorizonEpoch) = .empty;
+    if (old) |value| try policies.appendSlice(a, value.horizons);
+    for (horizons) |horizon| {
+        if (horizon == 0 or horizon > 128) return error.InvalidGroupedPriorContext;
+        var found = false;
+        for (policies.items) |*policy| if (policy.horizon == horizon) {
+            policy.revision = revision;
+            found = true;
+            break;
         };
+        if (!found) try policies.append(a, .{ .horizon = horizon, .revision = revision });
     }
+    try store(a, txn, selected, ContextEpoch{ .revision = revision, .horizons = policies.items });
+    // Publish unit guards together with the replacement snapshot, in group
+    // order. Eagerly waking a later unit here can put its producer before the
+    // predecessor's replacement on the ordinary replay stream, deadlocking
+    // replay on the very predecessor it still needs to materialize.
+    // The durable pending queue already fences prior-context reads meanwhile.
     try store(a, txn, head_key, head);
     if (head.pending > 0) try @import("group_source_queue.zig").stageGroup(a, txn, try group.anchor(a), group);
+    return pending_revision;
 }
+/// Retiring a unit removes both the legacy guard and every persisted policy.
+pub fn clearUnitContext(a: A, txn: anytype, group: Group, partition: index.Partition, unit: []const u8) !void {
+    try txn.delete(try identity.unitContextEpochKey(a, unit));
+    if (try load(ContextEpoch, a, txn, try contextEpochKey(a, group, partition))) |epoch| {
+        for (epoch.horizons) |policy| try txn.delete(try identity.unitHorizonEpochKey(a, unit, policy.horizon));
+    }
+}
+
 pub const lease_clock_prefix = "\x00\x00G\x05";
 fn leaseClockKey(a: A, table: u128) ![]u8 {
     var raw: [16]u8 = undefined;
@@ -407,15 +437,20 @@ pub fn stageSnapshot(a: A, txn: anytype, group: Group, partition: index.Partitio
         try store(a, txn, try causalQueueKey(a, group, pending), pending);
     }
     const epoch_key = try contextEpochKey(a, group, partition);
-    const ContextEpoch = struct { revision: u64 };
     const context_epoch = try load(ContextEpoch, a, txn, epoch_key);
     for (snapshot.units) |unit| {
         const unit_key = try identity.unitContextEpochKey(a, unit);
-        const desired = if (context_epoch) |epoch| try std.json.Stringify.valueAlloc(a, epoch, .{}) else null;
+        const desired = if (context_epoch) |epoch| try std.json.Stringify.valueAlloc(a, .{ .revision = epoch.revision }, .{}) else null;
         const existing = txn.get(unit_key) catch |err| if (err == error.NotFound) null else return err;
         if (desired) |raw| {
             if (existing == null or !std.mem.eql(u8, existing.?, raw)) try txn.put(unit_key, raw);
         } else if (existing != null) try txn.delete(unit_key);
+        if (context_epoch) |epoch| for (epoch.horizons) |policy| {
+            const policy_key = try identity.unitHorizonEpochKey(a, unit, policy.horizon);
+            const policy_value = try std.json.Stringify.valueAlloc(a, .{ .revision = policy.revision }, .{});
+            const previous = txn.get(policy_key) catch |err| if (err == error.NotFound) null else return err;
+            if (previous == null or !std.mem.eql(u8, previous.?, policy_value)) try txn.put(policy_key, policy_value);
+        };
         try store(a, txn, try identity.unitMembershipKey(a, unit), UnitMembership{ .snapshot_key_base64 = try @import("group_source_reads.zig").encode(a, try snapshotKey(a, group, partition)) });
     }
     if (snapshot.units.len > 0) try store(a, txn, try directoryKey(a, group, partition, snapshot.ordinal), DirectoryEntry{ .partition = partition, .snapshot = snapshot });

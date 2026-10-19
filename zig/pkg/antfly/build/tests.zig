@@ -6116,6 +6116,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const grouped_source_step = b.step("antfly-group-sources-test", "Verify grouped source publication, graph proofs, protocol negotiation and durable owner lifecycle");
     grouped_source_step.dependOn(&addFilteredTestRunArtifact(b, grouped_source_production_tests).step);
     grouped_source_step.dependOn(&addFilteredTestRunArtifact(b, grouped_source_protocol_tests).step);
+    const resolver_alias_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "resolver curation alias", "resolver curation preserves", "resolver curation ownership" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-resolver-alias-test", "Verify authored alias preservation and shared resolver contribution retraction")
+        .dependOn(&addFilteredTestRunArtifact(b, resolver_alias_tests).step);
     const query_capture_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{"query capture"},

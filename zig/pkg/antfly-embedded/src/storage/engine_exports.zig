@@ -604,6 +604,10 @@ fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.S
     return .{ .value = self.waitForResolvedTransactionSyncWithCancellation(sync_level, sequence, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn waitForResolvedTransactionSyncTargetWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) engine.Outcome(void) {
+    return .{ .value = self.waitForResolvedTransactionSyncTargetWithCancellation(sync_level, sequence, phase, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn captureRelationalStatementSnapshot(self: *DB) engine.Outcome(DB.RelationalStatementSnapshot) {
     return .{ .value = self.captureRelationalStatementSnapshot() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -2100,12 +2104,12 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v27", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v28", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v27", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v28", .visibility = .hidden });
 }

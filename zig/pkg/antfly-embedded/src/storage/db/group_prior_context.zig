@@ -66,14 +66,13 @@ pub fn select(a: A, config: groups.PriorContext, group: []const u8, current: Pos
     defer text.deinit(a);
     var items: std.ArrayList(Item) = .empty;
     defer items.deinit(a);
-    var segments: usize = 0;
-    var previous: ?Position = null;
+    var segments: std.StringHashMapUnmanaged(void) = .empty;
+    defer segments.deinit(a);
     for (sorted) |item| {
         if (items.items.len == config.max_items) break;
-        if (previous == null or Position.before(item.position, previous.?)) {
-            if (segments == config.horizon_segments) break;
-            segments += 1;
-            previous = item.position;
+        if (!segments.contains(item.position.segment)) {
+            if (segments.count() == config.horizon_segments) break;
+            try segments.put(a, item.position.segment, {});
         }
         const rendered = try renderer.render(renderer.ptr, a, config.render, item.value);
         defer a.free(rendered);
@@ -157,4 +156,33 @@ test "group prior context item byte and propagation horizon limits are explicit"
     try std.testing.expectEqual(@as(usize, 2), affected.len);
     try std.testing.expectError(error.InvalidGroupedPriorContext, invalidated(a, changed, &later, 1));
     try std.testing.expectError(error.InvalidGroupedPriorContext, invalidated(a, later[1], &later, 2));
+}
+
+test "group prior context counts distinct segments across ordinal cells" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Render = struct {
+        fn render(_: *anyopaque, alloc: A, _: []const u8, value: V) ![]const u8 {
+            return alloc.dupe(u8, value.string);
+        }
+    };
+    var ptr: u8 = 0;
+    const renderer = Renderer{ .ptr = &ptr, .render = Render.render };
+    const items = [_]Item{
+        .{ .group = "thread", .position = .{ .ordinal = 256, .segment = "b" }, .unit = groups.digest("B"), .ordinal = 0, .fingerprint = groups.digest("B"), .value = .{ .string = "B" } },
+        .{ .group = "thread", .position = .{ .ordinal = 128, .segment = "a" }, .unit = groups.digest("A2"), .ordinal = 0, .fingerprint = groups.digest("A2"), .value = .{ .string = "A2" } },
+        .{ .group = "thread", .position = .{ .ordinal = 0, .segment = "a" }, .unit = groups.digest("A1"), .ordinal = 0, .fingerprint = groups.digest("A1"), .value = .{ .string = "A1" } },
+    };
+    var config = groups.PriorContext{ .artifact = "claims", .render = "{{statement}}", .max_items = 4, .max_bytes = 1024, .horizon_segments = 2 };
+    const current = Position{ .ordinal = 512, .segment = "c" };
+    try std.testing.expectEqualStrings("B\nA2\nA1", (try select(a, config, "thread", current, &items, renderer)).text);
+    config.horizon_segments = 1;
+    try std.testing.expectEqualStrings("B", (try select(a, config, "thread", current, &items, renderer)).text);
+    config.horizon_segments = 2;
+    config.max_items = 2;
+    try std.testing.expectEqualStrings("B\nA2", (try select(a, config, "thread", current, &items, renderer)).text);
+    config.max_items = 4;
+    config.max_bytes = 4;
+    try std.testing.expectEqualStrings("B\nA2", (try select(a, config, "thread", current, &items, renderer)).text);
 }

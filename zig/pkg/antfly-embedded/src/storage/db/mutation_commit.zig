@@ -2344,7 +2344,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                     };
                     try @import("group_source_baseline.zig").applyPage(internal_keys, group_alloc, &group_overlay, command.definition, @import("group_source_baseline.zig").sourceGeneration(S.ownerField(self, "core").*.index_manager.activeSchemaVersion() orelse 0, namespace, S.ownerField(self, "core").*.byteRange().start, S.ownerField(self, "core").*.byteRange().end, S.ownerField(self, "root_incarnation").*), command.backfill.?.page.?, .{ .ptr = S.ownerField(self, "core").*, .read_fn = Materializer.read }, group_mutations.Plan.Projector{ .entry = matched_entry.?, .bounds = .{ .start = S.ownerField(self, "core").*.byteRange().start, .end = S.ownerField(self, "core").*.byteRange().end } });
-                } else group_staged = @import("group_source_apply.zig").stage(group_alloc, &group_overlay, command.*, S.ownerField(self, "core").*.nextDerivedAppendSequence(), matched_entry.?.horizon) catch |err| switch (err) {
+                } else group_staged = @import("group_source_apply.zig").stage(group_alloc, &group_overlay, command.*, S.ownerField(self, "core").*.nextDerivedAppendSequence(), matched_entry.?.horizons) catch |err| switch (err) {
                     error.EnrichmentSourceChanged, error.ArtifactPublicationPending, error.GroupedSourceRetirementPending, error.GroupedSourceBusy, error.GroupedSourceEarlierWorkPending => blk: {
                         // A committed control race is an ordered rejection. No
                         // partial effects survive; its applied watermark does.

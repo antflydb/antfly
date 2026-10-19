@@ -31425,7 +31425,7 @@ pub const DB = struct {
         return self.runMaintenanceUntilWithEnrichmentCompletion(sequence, sync_targets, cancellation, deadline_ns, .successful_requests);
     }
 
-    const EnrichmentCompletion = enum { successful_requests, published_requests };
+    const EnrichmentCompletion = enum { successful_requests, published_requests, published_cut };
 
     fn runMaintenanceUntilWithEnrichmentCompletion(
         self: *DB,
@@ -31455,7 +31455,7 @@ pub const DB = struct {
             try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
             const next_target = self.core.nextDerivedSequence();
-            if (next_target <= stable_target) {
+            if (completion == .published_cut or next_target <= stable_target) {
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
                 _ = try self.runArtifactRepairMetadataMaintenancePass();
                 return;
@@ -31509,6 +31509,31 @@ pub const DB = struct {
 
     pub fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("waitForResolvedTransactionSyncWithCancellation", .{ self, sync_level, sequence, cancellation });
+        return self.waitForResolvedTransactionSyncImpl(sync_level, sequence, cancellation, null);
+    }
+
+    /// The caller retains these scalars while releasing its owner lease
+    /// between bounded waits. Phase 1 owns the source cut; phase 2 owns the
+    /// publication cut captured after that source's grouped work is accepted.
+    pub fn waitForResolvedTransactionSyncTargetWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("waitForResolvedTransactionSyncTargetWithCancellation", .{ self, sync_level, sequence, phase, cancellation });
+        if (phase.* != 1 and phase.* != 2) return error.InvalidArgument;
+        return self.waitForResolvedTransactionSyncImpl(sync_level, sequence.*, cancellation, .{ .sequence = sequence, .phase = phase });
+    }
+
+    const PublicationCut = struct {
+        sequence: *u64,
+        phase: *u8,
+        fn get(self: @This()) ?u64 {
+            return if (self.phase.* == 2) self.sequence.* else null;
+        }
+        fn capture(self: @This(), sequence: u64) void {
+            self.sequence.* = sequence;
+            self.phase.* = 2;
+        }
+    };
+
+    fn waitForResolvedTransactionSyncImpl(self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken, publication_cut: ?PublicationCut) !void {
         try self.executor.checkSyncLevelHealth(sync_level);
         if (sequence == 0 or sync_level == .propose or sync_level == .write) return;
         try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
@@ -31519,7 +31544,7 @@ pub const DB = struct {
         }
         if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
         self.notifyResolverReplayRuntimes(sequence);
-        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation, false);
+        try self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, false, publication_cut);
         if (sync_level == .full_index and self.text_merge_runtime == null) {
             try self.drainScheduledTextMerges();
         }
@@ -35500,12 +35525,15 @@ pub const DB = struct {
     /// `applied_sequence >= sequence`, which is the whole table's enrichment
     /// watermark: a tiny write queued behind an unrelated backlog would wait
     /// for that backlog to drain even though it owes the runtime nothing.
-    /// This does not change `.full_text`/`.full_index` behavior (untouched
-    /// branches below) or the watermark-advance logic itself
-    /// (`markPrecomputedEnrichmentAppliedForSync` stays exactly as
-    /// conservative as before).
+    /// This shortcut replaces only ordinary producer work. Grouped source
+    /// debt and managed index fences remain required; shared replay watermark
+    /// advancement stays conservative.
     pub fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("waitForSyncLevelWithCancellation", .{ self, sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait });
+        return self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait, null);
+    }
+
+    fn waitForSyncLevelWithPublicationCut(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool, publication_cut: ?PublicationCut) !void {
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
         else
@@ -35518,22 +35546,45 @@ pub const DB = struct {
             .deadline_ns = deadline_ns,
             .clock = visibility_clock,
         };
-        const has_groups = self.core.index_manager.hasGroupSources() and (sync_level == .enrichments or sync_level == .full_index);
-        if (has_groups) try self.waitForGroupSourcesThrough(sequence, wait, skip_enrichment_runtime_wait);
-        const effective_sequence = if (has_groups) @max(sequence, self.core.nextEnrichmentSequence()) else sequence;
-        const effective_targets = if (has_groups) ManagedSyncTargets{} else sync_targets;
+        const captured_cut = if (publication_cut) |cut| cut.get() else null;
+        const has_groups = captured_cut != null or (self.core.index_manager.hasGroupSources() and (sync_level == .enrichments or sync_level == .full_index));
+        const wait_primary_enrichments = captured_cut == null and !skip_enrichment_runtime_wait and (!has_groups or primary: {
+            var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
+            defer pinned.release();
+            // The grouped debt fence certifies the private producer DAG.
+            // Only producers rooted in primary documents additionally owe an
+            // ordinary replay fence. A private-unit publication can follow
+            // its original source cut and share a replay window with a later,
+            // unrelated provider; its global cursor is not source readiness.
+            for (pinned.plan().generated_templates) |request| {
+                if (request.group_source_json.len == 0 and request.group_artifact_name.len == 0) break :primary true;
+            }
+            break :primary false;
+        });
+        const effective_sequence = captured_cut orelse if (has_groups)
+            try self.waitForGroupSourcesThrough(sequence, wait)
+        else
+            sequence;
         switch (sync_level) {
             .propose, .write => {},
             .enrichments => {
-                if (!skip_enrichment_runtime_wait)
-                    try self.runEnrichmentUntilWithVisibilityDeadline(effective_sequence, cancellation, deadline_ns);
+                if (wait_primary_enrichments)
+                    try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
             },
             .full_text => {
                 try self.runDerivedUntilTargetsWithVisibilityWait(sequence, sync_targets.full_text_indexes, wait);
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.full_text_indexes);
             },
             .full_index => {
-                try self.runMaintenanceUntilWithCancellation(effective_sequence, effective_targets, cancellation, deadline_ns);
+                if (has_groups) {
+                    if (wait_primary_enrichments) try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                    // Own grouped publications have been accepted before
+                    // this cut. Include them once without chasing unrelated
+                    // producer scheduling or publications appended afterward.
+                    const published_cut = captured_cut orelse @max(effective_sequence, self.core.nextDerivedSequence());
+                    if (publication_cut) |cut| if (captured_cut == null) cut.capture(published_cut);
+                    try self.runMaintenanceUntilWithEnrichmentCompletion(published_cut, sync_targets, cancellation, deadline_ns, .published_cut);
+                } else try self.runMaintenanceUntilWithCancellation(sequence, sync_targets, cancellation, deadline_ns);
                 if (self.text_merge_runtime == null) {
                     try wait.check();
                     try self.drainScheduledTextMerges();
@@ -35543,8 +35594,9 @@ pub const DB = struct {
         }
     }
 
-    fn waitForGroupSourcesThrough(self: *DB, through: u64, wait: derived_executor_mod.VisibilityWait, skip_foreground_producers: bool) !void {
+    fn waitForGroupSourcesThrough(self: *DB, through: u64, wait: derived_executor_mod.VisibilityWait) !u64 {
         const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        var producer_sequence = through;
         while (true) {
             try wait.check();
             if (self.async_context.background_closing.load(.acquire)) return error.Canceled;
@@ -35563,16 +35615,28 @@ pub const DB = struct {
                 var namespace: [24]u8 = undefined;
                 doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
                 const generation = baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation);
+                var settled = true;
                 for (plan.entries) |entry| {
                     const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
-                    if ((try baseline.load(a, &read, definition, generation)).phase != .ready) break :blk false;
-                    if (!try @import("group_source_debt.zig").settled(a, &read, definition, through)) break :blk false;
+                    if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
+                    if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
+                        settled = false;
+                        var source_namespace = namespace;
+                        if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
+                        const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
+                        producer_sequence = @max(producer_sequence, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
+                    }
                 }
-                break :blk true;
+                break :blk settled;
             };
-            if (ready) return;
+            if (ready) return producer_sequence;
             _ = try self.runGroupSourceSlice();
-            if (!skip_foreground_producers) try self.runEnrichmentUntilWithVisibilityDeadline(self.core.nextEnrichmentSequence(), wait.cancellation, wait.deadline_ns.?);
+            if (self.local_execution.optional_runtime_workers_enabled) {
+                // Wake the owner without waiting for a global cursor that
+                // may be blocked on an independent, later request. The
+                // durable source debt above is the completion authority.
+                if (self.enrichment_runtime) |runtime| runtime.notifySequence(producer_sequence);
+            } else try self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
             try wait.check();
             try io.sleep(.fromMilliseconds(5), .awake);
         }
@@ -71501,7 +71565,7 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     });
     defer db.close();
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
+    try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"openai\",\"model\":\"fixture\",\"api_key\":\"fixture\"}}}" });
     var fixture: u8 = 0;
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
     try db.initOptionalEnrichmentRuntime(&config);
@@ -141057,6 +141121,60 @@ test "grouped sources production publishes private units incrementally across de
             try std.testing.expectEqual(version, try std.fmt.parseInt(u32, raw, 10));
         }
     }
+}
+
+test "grouped sources production visibility retains its publication cut across later primary producer debt" {
+    const Fixture = struct {
+        calls: usize = 0,
+        fn produce(raw: *anyopaque, alloc: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, "{\"statement\":\"accepted\"}");
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("grouped-publication-cut");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
+    try db.addEnrichment(.{ .name = "notes", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"openai\",\"model\":\"fixture\",\"api_key\":\"fixture\"}}}" });
+    var fixture: Fixture = .{};
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
+    try db.initOptionalEnrichmentRuntime(&config);
+    try db.batch(.{ .writes = &.{.{ .key = "earlier", .value = "{\"body\":\"first\"}" }}, .sync_level = .write });
+    const runtime = db.enrichment_runtime.?;
+    try runtime.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    var sequence = db.core.nextDerivedSequence();
+    var phase: u8 = 1;
+    try db.waitForResolvedTransactionSyncTargetWithCancellation(.full_index, &sequence, &phase, .none);
+    try std.testing.expectEqual(@as(u8, 2), phase);
+    const captured = sequence;
+    const calls = fixture.calls;
+    try std.testing.expect(calls > 0);
+
+    runtime.retrying = true;
+    runtime.next_retry_at_ms = runtime.clock.nowRealtimeMs() + 60_000;
+    defer {
+        runtime.retrying = false;
+        runtime.next_retry_at_ms = 0;
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "later", .value = "{\"body\":\"pending\"}" }}, .sync_level = .write });
+    try std.testing.expect(runtime.stats().applied_sequence < db.core.nextDerivedSequence());
+    // A resumed owner wait retains the accepted cut even when a new primary
+    // producer is pending. It neither invokes that provider nor advances its
+    // watermark to manufacture completion.
+    try db.waitForResolvedTransactionSyncTargetWithCancellation(.full_index, &sequence, &phase, .none);
+    try std.testing.expectEqual(captured, sequence);
+    try std.testing.expectEqual(calls, fixture.calls);
+    try std.testing.expect(runtime.stats().applied_sequence < db.core.nextDerivedSequence());
+    try std.testing.expect(runtime.stats().retrying);
 }
 
 test "grouped sources production ordered transaction resolution never waits on derived publication" {

@@ -100,11 +100,21 @@ pub fn unitContextEpochKey(a: std.mem.Allocator, document: []const u8) ![]u8 {
     if (!isAnchor(document)) return error.InvalidGroupedSourceMutation;
     return documentMetadataKey(a, document, &.{11});
 }
+/// A horizon is a causal policy, shared only by consumers with that policy.
+pub fn unitHorizonEpochKey(a: std.mem.Allocator, document: []const u8, horizon: u16) ![]u8 {
+    if (!isAnchor(document) or horizon == 0 or horizon > 128) return error.InvalidGroupedSourceMutation;
+    var suffix = [_]u8{ 11, 0, 0 };
+    std.mem.writeInt(u16, suffix[1..3], horizon, .big);
+    return documentMetadataKey(a, document, &suffix);
+}
 pub fn isUnitContextEpochKey(selected: []const u8) bool {
     const encoded_marker = "/\x00\xffantfly/group/v1/";
-    return selected.len > 1 + 64 + encoded_marker.len + 4 and selected[0] == 1 and
-        std.mem.eql(u8, selected[65..][0..encoded_marker.len], encoded_marker) and
-        std.mem.eql(u8, selected[selected.len - 4 ..], &.{ 0, 0, metadata_kind, 11 });
+    if (selected.len <= 1 + 64 + encoded_marker.len + 4 or selected[0] != 1 or
+        !std.mem.eql(u8, selected[65..][0..encoded_marker.len], encoded_marker)) return false;
+    if (std.mem.eql(u8, selected[selected.len - 4 ..], &.{ 0, 0, metadata_kind, 11 })) return true;
+    if (!std.mem.eql(u8, selected[selected.len - 6 .. selected.len - 2], &.{ 0, 0, metadata_kind, 11 })) return false;
+    const horizon = std.mem.readInt(u16, selected[selected.len - 2 ..][0..2], .big);
+    return horizon > 0 and horizon <= 128;
 }
 pub fn tableOf(document: []const u8) ?u128 {
     const selected = root(document) orelse return null;

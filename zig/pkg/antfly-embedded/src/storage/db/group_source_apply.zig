@@ -23,12 +23,12 @@ const snapshot = @import("group_source_snapshot.zig");
 const keys = @import("../internal_keys.zig");
 const A = std.mem.Allocator;
 
-pub fn stage(a: A, overlay: *mutations.Overlay, command: contract.Command, next_sequence: u64, horizon: u16) !snapshot.Staged {
+pub fn stage(a: A, overlay: *mutations.Overlay, command: contract.Command, next_sequence: u64, horizons: []const u16) !snapshot.Staged {
     try command.validate();
     const empty = snapshot.Staged{ .changed = &.{}, .deleted = &.{}, .sequence = 0 };
     switch (command.action) {
         .invalidate => {
-            try @import("group_source_propagation.zig").advance(a, overlay, command.invalidate.?.owner, command.invalidate.?.event, horizon);
+            try @import("group_source_propagation.zig").advanceHorizons(a, overlay, command.invalidate.?.owner, command.invalidate.?.event, horizons);
         },
         .claim => {
             const value = command.claim.?;

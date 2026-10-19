@@ -41,18 +41,23 @@ pub fn remove(a: A, txn: anytype, outbox: []const u8, event: index.Invalidation)
     try txn.delete(try key(a, event.definition, event.since_sequence, outbox));
 }
 pub fn settled(a: A, txn: anytype, definition: index.Definition, through: u64) !bool {
+    return try earliest(a, txn, definition, through) == null;
+}
+/// Return the oldest original-source cause inside the captured fence. Never
+/// use the current global replay tail to drive a grouped visibility waiter.
+pub fn earliest(a: A, txn: anytype, definition: index.Definition, through: u64) !?index.Invalidation {
     const selected = try prefix(a, definition);
     var cursor = try txn.openPhysicalCursorAdapter();
     defer cursor.close();
-    const first = (try cursor.seekAtOrAfter(selected)) orelse return true;
-    if (!std.mem.startsWith(u8, first.key, selected)) return true;
+    const first = (try cursor.seekAtOrAfter(selected)) orelse return null;
+    if (!std.mem.startsWith(u8, first.key, selected)) return null;
     if (first.key.len != selected.len + 40) return error.GroupedSourceCorrupt;
     const sequence = std.mem.readInt(u64, first.key[selected.len..][0..8], .big);
     const outbox = try queue.decode(first.key, first.value);
     const raw = txn.get(outbox) catch |err| return if (err == error.NotFound) error.GroupedSourceCorrupt else err;
     const event = try index.readInvalidation(a, outbox, raw);
     if (!std.meta.eql(event.definition, definition) or event.since_sequence != sequence or !std.mem.eql(u8, first.key, try key(a, definition, sequence, outbox))) return error.GroupedSourceCorrupt;
-    return sequence > through;
+    return if (sequence > through) null else event;
 }
 
 test "source group barrier retains coalesced old debt and excludes independent later source writes" {

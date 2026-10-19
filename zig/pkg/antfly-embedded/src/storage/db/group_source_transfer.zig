@@ -141,7 +141,7 @@ pub fn reconstruct(a: A, txn: anytype, table: u128, selected: []const u8, value:
         identity.metadata_kind => {
             if (owner.suffix[0] == 11) {
                 const payload = try metadataPayload(selected, value.?);
-                const epoch = try std.json.parseFromSliceLeaky(struct { revision: u64 }, a, payload, .{});
+                const epoch = try std.json.parseFromSliceLeaky(struct { revision: u64 }, a, payload, .{ .ignore_unknown_fields = true });
                 try state.ensureLeaseFloor(a, txn, table, epoch.revision);
             }
             if (owner.suffix[0] == 1) {

@@ -1057,7 +1057,7 @@ components:
           minimum: 1
           maximum: 128
           default: 8
-          description: Earlier segments available for context and the maximum later segments invalidated by an original source change. Recomputed outputs never extend that interval.
+          description: Earlier segments available for context and the maximum later segments invalidated at each affected position of an original source change. A move invalidates the old and new neighborhoods independently; recomputed outputs never extend either interval.
     EnrichmentNeighborContextConfig:
       type: object
       additionalProperties: false

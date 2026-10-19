@@ -1464,6 +1464,8 @@ pub const SyncLevel = enum(u32) {
 
 /// Fixed visibility target, borrowed across bounded waits. A later slice
 /// cannot chase new writes or reuse a target after physical owner replacement.
+/// captured=1 retains the source cut; captured=2 retains its accepted publication
+/// cut. The owner advances that phase atomically before yielding its lease.
 pub const SyncTarget = extern struct {
     root_incarnation_le: [16]u8 = @splat(0),
     sequence: u64 = 0,

@@ -1731,7 +1731,11 @@ pub const ProvisionedKernelOwnerSource = struct {
                 defer lease.deinit();
                 const slice = Slice{ .outer = cancellation, .until = @min(platform_time.monotonicNs() +| 50 * std.time.ns_per_ms, if (target.captured != 0) target.deadline_ns else std.math.maxInt(u64)) };
                 lease.owner().waitForSyncTargetWithCancellation(table_name, owner_sync_level, &target, .{ .ptr = &slice, .is_cancelled_fn = Slice.cancelled }) catch |err| switch (err) {
-                    error.Canceled => break :blk false,
+                    // The storage owner preserves enrichment cancellation's
+                    // typed identity across the native boundary. An expired
+                    // local slice must yield the lease and resume; only the
+                    // outer request token may cancel the whole barrier.
+                    error.Canceled, error.EnrichmentWaitCanceled => break :blk false,
                     else => return err,
                 };
                 break :blk true;

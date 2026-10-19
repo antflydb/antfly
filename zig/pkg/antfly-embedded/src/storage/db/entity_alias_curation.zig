@@ -92,6 +92,44 @@ pub fn isStale(current: std.json.Value, instruction: Control) bool {
     return previous > instruction.curation_revision or (previous == instruction.curation_revision and @as(u64, @intCast(generation.integer)) > instruction.revision);
 }
 
+/// Alias origin belongs to a spelling, independently of which contributor is
+/// removed first. Explicit false means the spelling existed outside resolver
+/// ownership and must survive the last retraction.
+fn originPath(a: std.mem.Allocator, alias: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(alias, &digest, .{});
+    return std.fmt.allocPrint(a, "_resolver_alias_origins.{x}", .{&digest});
+}
+fn managedOrigin(current: std.json.Value, alias: []const u8) !?bool {
+    if (current != .object) return null;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(alias, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    if (current.object.get("_resolver_alias_origins")) |origins| {
+        if (origins != .object) return error.InvalidEntityPromotionDocument;
+        if (origins.object.get(&hex)) |origin| {
+            if (origin != .bool) return error.InvalidEntityPromotionDocument;
+            return origin.bool;
+        }
+    }
+    // Upgrade existing ownership conservatively. A live introducer proves a
+    // managed origin; an explicit non-introducer overrides document version.
+    const owners = current.object.get("_resolver_aliases") orelse return null;
+    const managed = current.object.get("_resolver_aliases_managed") orelse return null;
+    if (owners != .object or managed != .object) return error.InvalidEntityPromotionDocument;
+    var outside = false;
+    for (owners.object.keys(), owners.object.values()) |owner, spelling| {
+        if (spelling != .string) return error.InvalidEntityPromotionDocument;
+        if (!std.mem.eql(u8, spelling.string, alias)) continue;
+        if (managed.object.get(owner)) |origin| {
+            if (origin != .bool) return error.InvalidEntityPromotionDocument;
+            if (origin.bool) return true;
+            outside = true;
+        }
+    }
+    return if (outside) false else null;
+}
+
 pub fn operations(a: std.mem.Allocator, current: std.json.Value, instruction: Control) ![]types.TransformOp {
     var ops: std.ArrayListUnmanaged(types.TransformOp) = .empty;
     if (isStale(current, instruction)) return ops.items;
@@ -113,6 +151,8 @@ pub fn operations(a: std.mem.Allocator, current: std.json.Value, instruction: Co
                     break;
                 };
             };
+            const managed_origin = (try managedOrigin(current, instruction.alias)) orelse introduced;
+            try ops.append(a, .{ .op = .set, .path = try originPath(a, instruction.alias), .value_json = if (managed_origin) "true" else "false" });
             try ops.append(a, .{ .op = .set, .path = ownership_path, .value_json = if (introduced) "true" else "false" });
             try ops.append(a, .{ .op = .set, .path = owner_path, .value_json = try std.json.Stringify.valueAlloc(a, instruction.alias, .{}) });
             try ops.append(a, .{ .op = .add_to_set, .path = "aliases", .value_json = try std.json.Stringify.valueAlloc(a, instruction.alias, .{}) });
@@ -133,11 +173,14 @@ pub fn operations(a: std.mem.Allocator, current: std.json.Value, instruction: Co
             const version = if (current == .object) current.object.get("_resolver_aliases_version") else null;
             const name = if (current == .object) current.object.get("canonical_name") else null;
             const canonical = if (name) |v| v == .string and std.mem.eql(u8, v.string, instruction.alias) else false;
-            const managed = if (current == .object) current.object.get("_resolver_aliases_managed") else null;
-            const contribution = if (managed) |m| if (m == .object) m.object.get(instruction.owner) else null else null;
-            const introduced = if (contribution) |v| v == .bool and v.bool else false;
-            if (owned and !shared and !canonical and (introduced or (version != null and version.? == .integer and version.?.integer == 1)))
+            const managed_origin = (try managedOrigin(current, instruction.alias)) orelse (version != null and version.? == .integer and version.?.integer == 1);
+            if (owned and !shared and !canonical and managed_origin)
                 try ops.append(a, .{ .op = .pull, .path = "aliases", .value_json = try std.json.Stringify.valueAlloc(a, instruction.alias, .{}) });
+            if (shared) {
+                // Preserve origin when the contributor who first introduced
+                // this spelling leaves before the remaining contributors.
+                try ops.append(a, .{ .op = .set, .path = try originPath(a, instruction.alias), .value_json = if (managed_origin) "true" else "false" });
+            } else if (owned) try ops.append(a, .{ .op = .unset, .path = try originPath(a, instruction.alias) });
             try ops.append(a, .{ .op = .unset, .path = owner_path });
             try ops.append(a, .{ .op = .unset, .path = try std.fmt.allocPrint(a, "_resolver_aliases_managed.{s}", .{instruction.owner}) });
         },
@@ -197,4 +240,63 @@ test "resolver curation preserves unattributed legacy aliases and explicitly res
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, restored, .{});
     try std.testing.expect(!parsed.object.contains("merged_into"));
     try std.testing.expectEqual(@as(usize, 1), parsed.object.get("aliases").?.array.items.len);
+}
+
+test "resolver curation ownership preserves authored aliases on previously promoted entities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var instruction: Control = .{ .scope = &@as([64]u8, @splat('a')), .owner = &@as([64]u8, @splat('b')), .alias = "Seed", .revision = 1, .action = .add };
+    const promoted = try merge(a, null, try testDocument(a, instruction), "entity");
+    const authored = try merge(a, promoted, "{\"aliases\":[\"Authored\"]}", "entity");
+    instruction.owner = &@as([64]u8, @splat('c'));
+    instruction.alias = "Authored";
+    const attached = try merge(a, authored, try testDocument(a, instruction), "entity");
+    instruction.action = .remove;
+    instruction.revision = 2;
+    const removed = try merge(a, attached, try testDocument(a, instruction), "entity");
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, removed, .{});
+    const aliases = parsed.object.get("aliases").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), aliases.len);
+    try std.testing.expectEqualStrings("Authored", aliases[1].string);
+}
+
+test "resolver curation ownership survives removal of the introducer on legacy entities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var first: Control = .{ .scope = &@as([64]u8, @splat('a')), .owner = &@as([64]u8, @splat('b')), .alias = "Managed", .revision = 1, .action = .add };
+    const one = try merge(a, "{\"canonical_name\":\"Canonical\",\"aliases\":[]}", try testDocument(a, first), "entity");
+    var second = first;
+    second.owner = &@as([64]u8, @splat('c'));
+    const two = try merge(a, one, try testDocument(a, second), "entity");
+    first.action = .remove;
+    first.revision = 2;
+    const remaining = try merge(a, two, try testDocument(a, first), "entity");
+    const middle = try std.json.parseFromSliceLeaky(std.json.Value, a, remaining, .{});
+    try std.testing.expectEqual(@as(usize, 1), middle.object.get("aliases").?.array.items.len);
+    second.action = .remove;
+    second.revision = 2;
+    const removed = try merge(a, remaining, try testDocument(a, second), "entity");
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, removed, .{});
+    try std.testing.expectEqual(@as(usize, 0), parsed.object.get("aliases").?.array.items.len);
+    try std.testing.expect(!parsed.object.contains("_resolver_aliases_version"));
+}
+
+test "resolver curation ownership upgrades explicit external origin ahead of document version" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const instruction: Control = .{ .scope = &@as([64]u8, @splat('a')), .owner = &@as([64]u8, @splat('b')), .alias = "Authored", .revision = 2, .action = .remove };
+    var current = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"canonical_name\":\"Canonical\",\"aliases\":[\"Authored\"],\"_resolver_aliases_version\":1}", .{});
+    var owners: std.json.Value = .{ .object = .empty };
+    try owners.object.put(a, instruction.owner, .{ .string = instruction.alias });
+    try current.object.put(a, "_resolver_aliases", owners);
+    var managed: std.json.Value = .{ .object = .empty };
+    try managed.object.put(a, instruction.owner, .{ .bool = false });
+    try current.object.put(a, "_resolver_aliases_managed", managed);
+    const removed = try merge(a, try std.json.Stringify.valueAlloc(a, current, .{}), try testDocument(a, instruction), "entity");
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, removed, .{});
+    try std.testing.expectEqual(@as(usize, 1), parsed.object.get("aliases").?.array.items.len);
+    try std.testing.expectEqualStrings("Authored", parsed.object.get("aliases").?.array.items[0].string);
 }

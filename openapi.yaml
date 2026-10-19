@@ -28624,7 +28624,8 @@ components:
           maximum: 128
           default: 8
           description: Earlier segments available for context and the maximum later segments invalidated
-            by an original source change. Recomputed outputs never extend that interval.
+            at each affected position of an original source change. A move invalidates the old and new
+            neighborhoods independently; recomputed outputs never extend either interval.
     TextChunkOptions:
       type: object
       description: Options specific to text chunking.

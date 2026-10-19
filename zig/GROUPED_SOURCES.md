@@ -134,6 +134,17 @@ units; catalog mutation gates protect partially installed transfers.
 Original source sequence debt is indexed separately from
 coalesced latest work, so future appends do not starve an earlier visibility
 barrier. `enrichments` and `full_index` wait for affected grouped work.
+Each original correction owns bounded dependency rows for the partitions it
+invalidates. Completion retires those rows against accepted partition revisions,
+so a later source outside the correction's horizon cannot extend its barrier.
+Moves scan the old and new neighborhoods independently. Context invalidation
+records pending partition work immediately; unit guards become visible with
+the replacement snapshot in group order, keeping later producers from blocking
+the replay that materializes their predecessors.
+Grouped producer readiness replaces the shared enrichment replay watermark for
+group-rooted DAGs; producers rooted in primary documents retain their ordinary
+fence. After grouped acceptance, `full_index` captures one publication cut and
+waits for its managed indexes without chasing later appends.
 
 A group coordinator lives at a hash-distributed logical anchor. Units and
 coordinator records stay together across split boundaries. Cross-shard fan-in

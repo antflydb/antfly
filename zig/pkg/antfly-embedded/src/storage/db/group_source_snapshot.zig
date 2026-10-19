@@ -137,7 +137,7 @@ pub fn stage(comptime Keys: type, a: A, txn: anytype, prepared: *const Prepared,
         if (desired.contains(document)) continue;
         try txn.delete(try Keys.documentKeyAlloc(a, document));
         try txn.delete(try Keys.ttlKeyAlloc(a, document));
-        try txn.delete(try identity.unitContextEpochKey(a, document));
+        try state.clearUnitContext(a, txn, command.held.group, command.held.partition, document);
         try deleted.append(a, document);
     };
     var retired: std.ArrayList([]const u8) = .empty;
@@ -258,6 +258,7 @@ test "group unit publication changes only affected units replays context and ret
     const retired = try stage(Keys, a, &txn, &empty, command, 13);
     try std.testing.expectEqual(@as(usize, 2), retired.deleted.len);
     try std.testing.expectError(error.NotFound, txn.get(unchanged_key));
+    try std.testing.expectError(error.NotFound, txn.get(try identity.unitHorizonEpochKey(a, prepared.units[0].document, 1)));
     try std.testing.expectEqual(@as(usize, 0), (try state.readSnapshot(a, &txn, group, partition)).?.units.len);
     try state.finish(a, &txn, group, partition, command.held.lease, 402, groups.digest("published-empty"));
     event.source_revision = 4;

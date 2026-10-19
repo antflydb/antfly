@@ -10798,7 +10798,7 @@ pub const PriorArtifactContext = struct {
     render: []const u8,
     max_items: ?i64 = null,
     max_bytes: ?i64 = null,
-    /// Earlier segments available for context and the maximum later segments invalidated by an original source change. Recomputed outputs never extend that interval.
+    /// Earlier segments available for context and the maximum later segments invalidated at each affected position of an original source change. A move invalidates the old and new neighborhoods independently; recomputed outputs never extend either interval.
     horizon_segments: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

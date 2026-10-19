@@ -4053,9 +4053,9 @@ pub fn storageOwnerWaitForSync(
             const timeout_ms = if (handle.db.enrichment_runtime) |runtime| runtime.syncWaitTimeoutMs() else 5 * std.time.ms_per_min;
             target.deadline_ns = antfly.platform_time.monotonicNs() +| (std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64));
             target.captured = 1;
-        } else if (target.captured != 1 or std.mem.readInt(u128, &target.root_incarnation_le, .little) != root) return storageOwnerStatusFromError(error.StorageKernelOwnerStaleDescriptor);
+        } else if ((target.captured != 1 and target.captured != 2) or std.mem.readInt(u128, &target.root_incarnation_le, .little) != root) return storageOwnerStatusFromError(error.StorageKernelOwnerStaleDescriptor);
         if (antfly.platform_time.monotonicNs() >= target.deadline_ns) return storageOwnerStatusFromError(error.Timeout);
-        handle.db.waitForResolvedTransactionSyncWithCancellation(sync_level, target.sequence, cancellation) catch |err| return storageOwnerStatusFromError(err);
+        handle.db.waitForResolvedTransactionSyncTargetWithCancellation(sync_level, &target.sequence, &target.captured, cancellation) catch |err| return storageOwnerStatusFromError(err);
     } else handle.db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }

@@ -19,7 +19,8 @@ class PriorArtifactContext:
         max_items (int | Unset):  Default: 40.
         max_bytes (int | Unset):  Default: 16384.
         horizon_segments (int | Unset): Earlier segments available for context and the maximum later segments
-            invalidated by an original source change. Recomputed outputs never extend that interval. Default: 8.
+            invalidated at each affected position of an original source change. A move invalidates the old and new
+            neighborhoods independently; recomputed outputs never extend either interval. Default: 8.
     """
 
     artifact: str

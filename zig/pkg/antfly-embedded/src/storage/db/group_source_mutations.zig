@@ -31,6 +31,7 @@ pub const Plan = struct {
         source: groups.Config,
         configuration: groups.Digest,
         horizon: u16 = 0,
+        horizons: []const u16 = &.{},
         filter: graph.CompiledPatternFilter,
     };
     pub fn init(a: A, templates: anytype) !Plan {
@@ -45,6 +46,7 @@ pub const Plan = struct {
             try source.validate();
             const name = try owned.dupe(u8, template.artifact_name);
             var horizon: u16 = 0;
+            var horizons: std.ArrayList(u16) = .empty;
             for (templates) |consumer| {
                 if (consumer.prior_context_json.len == 0) continue;
                 var upstream = consumer.upstream_artifact_name;
@@ -53,6 +55,7 @@ pub const Plan = struct {
                     if (std.mem.eql(u8, upstream, name)) {
                         const prior = try std.json.parseFromSliceLeaky(groups.PriorContext, owned, consumer.prior_context_json, .{});
                         horizon = @max(horizon, prior.horizon_segments);
+                        if (std.mem.indexOfScalar(u16, horizons.items, prior.horizon_segments) == null) try horizons.append(owned, prior.horizon_segments);
                         break;
                     }
                     var next: []const u8 = "";
@@ -63,7 +66,7 @@ pub const Plan = struct {
                     upstream = next;
                 }
             }
-            try entries.append(owned, .{ .horizon = horizon, .name = name, .source = source, .configuration = groups.definitionDigest(name, source), .filter = if (source.filter == .null) .match_all else try graph.compilePatternFilter(owned, try groups.normalizedFilter(owned, source.filter)) });
+            try entries.append(owned, .{ .horizon = horizon, .horizons = try horizons.toOwnedSlice(owned), .name = name, .source = source, .configuration = groups.definitionDigest(name, source), .filter = if (source.filter == .null) .match_all else try graph.compilePatternFilter(owned, try groups.normalizedFilter(owned, source.filter)) });
         }
         return .{ .arena = arena, .entries = try entries.toOwnedSlice(owned) };
     }

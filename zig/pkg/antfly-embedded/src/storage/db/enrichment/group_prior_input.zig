@@ -55,7 +55,7 @@ pub fn capture(a: A, store: *Store, request: requests.GeneratedEnrichmentRequest
     if (try state.nextPending(owned, &read, group)) |pending| {
         if (!std.mem.eql(u8, pending.partition.segment, segment.string) and prior.Position.before(.{ .ordinal = pending.ordinal, .segment = pending.partition.segment }, .{ .ordinal = ordinal.integer, .segment = segment.string })) return error.ArtifactPublicationPending;
     }
-    const epoch_key = try identity.unitContextEpochKey(owned, request.doc_key);
+    const epoch_key = try identity.unitHorizonEpochKey(owned, request.doc_key, config.horizon_segments);
     const epoch = read.getLeased(epoch_key) catch |err| if (err == error.NotFound) null else return err;
     if (token) |value| try value.observe(epoch_key, epoch, try @import("../artifact_publication.zig").artifactRevision(&read, value.namespace, epoch_key));
     const prefix = try state.directoryPrefix(owned, group);

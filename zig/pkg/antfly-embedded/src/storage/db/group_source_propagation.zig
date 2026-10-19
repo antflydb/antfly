@@ -21,6 +21,7 @@ const index = @import("group_source_index.zig");
 const state = @import("group_source_state.zig");
 const reads = @import("group_source_reads.zig");
 const A = std.mem.Allocator;
+const causes = @import("group_source_causes.zig");
 pub const Progress = struct {
     source_revision: u64,
     event_digest: groups.Digest,
@@ -30,8 +31,12 @@ pub const Progress = struct {
     frontier: u64 = 0,
     enrollment: u64 = 0,
     ordinal: ?i64 = null,
+    new_ordinal: ?i64 = null,
+    anchors_bound: bool = false,
+    scan: u8 = 0,
+    causal_version: u8 = 0,
 };
-pub const Status = struct { source_revision: u64, propagated: bool, frontier: u64, settled: bool };
+pub const Status = struct { source_revision: u64, propagated: bool, frontier: u64, settled: bool, retire_ready: bool = false };
 fn selectedKey(a: A, group: state.Group, owner: state.Owner, event: index.Invalidation) ![]u8 {
     const identity = try std.json.Stringify.valueAlloc(a, .{ owner, event.document, event.partition }, .{});
     return state.metadataKey(a, group, 12, &groups.digest(identity));
@@ -39,15 +44,33 @@ fn selectedKey(a: A, group: state.Group, owner: state.Owner, event: index.Invali
 fn fingerprint(a: A, event: index.Invalidation) !groups.Digest {
     return index.eventDigest(a, event);
 }
-pub fn status(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation) !?Status {
+pub fn causeId(a: A, owner: state.Owner, event: index.Invalidation) !groups.Digest {
+    return groups.digest(try selectedKey(a, .{ .definition = event.definition, .key = event.partition.group }, owner, event));
+}
+pub fn currentProgress(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation) !?Progress {
     const group = state.Group{ .definition = event.definition, .key = event.partition.group };
     const value = (try state.readRecord(Progress, a, txn, try selectedKey(a, group, owner, event))) orelse return null;
     if (value.source_revision != event.source_revision or !std.mem.eql(u8, &value.event_digest, &(try fingerprint(a, event)))) return null;
     if (try state.readSnapshot(a, txn, group, event.partition) == null and try state.pendingFor(a, txn, group, event.partition) == null) return null;
-    return .{ .source_revision = value.source_revision, .propagated = value.done, .frontier = value.frontier, .settled = value.done and try state.frontierSettled(a, txn, group, value.frontier) };
+    return value;
+}
+pub fn status(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation) !?Status {
+    const value = (try currentProgress(a, txn, owner, event)) orelse return null;
+    const group = state.Group{ .definition = event.definition, .key = event.partition.group };
+    const propagated = value.done and value.causal_version == 1;
+    const readiness = if (propagated) try causes.readiness(a, txn, group, try causeId(a, owner, event)) else causes.Readiness{ .empty = false, .retire_ready = false };
+    return .{ .source_revision = value.source_revision, .propagated = propagated, .frontier = value.frontier, .settled = propagated and readiness.empty, .retire_ready = readiness.retire_ready };
 }
 pub fn advance(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation, horizon: u16) !void {
-    if (horizon > 128) return error.InvalidGroupedPriorContext;
+    return advanceHorizons(a, txn, owner, event, if (horizon == 0) &.{} else &.{horizon});
+}
+pub fn advanceHorizons(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation, horizons: []const u16) !void {
+    if (horizons.len > 128) return error.InvalidGroupedPriorContext;
+    var horizon: u16 = 0;
+    for (horizons) |value| {
+        if (value == 0 or value > 128) return error.InvalidGroupedPriorContext;
+        horizon = @max(horizon, value);
+    }
     const revision = try state.invalidate(a, txn, owner, event);
     const group = state.Group{ .definition = event.definition, .key = event.partition.group };
     const selected = try selectedKey(a, group, owner, event);
@@ -56,24 +79,37 @@ pub fn advance(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation
     if (progress.source_revision > event.source_revision) return;
     if (progress.source_revision < event.source_revision) progress = .{ .source_revision = event.source_revision, .event_digest = digest };
     if (!std.mem.eql(u8, &progress.event_digest, &digest)) return error.GroupedSourceCorrupt;
-    if (progress.enrollment != revision) progress = .{ .source_revision = event.source_revision, .event_digest = digest, .enrollment = revision };
-    if (progress.done) return;
-    if (horizon != 0 and !event.repair and progress.ordinal == null) {
-        // New segments acquire their global first-member ordinal from fan-in.
-        // Enroll first, then bind the finite interval after materialization;
-        // delivery order must not choose a different replay horizon.
-        const snapshot = (try state.readSnapshot(a, txn, group, event.partition)) orelse {
+    if (progress.enrollment != revision or progress.causal_version != 1) progress = .{ .source_revision = event.source_revision, .event_digest = digest, .enrollment = revision, .causal_version = 1 };
+    const cause = try causeId(a, owner, event);
+    if (progress.done) return causes.retirePage(a, txn, group, cause);
+    try causes.enroll(a, txn, group, cause, revision, event.partition, revision, &.{});
+    progress.frontier = @max(progress.frontier, revision); // Diagnostic only.
+    if (progress.ordinal == null) {
+        // Capture the old partition minimum before publishing the afterimage.
+        const pending = try state.pendingFor(a, txn, group, event.partition);
+        progress.ordinal = if (pending) |value| value.ordinal else event.ordinal;
+    }
+    if (horizon != 0 and !event.repair and !progress.anchors_bound) {
+        const snapshot = try state.readSnapshot(a, txn, group, event.partition);
+        if (snapshot == null or snapshot.?.revision < revision) {
             try state.writeRecord(a, txn, selected, progress);
             return;
-        };
-        progress.ordinal = if (snapshot.units.len != 0 or snapshot.revision == revision) @min(event.ordinal, snapshot.ordinal) else event.ordinal;
+        }
+        progress.new_ordinal = if (snapshot.?.units.len > 0) snapshot.?.ordinal else null;
+        progress.anchors_bound = true;
     }
     if (horizon == 0 or event.repair) {
         progress.done = true;
         progress.frontier = revision;
     } else {
         const prefix = try state.directoryPrefix(a, group);
-        const start = if (progress.cursor.len == 0) try state.directoryOrdinalBound(a, group, progress.ordinal orelse event.ordinal, false) else try reads.decode(a, progress.cursor);
+        // Enroll the earlier neighborhood first. A worker may run between
+        // bounded scans; a backward move must make its new predecessor work
+        // visible before allowing the old, later successors to publish.
+        const old_ordinal = progress.ordinal.?;
+        const new_ordinal = progress.new_ordinal orelse old_ordinal;
+        const ordinal = if (progress.scan == 0) @min(old_ordinal, new_ordinal) else @max(old_ordinal, new_ordinal);
+        const start = if (progress.cursor.len == 0) try state.directoryOrdinalBound(a, group, ordinal, false) else try reads.decode(a, progress.cursor);
         if (!std.mem.startsWith(u8, start, prefix)) return error.GroupedSourceCorrupt;
         var cursor = try txn.openPhysicalCursorAdapter();
         defer cursor.close();
@@ -88,10 +124,12 @@ pub fn advance(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation
             visits += 1;
             const entry = try state.directoryEntry(a, txn, group, current.key);
             progress.cursor = try reads.encode(a, current.key);
-            if (@import("group_prior_context.zig").Position.before(.{ .ordinal = progress.ordinal orelse event.ordinal, .segment = event.partition.segment }, .{ .ordinal = entry.snapshot.ordinal, .segment = entry.partition.segment }) and !std.mem.eql(u8, entry.partition.segment, event.partition.segment)) {
+            if (@import("group_prior_context.zig").Position.before(.{ .ordinal = ordinal, .segment = event.partition.segment }, .{ .ordinal = entry.snapshot.ordinal, .segment = entry.partition.segment }) and !std.mem.eql(u8, entry.partition.segment, event.partition.segment)) {
                 const segment = groups.digest(entry.partition.segment);
+                var distance = seen.items.len + 1;
                 var known = false;
-                for (seen.items) |previous| if (std.mem.eql(u8, &previous, &segment)) {
+                for (seen.items, 0..) |previous, i| if (std.mem.eql(u8, &previous, &segment)) {
+                    distance = i + 1;
                     known = true;
                     break;
                 };
@@ -102,13 +140,31 @@ pub fn advance(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation
                     }
                     try seen.append(a, segment);
                 }
-                try state.invalidateContext(a, txn, group, &.{.{ .partition = entry.partition, .ordinal = entry.snapshot.ordinal }}, 1);
+                var affected: [128]u16 = undefined;
+                var count: usize = 0;
+                for (horizons) |value| if (value >= distance) {
+                    affected[count] = value;
+                    count += 1;
+                };
+                const missing = try causes.missingHorizons(a, txn, group, cause, revision, entry.partition, affected[0..count]);
+                if (missing.len > 0) {
+                    const required = try state.invalidateContextHorizons(a, txn, group, entry.partition, entry.snapshot.ordinal, missing);
+                    try causes.enroll(a, txn, group, cause, revision, entry.partition, required, missing);
+                    progress.frontier = @max(progress.frontier, required);
+                }
             }
             row = try cursor.next();
         }
         progress.segments = try seen.toOwnedSlice(a);
         if (row == null or !std.mem.startsWith(u8, row.?.key, prefix)) progress.done = true;
-        if (progress.done) progress.frontier = (try state.currentHead(a, txn, group)).revision;
+        if (progress.done and progress.scan == 0 and progress.new_ordinal != null and progress.new_ordinal.? != progress.ordinal.?) {
+            // A move has two independently bounded neighborhoods. Persist the
+            // second cursor; dependency rows deduplicate overlapping policies.
+            progress.scan = 1;
+            progress.cursor = "";
+            progress.segments = &.{};
+            progress.done = false;
+        }
     }
     try state.writeRecord(a, txn, selected, progress);
 }
