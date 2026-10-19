@@ -17,6 +17,117 @@ const storage_engine = @import("../engine.zig");
 const snapshot_staging = @import("snapshot_staging.zig");
 const execution_resources = @import("execution_resources.zig");
 const read_projection = @import("read_projection.zig");
+const allocation_bench_support_mod = @import("../../allocation_bench_support.zig");
+const antfly_runtime_abi = @import("antfly_runtime_abi");
+const antfly_runtime_fs = @import("antfly_runtime_fs");
+const antfly_server_test_sources = @import("antfly_server_test_sources");
+const antfly_test_error_logs = @import("antfly_test_error_logs");
+const artifact_asset_publication = @import("artifact_asset_publication.zig");
+const artifact_authored_acceptance = @import("artifact_authored_acceptance.zig");
+const artifact_chunk_cursor = @import("artifact_chunk_cursor.zig");
+const artifact_chunk_generation = @import("artifact_chunk_generation.zig");
+const artifact_chunk_inventory_progress = @import("artifact_chunk_inventory_progress.zig");
+const artifact_chunk_manifest = @import("artifact_chunk_manifest.zig");
+const artifact_chunk_scan_position = @import("artifact_chunk_scan_position.zig");
+const artifact_chunk_vector_cursor = @import("artifact_chunk_vector_cursor.zig");
+const artifact_completion_progress = @import("artifact_completion_progress.zig");
+const artifact_coverage_epoch = @import("artifact_coverage_epoch.zig");
+const artifact_coverage_layout = @import("artifact_coverage_layout.zig");
+const artifact_footprint_mod = @import("../artifact_footprint.zig");
+const artifact_inventory = @import("artifact_inventory.zig");
+const artifact_native_stream = @import("artifact_native_stream.zig");
+const artifact_payload_mod = @import("../artifact_payload.zig");
+const artifact_producer_baseline = @import("artifact_producer_baseline.zig");
+const artifact_producer_obligations = @import("artifact_producer_obligations.zig");
+const artifact_producer_provenance = @import("artifact_producer_provenance.zig");
+const artifact_producer_readiness = @import("artifact_producer_readiness.zig");
+const artifact_producer_scheduler_mod = @import("artifact_producer_scheduler.zig");
+const artifact_producer_validation = @import("artifact_producer_validation.zig");
+const artifact_projection_epoch = @import("artifact_projection_epoch.zig");
+const artifact_publication = @import("artifact_publication.zig");
+const artifact_publication_resolution = @import("artifact_publication_resolution.zig");
+const artifact_publication_transport = @import("artifact_publication_transport.zig");
+const artifact_publication_transport_codec = @import("artifact_publication_transport_codec.zig");
+const artifact_reconcile = @import("artifact_reconcile.zig");
+const artifact_reconcile_intent = @import("artifact_reconcile_intent.zig");
+const artifact_source_gap = @import("artifact_source_gap.zig");
+const artifact_stream_checkpoint = @import("artifact_stream_checkpoint.zig");
+const artifact_stream_progress = @import("artifact_stream_progress.zig");
+const artifact_unit_jobs = @import("artifact_unit_jobs.zig");
+const artifact_unit_progress = @import("artifact_unit_progress.zig");
+const backend_mod = @import("../lite/backend.zig");
+const bulk_ingest_session_mod = @import("bulk_ingest_session.zig");
+const cleanup_job_owner = @import("cleanup_job_owner.zig");
+const distributed_stats_mod = @import("../../search/distributed_stats.zig");
+const document_mutation_revision_mod = @import("../document_mutation_revision.zig");
+const document_query = @import("document_query.zig");
+const empty_generation_handoff = @import("empty_generation_handoff.zig");
+const enrichment_runtime_owner = @import("enrichment_runtime_owner.zig");
+const graph_cleanup_contract_mod = @import("../graph_cleanup_contract.zig");
+const graph_cleanup_owner_mod = @import("graph_cleanup_owner.zig");
+const graph_retirement_seal = @import("graph_retirement_seal.zig");
+const index_repair_scheduler = @import("index_repair_scheduler.zig");
+const io_threaded_runtime_mod = @import("derived/io_threaded_runtime.zig");
+const ir_mod = @import("algebraic/ir.zig");
+const local_runtime_owner = @import("local_runtime_owner.zig");
+const merge_page_chunks = @import("merge_page_chunks.zig");
+const merge_page_contract = @import("merge_page_contract.zig");
+const merge_proof_adoption = @import("merge_proof_adoption.zig");
+const merge_tail_reader = @import("merge_tail_reader.zig");
+const native_backup_seal = @import("native_backup_seal.zig");
+const native_query_cut = @import("native_query_cut.zig");
+const native_query_cut_repository = @import("native_query_cut_repository.zig");
+const native_query_reuse = @import("native_query_reuse.zig");
+const native_query_warming_mod = @import("native_query_warming.zig");
+const native_topology_receipt = @import("native_topology_receipt.zig");
+const node_admission_mod = @import("../../graph/node_admission.zig");
+const online_graph_artifacts = @import("online_graph_artifacts.zig");
+const online_integrity_shadow = @import("online_integrity_shadow.zig");
+const online_merge_io = @import("online_merge_io.zig");
+const online_source = @import("online_source.zig");
+const online_source_contract = @import("online_source_contract.zig");
+const policies_mod = @import("../../system_catalog/policies.zig");
+const publication_mod = @import("publication.zig");
+const publication_recovery_owner = @import("publication_recovery_owner.zig");
+const query_visibility = @import("query_visibility.zig");
+const range_protection_mod = @import("../range_protection.zig");
+const receipt_position = @import("receipt_position.zig");
+const relational_checks_mod = @import("../../schema/relational_checks.zig");
+const relational_index_keys = @import("relational_index_keys.zig");
+const relational_index_maintenance = @import("relational_index_maintenance.zig");
+const relational_index_maintenance_contract = @import("relational_index_maintenance_contract.zig");
+const relational_index_mod = @import("../relational_index.zig");
+const relational_initial_child_publication = @import("relational_initial_child_publication.zig");
+const relational_integrity = @import("relational_integrity.zig");
+const relational_integrity_activation = @import("relational_integrity_activation.zig");
+const relational_integrity_catalog = @import("relational_integrity_catalog.zig");
+const relational_integrity_generation_admission = @import("relational_integrity_generation_admission.zig");
+const relational_integrity_generation_retirement = @import("relational_integrity_generation_retirement.zig");
+const relational_integrity_handoff = @import("relational_integrity_handoff.zig");
+const relational_integrity_json = @import("relational_integrity_json.zig");
+const relational_integrity_range = @import("relational_integrity_range.zig");
+const relational_integrity_retirement = @import("relational_integrity_retirement.zig");
+const relational_integrity_topology = @import("relational_integrity_topology.zig");
+const relational_integrity_topology_contract = @import("relational_integrity_topology_contract.zig");
+const relational_rewrite_program = @import("relational_rewrite_program.zig");
+const relational_rewrite_staging = @import("relational_rewrite_staging.zig");
+const relationship_filter_mod = @import("../../graph/relationship_filter.zig");
+const replay_vector_collectors = @import("replay_vector_collectors.zig");
+const replication_ingress = @import("replication_ingress.zig");
+const restore_generation_admissions = @import("restore_generation_admissions.zig");
+const restore_staging = @import("restore_staging.zig");
+const restore_staging_contract = @import("restore_staging_contract.zig");
+const retained_effects_mod = @import("../retained_effects.zig");
+const source_artifact_transfer = @import("source_artifact_transfer.zig");
+const source_authority_mod = @import("../source_authority.zig");
+const source_pin = @import("source_pin.zig");
+const source_pin_cleanup_owner = @import("source_pin_cleanup_owner.zig");
+const source_pin_state_mod = @import("../source_pin_state.zig");
+const source_proof_batch = @import("source_proof_batch.zig");
+const storage_io_mod = @import("../lsm_backend/storage_io.zig");
+const target_advance_tracker = @import("target_advance_tracker.zig");
+const test_allocator_mod = @import("../test_allocator.zig");
+const vopr_mod = @import("vopr");
 // Canonical execution types come from execution_resources. This compile-time
 // binding retains only open configuration, existing local codec/collector
 // entry points, and pointers to live cache and fault-injection state.
@@ -99,7 +210,7 @@ const document_child_range_effects = @import("document_child_range_effects.zig")
 const document_child_range_outbox = @import("document_child_range_outbox.zig");
 const replicated_mutation = @import("replicated_mutation.zig");
 const std = @import("std");
-const missingAsNull = @import("../backend_types.zig").missingAsNull;
+const missingAsNull = backend_types.missingAsNull;
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
 const replication_contract = @import("replication_contract.zig");
 const durable_outbox = @import("durable_outbox.zig");
@@ -115,7 +226,7 @@ const no_background_test_open: OpenOptions = .{ .start_index_workers = false, .t
 const no_replay_no_background_test_open: OpenOptions = .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } };
 const ant_json = @import("antfly-json");
 const vector_mod = @import("antfly_vector").vector;
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = platform.sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const antfly_image = @import("antfly_image");
@@ -123,9 +234,9 @@ const platform = @import("antfly_platform");
 const Allocator = execution_resources.Allocator;
 const Io = execution_resources.Io;
 const AtomicU64 = execution_resources.AtomicU64;
-const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const fs_paths = antfly_runtime_fs.fs_paths;
 const common_secrets = @import("../../common/secrets.zig");
-const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
+const threaded_io_limits = antfly_runtime_fs.threaded_io_limits;
 const backend_types = @import("../backend_types.zig");
 const backup_codec = @import("../backup_codec.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -173,7 +284,7 @@ const index_repair_state = @import("derived/index_repair_state.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
 const index_generation_manifest = @import("derived/index_generation_manifest.zig");
 const root_identity = @import("root_identity.zig");
-const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
+const runtime_error_abi = antfly_runtime_abi.error_abi;
 const json_helpers = @import("../../api/json_helpers.zig");
 
 test {
@@ -192,7 +303,7 @@ test {
 const change_journal_mod = @import("derived/change_journal.zig");
 const replication_effects_mod = @import("replication_effects.zig");
 
-const replication_mutation_barrier_mod = @import("antfly_runtime_abi").mutation_barrier;
+const replication_mutation_barrier_mod = antfly_runtime_abi.mutation_barrier;
 
 const replication_record_mod = @import("replication_record.zig");
 
@@ -233,7 +344,7 @@ const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
-const process_memory_mod = @import("antfly_platform").process_memory;
+const process_memory_mod = platform.process_memory;
 
 fn quarantineClaimMismatchReason(
     mismatch: index_manager_mod.IndexManager.FailedIndexLoadMismatch,
@@ -357,8 +468,8 @@ else
 const graph_metadata_tables = @import("../../graph/metadata_tables.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_metric_rerank = @import("../../graph/metric_rerank.zig");
-const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
-const GraphNodeRef = @import("../../graph/node_admission.zig").NodeRef;
+const NodeAdmission = node_admission_mod.NodeAdmission;
+const GraphNodeRef = node_admission_mod.NodeRef;
 const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
@@ -412,8 +523,8 @@ const db_split_sim_fixture = @import("db_split_sim_fixture.zig");
 const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
     pub const sim = struct {};
 };
-const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
+const platform_clock = platform.clock;
+const platform_time = platform.time;
 
 /// A backup can be admitted before a policy barrier and continue streaming
 /// after the barrier closes. Compose the caller's cancellation with the
@@ -545,7 +656,7 @@ pub const SchemaBeforeIndexLoad = struct {
 /// `DB.run_until_idle_no_progress_timeout_ns`. See `checkTargetAdvanceNoProgress`.
 const default_run_until_idle_no_progress_timeout_ns: u64 = 60 * std.time.ns_per_s;
 
-pub const ArtifactPublicationDispatcher = @import("artifact_publication.zig").Dispatcher;
+pub const ArtifactPublicationDispatcher = artifact_publication.Dispatcher;
 pub const OpenOptions = struct {
     pub const PhysicalRootMode = enum {
         /// The DB path names a directory-backed physical root. DB owns its
@@ -590,7 +701,7 @@ pub const OpenOptions = struct {
     /// source projections. Do not open intentionally omitted index artifacts.
     primary_only_readonly: bool = false,
     initial_owner_range: ?range_state_mod.InitialOwnerRange = null,
-    initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
+    initial_child_bootstrap: ?relational_initial_child_publication.Bootstrap = null,
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
     primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default },
@@ -627,7 +738,7 @@ pub const OpenOptions = struct {
     identity_namespace: ?doc_identity.Namespace = null,
     /// Immutable authenticated deployment ownership, not selected by a source
     /// request. Decoders/library opens may leave this unset.
-    online_source_authority: ?@import("../source_authority.zig").Kind = null,
+    online_source_authority: ?source_authority_mod.Kind = null,
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
@@ -776,7 +887,7 @@ pub const OpenMode = OpenOptions.OpenMode;
 
 pub const MutationBarrier = execution_resources.MutationBarrier;
 
-const deinitOwnedEnrichmentConfig = @import("enrichment_runtime_owner.zig").deinitConfig;
+const deinitOwnedEnrichmentConfig = enrichment_runtime_owner.deinitConfig;
 
 pub const ReplicationAsyncEffectMirror = execution_resources.ReplicationAsyncEffectMirror;
 
@@ -818,13 +929,13 @@ pub const CommittedBatchEffectsObserver = execution_resources.CommittedBatchEffe
 
 pub const ReplayProgressHook = *const fn (ctx: *anyopaque, index_name: []const u8, progress: ReplayProgress) anyerror!void;
 
-pub const QueryVisibilityChange = @import("query_visibility.zig").QueryVisibilityChange;
-pub const IndexRepairAdmission = @import("query_visibility.zig").IndexRepairAdmission;
-pub const IndexLifecycleWorkClass = @import("query_visibility.zig").IndexLifecycleWorkClass;
-pub const IndexRepairVisibility = @import("query_visibility.zig").IndexRepairVisibility;
-pub const IndexTargetVisibility = @import("query_visibility.zig").IndexTargetVisibility;
-pub const QueryVisibilityEvent = @import("query_visibility.zig").QueryVisibilityEvent;
-pub const QueryVisibilityHook = @import("query_visibility.zig").QueryVisibilityHook;
+pub const QueryVisibilityChange = query_visibility.QueryVisibilityChange;
+pub const IndexRepairAdmission = query_visibility.IndexRepairAdmission;
+pub const IndexLifecycleWorkClass = query_visibility.IndexLifecycleWorkClass;
+pub const IndexRepairVisibility = query_visibility.IndexRepairVisibility;
+pub const IndexTargetVisibility = query_visibility.IndexTargetVisibility;
+pub const QueryVisibilityEvent = query_visibility.QueryVisibilityEvent;
+pub const QueryVisibilityHook = query_visibility.QueryVisibilityHook;
 
 pub const PrimaryBackend = execution_resources.PrimaryBackend;
 
@@ -857,13 +968,13 @@ fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
     };
 }
 
-const IndexRepairSchedulerDirectory = @import("index_repair_scheduler.zig").Directory;
-const retryableIndexRepairTerminalPhase = @import("index_repair_scheduler.zig").retryableTerminalPhase;
+const IndexRepairSchedulerDirectory = index_repair_scheduler.Directory;
+const retryableIndexRepairTerminalPhase = index_repair_scheduler.retryableTerminalPhase;
 
 const AsyncDenseCatchUpSession = @import("dense_catch_up_session_owner.zig").Session;
 const AsyncContext = execution_resources.AsyncContext;
 
-const TargetAdvanceMaintenanceDebt = @import("target_advance_tracker.zig").Debt;
+const TargetAdvanceMaintenanceDebt = target_advance_tracker.Debt;
 
 fn indexRepairSupportsSnapshotCursor(kind: types.IndexKind) bool {
     return switch (kind) {
@@ -915,9 +1026,9 @@ var test_fail_portable_activation_retry_fallback_submit: std.atomic.Value(bool) 
 var test_pause_portable_activation_retry_probe_before_lifecycle_lock: std.atomic.Value(bool) = .init(false);
 var test_portable_activation_retry_probe_paused: std.atomic.Value(bool) = .init(false);
 var test_release_portable_activation_retry_probe: std.atomic.Value(bool) = .init(false);
-var test_graph_repair_stream_flushes: @import("antfly_platform").atomic.Value(u64) = .init(0);
-var test_graph_repair_stream_scans: @import("antfly_platform").atomic.Value(u64) = .init(0);
-var test_graph_split_retire_flushes: @import("antfly_platform").atomic.Value(u64) = .init(0);
+var test_graph_repair_stream_flushes: platform.atomic.Value(u64) = .init(0);
+var test_graph_repair_stream_scans: platform.atomic.Value(u64) = .init(0);
+var test_graph_split_retire_flushes: platform.atomic.Value(u64) = .init(0);
 var test_graph_split_retire_abort_after_flush: std.atomic.Value(bool) = .init(false);
 var test_graph_split_retire_abort_before_cursor: std.atomic.Value(bool) = .init(false);
 var test_graph_merge_import_abort_after_primary: std.atomic.Value(bool) = .init(false);
@@ -2066,7 +2177,7 @@ const PortableImportStage = struct {
     }
 
     fn publishMarkedGeneration(self: *PortableImportStage, target: *docstore_mod.DocStore) !void {
-        try @import("../artifact_footprint.zig").invalidate(target);
+        try artifact_footprint_mod.invalidate(target);
         try target.beginBulkIngestSession();
         var bulk_active = true;
         defer if (bulk_active) target.abortBulkIngestSession();
@@ -2106,7 +2217,7 @@ const PortableImportStage = struct {
                 // The staging store generated its own local footprint while
                 // importing. Never overwrite destination epochs/cursors with
                 // those facts; destination mutation hooks observe the bytes.
-                if (@import("../artifact_footprint.zig").isKey(key)) return .@"continue";
+                if (artifact_footprint_mod.isKey(key)) return .@"continue";
                 const entry_bytes = key.len +| value.len;
                 if (state.writes.items.len != 0 and
                     (state.writes.items.len >= portable_import_publish_batch_entries or
@@ -2353,7 +2464,7 @@ fn writeRestoreMarkerAtomicWithIo(
 ) !void {
     if (raw.len > max_restore_marker_bytes) return error.RestoreMarkerTooLarge;
     var entropy: [8]u8 = undefined;
-    try @import("antfly_platform").entropy.fill(io, &entropy);
+    try platform.entropy.fill(io, &entropy);
     const nonce = std.fmt.bytesToHex(entropy, .lower);
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{s}", .{ path, &nonce });
     defer alloc.free(tmp_path);
@@ -2522,7 +2633,7 @@ fn spinOrYield() void {
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
 }
 
@@ -2585,7 +2696,7 @@ fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: types.Canc
         if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
             std.atomic.spinLoopHint();
         } else if (attempts < 128) {
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
         } else {
             const backoff_step = @min(attempts - 128, 5);
             sleepNs(@min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000)));
@@ -2647,7 +2758,7 @@ fn lockApplyWithBackoffProfiled(rw_lock: *apply_rw_lock_mod.ApplyRwLock, stats: 
             continue;
         }
         if (attempts < 128) {
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
             yield_loops += 1;
             continue;
         }
@@ -2972,21 +3083,21 @@ const LookupProjectionPlans = struct {
     const Entry = struct { plan: RelationalProjectionPlan, used: usize };
     alloc: Allocator,
     opts: types.LookupOptions,
-    plain: ?@import("document_query.zig").SpanProjectionPlan = null,
+    plain: ?document_query.SpanProjectionPlan = null,
     plain_initialized: bool = false,
     native: [4]?Entry = @splat(null),
     clock: usize = 0,
     fn init(alloc: Allocator, opts: types.LookupOptions) !@This() {
-        const a = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+        const a = platform.allocator.reclaimingScratch(alloc);
         return .{ .alloc = a, .opts = opts };
     }
     fn deinit(self: *@This()) void {
         if (self.plain) |*plan| plan.deinit();
         for (&self.native) |*entry| if (entry.*) |*value| value.plan.deinit();
     }
-    fn getPlain(self: *@This()) !?*const @import("document_query.zig").SpanProjectionPlan {
+    fn getPlain(self: *@This()) !?*const document_query.SpanProjectionPlan {
         if (!self.plain_initialized) {
-            self.plain = try @import("document_query.zig").SpanProjectionPlan.init(self.alloc, self.opts);
+            self.plain = try document_query.SpanProjectionPlan.init(self.alloc, self.opts);
             self.plain_initialized = true;
         }
         return if (self.plain) |*plan| plan else null;
@@ -3013,11 +3124,11 @@ const LookupProjectionPlans = struct {
 const DocumentPrimaryReadWindow = struct {
     const max_bytes: usize = 8 * 1024 * 1024;
     arena: std.heap.ArenaAllocator,
-    scope: ?@import("../backend_erased.zig").ReadScope = null,
+    scope: ?backend_erased_mod.ReadScope = null,
     bytes: usize = 0,
     retirements: usize = 0,
     fn init(alloc: Allocator) @This() {
-        return .{ .arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
+        return .{ .arena = .init(platform.allocator.reclaimingScratch(alloc)) };
     }
     fn retire(self: *@This()) void {
         if (self.scope) |*scope| {
@@ -3078,9 +3189,9 @@ const DocumentPrimaryReadWindow = struct {
 const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
 
 pub const DB = struct {
-    retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
-    retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
-    native_query_warming: @import("native_query_warming.zig").Owner = .{},
+    retained_query_lease: ?native_query_cut.Guard = null,
+    retained_remote_query_lease: ?native_query_cut_repository.StorageLease = null,
+    native_query_warming: native_query_warming_mod.Owner = .{},
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
     /// Monolithic managed opens retain the process verifier until workers drain.
@@ -3093,7 +3204,7 @@ pub const DB = struct {
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
     stable_address: bool = false,
-    graph_cleanup_owner: @import("graph_cleanup_owner.zig").Owner = .{},
+    graph_cleanup_owner: graph_cleanup_owner_mod.Owner = .{},
     alloc: Allocator,
     runtime_alloc: Allocator,
     generation_read_lease: ?generation_lifecycle.ReadLease,
@@ -3120,7 +3231,7 @@ pub const DB = struct {
     /// Owner-scoped recovery keeps remote acknowledgement off the open/read
     /// path. The startup barrier orders crash-left obligations before new WAL
     /// records; steady-state mutations then wait on independent LSN watermarks.
-    publication_recovery: @import("publication_recovery_owner.zig").Owner,
+    publication_recovery: publication_recovery_owner.Owner,
     algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -3141,12 +3252,12 @@ pub const DB = struct {
     enrichment_append_context: ?*EnrichmentAppendContext,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     resolution_append_context: ?*EnrichmentAppendContext = null,
-    resolution_owner: @import("local_runtime_owner.zig").Bundle(EnrichmentAppendContext, resolution_runtime_mod.ResolutionRuntime) = .{},
-    promotion_owner_bundle: @import("local_runtime_owner.zig").RuntimeOwner(promotion_runtime_mod.PromotionRuntime) = .{},
-    ttl_owner: @import("local_runtime_owner.zig").Bundle(TtlCleanupContext, ttl_runtime_mod.TtlRuntime) = .{},
-    text_merge_owner: @import("local_runtime_owner.zig").RuntimeOwner(text_merge_runtime_mod.TextMergeRuntime) = .{},
-    sparse_compaction_owner: @import("local_runtime_owner.zig").RuntimeOwner(sparse_compaction_runtime_mod.SparseCompactionRuntime) = .{},
-    graph_metric_owner: @import("local_runtime_owner.zig").RuntimeOwner(graph_metric_runtime_mod.GraphMetricRuntime) = .{},
+    resolution_owner: local_runtime_owner.Bundle(EnrichmentAppendContext, resolution_runtime_mod.ResolutionRuntime) = .{},
+    promotion_owner_bundle: local_runtime_owner.RuntimeOwner(promotion_runtime_mod.PromotionRuntime) = .{},
+    ttl_owner: local_runtime_owner.Bundle(TtlCleanupContext, ttl_runtime_mod.TtlRuntime) = .{},
+    text_merge_owner: local_runtime_owner.RuntimeOwner(text_merge_runtime_mod.TextMergeRuntime) = .{},
+    sparse_compaction_owner: local_runtime_owner.RuntimeOwner(sparse_compaction_runtime_mod.SparseCompactionRuntime) = .{},
+    graph_metric_owner: local_runtime_owner.RuntimeOwner(graph_metric_runtime_mod.GraphMetricRuntime) = .{},
     // Runtime/context pointer fields below are borrowed views of these owners.
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
@@ -3155,12 +3266,12 @@ pub const DB = struct {
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
     promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
     entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
-    source_pin_cleanup: @import("source_pin_cleanup_owner.zig").Owner = .{},
+    source_pin_cleanup: source_pin_cleanup_owner.Owner = .{},
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
     transaction_recovery_local_context: ?*TransactionRecoveryLocalContext,
-    transaction_owner: @import("local_runtime_owner.zig").OwningBundle(TransactionRecoveryContexts, transaction_runtime_mod.Runtime, TransactionRecoveryContexts.release) = .{},
+    transaction_owner: local_runtime_owner.OwningBundle(TransactionRecoveryContexts, transaction_runtime_mod.Runtime, TransactionRecoveryContexts.release) = .{},
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
@@ -3182,7 +3293,7 @@ pub const DB = struct {
     document_authority_backfill_requested: std.atomic.Value(bool) = .init(false),
     document_authority_backfill_mutex: std.atomic.Mutex = .unlocked,
     document_authority_backfill_restart: bool = false,
-    document_authority_repairs: @import("../document_mutation_revision.zig").RepairQueue = .{},
+    document_authority_repairs: document_mutation_revision_mod.RepairQueue = .{},
     document_authority_repairs_yield_sweep: bool = false,
     relational_columns_building: std.atomic.Value(bool) = .init(false),
     relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
@@ -3191,7 +3302,7 @@ pub const DB = struct {
     artifact_repair_metadata_pending: bool = true,
     artifact_footprint_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_baseline_pending: std.atomic.Value(bool) = .init(true),
-    artifact_producer_scheduler: @import("artifact_producer_scheduler.zig").Scheduler = .{},
+    artifact_producer_scheduler: artifact_producer_scheduler_mod.Scheduler = .{},
     local_source_completion_audit_pending: bool = true,
     /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
     /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
@@ -3205,8 +3316,8 @@ pub const DB = struct {
     /// line. Overwritten on each new occurrence; freed at `deinitWrapperState`.
     last_run_until_idle_no_progress: ?NoProgressDiagnostic = null,
     shadow: ?*ShadowState,
-    bulk_ingest_session: @import("bulk_ingest_session.zig").State = .{},
-    bulk_identity: @import("bulk_ingest_session.zig").IdentityScratch = .{},
+    bulk_ingest_session: bulk_ingest_session_mod.State = .{},
+    bulk_identity: bulk_ingest_session_mod.IdentityScratch = .{},
     // Status snapshots are reconstructed from durable state on every poll, so
     // volatile worker observations need an independently owned cache. Keeping
     // it on the resident DB (rather than inside a returned DBStats value) lets
@@ -3496,7 +3607,7 @@ pub const DB = struct {
         if (index.generation != generation) return error.PreparedGenerationChanged;
         var maintenance_manager = try self.core.initTxnManager();
         defer maintenance_manager.deinit();
-        try maintenance_manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(index.id()));
+        try maintenance_manager.checkOrdinaryWriteConflict(&relational_index_maintenance_contract.controlKey(index.id()));
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         const current_progress = try relational_index_jobs.status(&txn, index);
@@ -3514,7 +3625,7 @@ pub const DB = struct {
         return true;
     }
 
-    pub fn requireRewriteSourceManifest(self: *DB, alloc: Allocator, program: *const @import("relational_rewrite_program.zig").ProgramSet, cancellation: types.CancellationToken) !void {
+    pub fn requireRewriteSourceManifest(self: *DB, alloc: Allocator, program: *const relational_rewrite_program.ProgramSet, cancellation: types.CancellationToken) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, program, cancellation });
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
@@ -3524,14 +3635,14 @@ pub const DB = struct {
         try program.requireSourceManifest(alloc, manifest, try read.get("\x00\x00__metadata__:schema_json"));
     }
 
-    pub fn verifyColdInitialChildSeed(self: *DB, expected: @import("relational_initial_child_publication.zig").Bootstrap) !void {
+    pub fn verifyColdInitialChildSeed(self: *DB, expected: relational_initial_child_publication.Bootstrap) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, expected });
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        if (try @import("relational_initial_child_publication.zig").load(&read)) |record| {
+        if (try relational_initial_child_publication.load(&read)) |record| {
             if (!expected.matches(record) or record.row_count != 0) return error.SeedReplicaIdentityMismatch;
         } else {
-            const hidden_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch null;
+            const hidden_catalog = read.get(relational_integrity_catalog.key) catch null;
             const schema_json = read.get("\x00\x00__metadata__:schema_json") catch null;
             if (hidden_catalog != null or schema_json != null) return error.SeedReplicaIdentityMismatch;
         }
@@ -3701,7 +3812,7 @@ pub const DB = struct {
     /// Queue remote acknowledgement without coupling it to DB open or reads.
     /// The dedicated owner gives this retry state an independent maintenance
     /// probe and makes close a lifetime barrier for every borrowed callback.
-    fn publicationOutboxRecoveryPort(self: *DB) @import("publication_recovery_owner.zig").Owner.Port {
+    fn publicationOutboxRecoveryPort(self: *DB) publication_recovery_owner.Owner.Port {
         return .{ .ptr = self, .eligible = outboxRecoveryEligible, .closing = outboxRecoveryClosing, .pending = outboxRecoveryPending, .may_disarm = outboxRecoveryMayDisarm, .now = outboxRecoveryNow, .drain = outboxRecoveryDrain, .retry_delay = outboxRecoveryDelay, .report = outboxRecoveryReport };
     }
 
@@ -3870,7 +3981,7 @@ pub const DB = struct {
             var repair_cleanup_owner_transferred = false;
             errdefer if (!repair_cleanup_owner_transferred)
                 backend_runtime.durable_jobs.closeOwner(repair_cleanup_owner_id);
-            var publication_recovery = try @import("publication_recovery_owner.zig").Owner.init(backend_runtime);
+            var publication_recovery = try publication_recovery_owner.Owner.init(backend_runtime);
             var publication_recovery_transferred = false;
             errdefer if (!publication_recovery_transferred)
                 publication_recovery.deinit();
@@ -4054,7 +4165,7 @@ pub const DB = struct {
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
-                .status_owner_epoch = @import("publication.zig").allocateOwnerEpoch(),
+                .status_owner_epoch = publication_mod.allocateOwnerEpoch(),
                 .repair_cleanup_owner_id = repair_cleanup_owner_id,
                 .publication_recovery = publication_recovery,
                 .owned_backend_runtime = owned_backend_runtime,
@@ -4118,8 +4229,8 @@ pub const DB = struct {
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
             if (opts.online_source_authority) |authority| {
-                const source_authority = @import("../source_authority.zig");
-                const namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace);
+                const source_authority = source_authority_mod;
+                const namespace = online_source_contract.namespaceBytes(db.core.identity_namespace);
                 if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                     var authority_txn = try db.core.store.beginWriteTxn();
                     errdefer authority_txn.abort();
@@ -4134,7 +4245,7 @@ pub const DB = struct {
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 if (comptime builtin.os.tag != .freestanding) {
                     try db.resumePreparedSourcePin();
-                    try @import("source_pin.zig").reconcileReleased(&db);
+                    try source_pin.reconcileReleased(&db);
                 }
             } else {
                 db.source_pin_cleanup.epoch.store(0, .release);
@@ -4198,14 +4309,14 @@ pub const DB = struct {
             {
                 var hidden_read = try db.core.store.beginReadTxn();
                 defer hidden_read.abort();
-                if (try @import("relational_initial_child_publication.zig").load(&hidden_read)) |hidden| {
+                if (try relational_initial_child_publication.load(&hidden_read)) |hidden| {
                     if (opts.initial_child_bootstrap) |bootstrap| if (!bootstrap.matches(hidden)) return error.InitialChildPublicationChanged;
                     db.local_execution.initial_child_hidden.store(hidden.phase != .released, .release);
                 }
                 // A cold old owner must not start graph workers or admit graph
                 // reads between reopening its index catalog and a resumed
                 // coordinator observing the durable cutover fence.
-                const graph_retirement = try @import("graph_retirement_seal.zig").status(&hidden_read);
+                const graph_retirement = try graph_retirement_seal.status(&hidden_read);
                 if (graph_retirement.intent != null)
                     db.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
             }
@@ -4654,7 +4765,7 @@ pub const DB = struct {
         const identity = try std.json.Stringify.valueAlloc(self.alloc, self.core.identity_namespace, .{});
         defer self.alloc.free(identity);
         const configuration_hash = try self.vectorMigrationConfigurationHash();
-        const disk = try @import("antfly_platform").filesystem.capacity(self.core.path);
+        const disk = try platform.filesystem.capacity(self.core.path);
         if (disk.available_bytes < request.budget.disk_reserve_bytes +| request.budget.batch_bytes * 8)
             return error.VectorMigrationDiskReserve;
         // The source manifest is durable before the primary job admits any
@@ -4662,7 +4773,7 @@ pub const DB = struct {
         try self.openSourceVectors(true);
         try self.local_execution.source_vectors.load(.acquire).?.beginMigrationRetention();
         errdefer self.requireVectorMigrationRecovery();
-        const raw_epoch = try missingAsNull(self.core.store.get(self.alloc, @import("../artifact_payload.zig").reference_epoch_key));
+        const raw_epoch = try missingAsNull(self.core.store.get(self.alloc, artifact_payload_mod.reference_epoch_key));
         defer if (raw_epoch) |value| self.alloc.free(value);
         const epoch: u64 = if (raw_epoch) |value| blk: {
             if (value.len != 8) return error.InvalidVectorReferenceEpoch;
@@ -5477,7 +5588,7 @@ pub const DB = struct {
 
     pub const notifyQueryVisibilityEvent = local_mutation.notifyQueryVisibilityEvent;
 
-    const EnrichmentOwner = @import("enrichment_runtime_owner.zig").Owner(EnrichmentAppendContext);
+    const EnrichmentOwner = enrichment_runtime_owner.Owner(EnrichmentAppendContext);
     pub const DetachedEnrichmentRuntime = EnrichmentOwner.Bundle;
 
     pub fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
@@ -6796,7 +6907,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{self});
         if (openModeRequiresReadOnlyBackends(self.open_mode) or !self.source_pin_cleanup.due(monotonicTimeNs())) return false;
         const units_before = self.source_pin_cleanup.work_units.load(.acquire);
-        const work = @import("source_pin.zig").reconcileReleasedWithBudget(self, .{}) catch |err| {
+        const work = source_pin.reconcileReleasedWithBudget(self, .{}) catch |err| {
             const progressed = self.source_pin_cleanup.work_units.load(.acquire) != units_before;
             self.recordSourcePinCleanupFailureWithProgress(err, progressed);
             return progressed;
@@ -6814,7 +6925,7 @@ pub const DB = struct {
         self.source_pin_cleanup.failed(err, progressed, monotonicTimeNs(), self.core.path);
     }
 
-    pub fn sourcePinCleanupStatus(self: *DB) @import("source_pin_cleanup_owner.zig").Status {
+    pub fn sourcePinCleanupStatus(self: *DB) source_pin_cleanup_owner.Status {
         return self.source_pin_cleanup.status();
     }
 
@@ -7123,7 +7234,7 @@ pub const DB = struct {
         if (!(self.canRunLocalGraphEndpointCleanup() catch false)) return;
         self.graph_cleanup_owner.start(self.graphCleanupPort());
     }
-    fn graphCleanupPort(self: *DB) @import("graph_cleanup_owner.zig").Owner.Port {
+    fn graphCleanupPort(self: *DB) graph_cleanup_owner_mod.Owner.Port {
         return .{ .ptr = self, .runtime = self.backend_runtime, .run = graphCleanupPage };
     }
     fn graphCleanupPage(ptr: *anyopaque) !bool {
@@ -7384,7 +7495,7 @@ pub const DB = struct {
         }
         var authority = try self.core.store.beginReadTxn();
         defer authority.abort();
-        _ = try @import("../source_authority.zig").require(&authority, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+        _ = try source_authority_mod.require(&authority, .native, online_source_contract.namespaceBytes(self.core.identity_namespace));
         return self.batchInternal(req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
@@ -7431,7 +7542,7 @@ pub const DB = struct {
         _ = try command.fence.encode();
         var authority = try self.core.store.beginReadTxn();
         defer authority.abort();
-        _ = try @import("../source_authority.zig").require(&authority, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+        _ = try source_authority_mod.require(&authority, .native, online_source_contract.namespaceBytes(self.core.identity_namespace));
         return self.batchInternal(req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
@@ -7519,21 +7630,21 @@ pub const DB = struct {
             if (hasCoordinatedConstraints(view)) {
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const topology = @import("relational_integrity_topology.zig");
+                const topology = relational_integrity_topology;
                 const fence = (try topology.current(&read)) orelse return error.CoordinatedConstraintTopologyUnsupported;
                 if (fence.role != .split_source or fence.transition_id != transition.transition_id or fence.attempt != transition.attempt_epoch or fence.peer_group_id != transition.destination_group_id) return error.IntegrityTopologyChanged;
                 try topology.requireDrained(&read, &transaction_manager, fence);
-                const raw_catalog = try read.get(@import("relational_integrity_catalog.zig").key);
-                var compiled = try @import("relational_integrity_catalog.zig").decode(self.alloc, raw_catalog);
+                const raw_catalog = try read.get(relational_integrity_catalog.key);
+                var compiled = try relational_integrity_catalog.decode(self.alloc, raw_catalog);
                 defer compiled.deinit();
-                try @import("relational_integrity_activation.zig").requireReady(&read, compiled);
-                integrity_coverage = try @import("relational_integrity_handoff.zig").coverageForRange(self.alloc, raw_catalog, self.core.identity_namespace, range);
+                try relational_integrity_activation.requireReady(&read, compiled);
+                integrity_coverage = try relational_integrity_handoff.coverageForRange(self.alloc, raw_catalog, self.core.identity_namespace, range);
                 receipt = try fence.encode();
-                try metadata_writes.appendSlice(self.alloc, &.{ .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage.? }, .{ .key = topology.receipt_key, .value = &receipt } });
+                try metadata_writes.appendSlice(self.alloc, &.{ .{ .key = relational_integrity_activation.key, .value = integrity_coverage.? }, .{ .key = topology.receipt_key, .value = &receipt } });
             } else {
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_topology.zig").requireUnfenced(&read);
+                try relational_integrity_topology.requireUnfenced(&read);
             }
         }
         try rebaseRangeCoverageMetadata(self.alloc, self.core.store, self.core.index_manager, range, metadata_writes.items);
@@ -7551,8 +7662,8 @@ pub const DB = struct {
         {
             var read = try self.core.store.beginProbeTxn();
             defer read.abort();
-            try @import("../source_pin_state.zig").requireNoPrepared(&read, namespace);
-            try @import("online_source.zig").requireTransferableSnapshots(&read, namespace);
+            try source_pin_state_mod.requireNoPrepared(&read, namespace);
+            try online_source.requireTransferableSnapshots(&read, namespace);
         }
         const marker = try readOrderedApplyReceipt(self.alloc, self.core.store);
         var primary = try self.core.pinNativeSnapshot();
@@ -7582,8 +7693,8 @@ pub const DB = struct {
             (if (marker) |value| value.term else 0) != (if (receipt) |value| value.term else 0)) return error.InvalidSnapshot;
         var read = try self.core.store.beginProbeTxn();
         defer read.abort();
-        try @import("../source_pin_state.zig").requireNoPrepared(&read, namespace);
-        try @import("online_source.zig").requireTransferableSnapshots(&read, namespace);
+        try source_pin_state_mod.requireNoPrepared(&read, namespace);
+        try online_source.requireTransferableSnapshots(&read, namespace);
     }
 
     pub fn orderedApplyReceipt(self: *DB) !?OrderedApplyReceipt {
@@ -7668,7 +7779,7 @@ pub const DB = struct {
     /// Private owner status query. A coordinator reads this only after the
     /// data-Raft proposal has committed; it is never a substitute for the
     /// metadata read-index bundle or an owner ACK. It exposes no user rows.
-    pub fn loadRowPolicyReceipt(self: *DB, generation: u64, phase: @import("../../system_catalog/policies.zig").Publication.Phase) !row_policy_bundle_mod.Receipt {
+    pub fn loadRowPolicyReceipt(self: *DB, generation: u64, phase: policies_mod.Publication.Phase) !row_policy_bundle_mod.Receipt {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, generation, phase });
         if (generation == 0) return error.InvalidRowPolicyReceipt;
         var key_buf: [128]u8 = undefined;
@@ -7699,7 +7810,7 @@ pub const DB = struct {
         return self.finalizePendingRowPolicyReceiptLocked(pending);
     }
 
-    pub fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: OrderedApplyReceipt) !?row_policy_bundle_mod.Receipt {
+    pub fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: policies_mod.InstallRequest, identity: OrderedApplyReceipt) !?row_policy_bundle_mod.Receipt {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, bundle_bytes, request, identity });
         return self.applyRowPolicyPublicationInternal(bundle_bytes, request, identity, null);
     }
@@ -7727,7 +7838,7 @@ pub const DB = struct {
         );
     }
 
-    fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: OrderedApplyReceipt, replication_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
+    fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: policies_mod.InstallRequest, identity: OrderedApplyReceipt, replication_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (identity.term == 0 or identity.index == 0 or (replication_lsn != null and replication_lsn.? == 0)) return error.InvalidRowPolicyPublication;
         if (replication_lsn == null and self.local_execution.replication_async_metadata_mirror == null and
@@ -7816,7 +7927,7 @@ pub const DB = struct {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             try self.requireOnlineArtifactCatalogMutableLocked(&read);
-            try @import("relational_integrity_topology.zig").requireUnfenced(&read);
+            try relational_integrity_topology.requireUnfenced(&read);
         }
         const stage_with_serving = pending_phase and self.local_execution.row_policy_gate.currentPhase() == .active;
         if (!stage_with_serving and pending_phase) {
@@ -7855,7 +7966,7 @@ pub const DB = struct {
         const previous = self.core.table_catalog;
         const publication = installed.parsed.value;
         const current_range = self.core.byteRange();
-        const actual_descriptor_digest = try (@import("../../system_catalog/policies.zig").OwnerDescriptor{
+        const actual_descriptor_digest = try (policies_mod.OwnerDescriptor{
             .table_id = self.core.identity_namespace.table_id,
             .group_id = request.owner_group_id,
             .shard_id = self.core.identity_namespace.shard_id,
@@ -7917,7 +8028,7 @@ pub const DB = struct {
                 parsed_candidate.parsed.value.catalog_epoch != publication.catalog_epoch or
                 !std.mem.eql(u8, &parsed_candidate.parsed.value.schema_digest, &publication.schema_digest) or
                 parsed_candidate.parsed.value.phase != (if (phase == .serving_install)
-                    @as(@import("../../system_catalog/policies.zig").Publication.Phase, .pending_install)
+                    @as(policies_mod.Publication.Phase, .pending_install)
                 else
                     .pending_disable))
                 return error.RowPolicyCatalogChanged;
@@ -8044,7 +8155,7 @@ pub const DB = struct {
         defer if (prepared_recovery) |*prepared| prepared.deinit();
         const versioned_key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, table_schema.version);
         defer self.alloc.free(versioned_key);
-        const admission = @import("relational_integrity_generation_admission.zig");
+        const admission = relational_integrity_generation_admission;
         const receipt_digest = try admission.sourceInstallDigest(published.fence, published.before_schema_json_digest, published.schema_json_digest, published.before_catalog_digest, published.after_catalog_digest);
         const receipt_bytes = (admission.AppliedReceipt{ .digest = receipt_digest, .term = published.applied_term, .index = published.applied_index }).encode();
         var lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
@@ -8069,7 +8180,7 @@ pub const DB = struct {
         var before_schema_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(current_schema, &before_schema_digest, .{});
         if (!std.mem.eql(u8, &before_schema_digest, &published.before_schema_json_digest)) return error.IntegrityCatalogChanged;
-        const current_catalog = (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+        const current_catalog = (try self.core.getStoreValue(self.alloc, relational_integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
         defer self.alloc.free(current_catalog);
         var before_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(current_catalog, &before_digest, .{});
@@ -8145,7 +8256,7 @@ pub const DB = struct {
         return false;
     }
 
-    pub fn recoverReplicatedRestoreFinish(self: *DB, finish: @FieldType(@import("restore_staging_contract.zig").Control, "finish")) !void {
+    pub fn recoverReplicatedRestoreFinish(self: *DB, finish: @FieldType(restore_staging_contract.Control, "finish")) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, finish });
         try self.prepareAppliedRestoreFinishReplay(.{ .restore_staging = .{ .finish = finish } });
     }
@@ -8411,12 +8522,12 @@ pub const DB = struct {
                 req.merge_source_transition != null or req.merge_checkpoint != null or
                 req.merge_replication != null or req.merge_page != null or
                 req.merge_artifacts.len != 0)) return error.RowPolicyTopologyUnsupported;
-        try @import("../range_protection.zig").validateRequest(req);
-        try @import("merge_page_contract.zig").validateRequest(req);
-        try @import("merge_proof_adoption.zig").validateRequest(req);
-        try @import("online_source_contract.zig").validateRequest(req);
-        try @import("artifact_inventory.zig").validateRequest(req);
-        try @import("artifact_publication_transport.zig").validateBatchRequest(req);
+        try range_protection_mod.validateRequest(req);
+        try merge_page_contract.validateRequest(req);
+        try merge_proof_adoption.validateRequest(req);
+        try online_source_contract.validateRequest(req);
+        try artifact_inventory.validateRequest(req);
+        try artifact_publication_transport.validateBatchRequest(req);
         if (req.merge_proof_adoption != null) return self.applyMergeProofAdoptionBatch(req, opts);
         if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
         if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
@@ -8433,7 +8544,7 @@ pub const DB = struct {
             defer source_read.abort();
             var source_namespace: [24]u8 = undefined;
             doc_identity.encodeNamespace(&source_namespace, self.core.identity_namespace);
-            try @import("../source_pin_state.zig").requireNoPrepared(&source_read, source_namespace);
+            try source_pin_state_mod.requireNoPrepared(&source_read, source_namespace);
         }
         if (req.relational_index_maintenance != null and (req.restore_staging != null or req.relational_topology != null)) return error.InvalidBatchRequest;
         if (req.restore_staging) |control| {
@@ -8474,8 +8585,8 @@ pub const DB = struct {
                     var previous_artifact: ?[]const u8 = null;
                     for (page.artifacts) |artifact| {
                         if (page.source_generation_proof_page) {
-                            const portable = @import("../portable_backup.zig");
-                            const accepted = @import("relational_integrity_generation_admission.zig");
+                            const portable = portable_backup;
+                            const accepted = relational_integrity_generation_admission;
                             if (!std.mem.startsWith(u8, artifact.key, portable.source_generation_admission_prefix) or
                                 artifact.key.len != portable.source_generation_admission_prefix.len + 32) return error.InvalidRestoreStagingCommand;
                             const decoded = accepted.Scope.decode(artifact.value) catch return error.InvalidRestoreStagingCommand;
@@ -8521,7 +8632,7 @@ pub const DB = struct {
                     const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0 and !page.source_generation_proof_page));
                     defer self.alloc.free(extra);
                     @memcpy(extra[0..opts.extra_store_writes.len], opts.extra_store_writes);
-                    extra[opts.extra_store_writes.len] = .{ .key = @import("restore_staging.zig").key, .value = page.next };
+                    extra[opts.extra_store_writes.len] = .{ .key = restore_staging.key, .value = page.next };
                     if (page.artifacts.len != 0 and !page.source_generation_proof_page) {
                         self.core.artifact_cleanup_maybe.store(true, .release);
                         extra[extra.len - 1] = .{ .key = internal_keys.artifact_presence_key[0..], .value = "1" };
@@ -8547,7 +8658,7 @@ pub const DB = struct {
         defer page_timestamps.deinit(self.alloc);
         var apply_opts = opts;
         var apply_req = req;
-        var chunk_prepared: ?@import("merge_page_chunks.zig").Prepared = null;
+        var chunk_prepared: ?merge_page_chunks.Prepared = null;
         defer if (chunk_prepared) |*prepared| prepared.deinit();
         if (req.merge_page) |page| if (page.chunk != null) {
             chunk_prepared = self.prepareMergePageChunk(preparation.guard.allocator(), req, opts.visibility_cancellation) catch |err| return preparation.mapError(err);
@@ -8567,13 +8678,13 @@ pub const DB = struct {
             apply_opts.restore_replication_request = req;
         };
         if (apply_req.merge_page) |page| if (page.provenance_effects.len != 0) {
-            try @import("merge_page_contract.zig").validateRequest(apply_req);
-            const proof_batch = @import("source_proof_batch.zig");
+            try merge_page_contract.validateRequest(apply_req);
+            const proof_batch = source_proof_batch;
             const scratch = preparation.guard.allocator();
             const owned = proof_witness_arena.allocator();
             const witness_writes = try owned.alloc(docstore_mod.KVPair, apply_opts.extra_store_writes.len + page.provenance_effects.len);
             @memcpy(witness_writes[0..apply_opts.extra_store_writes.len], apply_opts.extra_store_writes);
-            var namespace: @import("artifact_publication.zig").Namespace = undefined;
+            var namespace: artifact_publication.Namespace = undefined;
             doc_identity.encodeNamespace(&namespace, page.source.namespace);
             for (page.provenance_effects, 0..) |effect, index| {
                 const digest = try proof_batch.transferDigest(namespace, page.source.pin_digest, effect.key);
@@ -8690,7 +8801,7 @@ pub const DB = struct {
         lane: background_runtime_mod.DurableJobLane,
         owner_id: u64,
     ) void {
-        @import("cleanup_job_owner.zig").schedule(.{
+        cleanup_job_owner.schedule(.{
             .ptr = manager,
             .state = &manager.repair_cleanup_state,
             .lane = lane,
@@ -8701,7 +8812,7 @@ pub const DB = struct {
         });
     }
 
-    fn advanceRepairShadowCleanup(ptr: *anyopaque) !@import("cleanup_job_owner.zig").Advance {
+    fn advanceRepairShadowCleanup(ptr: *anyopaque) !cleanup_job_owner.Advance {
         const manager: *index_manager_mod.IndexManager = @ptrCast(@alignCast(ptr));
         return if (try manager.cleanupInactiveRepairShadowRootsPage()) .progressed else .idle;
     }
@@ -9002,7 +9113,7 @@ pub const DB = struct {
     /// Try to advance one bounded page of retired-index artifact records.
     /// Terminal filesystem finalization owns a separate lease, so callers never
     /// wait behind checkpoint or directory deletion performed by another job.
-    pub const GeneratedArtifactCleanupAdvanceResult = @import("cleanup_job_owner.zig").Advance;
+    pub const GeneratedArtifactCleanupAdvanceResult = cleanup_job_owner.Advance;
 
     pub fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) !GeneratedArtifactCleanupAdvanceResult {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, index_name });
@@ -9072,7 +9183,7 @@ pub const DB = struct {
         lane: background_runtime_mod.DurableJobLane,
         owner_id: u64,
     ) void {
-        @import("cleanup_job_owner.zig").schedule(.{
+        cleanup_job_owner.schedule(.{
             .ptr = ctx,
             .state = &ctx.index_manager.artifact_cleanup_state,
             .lane = lane,
@@ -9084,7 +9195,7 @@ pub const DB = struct {
         });
     }
 
-    fn advanceArtifactCleanup(ptr: *anyopaque) !@import("cleanup_job_owner.zig").Advance {
+    fn advanceArtifactCleanup(ptr: *anyopaque) !cleanup_job_owner.Advance {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
         return try advanceGeneratedArtifactCleanupContext(ctx, null);
     }
@@ -11490,7 +11601,7 @@ pub const DB = struct {
     /// boundaries.
     pub const IndexRepairWake = types.IndexRepairWake;
 
-    pub const IndexRepairIntentSummary = @import("index_repair_scheduler.zig").Summary;
+    pub const IndexRepairIntentSummary = index_repair_scheduler.Summary;
 
     /// Requires index_repair_scheduler_mutex.
     fn publishIndexRepairProgressWaitHint(ctx: *AsyncContext) void {
@@ -11960,9 +12071,9 @@ pub const DB = struct {
         if (sources.len == 0) return false;
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        if (try @import("artifact_publication.zig").authority(&read) != null) return false;
+        if (try artifact_publication.authority(&read) != null) return false;
         for (sources) |source| {
-            const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, intent.index_name, source, plan.plan());
+            const scope = try artifact_producer_readiness.localScopeAlloc(alloc, intent.index_name, source, plan.plan());
             defer alloc.free(scope);
             const counts = try DerivedCoverageCounters.load(alloc, &read, scope, generation);
             const total = counts.source_total orelse return false;
@@ -12550,7 +12661,7 @@ pub const DB = struct {
         errdefer txn.abort();
         const build_floor = try self.core.store.lastReplaySequenceFromTxn(&txn, 0);
         entry.intent.build_floor_sequence = build_floor;
-        entry.intent.build_source_guard = try @import("artifact_source_gap.zig").Guard.capture(&txn);
+        entry.intent.build_source_guard = try artifact_source_gap.Guard.capture(&txn);
         entry.intent.updated_at_ms = self.indexRepairNowMs();
         entry.pin.?.retain_after_sequence = build_floor;
         const control_revision = try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
@@ -16587,7 +16698,7 @@ pub const DB = struct {
         var resume_building = false;
         var resume_requires_ready_manifest = false;
         var persisted_build_floor_sequence: u64 = 0;
-        var build_source_guard: ?@import("artifact_source_gap.zig").Guard = null;
+        var build_source_guard: ?artifact_source_gap.Guard = null;
         var persisted_build_reprocessed: u64 = 0;
         var build_resume_key: ?[]u8 = null;
         defer if (build_resume_key) |key| alloc.free(key);
@@ -16802,7 +16913,7 @@ pub const DB = struct {
                     &pinned.txn
                 else
                     &ordinary_snapshot.?;
-                if (!resume_building) build_source_guard = try @import("artifact_source_gap.zig").Guard.capture(snapshot_txn);
+                if (!resume_building) build_source_guard = try artifact_source_gap.Guard.capture(snapshot_txn);
                 build_floor_sequence = if (resume_building)
                     persisted_build_floor_sequence
                 else if (pinned_snapshot) |pinned|
@@ -17956,7 +18067,7 @@ pub const DB = struct {
     }
 
     fn lookupRelationalIntegrityCatalog(self: *DB, alloc: Allocator) !?types.LookupResult {
-        const catalog_mod = @import("relational_integrity_catalog.zig");
+        const catalog_mod = relational_integrity_catalog;
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         var pinned = self.core.acquireSchemaView() orelse return error.InvalidRelationalRowsRequest;
@@ -18066,13 +18177,13 @@ pub const DB = struct {
     }
 
     fn lookupRelationalIntegrityAction(self: *DB, alloc: Allocator, routing: []const u8) !?types.LookupResult {
-        const integrity = @import("relational_integrity.zig");
+        const integrity = relational_integrity;
         if (routing.len != 32) return error.InvalidIntegrityAddress;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         var read = try integrity.CurrentView.init(self.core.store);
         defer read.deinit();
-        try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), routing);
+        try online_integrity_shadow.requireServing(&read, self.core.byteRange(), routing);
         var prefix: [integrity.namespace.len + 1 + 32]u8 = undefined;
         @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
         prefix[integrity.namespace.len] = @backingInt(integrity.Kind.job);
@@ -18091,7 +18202,7 @@ pub const DB = struct {
             page: *const integrity.ActionPage,
 
             pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-                try @import("relational_integrity_json.zig").write(.{
+                try relational_integrity_json.write(.{
                     .address = response.address,
                     .claim = response.page.claim,
                     .job = response.page.job,
@@ -18105,7 +18216,7 @@ pub const DB = struct {
     }
 
     fn lookupRelationalIntegrityJobs(self: *DB, alloc: Allocator, request_json: []const u8, options: types.LookupOptions) !?types.LookupResult {
-        const integrity = @import("relational_integrity.zig");
+        const integrity = relational_integrity;
         if (request_json.len > 4096) return error.InvalidIntegrityBudget;
         var kind = try std.json.parseFromSlice(struct { kind: []const u8 = "discover" }, alloc, request_json, .{ .ignore_unknown_fields = true });
         defer kind.deinit();
@@ -18139,7 +18250,7 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
         var read = try integrity.CurrentView.init(self.core.store);
         defer read.deinit();
-        const range = try @import("online_integrity_shadow.zig").servingRange(&read, self.core.byteRange());
+        const range = try online_integrity_shadow.servingRange(&read, self.core.byteRange());
         const prefix = integrity.namespace ++ &[_]u8{@backingInt(integrity.Kind.job)};
         const lower = try std.mem.concat(owned, u8, &.{ prefix, range.start });
         const start = if (after) |key| if (std.mem.order(u8, key, lower) == .gt) key else lower else lower;
@@ -18179,7 +18290,7 @@ pub const DB = struct {
             pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
                 try stream.beginObject();
                 try stream.objectField("jobs");
-                try @import("relational_integrity_json.zig").write(response.jobs, stream);
+                try relational_integrity_json.write(response.jobs, stream);
                 try stream.objectField("next");
                 try stream.write(response.next);
                 try stream.endObject();
@@ -18191,11 +18302,11 @@ pub const DB = struct {
     /// A single routed ReadIndex gate covers this bounded owner-local read.
     /// All addresses must belong to this physical range; topology changes fail
     /// closed rather than silently routing part of the batch elsewhere.
-    fn validateIntegrityReadGeneration(alloc: Allocator, read: *@import("relational_integrity.zig").CurrentView, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !void {
+    fn validateIntegrityReadGeneration(alloc: Allocator, read: *relational_integrity.CurrentView, expected_schema: ?u32, expected_set: ?relational_integrity.Digest) !void {
         if (expected_schema == null and expected_set == null) return;
         const schema_version = expected_schema orelse return error.InvalidIntegrityAddress;
         const generation_set = expected_set orelse return error.InvalidIntegrityAddress;
-        const catalog = @import("relational_integrity_catalog.zig");
+        const catalog = relational_integrity_catalog;
         const encoded = read.get(catalog.key) catch |err| switch (err) {
             error.NotFound => return error.PreparedGenerationChanged,
             else => return err,
@@ -18205,7 +18316,7 @@ pub const DB = struct {
         if (bindings.schema_version != schema_version or !std.mem.eql(u8, &generation_set, &@import("relational_integrity_activation_contract.zig").generationSet(bindings))) return error.PreparedGenerationChanged;
     }
 
-    fn lookupPreparationObservations(self: *DB, alloc: Allocator, keys: []const []const u8, outer: types.LookupOptions, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
+    fn lookupPreparationObservations(self: *DB, alloc: Allocator, keys: []const []const u8, outer: types.LookupOptions, expected_schema: ?u32, expected_set: ?relational_integrity.Digest) !?types.LookupResult {
         if (expected_schema == null or expected_set == null) return error.InvalidIntegrityAddress;
         if (keys.len == 0 or keys.len > 8) return error.InvalidIntegrityBudget;
         const Item = struct { key: []const u8, row: ?types.LookupResult };
@@ -18217,7 +18328,7 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
         var probe = try self.core.store.beginReadTxn();
         defer probe.abort();
-        var serving = try @import("relational_integrity.zig").CurrentView.init(self.core.store);
+        var serving = try relational_integrity.CurrentView.init(self.core.store);
         defer serving.deinit();
         try validateIntegrityReadGeneration(scratch, &serving, expected_schema, expected_set);
         var retained: usize = 0;
@@ -18225,7 +18336,7 @@ pub const DB = struct {
             try checkLookupOptionsActive(outer);
             if (key.len == 0 or key.len > 512 or internal_keys.isInternalUserKey(key)) return error.InvalidIntegrityAddress;
             if (!self.core.byteRange().contains(key)) return error.PreparedGenerationChanged;
-            try @import("online_integrity_shadow.zig").requireServing(&serving, self.core.byteRange(), key);
+            try online_integrity_shadow.requireServing(&serving, self.core.byteRange(), key);
             var options = outer;
             options.relational_integrity_jobs_json = "";
             options.include_primary_digest = true;
@@ -18245,7 +18356,7 @@ pub const DB = struct {
                 for (value.observations) |item| {
                     try stream.beginObject();
                     try stream.objectField("key");
-                    try @import("relational_integrity_json.zig").write(item.key, stream);
+                    try relational_integrity_json.write(item.key, stream);
                     try stream.objectField("row");
                     // Primary JSON remains an encoded document string. Binary
                     // digests are fixed arrays and cannot lose byte identity.
@@ -18263,8 +18374,8 @@ pub const DB = struct {
         return .{ .json = json };
     }
 
-    fn lookupRelationalIntegrityClaims(self: *DB, alloc: Allocator, addresses: []const @import("relational_integrity.zig").Address, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
-        const integrity = @import("relational_integrity.zig");
+    fn lookupRelationalIntegrityClaims(self: *DB, alloc: Allocator, addresses: []const relational_integrity.Address, expected_schema: ?u32, expected_set: ?relational_integrity.Digest) !?types.LookupResult {
+        const integrity = relational_integrity;
         if (expected_schema == null or expected_set == null) return error.InvalidIntegrityAddress;
         if (addresses.len == 0 or addresses.len > 8) return error.InvalidIntegrityBudget;
         const Item = struct { address: integrity.Address, claim: ?integrity.Claim };
@@ -18281,7 +18392,7 @@ pub const DB = struct {
             if (self.backend_runtime.io()) |io| try io.checkCancel();
             _ = try integrity.parseKey(&address.claimKey());
             if (!self.core.byteRange().contains(&address.routing)) return error.PreparedGenerationChanged;
-            try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), &address.routing);
+            try online_integrity_shadow.requireServing(&read, self.core.byteRange(), &address.routing);
             const raw = read.get(&address.claimKey()) catch |err| switch (err) {
                 error.NotFound => {
                     item.* = .{ .address = address, .claim = null };
@@ -18298,15 +18409,15 @@ pub const DB = struct {
             pub fn jsonStringify(value: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
                 try stream.beginObject();
                 try stream.objectField("claims");
-                try @import("relational_integrity_json.zig").write(value.claims, stream);
+                try relational_integrity_json.write(value.claims, stream);
                 try stream.endObject();
             }
         };
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .claims = items }, .{}) };
     }
 
-    fn lookupRelationalIntegrityReferences(self: *DB, alloc: Allocator, address: @import("relational_integrity.zig").Address, after: ?[]const u8, limit: u32, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
-        const integrity = @import("relational_integrity.zig");
+    fn lookupRelationalIntegrityReferences(self: *DB, alloc: Allocator, address: relational_integrity.Address, after: ?[]const u8, limit: u32, expected_schema: ?u32, expected_set: ?relational_integrity.Digest) !?types.LookupResult {
+        const integrity = relational_integrity;
         const prefix = address.referencePrefix();
         _ = try integrity.parseKey(&address.claimKey());
         var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -18323,7 +18434,7 @@ pub const DB = struct {
         var read = try integrity.CurrentView.init(self.core.store);
         defer read.deinit();
         try validateIntegrityReadGeneration(owned, &read, expected_schema, expected_set);
-        try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), &address.routing);
+        try online_integrity_shadow.requireServing(&read, self.core.byteRange(), &address.routing);
         const raw_claim = read.get(&address.claimKey()) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
@@ -18355,7 +18466,7 @@ pub const DB = struct {
             }
             if (self.backend_runtime.io()) |io| try io.checkCancel();
             const reference = try integrity.Reference.decode(item.key, item.value);
-            if (!try @import("relational_integrity_generation_retirement.zig").isRetired(&read, reference)) {
+            if (!try relational_integrity_generation_retirement.isRetired(&read, reference)) {
                 const copy = try owned.dupe(u8, item.value);
                 try references.append(owned, try integrity.Reference.decode(item.key, copy));
             }
@@ -18377,11 +18488,11 @@ pub const DB = struct {
             pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
                 try stream.beginObject();
                 try stream.objectField("address");
-                try @import("relational_integrity_json.zig").write(response.address, stream);
+                try relational_integrity_json.write(response.address, stream);
                 try stream.objectField("claim");
-                try @import("relational_integrity_json.zig").write(response.claim, stream);
+                try relational_integrity_json.write(response.claim, stream);
                 try stream.objectField("references");
-                try @import("relational_integrity_json.zig").write(response.references, stream);
+                try relational_integrity_json.write(response.references, stream);
                 try stream.objectField("next");
                 try stream.write(response.next);
                 try stream.endObject();
@@ -18470,7 +18581,7 @@ pub const DB = struct {
         if (self.local_execution.restore_staging_required.load(.acquire) or opts.restore_staging_scope != null) {
             var staging_read = try self.core.store.beginProbeTxn();
             defer staging_read.abort();
-            try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
+            try restore_staging.requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
         }
         if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json, opts);
         if (opts.relational_index_status_json.len != 0) return self.lookupRelationalIndexStatus(alloc, opts.relational_index_status_json, opts);
@@ -18486,7 +18597,7 @@ pub const DB = struct {
         return self.lookupPrimarySnapshot(alloc, key, opts, &probe);
     }
 
-    fn lookupPrimarySnapshot(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions, probe: *@import("../docstore.zig").DocStore.Txn) !?types.LookupResult {
+    fn lookupPrimarySnapshot(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn) !?types.LookupResult {
         var schema_view = self.core.acquireSchemaView();
         defer if (schema_view) |*view| view.release();
         return self.lookupPrimarySnapshotWithSchema(alloc, key, opts, probe, schema_view);
@@ -18624,8 +18735,8 @@ pub const DB = struct {
     }
 
     fn lookupRelationalRetirement(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
-        const retirement = @import("relational_integrity_retirement.zig");
-        const activation = @import("relational_integrity_activation.zig");
+        const retirement = relational_integrity_retirement;
+        const activation = relational_integrity_activation;
         var request = try std.json.parseFromSlice(struct { kind: []const u8, mode: enum { status, page } = .status, max_rows: u32 = 128, include_catalog: bool = true }, alloc, request_json, .{});
         defer request.deinit();
         if (request.value.max_rows == 0 or request.value.max_rows > 128) return error.InvalidIntegrityBudget;
@@ -18638,8 +18749,8 @@ pub const DB = struct {
             const owned = arena.allocator();
             const raw_progress = (try self.core.getStoreValue(owned, retirement.key)) orelse return null;
             const progress = try retirement.Progress.decode(raw_progress);
-            const raw_bindings = (try self.core.getStoreValue(owned, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
-            var bindings = try @import("relational_integrity_catalog.zig").decode(owned, raw_bindings);
+            const raw_bindings = (try self.core.getStoreValue(owned, relational_integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
+            var bindings = try relational_integrity_catalog.decode(owned, raw_bindings);
             defer bindings.deinit();
             if (view.version() != progress.schema_version or !std.mem.eql(u8, &progress.generation_set, &activation.generationSet(bindings))) return error.ConstraintRetirementChanged;
             var fields = std.ArrayList([]const u8).empty;
@@ -18670,13 +18781,13 @@ pub const DB = struct {
                     for (response.rows) |row| {
                         try jw.beginObject();
                         try jw.objectField("key");
-                        try @import("relational_integrity_json.zig").write(row.key, jw);
+                        try relational_integrity_json.write(row.key, jw);
                         try jw.objectField("json");
                         try jw.write(row.json);
                         try jw.objectField("version");
                         try jw.write(row.version);
                         try jw.objectField("expected_content_digest");
-                        try @import("relational_integrity_json.zig").write(row.expected_content_digest, jw);
+                        try relational_integrity_json.write(row.expected_content_digest, jw);
                         try jw.endObject();
                     }
                     try jw.endArray();
@@ -18691,9 +18802,9 @@ pub const DB = struct {
         }
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        var read = try @import("relational_integrity.zig").CurrentView.init(self.core.store);
+        var read = try relational_integrity.CurrentView.init(self.core.store);
         defer read.deinit();
-        const raw_catalog: []const u8 = if (request.value.include_catalog) read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+        const raw_catalog: []const u8 = if (request.value.include_catalog) read.get(relational_integrity_catalog.key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         } else "";
@@ -18705,16 +18816,16 @@ pub const DB = struct {
             range_start: []const u8,
             range_end: []const u8,
             pub fn jsonStringify(response: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-                try @import("relational_integrity_json.zig").write(response, jw);
+                try relational_integrity_json.write(response, jw);
             }
         };
-        const serving_range = try @import("online_integrity_shadow.zig").servingRange(&read, self.core.byteRange());
+        const serving_range = try online_integrity_shadow.servingRange(&read, self.core.byteRange());
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .catalog = raw_catalog, .progress = raw_progress, .owner = try activation.ownership(&read), .range_start = serving_range.start, .range_end = serving_range.end }, .{}) };
     }
 
     fn lookupRelationalActivation(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
-        const activation = @import("relational_integrity_activation.zig");
-        const catalog_mod = @import("relational_integrity_catalog.zig");
+        const activation = relational_integrity_activation;
+        const catalog_mod = relational_integrity_catalog;
         if (request_json.len > 1024) return error.InvalidConstraintActivation;
         var request = try std.json.parseFromSlice(struct { mode: enum { status, page, retry } = .status, max_rows: u32 = 128, schema_version: ?u32 = null }, alloc, request_json, .{});
         defer request.deinit();
@@ -18729,7 +18840,7 @@ pub const DB = struct {
             const unique_count = if (public_schema.unique_constraints) |values| values.value.len else 0;
             const foreign_count = if (public_schema.foreign_keys) |values| values.value.len else 0;
             const per_row = @max(@as(usize, 1), @max(unique_count, foreign_count));
-            const declaration_limit = @max(@as(usize, 1), @import("relational_integrity.zig").max_commands / (2 * per_row));
+            const declaration_limit = @max(@as(usize, 1), relational_integrity.max_commands / (2 * per_row));
             // Activation pages commit through distributed 2PC. A bounded
             // 100 ms source scan amortizes that commit without changing the
             // reusable reader's caller-specified budget or its row/byte caps.
@@ -18750,14 +18861,14 @@ pub const DB = struct {
                 phase: activation.Phase,
 
                 pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-                    try @import("relational_integrity_json.zig").write(response, stream);
+                    try relational_integrity_json.write(response, stream);
                 }
             };
             return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .rows = rows, .command = page.command, .phase = page.phase }, .{}) };
         }
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        var read = try @import("relational_integrity.zig").CurrentView.init(self.core.store);
+        var read = try relational_integrity.CurrentView.init(self.core.store);
         defer read.deinit();
         const raw_catalog = read.get(catalog_mod.key) catch |err| switch (err) {
             error.NotFound => return null,
@@ -18766,9 +18877,9 @@ pub const DB = struct {
         var catalog = try catalog_mod.decode(alloc, raw_catalog);
         defer catalog.deinit();
         const progress = try activation.status(&read, catalog);
-        const range = try @import("online_integrity_shadow.zig").servingRange(&read, self.core.byteRange());
+        const range = try online_integrity_shadow.servingRange(&read, self.core.byteRange());
         if (request.value.mode == .retry) {
-            try @import("online_integrity_shadow.zig").requireCatalogMutable(&read);
+            try online_integrity_shadow.requireCatalogMutable(&read);
             if ((request.value.schema_version orelse return error.InvalidConstraintActivation) != catalog.schema_version) return error.PreparedGenerationChanged;
             if (progress.state != .invalid) return null;
             const next = try (try progress.retry(catalog)).encode(alloc);
@@ -18783,7 +18894,7 @@ pub const DB = struct {
             range: types.ByteRange,
 
             pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-                try @import("relational_integrity_json.zig").write(.{
+                try relational_integrity_json.write(.{
                     .schema_version = response.progress.schema_version,
                     .schema_digest = response.catalog.schema_digest,
                     .generation_set = response.progress.generation_set,
@@ -18820,7 +18931,7 @@ pub const DB = struct {
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
+            try artifact_reconcile_intent.requireAbsent(&read);
         }
         const start = try self.alloc.dupe(u8, byte_range.start);
         errdefer self.alloc.free(start);
@@ -19513,7 +19624,7 @@ pub const DB = struct {
 
     /// Cohort capture verifies the exact durable owner fence and drained
     /// participant set under the same apply lock that pins the native root.
-    pub fn snapshotRelationalCohort(self: *DB, id: []const u8, expected: @import("relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) !u64 {
+    pub fn snapshotRelationalCohort(self: *DB, id: []const u8, expected: relational_integrity_topology.Fence, cancellation: types.CancellationToken) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, id, expected, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
@@ -19523,13 +19634,13 @@ pub const DB = struct {
 
     /// Seal an exact common-cut owner generation durably. No corpus copy or
     /// hashing is performed while the write fence is held.
-    pub fn sealBackupCohort(self: *DB, id: []const u8, expected: @import("relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) !@import("native_backup_seal.zig").Handle {
+    pub fn sealBackupCohort(self: *DB, id: []const u8, expected: relational_integrity_topology.Fence, cancellation: types.CancellationToken) !native_backup_seal.Handle {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, id, expected, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         try validateSnapshotId(id);
         if (expected.role != .backup_snapshot or !expected.namespace.eql(self.core.identity_namespace)) return error.InvalidTopologyFence;
-        const seal = @import("native_backup_seal.zig");
+        const seal = native_backup_seal;
         const name = try seal.nameAlloc(self.alloc, expected);
         defer self.alloc.free(name);
         _ = try self.snapshotInternal(name, true, cancellation, null, expected, true, null);
@@ -19539,7 +19650,7 @@ pub const DB = struct {
         return seal.readHandle(self.alloc, io, root, expected);
     }
 
-    pub fn exportBackupCohort(self: *DB, handle: @import("native_backup_seal.zig").Handle, id: []const u8, cancellation: types.CancellationToken) !u64 {
+    pub fn exportBackupCohort(self: *DB, handle: native_backup_seal.Handle, id: []const u8, cancellation: types.CancellationToken) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, handle, id, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
@@ -19549,7 +19660,7 @@ pub const DB = struct {
         try validateSnapshotId(id);
         try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
         defer self.snapshot_publication_mutex.unlock();
-        const seal = @import("native_backup_seal.zig");
+        const seal = native_backup_seal;
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         var pin_lock = try seal.StoreLock.acquire(self.alloc, io, self.core.path, cancellation);
         defer pin_lock.deinit();
@@ -19582,7 +19693,7 @@ pub const DB = struct {
 
     /// Portable logical rows from the identical immutable cut used by native
     /// cohorts. The live root may already have resumed writes at this point.
-    pub fn exportBackupCohortPortable(self: *DB, handle: @import("native_backup_seal.zig").Handle, writer: *std.Io.Writer, options: portable_backup.ExportOptions, cancellation: types.CancellationToken) !void {
+    pub fn exportBackupCohortPortable(self: *DB, handle: native_backup_seal.Handle, writer: *std.Io.Writer, options: portable_backup.ExportOptions, cancellation: types.CancellationToken) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, handle, writer, options, cancellation });
         if (options.source_generation_summary_output) |summary| summary.output.* = null;
         errdefer if (options.source_generation_summary_output) |summary| if (summary.output.*) |entries| {
@@ -19600,7 +19711,7 @@ pub const DB = struct {
         if (!handle.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
         defer self.snapshot_publication_mutex.unlock();
-        const seal = @import("native_backup_seal.zig");
+        const seal = native_backup_seal;
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         var pin_lock = try seal.StoreLock.acquire(self.alloc, io, self.core.path, cancellation);
         defer pin_lock.deinit();
@@ -19624,7 +19735,7 @@ pub const DB = struct {
         if (std.mem.eql(u8, opened.parsed.value.primary.artifact_format, "antfly-lsm-checkpoint")) {
             const primary = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ root, db_core.primary_lsm_checkpoint_directory_name });
             defer self.alloc.free(primary);
-            var backend = try @import("../lsm_backend.zig").Backend.open(self.alloc, primary, .{ .backend = .{ .read_only = true }, .read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(io) });
+            var backend = try @import("../lsm_backend.zig").Backend.open(self.alloc, primary, .{ .backend = .{ .read_only = true }, .read_runtime = storage_io_mod.ReadRuntime.init(io) });
             defer backend.close();
             var store = try docstore_mod.DocStore.openRuntime(self.alloc, try backend.runtimeStore(self.alloc, .{ .name = "docs" }));
             defer store.close();
@@ -19636,7 +19747,7 @@ pub const DB = struct {
             const temporary = try createSnapshotStagingRoot(self.alloc, io, parent, "portable-decoder");
             defer self.alloc.free(temporary);
             defer snapshot_staging.cleanup(io, temporary);
-            var backend = try @import("../lsm_backend.zig").Backend.open(self.alloc, temporary, .{ .read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(io) });
+            var backend = try @import("../lsm_backend.zig").Backend.open(self.alloc, temporary, .{ .read_runtime = storage_io_mod.ReadRuntime.init(io) });
             defer backend.close();
             var store = try docstore_mod.DocStore.openRuntime(self.alloc, try backend.runtimeStore(self.alloc, .{ .name = "docs" }));
             defer store.close();
@@ -19648,22 +19759,22 @@ pub const DB = struct {
 
     /// Tombstone before unlink: retries after a crash finish bounded inventory
     /// cleanup, and a delayed seal can never recreate an acknowledged release.
-    pub fn releaseBackupCohort(self: *DB, handle: @import("native_backup_seal.zig").Handle) !void {
+    pub fn releaseBackupCohort(self: *DB, handle: native_backup_seal.Handle) !void {
         if (!handle.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         lockAtomicWithBackoff(&self.snapshot_publication_mutex);
         defer self.snapshot_publication_mutex.unlock();
-        const seal = @import("native_backup_seal.zig");
+        const seal = native_backup_seal;
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         try seal.reclaim(self.alloc, io, self.core.path, .{ .release = handle }, .none);
     }
 
     /// Cancellation consumes a planned seal even when its response was lost
     /// or delivery is delayed. Caller authority is the exact cohort fence.
-    pub fn cancelBackupCohort(self: *DB, fence: @import("relational_integrity_topology.zig").Fence) !void {
+    pub fn cancelBackupCohort(self: *DB, fence: relational_integrity_topology.Fence) !void {
         if (fence.role != .backup_snapshot or !fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         lockAtomicWithBackoff(&self.snapshot_publication_mutex);
         defer self.snapshot_publication_mutex.unlock();
-        const seal = @import("native_backup_seal.zig");
+        const seal = native_backup_seal;
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         try seal.reclaim(self.alloc, io, self.core.path, .{ .cancel = fence }, .none);
     }
@@ -19671,17 +19782,17 @@ pub const DB = struct {
     /// A durable generation for cursor pages: no apply/read lease escapes
     /// capture, and resume never falls back to a fresh live generation.
     fn admitQueryCut(self: *DB, io: std.Io, id: []const u8, cancellation: types.CancellationToken) !void {
-        const cut = @import("native_query_cut.zig");
+        const cut = native_query_cut;
         var repository = self.backend_runtime.query_cut_repository;
         const Confirm = struct {
             fn durable(raw: *anyopaque, io_: std.Io, root: []const u8, manifest: cut.Manifest, token: types.CancellationToken) !bool {
-                const port: *@import("native_query_cut_repository.zig").Port = @ptrCast(@alignCast(raw));
+                const port: *native_query_cut_repository.Port = @ptrCast(@alignCast(raw));
                 return port.canEvict(io_, root, manifest.request, manifest.namespace, manifest.sequence, token);
             }
         };
         return cut.admitWithDurability(self.alloc, io, self.core.path, id, if (repository) |value| value.limits else .{}, cancellation, if (repository) |*value| .{ .ptr = value, .confirm = Confirm.durable } else null);
     }
-    pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
+    pub fn captureQueryCut(self: *DB, request: native_query_cut.Request, cancellation: types.CancellationToken) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, request, cancellation });
         return self.captureQueryCutInternal(request, cancellation, true);
     }
@@ -19699,7 +19810,7 @@ pub const DB = struct {
         if (self.currentMaintenanceTargetSequence() != sequence) return null;
         const configs = try self.core.listIndexes(a);
         defer types.freeIndexConfigs(a, configs);
-        const Entry = struct { name: []const u8, kind: []const u8, config_hash: u64, coverage_generation: u64, checkpoint: @import("derived/apply_state.zig").ProjectionCheckpoint };
+        const Entry = struct { name: []const u8, kind: []const u8, config_hash: u64, coverage_generation: u64, checkpoint: apply_state.ProjectionCheckpoint };
         const entries = try a.alloc(Entry, configs.len);
         defer a.free(entries);
         for (configs, entries) |cfg, *entry| {
@@ -19728,7 +19839,7 @@ pub const DB = struct {
     }
     /// Query-pin guard is held. Validate unchanged state at a short read point,
     /// release mutation fences before repository I/O, then rebind exact extents.
-    fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !bool {
+    fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: native_query_cut.Request, cancellation: types.CancellationToken) !bool {
         const repository = self.backend_runtime.query_cut_repository orelse return false;
         if (repository.vtable.reuse == null) return false;
         const basis = self.local_execution.native_query_reuse orelse return false;
@@ -19746,32 +19857,32 @@ pub const DB = struct {
             defer arena.deinit();
             break :checked (try self.nativeQueryReuseDigestLocked(arena.allocator())) orelse return false;
         };
-        if (!basis.matches(digest, @import("native_query_cut.zig").nowMs())) return false;
+        if (!basis.matches(digest, native_query_cut.nowMs())) return false;
         const proof = (try repository.reuse(io, basis.asRequest(), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
         // Rotate the logical authority, so expiry of the original manifest does
         // not force capture while the authenticated extents still cover readers.
-        self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+        self.local_execution.native_query_reuse = try native_query_reuse.State.init(request, proof);
         return true;
     }
-    fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
-        try request.validate(@import("native_query_cut.zig").nowMs());
+    fn captureQueryCutInternal(self: *DB, request: native_query_cut.Request, cancellation: types.CancellationToken, publish: bool) !void {
+        try request.validate(native_query_cut.nowMs());
         _ = try request.namespace(self.core.identity_namespace);
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-        const remaining = request.expires_ms -| @import("native_query_cut.zig").nowMs();
+        const remaining = request.expires_ms -| native_query_cut.nowMs();
         const expiry_deadline = monotonicTimeNs() +| remaining * std.time.ns_per_ms;
         const deadline = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline;
-        const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
+        const control: native_query_cut.Control = .{ .parent = cancellation, .deadline_ns = deadline };
         const token = control.token();
         try token.check();
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
             if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
         };
-        var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
+        var guard = try native_query_cut.lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
         try self.admitQueryCut(io, request.id, token);
-        const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
+        const root = try native_query_cut.pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
         const existed = try snapshotPathExists(io, root);
         // A failed new capture must not consume the capacity reserved for
@@ -19789,13 +19900,13 @@ pub const DB = struct {
         try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             if (try repository.publishReusable(io, root, request, self.core.identity_namespace, token)) |proof| {
-                self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+                self.local_execution.native_query_reuse = try native_query_reuse.State.init(request, proof);
             }
         };
     }
     fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
         const self: *DB = @ptrCast(@alignCast(raw));
-        const cut = @import("native_query_cut.zig");
+        const cut = native_query_cut;
         const repository = self.backend_runtime.query_cut_repository orelse return true;
         const io = self.backend_runtime.filesystemIo() orelse return true;
         const now = cut.nowMs();
@@ -19804,7 +19915,7 @@ pub const DB = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const warming = @import("native_query_warming.zig");
+        const warming = native_query_warming_mod;
         var state = try warming.readState(a, io, state_path);
         const sequence = self.core.nextDerivedSequence();
         if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
@@ -19838,15 +19949,15 @@ pub const DB = struct {
             try warming.writeState(a, io, state_path, state.?);
             var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
             defer guard.deinit();
-            if (warmed.proof) |proof| self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(state.?.request, proof);
+            if (warmed.proof) |proof| self.local_execution.native_query_reuse = try native_query_reuse.State.init(state.?.request, proof);
             try std.Io.Dir.cwd().deleteTree(io, root);
         }
         return completed;
     }
 
-    pub fn openQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !DB {
+    pub fn openQueryCut(self: *DB, request: native_query_cut.Request, cancellation: types.CancellationToken) !DB {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, request, cancellation });
-        const cut = @import("native_query_cut.zig");
+        const cut = native_query_cut;
         try request.validate(cut.nowMs());
         const origin = try request.namespace(self.core.identity_namespace);
         const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
@@ -19944,13 +20055,13 @@ pub const DB = struct {
         try self.enforceVectorMigrationConfigurationGate();
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
+        try artifact_reconcile_intent.requireAbsent(&read);
     }
 
     fn ensurePrimaryOnlySnapshotLocked(self: *DB) !void {
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
+        try artifact_reconcile_intent.requireAbsent(&read);
         if (!try self.primaryOnlySnapshotSupportedLocked()) return error.VectorStoreLifecycleUnsupported;
     }
 
@@ -19966,9 +20077,9 @@ pub const DB = struct {
         include_generated: bool,
         cancellation: types.CancellationToken,
         maintenance_deadline_ns: ?u64,
-        expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
+        expected_topology_fence: ?relational_integrity_topology.Fence,
         backup_seal_only: bool,
-        query_cut: ?@import("native_query_cut.zig").Request,
+        query_cut: ?native_query_cut.Request,
     ) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, id, include_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut });
         const seal_only = backup_seal_only or query_cut != null;
@@ -20000,7 +20111,7 @@ pub const DB = struct {
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ self.core.path, if (query_cut != null) "query-pins" else if (seal_only) "backup-pins" else "snapshots" });
         defer self.alloc.free(snapshot_parent);
-        var pin_lock: ?@import("native_backup_seal.zig").StoreLock = if (backup_seal_only) try @import("native_backup_seal.zig").StoreLock.acquire(self.alloc, io, self.core.path, cancellation) else null;
+        var pin_lock: ?native_backup_seal.StoreLock = if (backup_seal_only) try native_backup_seal.StoreLock.acquire(self.alloc, io, self.core.path, cancellation) else null;
         defer if (pin_lock) |*held| held.deinit();
         const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ snapshot_parent, id });
         defer self.alloc.free(snapshot_root);
@@ -20010,7 +20121,7 @@ pub const DB = struct {
             defer self.alloc.free(tombstone);
             if (try snapshotPathExists(io, tombstone)) return error.BackupSealReleased;
             if (try snapshotPathExists(io, snapshot_root)) {
-                if (query_cut) |request| try @import("native_query_cut.zig").validate(self.alloc, io, snapshot_root, request, self.core.identity_namespace, cancellation) else _ = try @import("native_backup_seal.zig").readHandle(self.alloc, io, snapshot_root, expected_topology_fence.?);
+                if (query_cut) |request| try native_query_cut.validate(self.alloc, io, snapshot_root, request, self.core.identity_namespace, cancellation) else _ = try native_backup_seal.readHandle(self.alloc, io, snapshot_root, expected_topology_fence.?);
                 return 0;
             }
         } else if (try snapshotPathExists(io, snapshot_root)) return error.SnapshotAlreadyExists;
@@ -20166,7 +20277,7 @@ pub const DB = struct {
             defer read.abort();
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
-            try @import("relational_integrity_topology.zig").requireDrained(&read, &manager, expected);
+            try relational_integrity_topology.requireDrained(&read, &manager, expected);
         }
         try self.core.syncStore(true);
         try self.core.index_manager.syncAll(true);
@@ -20284,7 +20395,7 @@ pub const DB = struct {
         defer generated_metadata.deinit();
 
         if (seal_only) {
-            const seal = @import("native_backup_seal.zig");
+            const seal = native_backup_seal;
             const wal_bytes = try generated_checkpoints.walPrefixBytes();
             if (wal_bytes > seal.wal_budget_bytes) return error.BackupSealWalBudgetExceeded;
             var vector_bytes: u64 = 0;
@@ -20310,7 +20421,7 @@ pub const DB = struct {
             if (query_cut) |request| {
                 const final_digest = try self.nativeQueryReuseDigestLocked(self.alloc);
                 const reuse_digest = if (query_reuse_digest != null and final_digest != null and std.mem.eql(u8, &query_reuse_digest.?, &final_digest.?)) query_reuse_digest else null;
-                try @import("native_query_cut.zig").finishWithReuseDigest(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, reuse_digest, cancellation);
+                try native_query_cut.finishWithReuseDigest(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, reuse_digest, cancellation);
             } else _ = try seal.finish(self.alloc, io, staging_root, expected_topology_fence.?, capture_target_sequence, .{
                 .artifact_format = primary_snapshot.artifactFormat(),
                 .artifact_version = primary_snapshot.artifactVersion(),
@@ -20410,8 +20521,8 @@ pub const DB = struct {
 
     pub const prepareMergeArtifactEffects = local_mutation.prepareMergeArtifactEffects;
 
-    fn prepareMergePageChunk(self: *DB, alloc: Allocator, req: types.BatchRequest, cancellation: types.CancellationToken) !@import("merge_page_chunks.zig").Prepared {
-        const chunks = @import("merge_page_chunks.zig");
+    fn prepareMergePageChunk(self: *DB, alloc: Allocator, req: types.BatchRequest, cancellation: types.CancellationToken) !merge_page_chunks.Prepared {
+        const chunks = merge_page_chunks;
         self.core.lockApplyShared();
         var locked = true;
         defer if (locked) self.core.unlockApplyShared();
@@ -20430,8 +20541,8 @@ pub const DB = struct {
         return chunks.prepare(alloc, &reader, req, cancellation);
     }
 
-    pub fn mergeCopyPageStatus(self: *DB, alloc: Allocator) !?std.json.Parsed(@import("merge_page_contract.zig").Progress) {
-        const pages = @import("merge_page_contract.zig");
+    pub fn mergeCopyPageStatus(self: *DB, alloc: Allocator) !?std.json.Parsed(merge_page_contract.Progress) {
+        const pages = merge_page_contract;
         const raw = (try self.core.getStoreValue(alloc, pages.key)) orelse return null;
         defer alloc.free(raw);
         return try pages.decode(alloc, raw);
@@ -20576,7 +20687,7 @@ pub const DB = struct {
             if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
             if (after_key) |key| if (std.mem.order(u8, row.key, key) != .gt) continue;
             if (!isMergeArtifactKey(row.key)) continue;
-            if (internal_keys.isGraphRetirementKey(row.key)) _ = try @import("../graph_cleanup_contract.zig").retirementGeneration(row.value);
+            if (internal_keys.isGraphRetirementKey(row.key)) _ = try graph_cleanup_contract_mod.retirementGeneration(row.value);
             const value = if (internal_keys.isGraphEdgeArtifactKey(row.key)) graph: {
                 const edge = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, row.key)) orelse return error.InvalidBatchRequest;
                 defer {
@@ -21062,28 +21173,28 @@ pub const DB = struct {
         // other tables at a later cut. Keep the candidate unpublished until a
         // cluster-coordinated restore/activation barrier is available.
         if (purpose == .historical_table) {
-            const topology_fence = try missingAsNull(opened_primary.store.get(alloc, @import("relational_integrity_topology.zig").fence_key));
+            const topology_fence = try missingAsNull(opened_primary.store.get(alloc, relational_integrity_topology.fence_key));
             if (topology_fence) |bytes| {
                 alloc.free(bytes);
                 return error.CoordinatedConstraintRestoreRequired;
             }
-            const retirement = try missingAsNull(opened_primary.store.get(alloc, @import("relational_integrity_retirement.zig").key));
+            const retirement = try missingAsNull(opened_primary.store.get(alloc, relational_integrity_retirement.key));
             if (retirement) |bytes| {
                 alloc.free(bytes);
                 return error.CoordinatedConstraintRestoreRequired;
             }
         }
-        const restored_integrity = try missingAsNull(opened_primary.store.get(alloc, @import("relational_integrity_catalog.zig").key));
+        const restored_integrity = try missingAsNull(opened_primary.store.get(alloc, relational_integrity_catalog.key));
         if (restored_integrity) |bytes| {
             defer alloc.free(bytes);
-            var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
+            var catalog = try relational_integrity_catalog.decode(alloc, bytes);
             defer catalog.deinit();
-            if (@import("relational_integrity_activation.zig").hasActive(catalog)) switch (purpose) {
+            if (relational_integrity_activation.hasActive(catalog)) switch (purpose) {
                 .historical_table => return error.CoordinatedConstraintRestoreRequired,
                 .identity_preserving => |expected_namespace| {
                     const stored_namespace = (try doc_identity.loadNamespaceFromStore(&opened_primary.store)) orelse return error.IdentityNamespaceMismatch;
                     if (!stored_namespace.eql(expected_namespace)) return error.IdentityNamespaceMismatch;
-                    const incarnation = try @import("relational_integrity_catalog.zig").incarnationFromTableId(expected_namespace.table_id);
+                    const incarnation = try relational_integrity_catalog.incarnationFromTableId(expected_namespace.table_id);
                     if (!std.mem.eql(u8, &incarnation, &catalog.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
                 },
             };
@@ -22824,7 +22935,7 @@ pub const DB = struct {
     }
 
     pub const PublishedChildSchema = struct {
-        fence: @import("relational_integrity_topology_contract.zig").Fence,
+        fence: relational_integrity_topology_contract.Fence,
         before_schema_json_digest: [32]u8,
         schema_json_digest: [32]u8,
         before_catalog_digest: [32]u8,
@@ -22834,7 +22945,7 @@ pub const DB = struct {
     };
 
     pub const InitialHiddenChild = struct {
-        fence: @import("relational_integrity_topology_contract.zig").Fence,
+        fence: relational_integrity_topology_contract.Fence,
         child_table_name: []const u8,
         plan_id: [16]u8,
         plan_digest: [32]u8,
@@ -22850,7 +22961,7 @@ pub const DB = struct {
     /// one write; Raft owners also persist the Raft marker, while native
     /// owners use the record itself as their exact durable operation receipt.
     pub fn provisionInitialHiddenChild(self: *DB, schema_json: []const u8, input: InitialHiddenChild, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
-        const hidden = @import("relational_initial_child_publication.zig");
+        const hidden = relational_initial_child_publication;
         if (self.local_execution.initial_child_bootstrap) |bootstrap| {
             if (!std.mem.eql(u8, &bootstrap.plan_id, &input.plan_id) or
                 !std.mem.eql(u8, &bootstrap.plan_digest, &input.plan_digest) or
@@ -22927,7 +23038,7 @@ pub const DB = struct {
         // their accepted generation scopes in the same durable transaction as
         // the initial schema and hidden gate, before any release can route a
         // row. External-parent scopes use the separate parent protocol.
-        const admission = @import("relational_integrity_generation_admission.zig");
+        const admission = relational_integrity_generation_admission;
         const fks = try parsed.relationalForeignKeyDefinitions(self.alloc);
         defer if (fks.len > 0) self.alloc.free(fks);
         var self_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -23018,7 +23129,7 @@ pub const DB = struct {
             self.alloc.free(prior_schema);
             return error.InitialChildPublicationChanged;
         }
-        if (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) |prior_catalog| {
+        if (try self.core.getStoreValue(self.alloc, relational_integrity_catalog.key)) |prior_catalog| {
             self.alloc.free(prior_catalog);
             return error.InitialChildPublicationChanged;
         }
@@ -23053,8 +23164,8 @@ pub const DB = struct {
         self.reconcilePublishedSchemaIndexes(runtime_schema.version);
     }
 
-    fn applyInitialChildPhase(self: *DB, fence: @import("relational_integrity_topology_contract.zig").Fence, control: @import("relational_integrity_topology_contract.zig").InitialChildControl, phase: @import("relational_initial_child_publication.zig").Phase, entry: OrderedApplyReceipt, native: bool, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
-        const hidden = @import("relational_initial_child_publication.zig");
+    fn applyInitialChildPhase(self: *DB, fence: relational_integrity_topology_contract.Fence, control: relational_integrity_topology_contract.InitialChildControl, phase: relational_initial_child_publication.Phase, entry: OrderedApplyReceipt, native: bool, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
+        const hidden = relational_initial_child_publication;
         if (fence.role != .child_generation_source or !fence.namespace.eql(self.core.identity_namespace) or
             std.mem.allEqual(u8, &control.plan_id, 0) or std.mem.allEqual(u8, &control.plan_digest, 0) or
             !std.mem.eql(u8, &control.catalog_digest, &fence.catalog_digest) or
@@ -23136,7 +23247,7 @@ pub const DB = struct {
             try txn.commit();
             return;
         }
-        const stored_catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch return error.IntegrityCatalogChanged;
+        const stored_catalog = txn.get(relational_integrity_catalog.key) catch return error.IntegrityCatalogChanged;
         var catalog_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(stored_catalog, &catalog_digest, .{});
         if (!std.mem.eql(u8, &catalog_digest, &current.catalog_digest)) return error.IntegrityCatalogChanged;
@@ -23147,7 +23258,7 @@ pub const DB = struct {
         if (phase == .released) {
             var parsed_schema = try public_table_schema.parseValidatedTableSchema(self.alloc, stored_schema);
             defer parsed_schema.deinit(self.alloc);
-            var parsed_catalog = try @import("relational_integrity_catalog.zig").decode(self.alloc, stored_catalog);
+            var parsed_catalog = try relational_integrity_catalog.decode(self.alloc, stored_catalog);
             defer parsed_catalog.deinit();
             const fks = try parsed_schema.relationalForeignKeyDefinitions(self.alloc);
             defer if (fks.len > 0) self.alloc.free(fks);
@@ -23158,7 +23269,7 @@ pub const DB = struct {
                 if (!std.mem.startsWith(u8, fk.parent_table, "table:")) continue;
                 const physical_id = std.hash.Wyhash.hash(0x54424c45, fk.parent_table);
                 if ((if (physical_id == 0) @as(u64, 1) else physical_id) != current.namespace.table_id) continue;
-                const scope = (try @import("relational_integrity_generation_admission.zig").load(&txn, fk.parent_table, fk.name)) orelse return error.InitialChildPublicationChanged;
+                const scope = (try relational_integrity_generation_admission.load(&txn, fk.parent_table, fk.name)) orelse return error.InitialChildPublicationChanged;
                 const binding = parsed_catalog.find(.foreign_key, fk.name) orelse return error.IntegrityCatalogChanged;
                 if (scope.phase != .active or scope.active_generation == null or
                     !std.mem.eql(u8, &scope.active_generation.?, &binding.generation) or
@@ -23167,8 +23278,8 @@ pub const DB = struct {
                     return error.InitialChildPublicationChanged;
             }
         }
-        const table_raw = txn.get(@import("table_catalog.zig").key) catch return error.InitialChildPublicationChanged;
-        if ((try @import("table_catalog.zig").Catalog.decode(table_raw)).row_count != 0) return error.InitialChildPublicationChanged;
+        const table_raw = txn.get(table_catalog_mod.key) catch return error.InitialChildPublicationChanged;
+        if ((try table_catalog_mod.Catalog.decode(table_raw)).row_count != 0) return error.InitialChildPublicationChanged;
         _ = try hidden.stagePhase(&txn, current, phase, entry.term, entry.index);
         try stageApplyMarkers(&txn, if (native) null else entry, replication_lsn);
         try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
@@ -23191,19 +23302,19 @@ pub const DB = struct {
             // Raft high-water mark that could suppress a later publication.
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            const admission = @import("relational_integrity_generation_admission.zig");
+            const admission = relational_integrity_generation_admission;
             const raw = try missingAsNull(read.get(admission.source_install_receipt_key));
             if (raw) |bytes| {
                 const receipt = try admission.AppliedReceipt.decode(bytes);
                 const expected = try admission.sourceInstallDigest(publication.fence, publication.before_schema_json_digest, publication.schema_json_digest, publication.before_catalog_digest, publication.after_catalog_digest);
                 if (std.mem.eql(u8, &receipt.digest, &expected)) {
-                    const completed = (try @import("relational_integrity_topology.zig").completed(&read)) orelse return error.GenerationAdmissionChanged;
+                    const completed = (try relational_integrity_topology.completed(&read)) orelse return error.GenerationAdmissionChanged;
                     if (!completed.eql(publication.fence) or receipt.term != publication.ordered_receipt.term or receipt.index != publication.ordered_receipt.index)
                         return error.GenerationAdmissionChanged;
                     const actual = try read.get(public_schema_json_key);
                     if (!std.mem.eql(u8, actual, schema_json)) return error.IntegrityCatalogChanged;
                     var actual_digest: [32]u8 = undefined;
-                    std.crypto.hash.Blake3.hash(try read.get(@import("relational_integrity_catalog.zig").key), &actual_digest, .{});
+                    std.crypto.hash.Blake3.hash(try read.get(relational_integrity_catalog.key), &actual_digest, .{});
                     if (!std.mem.eql(u8, &actual_digest, &publication.after_catalog_digest)) return error.IntegrityCatalogChanged;
                     return;
                 }
@@ -23297,7 +23408,7 @@ pub const DB = struct {
                 schema_metadata_writes[schema_metadata_write_count] = marker;
                 schema_metadata_write_count += 1;
             }
-            const admission = @import("relational_integrity_generation_admission.zig");
+            const admission = relational_integrity_generation_admission;
             const digest = try admission.sourceInstallDigest(published.fence, published.before_schema_json_digest, published.schema_json_digest, published.before_catalog_digest, published.after_catalog_digest);
             source_receipt_buffer = (admission.AppliedReceipt{ .digest = digest, .term = published.ordered_receipt.term, .index = published.ordered_receipt.index }).encode();
             schema_metadata_writes[schema_metadata_write_count] = .{ .key = admission.source_install_receipt_key, .value = &source_receipt_buffer };
@@ -23311,7 +23422,7 @@ pub const DB = struct {
             try self.core.prepareSchemaMetadata(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count]);
         defer prepared_schema.deinit();
         if (publication) |published| {
-            const current_catalog = (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+            const current_catalog = (try self.core.getStoreValue(self.alloc, relational_integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
             defer self.alloc.free(current_catalog);
             var before_digest: [32]u8 = undefined;
             std.crypto.hash.Blake3.hash(current_catalog, &before_digest, .{});
@@ -23455,7 +23566,7 @@ pub const DB = struct {
         if (self.local_execution.restore_staging_required.load(.acquire)) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            try @import("restore_staging.zig").requireScope(self.alloc, &read, null, false);
+            try restore_staging.requireScope(self.alloc, &read, null, false);
         }
         return try self.core.beginTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
     }
@@ -23501,7 +23612,7 @@ pub const DB = struct {
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, scope);
+            try restore_staging.requireMutableScope(self.alloc, &read, scope);
         }
         return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
             txn_id,
@@ -23539,7 +23650,7 @@ pub const DB = struct {
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, scope);
+            try restore_staging.requireMutableScope(self.alloc, &read, scope);
         }
         var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(identity, &value_buf);
@@ -23619,8 +23730,8 @@ pub const DB = struct {
             defer topology_manager.deinit();
             var topology_read = try self.core.store.beginProbeTxn();
             defer topology_read.abort();
-            if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireScope(preparation_alloc, &topology_read, null, false);
-            try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
+            if (self.local_execution.restore_staging_required.load(.acquire)) try restore_staging.requireScope(preparation_alloc, &topology_read, null, false);
+            try relational_integrity_topology.admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
         }
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         const index_spans = try self.collectIndexSpanReservations(preparation_alloc, prepared_intents, view);
@@ -23782,8 +23893,8 @@ pub const DB = struct {
 
         // These internal observations address this exact owner's metadata,
         // never document keyspace. The coordinator routes them by owner fence.
-        const tracking = @import("../range_protection.zig");
-        if (req.range_guards.len > @import("../range_protection.zig").max_proofs) return error.TransactionTooLarge;
+        const tracking = range_protection_mod;
+        if (req.range_guards.len > range_protection_mod.max_proofs) return error.TransactionTooLarge;
         const range_keys = try preparation_alloc.alloc([tracking.counter_prefix.len + 2]u8, req.range_guards.len);
         defer preparation_alloc.free(range_keys);
         const index_range_keys = try preparation_alloc.alloc([tracking.index_counter_prefix.len + tracking.index_span_digest_bytes]u8, req.range_guards.len);
@@ -23854,7 +23965,7 @@ pub const DB = struct {
         };
         var guarded_indexes: std.AutoHashMapUnmanaged([tracking.index_id_bytes]u8, void) = .empty;
         defer guarded_indexes.deinit(preparation_alloc);
-        var index_plan: ?@import("relational_index_catalog.zig").WriteSnapshot = null;
+        var index_plan: ?relational_index_catalog.WriteSnapshot = null;
         defer if (index_plan) |*plan| plan.deinit();
         var index_read: ?docstore_mod.DocStore.Txn = null;
         defer if (index_read) |*read| read.abort();
@@ -23865,9 +23976,9 @@ pub const DB = struct {
             if (index_plan == null) {
                 index_plan = self.core.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
                 index_read = try self.core.store.beginProbeTxn();
-                const head_raw = try index_read.?.get(@import("relational_index_catalog.zig").head_key);
-                if (!(try @import("relational_index_catalog.zig").Head.decode(head_raw)).eql(index_plan.?.head)) return error.PreparedGenerationChanged;
-                try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, @import("relational_index_catalog.zig").head_key);
+                const head_raw = try index_read.?.get(relational_index_catalog.head_key);
+                if (!(try relational_index_catalog.Head.decode(head_raw)).eql(index_plan.?.head)) return error.PreparedGenerationChanged;
+                try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, relational_index_catalog.head_key);
             }
             const index = for (index_plan.?.plan.boundIndexes()) |candidate| {
                 const candidate_id = candidate.id().encode();
@@ -23875,14 +23986,14 @@ pub const DB = struct {
             } else return error.PreparedGenerationChanged;
             if ((try relational_index_jobs.status(&index_read.?, index)).state != .ready) return error.RelationalIndexNotReady;
             const progress_key = relational_index_jobs.progressKey(index.id());
-            const control_key = @import("relational_index_maintenance_contract.zig").controlKey(index.id());
+            const control_key = relational_index_maintenance_contract.controlKey(index.id());
             try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &progress_key);
             try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &control_key);
         }
         defer freePreparedIntentRows(preparation_alloc, intents.items);
         try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
 
-        const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
+        const integrity_catalog_mod = relational_integrity_catalog;
         var integrity_catalog: ?integrity_catalog_mod.Catalog = null;
         var integrity_catalog_digest: ?[32]u8 = null;
         defer if (integrity_catalog) |*catalog| catalog.deinit();
@@ -23894,7 +24005,7 @@ pub const DB = struct {
             std.crypto.hash.Blake3.hash(raw_catalog, &digest, .{});
             integrity_catalog_digest = digest;
             if (req.relational_integrity_generation_set) |expected| {
-                const actual = @import("relational_integrity_activation.zig").generationSet(integrity_catalog.?);
+                const actual = relational_integrity_activation.generationSet(integrity_catalog.?);
                 if (!std.mem.eql(u8, &expected, &actual)) return error.IntegrityCatalogChanged;
             }
             const view = prepared_schema_view orelse return error.IntegrityCatalogChanged;
@@ -23917,8 +24028,8 @@ pub const DB = struct {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
             try self.enforceRowPolicyIntentsLocked(view, intents.items, principal);
         }
-        const integrity_mod = @import("relational_integrity.zig");
-        const activation_mod = @import("relational_integrity_activation.zig");
+        const integrity_mod = relational_integrity;
+        const activation_mod = relational_integrity_activation;
         var repair_checkpoint: ?[]const u8 = null;
         defer if (repair_checkpoint) |bytes| preparation_alloc.free(bytes);
         var restore_checkpoint: ?[]const u8 = null;
@@ -23928,16 +24039,16 @@ pub const DB = struct {
         {
             var topology_read = try self.core.store.beginProbeTxn();
             defer topology_read.abort();
-            try @import("restore_staging.zig").requireMutableScope(preparation_alloc, &topology_read, req.restore_staging_scope);
+            try restore_staging.requireMutableScope(preparation_alloc, &topology_read, req.restore_staging_scope);
             if (req.restore_staging_scope != null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0 or req.relational_repair or req.relational_retirement != null)) return error.InvalidRestoreStagingCommand;
             if (req.restore_staging_scope != null) {
-                const checkpoint = (try @import("restore_staging.zig").optional(&topology_read)) orelse return error.RestoreStagingScopeChanged;
+                const checkpoint = (try restore_staging.optional(&topology_read)) orelse return error.RestoreStagingScopeChanged;
                 restore_checkpoint = try preparation_alloc.dupe(u8, checkpoint);
-                try predicates.append(preparation_alloc, .{ .key = @import("restore_staging.zig").key, .comparison = .exact_value, .expected_value = restore_checkpoint });
+                try predicates.append(preparation_alloc, .{ .key = restore_staging.key, .comparison = .exact_value, .expected_value = restore_checkpoint });
             }
-            try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
+            try relational_integrity_topology.admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
         }
-        var maintenance_preparation: ?@import("relational_index_maintenance.zig").Prepared = null;
+        var maintenance_preparation: ?relational_index_maintenance.Prepared = null;
         defer if (maintenance_preparation) |*value| value.deinit();
         if (req.relational_index_maintenance) |command| {
             const view = prepared_schema_view orelse return error.RelationalTableRequired;
@@ -23947,7 +24058,7 @@ pub const DB = struct {
             if (plan.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
             var maintenance_read = try self.core.store.beginProbeTxn();
             defer maintenance_read.abort();
-            maintenance_preparation = try @import("relational_index_maintenance.zig").prepareCommand(
+            maintenance_preparation = try relational_index_maintenance.prepareCommand(
                 preparation_alloc,
                 &maintenance_read,
                 plan.plan,
@@ -23965,8 +24076,8 @@ pub const DB = struct {
             // Shadow claims must remain unobservable even to a participant
             // whose stale route happens to name this receiver. Check before
             // any claim/reference lookup or semantic preparation occurs.
-            for (req.integrity_commands) |command| try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), &command.address.routing);
-            for (req.integrity) |operation| try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), operation.routing_key);
+            for (req.integrity_commands) |command| try online_integrity_shadow.requireServing(&integrity_read, self.core.byteRange(), &command.address.routing);
+            for (req.integrity) |operation| try online_integrity_shadow.requireServing(&integrity_read, self.core.byteRange(), operation.routing_key);
             // Layout epochs alone do not fence changes to UNIQUE/FK declarations.
             // Compare the exact catalog observed during preparation under apply.
             const current_catalog = integrity_read.get(integrity_catalog_mod.key) catch |err| switch (err) {
@@ -23978,29 +24089,29 @@ pub const DB = struct {
             if (!std.mem.eql(u8, &current_digest, &integrity_catalog_digest.?)) return error.IntegrityCatalogChanged;
             if (req.relational_retirement) |command| {
                 if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0 or req.relational_activation != null or req.relational_repair) return error.InvalidConstraintRetirementCommand;
-                try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
-                try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), command.routing_key);
-                const retirement = try @import("relational_integrity_retirement.zig").prepareCommand(preparation_alloc, &integrity_read, integrity_catalog.?, command);
-                const after = try @import("relational_integrity_retirement.zig").Progress.decode(command.next);
+                try online_integrity_shadow.requireCatalogMutable(&integrity_read);
+                try online_integrity_shadow.requireServing(&integrity_read, self.core.byteRange(), command.routing_key);
+                const retirement = try relational_integrity_retirement.prepareCommand(preparation_alloc, &integrity_read, integrity_catalog.?, command);
+                const after = try relational_integrity_retirement.Progress.decode(command.next);
                 if (command.expected) |expected| {
-                    const before = try @import("relational_integrity_retirement.zig").Progress.decode(expected);
+                    const before = try relational_integrity_retirement.Progress.decode(expected);
                     if (binding == null and before.phase == .fenced and after.phase != .fenced and try topology_manager.hasSchemaLeases()) return error.SchemaInUse;
                 }
                 try intents.append(preparation_alloc, retirement.intent);
                 try predicates.append(preparation_alloc, retirement.predicate);
             }
             if (req.relational_activation) |command| {
-                try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
-                try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
+                try relational_integrity_retirement.requireMutable(&integrity_read);
+                try online_integrity_shadow.requireCatalogMutable(&integrity_read);
                 // A backfill page changes claims and its durable cursor, never
                 // primary rows. Its observed rows are retained read guards.
                 if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0) return error.InvalidConstraintActivationCommand;
-                try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), command.routing_key);
+                try online_integrity_shadow.requireServing(&integrity_read, self.core.byteRange(), command.routing_key);
                 const activation = try activation_mod.prepareCommand(preparation_alloc, &integrity_read, integrity_catalog.?, command);
                 try intents.append(preparation_alloc, activation.intent);
                 try predicates.append(preparation_alloc, activation.predicate);
             } else if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0) {
-                try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
+                try relational_integrity_retirement.requireMutable(&integrity_read);
                 if (req.relational_repair) {
                     const repair_guard = try activation_mod.repairPredicate(preparation_alloc, &integrity_read, integrity_catalog.?);
                     repair_checkpoint = repair_guard.expected_value;
@@ -24008,15 +24119,15 @@ pub const DB = struct {
                 } else try activation_mod.requireReady(&integrity_read, integrity_catalog.?);
             }
             if (req.integrity.len != 0 and req.integrity_commands.len != 0) return error.InvalidIntegrityOperation;
-            if (req.integrity.len != 0) try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
-            try @import("relational_integrity_retirement.zig").admitCommands(&integrity_read, req.integrity_commands);
+            if (req.integrity.len != 0) try relational_integrity_retirement.requireMutable(&integrity_read);
+            try relational_integrity_retirement.admitCommands(&integrity_read, req.integrity_commands);
             const integrity_operations = if (req.integrity_commands.len != 0) operations: {
                 integrity_effects = try integrity_mod.prepare(preparation_alloc, &integrity_read, req.integrity_commands);
                 break :operations integrity_effects.?.operations;
             } else req.integrity;
             try integrity_mod.validatePreparedEffects(preparation_alloc, &integrity_read, integrity_operations);
             for (integrity_operations) |operation| {
-                try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), operation.routing_key);
+                try online_integrity_shadow.requireServing(&integrity_read, self.core.byteRange(), operation.routing_key);
                 const parsed_key = try integrity_mod.parseKey(operation.key);
                 const generation = integrity_catalog.?.findGeneration(parsed_key.address.generation) orelse return error.IntegrityCatalogChanged;
                 if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
@@ -24173,7 +24284,7 @@ pub const DB = struct {
         }
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        const retention = (try @import("../retained_effects.zig").load(&read)) orelse return;
+        const retention = (try retained_effects_mod.load(&read)) orelse return;
         if (!retention.active() or !retention.direct_vectors) return;
         for (intents) |*intent| {
             if (isMetadataKey(intent.key)) continue;
@@ -24224,7 +24335,7 @@ pub const DB = struct {
                 while (entry) |record| : (entry = try cursor.next()) {
                     if (!std.mem.startsWith(u8, record.key, prefix)) break;
                     inspected += 1;
-                    if (inspected > @import("../retained_effects.zig").max_keys) return error.TransactionTooLarge;
+                    if (inspected > retained_effects_mod.max_keys) return error.TransactionTooLarge;
                     if (!internal_keys.isEmbeddingArtifactKey(record.key)) continue;
                     intent.retained_artifact_bytes = std.math.add(u64, intent.retained_artifact_bytes, 16 + record.key.len) catch return error.TransactionTooLarge;
                     intent.retained_artifact_keys += 1;
@@ -24238,8 +24349,8 @@ pub const DB = struct {
         alloc: Allocator,
         intents: []const transactions_mod.WriteIntent,
         schema_view: ?schema_registry_mod.SchemaView,
-    ) ![]const [@import("../range_protection.zig").index_span_digest_bytes]u8 {
-        const protection = @import("../range_protection.zig");
+    ) ![]const [range_protection_mod.index_span_digest_bytes]u8 {
+        const protection = range_protection_mod;
         const view = schema_view orelse return &.{};
         if (view.storageMode() != .relational) return &.{};
         var read = try self.core.store.beginReadTxn();
@@ -24475,12 +24586,12 @@ pub const DB = struct {
 
     pub const validateResolvedKeyOwnership = local_mutation.validateResolvedKeyOwnership;
 
-    pub const RelationalTopologyIdentity = @import("relational_integrity_topology_contract.zig").Identity;
+    pub const RelationalTopologyIdentity = relational_integrity_topology_contract.Identity;
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
             mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
-            scope: ?@import("online_source_contract.zig").Scope = null,
+            scope: ?online_source_contract.Scope = null,
         }, alloc, request_json, .{});
         defer request.deinit();
         if ((request.value.mode == .online_source_status) != (request.value.scope != null)) return error.InvalidOnlineSourceCommand;
@@ -24488,14 +24599,14 @@ pub const DB = struct {
         errdefer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
         switch (request.value.mode) {
-            .identity => try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream),
+            .identity => try relational_integrity_json.write(try self.relationalTopologyIdentity(), &stream),
             .generation_handoff_identity => {
                 const scope = opts.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
                 const plan_id = opts.restore_staging_plan_id orelse return error.RestoreStagingScopeChanged;
                 {
                     var read = try self.core.store.beginProbeTxn();
                     defer read.abort();
-                    const contract = @import("restore_staging_contract.zig");
+                    const contract = restore_staging_contract;
                     const raw = read.get(contract.bootstrap_key) catch return error.RestoreStagingScopeChanged;
                     var bootstrap = try contract.OwnerBootstrap.decode(alloc, raw);
                     defer bootstrap.deinit();
@@ -24505,10 +24616,10 @@ pub const DB = struct {
                         !std.mem.eql(u8, &scope, &bootstrap.value.scope.digest()) or
                         !std.mem.eql(u8, &plan_id, &bootstrap.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
                 }
-                try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream);
+                try relational_integrity_json.write(try self.relationalTopologyIdentity(), &stream);
             },
-            .status => try @import("relational_integrity_json.zig").write(try self.relationalTopologyStatus(), &stream),
-            .online_source_status => try @import("relational_integrity_json.zig").write(try self.onlineSourceStatus(request.value.scope.?), &stream),
+            .status => try relational_integrity_json.write(try self.relationalTopologyStatus(), &stream),
+            .online_source_status => try relational_integrity_json.write(try self.onlineSourceStatus(request.value.scope.?), &stream),
             .merge_copy_receipt => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
@@ -24517,14 +24628,14 @@ pub const DB = struct {
                 const raw = try missingAsNull(read.get(merge_state_mod.key));
                 var state = if (raw) |value| try merge_state_mod.decodeAlloc(alloc, value) else null;
                 defer if (state) |*value| value.deinit(alloc);
-                const table = @import("table_catalog.zig");
+                const table = table_catalog_mod;
                 const table_raw = try missingAsNull(read.get(table.key));
                 const row_derived_document = if (table_raw) |value| blk: {
                     const catalog = try table.Catalog.decode(value);
                     break :blk catalog.mode_initialized and catalog.storage_mode == .document and
-                        try @import("online_merge_io.zig").rowDerivedIndexesAssumeApply(self, alloc);
+                        try online_merge_io.rowDerivedIndexesAssumeApply(self, alloc);
                 } else false;
-                try @import("relational_integrity_json.zig").write(@import("merge_contract.zig").CopyReceipt{
+                try relational_integrity_json.write(@import("merge_contract.zig").CopyReceipt{
                     .namespace = self.core.identity_namespace,
                     .range = self.core.byteRange(),
                     .state = state,
@@ -24536,25 +24647,25 @@ pub const DB = struct {
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_json.zig").write(try @import("relational_integrity_topology.zig").completed(&read), &stream);
+                try relational_integrity_json.write(try relational_integrity_topology.completed(&read), &stream);
             },
             .parent_activation => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const retirement = @import("relational_integrity_generation_retirement.zig");
+                const retirement = relational_integrity_generation_retirement;
                 const value = try retirement.ownerStatus(alloc, &read);
                 defer if (value) |status| alloc.free(status.entries);
-                try @import("relational_integrity_json.zig").write(value, &stream);
+                try relational_integrity_json.write(value, &stream);
             },
             .generation_publication => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const value = try @import("relational_integrity_generation_admission.zig").ownerStatus(&read);
-                try @import("relational_integrity_json.zig").write(value, &stream);
+                const value = try relational_integrity_generation_admission.ownerStatus(&read);
+                try relational_integrity_json.write(value, &stream);
             },
             .generation_handoff_summary => {
                 self.core.lockApplyShared();
@@ -24575,61 +24686,61 @@ pub const DB = struct {
                         try checkLookupOptionsActive(options.*);
                     }
                 };
-                var value = try @import("empty_generation_handoff.zig").summaryAllocControlled(alloc, &read, self.core.identity_namespace, .{ .ptr = &scan_options, .check_fn = Scan.check });
+                var value = try empty_generation_handoff.summaryAllocControlled(alloc, &read, self.core.identity_namespace, .{ .ptr = &scan_options, .check_fn = Scan.check });
                 defer value.deinit(alloc);
-                try @import("relational_integrity_json.zig").write(value, &stream);
+                try relational_integrity_json.write(value, &stream);
             },
             .generation_handoff_seal => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").sealStatus(&read, self.core.identity_namespace), &stream);
+                try relational_integrity_json.write(try empty_generation_handoff.sealStatus(&read, self.core.identity_namespace), &stream);
             },
             .generation_handoff_install => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").loadInstallReceipt(&read), &stream);
+                try relational_integrity_json.write(try empty_generation_handoff.loadInstallReceipt(&read), &stream);
             },
             .graph_endpoint_cleanup => {
                 if (try self.prepareGraphEndpointCleanupBatch(alloc)) |owned| {
                     var cleanup = owned;
                     defer cleanup.deinit();
-                    try @import("relational_integrity_json.zig").write(types.GraphEndpointCleanupStatus{ .pending = true, .guards = cleanup.page.guards, .graph_deletes = cleanup.graph_deletes, .deletes = cleanup.page.deletes, .merge_artifacts = cleanup.replay_writes }, &stream);
-                } else try @import("relational_integrity_json.zig").write(types.GraphEndpointCleanupStatus{}, &stream);
+                    try relational_integrity_json.write(types.GraphEndpointCleanupStatus{ .pending = true, .guards = cleanup.page.guards, .graph_deletes = cleanup.graph_deletes, .deletes = cleanup.page.deletes, .merge_artifacts = cleanup.replay_writes }, &stream);
+                } else try relational_integrity_json.write(types.GraphEndpointCleanupStatus{}, &stream);
             },
             .graph_retirement => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_json.zig").write(try @import("graph_retirement_seal.zig").status(&read), &stream);
+                try relational_integrity_json.write(try graph_retirement_seal.status(&read), &stream);
             },
             .initial_child_publication => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const value = try @import("relational_initial_child_publication.zig").load(&read);
-                try @import("relational_integrity_json.zig").write(value, &stream);
+                const value = try relational_initial_child_publication.load(&read);
+                try relational_integrity_json.write(value, &stream);
             },
             .initial_child_preflight => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const table_raw = try missingAsNull(read.get(@import("table_catalog.zig").key));
-                const row_count: u64 = if (table_raw) |raw| (try @import("table_catalog.zig").Catalog.decode(raw)).row_count else 0;
+                const table_raw = try missingAsNull(read.get(table_catalog_mod.key));
+                const row_count: u64 = if (table_raw) |raw| (try table_catalog_mod.Catalog.decode(raw)).row_count else 0;
                 const existing_schema = try missingAsNull(read.get(public_schema_json_key));
-                const existing_catalog = try missingAsNull(read.get(@import("relational_integrity_catalog.zig").key));
-                try @import("relational_integrity_json.zig").write(.{
+                const existing_catalog = try missingAsNull(read.get(relational_integrity_catalog.key));
+                try relational_integrity_json.write(.{
                     .namespace = self.core.identity_namespace,
                     .row_count = row_count,
                     .has_schema = existing_schema != null,
                     .has_catalog = existing_catalog != null,
-                    .hidden = try @import("relational_initial_child_publication.zig").load(&read),
+                    .hidden = try relational_initial_child_publication.load(&read),
                 }, &stream);
             },
             .public_schema => {
@@ -24647,13 +24758,13 @@ pub const DB = struct {
                 // support point reads only and cannot open the required cursor.
                 var read = try self.core.store.beginReadTxn();
                 defer read.abort();
-                if (try @import("relational_integrity_topology.zig").current(&read) != null) {
-                    try @import("relational_integrity_json.zig").write(@as(?@import("relational_integrity_generation_retirement.zig").GcCommand, null), &stream);
+                if (try relational_integrity_topology.current(&read) != null) {
+                    try relational_integrity_json.write(@as(?relational_integrity_generation_retirement.GcCommand, null), &stream);
                 } else {
-                    var page = try @import("relational_integrity_generation_retirement.zig").prepareGcPage(alloc, &read, 64, 512 * 1024);
+                    var page = try relational_integrity_generation_retirement.prepareGcPage(alloc, &read, 64, 512 * 1024);
                     defer if (page) |*owned_page| owned_page.deinit();
-                    const value: ?@import("relational_integrity_generation_retirement.zig").GcCommand = if (page) |*owned_page| owned_page.command(0, self.core.identity_namespace) else null;
-                    try @import("relational_integrity_json.zig").write(value, &stream);
+                    const value: ?relational_integrity_generation_retirement.GcCommand = if (page) |*owned_page| owned_page.command(0, self.core.identity_namespace) else null;
+                    try relational_integrity_json.write(value, &stream);
                 }
             },
             .handoff_progress => {
@@ -24661,35 +24772,35 @@ pub const DB = struct {
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                var progress = try @import("relational_integrity_handoff.zig").loadProgress(alloc, &read);
+                var progress = try relational_integrity_handoff.loadProgress(alloc, &read);
                 defer progress.deinit();
-                try @import("relational_integrity_json.zig").write(progress.value, &stream);
+                try relational_integrity_json.write(progress.value, &stream);
             },
             .handoff_manifest => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const bytes = read.get(@import("relational_integrity_handoff.zig").manifest_key) catch |err| switch (err) {
+                const bytes = read.get(relational_integrity_handoff.manifest_key) catch |err| switch (err) {
                     error.NotFound => "null",
                     else => return err,
                 };
-                var manifest = try std.json.parseFromSlice(?@import("relational_integrity_handoff.zig").Manifest, alloc, bytes, .{});
+                var manifest = try std.json.parseFromSlice(?relational_integrity_handoff.Manifest, alloc, bytes, .{});
                 defer manifest.deinit();
-                try @import("relational_integrity_json.zig").write(manifest.value, &stream);
+                try relational_integrity_json.write(manifest.value, &stream);
             },
             .prune_progress => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const bytes = read.get(@import("relational_integrity_handoff.zig").prune_key) catch |err| switch (err) {
+                const bytes = read.get(relational_integrity_handoff.prune_key) catch |err| switch (err) {
                     error.NotFound => "null",
                     else => return err,
                 };
-                var progress = try std.json.parseFromSlice(?@import("relational_integrity_handoff.zig").PruneProgress, alloc, bytes, .{});
+                var progress = try std.json.parseFromSlice(?relational_integrity_handoff.PruneProgress, alloc, bytes, .{});
                 defer progress.deinit();
-                try @import("relational_integrity_json.zig").write(progress.value, &stream);
+                try relational_integrity_json.write(progress.value, &stream);
             },
         }
         return .{ .json = try output.toOwnedSlice() };
@@ -24701,15 +24812,15 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
         var read = try self.core.store.beginProbeTxn();
         defer read.abort();
-        const raw = read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+        const raw = read.get(relational_integrity_catalog.key) catch |err| switch (err) {
             error.NotFound => "",
             else => return err,
         };
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(raw, &digest, .{});
-        const authority = try @import("../source_authority.zig").load(&read);
-        const handoff_authority: @import("relational_integrity_topology_contract.zig").GenerationHandoffReceiptAuthority = if (authority) |value|
-            if (std.mem.eql(u8, &value.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+        const authority = try source_authority_mod.load(&read);
+        const handoff_authority: relational_integrity_topology_contract.GenerationHandoffReceiptAuthority = if (authority) |value|
+            if (std.mem.eql(u8, &value.namespace, &online_source_contract.namespaceBytes(self.core.identity_namespace)))
                 if (value.kind == .raft) .raft else .native
             else
                 .unsupported
@@ -24718,7 +24829,7 @@ pub const DB = struct {
         return .{
             .namespace = self.core.identity_namespace,
             .catalog_digest = digest,
-            .next_epoch = try @import("relational_integrity_topology.zig").nextEpoch(&read),
+            .next_epoch = try relational_integrity_topology.nextEpoch(&read),
             .generation_handoff_receipt_authority = handoff_authority,
             .backup_seal_supported = self.primary_backend == .lsm and self.physical_root_mode == .filesystem_managed and
                 nativeRestoreStoragePublicationCompatible(self.primary_lsm_storage) and self.backend_runtime.filesystemIo() != null and
@@ -24726,14 +24837,14 @@ pub const DB = struct {
         };
     }
 
-    pub const RelationalTopologyStatus = struct { fence: ?@import("relational_integrity_topology.zig").Fence, drained: bool };
+    pub const RelationalTopologyStatus = struct { fence: ?relational_integrity_topology.Fence, drained: bool };
     pub fn relationalTopologyStatus(self: *DB) !RelationalTopologyStatus {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{self});
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         var read = try self.core.store.beginProbeTxn();
         defer read.abort();
-        const fence = try @import("relational_integrity_topology.zig").current(&read);
+        const fence = try relational_integrity_topology.current(&read);
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
         return .{ .fence = fence, .drained = !try manager.hasTopologySensitiveTransactions() };
@@ -24742,11 +24853,11 @@ pub const DB = struct {
     fn childGenerationSourceFence(core: *db_core.DBCore) !bool {
         var read = try core.store.beginProbeTxn();
         defer read.abort();
-        const fence = (try @import("relational_integrity_topology.zig").current(&read)) orelse return false;
+        const fence = (try relational_integrity_topology.current(&read)) orelse return false;
         if (fence.role != .child_generation_source and fence.role != .child_generation_dual) return false;
         _ = core.schema orelse return error.IntegrityCatalogChanged;
         if (!fence.namespace.eql(core.identity_namespace)) return error.IdentityNamespaceMismatch;
-        const encoded_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch return error.IntegrityCatalogChanged;
+        const encoded_catalog = read.get(relational_integrity_catalog.key) catch return error.IntegrityCatalogChanged;
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(encoded_catalog, &digest, .{});
         if (!std.mem.eql(u8, &digest, &fence.catalog_digest)) return error.IntegrityCatalogChanged;
@@ -24788,12 +24899,12 @@ pub const DB = struct {
     pub fn relationalHandoffManifest(
         self: *DB,
         alloc: Allocator,
-        source: @import("relational_integrity_topology.zig").Fence,
-        destination: @import("relational_integrity_topology.zig").Fence,
+        source: relational_integrity_topology.Fence,
+        destination: relational_integrity_topology.Fence,
         lower: []const u8,
         upper: []const u8,
         primary_sequence: u64,
-    ) !@import("relational_integrity_handoff.zig").Manifest {
+    ) !relational_integrity_handoff.Manifest {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, source, destination, lower, upper, primary_sequence });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
@@ -24801,14 +24912,14 @@ pub const DB = struct {
         defer read.abort();
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
-        try @import("relational_integrity_topology.zig").requireDrained(&read, &manager, source);
+        try relational_integrity_topology.requireDrained(&read, &manager, source);
         const owned_range = self.core.byteRange();
         if (std.mem.order(u8, lower, owned_range.start) == .lt or
             (owned_range.end.len != 0 and (upper.len == 0 or std.mem.order(u8, upper, owned_range.end) == .gt))) return error.KeyOutOfRange;
-        const raw_catalog = try read.get(@import("relational_integrity_catalog.zig").key);
-        var compiled = try @import("relational_integrity_catalog.zig").decode(alloc, raw_catalog);
+        const raw_catalog = try read.get(relational_integrity_catalog.key);
+        var compiled = try relational_integrity_catalog.decode(alloc, raw_catalog);
         defer compiled.deinit();
-        try @import("relational_integrity_activation.zig").requireReady(&read, compiled);
+        try relational_integrity_activation.requireReady(&read, compiled);
         return .{
             .source = source,
             .destination = destination,
@@ -24817,12 +24928,12 @@ pub const DB = struct {
             .source_range_start = try alloc.dupe(u8, owned_range.start),
             .source_range_end = try alloc.dupe(u8, owned_range.end),
             .catalog_bytes = try alloc.dupe(u8, raw_catalog),
-            .activation_bytes = try alloc.dupe(u8, try read.get(@import("relational_integrity_activation.zig").key)),
+            .activation_bytes = try alloc.dupe(u8, try read.get(relational_integrity_activation.key)),
             .primary_sequence = primary_sequence,
         };
     }
 
-    pub fn relationalHandoffPage(self: *DB, alloc: Allocator, manifest: @import("relational_integrity_handoff.zig").Manifest, progress: @import("relational_integrity_handoff.zig").Progress) !@import("relational_integrity_handoff.zig").Page {
+    pub fn relationalHandoffPage(self: *DB, alloc: Allocator, manifest: relational_integrity_handoff.Manifest, progress: relational_integrity_handoff.Progress) !relational_integrity_handoff.Page {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, manifest, progress });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
@@ -24830,8 +24941,8 @@ pub const DB = struct {
         defer read.abort();
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
-        try @import("relational_integrity_topology.zig").requireDrained(&read, &manager, manifest.source);
-        return @import("relational_integrity_handoff.zig").readPage(alloc, self.core.store, manifest, progress);
+        try relational_integrity_topology.requireDrained(&read, &manager, manifest.source);
+        return relational_integrity_handoff.readPage(alloc, self.core.store, manifest, progress);
     }
 
     /// Private replicated lifecycle control. Begin fences new work without
@@ -24839,7 +24950,7 @@ pub const DB = struct {
     /// apply. Callers separately poll drained before snapshot or cutover.
     pub fn applyRelationalTopologyControl(
         self: *DB,
-        command: @import("relational_integrity_topology.zig").Command,
+        command: relational_integrity_topology.Command,
         ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, command, ordered_receipt });
@@ -24850,13 +24961,13 @@ pub const DB = struct {
     /// source progress, retained log, replication marker and durable outbox are
     /// one commit. The public API has no admission route for these commands.
     fn applyOnlineSourceBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
-        try @import("online_source_contract.zig").validateRequest(req);
+        try online_source_contract.validateRequest(req);
         const command = req.online_source orelse return error.InvalidOnlineSourceCommand;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         // A committed admission retry must not need a later Raft GC command to
         // free its slot. Try the bounded local cleanup catalog without waiting
         // on exports and before taking the apply fence.
-        if (command == .admit) @import("source_pin.zig").reconcileReleased(self) catch |err| switch (err) {
+        if (command == .admit) source_pin.reconcileReleased(self) catch |err| switch (err) {
             error.OnlineSourcePinPending => {}, // Repair this exact prepared cut below.
             else => return err,
         };
@@ -24891,10 +25002,10 @@ pub const DB = struct {
                         const repair = blk: {
                             var read = try self.core.store.beginReadTxn();
                             defer read.abort();
-                            const pending = try @import("../source_pin_state.zig").load(&read) orelse break :blk false;
+                            const pending = try source_pin_state_mod.load(&read) orelse break :blk false;
                             break :blk std.mem.eql(u8, &pending.namespace, &command.scope().namespace()) and std.mem.eql(u8, &pending.pin, &command.scope().pin());
                         };
-                        if (repair) try @import("source_pin.zig").ensureAssumeApply(self, command.scope());
+                        if (repair) try source_pin.ensureAssumeApply(self, command.scope());
                     }
                     break :apply_source;
                 },
@@ -24908,12 +25019,12 @@ pub const DB = struct {
                 const pending_scope = blk: {
                     var read = try self.core.store.beginReadTxn();
                     defer read.abort();
-                    const pending = try @import("../source_pin_state.zig").load(&read) orelse break :blk null;
-                    break :blk try @import("online_source_contract.zig").Scope.decode(&pending.scope_bytes);
+                    const pending = try source_pin_state_mod.load(&read) orelse break :blk null;
+                    break :blk try online_source_contract.Scope.decode(&pending.scope_bytes);
                 };
                 if (pending_scope) |scope| {
                     if (!std.meta.eql(scope, command.scope())) return error.OnlineSourcePinPending;
-                    try @import("source_pin.zig").ensureAssumeApply(self, scope);
+                    try source_pin.ensureAssumeApply(self, scope);
                 }
             }
             // Reject unsupported backends before publishing a durable write
@@ -24931,34 +25042,34 @@ pub const DB = struct {
                 // barriers are Raft-ordered; retain the local recheck for
                 // native standalone admission only.
                 if (command.scope().authority == .native)
-                    try @import("online_merge_io.zig").requireAdmissibleSourceAtCommitAssumeApply(self, self.alloc);
+                    try online_merge_io.requireAdmissibleSourceAtCommitAssumeApply(self, self.alloc);
             }
             var txn = try self.core.store.beginWriteTxn();
             var txn_open = true;
             defer if (txn_open) txn.abort();
             if (command == .admit) {
-                if (req.artifact_catalog) |install| try @import("artifact_inventory.zig").stageOrdered(self.alloc, &txn, install, applied_index);
+                if (req.artifact_catalog) |install| try artifact_inventory.stageOrdered(self.alloc, &txn, install, applied_index);
                 if (command.admit.artifact_catalog) |binding| {
-                    try @import("artifact_inventory.zig").requireReady(self.alloc, &txn, command.scope().namespace(), binding);
-                    if (!try self.artifactMaterializationsReady(&txn, try @import("artifact_inventory.zig").catalogs(&txn))) return error.ArtifactCatalogDrift;
+                    try artifact_inventory.requireReady(self.alloc, &txn, command.scope().namespace(), binding);
+                    if (!try self.artifactMaterializationsReady(&txn, try artifact_inventory.catalogs(&txn))) return error.ArtifactCatalogDrift;
                 } else if (command.scope().authority == .raft) {
-                    const ordered = try @import("artifact_inventory.zig").load(self.alloc, &txn);
+                    const ordered = try artifact_inventory.load(self.alloc, &txn);
                     defer if (ordered) |value| value.deinit();
                     if (ordered != null) return error.ArtifactCatalogDrift;
                 }
             } else if (command != .release) {
-                const progress = try @import("online_source.zig").status(&txn, command.scope());
+                const progress = try online_source.status(&txn, command.scope());
                 if (progress.artifact_catalog) |binding|
-                    try @import("artifact_inventory.zig").requireReady(self.alloc, &txn, command.scope().namespace(), binding);
+                    try artifact_inventory.requireReady(self.alloc, &txn, command.scope().namespace(), binding);
             }
-            try @import("restore_staging.zig").requireScope(self.alloc, &txn, null, false);
-            if (command != .admit and command != .release) try @import("../source_pin_state.zig").requireNoPrepared(&txn, command.scope().namespace());
+            try restore_staging.requireScope(self.alloc, &txn, null, false);
+            if (command != .admit and command != .release) try source_pin_state_mod.requireNoPrepared(&txn, command.scope().namespace());
             if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
                 if (!stored.eql(command.scope().fence.namespace)) return error.IdentityNamespaceMismatch;
             } else {
                 try doc_identity.writeNamespaceTxn(&txn, command.scope().fence.namespace);
             }
-            const source_authority = @import("../source_authority.zig");
+            const source_authority = source_authority_mod;
             if (command.scope().authority == .native) {
                 applied_index = try source_authority.advance(&txn, command.scope().namespace(), opts.online_source_applied_index);
             } else if (try source_authority.load(&txn) != null) {
@@ -24967,7 +25078,7 @@ pub const DB = struct {
             if (command == .final_fence) {
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
-                try @import("relational_integrity_topology.zig").requireDrained(&txn, &manager, command.scope().fence);
+                try relational_integrity_topology.requireDrained(&txn, &manager, command.scope().fence);
             }
             if (command == .admit) {
                 // Candidate discovery is advisory. Recheck the durable local
@@ -24989,8 +25100,8 @@ pub const DB = struct {
                     if (state.phase != .finalized and state.phase != .rolled_back and state.phase != .none) return error.IntegrityTopologyBusy;
                 }
             }
-            try @import("online_source.zig").stage(&txn, command, applied_index);
-            if (req.artifact_catalog) |install| try @import("artifact_reconcile_intent.zig").clear(self.alloc, &txn, install, applied_index);
+            try online_source.stage(&txn, command, applied_index);
+            if (req.artifact_catalog) |install| try artifact_reconcile_intent.clear(self.alloc, &txn, install, applied_index);
             if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
                 payload = if (req.artifact_catalog != null) try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand) else try replication_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
@@ -25008,8 +25119,8 @@ pub const DB = struct {
             try txn.commit();
             txn_open = false;
             if (command == .admit) {
-                try @import("source_pin.zig").afterPrepare();
-                try @import("source_pin.zig").ensureAssumeApply(self, command.scope());
+                try source_pin.afterPrepare();
+                try source_pin.ensureAssumeApply(self, command.scope());
             }
         }
         if (command == .release) {
@@ -25017,7 +25128,7 @@ pub const DB = struct {
             self.local_execution.source_publication.cancelScope(io, command.scope());
             self.local_execution.online_merge_reader.retire(io, command.scope());
         }
-        if (command == .release) @import("source_pin.zig").reclaimReleased(self, command.scope()) catch |err| {
+        if (command == .release) source_pin.reclaimReleased(self, command.scope()) catch |err| {
             // Release is already durable. Replica-local cleanup failures keep
             // the bounded slot reserved, but cannot suppress its outbox flush
             // or misreport the replicated terminal decision as rejected.
@@ -25026,27 +25137,27 @@ pub const DB = struct {
         if (payload != null) try self.flushDurableReplicationOutboxes();
     }
 
-    fn preflightArtifactAdmission(self: *DB, req: types.BatchRequest, entry: anytype) !@import("artifact_reconcile_intent.zig").Context {
-        try @import("artifact_inventory.zig").validateRequest(req);
-        try @import("artifact_reconcile.zig").validateDesired(self.alloc, req.artifact_catalog.?);
-        if (!std.mem.eql(u8, &req.artifact_catalog.?.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace))) return error.IdentityNamespaceMismatch;
+    fn preflightArtifactAdmission(self: *DB, req: types.BatchRequest, entry: anytype) !artifact_reconcile_intent.Context {
+        try artifact_inventory.validateRequest(req);
+        try artifact_reconcile.validateDesired(self.alloc, req.artifact_catalog.?);
+        if (!std.mem.eql(u8, &req.artifact_catalog.?.namespace, &online_source_contract.namespaceBytes(self.core.identity_namespace))) return error.IdentityNamespaceMismatch;
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
-        try @import("../range_protection.zig").validateRequest(req);
-        try @import("merge_page_contract.zig").validateRequest(req);
-        try @import("online_source_contract.zig").validateRequest(req);
+        try range_protection_mod.validateRequest(req);
+        try merge_page_contract.validateRequest(req);
+        try online_source_contract.validateRequest(req);
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
         var txn = try self.core.store.beginWriteTxn();
         var preflight_open = true;
         defer if (preflight_open) txn.abort();
-        const prepared = try @import("artifact_inventory.zig").prepareOrdered(self.alloc, &txn, req.artifact_catalog.?, entry.index);
+        const prepared = try artifact_inventory.prepareOrdered(self.alloc, &txn, req.artifact_catalog.?, entry.index);
         defer if (prepared) |bytes| self.alloc.free(bytes);
         // Speculative admission derives the effect language from the same
         // ordered catalog as final admission. This transaction is aborted
         // before installing the durable reconciliation intent.
-        if (prepared) |bytes| try txn.put(@import("artifact_inventory.zig").ordered_key, bytes);
-        try @import("restore_staging.zig").requireScope(self.alloc, &txn, null, false);
+        if (prepared) |bytes| try txn.put(artifact_inventory.ordered_key, bytes);
+        try restore_staging.requireScope(self.alloc, &txn, null, false);
         const raw = txn.get(merge_state_mod.key) catch |err| switch (err) {
             error.NotFound => txn.get(merge_state_mod.legacy_key) catch |legacy_err| switch (legacy_err) {
                 error.NotFound => null,
@@ -25065,21 +25176,21 @@ pub const DB = struct {
                 if (!stored.eql(source.scope().fence.namespace)) return error.IdentityNamespaceMismatch;
             } else try doc_identity.writeNamespaceTxn(&txn, source.scope().fence.namespace);
             if (existing) |state| if (state.phase != .none and state.phase != .finalized and state.phase != .rolled_back) return error.IntegrityTopologyBusy;
-            const authority = @import("../source_authority.zig");
+            const authority = source_authority_mod;
             if (try authority.load(&txn) != null) _ = try authority.require(&txn, .raft, source.scope().namespace());
-            try @import("online_source.zig").stage(&txn, source, entry.index);
+            try online_source.stage(&txn, source, entry.index);
         } else if (req.merge_checkpoint) |checkpoint| {
-            if (try @import("relational_integrity_topology.zig").current(&txn) != null) return error.IntegrityTopologyBusy;
+            if (try relational_integrity_topology.current(&txn) != null) return error.IntegrityTopologyBusy;
             if (checkpoint.page_source) |source| {
                 try source.validate();
                 if (source.artifact_catalog) |binding| if (!binding.compatible(req.artifact_catalog.?.binding)) return error.InvalidArtifactCatalogCommand;
             }
-            if (try @import("../retained_effects.zig").load(&txn)) |retained| {
-                const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            if (try retained_effects_mod.load(&txn)) |retained| {
+                const namespace = online_source_contract.namespaceBytes(self.core.identity_namespace);
                 if (retained.active() and std.mem.eql(u8, &retained.namespace, &namespace)) return error.IntegrityTopologyBusy;
             }
-            var coordinated = try @import("online_integrity_shadow.zig").admit(self.alloc, &txn, req, self.core.identity_namespace);
-            if (!coordinated) coordinated = try @import("relational_integrity_handoff.zig").admitMergeRequest(self.alloc, &txn, req);
+            var coordinated = try online_integrity_shadow.admit(self.alloc, &txn, req, self.core.identity_namespace);
+            if (!coordinated) coordinated = try relational_integrity_handoff.admitMergeRequest(self.alloc, &txn, req);
             var schema_view = self.core.schema_registry.acquire();
             defer if (schema_view) |*view| view.release();
             if (hasCoordinatedConstraints(schema_view) and !coordinated) return error.CoordinatedConstraintTopologyUnsupported;
@@ -25088,7 +25199,7 @@ pub const DB = struct {
             } else if (checkpoint.allow_doc_identity_reassignment) return error.InvalidBatchRequest;
             const plan = try merge_state_mod.planCheckpointApply(self.alloc, if (existing) |*state| state else null, self.core.byteRange(), checkpoint);
             defer plan.deinit(self.alloc);
-            const pages = @import("merge_page_contract.zig");
+            const pages = merge_page_contract;
             const page_raw = try missingAsNull(txn.get(pages.key));
             var progress = if (page_raw) |bytes| try pages.decode(self.alloc, bytes) else null;
             defer if (progress) |*value| value.deinit();
@@ -25101,28 +25212,28 @@ pub const DB = struct {
         preflight_open = false;
         var intent_txn = try self.core.store.beginWriteTxn();
         errdefer intent_txn.abort();
-        const context = try @import("artifact_reconcile_intent.zig").stage(self.alloc, &intent_txn, req, entry);
+        const context = try artifact_reconcile_intent.stage(self.alloc, &intent_txn, req, entry);
         try intent_txn.commit();
         return context;
     }
 
-    pub fn reconcileOrderedArtifactCatalogStep(self: *DB, command: @import("artifact_inventory.zig").Command, applied_index: u64) !bool {
+    pub fn reconcileOrderedArtifactCatalogStep(self: *DB, command: artifact_inventory.Command, applied_index: u64) !bool {
         return self.reconcileOrderedArtifactCatalogWithContext(command, applied_index, null);
     }
 
-    fn reconcileOrderedArtifactCatalogWithContext(self: *DB, command: @import("artifact_inventory.zig").Command, applied_index: u64, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
-        if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace))) return error.IdentityNamespaceMismatch;
+    fn reconcileOrderedArtifactCatalogWithContext(self: *DB, command: artifact_inventory.Command, applied_index: u64, context: ?artifact_reconcile_intent.Context) !bool {
+        if (!std.mem.eql(u8, &command.namespace, &online_source_contract.namespaceBytes(self.core.identity_namespace))) return error.IdentityNamespaceMismatch;
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            const validated = try @import("artifact_inventory.zig").prepareOrdered(self.alloc, &read, command, applied_index);
+            const validated = try artifact_inventory.prepareOrdered(self.alloc, &read, command, applied_index);
             defer if (validated) |bytes| self.alloc.free(bytes);
-            if (std.mem.eql(u8, &(try @import("artifact_inventory.zig").catalogs(&read)).digest(), &command.binding.digest) and try self.artifactMaterializationsReady(&read, command.catalogs)) return true;
+            if (std.mem.eql(u8, &(try artifact_inventory.catalogs(&read)).digest(), &command.binding.digest) and try self.artifactMaterializationsReady(&read, command.catalogs)) return true;
         }
-        return @import("artifact_reconcile.zig").step(self, command, context orelse return error.ArtifactCatalogDrift);
+        return artifact_reconcile.step(self, command, context orelse return error.ArtifactCatalogDrift);
     }
 
-    pub fn alignOrderedArtifactCatalog(self: *DB, command: @import("artifact_inventory.zig").Command, configs: []const types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
+    pub fn alignOrderedArtifactCatalog(self: *DB, command: artifact_inventory.Command, configs: []const types.IndexConfig, context: artifact_reconcile_intent.Context) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, command, configs, context });
         var guard = self.beginIndexStructuralMutation("ordered artifact reconciliation", "");
         defer guard.deinit();
@@ -25147,12 +25258,12 @@ pub const DB = struct {
     /// repairs or to an obsolete catalog. The primary apply cut is stationary
     /// while reconciliation runs; physical projection publication remains
     /// fenced by the repair intent's root/config/control identity.
-    pub fn advanceOrderedArtifactInitialBuild(self: *DB, configs: []const types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
+    pub fn advanceOrderedArtifactInitialBuild(self: *DB, configs: []const types.IndexConfig, context: artifact_reconcile_intent.Context) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, configs, context });
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            try @import("artifact_reconcile_intent.zig").requireContext(self.alloc, &read, context);
+            try artifact_reconcile_intent.requireContext(self.alloc, &read, context);
         }
         for (configs) |config| {
             if (!self.core.index_manager.repairUnavailable(config.name)) continue;
@@ -25178,22 +25289,22 @@ pub const DB = struct {
         }
     }
 
-    pub fn reconcileArtifactAddIndex(self: *DB, cfg: types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !?u128 {
+    pub fn reconcileArtifactAddIndex(self: *DB, cfg: types.IndexConfig, context: artifact_reconcile_intent.Context) !?u128 {
         return self.addIndexForReconciliation(cfg, .managed, context, null, null);
     }
-    pub fn reconcileArtifactDeleteIndex(self: *DB, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
+    pub fn reconcileArtifactDeleteIndex(self: *DB, name: []const u8, context: artifact_reconcile_intent.Context) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, name, context });
         return self.deleteIndexForReconciliation(name, context);
     }
-    pub fn reconcileArtifactDeleteResolver(self: *DB, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
+    pub fn reconcileArtifactDeleteResolver(self: *DB, name: []const u8, context: artifact_reconcile_intent.Context) !bool {
         const removed = try self.removeResolverForReconciliation(name, context);
         if (removed) self.stopResolverReplayRuntimesIfUnconfigured();
         return removed;
     }
-    pub fn reconcileArtifactDeleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
+    pub fn reconcileArtifactDeleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8, context: artifact_reconcile_intent.Context) !bool {
         return self.deleteEnrichmentForReconciliation(kind, name, context);
     }
-    pub fn reconcileArtifactAddEnrichment(self: *DB, cfg: types.EnrichmentConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
+    pub fn reconcileArtifactAddEnrichment(self: *DB, cfg: types.EnrichmentConfig, context: artifact_reconcile_intent.Context) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, cfg, context });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
@@ -25213,24 +25324,24 @@ pub const DB = struct {
 
     pub const artifactMaterializationsReady = local_mutation.artifactMaterializationsReady;
 
-    pub fn artifactInventoryStatus(self: *DB) !@import("artifact_inventory.zig").Status {
+    pub fn artifactInventoryStatus(self: *DB) !artifact_inventory.Status {
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
         var namespace: [24]u8 = undefined;
         doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-        var observed = try @import("artifact_inventory.zig").status(self.alloc, &txn, namespace);
-        if (observed.ready) observed.ready = try self.artifactMaterializationsReady(&txn, try @import("artifact_inventory.zig").catalogs(&txn));
+        var observed = try artifact_inventory.status(self.alloc, &txn, namespace);
+        if (observed.ready) observed.ready = try self.artifactMaterializationsReady(&txn, try artifact_inventory.catalogs(&txn));
         return observed;
     }
 
     /// The caller verifies this desired catalog against its metadata read-index
     /// before proposal. Ownership of catalogs belongs to the caller.
-    pub fn artifactInventoryCommand(self: *DB, alloc: Allocator) !@import("artifact_inventory.zig").Command {
+    pub fn artifactInventoryCommand(self: *DB, alloc: Allocator) !artifact_inventory.Command {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc });
-        const inventory = @import("artifact_inventory.zig");
+        const inventory = artifact_inventory;
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        if (try @import("artifact_reconcile_intent.zig").load(alloc, &txn)) |intent| {
+        if (try artifact_reconcile_intent.load(alloc, &txn)) |intent| {
             defer intent.deinit();
             var command = intent.value.command;
             command.catalogs.indexes = try alloc.dupe(u8, command.catalogs.indexes);
@@ -25251,18 +25362,18 @@ pub const DB = struct {
         return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{ .epoch = try std.math.add(u64, if (observed.ordered) |value| value.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc) }, .catalogs = catalogs };
     }
 
-    fn completeArtifactUpload(txn: anytype, finalization: ?@import("artifact_publication_transport.zig").Finalization, entry: OrderedApplyReceipt) !void {
+    fn completeArtifactUpload(txn: anytype, finalization: ?artifact_publication_transport.Finalization, entry: OrderedApplyReceipt) !void {
         if (finalization) |prepared| {
             const upload = prepared.control;
             if (upload.action != .finalize) return error.InvalidBatchRequest;
-            try @import("artifact_publication_transport.zig").stageCompletion(txn, upload.namespace, upload.publication_digest, upload.manifest_root, prepared.created_index, entry.index);
+            try artifact_publication_transport.stageCompletion(txn, upload.namespace, upload.publication_digest, upload.manifest_root, prepared.created_index, entry.index);
         }
     }
 
     fn applyMergeProofAdoptionBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
-        const adoption = @import("merge_proof_adoption.zig");
-        const proof_batch = @import("source_proof_batch.zig");
-        const provenance = @import("artifact_producer_provenance.zig");
+        const adoption = merge_proof_adoption;
+        const proof_batch = source_proof_batch;
+        const provenance = artifact_producer_provenance;
         try adoption.validateRequest(req);
         const command = req.merge_proof_adoption orelse return error.InvalidBatchRequest;
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
@@ -25357,7 +25468,7 @@ pub const DB = struct {
     }
 
     fn applyArtifactPublicationTransportBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
-        const transport = @import("artifact_publication_transport.zig");
+        const transport = artifact_publication_transport;
         const control = req.artifact_publication_transport orelse return error.InvalidBatchRequest;
         try transport.validateBatchRequest(req);
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
@@ -25433,7 +25544,7 @@ pub const DB = struct {
         if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
-        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        _ = try source_authority_mod.require(&txn, .raft, namespace);
         switch (control.action) {
             .begin => {
                 _ = try transport.pruneOneExpired(&txn, entry.index);
@@ -25470,14 +25581,14 @@ pub const DB = struct {
         if (replication_payload != null) try self.flushDurableReplicationOutboxes();
     }
 
-    fn rejectArtifactPublicationAssumeApply(self: *DB, command: @import("artifact_publication.zig").Command, opts: BatchExecutionOptions, replication_payload: ?[]const u8, reason: @import("artifact_publication.zig").Rejection, apply_held: *bool) !void {
+    fn rejectArtifactPublicationAssumeApply(self: *DB, command: artifact_publication.Command, opts: BatchExecutionOptions, replication_payload: ?[]const u8, reason: artifact_publication.Rejection, apply_held: *bool) !void {
         // A source/catalog race is an ordered outcome, not an apply failure.
         // Keep accepted provenance intact and commit the rejection with the
         // applied watermark, so retries cannot wedge a committed Raft entry.
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
-        try @import("artifact_publication.zig").stageRejection(&txn, command, entry.index, reason);
+        try artifact_publication.stageRejection(&txn, command, entry.index, reason);
         // Baseline readiness is temporary: keep the immutable upload so the
         // same logical publication can finalize after reconciliation. A
         // terminal upload record here would strand its retry forever.
@@ -25493,8 +25604,8 @@ pub const DB = struct {
     }
 
     fn applyArtifactPublicationBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
-        const publication = @import("artifact_publication.zig");
-        const inventory = @import("artifact_inventory.zig");
+        const publication = artifact_publication;
+        const inventory = artifact_inventory;
         try publication.validateRequest(self.alloc, req);
         const command = req.artifact_publication orelse return error.InvalidBatchRequest;
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
@@ -25527,9 +25638,9 @@ pub const DB = struct {
         defer if (prepared_replay) |value| self.alloc.free(value);
         var prepared_proof: ?[]u8 = null;
         defer if (prepared_proof) |value| self.alloc.free(value);
-        var prepared_document_refs: ?@import("artifact_producer_provenance.zig").PreparedDocumentReferences = null;
+        var prepared_document_refs: ?artifact_producer_provenance.PreparedDocumentReferences = null;
         defer if (prepared_document_refs) |*value| value.deinit();
-        var coverage_layout: ?@import("artifact_coverage_layout.zig").Layout = null;
+        var coverage_layout: ?artifact_coverage_layout.Layout = null;
         defer if (coverage_layout) |*value| value.deinit();
         var reservation: ?resource_manager_mod.Reservation = null;
         defer if (reservation) |*value| value.release();
@@ -25538,13 +25649,13 @@ pub const DB = struct {
         else
             null;
         defer if (census_budget) |*budget| budget.deinit();
-        var prepared_census: ?@import("artifact_stream_progress.zig").Prepared = null;
+        var prepared_census: ?artifact_stream_progress.Prepared = null;
         defer if (prepared_census) |*value| value.deinit();
-        var prepared_inventory: ?@import("artifact_chunk_inventory_progress.zig").Prepared = null;
+        var prepared_inventory: ?artifact_chunk_inventory_progress.Prepared = null;
         defer if (prepared_inventory) |*value| value.deinit();
-        var prepared_units: ?@import("artifact_unit_progress.zig").Prepared = null;
+        var prepared_units: ?artifact_unit_progress.Prepared = null;
         defer if (prepared_units) |*value| value.deinit();
-        const completion = @import("artifact_completion_progress.zig");
+        const completion = artifact_completion_progress;
         var prepared_completion: ?completion.Prepared(completion.StreamVerifier.Witness) = null;
         defer if (prepared_completion) |*value| value.deinit();
         if (command.mode == .census or command.mode == .complete_streams or command.mode == .reconcile_units) {
@@ -25569,18 +25680,18 @@ pub const DB = struct {
                     break :blk null;
                 };
             } else if (command.mode == .reconcile_units) {
-                prepared_units = @import("artifact_unit_progress.zig").prepareCommand(census_alloc, &read, self.root_incarnation, command, plan.plan()) catch |err| blk: {
+                prepared_units = artifact_unit_progress.prepareCommand(census_alloc, &read, self.root_incarnation, command, plan.plan()) catch |err| blk: {
                     if (err == error.OutOfMemory) if (census_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
                     preparation_error = err;
                     break :blk null;
                 };
             } else if (command.producer_kind == .enrichment) {
-                prepared_inventory = @import("artifact_chunk_inventory_progress.zig").prepareCommand(census_alloc, &read, self.root_incarnation, command, plan.plan()) catch |err| blk: {
+                prepared_inventory = artifact_chunk_inventory_progress.prepareCommand(census_alloc, &read, self.root_incarnation, command, plan.plan()) catch |err| blk: {
                     if (err == error.OutOfMemory) if (census_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
                     preparation_error = err;
                     break :blk null;
                 };
-            } else prepared_census = @import("artifact_stream_progress.zig").prepareCommand(census_alloc, &read, self.root_incarnation, command, plan.plan()) catch |err| blk: {
+            } else prepared_census = artifact_stream_progress.prepareCommand(census_alloc, &read, self.root_incarnation, command, plan.plan()) catch |err| blk: {
                 if (err == error.OutOfMemory) if (census_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
                 preparation_error = err;
                 break :blk null;
@@ -25666,10 +25777,10 @@ pub const DB = struct {
                     if (preparation_error == null) {
                         var preparation_ctx = self.batchContext();
                         prepared_replay = try encodeChangeRecordPayloadWithTargetHints(&preparation_ctx, value.batch, 0, value.target_hints);
-                        var proof = try @import("artifact_producer_provenance.zig").fromCommand(self.alloc, command);
+                        var proof = try artifact_producer_provenance.fromCommand(self.alloc, command);
                         defer proof.deinit();
-                        prepared_proof = try @import("artifact_producer_provenance.zig").encodeAlloc(self.alloc, proof.proof);
-                        prepared_document_refs = try @import("artifact_producer_provenance.zig").prepareDocumentReferences(self.alloc, command);
+                        prepared_proof = try artifact_producer_provenance.encodeAlloc(self.alloc, proof.proof);
+                        prepared_document_refs = try artifact_producer_provenance.prepareDocumentReferences(self.alloc, command);
                     }
                 }
             } else preparation_error = error.EnrichmentSourceChanged;
@@ -25684,7 +25795,7 @@ pub const DB = struct {
             if (anticipated) |value| if (value.value.command.binding.epoch == command.authority_epoch and
                 std.mem.eql(u8, &value.value.command.binding.digest, &command.catalog_digest))
             {
-                coverage_layout = try @import("artifact_coverage_layout.zig").Layout.prepare(self.alloc, value.value.command.catalogs, @import("artifact_coverage_epoch.zig").forCommand(command));
+                coverage_layout = try artifact_coverage_layout.Layout.prepare(self.alloc, value.value.command.catalogs, artifact_coverage_epoch.forCommand(command));
             };
         }
         var mutation = self.core.snapshot_admission.acquireMutation();
@@ -25699,8 +25810,8 @@ pub const DB = struct {
         var ordered = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            _ = try @import("../source_authority.zig").require(&read, .raft, namespace);
-            try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
+            _ = try source_authority_mod.require(&read, .raft, namespace);
+            try artifact_reconcile_intent.requireAbsent(&read);
             break :blk try inventory.load(self.alloc, &read);
         };
         defer if (ordered) |*value| value.deinit();
@@ -25721,7 +25832,7 @@ pub const DB = struct {
                     } else if (prepared_inventory) |*value| {
                         _ = value.stage(&txn, self.root_incarnation) catch |err| break :blk err;
                     } else {
-                        _ = @import("artifact_stream_progress.zig").stage(&txn, self.root_incarnation, &(prepared_census orelse return error.InvalidBatchRequest)) catch |err| break :blk err;
+                        _ = artifact_stream_progress.stage(&txn, self.root_incarnation, &(prepared_census orelse return error.InvalidBatchRequest)) catch |err| break :blk err;
                     }
                     break :blk null;
                 };
@@ -25740,7 +25851,7 @@ pub const DB = struct {
                 }
                 try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
             } else if (command.mode == .validate_inputs) {
-                _ = @import("artifact_producer_validation.zig").stageRaft(self.alloc, &txn, command) catch |err| switch (err) {
+                _ = artifact_producer_validation.stageRaft(self.alloc, &txn, command) catch |err| switch (err) {
                     error.ArtifactCatalogDrift, error.InvalidBatchRequest => {
                         txn.abort();
                         txn_open = false;
@@ -25750,7 +25861,7 @@ pub const DB = struct {
                 };
                 try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
             } else if (command.mode == .baseline) {
-                _ = @import("artifact_producer_baseline.zig").stageRaft(self.alloc, &txn, command) catch |err| switch (err) {
+                _ = artifact_producer_baseline.stageRaft(self.alloc, &txn, command) catch |err| switch (err) {
                     error.ArtifactCatalogDrift, error.InvalidBatchRequest => {
                         txn.abort();
                         txn_open = false;
@@ -25766,11 +25877,11 @@ pub const DB = struct {
                     std.mem.eql(u8, &value.namespace, &namespace) and std.mem.eql(u8, &value.catalog_digest, &command.catalog_digest) else false;
                 if (!same) {
                     try self.requireOnlineArtifactCatalogMutableLocked(&txn);
-                    try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+                    try relational_integrity_topology.requireUnfenced(&txn);
                     try publication.stageAuthority(&txn, command);
                     if (ordered_value.value.command.binding.effect_protocol == 15) {
-                        try @import("artifact_producer_obligations.zig").begin(self.alloc, &txn, (try publication.authority(&txn)).?);
-                        try @import("artifact_producer_validation.zig").begin(self.alloc, &txn, (try publication.authority(&txn)).?);
+                        try artifact_producer_obligations.begin(self.alloc, &txn, (try publication.authority(&txn)).?);
+                        try artifact_producer_validation.begin(self.alloc, &txn, (try publication.authority(&txn)).?);
                     }
                 }
             }
@@ -25791,7 +25902,7 @@ pub const DB = struct {
             const producer = (try publication.authority(&read)) orelse return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
             if (producer.epoch != command.authority_epoch or !std.mem.eql(u8, &producer.namespace, &namespace) or
                 !std.mem.eql(u8, &producer.catalog_digest, &command.catalog_digest)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
-            if (try @import("artifact_producer_obligations.zig").load(&read)) |obligations| {
+            if (try artifact_producer_obligations.load(&read)) |obligations| {
                 try obligations.requireAuthority(producer);
                 if (obligations.sealed_attempt != null) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .sealed_source, &apply_held);
             }
@@ -25886,11 +25997,11 @@ pub const DB = struct {
             coverage: []const publication.Coverage,
             chunk_fence: ?@import("artifact_chunk_publication.zig").Fence,
             chunk_vector_fence: ?@import("artifact_chunk_vector_publication.zig").Fence,
-            asset_upstream_fences: []const @import("artifact_asset_publication.zig").UpstreamFence,
+            asset_upstream_fences: []const artifact_asset_publication.UpstreamFence,
             position: publication.Position,
             proof: []const u8,
-            document_references: *const @import("artifact_producer_provenance.zig").PreparedDocumentReferences,
-            upload: ?@import("artifact_publication_transport.zig").Finalization,
+            document_references: *const artifact_producer_provenance.PreparedDocumentReferences,
+            upload: ?artifact_publication_transport.Finalization,
             pub fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
                 const guard: *@This() = @ptrCast(@alignCast(ptr));
                 try publication.validateSources(alloc, txn, guard.command.namespace, guard.command.sources);
@@ -25901,9 +26012,9 @@ pub const DB = struct {
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
-                try @import("artifact_producer_provenance.zig").stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);
+                try artifact_producer_provenance.stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);
                 try publication.stageArtifactRevisions(txn, guard.command, guard.position);
-                if (guard.command.producer_kind == .resolver) try @import("artifact_publication_resolution.zig").stageHandoff(alloc, txn, guard.command);
+                if (guard.command.producer_kind == .resolver) try artifact_publication_resolution.stageHandoff(alloc, txn, guard.command);
                 try DB.completeArtifactUpload(txn, guard.upload, .{ .term = guard.position.raft.term, .index = guard.position.raft.index });
                 try guard.db.stageRestoreStagingReplicationOutbox(txn, guard.replication_payload);
             }
@@ -25928,7 +26039,7 @@ pub const DB = struct {
     }
 
     fn applyArtifactCatalogBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
-        const inventory = @import("artifact_inventory.zig");
+        const inventory = artifact_inventory;
         try inventory.validateRequest(req);
         const command = req.artifact_catalog orelse return error.InvalidArtifactCatalogCommand;
         const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
@@ -25956,7 +26067,7 @@ pub const DB = struct {
             errdefer txn.abort();
             // The active source cut pins the existing catalog until release.
             try self.requireOnlineArtifactCatalogMutableLocked(&txn);
-            try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+            try relational_integrity_topology.requireUnfenced(&txn);
             try inventory.stageOrdered(self.alloc, &txn, command, entry.index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
             var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -25975,11 +26086,11 @@ pub const DB = struct {
         if (payload != null) try self.flushDurableReplicationOutboxes();
     }
 
-    pub fn onlineSourceStatus(self: *DB, scope: @import("online_source_contract.zig").Scope) !@import("online_source.zig").Progress {
+    pub fn onlineSourceStatus(self: *DB, scope: online_source_contract.Scope) !online_source.Progress {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, scope });
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        return try @import("online_source.zig").status(&txn, scope);
+        return try online_source.status(&txn, scope);
     }
 
     /// Writer-open recovery runs before any optional worker or catalog replay.
@@ -25988,47 +26099,47 @@ pub const DB = struct {
         const pending = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            break :blk try @import("../source_pin_state.zig").load(&read);
+            break :blk try source_pin_state_mod.load(&read);
         };
         if (pending) |prepared| {
             var namespace: [24]u8 = undefined;
             doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
             if (!std.mem.eql(u8, &prepared.namespace, &namespace)) return;
-            const scope = try @import("online_source_contract.zig").Scope.decode(&prepared.scope_bytes);
+            const scope = try online_source_contract.Scope.decode(&prepared.scope_bytes);
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            try @import("source_pin.zig").ensureAssumeApply(self, scope);
+            try source_pin.ensureAssumeApply(self, scope);
         }
     }
 
-    pub fn prepareOnlineSourcePublication(self: *DB, scope: @import("online_source_contract.zig").Scope, cancellation: types.CancellationToken) !@import("../source_snapshot.zig").Certificate {
+    pub fn prepareOnlineSourcePublication(self: *DB, scope: online_source_contract.Scope, cancellation: types.CancellationToken) !@import("../source_snapshot.zig").Certificate {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, scope, cancellation });
-        return @import("source_pin.zig").preparePublication(self, scope, cancellation);
+        return source_pin.preparePublication(self, scope, cancellation);
     }
 
-    pub fn describeOnlineSourceArtifact(self: *DB, scope: @import("online_source_contract.zig").Scope, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").Descriptor {
-        return @import("source_artifact_transfer.zig").describe(self, scope, cancellation);
+    pub fn describeOnlineSourceArtifact(self: *DB, scope: online_source_contract.Scope, cancellation: types.CancellationToken) !source_artifact_transfer.Descriptor {
+        return source_artifact_transfer.describe(self, scope, cancellation);
     }
 
-    pub fn readOnlineSourceArtifact(self: *DB, alloc: Allocator, descriptor: @import("source_artifact_transfer.zig").Descriptor, offset: u64, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").OwnedChunk {
-        return @import("source_artifact_transfer.zig").read(self, alloc, descriptor, offset, cancellation);
+    pub fn readOnlineSourceArtifact(self: *DB, alloc: Allocator, descriptor: source_artifact_transfer.Descriptor, offset: u64, cancellation: types.CancellationToken) !source_artifact_transfer.OwnedChunk {
+        return source_artifact_transfer.read(self, alloc, descriptor, offset, cancellation);
     }
 
-    pub fn receiveOnlineSourceArtifact(self: *DB, descriptor: @import("source_artifact_transfer.zig").Descriptor, chunk: @import("source_artifact_transfer.zig").Chunk, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").Status {
-        return @import("source_artifact_transfer.zig").receive(self, descriptor, chunk, cancellation);
+    pub fn receiveOnlineSourceArtifact(self: *DB, descriptor: source_artifact_transfer.Descriptor, chunk: source_artifact_transfer.Chunk, cancellation: types.CancellationToken) !source_artifact_transfer.Status {
+        return source_artifact_transfer.receive(self, descriptor, chunk, cancellation);
     }
 
-    pub fn onlineSourceArtifactStatus(self: *DB, descriptor: @import("source_artifact_transfer.zig").Descriptor, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").Status {
-        return @import("source_artifact_transfer.zig").status(self, descriptor, cancellation);
+    pub fn onlineSourceArtifactStatus(self: *DB, descriptor: source_artifact_transfer.Descriptor, cancellation: types.CancellationToken) !source_artifact_transfer.Status {
+        return source_artifact_transfer.status(self, descriptor, cancellation);
     }
 
-    pub fn finishOnlineSourceArtifact(self: *DB, descriptor: @import("source_artifact_transfer.zig").Descriptor, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").Status {
-        return @import("source_artifact_transfer.zig").finish(self, descriptor, cancellation);
+    pub fn finishOnlineSourceArtifact(self: *DB, descriptor: source_artifact_transfer.Descriptor, cancellation: types.CancellationToken) !source_artifact_transfer.Status {
+        return source_artifact_transfer.finish(self, descriptor, cancellation);
     }
 
     /// Keep this DB/owner leased until the returned frame session is released.
-    pub fn beginMergeTailRead(self: *DB, scope: @import("online_source_contract.zig").Scope, after_sequence: u64) !?@import("merge_tail_reader.zig").Session {
-        return try @import("merge_tail_reader.zig").Session.open(self, scope, after_sequence);
+    pub fn beginMergeTailRead(self: *DB, scope: online_source_contract.Scope, after_sequence: u64) !?merge_tail_reader.Session {
+        return try merge_tail_reader.Session.open(self, scope, after_sequence);
     }
 
     fn applyGenerationGcBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -26071,8 +26182,8 @@ pub const DB = struct {
         // activation or topology fence before its Raft entry applies. Such an
         // admitted entry must still advance the applied marker on every
         // replica; the next bounded sweep will reprepare from durable state.
-        if (try @import("relational_integrity_topology.zig").current(&txn) == null) {
-            @import("relational_integrity_generation_retirement.zig").applyGcPage(&txn, req.relational_generation_gc.?) catch |err| switch (err) {
+        if (try relational_integrity_topology.current(&txn) == null) {
+            relational_integrity_generation_retirement.applyGcPage(&txn, req.relational_generation_gc.?) catch |err| switch (err) {
                 error.GenerationRetirementChanged => {},
                 else => return err,
             };
@@ -26191,8 +26302,8 @@ pub const DB = struct {
             try self.preflightReplicationBatchSyncCommit();
         }
         const native_control = opts.ordered_apply_receipt == null and opts.native_fk_generation_entry == null and
-            (if (req.relational_topology) |command| @import("native_topology_receipt.zig").supports(command) else false);
-        if (native_control) try @import("native_topology_receipt.zig").validateRequest(self.alloc, req);
+            (if (req.relational_topology) |command| native_topology_receipt.supports(command) else false);
+        if (native_control) try native_topology_receipt.validateRequest(self.alloc, req);
         const mirror_control = !opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null;
         const payload = if (mirror_control and !native_control)
             if (req.relational_topology) |command|
@@ -26215,13 +26326,13 @@ pub const DB = struct {
 
     const NativeTopologyContext = struct {
         request: types.BatchRequest,
-        replay: ?@import("receipt_position.zig").Native,
+        replay: ?receipt_position.Native,
         mirror: bool,
     };
 
     fn applyRelationalTopologyControlWithReplication(
         self: *DB,
-        command: @import("relational_integrity_topology.zig").Command,
+        command: relational_integrity_topology.Command,
         ordered_receipt: ?OrderedApplyReceipt,
         replication_lsn: ?u64,
         replication_payload: ?[]const u8,
@@ -26255,8 +26366,8 @@ pub const DB = struct {
         } else {
             try doc_identity.writeNamespaceTxn(&txn, command.fence.namespace);
         }
-        const topology = @import("relational_integrity_topology.zig");
-        if (ordered_receipt != null) try @import("../source_authority.zig").requireRaftMarkerAllowed(&txn);
+        const topology = relational_integrity_topology;
+        if (ordered_receipt != null) try source_authority_mod.requireRaftMarkerAllowed(&txn);
         if ((command.action == .transfer) != (command.transfer != null) or
             (command.action == .seal_graph_retirement and command.graph_retirement == null) or
             (command.graph_retirement != null and command.action != .begin and command.action != .seal_graph_retirement) or
@@ -26268,16 +26379,16 @@ pub const DB = struct {
             ((command.action == .stage_child_generation or command.action == .activate_child_generation or command.action == .acknowledge_child_generation or
                 (command.action == .cancel and (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual))) != (command.child_generations != null))) return error.InvalidBatchRequest;
         if (command.child_schema_install != null) return error.InvalidBatchRequest;
-        const native_prepared: ?@import("native_topology_receipt.zig").Prepared = if (native_control) |control| blk: {
+        const native_prepared: ?native_topology_receipt.Prepared = if (native_control) |control| blk: {
             if (ordered_receipt != null or native_receipt != null) return error.InvalidControlReceiptPosition;
-            const owner = try @import("../source_authority.zig").load(&txn);
+            const owner = try source_authority_mod.load(&txn);
             if (owner == null or owner.?.kind != .native) {
                 if (control.replay != null) return error.InvalidControlReceiptPosition;
                 break :blk null;
             }
-            break :blk try @import("native_topology_receipt.zig").stage(self.alloc, &txn, command, control.replay);
+            break :blk try native_topology_receipt.stage(self.alloc, &txn, command, control.replay);
         } else null;
-        const stamp: ?@import("receipt_position.zig").Position = if (native_prepared) |prepared|
+        const stamp: ?receipt_position.Position = if (native_prepared) |prepared|
             .{ .native = prepared.receipt }
         else if (ordered_receipt) |entry|
             .{ .raft = .{ .term = entry.term, .index = entry.index } }
@@ -26300,9 +26411,9 @@ pub const DB = struct {
                 }
                 if (try topology.current(&txn) == null) {
                     if (command.fence.role == .split_destination) {
-                        const previous_manifest = try missingAsNull(txn.get(@import("relational_integrity_handoff.zig").manifest_key));
+                        const previous_manifest = try missingAsNull(txn.get(relational_integrity_handoff.manifest_key));
                         if (previous_manifest) |bytes| {
-                            var previous = try std.json.parseFromSlice(@import("relational_integrity_handoff.zig").Manifest, self.alloc, bytes, .{});
+                            var previous = try std.json.parseFromSlice(relational_integrity_handoff.Manifest, self.alloc, bytes, .{});
                             defer previous.deinit();
                             if (!previous.value.destination.eql(command.fence)) return error.IntegrityHandoffDestinationResetRequired;
                         }
@@ -26330,11 +26441,11 @@ pub const DB = struct {
                 }
                 try topology.stageBeginWithHandoff(&txn, command.fence, command.generation_handoff);
                 if (command.graph_retirement) |scope| {
-                    try @import("graph_retirement_seal.zig").stageBegin(&txn, scope);
+                    try graph_retirement_seal.stageBegin(&txn, scope);
                     close_graph_after_commit = true;
                 }
                 if (command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual)
-                    try @import("relational_integrity_generation_admission.zig").stageSourceFencedReceipt(&txn, command.fence, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
+                    try relational_integrity_generation_admission.stageSourceFencedReceipt(&txn, command.fence, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
             },
             .seal_graph_retirement => {
                 const scope = command.graph_retirement.?;
@@ -26342,18 +26453,18 @@ pub const DB = struct {
                 if (!self.core.index_manager.graphRetirementPinsDrainedAssumeCatalogLock()) return error.StorageBusy;
                 const loaded = (try self.core.index_manager.graphRetirementConfigDigestAssumeCatalogLock(self.alloc)) orelse return error.InvalidBatchRequest;
                 if (!std.mem.eql(u8, &loaded, &scope.graph_config_digest)) return error.InvalidBatchRequest;
-                _ = try @import("graph_retirement_seal.zig").stageSealPosition(&txn, scope, stamp orelse return error.InvalidBatchRequest);
+                _ = try graph_retirement_seal.stageSealPosition(&txn, scope, stamp orelse return error.InvalidBatchRequest);
             },
             .seal_generation_handoff => {
-                try @import("empty_generation_handoff.zig").stageSealPosition(&txn, command.fence, command.generation_handoff_seal.?, stamp orelse return error.InvalidBatchRequest);
+                try empty_generation_handoff.stageSealPosition(&txn, command.fence, command.generation_handoff_seal.?, stamp orelse return error.InvalidBatchRequest);
             },
             .install_generation_handoff => {
                 if (command.fence.role != .rewrite_destination) return error.InvalidGenerationHandoff;
                 const install_stamp = stamp orelse return error.InvalidBatchRequest;
                 try install_stamp.requireNamespace(command.fence.namespace);
                 const install = command.generation_handoff_install.?;
-                const contract = @import("restore_staging_contract.zig");
-                const logical = try @import("empty_generation_handoff.zig").installReceiptDigest(install);
+                const contract = restore_staging_contract;
+                const logical = try empty_generation_handoff.installReceiptDigest(install);
                 var expected_plan_id: [16]u8 = undefined;
                 std.mem.writeInt(u64, expected_plan_id[0..8], command.fence.transition_id, .little);
                 std.mem.writeInt(u64, expected_plan_id[8..16], command.fence.attempt, .little);
@@ -26374,13 +26485,13 @@ pub const DB = struct {
                     binding.retired_count != install.retired_count or
                     !std.mem.eql(u8, &binding.expected_install_receipt_digest, &logical))
                     return error.RestoreStagingScopeChanged;
-                _ = try @import("empty_generation_handoff.zig").stageInstallPosition(self.alloc, &txn, install, bootstrap.value.scope.plan_id, install_stamp);
+                _ = try empty_generation_handoff.stageInstallPosition(self.alloc, &txn, install, bootstrap.value.scope.plan_id, install_stamp);
             },
             .release => {
                 if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual or command.fence.role == .truncate_parent)
                     return error.GenerationAdmissionActivationRequired;
                 if ((command.fence.role == .split_destination or command.fence.role == .merge_destination) and try topology.current(&txn) != null) {
-                    var progress = try @import("relational_integrity_handoff.zig").loadProgress(self.alloc, &txn);
+                    var progress = try relational_integrity_handoff.loadProgress(self.alloc, &txn);
                     defer progress.deinit();
                     if (!progress.value.ready) return error.IntegrityHandoffIncomplete;
                     if (command.fence.role == .split_destination) {
@@ -26391,15 +26502,15 @@ pub const DB = struct {
                         defer state.deinit(self.alloc);
                         if (state.phase != .finalized or state.transition_id != command.fence.transition_id or state.donor_group_id != command.fence.peer_group_id) return error.MergeTransitionNotReady;
                     }
-                    var compiled = try @import("relational_integrity_catalog.zig").decode(self.alloc, try txn.get(@import("relational_integrity_catalog.zig").key));
+                    var compiled = try relational_integrity_catalog.decode(self.alloc, try txn.get(relational_integrity_catalog.key));
                     defer compiled.deinit();
-                    try @import("relational_integrity_activation.zig").requireReady(&txn, compiled);
+                    try relational_integrity_activation.requireReady(&txn, compiled);
                 } else if (command.fence.role != .backup_snapshot and try topology.current(&txn) != null) return error.IntegrityTopologyCutoverRequired;
                 try topology.stageRelease(&txn, command.fence);
                 if (command.fence.role == .merge_destination) {
-                    try txn.delete(@import("relational_integrity_handoff.zig").manifest_key);
-                    try txn.delete(@import("relational_integrity_handoff.zig").progress_key);
-                    try txn.delete(@import("relational_integrity_handoff.zig").prune_key);
+                    try txn.delete(relational_integrity_handoff.manifest_key);
+                    try txn.delete(relational_integrity_handoff.progress_key);
+                    try txn.delete(relational_integrity_handoff.prune_key);
                 }
             },
             .cancel => {
@@ -26413,28 +26524,28 @@ pub const DB = struct {
                 // admit a delayed old-generation attach after activation.
                 if (command.fence.role == .child_generation_source) return error.GenerationAdmissionActivationRequired;
                 if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual) {
-                    const admission = @import("relational_integrity_generation_admission.zig");
+                    const admission = relational_integrity_generation_admission;
                     const transitions = command.child_generations.?;
                     try admission.validateTransitions(transitions);
                     for (transitions) |transition| try admission.cancelTransition(self.alloc, &txn, transition);
                     try admission.stageCanceledReceipt(&txn, command.fence, transitions, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
                 }
                 if (command.fence.role == .child_generation_dual)
-                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
+                    try txn.delete(relational_integrity_generation_admission.dual_acknowledged_fence_key);
                 try topology.stageCancel(&txn, command.fence);
                 if (command.fence.role == .child_generation_dual) {
                     const encoded_fence = try command.fence.encode();
-                    try txn.put(@import("relational_integrity_generation_admission.zig").dual_canceled_fence_key, &encoded_fence);
+                    try txn.put(relational_integrity_generation_admission.dual_canceled_fence_key, &encoded_fence);
                 }
                 if (command.fence.role == .rewrite_source)
-                    open_graph_after_commit = try @import("graph_retirement_seal.zig").stageCancel(&txn, command.fence);
+                    open_graph_after_commit = try graph_retirement_seal.stageCancel(&txn, command.fence);
             },
             .abort_transition => {
                 if (command.fence.role == .merge_destination and try topology.current(&txn) != null) {
                     const active = (try topology.current(&txn)).?;
                     if (active.role != command.fence.role or active.transition_id != command.fence.transition_id or
                         active.peer_group_id != command.fence.peer_group_id or active.attempt > command.fence.attempt) return error.IntegrityTopologyChanged;
-                    const handoff = @import("relational_integrity_handoff.zig");
+                    const handoff = relational_integrity_handoff;
                     // An ambiguously delivered begin with no imported proof
                     // can be canceled immediately. Once copying started,
                     // rollback must first restore the range and drain all
@@ -26455,22 +26566,22 @@ pub const DB = struct {
                 }
                 try topology.stageAbortTransition(&txn, command.fence);
                 if (command.fence.role == .rewrite_source)
-                    open_graph_after_commit = try @import("graph_retirement_seal.zig").stageCancel(&txn, command.fence);
+                    open_graph_after_commit = try graph_retirement_seal.stageCancel(&txn, command.fence);
             },
             .transfer => {
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
                 try topology.requireDrained(&txn, &manager, command.fence);
-                try @import("relational_integrity_handoff.zig").apply(self.alloc, &txn, command.fence, command.transfer.?);
+                try relational_integrity_handoff.apply(self.alloc, &txn, command.fence, command.transfer.?);
             },
             .stage_parent_retirement => {
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
                 const stage = command.parent_retirement.?;
-                try @import("relational_integrity_generation_retirement.zig").stagePending(self.alloc, &txn, &manager, command.fence, stage.plan_digest, stage.entries);
+                try relational_integrity_generation_retirement.stagePending(self.alloc, &txn, &manager, command.fence, stage.plan_digest, stage.entries);
             },
             .activate_parent_retirement => {
-                const retirement = @import("relational_integrity_generation_retirement.zig");
+                const retirement = relational_integrity_generation_retirement;
                 const activation = command.parent_activation.?;
                 if (command.fence.role != .truncate_parent or std.mem.allEqual(u8, &activation.plan_id, 0) or
                     !std.mem.eql(u8, &activation.publication_digest, &retirement.publicationDigest(activation.plan_id, activation.plan_digest)))
@@ -26493,7 +26604,7 @@ pub const DB = struct {
                 }
             },
             .acknowledge_parent_retirement => {
-                const retirement = @import("relational_integrity_generation_retirement.zig");
+                const retirement = relational_integrity_generation_retirement;
                 const activation = command.parent_activation.?;
                 if (command.fence.role != .truncate_parent or std.mem.allEqual(u8, &activation.plan_id, 0) or
                     !std.mem.eql(u8, &activation.publication_digest, &retirement.publicationDigest(activation.plan_id, activation.plan_digest)))
@@ -26505,7 +26616,7 @@ pub const DB = struct {
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
                 try topology.requireDrained(&txn, &manager, command.fence);
-                const admission = @import("relational_integrity_generation_admission.zig");
+                const admission = relational_integrity_generation_admission;
                 const transitions = command.child_generations.?;
                 try admission.validateTransitions(transitions);
                 for (transitions) |transition| try admission.stageTransition(self.alloc, &txn, transition);
@@ -26513,7 +26624,7 @@ pub const DB = struct {
             },
             .activate_child_generation => {
                 if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
-                const admission = @import("relational_integrity_generation_admission.zig");
+                const admission = relational_integrity_generation_admission;
                 const transitions = command.child_generations.?;
                 try admission.validateTransitions(transitions);
                 if (try topology.current(&txn)) |actual| {
@@ -26522,7 +26633,7 @@ pub const DB = struct {
                     defer manager.deinit();
                     try topology.requireDrained(&txn, &manager, command.fence);
                     for (transitions) |transition| try admission.activateTransition(self.alloc, &txn, transition);
-                    try @import("relational_integrity_generation_retirement.zig").stageChildGenerationRetirements(self.alloc, &txn, command.fence, transitions);
+                    try relational_integrity_generation_retirement.stageChildGenerationRetirements(self.alloc, &txn, command.fence, transitions);
                     try admission.stageCompletion(&txn, command.fence, transitions, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
                     // The same fence still protects the old child schema. A
                     // dual-role owner releases it only with the published
@@ -26539,7 +26650,7 @@ pub const DB = struct {
             },
             .acknowledge_child_generation => {
                 if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
-                try @import("relational_integrity_generation_admission.zig").stageAcknowledgement(&txn, command.fence, command.child_generations.?, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
+                try relational_integrity_generation_admission.stageAcknowledgement(&txn, command.fence, command.child_generations.?, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
             },
             .cancel_child_generation_source => {
                 if (command.fence.role != .child_generation_source and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
@@ -26548,16 +26659,16 @@ pub const DB = struct {
                 // The source has no accepted-generation state to undo; the
                 // exact fence receipt consumes its admission epoch forever.
                 if (command.fence.role == .child_generation_dual) {
-                    try @import("relational_integrity_generation_admission.zig").requireDualParentCanceled(&txn, command.fence);
-                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
-                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_canceled_fence_key);
+                    try relational_integrity_generation_admission.requireDualParentCanceled(&txn, command.fence);
+                    try txn.delete(relational_integrity_generation_admission.dual_acknowledged_fence_key);
+                    try txn.delete(relational_integrity_generation_admission.dual_canceled_fence_key);
                 }
                 try topology.stageCancel(&txn, command.fence);
-                try @import("relational_integrity_generation_admission.zig").stageCanceledReceipt(&txn, command.fence, null, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
+                try relational_integrity_generation_admission.stageCanceledReceipt(&txn, command.fence, null, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
             },
             .install_child_schema => unreachable, // Handled before generic topology transaction.
             .provision_initial_child, .release_initial_child, .cancel_initial_child => unreachable, // Handled before generic topology transaction.
-            .prune => try @import("relational_integrity_handoff.zig").prune(self.alloc, &txn, command.fence, self.core.byteRange()),
+            .prune => try relational_integrity_handoff.prune(self.alloc, &txn, command.fence, self.core.byteRange()),
         };
         try stageApplyMarkers(&txn, ordered_receipt, replication_lsn);
         try self.stageRestoreStagingReplicationOutbox(&txn, native_payload orelse replication_payload);
@@ -27387,26 +27498,26 @@ pub const DB = struct {
         return self.requireOnlineArtifactCatalogMutableWithContextLocked(txn, null);
     }
 
-    fn requireArtifactReconcileUnfenced(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
+    fn requireArtifactReconcileUnfenced(self: *DB, txn: anytype, context: ?artifact_reconcile_intent.Context) !void {
         if (context) |value| {
-            try @import("artifact_reconcile_intent.zig").requireContext(self.alloc, txn, value);
-            if (try @import("relational_integrity_topology.zig").current(txn) != null) return error.IntegrityTopologyBusy;
-        } else try @import("relational_integrity_topology.zig").requireUnfenced(txn);
+            try artifact_reconcile_intent.requireContext(self.alloc, txn, value);
+            if (try relational_integrity_topology.current(txn) != null) return error.IntegrityTopologyBusy;
+        } else try relational_integrity_topology.requireUnfenced(txn);
     }
 
-    fn requireOnlineArtifactCatalogMutableWithContextLocked(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
-        if (context) |value| try @import("artifact_reconcile_intent.zig").requireContext(self.alloc, txn, value) else try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    fn requireOnlineArtifactCatalogMutableWithContextLocked(self: *DB, txn: anytype, context: ?artifact_reconcile_intent.Context) !void {
+        if (context) |value| try artifact_reconcile_intent.requireContext(self.alloc, txn, value) else try artifact_reconcile_intent.requireAbsent(txn);
         var namespace: [24]u8 = undefined;
         doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-        try @import("../source_pin_state.zig").requireNoPrepared(txn, namespace);
-        if (try @import("../retained_effects.zig").load(txn)) |retention| {
+        try source_pin_state_mod.requireNoPrepared(txn, namespace);
+        if (try retained_effects_mod.load(txn)) |retention| {
             if (retention.active() and std.mem.eql(u8, &retention.namespace, &namespace))
                 return error.IntegrityTopologyBusy;
         }
         // A receiver has no retained source record. Its immutable copy/tail
         // contract is instead owned by the durable merge checkpoint. This
         // also closes ordinary merge DDL races, without scanning any rows.
-        const merge = @import("merge_state.zig");
+        const merge = merge_state_mod;
         const merge_raw = txn.get(merge.key) catch |err| switch (err) {
             error.NotFound => txn.get(merge.legacy_key) catch |legacy_err| switch (legacy_err) {
                 error.NotFound => null,
@@ -27439,7 +27550,7 @@ pub const DB = struct {
         if (try manager.hasSchemaLeases()) return error.SchemaInUse;
     }
 
-    fn installIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context, replaces: ?[]const u8, prepared: ?*PreparedGraphReplacement) !InstalledIndex {
+    fn installIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?artifact_reconcile_intent.Context, replaces: ?[]const u8, prepared: ?*PreparedGraphReplacement) !InstalledIndex {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         {
@@ -27500,7 +27611,7 @@ pub const DB = struct {
             if (resolution_stats.catch_up_required or resolution_stats.blocked) return error.Busy;
             var probe = try self.core.store.beginProbeTxn();
             defer probe.abort();
-            for ([_][]const u8{ @import("catalog/resolver_catalog.zig").reresolve_resume_key, @import("catalog/resolver_catalog.zig").reresolve_repair_resume_key }) |key| {
+            for ([_][]const u8{ resolver_catalog_mod.reresolve_resume_key, resolver_catalog_mod.reresolve_repair_resume_key }) |key| {
                 _ = probe.get(key) catch |err| switch (err) {
                     error.NotFound => continue,
                     else => return err,
@@ -27758,7 +27869,7 @@ pub const DB = struct {
         return self.addIndexForReconciliation(cfg, admission_mode, null, null, null);
     }
 
-    fn addIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context, replaces: ?[]const u8, prepared: ?*PreparedGraphReplacement) !?u128 {
+    fn addIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?artifact_reconcile_intent.Context, replaces: ?[]const u8, prepared: ?*PreparedGraphReplacement) !?u128 {
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyUnsupported;
         var row_policy_lease = self.local_execution.row_policy_gate.enterRaw() catch return error.RowPolicyUnsupported;
         defer row_policy_lease.release();
@@ -28885,7 +28996,7 @@ pub const DB = struct {
         return self.removeResolverForReconciliation(name, null);
     }
 
-    fn removeResolverForReconciliation(self: *DB, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
+    fn removeResolverForReconciliation(self: *DB, name: []const u8, context: ?artifact_reconcile_intent.Context) !bool {
         if (context) |authority| return self.removeResolverReconciliationPage(name, authority);
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
@@ -28956,8 +29067,8 @@ pub const DB = struct {
         return null;
     }
 
-    fn removeResolverReconciliationPage(self: *DB, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
-        const intent = @import("artifact_reconcile_intent.zig");
+    fn removeResolverReconciliationPage(self: *DB, name: []const u8, context: artifact_reconcile_intent.Context) !bool {
+        const intent = artifact_reconcile_intent;
         var activity = try self.acquireResolverCatalogActivity(false);
         defer activity.deinit();
         try self.lockApplyForPortableRuntime();
@@ -29309,12 +29420,12 @@ pub const DB = struct {
                 defer read.abort();
                 try self.requireOnlineArtifactCatalogMutableLocked(&read);
                 try self.requireArtifactReconcileUnfenced(&read, null);
-                try @import("relational_integrity_retirement.zig").requireMutable(&read);
-                try @import("restore_staging.zig").requireScope(alloc, &read, null, false);
+                try relational_integrity_retirement.requireMutable(&read);
+                try restore_staging.requireScope(alloc, &read, null, false);
                 if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
                 // Local administration cannot invent an ordered publication
                 // position. External owners must order curation through their owner.
-                if (try @import("../source_authority.zig").publicationOwner(&read)) |owner| {
+                if (try source_authority_mod.publicationOwner(&read)) |owner| {
                     if (owner.mode == .ordered) return error.OnlineSourceScopeChanged;
                 }
             }
@@ -29361,7 +29472,7 @@ pub const DB = struct {
         {
             var read = try self.core.store.beginProbeTxn();
             defer read.abort();
-            const authority_mod = @import("../source_authority.zig");
+            const authority_mod = source_authority_mod;
             if (try authority_mod.load(&read)) |observed| {
                 var authority = try authority_mod.require(&read, .native, observed.namespace);
                 authority.sequence = std.math.add(u64, authority.sequence, 1) catch return error.OnlineSourceCorrupt;
@@ -30194,7 +30305,7 @@ pub const DB = struct {
         return self.deleteIndexWhileQuiescedForReconciliation(name, null);
     }
 
-    fn deleteIndexWhileQuiescedForReconciliation(self: *DB, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
+    fn deleteIndexWhileQuiescedForReconciliation(self: *DB, name: []const u8, context: ?artifact_reconcile_intent.Context) !bool {
         // Pausing drains a callback that may need the apply lock. Probe
         // before that drain; the caller's structural mutex also prevents a
         // source admission between this probe and the locked recheck below.
@@ -30257,7 +30368,7 @@ pub const DB = struct {
         return self.deleteIndexForReconciliation(name, null);
     }
 
-    fn deleteIndexForReconciliation(self: *DB, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
+    fn deleteIndexForReconciliation(self: *DB, name: []const u8, context: ?artifact_reconcile_intent.Context) !bool {
         // Match maintenance/cancellation ordering: replacement -> replication
         // -> resolver/structural -> apply. The marker and serving catalog are
         // removed by the same storage transaction below.
@@ -30381,7 +30492,7 @@ pub const DB = struct {
         return self.deleteEnrichmentForReconciliation(kind, name, null);
     }
 
-    fn deleteEnrichmentForReconciliation(self: *DB, kind: types.EnrichmentKind, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
+    fn deleteEnrichmentForReconciliation(self: *DB, kind: types.EnrichmentKind, name: []const u8, context: ?artifact_reconcile_intent.Context) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -30620,7 +30731,7 @@ pub const DB = struct {
     const TargetAdvanceStallGuard = struct {
         db: *DB,
         timeout_ns: u64,
-        last_check_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        last_check_ns: platform.atomic.Value(u64) = .init(0),
 
         const recheck_interval_ns: u64 = 250 * std.time.ns_per_ms;
 
@@ -31352,7 +31463,7 @@ pub const DB = struct {
             null;
         defer if (budget) |*value| value.deinit();
         const scratch = if (budget) |*value| value.allocator() else self.alloc;
-        var prepared = (@import("../document_mutation_revision.zig").BackfillPage.prepare(scratch, self.core.store, self.document_authority_backfill_restart) catch |err| {
+        var prepared = (document_mutation_revision_mod.BackfillPage.prepare(scratch, self.core.store, self.document_authority_backfill_restart) catch |err| {
             if (err == error.OutOfMemory) if (budget) |*value| if (value.denied()) return error.ResourceBudgetExceeded;
             return err;
         }) orelse {
@@ -31383,7 +31494,7 @@ pub const DB = struct {
             null;
         defer if (budget) |*value| value.deinit();
         const scratch = if (budget) |*value| value.allocator() else self.alloc;
-        const complete = @import("../artifact_footprint.zig").reconcilePage(scratch, self.core.store) catch |err| {
+        const complete = artifact_footprint_mod.reconcilePage(scratch, self.core.store) catch |err| {
             if (err == error.OutOfMemory) if (budget) |*value| if (value.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
@@ -31398,7 +31509,7 @@ pub const DB = struct {
         return self.advanceArtifactUploadRecoveryWithTrigger(.explicit);
     }
 
-    fn advanceArtifactUploadRecoveryWithTrigger(self: *DB, trigger: @FieldType(@import("artifact_publication.zig").UploadRecoveryInvocation, "trigger")) !bool {
+    fn advanceArtifactUploadRecoveryWithTrigger(self: *DB, trigger: @FieldType(artifact_publication.UploadRecoveryInvocation, "trigger")) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         const dispatcher = self.local_execution.artifact_publication_dispatcher orelse return false;
         const recovery = dispatcher.upload_recovery orelse return false;
@@ -31407,8 +31518,8 @@ pub const DB = struct {
         const inventory = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            const namespace = (try @import("../source_authority.zig").externalPublicationNamespace(&read)) orelse return false;
-            break :blk try @import("artifact_publication_transport.zig").recoveryInventory(&read, namespace);
+            const namespace = (try source_authority_mod.externalPublicationNamespace(&read)) orelse return false;
+            break :blk try artifact_publication_transport.recoveryInventory(&read, namespace);
         };
         return recovery.recover(dispatcher.ptr, .{
             .io = self.core.index_manager.checkpointIo(),
@@ -31445,8 +31556,8 @@ pub const DB = struct {
         };
     }
 
-    fn refreshArtifactProjections(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, limits: @import("artifact_completion_progress.zig").Limits) !void {
-        const completion = @import("artifact_completion_progress.zig");
+    fn refreshArtifactProjections(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, limits: artifact_completion_progress.Limits) !void {
+        const completion = artifact_completion_progress;
         var requests: completion.AdoptionRequests = .{};
         try completion.refreshProjectionsWithAdoption(scratch, self.core.store, self.core.index_manager, self.core.applied_sequence_checkpoint_path, self.root_incarnation, document, plan, limits, &requests);
         if (requests.count == 0) return;
@@ -31469,9 +31580,9 @@ pub const DB = struct {
             {
                 var read = try self.core.store.beginReadTxn();
                 defer read.abort();
-                const catalogs = try @import("artifact_inventory.zig").catalogs(&read);
+                const catalogs = try artifact_inventory.catalogs(&read);
                 if (!plan.matchesArtifactInventory(catalogs)) return error.ArtifactCatalogDrift;
-                const active = (try @import("artifact_publication.zig").authority(&read)) orelse return error.ArtifactCatalogDrift;
+                const active = (try artifact_publication.authority(&read)) orelse return error.ArtifactCatalogDrift;
                 if (!std.meta.eql(active, requests.authority.?) or !std.mem.eql(u8, &active.catalog_digest, &catalogs.digest())) return error.ArtifactCatalogDrift;
             }
             const cfg = self.core.index_manager.get(node.name) orelse return error.ArtifactCatalogDrift;
@@ -31486,24 +31597,24 @@ pub const DB = struct {
         try self.refreshArtifactProjections(scratch, document, plan, .{});
         var encoded: ?[]u8 = null;
         defer if (encoded) |bytes| scratch.free(bytes);
-        var namespace: @import("artifact_publication.zig").Namespace = undefined;
-        var action: ?@import("artifact_completion_progress.zig").NextAction = null;
+        var namespace: artifact_publication.Namespace = undefined;
+        var action: ?artifact_completion_progress.NextAction = null;
         defer if (action) |*value| value.deinit();
-        var jobs: ?@import("artifact_unit_jobs.zig").Admission = null;
+        var jobs: ?artifact_unit_jobs.Admission = null;
         defer if (jobs) |*value| value.deinit();
         {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer read.abort();
-            const owner = (try @import("../source_authority.zig").publicationOwner(&read)) orelse return error.ArtifactCatalogDrift;
+            const owner = (try source_authority_mod.publicationOwner(&read)) orelse return error.ArtifactCatalogDrift;
             if (owner.mode != .ordered) return;
-            action = (try @import("artifact_completion_progress.zig").discoverNextAction(scratch, &read, self.root_incarnation, document, plan, .{})) orelse return;
+            action = (try artifact_completion_progress.discoverNextAction(scratch, &read, self.root_incarnation, document, plan, .{})) orelse return;
             switch (action.?) {
                 .control => |*prepared| {
                     const command = try prepared.command();
                     namespace = command.namespace;
-                    encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, command);
+                    encoded = try artifact_publication_transport_codec.encodeAlloc(scratch, command);
                 },
-                .jobs => |*page| jobs = try @import("artifact_unit_jobs.zig").prepare(scratch, &read, self.root_incarnation, page, .{}),
+                .jobs => |*page| jobs = try artifact_unit_jobs.prepare(scratch, &read, self.root_incarnation, page, .{}),
             }
         }
         if (jobs) |*admission| {
@@ -31526,7 +31637,7 @@ pub const DB = struct {
     /// their slots. The pinned read is gone before the writer fence; the
     /// immutable plan remains pinned for the maintenance turn.
     pub fn advanceArtifactUnitReceiptPage(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !bool {
-        const unit_jobs = @import("artifact_unit_jobs.zig");
+        const unit_jobs = artifact_unit_jobs;
         var document_turn: ?unit_jobs.DocumentTurn = null;
         var work: ?unit_jobs.WorkTurn = null;
         defer if (work) |*turn| turn.deinit();
@@ -31574,7 +31685,7 @@ pub const DB = struct {
         const has_ordered_authority = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            break :blk try @import("artifact_publication.zig").authority(&read) != null;
+            break :blk try artifact_publication.authority(&read) != null;
         };
         if (!has_ordered_authority) {
             if (self.local_source_completion_audit_pending) {
@@ -31585,22 +31696,22 @@ pub const DB = struct {
         }
         var plan = try self.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
-        const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, self.core.store, self.root_incarnation, plan.plan());
-        const obligations = @import("artifact_producer_obligations.zig");
+        const readiness_progress = try artifact_producer_readiness.advance(scratch, self.core.store, self.root_incarnation, plan.plan());
+        const obligations = artifact_producer_obligations;
         var page = blk: {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer read.abort();
-            const authority = (try @import("artifact_publication.zig").authority(&read)) orelse return false;
+            const authority = (try artifact_publication.authority(&read)) orelse return false;
             // Protocol-14 owners have no required-stream work registry.
             const state = (try obligations.load(&read)) orelse {
-                var ordered = (try @import("artifact_inventory.zig").load(scratch, &read)) orelse return error.ArtifactCatalogDrift;
+                var ordered = (try artifact_inventory.load(scratch, &read)) orelse return error.ArtifactCatalogDrift;
                 defer ordered.deinit();
                 if (ordered.value.command.binding.effect_protocol >= 15) return error.ArtifactCatalogCorrupt;
                 return false;
             };
             try state.requireAuthority(authority);
             if (state.sealed_attempt != null) return false;
-            const catalogs = try @import("artifact_inventory.zig").catalogs(&read);
+            const catalogs = try artifact_inventory.catalogs(&read);
             if (!plan.plan().matchesArtifactInventory(catalogs) or !std.mem.eql(u8, &catalogs.digest(), &authority.catalog_digest)) return error.ArtifactCatalogDrift;
             const cursor = self.artifact_producer_scheduler.cursorForAuthority(self.alloc, authority);
             break :blk try obligations.scanWork(scratch, &read, authority, cursor);
@@ -31629,7 +31740,7 @@ pub const DB = struct {
             self.artifact_producer_scheduler.startRound(page.authority, round);
         }
         var refs: dispatch.Buffer = undefined;
-        const deadline = platform_time.monotonicNs() +| @import("artifact_producer_scheduler.zig").Scheduler.quantum_ns;
+        const deadline = platform_time.monotonicNs() +| artifact_producer_scheduler_mod.Scheduler.quantum_ns;
         var processed: usize = 0;
         var more_dispatch = false;
         for (page.items) |item| {
@@ -31640,7 +31751,7 @@ pub const DB = struct {
             errdefer self.alloc.free(next);
             // Native verification is local, resumable evidence, not discharge.
             // It also runs for catalogs with no generated provider templates.
-            const native_progress = try @import("artifact_native_stream.zig").advance(scratch, self.core.store, self.root_incarnation, item.document, plan.plan());
+            const native_progress = try artifact_native_stream.advance(scratch, self.core.store, self.root_incarnation, item.document, plan.plan());
             more_dispatch = more_dispatch or native_progress == .progress;
             if (native_progress == .closed) {
                 _ = try self.advanceArtifactUnitReceiptPage(scratch, item.document, plan.plan());
@@ -31683,11 +31794,11 @@ pub const DB = struct {
             self.artifact_producer_scheduler.commitCursor(self.alloc, page.authority, next);
             processed += 1;
         }
-        const readiness_pending = try @import("artifact_producer_readiness.zig").pending(scratch, self.core.store, self.root_incarnation);
+        const readiness_pending = try artifact_producer_readiness.pending(scratch, self.core.store, self.root_incarnation);
         more_dispatch = more_dispatch or readiness_pending;
         self.artifact_producer_scheduler.completePage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, self.independentMaintenanceNowNs());
         if (readiness_pending and !readiness_progress and processed == page.items.len and page.at_end) {
-            self.artifact_producer_scheduler.retry_after_ns.store(self.independentMaintenanceNowNs() +| @import("artifact_producer_scheduler.zig").Scheduler.poll_interval_ns, .release);
+            self.artifact_producer_scheduler.retry_after_ns.store(self.independentMaintenanceNowNs() +| artifact_producer_scheduler_mod.Scheduler.poll_interval_ns, .release);
         }
         return processed != 0;
     }
@@ -31695,7 +31806,7 @@ pub const DB = struct {
     /// Persist scoped jobs and their document wakeup atomically. The thin
     /// journal is only a wakeup: exact child/unit/generation identities remain
     /// in the root-local outbox until receipt-checked retirement.
-    pub fn admitArtifactUnitJobs(self: *DB, admission: *const @import("artifact_unit_jobs.zig").Admission) !u64 {
+    pub fn admitArtifactUnitJobs(self: *DB, admission: *const artifact_unit_jobs.Admission) !u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (admission.root != self.root_incarnation) return error.DurableRootIncarnationUnavailable;
         var plan = try self.core.index_manager.acquireWritePlanSnapshot();
@@ -31732,7 +31843,7 @@ pub const DB = struct {
 
     /// Retire only receiver-verified work; callback submission is not an ack.
     /// This changes local scheduling metadata, not replay or stream completion.
-    pub fn retireArtifactUnitJob(self: *DB, retirement: *const @import("artifact_unit_jobs.zig").Retirement) !bool {
+    pub fn retireArtifactUnitJob(self: *DB, retirement: *const artifact_unit_jobs.Retirement) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ctx = self.batchContext();
         var replication_mutation = acquireReplicationMutationSharedContext(&ctx);
@@ -31751,21 +31862,21 @@ pub const DB = struct {
 
     /// Advance the fair worker continuation without acknowledging any job.
     /// The turn owns its scan results; no provider runs under this write gate.
-    pub fn advanceArtifactUnitWorkTurn(self: *DB, turn: *const @import("artifact_unit_jobs.zig").WorkTurn) !void {
+    pub fn advanceArtifactUnitWorkTurn(self: *DB, turn: *const artifact_unit_jobs.WorkTurn) !void {
         return self.finishArtifactUnitWorkTurn(null, turn);
     }
 
     /// Commit sibling and within-child fairness together after a bounded
     /// attempt. A refused/canceled child may advance only the document cursor;
     /// neither cursor acknowledges a producer result or releases job headroom.
-    pub fn finishArtifactUnitWorkTurn(self: *DB, document: ?*const @import("artifact_unit_jobs.zig").DocumentTurn, work: ?*const @import("artifact_unit_jobs.zig").WorkTurn) !void {
+    pub fn finishArtifactUnitWorkTurn(self: *DB, document: ?*const artifact_unit_jobs.DocumentTurn, work: ?*const artifact_unit_jobs.WorkTurn) !void {
         return self.finishArtifactUnitWorkPage(document, work, &.{});
     }
 
     /// One durable worker checkpoint: fair continuations and receiver-verified
     /// receipts commit together. A callback outcome alone cannot enter this
     /// list; every retirement carries its own current accepted-result fence.
-    pub fn finishArtifactUnitWorkPage(self: *DB, document: ?*const @import("artifact_unit_jobs.zig").DocumentTurn, work: ?*const @import("artifact_unit_jobs.zig").WorkTurn, retirements: []const *const @import("artifact_unit_jobs.zig").Retirement) !void {
+    pub fn finishArtifactUnitWorkPage(self: *DB, document: ?*const artifact_unit_jobs.DocumentTurn, work: ?*const artifact_unit_jobs.WorkTurn, retirements: []const *const artifact_unit_jobs.Retirement) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (document == null and work == null and retirements.len == 0) return error.InvalidBatchRequest;
         if (retirements.len > 128) return error.InvalidBatchRequest;
@@ -31816,28 +31927,28 @@ pub const DB = struct {
         const publication_mode = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            if (try @import("artifact_publication.zig").authority(&read) == null) {
+            if (try artifact_publication.authority(&read) == null) {
                 self.artifact_producer_baseline_pending.store(false, .release);
                 return true;
             }
-            const owner = (try @import("../source_authority.zig").publicationOwner(&read)) orelse return error.ArtifactCatalogDrift;
+            const owner = (try source_authority_mod.publicationOwner(&read)) orelse return error.ArtifactCatalogDrift;
             break :blk owner.mode;
         };
-        const retired_work = try @import("artifact_producer_obligations.zig").collectObsoleteWorkPage(scratch, self.core.store);
-        const retired_proofs = try @import("artifact_producer_provenance.zig").collectObsoletePage(scratch, self.core.store);
-        const retired_checkpoints = try @import("artifact_stream_checkpoint.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_streams = try @import("artifact_stream_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_completions = try @import("artifact_completion_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_native = try @import("artifact_native_stream.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_inventories = try @import("artifact_chunk_inventory_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_units = try @import("artifact_unit_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_unit_jobs = try @import("artifact_unit_jobs.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_authored = try @import("artifact_authored_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const swept_authored = try @import("artifact_authored_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
+        const retired_work = try artifact_producer_obligations.collectObsoleteWorkPage(scratch, self.core.store);
+        const retired_proofs = try artifact_producer_provenance.collectObsoletePage(scratch, self.core.store);
+        const retired_checkpoints = try artifact_stream_checkpoint.collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const retired_streams = try artifact_stream_progress.collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const retired_completions = try artifact_completion_progress.collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const retired_native = try artifact_native_stream.collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const retired_inventories = try artifact_chunk_inventory_progress.collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const retired_units = try artifact_unit_progress.collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const retired_unit_jobs = try artifact_unit_jobs.collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const retired_authored = try artifact_authored_acceptance.collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const swept_authored = try artifact_authored_acceptance.collectCurrentPage(scratch, self.core.store, self.root_incarnation);
         const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored;
         if (publication_mode == .ordered) {
-            var prepared = (try @import("artifact_producer_baseline.zig").prepareRaft(scratch, self.core.store)) orelse {
-                var validation = (try @import("artifact_producer_validation.zig").prepareRaft(scratch, self.core.store)) orelse {
+            var prepared = (try artifact_producer_baseline.prepareRaft(scratch, self.core.store)) orelse {
+                var validation = (try artifact_producer_validation.prepareRaft(scratch, self.core.store)) orelse {
                     self.artifact_producer_baseline_pending.store(!retired, .release);
                     return retired;
                 };
@@ -31846,7 +31957,7 @@ pub const DB = struct {
                     self.artifact_producer_baseline_pending.store(!retired, .release);
                     return false;
                 };
-                const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, validation.command);
+                const encoded = try artifact_publication_transport_codec.encodeAlloc(scratch, validation.command);
                 defer scratch.free(encoded);
                 try dispatcher.enqueue(dispatcher.ptr, validation.command.namespace, encoded);
                 self.artifact_producer_baseline_pending.store(true, .release);
@@ -31857,7 +31968,7 @@ pub const DB = struct {
                 self.artifact_producer_baseline_pending.store(!retired, .release);
                 return false;
             };
-            const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, prepared.command);
+            const encoded = try artifact_publication_transport_codec.encodeAlloc(scratch, prepared.command);
             defer scratch.free(encoded);
             try dispatcher.enqueue(dispatcher.ptr, prepared.command.namespace, encoded);
             // Queue admission is not a baseline certificate. The next pass
@@ -31865,7 +31976,7 @@ pub const DB = struct {
             self.artifact_producer_baseline_pending.store(true, .release);
             return false;
         }
-        const complete = try @import("artifact_producer_baseline.zig").page(scratch, self.core.store);
+        const complete = try artifact_producer_baseline.page(scratch, self.core.store);
         self.artifact_producer_baseline_pending.store(!complete or !retired, .release);
         return complete and retired;
     }
@@ -35018,7 +35129,7 @@ pub const DB = struct {
         defer producer_plan.release();
         var producer_read = try self.core.store.beginReadTxn();
         defer producer_read.abort();
-        const legacy = try @import("artifact_publication.zig").authority(&producer_read) == null;
+        const legacy = try artifact_publication.authority(&producer_read) == null;
         const repair_summary_ready = try self.artifactRepairSummaryReady(alloc);
         for (names) |name| {
             const source_repair = try self.artifactRepairSummarySourceSnapshot(
@@ -35027,7 +35138,7 @@ pub const DB = struct {
                 name,
                 repair_summary_ready,
             );
-            const local_scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_name, name, producer_plan.plan());
+            const local_scope = try artifact_producer_readiness.localScopeAlloc(alloc, index_name, name, producer_plan.plan());
             defer alloc.free(local_scope);
             const legacy_complete = if (legacy) blk: {
                 const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse break :blk false;
@@ -35043,7 +35154,7 @@ pub const DB = struct {
                 .failed = source_repair.ready and source_repair.count != 0,
                 .repair_issue_count = source_repair.count,
                 .repair_summary_ready = source_repair.ready,
-                .producer_complete = legacy_complete or try @import("artifact_producer_readiness.zig").sourceComplete(alloc, &producer_read, producer_plan.plan(), self.root_incarnation, name),
+                .producer_complete = legacy_complete or try artifact_producer_readiness.sourceComplete(alloc, &producer_read, producer_plan.plan(), self.root_incarnation, name),
             };
             initialized += 1;
         }
@@ -36246,7 +36357,7 @@ pub const DB = struct {
     fn portableImportTargetEmptyLocked(self: *DB, alloc: Allocator) !bool {
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
+        try artifact_reconcile_intent.requireAbsent(&read);
         if (self.core.schema != null) return false;
         // Every Lite database is now provisioned with the default full-text
         // index at creation, matching the server's table-create behavior, so
@@ -36353,7 +36464,7 @@ pub const DB = struct {
         identity_summary: ?doc_identity.VisibilitySummary,
         schema: ?schema_mod.TableSchema,
         schema_replacement: schema_registry_mod.Registry.PreparedReplacement,
-        relational_indexes: ?@import("relational_index_catalog.zig").WriteSnapshot,
+        relational_indexes: ?relational_index_catalog.WriteSnapshot,
         table_catalog: table_catalog_mod.Catalog,
         row_policy_lease: row_policy_gate_mod.Gate.Lease,
         recovery: ?db_core.PreparedRecoveryRelationalState,
@@ -36402,7 +36513,7 @@ pub const DB = struct {
         var schema_replacement = try self.core.prepareSchemaRegistryReplacement(prepared_epoch);
         prepared_epoch_owned = false;
         errdefer schema_replacement.deinit();
-        var restored_indexes = try @import("relational_index_catalog.zig").Controller.loadSnapshot(
+        var restored_indexes = try relational_index_catalog.Controller.loadSnapshot(
             self.alloc,
             source_store,
             if (prepared_epoch) |epoch| .{ .epoch = epoch } else null,
@@ -36582,11 +36693,11 @@ pub const DB = struct {
 
     pub const restoreStagingStatus = local_mutation.restoreStagingStatus;
 
-    pub fn restoreGenerationAdmissionReceipt(self: *DB) !?@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
+    pub fn restoreGenerationAdmissionReceipt(self: *DB) !?restore_staging_contract.GenerationAdmissionReceipt {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{self});
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        return @import("restore_generation_admissions.zig").loadReceipt(&read);
+        return restore_generation_admissions.loadReceipt(&read);
     }
 
     /// Private provisioners call this before cache adoption, after installing
@@ -36693,14 +36804,14 @@ pub const DB = struct {
     /// reads or writes, including scoped ones, until authenticated import binds it.
     pub fn reserveRestoreStaging(self: *DB, alloc: Allocator, plan_id: [16]u8, plan_digest: [32]u8, namespace: doc_identity.Namespace) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, plan_id, plan_digest, namespace });
-        const staging = @import("restore_staging.zig");
+        const staging = restore_staging;
         const scope: staging.Scope = .{ .plan_id = plan_id, .plan_digest = plan_digest, .target_namespace = namespace, .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 }, .source_artifact_digest = @splat(0), .target_schema_digest = @splat(0) };
         return self.reserveRestoreStagingScoped(alloc, scope);
     }
 
-    pub fn reserveRestoreStagingScoped(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope) !void {
+    pub fn reserveRestoreStagingScoped(self: *DB, alloc: Allocator, scope: restore_staging.Scope) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope });
-        const staging = @import("restore_staging.zig");
+        const staging = restore_staging;
         const namespace = scope.target_namespace;
         try scope.validateReservation();
         if (scope.source_namespace.table_id != 0) try scope.validate();
@@ -36741,10 +36852,10 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope });
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        try @import("restore_staging.zig").requireScope(alloc, &txn, scope, false);
+        try restore_staging.requireScope(alloc, &txn, scope, false);
     }
 
-    pub fn beginRestoreStaging(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope) !void {
+    pub fn beginRestoreStaging(self: *DB, alloc: Allocator, scope: restore_staging.Scope) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope });
         return self.beginRestoreStagingWithMarker(alloc, scope, null, null, null);
     }
@@ -36753,7 +36864,7 @@ pub const DB = struct {
     /// versioned projection. This does not switch the active row schema or
     /// import source-local migration progress. hot-standby begin carries the same mapping
     /// so followers reconstruct it before accepting row effects.
-    pub fn installRestoreStagingReadSchema(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, read_json: []const u8) !void {
+    pub fn installRestoreStagingReadSchema(self: *DB, alloc: Allocator, scope: restore_staging.Scope, read_json: []const u8) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope, read_json });
         if (read_json.len == 0) return;
         try scope.validate();
@@ -36774,20 +36885,20 @@ pub const DB = struct {
         if (historical.version >= active.version or historical.storage_mode != active.storage_mode) return error.InvalidRestoreMigrationState;
         const active_encoded = try schema_mod.serializeSchema(alloc, active);
         defer alloc.free(active_encoded);
-        if (!std.mem.eql(u8, &@import("restore_staging.zig").digest(active_encoded), &scope.target_schema_digest)) return error.RestoreStagingScopeChanged;
+        if (!std.mem.eql(u8, &restore_staging.digest(active_encoded), &scope.target_schema_digest)) return error.RestoreStagingScopeChanged;
         var txn = try self.core.store.beginWriteTxn();
         var history_txn_open = true;
         defer if (history_txn_open) txn.abort();
         var history_mutable = true;
-        if (try @import("restore_staging.zig").optional(&txn)) |raw| {
-            var status = try @import("restore_staging.zig").Progress.decode(alloc, raw);
+        if (try restore_staging.optional(&txn)) |raw| {
+            var status = try restore_staging.Progress.decode(alloc, raw);
             defer status.deinit();
             if (!std.mem.eql(u8, &status.value.scope.digest(), &scope.digest())) return error.RestoreStagingScopeChanged;
             history_mutable = status.value.phase == .reserved;
         } else if (self.core.table_catalog.row_count != 0) return error.RestoreStagingTargetNotEmpty;
-        const prior_bootstrap = try missingAsNull(txn.get(@import("restore_staging.zig").bootstrap_key));
+        const prior_bootstrap = try missingAsNull(txn.get(restore_staging.bootstrap_key));
         if (prior_bootstrap) |bytes| {
-            var prior = try @import("restore_staging.zig").OwnerBootstrap.decode(alloc, bytes);
+            var prior = try restore_staging.OwnerBootstrap.decode(alloc, bytes);
             defer prior.deinit();
             if (!std.mem.eql(u8, prior.value.read_schema_json, read_json)) return error.RestoreStagingScopeChanged;
         }
@@ -36804,9 +36915,9 @@ pub const DB = struct {
         try self.core.store.sync(true);
     }
 
-    pub fn installRestoreStagingBootstrap(self: *DB, alloc: Allocator, descriptor: @import("restore_staging.zig").OwnerBootstrap) !void {
+    pub fn installRestoreStagingBootstrap(self: *DB, alloc: Allocator, descriptor: restore_staging.OwnerBootstrap) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, descriptor });
-        const staging = @import("restore_staging.zig");
+        const staging = restore_staging;
         try descriptor.validate();
         try @import("../../schema/restore_migration.zig").validate(alloc, descriptor.schema_json, descriptor.read_schema_json);
         try self.installRestoreStagingReadSchema(alloc, descriptor.scope, descriptor.read_schema_json);
@@ -36842,9 +36953,9 @@ pub const DB = struct {
         try self.core.store.sync(true);
     }
 
-    pub fn readRestoreStagingBootstrap(self: *DB, alloc: Allocator) !?std.json.Parsed(@import("restore_staging.zig").OwnerBootstrap) {
+    pub fn readRestoreStagingBootstrap(self: *DB, alloc: Allocator) !?std.json.Parsed(restore_staging.OwnerBootstrap) {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc });
-        const staging = @import("restore_staging.zig");
+        const staging = restore_staging;
         const stored = try self.core.getStoreValue(alloc, staging.bootstrap_key);
         defer if (stored) |bytes| alloc.free(bytes);
         if (stored) |bytes| return try staging.OwnerBootstrap.decode(alloc, bytes);
@@ -36853,27 +36964,27 @@ pub const DB = struct {
 
     /// A cold, read-only physical proof for canceled initial FK retirement.
     /// This does not consult or synthesize a public catalog route.
-    pub fn readInitialChildPublicationRecord(self: *DB) !?@import("relational_initial_child_publication.zig").Record {
+    pub fn readInitialChildPublicationRecord(self: *DB) !?relational_initial_child_publication.Record {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{self});
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        return @import("relational_initial_child_publication.zig").load(&txn);
+        return relational_initial_child_publication.load(&txn);
     }
 
     /// Local terminal retirement only, after Raft and all physical owners have
     /// drained under an authenticated exact-root cancellation ticket. This is
     /// not a Raft receipt and must never be used to publish/release a child.
-    pub fn cancelColdInitialChildForRetirement(self: *DB, expected: @import("relational_initial_child_publication.zig").Record, cancel_revision: u64) !void {
+    pub fn cancelColdInitialChildForRetirement(self: *DB, expected: relational_initial_child_publication.Record, cancel_revision: u64) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, expected, cancel_revision });
-        const hidden = @import("relational_initial_child_publication.zig");
+        const hidden = relational_initial_child_publication;
         try expected.validate();
         if (cancel_revision == 0 or expected.phase == .released) return error.InitialChildPublicationChanged;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         const current = (try hidden.load(&txn)) orelse return error.InitialChildPublicationMissing;
         if (!current.samePlan(expected) or current.phase == .released) return error.InitialChildPublicationChanged;
-        const table_raw = txn.get(@import("table_catalog.zig").key) catch return error.InitialChildPublicationChanged;
-        if ((try @import("table_catalog.zig").Catalog.decode(table_raw)).row_count != 0) return error.InitialChildPublicationChanged;
+        const table_raw = txn.get(table_catalog_mod.key) catch return error.InitialChildPublicationChanged;
+        if ((try table_catalog_mod.Catalog.decode(table_raw)).row_count != 0) return error.InitialChildPublicationChanged;
         // The terminal metadata revision identifies this local-only phase;
         // no data-Raft applied watermark is advanced or fabricated.
         _ = try hidden.stagePhase(&txn, current, .canceled, @max(current.provision_term, 1), cancel_revision);
@@ -36881,7 +36992,7 @@ pub const DB = struct {
     }
 
     fn encodeRestoreStagingReplicationPayload(self: *DB, req: types.BatchRequest, ordered_receipt: ?OrderedApplyReceipt) ![]u8 {
-        const staging = @import("restore_staging.zig");
+        const staging = restore_staging;
         if (req.restore_staging.? == .install_generation_admissions)
             return replication_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, ordered_receipt orelse return error.InvalidRestoreStagingCommand);
         if (req.restore_staging.? == .begin) {
@@ -36918,12 +37029,12 @@ pub const DB = struct {
     fn installRestoreGenerationAdmissionsWithMarker(
         self: *DB,
         alloc: Allocator,
-        command: @import("restore_staging_contract.zig").InstallGenerationAdmissions,
+        command: restore_staging_contract.InstallGenerationAdmissions,
         marker: ?OrderedApplyReceipt,
         replication_lsn: ?u64,
         replication_payload: ?[]const u8,
-    ) !@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
-        const contract = @import("restore_staging_contract.zig");
+    ) !restore_staging_contract.GenerationAdmissionReceipt {
+        const contract = restore_staging_contract;
         const entry = marker orelse return error.InvalidRestoreStagingCommand;
         const expected = try contract.admissionReceiptDigest(command);
         try self.lockApplyForPortableRuntime();
@@ -36946,7 +37057,7 @@ pub const DB = struct {
             return error.RestoreStagingScopeChanged;
         switch (try orderedApplyDisposition(try readOrderedApplyReceipt(alloc, self.core.store), entry)) {
             .already_applied => {
-                const receipt = (try @import("restore_generation_admissions.zig").loadReceipt(&txn)) orelse
+                const receipt = (try restore_generation_admissions.loadReceipt(&txn)) orelse
                     return error.RestoreSourceProofMissing;
                 if (!std.mem.eql(u8, &receipt.logical_digest, &expected) or
                     !std.mem.eql(u8, &receipt.scope, &command.scope)) return error.RestoreStagingScopeChanged;
@@ -36954,7 +37065,7 @@ pub const DB = struct {
             },
             .apply => {},
         }
-        const receipt = try @import("restore_generation_admissions.zig").stageInstall(alloc, &txn, command, entry.term, entry.index);
+        const receipt = try restore_generation_admissions.stageInstall(alloc, &txn, command, entry.term, entry.index);
         var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
         const applied = orderedApplyReceiptWrite(entry, &marker_bytes);
         try txn.put(applied.key, applied.value);
@@ -37031,8 +37142,8 @@ pub const DB = struct {
         self.local_execution.durable_replication_outbox_maybe.store(true, .release);
     }
 
-    fn beginRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, marker: ?OrderedApplyReceipt, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
-        const staging = @import("restore_staging.zig");
+    fn beginRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: restore_staging.Scope, marker: ?OrderedApplyReceipt, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
+        const staging = restore_staging;
         try scope.validate();
         if (!scope.target_namespace.eql(self.core.identity_namespace)) return error.RestoreStagingScopeChanged;
         try self.lockApplyForPortableRuntime();
@@ -37105,7 +37216,7 @@ pub const DB = struct {
             // ordered-index entries even if a corrupt counter says zero.
             var cursor = try txn.openPhysicalCursorAdapter();
             defer cursor.close();
-            for ([_][]const u8{ @import("relational_integrity_contract.zig").namespace, @import("relational_index_records.zig").forward_namespace, @import("relational_index_records.zig").ownership_namespace }) |prefix| {
+            for ([_][]const u8{ @import("relational_integrity_contract.zig").namespace, relational_index_records.forward_namespace, relational_index_records.ownership_namespace }) |prefix| {
                 if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return error.RestoreStagingTargetNotEmpty;
             }
         }
@@ -37126,13 +37237,13 @@ pub const DB = struct {
                 try txn.put(&internal_keys.range_document_count_key, &zero);
             }
         }
-        const raw_catalog = try missingAsNull(txn.get(@import("relational_integrity_catalog.zig").key));
+        const raw_catalog = try missingAsNull(txn.get(relational_integrity_catalog.key));
         if (raw_catalog) |bytes| {
-            var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
+            var catalog = try relational_integrity_catalog.decode(alloc, bytes);
             defer catalog.deinit();
             if (try staging.initialCoverage(alloc, &txn, catalog)) |coverage| {
                 defer alloc.free(coverage);
-                try txn.put(@import("relational_integrity_activation.zig").key, coverage);
+                try txn.put(relational_integrity_activation.key, coverage);
             }
         }
         const bootstrap_raw = try missingAsNull(txn.get(staging.bootstrap_key));
@@ -37167,7 +37278,7 @@ pub const DB = struct {
     /// Source is a verified immutable artifact opened read-only by the shared
     /// restore driver. Each page decodes its declared historical layout once
     /// and feeds logical rows through the target's normal preparation pipeline.
-    pub fn importRestoreStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken) !@import("restore_staging.zig").Phase {
+    pub fn importRestoreStagingPage(self: *DB, alloc: Allocator, scope: restore_staging.Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken) !restore_staging.Phase {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope, source, max_rows, cancellation });
         var prepared = try self.prepareRestoreStagingPage(alloc, scope, source, max_rows, cancellation);
         defer prepared.deinit();
@@ -37176,21 +37287,21 @@ pub const DB = struct {
         return prepared.phase;
     }
 
-    pub fn prepareRestoreStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken) !@import("restore_staging.zig").PreparedPage {
+    pub fn prepareRestoreStagingPage(self: *DB, alloc: Allocator, scope: restore_staging.Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken) !restore_staging.PreparedPage {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope, source, max_rows, cancellation });
         if (scope.rewrite != null or scope.empty_generation) return error.InvalidRestoreStagingCommand;
         return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, null);
     }
 
-    pub fn prepareRewriteStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: *const @import("relational_rewrite_staging.zig").ProgramSet) !@import("restore_staging.zig").PreparedPage {
+    pub fn prepareRewriteStagingPage(self: *DB, alloc: Allocator, scope: restore_staging.Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: *const relational_rewrite_staging.ProgramSet) !restore_staging.PreparedPage {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope, source, max_rows, cancellation, program });
         try program.requireScope(scope);
-        try @import("relational_rewrite_staging.zig").requireSnapshotSource(alloc, scope, source);
+        try relational_rewrite_staging.requireSnapshotSource(alloc, scope, source);
         return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, program);
     }
 
-    fn prepareRestoreStagingPageInternal(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: ?*const @import("relational_rewrite_staging.zig").ProgramSet) !@import("restore_staging.zig").PreparedPage {
-        const staging = @import("restore_staging.zig");
+    fn prepareRestoreStagingPageInternal(self: *DB, alloc: Allocator, scope: restore_staging.Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: ?*const relational_rewrite_staging.ProgramSet) !restore_staging.PreparedPage {
+        const staging = restore_staging;
         if (max_rows == 0 or max_rows > 128 or source.open_mode != .query_readonly or !source.core.identity_namespace.eql(scope.source_namespace)) return error.InvalidRestoreStagingCommand;
         if (!std.mem.eql(u8, source.core.byteRange().start, self.core.byteRange().start) or !std.mem.eql(u8, source.core.byteRange().end, self.core.byteRange().end)) return error.RestoreStagingScopeChanged;
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -37204,7 +37315,7 @@ pub const DB = struct {
         if (next.phase == .reserved) return error.RestoreStagingInProgress;
         if (next.phase != .importing) return .{ .arena = arena, .phase = next.phase, .batch = null };
         if (!next.source_generation_proofs_complete) {
-            const portable = @import("../portable_backup.zig");
+            const portable = portable_backup;
             var bootstrap = (try self.readRestoreStagingBootstrap(alloc)) orelse return error.RestoreSourceProofMissing;
             defer bootstrap.deinit();
             const expected_digest = bootstrap.value.source_generation_proof_digest orelse return error.RestoreSourceProofMissing;
@@ -37447,7 +37558,7 @@ pub const DB = struct {
             hash.update(&length);
             hash.update(document_key);
             hash.update(json);
-            @import("relational_rewrite_program.zig").hashJsonNullFields(&hash, json_null_fields);
+            relational_rewrite_program.hashJsonNullFields(&hash, json_null_fields);
             hash.final(&next.logical_digest);
             next.rows = std.math.add(u64, next.rows, 1) catch return error.InvalidRestoreStagingCommand;
             continuation_buffer.clearRetainingCapacity();
@@ -37481,13 +37592,13 @@ pub const DB = struct {
 
     /// Scope is retained as a tombstone after publication/cancellation. Late
     /// import RPCs can never initialize or mutate a recycled owner generation.
-    pub fn finishRestoreStaging(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Digest, phase: @import("restore_staging.zig").Phase) !@import("restore_staging.zig").Digest {
+    pub fn finishRestoreStaging(self: *DB, alloc: Allocator, scope: restore_staging.Digest, phase: restore_staging.Phase) !restore_staging.Digest {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope, phase });
         return self.finishRestoreStagingWithMarker(alloc, scope, phase, null, null, null);
     }
 
-    fn finishRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Digest, phase: @import("restore_staging.zig").Phase, marker: ?OrderedApplyReceipt, replication_lsn: ?u64, replication_payload: ?[]const u8) !@import("restore_staging.zig").Digest {
-        const staging = @import("restore_staging.zig");
+    fn finishRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: restore_staging.Digest, phase: restore_staging.Phase, marker: ?OrderedApplyReceipt, replication_lsn: ?u64, replication_payload: ?[]const u8) !restore_staging.Digest {
+        const staging = restore_staging;
         if (phase != .validated and phase != .published and phase != .canceled) return error.InvalidRestoreStagingCommand;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -37541,7 +37652,7 @@ pub const DB = struct {
                 if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &scope)) return error.RestoreStagingScopeChanged;
                 if (bootstrap.value.source_generation_proof_digest) |expected_digest| {
                     if (!next.source_generation_proofs_complete) return error.RestoreSourceProofMissing;
-                    try @import("restore_generation_admissions.zig").verifyImportedProofSummary(alloc, &txn, next.scope.source_namespace, expected_digest);
+                    try restore_generation_admissions.verifyImportedProofSummary(alloc, &txn, next.scope.source_namespace, expected_digest);
                 }
             }
             if (self.core.acquireSchemaView()) |active| {
@@ -37558,11 +37669,11 @@ pub const DB = struct {
             // receive the same PreparedRow writes. Seal their durable state
             // before acknowledging this owner's completion receipt.
             try self.core.index_manager.syncAll(true);
-            const raw_catalog = try missingAsNull(txn.get(@import("relational_integrity_catalog.zig").key));
+            const raw_catalog = try missingAsNull(txn.get(relational_integrity_catalog.key));
             if (raw_catalog) |bytes| {
-                var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
+                var catalog = try relational_integrity_catalog.decode(alloc, bytes);
                 defer catalog.deinit();
-                try @import("relational_integrity_activation.zig").requireReady(&txn, catalog);
+                try relational_integrity_activation.requireReady(&txn, catalog);
             }
         }
         next.phase = phase;
@@ -38106,7 +38217,7 @@ pub const DB = struct {
             (std.mem.eql(u8, item.projection_checkpoint_status, "clean") or item.index_repair_active_generation_serviceable) and
             item.projection_checkpoint_config_hash == types.indexConfigHash(cfg) and
             item.projection_checkpoint_applied_sequence <= item.replay_applied_sequence;
-        const stamp = @import("publication.zig").Stamp{
+        const stamp = publication_mod.Stamp{
             .owner_epoch = self.status_owner_epoch,
             .revision = self.status_publication_revision,
             .applied_through = item.replay_applied_sequence,
@@ -39035,11 +39146,11 @@ pub const DB = struct {
                 if (source_names.len == 0) continue;
                 var read = try self.core.store.beginReadTxn();
                 defer read.abort();
-                if (try @import("artifact_publication.zig").authority(&read) != null) continue;
+                if (try artifact_publication.authority(&read) != null) continue;
                 const generation = self.core.index_manager.coverageGenerationForIndex(index_ref.name) orelse continue;
                 var complete = primary_doc_count != null;
                 for (source_names) |source_name| {
-                    const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_ref.name, source_name, recovery_plan.plan());
+                    const scope = try artifact_producer_readiness.localScopeAlloc(alloc, index_ref.name, source_name, recovery_plan.plan());
                     defer alloc.free(scope);
                     const counts = try DerivedCoverageCounters.load(alloc, &read, scope, generation);
                     // A retained terminal failure is known producer debt, not
@@ -39340,7 +39451,7 @@ pub const DB = struct {
                     if (bound.values.len == 0 or bound.values.len > index.tuple.keys.len) return error.InvalidRelationalIndexBound;
                     const values = try scratch.alloc(RelationalRows.Value, bound.values.len);
                     for (bound.values, values, index.tuple.keys[0..bound.values.len]) |value, *target, key| {
-                        target.* = try @import("../../schema/relational_checks.zig").valueFromJson(scratch, key.column_type, value, true);
+                        target.* = try relational_checks_mod.valueFromJson(scratch, key.column_type, value, true);
                     }
                     if (comptime std.mem.eql(u8, field, "lower")) lower = .{ .values = values, .inclusive = bound.inclusive } else upper = .{ .values = values, .inclusive = bound.inclusive };
                 }
@@ -39352,7 +39463,7 @@ pub const DB = struct {
             compiled.* = .{
                 .column = condition.column,
                 .op = condition.op,
-                .value = try @import("../../schema/relational_checks.zig").valueFromJson(scratch, view.tableSchema().relational_columns[ordinal].column_type, condition.value orelse .null, true),
+                .value = try relational_checks_mod.valueFromJson(scratch, view.tableSchema().relational_columns[ordinal].column_type, condition.value orelse .null, true),
                 .collation = condition.collation,
             };
         }
@@ -39428,9 +39539,9 @@ pub const DB = struct {
         session.destroy_filter = Filter.destroy;
         errdefer session.reader.deinit();
         if (opts.include_range_proofs) {
-            const tracking = @import("../range_protection.zig");
+            const tracking = range_protection_mod;
             if (session.reader.index) |index| {
-                const prefix = try @import("relational_index_records.zig").forwardPrefix(index.id());
+                const prefix = try relational_index_records.forwardPrefix(index.id());
                 const next = if (parsed.value.after == null and lower != null and upper != null and
                     lower.?.inclusive and upper.?.inclusive and
                     lower.?.values.len == index.tuple.keys.len and upper.?.values.len == index.tuple.keys.len and
@@ -39578,7 +39689,7 @@ pub const DB = struct {
         if (columnar_progress.delivered != 0) fallback_opts.inclusive_from = false;
 
         var stream_plan = if (visitor.borrow_documents and opts.include_documents and !projection_plan.special.all_artifacts and !projection_plan.special.all_chunks and !projection_plan.special.all_embeddings)
-            try @import("document_query.zig").SpanProjectionPlan.init(alloc, .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields })
+            try document_query.SpanProjectionPlan.init(alloc, .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields })
         else
             null;
         defer if (stream_plan) |*plan| plan.deinit();
@@ -39609,7 +39720,7 @@ pub const DB = struct {
             now_ns: u64,
             filter: ?*db_query_graph.PreparedPatternFilter,
             direct_projection_fields: ?[]const []const u8,
-            stream_plan: ?*const @import("document_query.zig").SpanProjectionPlan,
+            stream_plan: ?*const document_query.SpanProjectionPlan,
             read_txn: *docstore_mod.DocStore.Txn,
             projection_context: *TransactionProjectionContext,
             values_authenticated: bool,
@@ -40131,12 +40242,12 @@ pub const DB = struct {
 
     fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: types.SearchRequest, exec_ctx: types.ExecutionContext, externalize_artifact_ids: bool, dense_profile_sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
         var request = req;
-        var projection: ?@import("document_query.zig").SpanProjectionPlan = null;
+        var projection: ?document_query.SpanProjectionPlan = null;
         defer if (projection) |*plan| plan.deinit();
         const projection_opts: types.LookupOptions = .{ .fields = req.fields, .include_all_fields = req.include_all_fields };
         const shared_matches = if (req.document_projection_plan) |shared| shared.matches(projection_opts) else false;
         if (req.include_stored and !req.count_only and req.limit != 0 and !req.defer_stored_projection and db_query_projection.shouldProjectSearchStored(req) and !shared_matches) {
-            projection = try @import("document_query.zig").SpanProjectionPlan.init(alloc, projection_opts);
+            projection = try document_query.SpanProjectionPlan.init(alloc, projection_opts);
             if (projection) |*plan| request.document_projection_plan = .{ .plan = plan, .fields = req.fields, .include_all_fields = req.include_all_fields };
         }
         var result = try self.searchLockedWithExecutionContextRaw(alloc, request, exec_ctx, externalize_artifact_ids, dense_profile_sink);
@@ -40161,15 +40272,15 @@ pub const DB = struct {
         defer plans.deinit();
         var read: ?docstore_mod.DocStore.Txn = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
         defer if (read) |*owned| owned.abort();
-        var metadata_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        var metadata_scratch = std.heap.ArenaAllocator.init(platform.allocator.reclaimingScratch(alloc));
         defer metadata_scratch.deinit();
-        var projection_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        var projection_scratch = std.heap.ArenaAllocator.init(platform.allocator.reclaimingScratch(alloc));
         defer projection_scratch.deinit();
         var primary_window = DocumentPrimaryReadWindow.init(alloc);
         defer primary_window.deinit();
         var physical: [64][]const u8 = undefined;
         var ids: [64][]const u8 = undefined;
-        var contents: [64]?@import("../document_mutation_revision.zig").Content = undefined;
+        var contents: [64]?document_mutation_revision_mod.Content = undefined;
         var versions: [64]u64 = undefined;
         var mutation_revisions: [64]u64 = undefined;
         const body_allocator = req.document_output_allocator orelse alloc;
@@ -40196,9 +40307,9 @@ pub const DB = struct {
                     ids[row] = candidate.id;
                     physical[row] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, m, candidate.id, schema_view);
                 }
-                var scope = try read.?.openReadScope(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+                var scope = try read.?.openReadScope(platform.allocator.reclaimingScratch(alloc));
                 defer scope.close();
-                try @import("../document_mutation_revision.zig").loadWindowWithRevisions(&scope, m, physical[0..count], ids[0..count], contents[0..count], versions[0..count], mutation_revisions[0..count]);
+                try document_mutation_revision_mod.loadWindowWithRevisions(&scope, m, physical[0..count], ids[0..count], contents[0..count], versions[0..count], mutation_revisions[0..count]);
             }
             if (req.cancellation) |token| try token.check();
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
@@ -41647,7 +41758,7 @@ pub const DB = struct {
         return entry.config.name;
     }
 
-    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const distributed_stats_mod.TextFieldStats {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, req });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
@@ -41741,7 +41852,7 @@ pub const DB = struct {
         return try self.searchLocked(alloc, req);
     }
 
-    pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+    pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const distributed_stats_mod.TextFieldStats {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -43550,7 +43661,7 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                @import("antfly_platform").time.yieldNow();
+                platform.time.yieldNow();
             }
         }
         return true;
@@ -43612,7 +43723,7 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                @import("antfly_platform").time.yieldNow();
+                platform.time.yieldNow();
             }
         }
         return true;
@@ -47485,13 +47596,13 @@ fn testEmbeddingArtifactOrigins(alloc: Allocator) !void {
 }
 
 test "ordered artifact inventory authored ingress differs from unhashed provider output" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testEmbeddingArtifactOrigins, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, testEmbeddingArtifactOrigins, .{});
 }
 
 test "ordered artifact inventory DB authored acceptance survives projection and reopen" {
     const alloc = std.testing.allocator;
-    const publication = @import("artifact_publication.zig");
-    const acceptance = @import("artifact_authored_acceptance.zig");
+    const publication = artifact_publication;
+    const acceptance = artifact_authored_acceptance;
     for ([_]bool{ false, true }) |typed| {
         var directory = try TestDirectory.init("authored-acceptance");
         defer directory.cleanup();
@@ -47507,7 +47618,7 @@ test "ordered artifact inventory DB authored acceptance survives projection and 
             errdefer txn.abort();
             var namespace: publication.Namespace = undefined;
             doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
-            const catalog = try @import("artifact_inventory.zig").local(&txn);
+            const catalog = try artifact_inventory.local(&txn);
             try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = catalog.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
             try txn.commit();
         }
@@ -47807,7 +47918,7 @@ test "materialized preserved sources release writes and store rows across alloca
             try std.testing.expectEqualStrings("stored", sources.items[1].text);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, writes.items });
+    try platform.allocator.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, writes.items });
 }
 
 const chunkEmbeddingSourcesForRequest = local_mutation.chunkEmbeddingSourcesForRequest;
@@ -49341,10 +49452,10 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
-        try @import("relational_integrity_topology.zig").requireUnfenced(&lifecycle);
-        try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
-        try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
-        const catalog_mod = @import("relational_integrity_catalog.zig");
+        try relational_integrity_topology.requireUnfenced(&lifecycle);
+        try relational_integrity_retirement.requireMutable(&lifecycle);
+        try restore_staging.requireScope(ctx.alloc, &lifecycle, null, false);
+        const catalog_mod = relational_integrity_catalog;
         const raw = try missingAsNull(lifecycle.get(catalog_mod.key));
         if (raw) |bytes| {
             var catalog = try catalog_mod.decode(ctx.alloc, bytes);
@@ -49887,9 +49998,9 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
-        try @import("relational_integrity_topology.zig").requireUnfenced(&lifecycle);
-        try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
-        try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
+        try relational_integrity_topology.requireUnfenced(&lifecycle);
+        try relational_integrity_retirement.requireMutable(&lifecycle);
+        try restore_staging.requireScope(ctx.alloc, &lifecycle, null, false);
     }
     var txn_manager = try transactions_mod.TxnManager.init(ctx.alloc, ctx.store);
     defer txn_manager.deinit();
@@ -50051,9 +50162,9 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
-        try @import("relational_integrity_topology.zig").requireUnfenced(&lifecycle);
-        try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
-        try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
+        try relational_integrity_topology.requireUnfenced(&lifecycle);
+        try relational_integrity_retirement.requireMutable(&lifecycle);
+        try restore_staging.requireScope(ctx.alloc, &lifecycle, null, false);
     }
     var txn_manager = try transactions_mod.TxnManager.init(ctx.alloc, ctx.store);
     defer txn_manager.deinit();
@@ -50234,10 +50345,10 @@ fn appendDerivedBatchRecordContextWithProducerFence(ctx: *const BatchExecutionCo
 }
 
 const RequiredProducerDispatch = struct {
-    authority: @import("artifact_publication.zig").Authority,
-    item: @import("artifact_producer_obligations.zig").WorkPage.Item,
+    authority: artifact_publication.Authority,
+    item: artifact_producer_obligations.WorkPage.Item,
     plan_generation: u64,
-    page: @import("artifact_producer_obligations.zig").Dispatch,
+    page: artifact_producer_obligations.Dispatch,
     retry_round: ?u64 = null,
 };
 
@@ -50246,7 +50357,7 @@ fn appendDerivedBatchRecordContextWithWork(ctx: *const BatchExecutionContext, ba
 }
 
 const RequiredUnitProducerDispatch = struct {
-    admission: *const @import("artifact_unit_jobs.zig").Admission,
+    admission: *const artifact_unit_jobs.Admission,
     root: u128,
     plan_generation: u64,
 };
@@ -50310,9 +50421,9 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
             pub fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 const accepted = if (self.required.retry_round) |round|
-                    try @import("artifact_producer_obligations.zig").stageRetry(alloc, txn, self.required.authority, self.required.item, round, self.sequence, self.required.page)
+                    try artifact_producer_obligations.stageRetry(alloc, txn, self.required.authority, self.required.item, round, self.sequence, self.required.page)
                 else
-                    try @import("artifact_producer_obligations.zig").stageDispatch(alloc, txn, self.required.authority, self.required.item, self.sequence, self.required.page);
+                    try artifact_producer_obligations.stageDispatch(alloc, txn, self.required.authority, self.required.item, self.sequence, self.required.page);
                 if (!accepted) return error.EnrichmentSourceChanged;
             }
         };
@@ -50568,7 +50679,7 @@ const acquireSnapshotReplayAsyncContext = local_mutation.acquireSnapshotReplayAs
 
 const replicationTransitionMutexFromContext = local_mutation.replicationTransitionMutexFromContext;
 
-const DurableReplicationOutboxKind = @import("durable_outbox.zig").Kind;
+const DurableReplicationOutboxKind = durable_outbox.Kind;
 
 /// Finish a crash-left local outbox without appending its non-idempotent
 /// mutation twice. The transition mutex serializes this lookup-and-append with
@@ -51249,7 +51360,7 @@ fn clearTargetAdvanceStuck(ctx: *AsyncContext, index_name: []const u8) void {
 /// Snapshot of the target tracker’s stuck observations older than `timeout_ns`, or null if
 /// none. Copies out under the shared mutex so the caller can log/stash the
 /// diagnostic and return without holding it.
-const TargetAdvanceStuckSnapshot = @import("target_advance_tracker.zig").Snapshot;
+const TargetAdvanceStuckSnapshot = target_advance_tracker.Snapshot;
 
 fn oldestTargetAdvanceStuck(ctx: *AsyncContext, timeout_ns: u64, now_ns: u64) !?TargetAdvanceStuckSnapshot {
     return ctx.target_advance.oldestStuck(ctx.alloc, timeout_ns, now_ns);
@@ -51683,7 +51794,7 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     return sequence;
 }
 
-fn commitArtifactUnitTurnFromEnrichment(ptr: *anyopaque, document: ?*const @import("artifact_unit_jobs.zig").DocumentTurn, work: ?*const @import("artifact_unit_jobs.zig").WorkTurn) !void {
+fn commitArtifactUnitTurnFromEnrichment(ptr: *anyopaque, document: ?*const artifact_unit_jobs.DocumentTurn, work: ?*const artifact_unit_jobs.WorkTurn) !void {
     const owner: *EnrichmentAppendContext = @ptrCast(@alignCast(ptr));
     if (owner.read_only) return error.ReadOnly;
     if (owner.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
@@ -51843,7 +51954,7 @@ const NoopResolutionHandoffPublishHook = struct {
 
 fn processOrderedResolutions(ctx_ptr: *anyopaque, alloc: Allocator, resolvers: []const resolution_runtime_mod.ResolverConfig, store: resolver_lib.ArtifactStore, provider: ?resolver_lib.CandidateProvider, changed_keys: []const []const u8, candidate_source: ?resolution_runtime_mod.CandidateSource, embedder: ?embedder_mod.DenseEmbedder) !bool {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
-    return @import("artifact_publication_resolution.zig").process(alloc, ctx.store, ctx.artifact_publication_dispatcher, resolvers, store, provider, changed_keys, candidate_source, embedder);
+    return artifact_publication_resolution.process(alloc, ctx.store, ctx.artifact_publication_dispatcher, resolvers, store, provider, changed_keys, candidate_source, embedder);
 }
 
 fn appendResolutionRecord(ctx_ptr: *anyopaque, write: resolution_runtime_mod.RecordWrite) !u64 {
@@ -52347,11 +52458,11 @@ fn unlockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
 fn requireArtifactProducerMutableContext(ctx: *const BatchExecutionContext) !void {
     var read = try ctx.store.beginReadTxn();
     defer read.abort();
-    try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
+    try artifact_reconcile_intent.requireAbsent(&read);
     // Activation is serialized with this same apply fence. Work prepared by
     // an old local lease may retry through ordered publication, never commit
     // an unreplicated result after the owner selected replicated producers.
-    if (try @import("artifact_publication.zig").authority(&read) != null) return error.ArtifactCatalogDrift;
+    if (try artifact_publication.authority(&read) != null) return error.ArtifactCatalogDrift;
 }
 
 fn appendGeneratedBatchFromEnrichment(
@@ -52464,9 +52575,9 @@ fn appendGeneratedBatchFromEnrichment(
     var apply_mutex_held = true;
     errdefer if (apply_mutex_held) batch_ctx.apply_mutex.unlockExclusive();
     const graph_effects = for (artifact_promotions) |promotion| {
-        if (@import("online_graph_artifacts.zig").isKey(promotion.final_key)) break true;
+        if (online_graph_artifacts.isKey(promotion.final_key)) break true;
     } else for (artifact_delete_keys) |key| {
-        if (@import("online_graph_artifacts.zig").isKey(key)) break true;
+        if (online_graph_artifacts.isKey(key)) break true;
     } else false;
     var graph_publication = if (graph_effects) batch_ctx.index_manager.beginGraphPrimaryMutation() else null;
     defer if (graph_publication) |*lease| lease.release();
@@ -53284,9 +53395,9 @@ fn loadDerivedCoverageOutcomeCounterFromTxn(
     index_name: []const u8,
     generation: u64,
     outcome: []const u8,
-    authority: ?@import("artifact_publication.zig").Authority,
+    authority: ?artifact_publication.Authority,
 ) !?u64 {
-    const counter_key = try @import("artifact_coverage_epoch.zig").counter(alloc, authority, index_name, generation, outcome);
+    const counter_key = try artifact_coverage_epoch.counter(alloc, authority, index_name, generation, outcome);
     defer alloc.free(counter_key);
     const raw = txn.get(counter_key) catch |err| switch (err) {
         error.NotFound => return null,
@@ -53307,7 +53418,7 @@ const DerivedCoverageCounters = struct {
     artifact_invalid: bool,
 
     fn load(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, index_name: []const u8, generation: u64) !@This() {
-        const authority = try @import("artifact_publication.zig").authority(txn);
+        const authority = try artifact_publication.authority(txn);
         return .{
             .produced = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, txn, index_name, generation, "produced", authority),
             .skipped = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, txn, index_name, generation, "skipped", authority),
@@ -53332,7 +53443,7 @@ fn loadDerivedCoverageCounters(
     legacy_range: ?types.ByteRange,
     test_ctx: ?*AsyncContext,
 ) !DerivedCoverageCounters {
-    const publication = @import("artifact_publication.zig");
+    const publication = artifact_publication;
     var scope: ?publication.Authority = null;
     for (0..4) |_| {
         var point = try loadCoveragePointSet(alloc, store, index_name, generation, scope);
@@ -53369,20 +53480,20 @@ fn loadDerivedCoverageCounters(
 const CoveragePointSet = struct {
     lease: docstore_mod.DocStore.Txn,
     counts: DerivedCoverageCounters,
-    authority: ?@import("artifact_publication.zig").Authority,
+    authority: ?artifact_publication.Authority,
 };
 
 /// The authority witness is in the SAME atomic point batch as the counters,
 /// source cardinality and artifact target. The common path never clones the
 /// mutable LSM snapshot merely to discover a producer epoch.
-fn loadCoveragePointSet(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8, generation: u64, scope: ?@import("artifact_publication.zig").Authority) !CoveragePointSet {
-    const publication = @import("artifact_publication.zig");
+fn loadCoveragePointSet(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8, generation: u64, scope: ?artifact_publication.Authority) !CoveragePointSet {
+    const publication = artifact_publication;
     const tags = [_][]const u8{ "produced", "skipped", "terminal_failed" };
     var owned_keys: [4][]u8 = undefined;
     var initialized: usize = 0;
     defer for (owned_keys[0..initialized]) |key| alloc.free(key);
     for (tags, 0..) |tag, i| {
-        owned_keys[i] = try @import("artifact_coverage_epoch.zig").counter(alloc, scope, index_name, generation, tag);
+        owned_keys[i] = try artifact_coverage_epoch.counter(alloc, scope, index_name, generation, tag);
         initialized += 1;
     }
     owned_keys[3] = try DB.denseArtifactTargetCounterKeyAlloc(alloc, index_name);
@@ -53845,22 +53956,22 @@ fn batchAdvancesManagedIndexApplyStateForReplay(
 
 const managedIndexRecordApplicability = local_mutation.managedIndexRecordApplicability;
 
-const CollectSparseFieldWritesProfile = @import("replay_vector_collectors.zig").CollectSparseFieldWritesProfile;
+const CollectSparseFieldWritesProfile = replay_vector_collectors.CollectSparseFieldWritesProfile;
 
 /// Changed-artifact hints include removals as well as positive writes. Keep
 /// explicit tombstones in the delete lane: probing them as missing upserts
 /// would create spurious repair debt and wedge replay while the source lives.
-const filterDeletedEmbeddingWrites = @import("replay_vector_collectors.zig").filterDeletedEmbeddingWrites;
+const filterDeletedEmbeddingWrites = replay_vector_collectors.filterDeletedEmbeddingWrites;
 
-const OwnedDenseEmbeddingWrites = @import("replay_vector_collectors.zig").OwnedDenseEmbeddingWrites;
+const OwnedDenseEmbeddingWrites = replay_vector_collectors.OwnedDenseEmbeddingWrites;
 
-const OwnedEmbeddingArtifactWriteIdentity = @import("replay_vector_collectors.zig").OwnedEmbeddingArtifactWriteIdentity;
+const OwnedEmbeddingArtifactWriteIdentity = replay_vector_collectors.OwnedEmbeddingArtifactWriteIdentity;
 
-const decodeEmbeddingArtifactWriteIdentityAlloc = @import("replay_vector_collectors.zig").decodeEmbeddingArtifactWriteIdentityAlloc;
+const decodeEmbeddingArtifactWriteIdentityAlloc = replay_vector_collectors.decodeEmbeddingArtifactWriteIdentityAlloc;
 
-const decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc = @import("replay_vector_collectors.zig").decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc;
+const decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc = replay_vector_collectors.decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc;
 
-const OwnedSparseEmbeddingWrites = @import("replay_vector_collectors.zig").OwnedSparseEmbeddingWrites;
+const OwnedSparseEmbeddingWrites = replay_vector_collectors.OwnedSparseEmbeddingWrites;
 
 const CollectDocumentWritesOptions = document_collectors.CollectDocumentWritesOptions;
 
@@ -53870,9 +53981,9 @@ const replayDocumentKeyInRange = document_collectors.replayDocumentKeyInRange;
 
 const replayDocumentIsDurablyDeleted = document_collectors.replayDocumentIsDurablyDeleted;
 
-const OwnedSparseFieldWrites = @import("replay_vector_collectors.zig").OwnedSparseFieldWrites;
+const OwnedSparseFieldWrites = replay_vector_collectors.OwnedSparseFieldWrites;
 
-const collectSparseFieldWritesProfiled = @import("replay_vector_collectors.zig").collectSparseFieldWritesProfiled;
+const collectSparseFieldWritesProfiled = replay_vector_collectors.collectSparseFieldWritesProfiled;
 
 const collectDocumentWrites = document_collectors.collectDocumentWrites;
 
@@ -53885,9 +53996,9 @@ const appendUniqueBorrowedKeyWithSet = local_mutation.appendUniqueBorrowedKeyWit
 
 const collectTextReplayDeleteKeys = local_mutation.collectTextReplayDeleteKeys;
 
-const denseEmbeddingDocKeySet = @import("replay_vector_collectors.zig").denseEmbeddingDocKeySet;
+const denseEmbeddingDocKeySet = replay_vector_collectors.denseEmbeddingDocKeySet;
 
-const sparseEmbeddingDocKeySet = @import("replay_vector_collectors.zig").sparseEmbeddingDocKeySet;
+const sparseEmbeddingDocKeySet = replay_vector_collectors.sparseEmbeddingDocKeySet;
 
 const attachPreparedUpsertDocumentProjections = local_mutation.attachPreparedUpsertDocumentProjections;
 
@@ -53907,7 +54018,7 @@ const collectVectorReplayDeleteKeys = local_mutation.collectVectorReplayDeleteKe
 /// One ordered delete set for one index/source transaction. Do not broaden
 /// chunk identity deletes to parent documents; callers supply only the keys
 /// permitted by the projection's existing lifecycle policy.
-const collectDenseReplayDeleteKeys = @import("replay_vector_collectors.zig").collectDenseReplayDeleteKeys;
+const collectDenseReplayDeleteKeys = replay_vector_collectors.collectDenseReplayDeleteKeys;
 
 test "dense replay delete plan preserves ordered union and chunk boundaries" {
     const alloc = std.testing.allocator;
@@ -53925,21 +54036,21 @@ test "dense replay delete plan preserves ordered union and chunk boundaries" {
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
-const collectDenseEmbeddingWrites = @import("replay_vector_collectors.zig").collectDenseEmbeddingWrites;
+const collectDenseEmbeddingWrites = replay_vector_collectors.collectDenseEmbeddingWrites;
 
-const collectDenseEmbeddingWritesForArtifacts = @import("replay_vector_collectors.zig").collectDenseEmbeddingWritesForArtifacts;
+const collectDenseEmbeddingWritesForArtifacts = replay_vector_collectors.collectDenseEmbeddingWritesForArtifacts;
 
-const appendDenseEmbeddingWritesForArtifacts = @import("replay_vector_collectors.zig").appendDenseEmbeddingWritesForArtifacts;
+const appendDenseEmbeddingWritesForArtifacts = replay_vector_collectors.appendDenseEmbeddingWritesForArtifacts;
 
-const collectDenseEmbeddingWritesForBatch = @import("replay_vector_collectors.zig").collectDenseEmbeddingWritesForBatch;
+const collectDenseEmbeddingWritesForBatch = replay_vector_collectors.collectDenseEmbeddingWritesForBatch;
 
-const collectSparseEmbeddingWrites = @import("replay_vector_collectors.zig").collectSparseEmbeddingWrites;
+const collectSparseEmbeddingWrites = replay_vector_collectors.collectSparseEmbeddingWrites;
 
-const collectSparseEmbeddingWritesForArtifacts = @import("replay_vector_collectors.zig").collectSparseEmbeddingWritesForArtifacts;
+const collectSparseEmbeddingWritesForArtifacts = replay_vector_collectors.collectSparseEmbeddingWritesForArtifacts;
 
-const appendSparseEmbeddingWritesForArtifacts = @import("replay_vector_collectors.zig").appendSparseEmbeddingWritesForArtifacts;
+const appendSparseEmbeddingWritesForArtifacts = replay_vector_collectors.appendSparseEmbeddingWritesForArtifacts;
 
-const collectSparseEmbeddingWritesForBatch = @import("replay_vector_collectors.zig").collectSparseEmbeddingWritesForBatch;
+const collectSparseEmbeddingWritesForBatch = replay_vector_collectors.collectSparseEmbeddingWritesForBatch;
 
 const collectGraphWrites = local_mutation.collectGraphWrites;
 
@@ -55426,7 +55537,7 @@ fn finalizePrimarySplitPreservingMetadata(
     try self.core.store.ensureGraphIncomingDirectory();
     try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
     try reconcileRelationalIndexRange(self, self.core.store, retained_range);
-    try @import("relational_integrity_range.zig").pruneOutside(self.alloc, self.backend_runtime.io(), self.core.store, retained_range.start, retained_range.end);
+    try relational_integrity_range.pruneOutside(self.alloc, self.backend_runtime.io(), self.core.store, retained_range.start, retained_range.end);
     try rebaseRangeCoverageMetadata(
         self.alloc,
         self.core.store,
@@ -55482,7 +55593,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     try range_state_mod.saveRange(dest_store, byte_range);
     try self.core.saveSchemaCloneTo(dest_store);
     try relational_index_catalog.copyToUnpublished(self.alloc, self.core.store, dest_store);
-    try @import("relational_integrity_range.zig").copyToUnpublished(self.alloc, self.backend_runtime.io(), self.core.store, dest_store, byte_range.start, byte_range.end);
+    try relational_integrity_range.copyToUnpublished(self.alloc, self.backend_runtime.io(), self.core.store, dest_store, byte_range.start, byte_range.end);
     // Replicated apply reopens prepared shards from their local manifest;
     // it cannot consult metadata while metadata is waiting for that apply.
     // Keep public validation/provenance alongside the internal runtime schema.
@@ -61409,7 +61520,7 @@ test "db dense filter hydration only looks up required hit ordinals" {
 
 test "db stats report engine-owned algebraic adaptive observation status" {
     const alloc = std.testing.allocator;
-    const algebraic_ir = @import("algebraic/ir.zig");
+    const algebraic_ir = ir_mod;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -61529,7 +61640,7 @@ test "db stats report engine-owned algebraic adaptive observation status" {
 
 test "db evaluates policy-gated algebraic adaptive candidates" {
     const alloc = std.testing.allocator;
-    const algebraic_ir = @import("algebraic/ir.zig");
+    const algebraic_ir = ir_mod;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -61723,7 +61834,7 @@ test "db close retires runtime owners for memory primary backend" {
 }
 
 test "db apply fences wait through their borrowed runtime" {
-    const vopr = @import("vopr");
+    const vopr = vopr_mod;
     const alloc = std.testing.allocator;
     var runtime_io = try vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
     defer runtime_io.deinit();
@@ -61812,7 +61923,7 @@ test "db apply fences wait through their borrowed runtime" {
 }
 
 test "db replay truncation waits for repair pins through borrowed VoprIo" {
-    const vopr = @import("vopr");
+    const vopr = vopr_mod;
     const alloc = std.testing.allocator;
     var vopr_io = try vopr.vopr_io.VoprIo.init(.{});
     defer vopr_io.deinit();
@@ -61891,7 +62002,7 @@ test "db replay truncation waits for repair pins through borrowed VoprIo" {
 
 test "db implicit batch timestamps use the borrowed runtime clock" {
     const alloc = std.testing.allocator;
-    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .realtime_ns = 7 * std.time.ns_per_s });
+    var vopr_io = try vopr_mod.vopr_io.VoprIo.init(.{ .realtime_ns = 7 * std.time.ns_per_s });
     defer vopr_io.deinit();
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
@@ -61930,7 +62041,7 @@ test "db implicit batch timestamps use the borrowed runtime clock" {
 }
 
 test "background maintenance services lifecycle runs on borrowed VoprIo" {
-    const vopr = @import("vopr");
+    const vopr = vopr_mod;
     const alloc = std.testing.allocator;
     var vopr_io = try vopr.vopr_io.VoprIo.init(.{
         .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
@@ -63151,7 +63262,7 @@ test "relational index schema declarations publish atomically and maintenance ba
 
 test "relational index build pages fence races resume after reopen and prove readiness" {
     const alloc = std.testing.allocator;
-    const native = @import("../relational_index.zig");
+    const native = relational_index_mod;
     for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 2 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
@@ -63290,7 +63401,7 @@ test "relational index build pages fence races resume after reopen and prove rea
 
 test "relational index mutations follow primary batches transactions deletes and reopen" {
     const alloc = std.testing.allocator;
-    const native = @import("../relational_index.zig");
+    const native = relational_index_mod;
     for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 2 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
@@ -63437,7 +63548,7 @@ test "relational index restore projects historical rows without requiring unused
     var candidate = try source.core.relational_indexes.prepare(view, &.{.{
         .name = "tenant_id",
         .owner_kind = .table,
-        .owner_name = @import("../relational_index.zig").relational_table_index_owner_name,
+        .owner_name = relational_index_mod.relational_table_index_owner_name,
         .access_method = .ordered_tuple,
         .keys = &.{ .{ .column = "tenant" }, .{ .column = "id", .direction = .desc } },
     }});
@@ -63466,8 +63577,8 @@ test "relational index restore projects historical rows without requiring unused
 
 test "relational index catalog core publishes schema bound plans and recovers on reopen" {
     const alloc = std.testing.allocator;
-    const native_indexes = @import("../relational_index.zig");
-    const catalog = @import("relational_index_catalog.zig");
+    const native_indexes = relational_index_mod;
+    const catalog = relational_index_catalog;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -63870,7 +63981,7 @@ test "relational transform preparation releases every failed allocation" {
             try std.testing.expectEqual(@as(usize, 2), prepared.writes.len);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "generated embedding memo releases failed insertion allocations" {
@@ -63884,7 +63995,7 @@ test "generated embedding memo releases failed insertion allocations" {
             try memo.putSparseCopy(key, .{ .indices = @constCast(&[_]u32{1}), .values = @constCast(&[_]f32{2}) });
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "prepared relational batch uses bounded parallel workers safely" {
@@ -64723,7 +64834,7 @@ test "relational columnar scheduler batches deferred discovery before ready work
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -65261,7 +65372,7 @@ fn testColumnarSelection(comptime physical_plan: bool) !void {
     // retains boundary keys on a smaller fixture without asserting that plan.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
@@ -65380,7 +65491,7 @@ test "relational columnar sequential selection preserves dirty owners bounds and
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
@@ -65493,7 +65604,7 @@ test "relational columnar bound scan benchmark" {
 fn testRelationalBoundScan(benchmark: bool) !void {
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     const row_count: usize = if (benchmark) 768 else 2 * @import("column_read_cache.zig").max_rows;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -65570,7 +65681,7 @@ test "relational columnar prepared ownership aggregates and aborts atomically" {
                 _ = try payloads.prepare(target, preparation.allocator(), 1, changes);
             }
         };
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, @as([]const payloads.Delta, &deltas) });
+        try platform.allocator.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, @as([]const payloads.Delta, &deltas) });
         const prepared = try payloads.prepare(db.core.store, scratch, 1, &deltas);
         try std.testing.expectEqual(@as(usize, 2), prepared.writes.items.len);
         try std.testing.expectEqual(@as(u64, 299), prepared.shared);
@@ -65657,7 +65768,7 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     var path_tmp = try TestDirectory.init("db");
@@ -65926,7 +66037,7 @@ test "relational columnar decoded reuse production scale benchmark" {
 }
 
 fn testRelationalDecodedReuse(comptime benchmark: bool) !void {
-    var allocator_state: @import("../test_allocator.zig").TestAllocator = .{};
+    var allocator_state: test_allocator_mod.TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
@@ -66278,7 +66389,7 @@ test "relational columnar clean coalescing preserves typed cells without primary
     // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
@@ -66517,7 +66628,7 @@ test "relational columnar maintenance survives unrelated artifact corruption and
 
 test "relational columnar artifact backoff uses the owner clock through suppression and expiry" {
     const alloc = std.testing.allocator;
-    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
+    var clock = try vopr_mod.vopr_io.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
     defer clock.deinit();
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
@@ -66977,7 +67088,7 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     // The explicit block limit below, not elapsed wall time, defines quanta.
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -67690,7 +67801,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
                 return;
             };
             self.returned.store(true, .release);
-            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!self.release.load(.acquire)) platform.time.yieldNow();
             self.store.finishPortableImportPublication();
         }
     };
@@ -67708,7 +67819,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
 
     const close_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!db.core.store.portableImportPublicationInProgress() and monotonicTimeNs() < close_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(db.core.store.portableImportPublicationInProgress());
     try std.testing.expect(!publisher.returned.load(.acquire));
@@ -67718,7 +67829,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
     admitted_open = false;
     const drain_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!publisher.returned.load(.acquire) and monotonicTimeNs() < drain_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(publisher.returned.load(.acquire));
     publisher.release.store(true, .release);
@@ -67767,7 +67878,7 @@ test "db portable activation gate revalidates queued and replicated writes" {
 
     const prelock_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(hook.entered.load(.acquire));
 
@@ -67832,7 +67943,7 @@ test "db portable activation gate revalidates queued graph reads" {
 
     const entered_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!reader.entered.load(.acquire) and monotonicTimeNs() < entered_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(reader.entered.load(.acquire));
     db.async_context.portable_runtime_activation_pending.store(true, .release);
@@ -67968,7 +68079,7 @@ test "portable activation retry runtime job can be restarted" {
 
         const exit_deadline = monotonicTimeNs() + std.time.ns_per_s;
         while (db.portable_activation_recovery.worker_running.load(.acquire) and monotonicTimeNs() < exit_deadline) {
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
         }
         try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
     }
@@ -67996,11 +68107,11 @@ test "portable activation retry stop joins the runtime worker final handshake" {
         release_final_lock: *std.atomic.Value(bool),
 
         fn run(ctx: @This()) void {
-            while (!ctx.db.portable_activation_recovery.stopping.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!ctx.db.portable_activation_recovery.stopping.load(.acquire)) platform.time.yieldNow();
             _ = lockAtomic(&ctx.db.portable_activation_recovery.lifecycle_mutex);
             ctx.db.portable_activation_recovery.worker_running.store(false, .release);
             ctx.holding_final_lock.store(true, .release);
-            while (!ctx.release_final_lock.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!ctx.release_final_lock.load(.acquire)) platform.time.yieldNow();
             ctx.db.portable_activation_recovery.lifecycle_mutex.unlock();
         }
     };
@@ -68039,7 +68150,7 @@ test "portable activation retry stop joins the runtime worker final handshake" {
 
     const hold_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!holding_final_lock.load(.acquire) and monotonicTimeNs() < hold_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(holding_final_lock.load(.acquire));
     // Give the stopper ample time to observe the published false state. It
@@ -68124,7 +68235,7 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
 
     const pause_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!test_portable_activation_retry_probe_paused.load(.acquire) and monotonicTimeNs() < pause_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(test_portable_activation_retry_probe_paused.load(.acquire));
 
@@ -68140,7 +68251,7 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
 
     const stop_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!db.portable_activation_recovery.stopping.load(.acquire) and monotonicTimeNs() < stop_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(db.portable_activation_recovery.stopping.load(.acquire));
     try std.testing.expect(!close_returned.load(.acquire));
@@ -68189,7 +68300,7 @@ test "portable activation retry uses owner scoped runtime" {
         db.portable_activation_recovery.worker_running.load(.acquire)) and
         monotonicTimeNs() < recovery_deadline)
     {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
     try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
@@ -68294,7 +68405,7 @@ test "db searches fail fast without joining portable activation recovery" {
 }
 
 test "db portable resolver activation stops partial startup before retry reload" {
-    @import("antfly_test_error_logs").expectErrorLogs(1);
+    antfly_test_error_logs.expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var source_path_tmp = try TestDirectory.init("db");
     defer source_path_tmp.cleanup();
@@ -68345,7 +68456,7 @@ test "db portable resolver activation stops partial startup before retry reload"
 }
 
 test "db failed portable rollback fences live access until reopen recovery" {
-    @import("antfly_test_error_logs").expectErrorLogs(1);
+    antfly_test_error_logs.expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var source_path_tmp = try TestDirectory.init("db");
     defer source_path_tmp.cleanup();
@@ -70289,13 +70400,13 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
         }
     };
     const id: [64]u8 = @splat('a');
-    const request: @import("native_query_cut.zig").Request = .{
+    const request: native_query_cut.Request = .{
         .id = &id,
         .table_id = 7,
-        .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
+        .expires_ms = native_query_cut.nowMs() + 300_000,
         .create = true,
     };
-    const root = try @import("native_query_cut.zig").pathAlloc(alloc, std.mem.span(path), &id);
+    const root = try native_query_cut.pathAlloc(alloc, std.mem.span(path), &id);
     defer alloc.free(root);
     const staging = try std.fmt.allocPrint(alloc, "{s}.staging", .{root});
     defer alloc.free(staging);
@@ -70314,7 +70425,7 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
     // Exercise the full retry: structural, snapshot, replay, and file leases
     // from both aborted attempts must have been released.
     try db.captureQueryCut(request, .{});
-    try @import("native_query_cut.zig").validate(alloc, io, root, request, db.core.identity_namespace, .{});
+    try native_query_cut.validate(alloc, io, root, request, db.core.identity_namespace, .{});
     try std.testing.expect(!db.indexCatalogBarrierActive());
 }
 
@@ -70350,10 +70461,10 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     try std.testing.expectError(error.EnrichmentWorkerFailed, db.runMaintenanceUntilWithCancellation(sequence, .{}, .none, std.math.maxInt(u64)));
 
     const id: [64]u8 = @splat('b');
-    const request: @import("native_query_cut.zig").Request = .{
+    const request: native_query_cut.Request = .{
         .id = &id,
         .table_id = 7,
-        .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
+        .expires_ms = native_query_cut.nowMs() + 300_000,
         .create = true,
     };
     // An applied watermark is insufficient when the owner itself is unhealthy.
@@ -70825,7 +70936,7 @@ test "db vector full text filters project through doc identity ordinals" {
 
 test "db default dynamic schema vector term filters project through doc identity ordinals" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -70934,7 +71045,7 @@ test "db default dynamic schema vector term filters project through doc identity
 
 test "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -71095,7 +71206,7 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
 
 test "db exact sort resolves explicit keyword metadata filters natively" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -71185,7 +71296,7 @@ test "db exact sort resolves explicit keyword metadata filters natively" {
 
 test "db exact sort resolves mapped numeric metadata filters from typed doc values" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -71268,7 +71379,7 @@ test "db exact sort resolves mapped numeric metadata filters from typed doc valu
 
 test "db exact sort resolves mapped date metadata filters from typed doc values" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -71351,7 +71462,7 @@ test "db exact sort resolves mapped date metadata filters from typed doc values"
 
 test "db exact sort resolves mapped boolean metadata filters from typed doc values" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -71411,7 +71522,7 @@ test "db exact sort resolves mapped boolean metadata filters from typed doc valu
 
 test "db exact sort resolves mapped geo metadata filters from typed doc values" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -71801,7 +71912,7 @@ test "db dense stored symbolic filter candidate window covers offset pagination"
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -76659,13 +76770,13 @@ test "db rewriteEntityEdges preserves owners TTL and destination collisions" {
         const before_sequence = blk: {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
-            break :blk (try @import("../source_authority.zig").load(&read)).?.sequence;
+            break :blk (try source_authority_mod.load(&read)).?.sequence;
         };
         try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
-            try std.testing.expectEqual(before_sequence + 1, (try @import("../source_authority.zig").load(&read)).?.sequence);
+            try std.testing.expectEqual(before_sequence + 1, (try source_authority_mod.load(&read)).?.sequence);
         }
         try db.runUntilIdle();
         db.close();
@@ -76805,7 +76916,7 @@ test "db rewriteEntityEdges retains scoped source replay and curation" {
 
 test "db rewriteEntityEdges clears acknowledged replication outbox and retains failed acknowledgement" {
     const alloc = std.testing.allocator;
-    const contract = @import("replication_contract.zig");
+    const contract = replication_contract;
     const FakePublisher = struct {
         fail: bool = false,
         barrier: *MutationBarrier,
@@ -76816,14 +76927,14 @@ test "db rewriteEntityEdges clears acknowledged replication outbox and retains f
         fn identity(_: *anyopaque) contract.Publisher.Identity {
             return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
         }
-        fn publish(mirror: contract.AsyncEffectMirror, kind: @import("durable_outbox.zig").Kind, payload: []const u8, _: doc_identity.Namespace) !u64 {
+        fn publish(mirror: contract.AsyncEffectMirror, kind: durable_outbox.Kind, payload: []const u8, _: doc_identity.Namespace) !u64 {
             const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
-            try std.testing.expectEqual(@import("durable_outbox.zig").Kind.primary_effect, kind);
+            try std.testing.expectEqual(durable_outbox.Kind.primary_effect, kind);
             try std.testing.expect(replication_effects_mod.primary_effect.isPrimaryEffect(payload));
             self.published += 1;
             return 1;
         }
-        fn recover(_: contract.AsyncEffectMirror, _: @import("durable_outbox.zig").Kind, _: @import("durable_outbox.zig").DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+        fn recover(_: contract.AsyncEffectMirror, _: durable_outbox.Kind, _: durable_outbox.DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
             return error.UnexpectedRecovery;
         }
         fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
@@ -78012,8 +78123,8 @@ test "db vector status revalidates stale repair admission without a query" {
     try std.testing.expect(refreshed.indexes[0].serving_publication.?.revision > stats.indexes[0].serving_publication.?.revision);
     try std.testing.expect(db.overlayRuntimeStatusBestEffort(alloc, &refreshed));
     for (refreshed.indexes) |item| {
-        try std.testing.expectEqual(@as(?@import("publication.zig").Stamp, null), item.serving_publication);
-        try std.testing.expectEqual(@as(?@import("publication.zig").Stamp, null), item.coverage_publication);
+        try std.testing.expectEqual(@as(?publication_mod.Stamp, null), item.serving_publication);
+        try std.testing.expectEqual(@as(?publication_mod.Stamp, null), item.coverage_publication);
     }
 }
 
@@ -81486,7 +81597,7 @@ const plural_source_dense_test_support = if (builtin.is_test) struct {
 // rather than by reproducing a genuinely broken pipeline, so the pass/fail
 // signal is deterministic and does not depend on timing.
 test "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic" {
-    @import("antfly_test_error_logs").expectErrorLogs(1);
+    antfly_test_error_logs.expectErrorLogs(1);
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -81539,7 +81650,7 @@ test "runUntilIdle no-progress guard interrupts the threaded derived wait" {
     });
     defer db.close();
     if (!db.executor.hasWorkers()) return error.SkipZigTest;
-    @import("antfly_test_error_logs").expectErrorLogs(1);
+    antfly_test_error_logs.expectErrorLogs(1);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
@@ -81831,7 +81942,7 @@ test "document child range partition preserves single ownership on allocation fa
     );
     defer alloc.free(remote_key);
 
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(
+    try platform.allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, routed_key: []const u8) !void {
@@ -81895,7 +82006,7 @@ test "document child range partition preserves single ownership on allocation fa
 test "generated enrichment preparation helpers release partial allocations" {
     const alloc = std.testing.allocator;
 
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(
+    try platform.allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator) !void {
@@ -81916,7 +82027,7 @@ test "generated enrichment preparation helpers release partial allocations" {
         .{},
     );
 
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(
+    try platform.allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator) !void {
@@ -81945,7 +82056,7 @@ test "generated enrichment preparation helpers release partial allocations" {
         .doc_key = "doc:a",
         .source_field = "body",
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(
+    try platform.allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(
@@ -82076,7 +82187,7 @@ test "db public extraction budget rejection publishes a failure manifest" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
-    const resources = @import("../resource_manager.zig");
+    const resources = resource_manager_mod;
     var budgets = resources.Options.defaultBudgets();
     budgets[@backingInt(resources.Slice.document_extraction_working_set)] = .{ .soft_limit_bytes = 3072, .hard_limit_bytes = 4096 };
     var manager = resources.ResourceManager.init(.{ .budgets = budgets });
@@ -85308,7 +85419,7 @@ test "db query drops full text hits whose stored document row was deleted direct
             try std.testing.expectEqualSlices(bool, &.{ false, true }, single);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_source_key, remote_embedding_ref });
+    try platform.allocator.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_source_key, remote_embedding_ref });
 
     // Presence is a candidate visibility rule, including IDs-only and count
     // requests. Apply it before offset/limit, and refill an orphaned top hit.
@@ -86195,7 +86306,7 @@ test "db document extraction concurrent same-key writes converge without stale p
 
     const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(hook.entered.load(.acquire));
 
@@ -86324,7 +86435,7 @@ test "db document extraction pre-lock precompute survives a concurrent catalog m
 
     const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(hook.entered.load(.acquire));
 
@@ -86988,7 +87099,7 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
             try std.testing.expectEqual(@as(f32, 1), packed_result.dense_embeddings[0].vector[0]);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Failure.run, .{&db});
+    try platform.allocator.checkAllAllocationFailures(alloc, Failure.run, .{&db});
 }
 
 test "db extractEnrichments rejects unsupported legacy summaries field" {
@@ -87077,7 +87188,7 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
             try std.testing.expect(computed.dense_embeddings.len != 0);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationSweep.run, .{&db});
+    try platform.allocator.checkAllAllocationFailures(alloc, AllocationSweep.run, .{&db});
 }
 
 test "db leased enrichment worker generates dense embeddings" {
@@ -88403,7 +88514,7 @@ test "retired repair cleanup propagates allocation failures from durable metadat
     const encoded_issue = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
     defer alloc.free(encoded_issue);
 
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(
+    try platform.allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, key: []const u8) !void {
@@ -88416,7 +88527,7 @@ test "retired repair cleanup propagates allocation failures from durable metadat
         }.run,
         .{issue_key},
     );
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(
+    try platform.allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, raw: []const u8) !void {
@@ -95923,14 +96034,14 @@ test "storage.hot_standby db applies timeline switch as durable replication boun
     {
         var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
         defer db.close();
-        try @import("replication_ingress.zig").applyRecord(&db, switch_record);
+        try replication_ingress.applyRecord(&db, switch_record);
         try std.testing.expectEqual(@as(u64, 7), try db.replicationAppliedSequence());
     }
 
     var reopened = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 7), try reopened.replicationAppliedSequence());
-    try @import("replication_ingress.zig").applyRecord(&reopened, switch_record);
+    try replication_ingress.applyRecord(&reopened, switch_record);
     try std.testing.expectEqual(@as(u64, 7), try reopened.replicationAppliedSequence());
 }
 
@@ -100678,7 +100789,7 @@ test "db paged merge ttl-state probes bound memory across source fan-in" {
     defer alloc.free(lifetime_key);
     var timestamp: [8]u8 = undefined;
     std.mem.writeInt(u64, &timestamp, 1, .big);
-    var bounded = @import("../test_allocator.zig").BoundedAllocator.init(alloc, 64 * 1024);
+    var bounded = test_allocator_mod.BoundedAllocator.init(alloc, 64 * 1024);
     defer std.debug.assert(bounded.deinit() == 0);
     const probe_alloc = bounded.allocator();
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
@@ -101265,7 +101376,7 @@ test "db document _embeddings external indexes ignore source vector fields and i
 
 test "db document _embeddings transaction null reserves retained artifact tombstones" {
     const alloc = std.testing.allocator;
-    const retention = @import("../retained_effects.zig");
+    const retention = retained_effects_mod;
     for ([_]bool{ false, true }) |sparse| {
         var dir = try TestDirectory.init("external-null-transaction");
         defer dir.cleanup();
@@ -103969,7 +104080,7 @@ test "index repair intent string replacement is allocation failure safe" {
         .replace_last_error = true,
     });
 
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(
+    try platform.allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, target_db: *DB, target_repair_id: u128) !void {
@@ -103987,7 +104098,7 @@ test "index repair intent string replacement is allocation failure safe" {
         }.run,
         .{ &db, repair_id },
     );
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(
+    try platform.allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, target_db: *DB, target_repair_id: u128) !void {
@@ -105078,7 +105189,7 @@ test "producer readiness local receipt migration retires only after source and c
     {
         var proof = try db.core.index_manager.acquireWritePlanSnapshot();
         defer proof.release();
-        const pending_scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, cfg.name, "copied", proof.plan());
+        const pending_scope = try artifact_producer_readiness.localScopeAlloc(alloc, cfg.name, "copied", proof.plan());
         defer alloc.free(pending_scope);
         const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, pending_scope, db.core.index_manager.coverageGenerationForIndex(cfg.name).?, "doc");
         defer alloc.free(marker);
@@ -105089,12 +105200,12 @@ test "producer readiness local receipt migration retires only after source and c
     // A repeated row must keep its producer revision even after another
     // document has advanced the table's replay sequence.
     var before_read = try db.core.store.beginReadTxn();
-    const primary_before = try @import("artifact_producer_readiness.zig").localPrimaryRevision(alloc, &before_read, "doc");
+    const primary_before = try artifact_producer_readiness.localPrimaryRevision(alloc, &before_read, "doc");
     before_read.abort();
     try db.batch(.{ .writes = &.{.{ .key = "other", .value = "{\"body\":\"other submarine\"}" }}, .sync_level = .full_index });
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .write });
     var after_read = try db.core.store.beginReadTxn();
-    const primary_after = try @import("artifact_producer_readiness.zig").localPrimaryRevision(alloc, &after_read, "doc");
+    const primary_after = try artifact_producer_readiness.localPrimaryRevision(alloc, &after_read, "doc");
     after_read.abort();
     try std.testing.expectEqual(primary_before, primary_after);
     try local_mutation.deleteDerivedCoverageForDocKeys(alloc, db.core.store, db.core.index_manager, cfg.name, &.{ "doc", "doc" });
@@ -105110,7 +105221,7 @@ test "producer readiness local receipt migration retires only after source and c
     try db.core.saveProjectionCheckpoint(cfg.name, checkpoint);
     var plan = try db.core.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
-    const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, cfg.name, "copied", plan.plan());
+    const scope = try artifact_producer_readiness.localScopeAlloc(alloc, cfg.name, "copied", plan.plan());
     defer alloc.free(scope);
     const generation = db.core.index_manager.coverageGenerationForIndex(cfg.name).?;
     const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, scope, generation, "produced");
@@ -105205,7 +105316,7 @@ test "db completed partial managed admission serves and retires redundant repair
     while (!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent)) {
         if (monotonicTimeNs() >= publication_deadline) return error.TestUnexpectedResult;
         _ = try db.finalizeDenseProjectionLifecycleForIdle();
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
     const runtime_stats = try db.stats(alloc);
@@ -105262,7 +105373,7 @@ test "db completed generated recovery retires an inactive candidate without an a
     while (!try db.managedAdmissionGenerationIsServiceable(alloc, admitted.intent)) {
         if (monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
         _ = try db.finalizeDenseProjectionLifecycleForIdle();
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     _ = try db.advanceIndexRepairIntent(alloc, admission, .{});
     const marker_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
@@ -113375,7 +113486,7 @@ test "db storage kernel graph edges retain typed filters and physical scan budge
         \\{"relations":[{"type":"links","target":{"document_id":"doc:b"},"weight":2},{"type":"mentions","target":{"document_id":"doc:c"},"weight":3}]}
     }}, .sync_level = .enrichments });
     try db.runUntilIdle();
-    const graph = @import("antfly_server_test_sources").local_test_sources.api_distributed_graph;
+    const graph = antfly_server_test_sources.local_test_sources.api_distributed_graph;
     const access = algebraic_mod.ir.graphEdgeAccessPath("relations_graph");
     var request = graph.GraphEdgesRequest{
         .index_name = try alloc.dupe(u8, "relations_graph"),
@@ -113809,7 +113920,7 @@ test "db graph ttl direct cleanup cannot delete a replaced artifact" {
 
 test "db graph ttl migration cold writer fences legacy expiry without changing readonly files" {
     const alloc = std.testing.allocator;
-    const resolver_catalog = @import("catalog/resolver_catalog.zig");
+    const resolver_catalog = resolver_catalog_mod;
     const migration = @import("maintenance/graph_ttl_migration.zig");
     var path_tmp = try TestDirectory.init("db-graph-ttl-legacy-namespace");
     defer path_tmp.cleanup();
@@ -116535,12 +116646,12 @@ fn testChildGenerationInstall(native: bool) !void {
     defer parsed_next.deinit(alloc);
     const next_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_next);
     defer schema_mod.freeSchema(alloc, next_schema);
-    var fence: @import("relational_integrity_topology.zig").Fence = undefined;
+    var fence: relational_integrity_topology.Fence = undefined;
     {
         var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .online_source_authority = if (native) .native else .raft, .start_optional_runtimes = false });
         defer db.close();
         try db.setSchemaJson(alloc, old_json);
-        const catalog = try db.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        const catalog = try db.core.store.get(alloc, relational_integrity_catalog.key);
         defer alloc.free(catalog);
         var catalog_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
@@ -116574,7 +116685,7 @@ fn testChildGenerationInstall(native: bool) !void {
         const public_json = try reopened.core.store.get(alloc, public_schema_json_key);
         defer alloc.free(public_json);
         try std.testing.expectEqualStrings(old_json, public_json);
-        const old_catalog = try reopened.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        const old_catalog = try reopened.core.store.get(alloc, relational_integrity_catalog.key);
         defer alloc.free(old_catalog);
         var before_catalog_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(old_catalog, &before_catalog_digest, .{});
@@ -116613,21 +116724,21 @@ fn testChildGenerationInstall(native: bool) !void {
     const installed_public = try installed.core.store.get(alloc, public_schema_json_key);
     defer alloc.free(installed_public);
     try std.testing.expectEqualStrings(next_json, installed_public);
-    const installed_catalog = try installed.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+    const installed_catalog = try installed.core.store.get(alloc, relational_integrity_catalog.key);
     defer alloc.free(installed_catalog);
     var installed_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(installed_catalog, &installed_digest, .{});
     try std.testing.expectEqual(after_catalog_digest, installed_digest);
-    const receipt_bytes = try installed.core.store.get(alloc, @import("relational_integrity_generation_admission.zig").source_install_receipt_key);
+    const receipt_bytes = try installed.core.store.get(alloc, relational_integrity_generation_admission.source_install_receipt_key);
     defer alloc.free(receipt_bytes);
-    const receipt = try @import("relational_integrity_generation_admission.zig").AppliedReceipt.decode(receipt_bytes);
+    const receipt = try relational_integrity_generation_admission.AppliedReceipt.decode(receipt_bytes);
     try std.testing.expectEqual(@as(u64, 1), receipt.term);
     try std.testing.expectEqual(@as(u64, if (native) 5 else 1), receipt.index);
     if (native) try std.testing.expect((try readOrderedApplyReceipt(alloc, installed.core.store)) == null);
     // A later DROP publication fences the already-installed v1 layout. The
     // schema pin is intentionally false for an equal version, but cold owner
     // index reconciliation must still wait for this dual-role fence.
-    const dual_fence: @import("relational_integrity_topology.zig").Fence = .{
+    const dual_fence: relational_integrity_topology.Fence = .{
         .admission_epoch = 2,
         .transition_id = 2,
         .attempt = 1,
@@ -116644,7 +116755,7 @@ fn testChildGenerationInstall(native: bool) !void {
 
 test "db provisioning schema is persisted before configured full text indexes open" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -116715,7 +116826,7 @@ test "db provisioning schema is persisted before configured full text indexes op
 
 test "db best effort force compact leaves text merge debt under pressure" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
@@ -117004,7 +117115,7 @@ test "db prefix wildcard and regexp queries use text dictionary filters" {
 
 test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -117212,7 +117323,7 @@ fn expectFilteredFullTextDeleteCliffProbe(
 
 test "db one real delete keeps filtered full text on complement path across restart" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -117348,7 +117459,7 @@ fn expectHighFrequencyKeywordRecall(db: *DB, alloc: Allocator) !void {
 
 test "db production ingest preserves high-frequency keyword recall across clean restarts" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -117426,7 +117537,7 @@ test "db production ingest preserves high-frequency keyword recall across clean 
 
 test "db versioned full text indexes reload matching schema mappings after reopen" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -117556,7 +117667,7 @@ test "db versioned full text indexes reload matching schema mappings after reope
 
 test "db additionalProperties true nested text fields survive reopen" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -117637,7 +117748,7 @@ test "db additionalProperties true nested text fields survive reopen" {
 
 test "db explicit field analyzer override drives match queries" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -117699,7 +117810,7 @@ test "db explicit field analyzer override drives match queries" {
 
 test "db dynamic template match_mapping_type analyzer survives reopen" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -117785,7 +117896,7 @@ test "db dynamic template match_mapping_type analyzer survives reopen" {
 
 test "db dynamic template precedence beats open additionalProperties fallback" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -117849,7 +117960,7 @@ test "db dynamic template precedence beats open additionalProperties fallback" {
 
 test "db patternProperties text fields survive reopen" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -117942,7 +118053,7 @@ test "db patternProperties text fields survive reopen" {
 
 test "db root additionalProperties true text fields survive reopen" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -118017,7 +118128,7 @@ test "db root additionalProperties true text fields survive reopen" {
 
 test "db schema-driven text query matrix covers explicit dynamic template and fallback modes" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -118258,7 +118369,7 @@ test "db no-schema path recursively infers nested text and typed fields" {
 
 test "db schema-present infer_types opt-in recursively infers nested fields after reopen" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
+    const table_schema_api = public_table_schema;
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -118767,7 +118878,7 @@ test "db ordered artifact inventory chunk projection streams pinned snapshots an
             try std.testing.expectEqualStrings("binary", value.object.get("escaped\x00").?.array.items[0].object.get("body").?.string);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.project, .{ &db, &read });
+    try platform.allocator.checkAllAllocationFailures(alloc, Harness.project, .{ &db, &read });
     var current = (try loadChunkFieldValueTxn(&db, alloc, "doc\x00", null)).?;
     defer freeJsonValue(alloc, &current);
     try std.testing.expectEqualStrings("new", current.object.get("chunks").?.array.items[0].object.get("body").?.string);
@@ -119563,18 +119674,18 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
     try db.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","ttl":{"duration":"1s","field":"expires"},"unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"expires":{"type":"datetime"},"value":{"type":"integer"}},"additionalProperties":false}}}}
     );
-    const integrity = @import("relational_integrity.zig");
-    const catalog_mod = @import("relational_integrity_catalog.zig");
+    const integrity = relational_integrity;
+    const catalog_mod = relational_integrity_catalog;
     const catalog_raw = (try db.core.getStoreValue(alloc, catalog_mod.key)).?;
     defer alloc.free(catalog_raw);
     var catalog = try catalog_mod.decode(alloc, catalog_raw);
     defer catalog.deinit();
-    const generation_set = @import("relational_integrity_activation.zig").generationSet(catalog);
+    const generation_set = relational_integrity_activation.generationSet(catalog);
     var view = db.core.acquireSchemaView().?;
     defer view.release();
     try std.testing.expect(view.hasCoordinatedConstraints());
     try std.testing.expectEqual(@as(u64, 0), view.visibilityTtlDurationNs());
-    var tuple_plan = try @import("relational_index_keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+    var tuple_plan = try relational_index_keys.TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
     defer tuple_plan.deinit();
     var tuple: std.ArrayList(u8) = .empty;
     defer tuple.deinit(alloc);
@@ -121873,7 +121984,7 @@ test "online direct vector shadow repair resumes raw and stripped rows without o
 
 test "db transaction retained credits bind compact no-op and prepared generated AROW after reopen" {
     const alloc = std.testing.allocator;
-    const retention = @import("../retained_effects.zig");
+    const retention = retained_effects_mod;
     for ([_]bool{ false, true }) |typed| {
         var directory = try TestDirectory.init("reserved-db-rows");
         defer directory.cleanup();
@@ -124424,7 +124535,7 @@ test "db direct merge import supersedes queued graph replay across publication a
                 fn pause(ptr: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.entered.store(true, .release);
-                    while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+                    while (!self.release.load(.acquire)) platform.time.yieldNow();
                 }
                 fn run(self: *@This()) void {
                     _ = applyDerivedBatchToIndexAsync(self.ctx, self.batch, .{ .name = "g", .kind = .graph }, .{}) catch |err| {
@@ -124441,7 +124552,7 @@ test "db direct merge import supersedes queued graph replay across publication a
                 pending.release.store(true, .release);
                 thread.join();
             };
-            while (!pending.entered.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!pending.entered.load(.acquire)) platform.time.yieldNow();
             try receiver.importMergeRangeFromTransitionDonor(&donor, .{ .start = "doc:a", .end = "doc:z" });
             pending.release.store(true, .release);
             thread.join();
@@ -126205,7 +126316,7 @@ test "db native snapshot exports self-contained generation" {
 }
 
 test "db native snapshot rejects storage without atomic host generation publication" {
-    @import("antfly_test_error_logs").expectErrorLogs(1);
+    antfly_test_error_logs.expectErrorLogs(1);
 
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -126865,7 +126976,7 @@ test "db native deferred restore preserves generated dense generation without em
 }
 
 test "db native restore rejects a primary revision outside the manifest generation" {
-    @import("antfly_test_error_logs").expectErrorLogs(1);
+    antfly_test_error_logs.expectErrorLogs(1);
 
     const alloc = std.testing.allocator;
     var source_tmp = try TestDirectory.init("db");
@@ -128540,7 +128651,7 @@ test "db graph ownership restore materializes large artifacts in published segme
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -129279,7 +129390,7 @@ test "source vector migration recovers each preparation commit and publication b
 
 test "source vector migration preserves concurrent models deletes and old snapshots through restart" {
     const alloc = std.testing.allocator;
-    const payload = @import("../artifact_payload.zig");
+    const payload = artifact_payload_mod;
     var tmp = try TestDirectory.init("vector-migration");
     defer tmp.cleanup();
     const path = std.mem.span(tmp.path().ptr);
@@ -129383,7 +129494,7 @@ test "source vector table persists references without an ANN index and reopens" 
         try db.core.store.putBatch(&.{ .{ .key = key, .value = first }, .{ .key = other_key, .value = second } }, &.{});
         var raw = try db.core.store.runtime_store.beginRead();
         defer raw.abort();
-        try std.testing.expect(@import("../artifact_payload.zig").isReference(try raw.get(key)));
+        try std.testing.expect(artifact_payload_mod.isReference(try raw.get(key)));
         try std.testing.expectError(error.ImmutableTableStorageSettings, db.configureTableStorage(.{}));
         try db.sync(true);
     }
@@ -129704,7 +129815,7 @@ test "db graph stale generation cleanup retires the exact fact identity" {
             try std.testing.expectEqual(@as(usize, 1), stale_copy.deletes.len);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, FailureCase.run, .{ db.core.store, key, generation });
+    try platform.allocator.checkAllAllocationFailures(alloc, FailureCase.run, .{ db.core.store, key, generation });
     var stale = try collectGraphMutationsForArtifacts(alloc, db.core.store, &.{key}, "facts", .{ .expected_generation = generation + 1 });
     defer stale.deinit();
     try std.testing.expectEqual(@as(usize, 1), stale.deletes.len);
@@ -129739,7 +129850,7 @@ test "db algebraic path conversion preserves provenance under allocation failure
             try std.testing.expectEqual(item.traversal_direction, path.edges[0].traversal_direction);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.convert, .{edge});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.convert, .{edge});
 }
 
 test "db graph endpoint deletion retires inline identities and preserves independent facts" {
@@ -130167,7 +130278,7 @@ test "graph projection preserves numeric literals in direct materialization" {
     }, "application/json", null, null, 10);
     defer freeGraphWrites(alloc, writes);
     try std.testing.expectEqual(@as(usize, 1), writes.len);
-    const filter = @import("../../graph/relationship_filter.zig").Filter{ .properties = &.{.{ .field = "/metadata/score", .op = .eq, .value_json = "1.0000000000000001" }} };
+    const filter = relationship_filter_mod.Filter{ .properties = &.{.{ .field = "/metadata/score", .op = .eq, .value_json = "1.0000000000000001" }} };
     const edge = graph_mod.Edge{ .source = writes[0].source, .target = writes[0].target, .edge_type = writes[0].edge_type, .weight = writes[0].weight, .metadata = writes[0].metadata_json, .created_at = 0, .updated_at = 0 };
     try std.testing.expect(try filter.matches(alloc, edge));
 }
@@ -130227,7 +130338,7 @@ test "graph projection preserves numeric literals through field artifacts repair
             try std.testing.expectEqual(@as(usize, 1), found.len);
             try std.testing.expectEqualStrings("18446744073709551615", found[0].edge_id);
             try std.testing.expectEqual(@as(f64, 0.75), found[0].weight);
-            const filter = @import("../../graph/relationship_filter.zig").Filter{ .properties = &.{
+            const filter = relationship_filter_mod.Filter{ .properties = &.{
                 .{ .field = "/metadata/score", .op = .eq, .value_json = "1.0000000000000001" },
                 .{ .field = "/metadata/large", .op = .eq, .value_json = "18446744073709551615" },
             } };
@@ -130357,7 +130468,7 @@ test "db prepared posting refresh rejects index replacement and releases capture
 
 test "source vector table defers reopen GC and bounded maintenance preserves readers writes and cancellation" {
     const alloc = std.testing.allocator;
-    const payload = @import("../artifact_payload.zig");
+    const payload = artifact_payload_mod;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -130458,8 +130569,8 @@ test "source vector migration offline resumes a physical shadow preserving every
     var tmp = try TestDirectory.init("offline-vector-migration");
     defer tmp.cleanup();
     const path = std.mem.span(tmp.path().ptr);
-    const payload = @import("../artifact_payload.zig");
-    const offline = @import("antfly_server_test_sources").local_test_sources.storage_vector_migration_offline;
+    const payload = artifact_payload_mod;
+    const offline = antfly_server_test_sources.local_test_sources.storage_vector_migration_offline;
     const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model-a");
     defer alloc.free(key);
     const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 29, &.{ 1, 2, 3 });
@@ -130769,7 +130880,7 @@ test "source vector migration cancels rejected admission durably without a sourc
 }
 
 test "source vector migration offline recovers every copy and publication boundary" {
-    const offline = @import("antfly_server_test_sources").local_test_sources.storage_vector_migration_offline;
+    const offline = antfly_server_test_sources.local_test_sources.storage_vector_migration_offline;
     const Hook = struct {
         var selected: offline.Boundary = .fenced;
         var fired: bool = false;
@@ -130816,7 +130927,7 @@ test "source vector migration offline recovers every copy and publication bounda
 }
 
 test "source vector migration offline cancellation retains an idempotency receipt" {
-    const offline = @import("antfly_server_test_sources").local_test_sources.storage_vector_migration_offline;
+    const offline = antfly_server_test_sources.local_test_sources.storage_vector_migration_offline;
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("offline-cancel");
     defer tmp.cleanup();
@@ -130841,7 +130952,7 @@ test "source vector migration offline cancellation retains an idempotency receip
 }
 
 test "source vector migration offline cancellation before the copy fence survives retry" {
-    const offline = @import("antfly_server_test_sources").local_test_sources.storage_vector_migration_offline;
+    const offline = antfly_server_test_sources.local_test_sources.storage_vector_migration_offline;
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("offline-cancel-admission");
     defer tmp.cleanup();
@@ -130917,7 +131028,7 @@ test "source vector migration fences live probes admitted before activation" {
 }
 
 test "source vector migration converts legacy ANN generations in both modes" {
-    const offline = @import("antfly_server_test_sources").local_test_sources.storage_vector_migration_offline;
+    const offline = antfly_server_test_sources.local_test_sources.storage_vector_migration_offline;
     const Gate = struct {
         permitted: bool = false,
         pub fn read(ptr: *const anyopaque) bool {
@@ -130974,7 +131085,7 @@ test "source vector migration converts legacy ANN generations in both modes" {
 
 test "db cold initial FK retirement cancels exact hidden publication durably" {
     const alloc = std.testing.allocator;
-    const hidden = @import("relational_initial_child_publication.zig");
+    const hidden = relational_initial_child_publication;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cold-retirement", .{tmp.sub_path});
@@ -130987,17 +131098,17 @@ test "db cold initial FK retirement cancels exact hidden publication durably" {
         var txn = try db.core.store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(hidden.key, &try record.encode());
-        const catalog: @import("table_catalog.zig").Catalog = .{};
-        try txn.put(@import("table_catalog.zig").key, &catalog.encode());
+        const catalog: table_catalog_mod.Catalog = .{};
+        try txn.put(table_catalog_mod.key, &catalog.encode());
         try txn.commit();
         var stale = record;
         stale.plan_digest = @splat(9);
         try std.testing.expectError(error.InitialChildPublicationChanged, db.cancelColdInitialChildForRetirement(stale, 19));
         var nonempty = catalog;
         nonempty.row_count = 1;
-        try db.core.store.put(@import("table_catalog.zig").key, &nonempty.encode());
+        try db.core.store.put(table_catalog_mod.key, &nonempty.encode());
         try std.testing.expectError(error.InitialChildPublicationChanged, db.cancelColdInitialChildForRetirement(record, 19));
-        try db.core.store.put(@import("table_catalog.zig").key, &catalog.encode());
+        try db.core.store.put(table_catalog_mod.key, &catalog.encode());
         var released = record;
         released.phase = .released;
         released.phase_term = 7;
@@ -131018,8 +131129,8 @@ test "db cold initial FK retirement cancels exact hidden publication durably" {
 
 test "db empty-generation install receipt survives hidden to public owner reopen" {
     const alloc = std.testing.allocator;
-    const staging = @import("restore_staging_contract.zig");
-    const handoff = @import("empty_generation_handoff.zig");
+    const staging = restore_staging_contract;
+    const handoff = empty_generation_handoff;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -131093,9 +131204,9 @@ test "db empty-generation install receipt survives hidden to public owner reopen
 
 test "db ordered artifact inventory staged generations resume and switch snapshot visibility atomically" {
     const alloc = std.testing.allocator;
-    const generations = @import("artifact_chunk_generation.zig");
-    const chunks = @import("artifact_chunk_manifest.zig");
-    const publication = @import("artifact_publication.zig");
+    const generations = artifact_chunk_generation;
+    const chunks = artifact_chunk_manifest;
+    const publication = artifact_publication;
     const Guard = struct {
         valid: bool = true,
         pub fn validate(self: @This(), _: anytype) !void {
@@ -131129,7 +131240,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
                 defer alloc.free(legacy);
                 try txn.put(legacy, "legacy-local-output");
             }
-            try @import("../source_authority.zig").bind(&txn, .native, authority.namespace);
+            try source_authority_mod.bind(&txn, .native, authority.namespace);
             try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
             try std.testing.expect(try plan.begin(&txn));
             try txn.commit();
@@ -131180,7 +131291,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
             defer page.deinit();
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.prepare, .{ &plan, previous });
+    try platform.allocator.checkAllAllocationFailures(alloc, Check.prepare, .{ &plan, previous });
     var page = try generations.PreparedAppend.init(alloc, &plan, previous, &.{"second"});
     defer page.deinit();
     for (0..2) |pass| {
@@ -131244,7 +131355,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
         try publication.validateArtifactSources(alloc, &pinned, authority.namespace, producer_input.sources(), producer_input.reads.items);
         // Storage completion is not a causal producer certificate. A callback
         // must not adopt an old per-member receipt or infer completion itself.
-        try std.testing.expectError(error.ArtifactPublicationPending, @import("artifact_asset_publication.zig").readUpstream(alloc, &producer_input, &pinned, logical));
+        try std.testing.expectError(error.ArtifactPublicationPending, artifact_asset_publication.readUpstream(alloc, &producer_input, &pinned, logical));
     }
     var identity = (try artifact_ids.decodeArtifactRefAlloc(alloc, logical)).?;
     defer identity.deinit(alloc);
@@ -131260,7 +131371,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
             } else try std.testing.expect(artifact == null);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, LookupCheck.run, .{ &db, public_id, @as(?[]const u8, "first") });
+    try platform.allocator.checkAllAllocationFailures(alloc, LookupCheck.run, .{ &db, public_id, @as(?[]const u8, "first") });
     const empty = try generations.Spec.init(authority, scope, @splat(4), chunks.Builder.init().finish(), 2);
     var replacement = try generations.Plan.init(alloc, scope, empty);
     defer replacement.deinit();
@@ -131311,7 +131422,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
     defer current.abort();
     try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateArtifactSources(alloc, &current, authority.namespace, &source_inputs, &head_guard));
     try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateArtifactSources(alloc, &current, authority.namespace, producer_input.sources(), producer_input.reads.items));
-    try std.testing.expectError(error.ArtifactPublicationPending, @import("artifact_asset_publication.zig").readUpstream(alloc, &producer_input, &current, logical));
+    try std.testing.expectError(error.ArtifactPublicationPending, artifact_asset_publication.readUpstream(alloc, &producer_input, &current, logical));
     try publication.validateArtifactSources(alloc, &pinned, authority.namespace, &source_inputs, &head_guard);
     var next = (try generations.View(docstore_mod.DocStore.Txn).open(alloc, &current, scope)).?;
     defer next.deinit();
@@ -131328,15 +131439,15 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
         try std.testing.expectError(error.EnrichmentSourceChanged, plan.publish(&txn, empty.id(), Guard{}));
         try std.testing.expectError(error.EnrichmentSourceChanged, page.stage(&plan, &txn));
     }
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, LookupCheck.run, .{ &db, public_id, @as(?[]const u8, null) });
-    try std.testing.expectEqual(@import("../artifact_footprint.zig").Family.generated, @import("../artifact_footprint.zig").classify(plan.head_key).?);
+    try platform.allocator.checkAllAllocationFailures(alloc, LookupCheck.run, .{ &db, public_id, @as(?[]const u8, null) });
+    try std.testing.expectEqual(artifact_footprint_mod.Family.generated, artifact_footprint_mod.classify(plan.head_key).?);
 }
 
 test "db ordered artifact inventory generation retirement resumes after restart without resurrection or tombstone growth" {
     const alloc = std.testing.allocator;
-    const generations = @import("artifact_chunk_generation.zig");
-    const chunks = @import("artifact_chunk_manifest.zig");
-    const publication = @import("artifact_publication.zig");
+    const generations = artifact_chunk_generation;
+    const chunks = artifact_chunk_manifest;
+    const publication = artifact_publication;
     const Guard = struct {
         pub fn validate(_: @This(), _: anytype) !void {}
     };
@@ -131380,7 +131491,7 @@ test "db ordered artifact inventory generation retirement resumes after restart 
                 defer page.deinit();
             }
         };
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &plan, authority, state });
+        try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ &plan, authority, state });
         first_page = try generations.PreparedRetirement.init(alloc, &plan, authority, state, 17);
         var txn = try db.core.store.beginWriteTxn();
         errdefer txn.abort();
@@ -131451,10 +131562,10 @@ test "db ordered artifact inventory generation retirement resumes after restart 
 
 test "db ordered artifact inventory generation discovery resumes scoped cursors and races incarnation proposals safely" {
     const alloc = std.testing.allocator;
-    const generations = @import("artifact_chunk_generation.zig");
+    const generations = artifact_chunk_generation;
     const recovery = @import("artifact_generation_recovery.zig");
-    const chunks = @import("artifact_chunk_manifest.zig");
-    const publication = @import("artifact_publication.zig");
+    const chunks = artifact_chunk_manifest;
+    const publication = artifact_publication;
     const Guard = struct {
         pub fn validate(_: @This(), _: anytype) !void {}
     };
@@ -131477,7 +131588,7 @@ test "db ordered artifact inventory generation discovery resumes scoped cursors 
         {
             var txn = try db.core.store.beginWriteTxn();
             errdefer txn.abort();
-            try @import("../source_authority.zig").bind(&txn, .native, authority.namespace);
+            try source_authority_mod.bind(&txn, .native, authority.namespace);
             try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
             try txn.commit();
         }
@@ -131534,7 +131645,7 @@ test "db ordered artifact inventory generation discovery resumes scoped cursors 
             try std.testing.expect(page.states.len > 0 and page.states.len <= 2);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &db, scope });
+    try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ &db, scope });
     {
         var txn = try db.core.store.beginWriteTxn();
         defer txn.abort();
@@ -131564,9 +131675,9 @@ test "db ordered artifact inventory generation discovery resumes scoped cursors 
 
 test "db ordered artifact inventory logical chunk projection merges generations without legacy tails" {
     const alloc = std.testing.allocator;
-    const generations = @import("artifact_chunk_generation.zig");
-    const chunks = @import("artifact_chunk_manifest.zig");
-    const publication = @import("artifact_publication.zig");
+    const generations = artifact_chunk_generation;
+    const chunks = artifact_chunk_manifest;
+    const publication = artifact_publication;
     const Guard = struct {
         pub fn validate(_: @This(), _: anytype) !void {}
     };
@@ -131605,7 +131716,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
         const tail = try internal_keys.chunkArtifactKeyAlloc(alloc, doc, "chunks", 9000);
         defer alloc.free(tail);
         try txn.put(tail, "not-json");
-        try @import("../source_authority.zig").bind(&txn, .native, authority.namespace);
+        try source_authority_mod.bind(&txn, .native, authority.namespace);
         try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
         try txn.commit();
     }
@@ -131654,7 +131765,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expectEqualStrings("generation-only", generated[0].object.get("body").?.string);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{&db});
+    try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{&db});
     var expected_nums: [2]u32 = undefined;
     for ([_]?[]const u8{ null, "z" }, &expected_nums) |unit, *expected| {
         const key = if (unit) |id|
@@ -131673,14 +131784,14 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expectEqualSlices(u32, &expected, nums);
             var read = try owner.core.store.beginReadTxn();
             defer read.abort();
-            var binary = try @import("artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(a, &read, "doc\x00", "fresh\x00");
+            var binary = try artifact_chunk_cursor.Cursor(docstore_mod.DocStore.Txn).openNamed(a, &read, "doc\x00", "fresh\x00");
             defer binary.close();
             const row = (try binary.next()).?;
             try std.testing.expect(internal_keys.matchesChunkArtifactName(row.key, "fresh\x00"));
             try std.testing.expectEqualStrings("{\"body\":\"generation-only\"}", row.value);
             try binary.seekAfter(row.key);
             try std.testing.expect((try binary.next()) == null);
-            var resumed = try @import("artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(a, &read, "doc\x00", "chunks");
+            var resumed = try artifact_chunk_cursor.Cursor(docstore_mod.DocStore.Txn).openNamed(a, &read, "doc\x00", "chunks");
             defer resumed.close();
             const first = (try resumed.next()).?;
             try std.testing.expectEqualStrings("{\"body\":\"new-root\"}", first.value);
@@ -131702,7 +131813,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expectError(error.InvalidBatchRequest, binary.seekAfter(tail));
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ProjectionCheck.run, .{ &db, expected_nums });
+    try platform.allocator.checkAllAllocationFailures(alloc, ProjectionCheck.run, .{ &db, expected_nums });
     // A selected empty unit and a shadowed root tail still have vector bytes
     // to retire. Reconciliation must enumerate them without exposing their
     // obsolete chunk payloads or confusing another embedding's outputs.
@@ -131722,7 +131833,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
         fn run(a: Allocator, owner: *DB) !void {
             var read = try owner.core.store.beginReadTxn();
             defer read.abort();
-            var cursor = try @import("artifact_chunk_vector_cursor.zig").Cursor(docstore_mod.DocStore.Txn).open(a, &read, "doc\x00", "chunks", "model\x00");
+            var cursor = try artifact_chunk_vector_cursor.Cursor(docstore_mod.DocStore.Txn).open(a, &read, "doc\x00", "chunks", "model\x00");
             defer cursor.close();
             const expected = [_]struct { unit: ?[]const u8, ordinal: u32 }{
                 .{ .unit = null, .ordinal = 0 },
@@ -131743,10 +131854,10 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expect((try cursor.next()) == null);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, CandidateCheck.run, .{&db});
+    try platform.allocator.checkAllAllocationFailures(alloc, CandidateCheck.run, .{&db});
     const PollCheck = struct {
         fn run(a: Allocator, owner: *DB, minimum_yields: usize, extra_outputs: usize) !void {
-            const candidates = @import("artifact_chunk_vector_cursor.zig");
+            const candidates = artifact_chunk_vector_cursor;
             const expected = [_]struct { unit: ?[]const u8, ordinal: u32 }{
                 .{ .unit = null, .ordinal = 0 },
                 .{ .unit = null, .ordinal = 1 },
@@ -131799,7 +131910,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
                     },
                     .logical_yielded => |position| {
                         if (logical_scan) |previous_key| {
-                            const Position = @import("artifact_chunk_scan_position.zig").Position;
+                            const Position = artifact_chunk_scan_position.Position;
                             try std.testing.expect((try Position.decode(position)).advances(try Position.decode(previous_key)));
                         }
                         const next = try a.dupe(u8, position);
@@ -131820,7 +131931,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expect(yields >= minimum_yields);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PollCheck.run, .{ &db, 1, 0 });
+    try platform.allocator.checkAllAllocationFailures(alloc, PollCheck.run, .{ &db, 1, 0 });
     // Long obsolete tails are opaque here: malformed payloads and another
     // embedding's keys consume bounded scan work, never provider invocations.
     for (2..66) |ordinal| {
@@ -131864,10 +131975,10 @@ test "db ordered artifact inventory logical chunk projection merges generations 
 
 test "db ordered artifact inventory local stream checkpoints survive restart without discharging work" {
     const alloc = std.testing.allocator;
-    const checkpoints = @import("artifact_stream_checkpoint.zig");
+    const checkpoints = artifact_stream_checkpoint;
     const Observation = @import("artifact_stream_observation.zig").Observation;
-    const publication = @import("artifact_publication.zig");
-    const obligations = @import("artifact_producer_obligations.zig");
+    const publication = artifact_publication;
+    const obligations = artifact_producer_obligations;
     const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) };
     var incarnation: u128 = undefined;
     var selected: checkpoints.Key = undefined;
@@ -131878,7 +131989,7 @@ test "db ordered artifact inventory local stream checkpoints survive restart wit
     const options: OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     const document = try internal_keys.documentKeyAlloc(alloc, "doc\x00");
     defer alloc.free(document);
-    const ScanPosition = @import("artifact_chunk_scan_position.zig").Position;
+    const ScanPosition = artifact_chunk_scan_position.Position;
     const logical_start = try (ScanPosition{ .head = "head\x00", .legacy = "legacy\xff", .members_open = true, .ordinal = 1 }).encodeAlloc(alloc);
     defer alloc.free(logical_start);
     const logical_next = try (ScanPosition{ .head = "head\x00", .legacy = "legacy\xff", .members_open = true, .ordinal = 2 }).encodeAlloc(alloc);
@@ -131894,10 +132005,10 @@ test "db ordered artifact inventory local stream checkpoints survive restart wit
         {
             var txn = try db.core.store.beginWriteTxn();
             errdefer txn.abort();
-            try @import("../source_authority.zig").bind(&txn, .native, authority.namespace);
+            try source_authority_mod.bind(&txn, .native, authority.namespace);
             try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
             try obligations.begin(alloc, &txn, authority);
-            try @import("artifact_producer_validation.zig").begin(alloc, &txn, authority);
+            try artifact_producer_validation.begin(alloc, &txn, authority);
             try txn.commit();
         }
         try db.core.store.put(document, "{\"body\":\"one\"}");
@@ -132031,7 +132142,7 @@ test "db ordered artifact inventory local stream checkpoints survive restart wit
         errdefer txn.abort();
         try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = next_authority.namespace, .authority_epoch = next_authority.epoch, .catalog_digest = next_authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
         try obligations.begin(alloc, &txn, next_authority);
-        try @import("artifact_producer_validation.zig").begin(alloc, &txn, next_authority);
+        try artifact_producer_validation.begin(alloc, &txn, next_authority);
         const current: checkpoints.State = .{ .root_incarnation = incarnation, .observation = try Observation.capture(&txn, "doc\x00") };
         _ = try checkpoints.stage(alloc, &txn, &current_key, null, current, "doc\x00");
         for ([_]u128{ if (incarnation == 1) 2 else 1, if (incarnation == std.math.maxInt(u128)) std.math.maxInt(u128) - 1 else std.math.maxInt(u128) }) |foreign_root| {
@@ -132066,8 +132177,8 @@ test "db ordered artifact inventory local stream checkpoints survive restart wit
 test "db ordered artifact inventory chunk reconstruction resumes bounded pages and rejects stream races" {
     const alloc = std.testing.allocator;
     const reconstruction = @import("artifact_chunk_reconstruction.zig");
-    const chunks = @import("artifact_chunk_manifest.zig");
-    const publication = @import("artifact_publication.zig");
+    const chunks = artifact_chunk_manifest;
+    const publication = artifact_publication;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-reconstruction", .{tmp.sub_path});
@@ -132139,7 +132250,7 @@ test "db ordered artifact inventory chunk reconstruction resumes bounded pages a
             defer page.deinit();
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.prepare, .{ db.core.store, scope, first });
+    try platform.allocator.checkAllAllocationFailures(alloc, Harness.prepare, .{ db.core.store, scope, first });
     const other_scope: reconstruction.Scope = .{ .document = scope.document, .producer = scope.producer, .unit = "other" };
     try std.testing.expectError(error.InvalidBatchRequest, reconstruction.prepare(alloc, db.core.store, other_scope, first, .{}));
     // A deletion behind the completed scan invalidates its fixed-size witness.
@@ -132180,8 +132291,8 @@ test "db ordered artifact inventory chunk reconstruction resumes bounded pages a
 
 test "db ordered artifact inventory chunk replacement rolls back and reopens as one output set" {
     const alloc = std.testing.allocator;
-    const chunks = @import("artifact_chunk_manifest.zig");
-    const publication = @import("artifact_publication.zig");
+    const chunks = artifact_chunk_manifest;
+    const publication = artifact_publication;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-output-set", .{tmp.sub_path});
@@ -132249,8 +132360,8 @@ test "db ordered artifact inventory chunk replacement rolls back and reopens as 
 
 test "db ordered artifact inventory producer dispatch is durable and never completes work" {
     const alloc = std.testing.allocator;
-    const publication = @import("artifact_publication.zig");
-    const obligations = @import("artifact_producer_obligations.zig");
+    const publication = artifact_publication;
+    const obligations = artifact_producer_obligations;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/producer-dispatch", .{tmp.sub_path});
@@ -132272,12 +132383,12 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             const authority = blk: {
                 var txn = try db.core.store.beginWriteTxn();
                 errdefer txn.abort();
-                const catalogs = try @import("artifact_inventory.zig").catalogs(&txn);
+                const catalogs = try artifact_inventory.catalogs(&txn);
                 const active: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = catalogs.digest() };
-                try @import("artifact_inventory.zig").stageOrdered(alloc, &txn, ordered, 1);
+                try artifact_inventory.stageOrdered(alloc, &txn, ordered, 1);
                 try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = active.epoch, .catalog_digest = active.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
                 try obligations.begin(alloc, &txn, active);
-                try @import("artifact_producer_validation.zig").begin(alloc, &txn, active);
+                try artifact_producer_validation.begin(alloc, &txn, active);
                 _ = try obligations.mark(alloc, &txn, active, "doc", null);
                 try txn.commit();
                 break :blk active;
@@ -132406,8 +132517,8 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
 
 test "db ordered artifact inventory producer pages resume after restart without completing obligations" {
     const alloc = std.testing.allocator;
-    const publication = @import("artifact_publication.zig");
-    const obligations = @import("artifact_producer_obligations.zig");
+    const publication = artifact_publication;
+    const obligations = artifact_producer_obligations;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/paged-producer-dispatch", .{tmp.sub_path});
@@ -132428,12 +132539,12 @@ test "db ordered artifact inventory producer pages resume after restart without 
             doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
             var txn = try db.core.store.beginWriteTxn();
             errdefer txn.abort();
-            const catalogs = try @import("artifact_inventory.zig").catalogs(&txn);
+            const catalogs = try artifact_inventory.catalogs(&txn);
             const authority: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = catalogs.digest() };
-            try @import("artifact_inventory.zig").stageOrdered(alloc, &txn, ordered, 1);
+            try artifact_inventory.stageOrdered(alloc, &txn, ordered, 1);
             try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
             try obligations.begin(alloc, &txn, authority);
-            try @import("artifact_producer_validation.zig").begin(alloc, &txn, authority);
+            try artifact_producer_validation.begin(alloc, &txn, authority);
             _ = try obligations.mark(alloc, &txn, authority, &document, null);
             try txn.commit();
         }
@@ -132456,7 +132567,7 @@ test "db ordered artifact inventory producer pages resume after restart without 
 
 test "db ordered artifact inventory row reconciliation publishes envelopes and preserves reader floors" {
     const alloc = std.testing.allocator;
-    const inventory = @import("artifact_inventory.zig");
+    const inventory = artifact_inventory;
     var tmp = try TestDirectory.init("row-inventory-envelope");
     defer tmp.cleanup();
     const Check = struct {
@@ -132490,7 +132601,7 @@ test "db ordered artifact inventory row reconciliation publishes envelopes and p
         alloc.free(expected.?.resolvers);
         expected.?.resolvers = envelope;
         const command: inventory.Command = .{
-            .namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace),
+            .namespace = online_source_contract.namespaceBytes(db.core.identity_namespace),
             .binding = .{ .epoch = 1, .digest = expected.?.digest(), .semantic_digest = try expected.?.semanticDigest(alloc) },
             .catalogs = expected.?,
         };
@@ -132504,7 +132615,7 @@ test "db ordered artifact inventory row reconciliation publishes envelopes and p
             var ack = try db.core.store.beginWriteTxn();
             errdefer ack.abort();
             try inventory.stageOrdered(alloc, &ack, command, receipt.index);
-            try @import("artifact_reconcile_intent.zig").clear(alloc, &ack, command, receipt.index);
+            try artifact_reconcile_intent.clear(alloc, &ack, command, receipt.index);
             try ack.commit();
         }
         try Check.ready(&db, command);
@@ -132523,7 +132634,7 @@ test "db ordered artifact inventory row reconciliation publishes envelopes and p
         {
             var cleanup = try db.core.store.beginWriteTxn();
             errdefer cleanup.abort();
-            try @import("artifact_reconcile_intent.zig").clear(alloc, &cleanup, legacy, 2);
+            try artifact_reconcile_intent.clear(alloc, &cleanup, legacy, 2);
             try cleanup.commit();
         }
     }
@@ -132534,7 +132645,7 @@ test "db ordered artifact inventory row reconciliation publishes envelopes and p
 
 test "db ordered artifact inventory reader epoch upgrade refreshes digest and immutable plans" {
     const alloc = std.testing.allocator;
-    const inventory = @import("artifact_inventory.zig");
+    const inventory = artifact_inventory;
     var tmp = try TestDirectory.init("reader-upgrade-inventory");
     defer tmp.cleanup();
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
@@ -132577,7 +132688,7 @@ test "db ordered artifact inventory reader epoch upgrade refreshes digest and im
 
 test "db ordered artifact inventory graph TTL definitions retain reader envelope across mutations and reopen" {
     const alloc = std.testing.allocator;
-    const inventory = @import("artifact_inventory.zig");
+    const inventory = artifact_inventory;
     var tmp = try TestDirectory.init("ttl-inventory-envelope");
     defer tmp.cleanup();
     const Check = struct {
@@ -132624,8 +132735,8 @@ test "db ordered artifact inventory graph TTL definitions retain reader envelope
 
 test "db ordered artifact inventory obsolete producer work is bounded and preserves pinned readers" {
     const alloc = std.testing.allocator;
-    const publication = @import("artifact_publication.zig");
-    const obligations = @import("artifact_producer_obligations.zig");
+    const publication = artifact_publication;
+    const obligations = artifact_producer_obligations;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/producer-work-gc", .{tmp.sub_path});
@@ -132693,7 +132804,7 @@ test "db ordered artifact inventory resolver commit invalidates pinned producer 
     try std.testing.expect(after.generation() > before.generation());
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
-    const current = try @import("artifact_inventory.zig").catalogs(&read);
+    const current = try artifact_inventory.catalogs(&read);
     try std.testing.expect(!before.plan().matchesArtifactInventory(current));
     try std.testing.expect(after.plan().matchesArtifactInventory(current));
     try std.testing.expect(before.plan().matchesArtifactInventory(before.plan().artifact_catalogs.?));
@@ -132701,8 +132812,8 @@ test "db ordered artifact inventory resolver commit invalidates pinned producer 
 
 test "db ordered artifact inventory writer reopen revokes external projection evidence but readonly does not" {
     const alloc = std.testing.allocator;
-    const publication = @import("artifact_publication.zig");
-    const epoch = @import("artifact_projection_epoch.zig");
+    const publication = artifact_publication;
+    const epoch = artifact_projection_epoch;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-reopen", .{tmp.sub_path});
@@ -132738,9 +132849,9 @@ test "db ordered artifact inventory writer reopen revokes external projection ev
 
 test "db ordered artifact inventory full text reset revokes before destructive work" {
     const alloc = std.testing.allocator;
-    const publication = @import("artifact_publication.zig");
-    const epoch = @import("artifact_projection_epoch.zig");
-    const rebuild = @import("backfill_state.zig");
+    const publication = artifact_publication;
+    const epoch = artifact_projection_epoch;
+    const rebuild = backfill_state_mod;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-reset-order", .{tmp.sub_path});
@@ -132800,16 +132911,16 @@ test "db transaction integrity contention precedes stale claim semantics" {
         try db.setSchemaJson(alloc,
             \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
         );
-        const integrity = @import("relational_integrity.zig");
-        const catalog_mod = @import("relational_integrity_catalog.zig");
+        const integrity = relational_integrity;
+        const catalog_mod = relational_integrity_catalog;
         const raw = (try db.core.getStoreValue(alloc, catalog_mod.key)).?;
         defer alloc.free(raw);
         var catalog = try catalog_mod.decode(alloc, raw);
         defer catalog.deinit();
-        const generation_set = @import("relational_integrity_activation.zig").generationSet(catalog);
+        const generation_set = relational_integrity_activation.generationSet(catalog);
         var view = db.core.acquireSchemaView().?;
         defer view.release();
-        var plan = try @import("relational_index_keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+        var plan = try relational_index_keys.TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
         defer plan.deinit();
         var tuple: std.ArrayList(u8) = .empty;
         defer tuple.deinit(alloc);
@@ -133449,7 +133560,7 @@ test "document extraction catalog snapshot releases every allocation on failure"
             }
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 test "pending document-unit dense embedding collection releases every failed allocation" {
     const Harness = struct {
@@ -133474,7 +133585,7 @@ test "pending document-unit dense embedding collection releases every failed all
             try std.testing.expectEqualStrings("second_consumer", pending.items[1].consumer_indexes[1]);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "pending document-unit sparse embedding collection releases every failed allocation" {
@@ -133500,7 +133611,7 @@ test "pending document-unit sparse embedding collection releases every failed al
             try std.testing.expectEqualStrings("second_consumer", pending.items[1].consumer_indexes[1]);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "pending document-unit chunk sources append atomically under allocation failure" {
@@ -133526,7 +133637,7 @@ test "pending document-unit chunk sources append atomically under allocation fai
             }
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 fn graphTestApplyOrdered(db: *DB, req: types.BatchRequest, receipt: OrderedApplyReceipt) !void {
@@ -133911,7 +134022,7 @@ test "db graph owner revival bounds foreground history and fences stale pages an
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const contract = @import("../graph_cleanup_contract.zig");
+    const contract = graph_cleanup_contract_mod;
     const history = try a.alloc(docstore_mod.KVPair, 601);
     for (history, 0..) |*row, i| {
         const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(a, "a", "g", if (i == 600) "R" else "OLD", if (i == 600) "b" else "target", "a", if (i == 600) "" else try std.fmt.allocPrint(a, "{d:0>4}", .{i}));
@@ -133975,7 +134086,7 @@ test "db graph owner revival retained input replay cannot overwrite a newer inpu
         \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
     });
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"relations\":{\"relations\":[{\"type\":\"R\",\"target\":{\"document_id\":\"b\"}}]}}" }}, .sync_level = .full_index });
-    const contract = @import("../graph_cleanup_contract.zig");
+    const contract = graph_cleanup_contract_mod;
     const job = try contract.ownerJobKeyAlloc(alloc, "a");
     defer alloc.free(job);
     const value = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "a", .generation = 10, .phase = .inputs });
@@ -134011,7 +134122,7 @@ test "db graph cleanup lookup carries and applies owner replay afterimages" {
     var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    const contract = @import("../graph_cleanup_contract.zig");
+    const contract = graph_cleanup_contract_mod;
     const key = try contract.ownerJobKeyAlloc(alloc, "owner");
     defer alloc.free(key);
     const value = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7, .phase = .inputs });
@@ -134285,7 +134396,7 @@ test "db graph fact neighbor replay releases partial allocations" {
             try std.testing.expectEqual(@as(usize, 2), generated.keys.len);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "db graph fact transform preserves exact metadata" {
@@ -134420,7 +134531,7 @@ test "db graph fact enrichment observes pending graph replay" {
             }
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, RefreshAllocationFixture.run, .{&db});
+    try platform.allocator.checkAllAllocationFailures(alloc, RefreshAllocationFixture.run, .{&db});
     // Simulate an older consumer window withdrawing this owner after a source
     // refresh. Invalidation must make the next sample restore current primary
     // effects even though no new primary revision has arrived.
@@ -135030,7 +135141,7 @@ test "db document extraction concurrent writes with unchanged TTL timestamps con
 
     const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(hook.entered.load(.acquire));
 
@@ -135125,7 +135236,7 @@ fn testChildRangeDestination(_: *anyopaque, range: types.DocumentArtifactChildRa
 }
 
 test "db document lookup allocation benchmark" {
-    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const Counter = allocation_bench_support_mod.Counter;
     const Case = enum { short, long, missing, sparse, sparse_large, text_large, embedding_identity, embedding_identity_chunk, text, text_asset, text_asset_large, text_asset_escaped, text_mixed, text_missing, delete_set, relational, json_numbers, json_media };
     const case_name = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_CASE")) |raw| std.mem.span(raw) else "short";
     const fixture = std.meta.stringToEnum(Case, case_name) orelse return error.InvalidBenchmarkCase;
@@ -135283,7 +135394,7 @@ test "db document lookup allocation benchmark" {
 }
 
 fn embeddingIdentityAllocationBenchmark(case_name: []const u8, count: usize, batch: usize) !void {
-    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const Counter = allocation_bench_support_mod.Counter;
     const setup = std.heap.c_allocator;
     const chunk = std.mem.eql(u8, case_name, "embedding_identity_chunk");
     const doc_key = if (chunk) try internal_keys.documentUnitChunkArtifactKeyAlloc(setup, "doc\x00id", "chunks", "page:1", 3) else try setup.dupe(u8, "doc\x00id");
@@ -135320,7 +135431,7 @@ fn renderJsonOutputBenchmark(alloc: Allocator, media: bool, batch: usize, data: 
 }
 
 fn jsonOutputAllocationBenchmark(case_name: []const u8, count: usize, batch: usize) !void {
-    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const Counter = allocation_bench_support_mod.Counter;
     const media = std.mem.eql(u8, case_name, "json_media");
     // Setup is outside measurement. Use the C allocator here to avoid
     // debug-allocator bookkeeping dominating large fixture construction;
@@ -135399,8 +135510,8 @@ test "document collectors release text projections and materialized values on al
     for ([_]bool{ false, true }) |inline_values| {
         // Mixed batches exercise per-value ownership; ordinary batches also
         // exhaust failures before and after the exact-size slab allocation.
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, docs[1..]), inline_values });
+        try platform.allocator.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
+        try platform.allocator.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, docs[1..]), inline_values });
     }
 }
 
@@ -135454,7 +135565,7 @@ test "document collectors asset projection borrows ordinary names and preserves 
             try std.testing.expectEqualStrings("{\"caption\":\"projected value\"}", result);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ db.core.index_manager, @as([]const u8, escaped) });
+    try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ db.core.index_manager, @as([]const u8, escaped) });
 }
 
 test "document collectors ordinary slab excludes projected assets" {
@@ -135517,7 +135628,7 @@ test "document collectors JSON string writing preserves escaping and output owne
     for (inputs) |input| {
         const expected = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{std.json.fmt(input, .{})});
         defer std.testing.allocator.free(expected);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ input, expected });
+        try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ input, expected });
     }
     var output = std.ArrayListUnmanaged(u8).empty;
     defer output.deinit(std.testing.allocator);
@@ -135542,7 +135653,7 @@ test "document collectors JSON numeric fields preserve boundaries and ownership 
             try std.testing.expectEqualStrings("{\"zero\":0,\"max\":18446744073709551615,\"size\":42}", out.items);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(std.testing.allocator);
     try out.ensureTotalCapacityPrecise(std.testing.allocator, 128);
@@ -135570,7 +135681,7 @@ test "document collectors JSON media encoding preserves padding escaping and fai
         _ = std.base64.standard.Encoder.encode(encoded, bytes[0..len]);
         const expected = try std.fmt.allocPrint(alloc, "[{{\"type\":\"text\",\"text\":\"prefix\\n\"}},{{\"type\":\"media\",\"mime_type\":\"quoted\\\"type\",\"data\":\"{s}\"}},{{\"type\":\"media\",\"url\":\"suffix\"}}]", .{encoded});
         defer alloc.free(expected);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ @as([]const u8, bytes[0..len]), @as([]const u8, expected) });
+        try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ @as([]const u8, bytes[0..len]), @as([]const u8, expected) });
     }
 }
 
@@ -135603,7 +135714,7 @@ test "document collectors sparse borrowed JSON owns numeric outputs and cleans e
         try store.put(key, value);
         doc.* = .{ .key = id, .action = .upsert };
     }
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ &store, @as(?*index_manager_mod.IndexManager, null), @as([]const derived_types.DerivedDocument, &docs), false });
+    try platform.allocator.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ &store, @as(?*index_manager_mod.IndexManager, null), @as([]const derived_types.DerivedDocument, &docs), false });
     var result = try collectSparseFieldWritesProfiled(alloc, &store, null, &docs, .{ .start = "", .end = "" }, "vec", .{}, null);
     defer result.deinit();
     // Returned numeric arrays outlive the collector's read transaction.
@@ -135645,7 +135756,7 @@ test "document collectors sparse relational rows still decode under allocation f
     defer alloc.free(key);
     try db.core.store.put(key, packed_row);
     const docs = [_]derived_types.DerivedDocument{.{ .key = "row", .action = .upsert }};
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ db.core.store, @as(?*index_manager_mod.IndexManager, db.core.index_manager), @as([]const derived_types.DerivedDocument, &docs), true });
+    try platform.allocator.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ db.core.store, @as(?*index_manager_mod.IndexManager, db.core.index_manager), @as([]const derived_types.DerivedDocument, &docs), true });
 }
 
 fn embeddingWriteIdentitySweep(alloc: Allocator, key: []const u8, expected: []const u8, manager: ?*index_manager_mod.IndexManager) !void {
@@ -135671,7 +135782,7 @@ test "document collectors embedding identity accepted and rejected keys clean ev
     defer alloc.free(rejected);
     for ([_][]const u8{ doc, derived, rejected }) |key| {
         for ([_]?*index_manager_mod.IndexManager{ null, db.core.index_manager }) |manager|
-            try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, embeddingWriteIdentitySweep, .{ key, @as([]const u8, "dense"), manager });
+            try platform.allocator.checkAllAllocationFailures(alloc, embeddingWriteIdentitySweep, .{ key, @as([]const u8, "dense"), manager });
     }
     try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, rejected, "dense"));
     try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, db.core.index_manager, .{ .name = "dense", .kind = .dense_vector }, rejected));
@@ -135711,7 +135822,7 @@ test "db extractEnrichments field-index planning is allocation atomic" {
         }
     };
     for ([_][]const u8{ "{\"links\":[\"target\"]}", "{\"links\":[]}" }) |value|
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &db, value });
+        try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ &db, value });
 }
 
 test "overwritten document keys release failures and preserve request order" {
@@ -135733,7 +135844,7 @@ test "overwritten document keys release failures and preserve request order" {
             try std.testing.expectEqualStrings("last", keys[2]);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "artifact projection construction releases failures with real local resources" {
@@ -135757,14 +135868,14 @@ test "artifact projection construction releases failures with real local resourc
         }
     };
     const source = read_projection.Source{ .core = db.core };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.asset, @as([]const u8, "{\"entities\":[{\"text\":\"Antfly\"}]}") });
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "{\"body\":\"hello\",\"_chunk_id\":0}") });
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "plain chunk") });
+    try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.asset, @as([]const u8, "{\"entities\":[{\"text\":\"Antfly\"}]}") });
+    try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "{\"body\":\"hello\",\"_chunk_id\":0}") });
+    try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "plain chunk") });
 }
 
 test "lite bounded reader integration scans native relational dirty rows" {
     const a = std.testing.allocator;
-    const lite = @import("../lite/backend.zig");
+    const lite = backend_mod;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bounded-rows.aflite", .{tmp.sub_path});
@@ -135806,7 +135917,7 @@ test "lite bounded reader integration scans native relational dirty rows" {
 test "lite bounded reader integration publishes full text mappings through db" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const lite = @import("../lite/backend.zig");
+    const lite = backend_mod;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bounded-text.aflite", .{tmp.sub_path});
@@ -135830,7 +135941,7 @@ test "lite bounded reader integration publishes full text mappings through db" {
         // Force native typed staging through the production kernel builder.
         // Virtual index names must never become host filesystem paths.
         const payload: [40 * 1024]u8 = @splat('x');
-        const fields = [_]@import("../../introducer.zig").TypedFieldValue{.{ .field_name = "large", .value_type = .bytes_val, .value = .{ .bytes_val = &payload } }};
+        const fields = [_]introducer_mod.TypedFieldValue{.{ .field_name = "large", .value_type = .bytes_val, .value = .{ .bytes_val = &payload } }};
         _ = try db.core.index_manager.indexTextKernelDocuments("text", &.{
             .{ .id = "kernel-c", .stored_data = "{}", .text_fields = &.{}, .typed_fields = &fields, .doc_ordinal = 3 },
             .{ .id = "kernel-d", .stored_data = "{}", .text_fields = &.{}, .typed_fields = &fields, .doc_ordinal = 4 },
@@ -135859,7 +135970,7 @@ test "issue1015 primary writes survive failed derived runtime and visibility sta
     var open = true;
     defer if (open) db.close();
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
-    const Runtime = @import("derived/io_threaded_runtime.zig").DerivedRuntime;
+    const Runtime = io_threaded_runtime_mod.DerivedRuntime;
     const runtime: *Runtime = @ptrCast(@alignCast(db.executor.ptr));
     const io = runtime.threaded.io();
     runtime.mutex.lockUncancelable(io);
@@ -135894,7 +136005,7 @@ test "issue1015 degraded primary writes reject backlog exhaustion before commit"
     var db = try DB.open(alloc, directory.path(), .{ .resource_manager = &manager, .start_optional_runtimes = false, .executor = .{ .backend = .io_threaded } });
     defer db.close();
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
-    const Runtime = @import("derived/io_threaded_runtime.zig").DerivedRuntime;
+    const Runtime = io_threaded_runtime_mod.DerivedRuntime;
     const runtime: *Runtime = @ptrCast(@alignCast(db.executor.ptr));
     const io = runtime.threaded.io();
     runtime.mutex.lockUncancelable(io);
@@ -136767,7 +136878,7 @@ test "capi resolver pending replacement fences old writers without a permanent p
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
     defer db.close();
-    const resolver_catalog = @import("catalog/resolver_catalog.zig");
+    const resolver_catalog = resolver_catalog_mod;
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
     _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
@@ -136802,7 +136913,7 @@ test "capi resolver replacement reader fence survives multiple jobs and resolver
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
     defer db.close();
-    const resolver_catalog = @import("catalog/resolver_catalog.zig");
+    const resolver_catalog = resolver_catalog_mod;
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old1", .kind = .graph, .config_json = config });
     try db.addIndex(.{ .name = "old2", .kind = .graph, .config_json = config });
@@ -137047,7 +137158,7 @@ test "capi resolver topology busy leaves pending replacement and resolver config
     var resolver: index_manager_mod.ResolverConfig = .{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .min_confidence = 0.2 };
     try db.addResolver(resolver);
     const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
-    const topology = @import("relational_integrity_topology.zig");
+    const topology = relational_integrity_topology;
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash("", &digest, .{});
     const fence: topology.Fence = .{ .transition_id = 1, .attempt = 1, .peer_group_id = 2, .owner_group_id = 1, .role = .backup_snapshot, .namespace = db.core.identity_namespace, .catalog_digest = digest };
@@ -137120,7 +137231,7 @@ test "capi resolver replacement clock clamp skips denied and ordered writes" {
 
 test "public graph metric borrowed wire content migration fences edits abort deletion and restart" {
     const a = std.testing.allocator;
-    const revision = @import("../document_mutation_revision.zig");
+    const revision = document_mutation_revision_mod;
     var directory = try TestDirectory.init("content-migration");
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
@@ -137677,7 +137788,7 @@ test "inline resolver replacement preserves shared explicit and upstream produce
                 var probe = try db.core.store.beginProbeTxn();
                 defer probe.abort();
                 // Explicit producers need the same replay fence as shorthand.
-                try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, @import("catalog/resolver_catalog.zig").readMinimumReaderVersion(&probe, 2));
+                try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog_mod.readMinimumReaderVersion(&probe, 2));
             }
             if (mode == 1) try db.addIndex(.{ .name = "shared", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"}}" });
             if (mode == 2) _ = try db.upsertEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
@@ -137819,7 +137930,7 @@ test "inline resolver replacement preserves serving identity and curated replay 
         try std.testing.expect(db.indexGeneration("new") == null);
         var probe = try db.core.store.beginProbeTxn();
         defer probe.abort();
-        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, @import("catalog/resolver_catalog.zig").readMinimumReaderVersion(&probe, 2));
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog_mod.readMinimumReaderVersion(&probe, 2));
     }
     {
         var db = try DB.open(a, directory.path(), options);
@@ -137947,19 +138058,19 @@ test "public graph metric borrowed wire compact embedding physical loader matche
         defer db_query_projection.freeJsonValue(a, &logical);
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        const sources = [_]@import("document_query.zig").ProjectionSource{.{ .name = "_embeddings", .embeddings = &compact }};
-        var plan = (try @import("document_query.zig").SpanProjectionPlan.init(a, .{ .fields = &.{"_embeddings.*"}, .include_all_fields = false })).?;
+        const sources = [_]document_query.ProjectionSource{.{ .name = "_embeddings", .embeddings = &compact }};
+        var plan = (try document_query.SpanProjectionPlan.init(a, .{ .fields = &.{"_embeddings.*"}, .include_all_fields = false })).?;
         defer plan.deinit();
-        var actual = try @import("document_query.zig").lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &sources);
+        var actual = try document_query.lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &sources);
         defer actual.deinit(a);
-        const expected_source = [_]@import("document_query.zig").ProjectionSource{.{ .name = "_embeddings", .value = logical }};
-        var expected = try @import("document_query.zig").lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &expected_source);
+        const expected_source = [_]document_query.ProjectionSource{.{ .name = "_embeddings", .value = logical }};
+        var expected = try document_query.lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &expected_source);
         defer expected.deinit(a);
         try std.testing.expectEqualStrings(expected.json, actual.json);
         var streamed = (try read_projection.openEmbeddingStreamTxn(.{ .core = db.core }, a, "doc", txn)).?;
         defer streamed.deinit();
-        const stream_source = [_]@import("document_query.zig").ProjectionSource{.{ .name = "_embeddings", .embedding_stream = &streamed }};
-        var streamed_result = try @import("document_query.zig").lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &stream_source);
+        const stream_source = [_]document_query.ProjectionSource{.{ .name = "_embeddings", .embedding_stream = &streamed }};
+        var streamed_result = try document_query.lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &stream_source);
         defer streamed_result.deinit(a);
         try std.testing.expectEqualStrings(expected.json, streamed_result.json);
         try std.testing.expectEqual(@as(usize, 1), compact.values.count());
@@ -138331,7 +138442,7 @@ test "inline resolver replacement preserves serving sibling routing until durabl
                 // post-activation drain or a subsequent foreground write.
                 var probe = try db.core.store.beginProbeTxn();
                 defer probe.abort();
-                _ = try probe.get(@import("catalog/resolver_catalog.zig").reresolve_resume_key);
+                _ = try probe.get(resolver_catalog_mod.reresolve_resume_key);
                 try Check.count(&db, 1);
             }
         }
