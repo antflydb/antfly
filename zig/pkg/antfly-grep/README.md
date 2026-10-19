@@ -3151,3 +3151,59 @@ cannot become another response. Response and retained-payload allowances remain
 independent; Python allocation overhead is additional. `bench/retained_delivery.py`
 compares this path with the unchanged decoded-tree application path against the
 same binary, retaining all paired timings and a separate traced-allocation probe.
+
+Qualification against the previous PR head (`5e0b230939`) retains the exact
+binary hashes and paired raw trials. Full-output controls use nine alternating
+batches of 256 requests; the consumer control uses nine alternating batches of
+32 complete view transactions against one binary. Capture uses seven fresh-process
+pairs. Data and processes are warm; capture/refresh is excluded from query timing.
+The Linux controls use the same two-CPU ARM64 VM, not independent Linux hardware.
+
+| Control | macOS before → after | Linux VM before → after |
+|---|---:|---:|
+| Dense 1K-file JSON, server CPU/request | 5.742 → 5.078 ms | 6.914 → 6.250 ms |
+| Same full delivery, client elapsed | 11.469 → 11.619 ms | 11.608 → 11.383 ms |
+| Decoded-tree → streaming consumer, elapsed | 16.994 → 9.420 ms | 20.218 → 12.770 ms |
+| Same consumer, client CPU | 16.869 → 9.375 ms | 17.111 → 9.614 ms |
+| Same consumer, traced peak allocation | 8.33 → 1.54 MB | 8.24 → 1.50 MB |
+| Capture 100K files, repeat without concurrent validation | 2.482 → 2.334 s | 686.7 → 673.5 ms |
+| Ready retained source allocation, 100K files | 50.46 → 48.86 MB | 50.46 → 48.86 MB |
+| One-file delta, paired client elapsed | 121.2 → 126.8 µs | 281.1 → 223.3 µs |
+
+The first macOS capture control overlapped other validation and recorded
+11.620 → 11.905 s; it remains alongside the repeat. Small 1K-file capture controls
+are mixed across hosts. Source-header memory savings are deterministic, but these
+shared-host capture times do not establish a general storage-speed improvement.
+The traced consumer probe is Python allocation, not process RSS or native source
+memory. Pinned retained reads still send zero requests/bytes.
+
+Delta timing now collects garbage before each pair and completes both requests
+before copying either full oracle view. Query order is recorded. Earlier controls
+performed that O(N) verification between requests and showed strong order effects;
+they remain available rather than being relabeled as the improved harness. The
+corrected Linux probe records 126.3 → 90.3 µs of main-thread CPU, with zero median
+runqueue delay. A separate comparison against the older `7a19e40c9a` binary remains
+slower: 158.4 → 199.7 µs elapsed and 82.8 → 109.8 µs CPU. Tiny-delta overhead is
+therefore not eliminated, and no universal delta speedup is claimed. A bounded
+transport-coalescing experiment also regressed complete-request latency and was
+reverted; its negative controls identify the experimental binary separately.
+
+Final product sources pass the 243-case CLI suites on macOS/Linux (two expected
+skips each), 100/101 package tests each (one expected skip), ReleaseSafe native
+conformance/hardening, 1,000 generated oracle comparisons without failures or
+timeouts, Windows cross-compilation, and release/license/toolchain/compatibility
+checks. Decision providers remain local fixtures. The rejected transport build
+has separate 244-case diagnostic logs and is not the distributed product.
+
+Evidence: [qualification and source/binary/archive identities](bench/results/recovery-validation.json),
+[macOS CPU/output](bench/results/recovery-overhead-macos.json),
+[Linux CPU/output](bench/results/recovery-overhead-linux.json),
+[macOS capture repeat](bench/results/recovery-capture-macos-repeat.json),
+[Linux capture](bench/results/recovery-capture-linux.json),
+[macOS consumer](bench/results/recovery-consumer-macos.json),
+[Linux consumer](bench/results/recovery-consumer-linux.json),
+[paired macOS deltas](bench/results/recovery-paired-delta-macos.json),
+[paired Linux deltas](bench/results/recovery-paired-delta-linux.json),
+[older-reference Linux deltas](bench/results/recovery-reference-delta-linux.json),
+[oracle results](bench/results/recovery-differential.json), and
+[pre-optimization diagnostic stacks and driver](bench/results/recovery-profile.json).

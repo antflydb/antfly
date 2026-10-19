@@ -1,0 +1,204 @@
+{
+  "measurement": "Paired full-view consumption: decoded trees versus staged original frames.\n\nOne exact binary, warm pinned generation. Includes request, response decoding and\ntransaction publication; refresh excluded. Python CPU measures the consumer.\nTraced peak is a separate untimed allocation probe, not process RSS.",
+  "host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "binary_sha256": "aff7ffae4017e91ce2f574982b6e9bb134769caf5017361dad86d79d9a146e08",
+  "files": 1000,
+  "rounds": 32,
+  "trials": [
+    {
+      "load_average": [
+        11.6689453125,
+        16.33740234375,
+        17.060546875
+      ],
+      "streaming": {
+        "seconds_per_request": 0.009326843748567626,
+        "client_cpu_seconds_per_request": 0.00929828125,
+        "bytes_per_request": 1245327.09375,
+        "retained_payload_bytes": 1259881
+      },
+      "decoded": {
+        "seconds_per_request": 0.016742032563342946,
+        "client_cpu_seconds_per_request": 0.016697218750000003,
+        "bytes_per_request": 1245260.625,
+        "retained_payload_bytes": 1259861
+      }
+    },
+    {
+      "load_average": [
+        11.6689453125,
+        16.33740234375,
+        17.060546875
+      ],
+      "decoded": {
+        "seconds_per_request": 0.01664305859594606,
+        "client_cpu_seconds_per_request": 0.016600499999999997,
+        "bytes_per_request": 1245253.9375,
+        "retained_payload_bytes": 1259879
+      },
+      "streaming": {
+        "seconds_per_request": 0.009419945312401978,
+        "client_cpu_seconds_per_request": 0.009374874999999998,
+        "bytes_per_request": 1245268.90625,
+        "retained_payload_bytes": 1259855
+      }
+    },
+    {
+      "load_average": [
+        11.53515625,
+        16.23193359375,
+        17.01904296875
+      ],
+      "streaming": {
+        "seconds_per_request": 0.01103642837551888,
+        "client_cpu_seconds_per_request": 0.009554218750000003,
+        "bytes_per_request": 1245265.25,
+        "retained_payload_bytes": 1259857
+      },
+      "decoded": {
+        "seconds_per_request": 0.016994106783386087,
+        "client_cpu_seconds_per_request": 0.0168694375,
+        "bytes_per_request": 1245251.0,
+        "retained_payload_bytes": 1259899
+      }
+    },
+    {
+      "load_average": [
+        11.53515625,
+        16.23193359375,
+        17.01904296875
+      ],
+      "decoded": {
+        "seconds_per_request": 0.016837208346260013,
+        "client_cpu_seconds_per_request": 0.01678871875,
+        "bytes_per_request": 1245255.46875,
+        "retained_payload_bytes": 1259831
+      },
+      "streaming": {
+        "seconds_per_request": 0.009361476561025484,
+        "client_cpu_seconds_per_request": 0.009334906249999997,
+        "bytes_per_request": 1245267.15625,
+        "retained_payload_bytes": 1259876
+      }
+    },
+    {
+      "load_average": [
+        11.53515625,
+        16.23193359375,
+        17.01904296875
+      ],
+      "streaming": {
+        "seconds_per_request": 0.009518074217339745,
+        "client_cpu_seconds_per_request": 0.0094931875,
+        "bytes_per_request": 1245300.21875,
+        "retained_payload_bytes": 1259861
+      },
+      "decoded": {
+        "seconds_per_request": 0.017049964844773058,
+        "client_cpu_seconds_per_request": 0.0170118125,
+        "bytes_per_request": 1245278.09375,
+        "retained_payload_bytes": 1259822
+      }
+    },
+    {
+      "load_average": [
+        11.53515625,
+        16.23193359375,
+        17.01904296875
+      ],
+      "decoded": {
+        "seconds_per_request": 0.017009015624353196,
+        "client_cpu_seconds_per_request": 0.016966281249999993,
+        "bytes_per_request": 1245283.3125,
+        "retained_payload_bytes": 1259880
+      },
+      "streaming": {
+        "seconds_per_request": 0.009509027342573972,
+        "client_cpu_seconds_per_request": 0.00948293750000001,
+        "bytes_per_request": 1245304.25,
+        "retained_payload_bytes": 1259881
+      }
+    },
+    {
+      "load_average": [
+        11.53515625,
+        16.23193359375,
+        17.01904296875
+      ],
+      "streaming": {
+        "seconds_per_request": 0.009513582030194812,
+        "client_cpu_seconds_per_request": 0.009484656250000001,
+        "bytes_per_request": 1245296.65625,
+        "retained_payload_bytes": 1259887
+      },
+      "decoded": {
+        "seconds_per_request": 0.017057333341654157,
+        "client_cpu_seconds_per_request": 0.01692521875,
+        "bytes_per_request": 1245288.375,
+        "retained_payload_bytes": 1259875
+      }
+    },
+    {
+      "load_average": [
+        11.53515625,
+        16.23193359375,
+        17.01904296875
+      ],
+      "decoded": {
+        "seconds_per_request": 0.017468889309384394,
+        "client_cpu_seconds_per_request": 0.01726968749999999,
+        "bytes_per_request": 1245307.1875,
+        "retained_payload_bytes": 1259877
+      },
+      "streaming": {
+        "seconds_per_request": 0.009167286469164537,
+        "client_cpu_seconds_per_request": 0.00914284374999999,
+        "bytes_per_request": 1245270.84375,
+        "retained_payload_bytes": 1259843
+      }
+    },
+    {
+      "load_average": [
+        11.33203125,
+        16.11181640625,
+        16.9716796875
+      ],
+      "streaming": {
+        "seconds_per_request": 0.009227493501384743,
+        "client_cpu_seconds_per_request": 0.009200843749999993,
+        "bytes_per_request": 1245262.75,
+        "retained_payload_bytes": 1259809
+      },
+      "decoded": {
+        "seconds_per_request": 0.01654373696874245,
+        "client_cpu_seconds_per_request": 0.016509312499999984,
+        "bytes_per_request": 1245271.625,
+        "retained_payload_bytes": 1259866
+      }
+    }
+  ],
+  "allocation_probe": {
+    "decoded": {
+      "live_bytes": 1411426,
+      "peak_bytes": 8333886
+    },
+    "streaming": {
+      "live_bytes": 1402486,
+      "peak_bytes": 1542828
+    }
+  },
+  "median": {
+    "decoded": {
+      "seconds_per_request": 0.016994106783386087,
+      "client_cpu_seconds_per_request": 0.0168694375,
+      "bytes_per_request": 1245271.625,
+      "retained_payload_bytes": 1259875
+    },
+    "streaming": {
+      "seconds_per_request": 0.009419945312401978,
+      "client_cpu_seconds_per_request": 0.009374874999999998,
+      "bytes_per_request": 1245270.84375,
+      "retained_payload_bytes": 1259861
+    }
+  }
+}
