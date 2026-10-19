@@ -59,7 +59,7 @@ pub const Plan = struct {
         for (input, result) |certificate, *out| {
             const stable = try a.alloc([]const u8, certificate.invariants.len);
             for (certificate.invariants, stable) |field, *owned| owned.* = try a.dupe(u8, field);
-            out.* = .{ .field = try a.dupe(u8, certificate.field), .invariants = stable, .joint = certificate.joint };
+            out.* = .{ .field = try a.dupe(u8, certificate.field), .invariants = stable, .joint = certificate.joint, .linear = certificate.linear };
         }
         return result;
     }
@@ -82,6 +82,56 @@ pub const Plan = struct {
         };
         try fields.put(a, query.statement.columns[ordinal].field, {});
     }
+    const LinearCheck = @import("cypher").linear_bounds.Check;
+    const FieldBounds = @import("cypher").linear_bounds.Field;
+    fn fieldBounds(fields: []const FieldBounds, name: []const u8) ?@import("cypher").linear_bounds.Interval {
+        for (fields) |field| if (std.mem.eql(u8, field.name, name)) return field.bounds;
+        return null;
+    }
+    const RenamedCheck = struct {
+        next: LinearCheck,
+        from: []const []const u8,
+        to: []const []const u8,
+        fn validate(ptr: *const anyopaque, a: A, fields: []const FieldBounds) !bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const renamed = try a.alloc(FieldBounds, self.from.len);
+            for (self.from, self.to, renamed) |from, to, *out| out.* = .{ .name = from, .bounds = fieldBounds(fields, to) };
+            return self.next.accepts(a, renamed);
+        }
+    };
+    fn renameCheck(a: A, check: ?LinearCheck, from: []const []const u8, to: []const []const u8) !?LinearCheck {
+        const original = check orelse return null;
+        const owned = try a.create(RenamedCheck);
+        owned.* = .{ .next = original, .from = from, .to = to };
+        return .{ .ptr = owned, .validate = RenamedCheck.validate, .integers = original.integers };
+    }
+    const ProjectedCheck = struct {
+        next: LinearCheck,
+        node: *const binding.Node,
+        fields: []const []const u8,
+        fn validate(ptr: *const anyopaque, a: A, fields: []const FieldBounds) !bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const query = self.node.operation.query;
+            const bound = query.binding.scalars;
+            const projected = try a.alloc(FieldBounds, self.fields.len);
+            for (self.fields, projected) |field, *out| {
+                const ordinal = columnIndex(self.node, field) orelse return false;
+                const program = if (ordinal < bound.projections.len) bound.projections[ordinal] else null;
+                const interval = if (program) |p| p.linearBounds(bound.columns, fields, self.next.integers) else fieldBounds(fields, query.statement.columns[ordinal].field);
+                // A demanded or otherwise observed arithmetic projection must
+                // retain every intermediate error, even if a reducer ignores it.
+                if (program) |p| if (p.affineTogether() and interval == null) return false;
+                out.* = .{ .name = field, .bounds = interval };
+            }
+            return self.next.accepts(a, projected);
+        }
+    };
+    fn projectCheck(a: A, check: ?LinearCheck, node: *const binding.Node, wanted: Names) !?LinearCheck {
+        const original = check orelse return null;
+        const owned = try a.create(ProjectedCheck);
+        owned.* = .{ .next = original, .node = node, .fields = try names(a, wanted) };
+        return .{ .ptr = owned, .validate = ProjectedCheck.validate, .integers = original.integers };
+    }
     fn projectCertificates(a: A, node: *const binding.Node, request: catalog.AggregateWeight, wanted: Names) ![]const catalog.SummaryCertificate {
         const query = node.operation.query;
         const bound = query.binding.scalars;
@@ -100,7 +150,7 @@ pub const Plan = struct {
                     };
                 }
                 var input_keys = inputs.keyIterator();
-                if (inputs.count() != 0 and result.items.len < 256) try result.append(a, .{ .field = input_keys.next().?.*, .invariants = try names(a, stable), .joint = true });
+                if (inputs.count() != 0 and result.items.len < 256) try result.append(a, .{ .field = input_keys.next().?.*, .invariants = try names(a, stable), .joint = true, .linear = try projectCheck(a, certificate.linear, node, wanted) });
                 continue;
             }
             const target = columnIndex(node, certificate.field) orelse continue;
@@ -307,7 +357,7 @@ pub const Plan = struct {
             for (request.summaries, summaries) |certificate, *mapped_certificate| {
                 const stable = try a.alloc([]const u8, certificate.invariants.len);
                 for (certificate.invariants, stable) |field, *name| name.* = node.operation.scan.source_columns[columnIndex(node, field) orelse return null];
-                mapped_certificate.* = .{ .field = node.operation.scan.source_columns[columnIndex(node, certificate.field) orelse return null], .invariants = stable, .joint = certificate.joint };
+                mapped_certificate.* = .{ .field = node.operation.scan.source_columns[columnIndex(node, certificate.field) orelse return null], .invariants = stable, .joint = certificate.joint, .linear = try renameCheck(a, certificate.linear, request.fields, fields) };
             }
             out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| node.operation.scan.source_columns[columnIndex(node, name) orelse return null] else null, .invariants = invariants, .summaries = summaries };
         }
@@ -330,7 +380,7 @@ pub const Plan = struct {
             for (request.summaries, summaries) |certificate, *mapped_certificate| {
                 const stable = try a.alloc([]const u8, certificate.invariants.len);
                 for (certificate.invariants, stable) |field, *name| name.* = nested.columns[columnIndex(parent, field) orelse return error.InvalidSqlBackendResponse].internal;
-                mapped_certificate.* = .{ .field = nested.columns[columnIndex(parent, certificate.field) orelse return error.InvalidSqlBackendResponse].internal, .invariants = stable, .joint = certificate.joint };
+                mapped_certificate.* = .{ .field = nested.columns[columnIndex(parent, certificate.field) orelse return error.InvalidSqlBackendResponse].internal, .invariants = stable, .joint = certificate.joint, .linear = try renameCheck(a, certificate.linear, request.fields, fields) };
             }
             out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| nested.columns[columnIndex(parent, name) orelse return error.InvalidSqlBackendResponse].internal else null, .invariants = invariants, .summaries = summaries };
         }

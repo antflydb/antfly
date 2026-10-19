@@ -3549,3 +3549,133 @@ def test_sql_shared_path_marginal_certificates_preserve_correlations(graph_db):
         )
     with pytest.raises(SQLStateError, match="22012"):
         db.sql(f"WITH t AS (SELECT hops,twice,1/(hops-2) AS unused FROM {relation}) SELECT avg(hops+twice) FROM t")
+
+
+def test_independent_linear_reductions_use_first_moments(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[xs:R*1..]->()-[ys:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 35000}
+    expected = db.cypher_json("g", {"query": base + "RETURN avg(length(p))", "limits": limits})["rows"][0][0]["value"]
+    for tail, scale, offset in (
+        ("RETURN avg(size(xs)+size(ys))", 1, 0),
+        ("RETURN avg(2*size(xs)+3*size(ys)+7)", 2.5, 7),
+        ("RETURN avg(size(xs)-size(ys))", 0, 0),
+        ("WITH size(xs)+size(ys) AS n RETURN avg(n)", 1, 0),
+        ("CALL { WITH xs,ys RETURN size(xs)+size(ys) AS n } RETURN avg(n)", 1, 0),
+        ("UNWIND [size(xs)+size(ys),2*(size(xs)+size(ys))] AS n RETURN avg(n)", 1.5, 0),
+    ):
+        result = db.cypher_json("g", {"query": base + tail, "limits": limits})
+        assert result["rows"][0][0]["value"] == pytest.approx(scale * expected + offset, rel=1e-13, abs=1e-13)
+    relation = "GRAPH_TABLE(g MATCH p=(s IS D)-[xs IS R*]->()-[ys IS R*]->(b IS D) WHERE s.id='start' COLUMNS(size(xs) AS first_hops,size(ys) AS second_hops)) q"
+    for query, scale, offset, parameters in (
+        (f"SELECT avg(first_hops+second_hops) FROM {relation}", 1, 0, []),
+        (f"SELECT avg(first_hops-second_hops) FROM {relation}", 0, 0, []),
+        (
+            f"WITH t AS (SELECT first_hops AS a,second_hops AS b FROM {relation}) SELECT avg(2*a+3*b+7) FROM t",
+            2.5,
+            7,
+            [],
+        ),
+        (
+            f"WITH t AS (SELECT first_hops+$1 AS a,second_hops AS b FROM {relation}) SELECT avg(a+b+$2) FROM t",
+            1,
+            7,
+            [3, 4],
+        ),
+        (
+            f"SELECT avg(a+b) FROM (SELECT first_hops AS a,second_hops AS b FROM {relation} UNION ALL SELECT first_hops AS a,second_hops AS b FROM {relation}) u",
+            1,
+            0,
+            [],
+        ),
+    ):
+        assert db.sql(query, parameters)["rows"][0][0] == pytest.approx(scale * expected + offset, rel=1e-13, abs=1e-13)
+
+
+def test_typed_length_bounds_remain_invocation_local_and_compressed(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 15000}
+    expected = db.cypher_json("g", {"query": base + "WHERE length(p)>=2 RETURN avg(length(p))", "limits": limits})[
+        "rows"
+    ]
+    for tail in (
+        "WHERE length(p)>=2.0 RETURN avg(length(p))",
+        "WHERE length(p)>1.5 RETURN avg(length(p))",
+        "WHERE length(p)>=2 AND $enabled RETURN avg(length(p))",
+        "WITH length(p) AS n,2 AS low WHERE n>=low RETURN avg(n)",
+        "WITH length(p) AS n,$minimum AS low WITH n,low AS bound WHERE n>=bound RETURN avg(n)",
+    ):
+        result = db.cypher_json(
+            "g", {"query": base + tail, "parameters": {"minimum": 2.0, "enabled": True}, "limits": limits}
+        )
+        assert result["rows"] == expected
+    for minimum in (None, 2.0, None, 2):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": base + "WHERE length(p)>=$minimum RETURN avg(length(p))",
+                "parameters": {"minimum": minimum},
+                "limits": limits,
+            },
+        )
+        if minimum is None:
+            assert result["rows"] == [[{"type": "null", "value": None}]]
+            assert result["stats"]["explored_edges"] == 0
+        else:
+            assert result["rows"] == expected
+
+    result = db.cypher_json(
+        "g",
+        {
+            "query": base + "WHERE length(p)>=2 AND $enabled RETURN avg(length(p))",
+            "parameters": {"enabled": False},
+            "limits": limits,
+        },
+    )
+    assert result["rows"] == [[{"type": "null", "value": None}]]
+    assert result["stats"]["explored_edges"] == 0
+
+
+def test_independent_linear_proofs_preserve_joint_observers_and_errors(graph_db):
+    db = graph_db
+    populate_layered_graph(db, layers=3)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[xs:R*1..]->()-[ys:R*1..]->(b:D) "
+    exact = db.cypher_json("g", {"query": base + "RETURN size(xs),size(ys)"})["rows"]
+    pairs = [(int(row[0]["value"]), int(row[1]["value"])) for row in exact]
+    expected = sum(a + b for a, b in pairs)
+    result = db.cypher_json(
+        "g",
+        {
+            "query": base
+            + "RETURN sum(size(xs)+size(ys)),avg(size(xs)+size(ys)),min(size(xs)-size(ys)),max(size(xs)-size(ys))"
+        },
+    )["rows"][0]
+    assert [cell["value"] for cell in result] == [
+        str(expected),
+        pytest.approx(expected / len(pairs)),
+        str(min(a - b for a, b in pairs)),
+        str(max(a - b for a, b in pairs)),
+    ]
+    # Exercise the compressed reducers without joint-distribution observers.
+    result = db.cypher_json("g", {"query": base + "RETURN sum(size(xs)+size(ys)),avg(size(xs)+size(ys))"})["rows"][0]
+    assert [cell["value"] for cell in result] == [str(expected), pytest.approx(expected / len(pairs))]
+    relation = "GRAPH_TABLE(g MATCH p=(s IS D)-[xs IS R*]->()-[ys IS R*]->(b IS D) WHERE s.id='start' COLUMNS(size(xs) AS a,size(ys) AS b)) q"
+    for expression in ("avg(a+b)", "sum(a+b)", "avg(a*b)", "min(a-b)", "max(a-b)", "count(DISTINCT a+b)"):
+        actual = db.sql(f"SELECT {expression} FROM {relation}")["rows"][0][0]
+        ordinary = db.sql(f"WITH t AS MATERIALIZED (SELECT * FROM {relation}) SELECT {expression} FROM t")["rows"][0][0]
+        assert actual == (pytest.approx(ordinary, rel=1e-13) if isinstance(ordinary, float) else ordinary)
+    with pytest.raises(af.GraphError, match="CypherNumericOverflow"):
+        db.cypher_json("g", {"query": base + "RETURN avg((size(xs)+9223372036854775807)-size(ys))"})
+    with pytest.raises(SQLStateError, match="22003"):
+        db.sql(f"SELECT avg((a+9223372036854775807)-b) FROM {relation}")
+    with pytest.raises(SQLStateError, match="22003"):
+        db.sql(
+            f"WITH t AS (SELECT a,b,(a+9223372036854775807)-9223372036854775807 AS c FROM {relation}) SELECT avg(c+b) FROM t"
+        )
+    assert db.sql(f"SELECT count(a+b+$1),avg(a+b+$1) FROM {relation}", [None])["rows"] == [["0", None]]

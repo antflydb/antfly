@@ -3063,3 +3063,41 @@ test "UNWIND preserves endpoint lineage multiplicity and opaque shadows" {
     try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND [b.id] AS x RETURN min(length(p)+x),max(length(p)+x)", "[[\"0a\",\"1b\"]]");
     try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND [b,b] AS x WITH length(p) AS n,{rank:'x'} AS x RETURN min(n+x.rank),max(n+x.rank)", "[[\"0x\",\"1x\"]]");
 }
+
+test "typed length bounds retain numeric ordering aliases NULL and eager errors" {
+    for ([_][]const u8{
+        "WHERE length(p)>=1.0 RETURN count(*)",
+        "WHERE length(p)>0.5 RETURN count(*)",
+        "WITH length(p) AS n,1.0 AS low WHERE n>=low RETURN count(*)",
+        "WITH length(p) AS n,1 AS low WITH n,low AS minimum WHERE n>=minimum RETURN count(*)",
+    }) |tail| {
+        const query = try std.fmt.allocPrint(std.testing.allocator, "MATCH p=(a:Document {{id:'a'}})-[:CITES*0..1]->(b) {s}", .{tail});
+        defer std.testing.allocator.free(query);
+        try check(query, "[[2]]");
+    }
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)=0.5 RETURN count(*)", "[[0]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n,null AS low WHERE n>=low RETURN count(*)", "[[0]]");
+    try check("WITH 1 AS low UNWIND [0] AS x WITH x AS low MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=low RETURN count(*)", "[[3]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=$minimum RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    for ([_]v.Value{ .{ .number = 0.5 }, .{ .number = 1.0 }, .{ .number = -0.5 }, .{ .number = 9223372036854775808.0 }, .null }, [_]i64{ 2, 2, 3, 0, 0 }) |value, expected| {
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "minimum", .value = value }}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(expected, result.rows[0][0].integer);
+    }
+    var bad = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=$minimum AND 1/length(p)>0 RETURN count(*)", .{}, &diagnostic);
+    defer bad.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &bad, &.{.{ .name = "minimum", .value = .null }}, .{}));
+}
+
+test "constant bounds cross total unknown bindings without crossing errors" {
+    try check("WITH 1 AS low,0 AS unrelated WITH unrelated AS x,low MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=low RETURN count(*)", "[[2]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n,1/length(p) AS bad,1 AS low WHERE n>=low RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}

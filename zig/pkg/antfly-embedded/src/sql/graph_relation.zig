@@ -366,7 +366,7 @@ pub const Cursor = struct {
             const summary_plan = selected: {
                 for (request.summaries) |certificate| {
                     if (certificate.joint) {
-                        for (request.fields) |field| if (try stream.planSummaryFieldsJoint(request.fields, multiplicity, field, certificate.invariants, true)) |plan| break :selected plan;
+                        for (request.fields) |field| if (try stream.planSummaryFieldsChecked(request.fields, multiplicity, field, certificate.invariants, true, certificate.linear)) |plan| break :selected plan;
                     } else if (try stream.planSummaryFields(request.fields, multiplicity, certificate.field, certificate.invariants)) |plan| break :selected plan;
                 }
                 if (request.summary) |field| break :selected try stream.planSummaryFields(request.fields, multiplicity, field, request.invariants);
@@ -377,7 +377,7 @@ pub const Cursor = struct {
                     var selected: ?usize = null;
                     for (candidates.items, 0..) |candidate, position| {
                         if (candidate.plan.summary == null or !std.mem.eql(u8, candidate.plan.summary.?, plan.summary.?) or
-                            candidate.plan.path.execution_reversed != plan.path.execution_reversed or candidate.plan.projection.items.len != plan.projection.items.len) continue;
+                            candidate.plan.linear != plan.linear or candidate.plan.path.execution_reversed != plan.path.execution_reversed or candidate.plan.projection.items.len != plan.projection.items.len) continue;
                         const same_fields = for (plan.projection.items) |item| {
                             const name = item.alias.?;
                             const present = for (candidate.plan.projection.items) |other| {

@@ -338,6 +338,49 @@ pub const Program = struct {
         if (self.output_type.kind != .integer) return false;
         return self.affineInstruction(self.root, 0, .shared) != null;
     }
+    /// A request-local totality proof for linear consumers. Unknown parameter
+    /// or column bounds decline compression rather than speculating about an
+    /// error. Every intermediate instruction must fit the integer domain.
+    pub fn linearBounds(self: Program, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64) ?@import("cypher").linear_bounds.Interval {
+        const proof = self.linearInstruction(self.root, 0, columns, fields, integers) orelse return null;
+        return proof.interval;
+    }
+    fn linearInstruction(self: Program, index: u32, depth: usize, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64) ?@import("cypher").integer_affine.Form {
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const Form = @import("cypher").integer_affine.Form;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or instruction.type.kind != .integer) return null;
+        return switch (instruction.operation) {
+            .column => |column| blk: {
+                if (column >= columns.len) break :blk null;
+                for (fields) |field| if (std.mem.eql(u8, field.name, columns[column].name)) break :blk Form.column(column).bounded(field.bounds orelse return null);
+                break :blk null;
+            },
+            .literal => |value| if (value == .integer) Form.literal(value.integer) else null,
+            .parameter => |slot| if (slot < integers.len) (if (integers[slot]) |value| Form.literal(value) else null) else null,
+            .unary => |unary| blk: {
+                const operand = self.linearInstruction(unary.operand, depth + 1, columns, fields, integers) orelse return null;
+                break :blk switch (unary.op) {
+                    .positive => operand,
+                    .negative => operand.negative(),
+                    else => null,
+                };
+            },
+            .binary => |binary| blk: {
+                const left = self.linearInstruction(binary.left, depth + 1, columns, fields, integers) orelse return null;
+                const right = self.linearInstruction(binary.right, depth + 1, columns, fields, integers) orelse return null;
+                const result = switch (binary.op) {
+                    .add => Form.combineMarginals(left, right, .add),
+                    .subtract => Form.combineMarginals(left, right, .subtract),
+                    .multiply => Form.combineMarginals(left, right, .multiply),
+                    else => null,
+                } orelse return null;
+                if (result.interval == null) break :blk null;
+                break :blk result;
+            },
+            else => null,
+        };
+    }
     const AffineInputs = union(enum) { distinct, single: u32, shared };
     fn affineInstruction(self: Program, index: u32, depth: usize, inputs: AffineInputs) ?@import("cypher").integer_affine.Form {
         if (depth > 128 or index >= self.instructions.len) return null;

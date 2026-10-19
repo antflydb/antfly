@@ -346,7 +346,18 @@ fn multiplicity(bound: *const binding.Bound) catalog.Multiplicity {
     return .presence;
 }
 
-fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: catalog.Table, conditions: []const catalog.Condition) ![]const catalog.AggregateWeight {
+const LinearConsumer = struct {
+    program: scalar.Program,
+    columns: []const scalar.Column,
+    integers: []const ?i64,
+    fn validate(ptr: *const anyopaque, _: std.mem.Allocator, fields: []const @import("cypher").linear_bounds.Field) !bool {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        return self.program.linearBounds(self.columns, fields, self.integers) != null;
+    }
+};
+fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: catalog.Table, conditions: []const catalog.Condition, parameters: []const Json) ![]const catalog.AggregateWeight {
+    const integers = try a.alloc(?i64, parameters.len);
+    for (parameters, integers) |parameter, *integer| integer.* = if (parameter == .integer) parameter.integer else null;
     const requests = try a.alloc(catalog.AggregateWeight, bound.specs.len);
     var stable: std.StringHashMapUnmanaged(void) = .empty;
     for (conditions) |condition| try stable.put(a, condition.column, {});
@@ -385,7 +396,15 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
                     var stable_fields: std.ArrayList([]const u8) = .empty;
                     var stable_inputs = invariant.keyIterator();
                     while (stable_inputs.next()) |key| try stable_fields.append(a, key.*);
-                    try summaries.append(a, .{ .field = (try table.column(bound.input.columns[program.required_columns[0]].name)).path, .invariants = stable_fields.items, .joint = true });
+                    var linear: ?@import("cypher").linear_bounds.Check = null;
+                    if (spec.kind == .count or spec.kind == .sum or spec.kind == .avg) {
+                        const consumer = try a.create(LinearConsumer);
+                        const columns = try a.dupe(scalar.Column, bound.input.columns);
+                        for (program.required_columns) |ordinal| columns[ordinal].name = (try table.column(columns[ordinal].name)).path;
+                        consumer.* = .{ .program = program, .columns = columns, .integers = integers };
+                        linear = .{ .ptr = consumer, .validate = LinearConsumer.validate, .integers = integers };
+                    }
+                    try summaries.append(a, .{ .field = (try table.column(bound.input.columns[program.required_columns[0]].name)).path, .invariants = stable_fields.items, .joint = true, .linear = linear });
                 }
                 if (program.affineColumn()) |column| {
                     summary = (try table.column(bound.input.columns[column].name)).path;
@@ -464,7 +483,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         };
         const can_weight = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound);
         const partitioned = can_weight and bound.specs.len > 0 and
-            try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, try aggregateRequests(context.arena, bound, table, predicates.terms.items));
+            try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, try aggregateRequests(context.arena, bound, table, predicates.terms.items, context.parameters));
         const weighted = partitioned or (can_weight and try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound)));
         const parallel = !weighted and bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !aggregate_loaded and !parallel) {

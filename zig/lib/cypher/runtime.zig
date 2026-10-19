@@ -119,6 +119,7 @@ pub const NodeCursor = struct {
     weighted: bool = false,
     multiplicity: Multiplicity = .exact,
     summary: ?[]const u8 = null,
+    linear_summary: bool = false,
     weighted_seeds: ?Engine.AnchorBatch = null,
     fallback_seed: ?usize = null,
     weighted_arena: std.heap.ArenaAllocator,
@@ -128,7 +129,7 @@ pub const NodeCursor = struct {
     /// Compact prefix counts; exact consumers must read last_counts.
     last_weights: std.ArrayList(u64) = .empty,
     last_counts: std.ArrayList(Count) = .empty,
-    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity, summary: ?[]const u8 = null };
+    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity, summary: ?[]const u8 = null, linear: bool = false };
     /// Plan a projected endpoint bag without advancing or rebinding the read
     /// cut. Plans and their AST storage belong to this cursor.
     pub fn planWeightFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity) !?WeightPlan {
@@ -169,6 +170,9 @@ pub const NodeCursor = struct {
     /// Joint certificates permit several affine projections of the same private
     /// marginal. Invariant observers still cannot read that marginal.
     pub fn planSummaryFieldsJoint(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity, field: []const u8, invariants: []const []const u8, joint: bool) !?WeightPlan {
+        return self.planSummaryFieldsChecked(fields, multiplicity, field, invariants, joint, null);
+    }
+    pub fn planSummaryFieldsChecked(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity, field: []const u8, invariants: []const []const u8, joint: bool, check: ?@import("linear_bounds.zig").Check) !?WeightPlan {
         // Endpoint integer columns also receive affine certificates. Reject
         // them before constructing a reduction plan: long fixed-hop patterns
         // otherwise pay for (and retain) the same geometry twice per reducer.
@@ -187,26 +191,29 @@ pub const NodeCursor = struct {
         if (!observed) return null;
         var plan = (try self.planWeightFields(fields, multiplicity)) orelse return null;
         const targets = try self.engine.summaryTargets(plan.path);
-        if (targets.len != 1) return null;
+        if (targets.len == 0 or (targets.len != 1 and check == null)) return null;
         const target = targets[0].name;
+        var names: Engine.MomentNames = .empty;
+        for (targets, 0..) |part, index| try names.put(self.engine.a, part.name, .{ .scalar = Engine.Affine.column(index).bounded(.{ .low = 0, .high = std.math.cast(i64, self.engine.limits.path_depth) orelse std.math.maxInt(i64) }) });
         var found = false;
+        var bounds: std.ArrayList(@import("linear_bounds.zig").Field) = .empty;
         for (plan.projection.items) |item| {
             const name = item.alias orelse try self.engine.expressionName(item.expression);
+            const reads = Engine.referencesAny(item.expression, names);
+            const form = self.engine.momentArgument(item.expression, names);
             if (std.mem.eql(u8, name, field)) {
-                var names: Engine.MomentNames = .empty;
-                try names.put(self.engine.a, target, .{ .scalar = Engine.Affine.column(0) });
-                const form = self.engine.momentArgument(item.expression, names) orelse return null;
-                if (form.field == null) return null;
+                const proof = form orelse return null;
+                if (proof.field == null) return null;
                 found = true;
-            } else if (path_summaries.references(item.expression, target)) {
-                if (!joint) return null;
-                var names: Engine.MomentNames = .empty;
-                try names.put(self.engine.a, target, .{ .scalar = Engine.Affine.column(0) });
-                if (self.engine.momentArgument(item.expression, names) == null) return null;
-            }
-            for (invariants) |invariant| if (std.mem.eql(u8, invariant, name) and path_summaries.references(item.expression, target)) return null;
+            } else if (reads and (!joint or form == null or (targets.len == 1 and form.?.multiple))) return null;
+            for (invariants) |invariant| if (std.mem.eql(u8, invariant, name) and reads) return null;
+            try bounds.append(self.engine.a, .{ .name = name, .bounds = if (form) |proof| proof.interval else null });
         }
-        if (!found or path_summaries.references(.{ plan.projection.predicate, self.original_match.predicate }, target)) return null;
+        if (!found or Engine.referencesAny(.{ plan.projection.predicate, self.original_match.predicate }, names)) return null;
+        if (targets.len > 1) {
+            if (!try check.?.accepts(self.engine.a, bounds.items)) return null;
+            plan.linear = true;
+        }
         plan.summary = target;
         return plan;
     }
@@ -251,6 +258,7 @@ pub const NodeCursor = struct {
         self.weighted = true;
         self.multiplicity = plan.multiplicity;
         self.summary = plan.summary;
+        self.linear_summary = plan.linear;
         const predicates = try self.engine.batchPredicates(plan.path, &.{}, clauses[0].operation.match.predicate);
         self.weighted_seeds = .{ .admission = predicates.admission, .residual = predicates.residual, .path = plan.path, .input = .{ .row = &.{} }, .mode = clauses[0].operation.match.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
     }
@@ -291,10 +299,12 @@ pub const NodeCursor = struct {
         const e = self.engine;
         e.weighted_sink = .{ .ptr = self, .emit = emitWeighted, .multiplicity = self.multiplicity };
         e.external_summary = self.summary;
+        e.external_linear_summary = self.linear_summary;
         e.stream_predicate = if (self.weighted_seeds != null and input.row.len == 0) self.weighted_seeds.?.residual else self.query.clauses[0].operation.match.predicate;
         defer {
             e.weighted_sink = null;
             e.external_summary = null;
+            e.external_linear_summary = false;
             e.stream_predicate = null;
         }
         var ignored: std.ArrayList(Engine.MatchState) = .empty;
@@ -1017,6 +1027,7 @@ const Engine = struct {
     expression_memo: ?CallMemo = null,
     moment_targets: []const SummaryTarget = &.{},
     external_summary: ?[]const u8 = null,
+    external_linear_summary: bool = false,
     moment_input: Row = &.{},
     moment_endpoint: ?[]const u8 = null,
     moment_invariants: std.ArrayList(*const ast.Expr) = .empty,
@@ -4441,9 +4452,9 @@ const Engine = struct {
                 const left = self.momentArgument(b.left, names) orelse return null;
                 const right = self.momentArgument(b.right, names) orelse return null;
                 break :blk switch (b.op) {
-                    .add => Affine.combine(left, right, .add),
-                    .subtract => Affine.combine(left, right, .subtract),
-                    .multiply => Affine.combine(left, right, .multiply),
+                    .add => Affine.combineMarginals(left, right, .add),
+                    .subtract => Affine.combineMarginals(left, right, .subtract),
+                    .multiply => Affine.combineMarginals(left, right, .multiply),
                     else => null,
                 };
             },
@@ -4537,6 +4548,8 @@ const Engine = struct {
         if (aggregate_function.args.len != 1) return null;
         const form = self.momentArgument(aggregate_function.args[0], names) orelse return null;
         if (form.field == null) return null;
+        if (form.multiple and (form.interval == null or aggregate_function.distinct or
+            !(std.ascii.eqlIgnoreCase(aggregate_function.name, "avg") or std.ascii.eqlIgnoreCase(aggregate_function.name, "sum") or std.ascii.eqlIgnoreCase(aggregate_function.name, "count")))) return null;
         if (std.ascii.eqlIgnoreCase(aggregate_function.name, "sum") and !form.oneSign()) return null;
         inline for (@typeInfo(MomentCall).@"enum".field_names) |name| {
             if (std.ascii.eqlIgnoreCase(aggregate_function.name, name) and (!aggregate_function.distinct or std.mem.eql(u8, name, "min") or std.mem.eql(u8, name, "max"))) return @field(MomentCall, name);
@@ -4673,11 +4686,11 @@ const Engine = struct {
         const targets = try self.summaryTargets(path);
         if (targets.len == 0) return null;
         var names: MomentNames = .empty;
-        for (targets, 0..) |target, i| try names.put(self.a, target.name, .{ .scalar = Affine.column(i) });
+        for (targets, 0..) |target, i| try names.put(self.a, target.name, .{ .scalar = Affine.column(i).bounded(.{ .low = 0, .high = std.math.cast(i64, self.limits.path_depth) orelse std.math.maxInt(i64) }) });
         if (referencesAny(self.stream_predicate, names)) return null;
         if (self.weighted_sink) |_| {
             // External consumers negotiate this certificate before advancing.
-            if (self.external_summary == null or targets.len != 1 or !std.mem.eql(u8, targets[0].name, self.external_summary.?)) return null;
+            if (self.external_summary == null or (!self.external_linear_summary and targets.len != 1) or !std.mem.eql(u8, targets[0].name, self.external_summary.?)) return null;
             return targets;
         }
         var fold = self.stream_fold orelse return null;

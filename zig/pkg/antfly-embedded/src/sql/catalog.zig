@@ -591,6 +591,11 @@ pub const SummaryCertificate = struct {
     /// marginal. This is a consumer obligation, independently checked by the
     /// graph producer; it never asserts that arbitrary columns are correlated.
     joint: bool = false,
+    /// Only non-distinct first-moment consumers may supply this request-local
+    /// totality check. The producer independently certifies marginal lineage.
+    /// Its context and integer slots stay pinned for this query, never a cached
+    /// prepared plan or an external transport.
+    linear: ?@import("cypher").linear_bounds.Check = null,
 };
 pub const AggregateWeight = struct { fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null, invariants: []const []const u8 = &.{}, summaries: []const SummaryCertificate = &.{} };
 /// Borrowed snapshot-local costing evidence. Providers never perform I/O for

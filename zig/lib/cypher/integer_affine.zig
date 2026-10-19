@@ -16,8 +16,13 @@
 //! Checked integer affine lineage. Keeping the dependency even when its
 //! coefficient cancels preserves the domain and errors of intermediate nodes.
 const std = @import("std");
+pub const bounds = @import("linear_bounds.zig");
 pub const Form = struct {
     field: ?usize = null,
+    /// Multiple independent marginals certify only first moments. No concrete
+    /// coefficient or joint extremum is inferred from this symbolic form.
+    multiple: bool = false,
+    interval: ?bounds.Interval = null,
     scale: i64 = 0,
     offset: i64 = 0,
     direct: bool = false,
@@ -52,19 +57,49 @@ pub const Form = struct {
         if (left.field != null and right.field != null and left.field.? != right.field.?) return null;
         const l = left.signs();
         const r = right.signs();
-        return .{ .field = left.field orelse right.field, .symbolic = true, .sign = if (l == r) l else if (l == .zero) r else if (r == .zero) l else .unknown };
+        return .{ .field = left.field orelse right.field, .multiple = left.multiple or right.multiple, .interval = if (left.interval != null and right.interval != null) .{ .low = @min(left.interval.?.low, right.interval.?.low), .high = @max(left.interval.?.high, right.interval.?.high) } else null, .symbolic = true, .sign = if (l == r) l else if (l == .zero) r else if (r == .zero) l else .unknown };
     }
     pub fn column(field: usize) Form {
         return .{ .field = field, .scale = 1, .direct = true };
     }
     pub fn literal(value: i64) Form {
-        return .{ .offset = value };
+        return .{ .offset = value, .interval = .literal(value) };
+    }
+    pub fn bounded(self: Form, interval: bounds.Interval) Form {
+        var result = self;
+        result.interval = interval;
+        return result;
     }
     pub fn negative(self: Form) ?Form {
-        if (self.symbolic) return .{ .field = self.field, .symbolic = true, .sign = negateSign(self.sign) };
-        return .{ .field = self.field, .scale = std.math.negate(self.scale) catch return null, .offset = std.math.negate(self.offset) catch return null };
+        var result: Form = if (self.symbolic) .{ .field = self.field, .symbolic = true, .multiple = self.multiple, .sign = negateSign(self.sign) } else .{ .field = self.field, .scale = std.math.negate(self.scale) catch return null, .offset = std.math.negate(self.offset) catch return null };
+        result.interval = if (self.interval) |interval| interval.negative() else null;
+        return result;
     }
-    pub fn combine(left: Form, right: Form, op: enum { add, subtract, multiply }) ?Form {
+    const Operation = enum { add, subtract, multiply };
+    pub fn combine(left: Form, right: Form, op: Operation) ?Form {
+        if (left.multiple or right.multiple) return null;
+        var result = combineRaw(left, right, op) orelse return null;
+        if (left.interval) |l| if (right.interval) |r| {
+            result.interval = bounds.Interval.combine(l, r, @fromBackingInt(@intCast(@backingInt(op))));
+        };
+        return result;
+    }
+    /// Independent marginals may share representatives only when all arithmetic
+    /// is total over their bounding box. Ordinary evaluation retains actual
+    /// coefficients; AVG/SUM never require a fabricated joint distribution.
+    pub fn combineMarginals(left: Form, right: Form, op: Operation) ?Form {
+        if (!left.multiple and !right.multiple and (left.field == null or right.field == null or left.field.? == right.field.?)) return combine(left, right, op);
+        if (op == .multiply and left.field != null and right.field != null) return null;
+        const interval = bounds.Interval.combine(left.interval orelse return null, right.interval orelse return null, @fromBackingInt(@intCast(@backingInt(op)))) orelse return null;
+        const l = left.signs();
+        const r = right.signs();
+        return .{ .field = left.field orelse right.field, .multiple = true, .symbolic = true, .interval = interval, .sign = switch (op) {
+            .add => addSign(l, r),
+            .subtract => addSign(l, negateSign(r)),
+            .multiply => if (l == .zero or r == .zero) .zero else if (l == .unknown or r == .unknown) .unknown else if (l == r) .nonnegative else .nonpositive,
+        } };
+    }
+    fn combineRaw(left: Form, right: Form, op: Operation) ?Form {
         if (left.field != null and right.field != null and left.field.? != right.field.?) return null;
         const field = left.field orelse right.field;
         if (op == .multiply and left.field != null and right.field != null) return null;
@@ -115,4 +150,22 @@ test "symbolic affine choices retain dependency and conservative signs" {
     try std.testing.expect(Form.combine(choice, choice, .multiply) == null);
     try std.testing.expect(Form.combine(choice, Form.literal(-2), .multiply).?.oneSign());
     try std.testing.expect(!Form.combine(x, Form.invariant(), .add).?.oneSign());
+}
+
+test "independent first moments require total bounded arithmetic" {
+    const x = Form.column(0).bounded(.{ .low = 0, .high = 1024 });
+    const y = Form.column(1).bounded(.{ .low = 0, .high = 1024 });
+    const added = Form.combineMarginals(x, y, .add).?;
+    try std.testing.expect(added.multiple and added.symbolic and added.oneSign());
+    try std.testing.expectEqual(@as(i64, 2048), added.interval.?.high);
+    try std.testing.expect(Form.combine(x, y, .add) == null);
+    try std.testing.expect(Form.combineMarginals(x, y, .multiply) == null);
+    const difference = Form.combineMarginals(x, y, .subtract).?;
+    try std.testing.expect(difference.multiple and !difference.oneSign());
+    try std.testing.expectEqual(@as(i64, -1024), difference.interval.?.low);
+    const unsafe = Form.combine(x, Form.literal(std.math.maxInt(i64)), .add).?;
+    try std.testing.expect(unsafe.interval == null);
+    try std.testing.expect(Form.combineMarginals(unsafe, y, .subtract) == null);
+    try std.testing.expect(Form.combineMarginals(added, Form.literal(std.math.maxInt(i64)), .multiply) == null);
+    try std.testing.expect(Form.combineMarginals(x, Form.column(1), .add) == null);
 }

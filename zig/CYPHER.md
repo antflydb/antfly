@@ -1631,7 +1631,8 @@ length lineage. Materialized child bags and memo replay carry at most four
 integer bins per marginal, preserving exact counts, sums and extrema. Coupling
 these bins by splitting their arbitrary-precision weights avoids a Cartesian
 product. This representation is admitted only when downstream consumers observe
-individual marginal statistics; it never substitutes for an observable path.
+individual marginal statistics or certified linear first-moment consumers; it
+never substitutes for an observable path or a joint distribution.
 
 SQL aggregate requests can certify a direct integer COUNT/SUM/AVG/MIN/MAX field.
 Transparent typed renames propagate that certificate; filters, computed
@@ -1671,24 +1672,28 @@ The original expression still performs read-policy projection at evaluation;
 rebinding an alias to a map, scalar or another value cannot revive an earlier
 entity proof.
 
-After private path-summary lowering, read execution specializes total integer
+After private path-summary lowering, read execution specializes total numeric
 length guards for one ALL-path segment into its hop bounds. The same pass runs
 for native queries, returning CALL and UNION scopes, and SQL GRAPH_TABLE
 cursors. It accepts comparisons and conjunctions (including chained and
-reversed comparisons) with checked integer literals or invocation parameters.
+reversed comparisons) with checked integer or floating-point literals,
+invocation parameters and transparent constant aliases. Mixed numeric bounds
+use the runtime's exact integer/number ordering, including fractional and i64
+boundaries. A known NULL comparison accepts no rows.
 The complete predicate and pattern property expressions must certify:
 eager Boolean siblings or deferred pattern properties that can fail,
-noninteger/null bounds, unproved projection boundaries, multiple segments and shortest
+unproved bound types or projection boundaries, multiple segments and shortest
 selectors remain barriers. Contradictory ranges keep ordinary empty/optional
 semantics, and invocation-local copies leave cached query trees unchanged.
 
 Native and SQL scalar programs share checked integer affine lineage for unary
 signs, addition, subtraction and multiplication by constants. Every intermediate
-must remain affine in one marginal. Representative bags include both extrema,
+must remain affine in one marginal, or carry an independent-marginal totality
+proof for a first-moment consumer. Representative bags include both extrema,
 so the ordinary scalar evaluators still detect intermediate BIGINT overflow,
 including when a later operation cancels it. Native SUM also requires a
 one-sign argument to preserve its contribution-order overflow semantics; mixed
-signs retain the ordinary executor. Nonlinear and cross-marginal expressions
+signs retain the ordinary executor. Nonlinear expressions and joint extrema
 remain distribution-sensitive.
 
 Integer parameters specialize native affine coefficients per invocation, and
@@ -1705,8 +1710,8 @@ retain at most four integer representatives per marginal; UNWIND evaluates the
 original list for each representative with its exact multiplicity. This avoids
 length histograms without inventing branch values or changing duplicate, eager
 list evaluation, or intermediate overflow behavior. Conservative sign proofs
-allow one-sign SUM consumers; nonlinear, cross-marginal and distribution
-observers still require exact values.
+allow one-sign SUM consumers; nonlinear and distribution observers still
+require exact values.
 
 Fixed UNWIND repetitions retain scalar lineage and exact weights. Path/list
 aliases in a fixed list carry their private summaries; full values are removed
@@ -1721,7 +1726,7 @@ length-dependent filters retain their normal semantics.
 
 Invocation-local range proofs follow length aliases through transparent WITH
 projections and split conjunctions only when every crossed expression is total.
-Literal Boolean siblings and equality comparisons on known node properties may
+Known Boolean siblings and equality comparisons on known node properties may
 remain as residual filters; arbitrary functions, arithmetic projections, scope
 changes, DISTINCT, ordering, pagination and post-OPTIONAL filters remain barriers.
 Eager error-producing siblings and pattern-property expressions are never
@@ -1729,7 +1734,7 @@ pruned by a later length guard.
 
 Fixed UNWIND lists also carry endpoint identity and integer property lineage.
 All entity branches must have the same producer origin; scalar branches must
-share an affine marginal. The original list still evaluates with all duplicates,
+carry compatible affine proofs. The original list still evaluates with all duplicates,
 NULLs and errors, and opaque rebindings block prior proofs.
 
 SQL joint summary certificates prove that every input to an integer affine
@@ -1741,6 +1746,28 @@ carry this certificate and its invariant obligations. Nonlinear computations,
 filters and grouping keys that observe the marginal decline the certificate
 and retain exact distributions. Original expression evaluation on integer
 extrema preserves checked intermediate arithmetic.
+
+Independent segment lengths can also feed linear AVG, COUNT and eligible SUM
+expressions, such as `avg(size(xs)+size(ys))`. Coupled integer marginal bins
+preserve every linear first moment without constructing a Cartesian product.
+An interval proof over the statement's path-depth bound must establish that
+every intermediate integer operation is total for every possible coupling.
+Unknown bounds, multiplication of varying inputs, possible overflow and joint
+MIN/MAX or DISTINCT consumers retain exact distributions. Native integer
+parameters specialize the proof per invocation; transparent projections,
+returning CALL and finite linear UNWIND branches preserve the proof.
+
+SQL first-moment certificates carry request-local bounds checks in addition to
+producer lineage obligations. GRAPH_TABLE supplies bounds for each observed
+column and independently proves all private marginal dependencies. CTE relays
+compose the checks through their original scalar programs; physical-column
+and positional UNION ALL mappings translate the bounds into each caller's
+names. Integer parameter slots belong to the current invocation, never cached
+programs. NULL and other parameter types remain unknown and retain ordinary
+execution. Filters, grouping keys and computed error observations cannot lose
+their invariant obligations while a proof crosses a projection. Proof failures
+return to exact execution before publishing any contribution; they do not
+raise speculative arithmetic errors.
 
 Unproved length predicates, length grouping keys, non-extremum DISTINCT
 arguments and other distribution-dependent expressions retain exact hop states. Cyclic

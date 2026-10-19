@@ -22,34 +22,50 @@ const v = @import("value.zig");
 const Form = @import("integer_affine.zig").Form;
 const A = std.mem.Allocator;
 const Range = struct { low: i128, high: i128 };
-fn integer(expression: *const ast.Expr, parameters: []const v.Entry) ?i64 {
+const Origin = union(enum) { length, node, value, constant: v.Value };
+const Names = std.StringHashMapUnmanaged(Origin);
+fn constant(expression: *const ast.Expr, names: Names, parameters: []const v.Entry) ?v.Value {
     return switch (expression.value) {
-        .literal => |value| if (value == .integer) value.integer else null,
+        .literal => |literal| switch (literal) {
+            .null => .null,
+            inline else => |value, tag| @unionInit(v.Value, @tagName(tag), value),
+        },
+        .variable => |name| if (names.get(name)) |origin| (if (origin == .constant) origin.constant else null) else null,
         .parameter => |name| blk: {
-            for (parameters) |entry| if (std.mem.eql(u8, entry.name, name)) break :blk if (entry.value == .integer) entry.value.integer else null;
+            for (parameters) |entry| if (std.mem.eql(u8, entry.name, name)) break :blk switch (entry.value) {
+                .null, .boolean, .integer, .number, .string => entry.value,
+                else => null,
+            };
             break :blk null;
         },
         .unary => |u| blk: {
-            const value = integer(u.operand, parameters) orelse return null;
-            break :blk switch (u.op) {
-                .positive => value,
-                .negative => std.math.negate(value) catch null,
+            const value = constant(u.operand, names, parameters) orelse return null;
+            if (u.op == .positive and (value == .integer or value == .number)) break :blk value;
+            if (u.op != .negative) break :blk null;
+            break :blk switch (value) {
+                .integer => |n| .{ .integer = std.math.negate(n) catch return null },
+                .number => |n| .{ .number = -n },
                 else => null,
             };
         },
         .binary => |b| blk: {
-            const left = Form.literal(integer(b.left, parameters) orelse return null);
-            const right = Form.literal(integer(b.right, parameters) orelse return null);
+            const left = constant(b.left, names, parameters) orelse return null;
+            const right = constant(b.right, names, parameters) orelse return null;
+            if (left != .integer or right != .integer) break :blk null;
             const result = switch (b.op) {
-                .add => Form.combine(left, right, .add),
-                .subtract => Form.combine(left, right, .subtract),
-                .multiply => Form.combine(left, right, .multiply),
+                .add => Form.combine(Form.literal(left.integer), Form.literal(right.integer), .add),
+                .subtract => Form.combine(Form.literal(left.integer), Form.literal(right.integer), .subtract),
+                .multiply => Form.combine(Form.literal(left.integer), Form.literal(right.integer), .multiply),
                 else => null,
             } orelse return null;
-            break :blk result.offset;
+            break :blk .{ .integer = result.offset };
         },
         else => null,
     };
+}
+fn integer(expression: *const ast.Expr, parameters: []const v.Entry) ?i64 {
+    const value = constant(expression, .empty, parameters) orelse return null;
+    return if (value == .integer) value.integer else null;
 }
 fn totalProperty(expression: *const ast.Expr, parameters: []const v.Entry) bool {
     if (expression.value == .literal) return true;
@@ -67,22 +83,27 @@ fn totalProperties(path: ast.Path, parameters: []const v.Entry) bool {
     for (path.edges) |edge| for (edge.properties) |entry| if (!totalProperty(entry.value, parameters)) return false;
     return true;
 }
-const Origin = enum { length, node, value };
-const Names = std.StringHashMapUnmanaged(Origin);
 fn length(expression: *const ast.Expr, names: Names) bool {
-    return expression.value == .variable and names.get(expression.value.variable) == .length;
+    if (expression.value != .variable) return false;
+    const origin = names.get(expression.value.variable) orelse return false;
+    return origin == .length;
 }
 fn scalarRead(expression: *const ast.Expr, names: Names, parameters: []const v.Entry) bool {
+    if (constant(expression, names, parameters) != null) return true;
     return switch (expression.value) {
         .literal => true,
         .parameter => totalProperty(expression, parameters),
-        .property => |property| property.base.value == .variable and names.get(property.base.value.variable) == .node,
+        .property => |property| property.base.value == .variable and (if (names.get(property.base.value.variable)) |origin| origin == .node else false),
         else => false,
     };
 }
 fn comparison(left: *const ast.Expr, op: ast.Binary, right: *const ast.Expr, names: Names, parameters: []const v.Entry, range: *Range) bool {
     var operation = op;
-    const bound: i128 = if (length(left, names)) integer(right, parameters) orelse return false else if (length(right, names)) blk: {
+    switch (op) {
+        .eq, .neq, .lt, .lte, .gt, .gte => {},
+        else => return false,
+    }
+    const bound = if (length(left, names)) constant(right, names, parameters) orelse return false else if (length(right, names)) blk: {
         operation = switch (op) {
             .lt => .gt,
             .lte => .gte,
@@ -90,23 +111,56 @@ fn comparison(left: *const ast.Expr, op: ast.Binary, right: *const ast.Expr, nam
             .gte => .lte,
             else => op,
         };
-        break :blk integer(left, parameters) orelse return false;
+        break :blk constant(left, names, parameters) orelse return false;
     } else return false;
+    if (bound == .null) {
+        // Every comparison is UNKNOWN; the total enclosing predicate cannot
+        // accept a row. Keep normal MATCH/OPTIONAL empty-result semantics.
+        range.high = -1;
+        return true;
+    }
+    if (operation == .neq or (bound != .integer and bound != .number)) return false;
+    if (bound == .number and !std.math.isFinite(bound.number)) return false;
+    // Use the runtime's exact mixed numeric ordering. Binary search avoids
+    // lossy float-to-integer casts at fractional and i64 boundary values.
+    const ge: i128 = if (bound == .integer) @max(0, @as(i128, bound.integer)) else numericBoundary(bound, false);
+    const gt: i128 = if (bound == .integer) @max(0, @as(i128, bound.integer) + 1) else numericBoundary(bound, true);
     switch (operation) {
         .eq => {
-            range.low = @max(range.low, bound);
-            range.high = @min(range.high, bound);
+            if (ge == gt) {
+                range.high = -1;
+                return true;
+            }
+            range.low = @max(range.low, ge);
+            range.high = @min(range.high, ge);
         },
-        .gt => range.low = @max(range.low, bound + 1),
-        .gte => range.low = @max(range.low, bound),
-        .lt => range.high = @min(range.high, bound - 1),
-        .lte => range.high = @min(range.high, bound),
-        else => return false,
+        .gt => range.low = @max(range.low, gt),
+        .gte => range.low = @max(range.low, ge),
+        .lt => range.high = @min(range.high, ge - 1),
+        .lte => range.high = @min(range.high, gt - 1),
+        else => unreachable,
     }
     return true;
 }
+fn numericBoundary(bound: v.Value, strict: bool) i128 {
+    var low: i128 = 0;
+    var high: i128 = @as(i128, std.math.maxInt(i64)) + 1;
+    while (low < high) {
+        const middle = low + @divTrunc(high - low, 2);
+        const order = v.Value.compare(.{ .integer = @intCast(middle) }, bound).?;
+        if (order == .lt or (strict and order == .eq)) low = middle + 1 else high = middle;
+    }
+    return low;
+}
 const Extracted = struct { residual: ?*const ast.Expr = null, observed: bool = false };
 fn extract(a: A, expression: *const ast.Expr, names: Names, parameters: []const v.Entry, range: *Range) !?Extracted {
+    if (constant(expression, names, parameters)) |value| {
+        if (value == .null or (value == .boolean and !value.boolean)) {
+            range.high = -1;
+            return .{ .observed = true };
+        }
+        if (value == .boolean) return .{};
+    }
     switch (expression.value) {
         .binary => |binary| {
             if (binary.op == .@"and") {
@@ -140,16 +194,32 @@ fn project(a: A, projection: ast.Projection, names: Names, parameters: []const v
     var next: Names = if (projection.wildcard) try names.clone(a) else .empty;
     for (projection.items) |item| {
         const expression = item.expression;
-        const origin: Origin = if (expression.value == .variable) names.get(expression.value.variable) orelse return null else if (scalarRead(expression, names, parameters)) .value else return null;
+        const origin: Origin = if (constant(expression, names, parameters)) |value| .{ .constant = value } else if (expression.value == .variable) names.get(expression.value.variable) orelse return null else if (scalarRead(expression, names, parameters)) .value else return null;
         const name = item.alias orelse if (expression.value == .variable) expression.value.variable else return null;
         try next.put(a, name, origin);
     }
     return next;
 }
+// Prefix projections have already executed before this MATCH. Track their
+// constant outputs without claiming that unknown entity/path reads are total
+// or allowing a later filter to move across those reads.
+fn constantsProjection(a: A, projection: ast.Projection, names: Names, parameters: []const v.Entry) !Names {
+    var next: Names = if (projection.wildcard) try names.clone(a) else .empty;
+    for (projection.items) |item| {
+        const name = item.alias orelse if (item.expression.value == .variable) item.expression.value.variable else continue;
+        if (constant(item.expression, names, parameters)) |value| try next.put(a, name, .{ .constant = value }) else _ = next.remove(name);
+    }
+    return next;
+}
 fn clauses(a: A, input: []const ast.Clause, parameters: []const v.Entry) anyerror![]const ast.Clause {
     const result = try a.dupe(ast.Clause, input);
+    var prefix: Names = .empty;
     for (result, 0..) |*clause, index| switch (clause.operation) {
-        .subquery => |inner| clause.operation.subquery = try clauses(a, inner, parameters),
+        .project => |projection| prefix = try constantsProjection(a, projection.value, prefix, parameters),
+        .subquery => |inner| {
+            clause.operation.subquery = try clauses(a, inner, parameters);
+            prefix = .empty;
+        },
         .match => |*operation| {
             if (operation.paths.len != 1) continue;
             const path = operation.paths[0];
@@ -158,7 +228,8 @@ fn clauses(a: A, input: []const ast.Clause, parameters: []const v.Entry) anyerro
             // Property constraints precede WHERE, including at rejected endpoints.
             // Every boundary crossed by a range must be total, not merely pure.
             if (!totalProperties(path, parameters)) continue;
-            var names: Names = .empty;
+            var names = try prefix.clone(a);
+            prefix = .empty;
             for (path.nodes) |node| if (node.alias) |name| try names.put(a, name, .node);
             if (path.execution_summary.length) |name| try names.put(a, name, .length);
             if (path.edges[0].execution_length) |name| try names.put(a, name, .length);
@@ -205,7 +276,7 @@ fn clauses(a: A, input: []const ast.Clause, parameters: []const v.Entry) anyerro
                 if (edit.index == index) operation.predicate = edit.residual else result[edit.index].operation.project.value.predicate = edit.residual;
             }
         },
-        else => {},
+        else => prefix = .empty,
     };
     return result;
 }
