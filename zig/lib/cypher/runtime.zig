@@ -6091,9 +6091,13 @@ const Engine = struct {
             const items = try a.alloc(*const v.Relationship, page.items.len);
             for (page.items, items) |relationship, *out| out.* = (try (v.Value{ .relationship = relationship }).clone(a)).relationship;
             const owned: Key = .{ .mapping = key.mapping, .direction = key.direction, .node = .{ .table = try a.dupe(u8, key.node.table), .key = try a.dupe(u8, key.node.key) }, .cursor = if (key.cursor) |cursor| try a.dupe(u8, cursor) else null };
-            try self.pages.put(a, owned, .{ .items = items, .next = if (page.next) |next| try a.dupe(u8, next) else null });
+            // Page values remain pinned in the arena. Index rehashes must
+            // reclaim obsolete tables instead of retaining every capacity in
+            // that arena and prematurely disabling cross-batch capture.
+            try self.pages.put(self.budget.allocator(), owned, .{ .items = items, .next = if (page.next) |next| try a.dupe(u8, next) else null });
         }
         fn deinit(self: *@This()) void {
+            self.pages.deinit(self.budget.allocator());
             if (self.arena) |*arena| arena.deinit();
         }
     };
@@ -8229,4 +8233,22 @@ test "child barrier admission requires available bound pattern identities" {
     defer compiled.deinit();
     engine.source = source;
     try std.testing.expect(try engine.admissionCallShape(shape, compiled.query.clauses) != null);
+}
+
+test "adjacency page index growth reclaims obsolete hash tables" {
+    var cache: Engine.AdjacencyCache = .{ .budget = .{ .backing = std.testing.allocator, .limit = 512 << 10 } };
+    defer cache.deinit();
+    // Empty pages matter on multi-anchor sparse graphs too. Their identities
+    // fit alongside the final index; obsolete rehash tables must not consume
+    // the payload arena and disable subsequent capture admission.
+    for (0..1000) |i| {
+        var key: [40]u8 = undefined;
+        const identity: v.Identity = .{ .table = "docs", .key = try std.fmt.bufPrint(&key, "node-{d:0>32}", .{i}) };
+        try cache.put(.{ .mapping = 0, .node = identity, .direction = .out, .cursor = null }, .{ .items = &.{} });
+    }
+    for (0..1000) |i| {
+        var key: [40]u8 = undefined;
+        const identity: v.Identity = .{ .table = "docs", .key = try std.fmt.bufPrint(&key, "node-{d:0>32}", .{i}) };
+        try std.testing.expect(cache.pages.contains(.{ .mapping = 0, .node = identity, .direction = .out, .cursor = null }));
+    }
 }
