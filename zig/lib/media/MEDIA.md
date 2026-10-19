@@ -266,6 +266,10 @@ Within that immutable scope, packet-table identity and cardinality locate the
 validated content binding without another table traversal. The inspection owns
 the validated backing descriptor, so preparation does not revalidate every packet.
 Identity reuse is never a content proof outside the request lifetime.
+Host-only preflight reports its admission pressure independently of model
+workspace. Inference can reclaim relevant optional caches and retry the same
+host reservation before decoding/indexing; cancellation and permanent or forced
+denials retain their original behavior.
 
 A request may reuse its validated binding while its borrowed bytes, provider
 configuration and packet metadata remain immutable and owned through worker

@@ -280,10 +280,16 @@ fn admitWithVisionCacheReclaim(session: Session, request: @import("../backends/s
 /// Optional caches cannot starve an unchanged request reservation. Prefer
 /// vision reclamation; yield language constants only if pressure persists.
 /// Each class is attempted once, with no waiting or native locks across admit.
-fn admitReclaimingVisionCache(session: Session, request: @import("../backends/session.zig").RunRequest, control: Control, context: anytype, comptime reclaim_vision: anytype, comptime reclaim_language: anytype) !@import("../backends/session.zig").RunPermit {
+fn admitReclaimingVisionCache(session: Session, request: @import("../backends/session.zig").RunRequest, control: Control, context: anytype, comptime reclaim_vision: anytype, comptime reclaim_language: anytype) !RunPermit {
+    return admitReclaimingResources(false, session, request, control, context, reclaim_vision, reclaim_language);
+}
+fn admitHostPreprocess(session: Session, bytes: usize, control: Control) !RunPermit {
+    return admitReclaimingResources(true, session, bytes, control, session, reclaimMediaWeights, factory.reclaimEmbeddingGemma2LanguageWeights);
+}
+fn admitReclaimingResources(comptime host_only: bool, session: Session, request: if (host_only) usize else @import("../backends/session.zig").RunRequest, control: Control, context: anytype, comptime reclaim_vision: anytype, comptime reclaim_language: anytype) !RunPermit {
     try control.check();
     var pressure: ?@import("../runtime/tier/memory.zig").AdmissionPressure = null;
-    return session.admitWithPressure(request, &pressure) catch |err| blk: {
+    return (if (host_only) session.admitHostPreprocessWithPressure(request, &pressure) else session.admitWithPressure(request, &pressure)) catch |err| blk: {
         var denied: anyerror = err;
         inline for (.{ reclaim_vision, reclaim_language }) |reclaim| {
             const reason = pressure orelse return denied;
@@ -298,7 +304,7 @@ fn admitReclaimingVisionCache(session: Session, request: @import("../backends/se
             try control.check();
             if (bytes != 0) {
                 pressure = null;
-                if (session.admitWithPressure(request, &pressure)) |permit| {
+                if (if (host_only) session.admitHostPreprocessWithPressure(request, &pressure) else session.admitWithPressure(request, &pressure)) |permit| {
                     break :blk permit;
                 } else |failure| denied = failure;
             }
@@ -441,7 +447,7 @@ pub const VideoAhead = struct {
         var request_reservation = try request_pool.acquire(.{ .host_bytes = host });
         errdefer request_reservation.deinit();
         const plan = blk: {
-            var preflight = try session.admitHostPreprocess(host);
+            var preflight = try admitHostPreprocess(session, host, control);
             defer preflight.deinit();
             errdefer inspection_scope.deinit();
             const plan = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(inspection_allocator.allocator(), movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = decoder, .cache_pins = pins, .inspection_scope = inspection_scope }, session.backend() == .metal);
@@ -513,7 +519,7 @@ pub fn embedLiveWindow(out: std.mem.Allocator, session: Session, tokenizer: Toke
     try sampling.validate();
     const effective = control orelse Control{};
     const adapter = effective.imageWorkControl();
-    var window_permit = try session.admitHostPreprocess(192 * 1024 * 1024);
+    var window_permit = try admitHostPreprocess(session, 192 * 1024 * 1024, effective);
     defer window_permit.deinit();
     var window = try @import("antfly_video").live_windows.join(out, "live-model-window", segments, .{ .stream = .{ .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } } });
     defer window.deinit();
@@ -543,7 +549,7 @@ pub fn embedNextLiveCached(out: std.mem.Allocator, session: Session, tokenizer: 
     try effective.check();
     if (cache) |owner| if (owner.session.ptr != session.ptr or owner.session.vtable != session.vtable) return error.InvalidVideoCacheSession;
     if (coordinator.options.window.stream.max_bytes > 64 * 1024 * 1024 or coordinator.options.window.max_packets > 8192) return error.ResourceLimitExceeded;
-    var window_permit = try session.admitHostPreprocess(512 * 1024 * 1024);
+    var window_permit = try admitHostPreprocess(session, 512 * 1024 * 1024, effective);
     defer window_permit.deinit();
     const adapter = effective.imageWorkControl();
     const old_control = coordinator.options.window.stream.control;
@@ -728,7 +734,7 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
         const preflight_bytes = try preflightHostBytes(group);
         bounded.limit = preflight_bytes;
         if (options.video_inspection_scope) |scope| scope.limit = preflight_bytes;
-        var preflight = session.admitHostPreprocess(preflight_bytes) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
+        var preflight = admitHostPreprocess(session, preflight_bytes, effective) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
         defer preflight.deinit();
         errdefer if (options.video_inspection_scope) |scope| scope.deinit();
         var host_budget = media_admission.Pool{ .limits = .{ .host_bytes = preflight_bytes } };
@@ -938,7 +944,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer std.debug.assert(bounded.live == 0);
     defer inspection_scope.deinit();
     options.video_inspection_scope = &inspection_scope;
-    var preflight = try session.admitHostPreprocess(64 * 1024 * 1024);
+    var preflight = try admitHostPreprocess(session, 64 * 1024 * 1024, control);
     var preflight_live = true;
     defer if (preflight_live) preflight.deinit();
     errdefer inspection_scope.deinit();
@@ -1523,7 +1529,7 @@ const MixedWave = struct {
             }
             if (self.budget.limit == 64 * 1024 * 1024) self.budget.limit = @min(@as(usize, 512 * 1024 * 1024), try std.math.add(usize, 64 * 1024 * 1024, decoded));
         }
-        self.permit = try self.session.admitHostPreprocess(self.budget.limit);
+        self.permit = try admitHostPreprocess(self.session, self.budget.limit, self.control);
         const a = self.allocator();
         const scope = @import("antfly_image").work_control.Scope.enter(self.control.imageWorkControl());
         defer scope.deinit();
@@ -2729,7 +2735,7 @@ const PreparationSlot = struct {
             };
             self.input_bytes = std.math.add(usize, self.input_bytes, partBytes(part).len) catch return error.ResourceLimitExceeded;
         }
-        self.permit = try self.session.admitHostPreprocess(std.math.add(usize, self.input_bytes, if (self.source == .rasters) try rasterPreparationBytes(self.session.backend(), self.source.rasters) else 512 * 1024 * 1024) catch return error.ResourceLimitExceeded);
+        self.permit = try admitHostPreprocess(self.session, std.math.add(usize, self.input_bytes, if (self.source == .rasters) try rasterPreparationBytes(self.session.backend(), self.source.rasters) else 512 * 1024 * 1024) catch return error.ResourceLimitExceeded, self.control);
         const image_scope = @import("antfly_image").work_control.Scope.enter(self.control.imageWorkControl());
         defer image_scope.deinit();
         for (0..self.source.len()) |index| {
@@ -3052,7 +3058,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
     // Encoded dimensions are not known until decoding. Reserve bounded host
     // preprocessing before codecs; reserve GPU scratch under the model lock.
     const preprocessing_bytes = std.math.add(usize, input_bytes, 512 * 1024 * 1024) catch return error.ResourceLimitExceeded;
-    var host_permit = try session.admitHostPreprocess(preprocessing_bytes);
+    var host_permit = try admitHostPreprocess(session, preprocessing_bytes, control);
     defer host_permit.deinit();
     const image_scope = @import("antfly_image").work_control.Scope.enter(control.imageWorkControl());
     defer image_scope.deinit();
@@ -3145,7 +3151,7 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     }
     const vision_limit: usize = if (session.backend() == .metal or session.backend() == .cuda) 2 * 1024 * 1024 * 1024 else 512 * 1024 * 1024;
     _ = try projector.embeddingGemma2RasterScratch(rasters, vision_limit);
-    var host_permit = try session.admitHostPreprocess(try std.math.add(usize, input_bytes, try rasterPreparationBytes(session.backend(), rasters)));
+    var host_permit = try admitHostPreprocess(session, try std.math.add(usize, input_bytes, try rasterPreparationBytes(session.backend(), rasters)), control);
     defer host_permit.deinit();
     const image_scope = @import("antfly_image").work_control.Scope.enter(control.imageWorkControl());
     defer image_scope.deinit();
@@ -5154,4 +5160,60 @@ test "embeddinggemma2 inspection host lease transfers before preflight ends and 
     try std.testing.expectEqual(retained + 8 * 1024 * 1024, controller.snapshot().host_scratch_bytes);
     scope.deinit();
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), controller.snapshot().host_scratch_bytes);
+}
+
+test "embeddinggemma2 host preflight reclaims shared caches without reserving model compute or bypassing denial" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Probe = struct {
+        held: ?memory.AdmissionLease = null,
+        calls: usize = 0,
+        cancel: bool = false,
+        cancelled: bool = false,
+        busy: bool = false,
+        fn reclaim(self: *@This(), _: Control) !usize {
+            self.calls += 1;
+            if (self.busy) return 0;
+            self.held.?.release();
+            self.held = null;
+            self.cancelled = self.cancel;
+            return 4;
+        }
+        fn language(_: *@This(), _: Control) !usize {
+            return 0;
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+    };
+    const Mode = enum { release, cancel, busy, forced, permanent };
+    for (std.enums.values(Mode)) |mode| {
+        var controller = memory.AdmissionController{ .shared_limits = .{ .unified_limit_bytes = 8 } };
+        defer controller.deinit();
+        const limits = memory.Limits{ .host_limit_bytes = 16, .backend_limit_bytes = 16, .combined_limit_bytes = 8 };
+        var probe = Probe{ .cancel = mode == .cancel, .busy = mode == .busy };
+        probe.held = try controller.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 4 }, false);
+        defer if (probe.held) |*held| held.release();
+        if (mode == .forced) controller.configureForcedRunDenialsForTesting(1);
+        const session = Session{ .ptr = &probe, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 64, .check_live_memory = false } };
+        const control = Control{ .ptr = &probe, .check_fn = Probe.check };
+        const bytes: usize = if (mode == .permanent) 9 else 6;
+        const result = admitReclaimingResources(true, session, bytes, control, &probe, Probe.reclaim, Probe.language);
+        if (mode == .release) {
+            var permit = try result;
+            defer permit.deinit();
+            try std.testing.expectEqual(@as(usize, 6), controller.snapshot().host_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+            try permit.retainHostBytes(3);
+            try std.testing.expectEqual(@as(usize, 3), controller.snapshot().host_scratch_bytes);
+        } else {
+            try std.testing.expectError(switch (mode) {
+                .cancel => error.Cancelled,
+                .permanent => error.ResourceLimitExceeded,
+                else => error.ResourceTemporarilyUnavailable,
+            }, result);
+            try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+        }
+        try std.testing.expectEqual(@as(usize, if (mode == .forced or mode == .permanent) 0 else 1), probe.calls);
+    }
 }

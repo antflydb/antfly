@@ -1875,3 +1875,8 @@ remain live across those attempts. Completed vectors survive later pressure
 failures; only unfinished items receive indexed errors. After prepared owners
 drain, the broker may retry those failed items independently without replaying
 completed peers. Cancellation and non-pressure errors do not trigger resizing.
+
+Host-only inspection, streaming-window and media preprocessing admission use the
+same bounded cache-recovery policy as model execution. Relevant warm state is
+reclaimed before retrying the original host reservation; no compute workspace
+is reserved, no bound is reduced, and forced/permanent denials still propagate.

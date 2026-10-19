@@ -1081,3 +1081,8 @@ cohorts, including required prepared plans, conservative fallback admission
 and completed-cost observation. This is necessary for cold calibration to
 advance from width one. Pretrained qualification checks serving-path samples;
 direct batch-tower probes alone do not qualify adaptive selection.
+
+Host-only inspection, streaming-window and media preprocessing admission use the
+same bounded cache-recovery policy as model execution. Relevant warm state is
+reclaimed before retrying the original host reservation; no compute workspace
+is reserved, no bound is reduced, and forced/permanent denials still propagate.

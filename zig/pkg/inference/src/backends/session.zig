@@ -1015,12 +1015,20 @@ pub const Session = struct {
     /// discovering the actual padded sequence length, then admit the backend
     /// run using that length instead of the model's maximum context.
     pub fn admitHostPreprocess(self: Session, host_scratch_bytes: usize) !RunPermit {
+        var pressure: ?memory.AdmissionPressure = null;
+        return self.admitHostPreprocessWithPressure(host_scratch_bytes, &pressure);
+    }
+
+    /// Host-only preflight reports its denial constraint without estimating a
+    /// model run, enabling callers to reclaim relevant optional caches safely.
+    pub fn admitHostPreprocessWithPressure(self: Session, host_scratch_bytes: usize, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
         return .{
             .session = self,
-            .lease = if (self.run_admission) |admission|
-                try admission.acquireAmounts(.{ .host_scratch_bytes = host_scratch_bytes })
-            else
-                null,
+            .lease = if (self.run_admission) |admission| blk: {
+                if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
+                break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, .{ .host_scratch_bytes = host_scratch_bytes }, admission.check_live_memory, pressure);
+            } else null,
         };
     }
 
