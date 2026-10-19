@@ -1660,6 +1660,23 @@ one-sign argument to preserve its contribution-order overflow semantics; mixed
 signs retain the ordinary executor. Nonlinear and cross-marginal expressions
 remain distribution-sensitive.
 
+Integer parameters specialize native affine coefficients per invocation, and
+constant aliases retain their lineage through WITH and returning CALL. SQL
+certificates recognize typed integer parameters without embedding their bound
+values in cached programs. Endpoint property operands use symbolic affine
+proofs: every endpoint is checked for an integer operand before any bag is
+published, and ordinary representative evaluation retains read-policy
+projection and expression error boundaries. Other operand types retry the
+exact distribution executor, preserving NULL and overloaded `+` semantics.
+
+Fixed lists such as `[n,n+1,2*n]` form finite unions of affine branches. They
+retain at most four integer representatives per marginal; UNWIND evaluates the
+original list for each representative with its exact multiplicity. This avoids
+length histograms without inventing branch values or changing duplicate, eager
+list evaluation, or intermediate overflow behavior. Conservative sign proofs
+allow one-sign SUM consumers; nonlinear, cross-marginal and distribution
+observers still require exact values.
+
 Fixed UNWIND repetitions retain scalar lineage and exact weights. Path/list
 aliases in a fixed list carry their private summaries; full values are removed
 only after consumer liveness proves that the alias itself is unobserved.

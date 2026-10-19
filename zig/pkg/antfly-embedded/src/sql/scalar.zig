@@ -332,6 +332,10 @@ pub const Program = struct {
         if (instruction.input_function or instruction.type.kind != .integer) return null;
         return switch (instruction.operation) {
             .column => |column| form.column(column),
+            // Typed parameters are invocation invariants. This certificate is
+            // structural; ordinary evaluation of integer bins retains their
+            // actual coefficients, nulls and checked intermediate failures.
+            .parameter => form.invariant(),
             .literal => |value| if (value == .integer) form.literal(value.integer) else null,
             .unary => |u| blk: {
                 const operand = self.affineInstruction(u.operand, depth + 1) orelse return null;

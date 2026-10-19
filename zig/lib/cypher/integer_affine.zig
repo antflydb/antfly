@@ -21,6 +21,39 @@ pub const Form = struct {
     scale: i64 = 0,
     offset: i64 = 0,
     direct: bool = false,
+    /// Symbolic forms certify affine shape, never concrete coefficients.
+    /// Their integer representatives are evaluated by the ordinary evaluator.
+    symbolic: bool = false,
+    sign: Sign = .unknown,
+    pub const Sign = enum { unknown, nonnegative, nonpositive, zero };
+    pub fn invariant() Form {
+        return .{ .symbolic = true };
+    }
+    fn signs(self: Form) Sign {
+        if (self.symbolic) return self.sign;
+        if (self.scale == 0 and self.offset == 0) return .zero;
+        if (self.scale >= 0 and self.offset >= 0) return .nonnegative;
+        if (self.scale <= 0 and self.offset <= 0) return .nonpositive;
+        return .unknown;
+    }
+    fn negateSign(sign: Sign) Sign {
+        return switch (sign) {
+            .nonnegative => .nonpositive,
+            .nonpositive => .nonnegative,
+            else => sign,
+        };
+    }
+    fn addSign(left: Sign, right: Sign) Sign {
+        if (left == .zero) return right;
+        if (right == .zero or left == right) return left;
+        return .unknown;
+    }
+    pub fn choice(left: Form, right: Form) ?Form {
+        if (left.field != null and right.field != null and left.field.? != right.field.?) return null;
+        const l = left.signs();
+        const r = right.signs();
+        return .{ .field = left.field orelse right.field, .symbolic = true, .sign = if (l == r) l else if (l == .zero) r else if (r == .zero) l else .unknown };
+    }
     pub fn column(field: usize) Form {
         return .{ .field = field, .scale = 1, .direct = true };
     }
@@ -28,11 +61,22 @@ pub const Form = struct {
         return .{ .offset = value };
     }
     pub fn negative(self: Form) ?Form {
+        if (self.symbolic) return .{ .field = self.field, .symbolic = true, .sign = negateSign(self.sign) };
         return .{ .field = self.field, .scale = std.math.negate(self.scale) catch return null, .offset = std.math.negate(self.offset) catch return null };
     }
     pub fn combine(left: Form, right: Form, op: enum { add, subtract, multiply }) ?Form {
         if (left.field != null and right.field != null and left.field.? != right.field.?) return null;
         const field = left.field orelse right.field;
+        if (op == .multiply and left.field != null and right.field != null) return null;
+        if (left.symbolic or right.symbolic) {
+            const l = left.signs();
+            const r = right.signs();
+            return .{ .field = field, .symbolic = true, .sign = switch (op) {
+                .add => addSign(l, r),
+                .subtract => addSign(l, negateSign(r)),
+                .multiply => if (l == .zero or r == .zero) .zero else if (l == .unknown or r == .unknown) .unknown else if (l == r) .nonnegative else .nonpositive,
+            } };
+        }
         return switch (op) {
             .add => .{ .field = field, .scale = std.math.add(i64, left.scale, right.scale) catch return null, .offset = std.math.add(i64, left.offset, right.offset) catch return null },
             .subtract => .{ .field = field, .scale = std.math.sub(i64, left.scale, right.scale) catch return null, .offset = std.math.sub(i64, left.offset, right.offset) catch return null },
@@ -46,7 +90,7 @@ pub const Form = struct {
     }
     /// A one-sign argument preserves Cypher SUM's intermediate overflow.
     pub fn oneSign(self: Form) bool {
-        return (self.scale >= 0 and self.offset >= 0) or (self.scale <= 0 and self.offset <= 0);
+        return self.signs() != .unknown;
     }
 };
 
@@ -59,4 +103,16 @@ test "affine lineage retains cancelled dependencies and checked intermediates" {
     try std.testing.expect(Form.combine(x, Form.column(4), .add) == null);
     try std.testing.expect(Form.combine(Form.literal(std.math.maxInt(i64)), Form.literal(1), .add) == null);
     try std.testing.expect(Form.literal(std.math.minInt(i64)).negative() == null);
+}
+
+test "symbolic affine choices retain dependency and conservative signs" {
+    const x = Form.column(0);
+    const choice = Form.choice(x, Form.combine(x, Form.literal(1), .add).?).?;
+    try std.testing.expect(choice.symbolic and choice.oneSign());
+    try std.testing.expectEqual(@as(?usize, 0), choice.field);
+    try std.testing.expect(!Form.choice(x, x.negative().?).?.oneSign());
+    try std.testing.expect(Form.choice(x, Form.column(1)) == null);
+    try std.testing.expect(Form.combine(choice, choice, .multiply) == null);
+    try std.testing.expect(Form.combine(choice, Form.literal(-2), .multiply).?.oneSign());
+    try std.testing.expect(!Form.combine(x, Form.invariant(), .add).?.oneSign());
 }

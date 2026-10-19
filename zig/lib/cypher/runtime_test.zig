@@ -2924,3 +2924,56 @@ test "endpoint certificates decline before allocating summary geometry" {
     defer scalar_cursor.close();
     try std.testing.expect(try scalar_cursor.planSummaryFields(&.{"hops"}, .exact, "hops", &.{}) != null);
 }
+
+test "invariant aliases and affine list branches preserve exact reductions" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n,1 AS k RETURN min(n+k),max(n+k),sum(n+k)", "[[1,2,5]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN min(length(p)+b.rank),max(length(p)+b.rank),avg(length(p)+b.rank)=7.0/3", "[[1,3,true]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n UNWIND [n,n+1,0] AS x RETURN count(*),sum(x),min(x),max(x)", "[[9,7,0,2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n UNWIND [n,n+1] AS x UNWIND [x,2*x] AS y RETURN count(*),sum(y),min(y),max(y)", "[[12,21,0,4]]");
+    try check("CALL { MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n UNWIND [n,n+1] AS x RETURN x } RETURN count(*),sum(x),min(x),max(x)", "[[6,7,0,2]]");
+    try check("WITH 1 AS k MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n,'x' AS k RETURN min(n+k),max(n+k)", "[[\"0x\",\"1x\"]]");
+    try check("WITH 1 AS k MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n UNWIND ['x'] AS k RETURN min(n+k),max(n+k)", "[[\"0x\",\"1x\"]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n,{rank:'x'} AS b RETURN min(n+b.rank),max(n+b.rank)", "[[\"0x\",\"1x\"]]");
+    // A distribution observer must keep actual values rather than moment bins.
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n UNWIND [n,n+1] AS x WITH x WHERE x=1 RETURN count(*)", "[[3]]");
+    // Noninteger endpoint properties retain overloaded + and NULL semantics.
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN min(length(p)+b.id),max(length(p)+b.id)", "[[\"0a\",\"1b\"]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN count(length(p)+b.missing),avg(length(p)+b.missing)", "[[0,null]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n WHERE b.rank<0 UNWIND [n,n+9223372036854775807] AS x RETURN avg(x)", "[[null]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n UNWIND [n,n+9223372036854775807] AS x RETURN avg(x)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}
+
+test "bound affine parameters retain invocation types nulls and overflow" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN min(length(p)+$offset),max(length(p)+$offset),count(length(p)+$offset)", .{}, &diagnostic);
+    defer compiled.deinit();
+    for ([_]v.Value{ .{ .integer = 1 }, .{ .integer = -2 }, .null, .{ .string = "x" } }, [_][]const u8{ "[[1,2,3]]", "[[-2,-1,3]]", "[[null,null,0]]", "[[\"0x\",\"1x\",3]]" }) |value, expected| {
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "offset", .value = value }}, .{});
+        defer result.deinit();
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, result.rows, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectEqualStrings(expected, json);
+    }
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "offset", .value = .{ .integer = std.math.maxInt(i64) } }}, .{}));
+}
+
+test "invariant and affine choice proofs release failed allocations" {
+    const Campaign = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n,b.rank AS k UNWIND [n,n+k] AS x RETURN min(x),max(x),avg(x)", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 3), result.rows[0][1].integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}

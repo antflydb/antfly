@@ -190,7 +190,7 @@ pub const NodeCursor = struct {
             if (std.mem.eql(u8, name, field)) {
                 var names: Engine.MomentNames = .empty;
                 try names.put(self.engine.a, target, Engine.Affine.column(0));
-                const form = Engine.momentArgument(item.expression, names) orelse return null;
+                const form = self.engine.momentArgument(item.expression, names) orelse return null;
                 if (form.field == null) return null;
                 found = true;
             } else if (path_summaries.references(item.expression, target)) return null;
@@ -1006,6 +1006,10 @@ const Engine = struct {
     expression_memo: ?CallMemo = null,
     moment_targets: []const SummaryTarget = &.{},
     external_summary: ?[]const u8 = null,
+    moment_input: Row = &.{},
+    moment_endpoint: ?[]const u8 = null,
+    moment_invariants: std.ArrayList(*const ast.Expr) = .empty,
+    moment_representatives: bool = false,
     moment_calls: ?[]const ?DirectMoment = null,
     moment_checks: std.AutoHashMapUnmanaged(*const ast.Expr, Affine) = .empty,
     active_moments: ?struct { values: PathMoments, checks: std.AutoHashMapUnmanaged(*const ast.Expr, Affine) } = null,
@@ -4291,11 +4295,32 @@ const Engine = struct {
         const saved_checks = self.moment_checks;
         self.moment_checks = .empty;
         defer self.moment_checks = saved_checks;
+        const prior_input = self.moment_input;
+        const prior_endpoint = self.moment_endpoint;
+        const prior_invariants = self.moment_invariants;
+        const prior_representatives = self.moment_representatives;
+        self.moment_input = input.row;
+        self.moment_endpoint = path.nodes[path.nodes.len - 1].alias;
+        self.moment_invariants = .empty;
+        self.moment_representatives = false;
+        defer {
+            self.moment_input = prior_input;
+            self.moment_endpoint = prior_endpoint;
+            self.moment_invariants = prior_invariants;
+            self.moment_representatives = prior_representatives;
+        }
         if (try self.momentTargets(path)) |targets| {
             const saved = self.moment_targets;
             self.moment_targets = targets;
             defer self.moment_targets = saved;
-            return self.countAllPathsTyped(PathMoments, input, path, mode, starts, output);
+            if (self.countAllPathsTyped(PathMoments, input, path, mode, starts, output)) |result| return result else |err| switch (err) {
+                // The entire endpoint set is certified before publishing any
+                // contribution. Noninteger properties retain overloaded Cypher
+                // operations through the exact distribution executor.
+                error.CypherMomentTypeDeclined => {},
+                else => return err,
+            }
+            self.moment_calls = null;
         }
         // Native and SQL exact consumers keep arbitrary-precision counts.
         // Bounded and presence consumers retain the compact u64 DP.
@@ -4317,7 +4342,9 @@ const Engine = struct {
     const MomentCall = enum { count, sum, avg, min, max };
     const DirectMoment = struct { kind: MomentCall, form: Affine, expression: *const ast.Expr };
     const Affine = @import("integer_affine.zig").Form;
-    const MomentNames = std.StringHashMapUnmanaged(Affine);
+    // A null entry is a lexical shadow with no affine proof. Keeping it
+    // prevents an older input binding from being reused after WITH/UNWIND.
+    const MomentNames = std.StringHashMapUnmanaged(?Affine);
     const SummaryTarget = struct { name: []const u8, edge: ?usize = null };
     const MomentStats = struct { sum: Count = Count.init(0), min: usize = 0, max: usize = 0 };
     /// The fields are independent marginals. Their joint distribution is never
@@ -4365,17 +4392,32 @@ const Engine = struct {
             return .{ .count = self.count, .parts = parts };
         }
     };
-    fn referencesAny(value: anytype, names: anytype) bool {
+    fn referencesAny(value: anytype, names: MomentNames) bool {
         var keys = names.keyIterator();
-        while (keys.next()) |key| if (path_summaries.references(value, key.*)) return true;
+        while (keys.next()) |key| if (names.get(key.*).?) |form| {
+            if (form.field != null and path_summaries.references(value, key.*)) return true;
+        };
         return false;
     }
-    fn momentArgument(expression: *const ast.Expr, names: MomentNames) ?Affine {
+    fn momentArgument(self: *Engine, expression: *const ast.Expr, names: MomentNames) ?Affine {
         return switch (expression.value) {
-            .variable => |name| names.get(name),
+            .variable => |name| if (names.get(name)) |proof| proof else if (lookup(self.moment_input, name)) |value| (if (value == .integer) Affine.literal(value.integer) else null) else null,
+            .parameter => |name| if (lookup(self.parameters, name)) |value| (if (value == .integer) Affine.literal(value.integer) else null) else null,
+            .property => |property| blk: {
+                // Property reads retain the ordinary policy projection even
+                // when their raw input is already bound at the anchor.
+                if (property.base.value == .variable) {
+                    if (names.contains(property.base.value.variable)) break :blk null;
+                    if (lookup(self.moment_input, property.base.value.variable) != null) break :blk Affine.invariant();
+                    if (self.moment_endpoint) |endpoint| {
+                        if (std.mem.eql(u8, endpoint, property.base.value.variable)) break :blk Affine.invariant();
+                    }
+                }
+                break :blk null;
+            },
             .literal => |value| if (value == .integer) Affine.literal(value.integer) else null,
             .unary => |u| blk: {
-                const operand = momentArgument(u.operand, names) orelse return null;
+                const operand = self.momentArgument(u.operand, names) orelse return null;
                 break :blk switch (u.op) {
                     .positive => operand,
                     .negative => operand.negative(),
@@ -4383,8 +4425,8 @@ const Engine = struct {
                 };
             },
             .binary => |b| blk: {
-                const left = momentArgument(b.left, names) orelse return null;
-                const right = momentArgument(b.right, names) orelse return null;
+                const left = self.momentArgument(b.left, names) orelse return null;
+                const right = self.momentArgument(b.right, names) orelse return null;
                 break :blk switch (b.op) {
                     .add => Affine.combine(left, right, .add),
                     .subtract => Affine.combine(left, right, .subtract),
@@ -4396,15 +4438,27 @@ const Engine = struct {
         };
     }
     fn retainMomentChecks(self: *Engine, expression: *const ast.Expr, names: MomentNames) anyerror!void {
+        const optional = self.momentArgument(expression, names);
+        if (optional) |form| if (form.symbolic) {
+            self.moment_representatives = true;
+        };
         switch (expression.value) {
             .unary => |u| try self.retainMomentChecks(u.operand, names),
             .binary => |b| {
                 try self.retainMomentChecks(b.left, names);
                 try self.retainMomentChecks(b.right, names);
             },
+            .property => {
+                const form = optional orelse return;
+                if (form.symbolic) {
+                    for (self.moment_invariants.items) |prior| if (prior == expression) return;
+                    try self.moment_invariants.append(self.a, expression);
+                }
+                return;
+            },
             else => return,
         }
-        const form = momentArgument(expression, names) orelse return;
+        const form = optional orelse return;
         if (form.field != null) try self.moment_checks.put(self.a, expression, form);
     }
     fn validateMomentNode(self: *Engine, expression: *const ast.Expr) !void {
@@ -4452,11 +4506,12 @@ const Engine = struct {
         return true;
     }
     fn affineValue(form: Affine, input: usize) !i64 {
+        std.debug.assert(!form.symbolic);
         return std.math.cast(i64, @as(i128, form.scale) * @as(i128, input) + form.offset) orelse error.CypherNumericOverflow;
     }
-    fn momentKind(aggregate_function: ast.Function, names: MomentNames) ?MomentCall {
+    fn momentKind(self: *Engine, aggregate_function: ast.Function, names: MomentNames) ?MomentCall {
         if (aggregate_function.args.len != 1) return null;
-        const form = momentArgument(aggregate_function.args[0], names) orelse return null;
+        const form = self.momentArgument(aggregate_function.args[0], names) orelse return null;
         if (form.field == null) return null;
         if (std.ascii.eqlIgnoreCase(aggregate_function.name, "sum") and !form.oneSign()) return null;
         inline for (@typeInfo(MomentCall).@"enum".field_names) |name| {
@@ -4464,31 +4519,34 @@ const Engine = struct {
         }
         return null;
     }
-    fn momentSafe(value: anytype, names: MomentNames) bool {
+    fn momentSafe(self: *Engine, value: anytype, names: MomentNames) anyerror!bool {
         const T = @TypeOf(value);
-        if (T == ast.MapSelector) if (value == .variable) return !names.contains(value.variable);
+        if (T == ast.MapSelector) if (value == .variable) return if (names.get(value.variable)) |proof| (if (proof) |form| form.field == null else true) else true;
         if (T == ast.Expr) {
-            if (value.value == .variable) return !names.contains(value.value.variable);
+            if (value.value == .variable) return if (names.get(value.value.variable)) |proof| (if (proof) |form| form.field == null else true) else true;
             if (value.value == .call) {
                 const invocation = value.value.call;
                 if (std.ascii.eqlIgnoreCase(invocation.name, "collect")) return false;
-                if (momentKind(invocation, names) != null) return true;
+                if (self.momentKind(invocation, names) != null) {
+                    try self.retainMomentChecks(invocation.args[0], names);
+                    return true;
+                }
             }
         }
         switch (@typeInfo(T)) {
             .pointer => |p| {
-                if (p.size == .one and p.child == ast.Expr) return momentSafe(value.*, names);
+                if (p.size == .one and p.child == ast.Expr) return self.momentSafe(value.*, names);
                 if (p.size == .slice and p.child != u8) for (value) |child| {
-                    if (!momentSafe(child, names)) return false;
+                    if (!try self.momentSafe(child, names)) return false;
                 };
             },
             .@"struct" => |info| inline for (info.field_names) |name| {
-                if (!momentSafe(@field(value, name), names)) return false;
+                if (!try self.momentSafe(@field(value, name), names)) return false;
             },
             .@"union" => switch (value) {
-                inline else => |child| return momentSafe(child, names),
+                inline else => |child| return self.momentSafe(child, names),
             },
-            .optional => if (value) |child| return momentSafe(child, names),
+            .optional => if (value) |child| return self.momentSafe(child, names),
             else => {},
         }
         return true;
@@ -4497,12 +4555,13 @@ const Engine = struct {
         if (projection.distinct or projection.skip != null or projection.limit != null or projection.order.len != 0) return null;
         var next: MomentNames = if (projection.wildcard) try names.clone(self.a) else .empty;
         for (projection.items) |item| {
-            if (momentArgument(item.expression, names)) |form| if (form.field != null) {
+            if (self.momentArgument(item.expression, names)) |form| {
                 try self.retainMomentChecks(item.expression, names);
                 try next.put(self.a, item.alias orelse try self.expressionName(item.expression), form);
                 continue;
-            };
+            }
             if (referencesAny(item.expression, names)) return null;
+            try next.put(self.a, item.alias orelse try self.expressionName(item.expression), null);
         }
         if (referencesAny(projection.predicate, names) or referencesAny(projection.predicate, next)) return null;
         return next;
@@ -4516,17 +4575,18 @@ const Engine = struct {
                 if (referencesAny(u.expression, names)) {
                     const items = if (u.expression.value == .list) u.expression.value.list else &.{u.expression};
                     for (items) |item| {
-                        const candidate = momentArgument(item, names) orelse return null;
-                        if (candidate.field == null) return null;
+                        const candidate = self.momentArgument(item, names) orelse return null;
                         try self.retainMomentChecks(item, names);
                         if (form) |prior| {
-                            if (prior.field != candidate.field or prior.scale != candidate.scale or prior.offset != candidate.offset) return null;
+                            if (prior.symbolic or candidate.symbolic or prior.field != candidate.field or prior.scale != candidate.scale or prior.offset != candidate.offset) {
+                                form = Affine.choice(prior, candidate) orelse return null;
+                                self.moment_representatives = true;
+                            }
                         } else form = candidate;
                     }
                 }
                 names = try names.clone(self.a);
-                _ = names.remove(u.alias);
-                if (form) |value| try names.put(self.a, u.alias, value);
+                try names.put(self.a, u.alias, form);
             },
             .subquery => |inner| {
                 if (inner.len == 0 or inner[inner.len - 1].operation != .project or !inner[inner.len - 1].operation.project.final) return null;
@@ -4553,7 +4613,7 @@ const Engine = struct {
                     const reduction = for (projection.items) |item| {
                         if (aggregates(item.expression)) break true;
                     } else false;
-                    if (reduction) return momentSafe(projection, names);
+                    if (reduction) return self.momentSafe(projection, names);
                     names = (try self.momentProjection(projection, names)) orelse return false;
                 } else if (clause.operation == .subquery or clause.operation == .unwind) {
                     names = (try self.momentMiddle(&.{clause}, names)) orelse return false;
@@ -4594,15 +4654,15 @@ const Engine = struct {
                 start = next.index;
             } else {
                 if (fold.calls.len != 0) {
-                    if (!momentSafe(fold.projection, names)) return null;
+                    if (!try self.momentSafe(fold.projection, names)) return null;
                     if (fold == self.stream_fold.? and self.momentLocal(fold.middle)) {
                         const calls = try self.a.alloc(?DirectMoment, fold.calls.len);
                         for (fold.calls, calls) |expression, *call_input| {
                             const invocation = expression.value.call;
-                            call_input.* = if (momentKind(invocation, names)) |kind| .{ .kind = kind, .form = momentArgument(invocation.args[0], names).?, .expression = invocation.args[0] } else null;
+                            call_input.* = if (self.momentKind(invocation, names)) |kind| .{ .kind = kind, .form = self.momentArgument(invocation.args[0], names).?, .expression = invocation.args[0] } else null;
                             if (call_input.* != null) try self.retainMomentChecks(invocation.args[0], names);
                         }
-                        self.moment_calls = calls;
+                        if (!self.moment_representatives) self.moment_calls = calls;
                     }
                     return targets;
                 }
@@ -4883,6 +4943,21 @@ const Engine = struct {
             resumed.row = (try self.bind(input.row, path.nodes[0].alias, .{ .node = starts[0] })).?;
             try self.pathStep(resumed, path, mode, 0, &.{starts[0]}, &.{}, output);
             return true;
+        }
+        if (W == PathMoments and self.moment_invariants.items.len != 0) {
+            // Type admission is effect-free and cannot raise an expression
+            // error behind a filter. Check all endpoints before emitting a bag.
+            var candidates = current.iterator();
+            while (candidates.next()) |endpoint| {
+                if (waysCap(endpoint.value_ptr.*) == 0) continue;
+                const node = graph.nodes.items[graph.nodeIndex(endpoint.key_ptr.*)].node;
+                const row = (try self.bind(input.row, path.nodes[path.nodes.len - 1].alias, .{ .node = node })) orelse continue;
+                for (self.moment_invariants.items) |expression| {
+                    try self.state();
+                    const value = self.constant(expression, row) orelse return error.CypherMomentTypeDeclined;
+                    if (value != .integer) return error.CypherMomentTypeDeclined;
+                }
+            }
         }
         var counts = current.iterator();
         while (counts.next()) |endpoint| {

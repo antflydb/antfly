@@ -3216,6 +3216,17 @@ def test_sql_graph_statistics_use_consumer_certificates(graph_db):
         if len(result[0]) > 1:
             assert result[0][1] == str(layers)
             assert float(result[0][2]) == pytest.approx(average, rel=1e-13)
+    for statement in (
+        f"SELECT min(hops+$1),max(hops+$1),avg(hops+$1) FROM {relation}",
+        f"WITH t AS (SELECT hops+$1 AS n FROM {relation}) SELECT min(n),max(n),avg(n) FROM t",
+    ):
+        for offset in (1, -2):
+            assert db.sql(statement, [offset])["rows"][0] == [
+                str(1 + offset),
+                str(layers + offset),
+                pytest.approx(average + offset, rel=1e-13),
+            ]
+    assert db.sql(f"SELECT count(hops+$1),avg(hops+$1) FROM {relation}", [None])["rows"] == [["0", None]]
     grouped = relation.replace("length(p) AS hops", "length(p) AS hops,b.score AS depth")
     assert db.sql(f"SELECT min(hops+1),max(hops+1),avg(hops+1) FROM {grouped} WHERE depth>0")["rows"][0] == [
         "2",
@@ -3308,3 +3319,41 @@ def test_affine_and_fixed_unwind_keep_length_statistics_compressed(graph_db):
         if "CALL" in tail:
             expected = [str(2 * int(minimum)), str(2 * int(maximum)), pytest.approx(2 * average, rel=1e-13)]
         assert [cell["value"] for cell in result["rows"][0]] == expected
+
+
+def test_invariant_and_branch_moments_avoid_length_histograms(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 35000}
+    control = db.cypher_json(
+        "g", {"query": base + "RETURN min(length(p)),max(length(p)),avg(length(p))", "limits": limits}
+    )
+    minimum, maximum, average = [cell["value"] for cell in control["rows"][0]]
+    cases = (
+        ("RETURN min(length(p)+$offset),max(length(p)+$offset),avg(length(p)+$offset)", 1, 1),
+        ("WITH length(p) AS n,1 AS k RETURN min(n+k),max(n+k),avg(n+k)", 1, 1),
+        ("WITH length(p) AS n UNWIND [n,n+1] AS x RETURN min(x),max(x),avg(x)", 0, 0.5),
+        ("WITH length(p) AS n UNWIND [n,2*n] AS x RETURN min(x),max(x)/2,avg(x)", 0, None),
+    )
+    for tail, offset, average_offset in cases:
+        result = db.cypher_json("g", {"query": base + tail, "parameters": {"offset": 1}, "limits": limits})
+        expected_maximum = int(maximum) + (1 if "n,n+1" in tail else offset)
+        expected_average = average * 1.5 if average_offset is None else average + average_offset
+        assert [cell["value"] for cell in result["rows"][0]] == [
+            str(int(minimum) + offset),
+            str(expected_maximum),
+            pytest.approx(expected_average, rel=1e-13),
+        ]
+    # Endpoint values are constant inside each endpoint bag. Verify this proof
+    # survives both direct properties and a projected invariant alias.
+    for tail in (
+        "RETURN b.score,min(length(p)+b.score),max(length(p)+b.score),avg(length(p)+b.score) ORDER BY b.score",
+        "WITH b.score AS depth,length(p) AS n RETURN depth,min(n+depth),max(n+depth),avg(n+depth) ORDER BY depth",
+    ):
+        rows = db.cypher_json("g", {"query": base + tail, "limits": {**limits, "intermediate_states": 50000}})["rows"]
+        assert len(rows) == 68
+        for row in rows:
+            depth, low, high = [int(cell["value"]) for cell in row[:3]]
+            assert (low, high) == ((depth + 1) // 2 + depth, 2 * depth)
