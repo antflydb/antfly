@@ -256,6 +256,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     parser_source.addOptions("antfly_local_test_sources", parser_selection);
     const schema_parser_tests = b.addTest(.{
         .root_module = parser_source,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .filters = selectTestFilters(b, &.{"relational contract schema parsing uses bounded stack"}),
     });
     const schema_contract_step = b.step("antfly-schema-contract-test", "Run bounded schema parsing and public response/sort contracts");
@@ -2729,7 +2730,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
     // Query-engine and SQL owners run their shared kernels and lake-named
     // regressions. Broad scaffold filters must not select those tests again.
-    addRuntimeSkipTestFilters(run_lake_scaffold_tests, &.{ "encoding.roaring.test.", "sql." });
+    addRuntimeSkipTestFilters(run_lake_scaffold_tests, &.{ "encoding.roaring.test.", "sql.", "storage.rowsource.types.test.", "storage.typed_json.test.", "system_catalog.domain.test." });
     const lake_integration_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_integration_test_root.zig"),
         .target = target,
@@ -4919,8 +4920,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone Lite transaction sessions survive file reopen",
             "durable session mutations publish only after persistence succeeds",
             "durable session limits bound count and encoded record size",
-            "common config rejects removed top-level storage backend fields",
-            "common config parses bounded transaction session policy",
             "parse cli accepts inference budget overrides",
             "standalone preserves effective process envelope provenance for inference",
             "standalone kernel JIT mode precedence is CLI then environment then config",

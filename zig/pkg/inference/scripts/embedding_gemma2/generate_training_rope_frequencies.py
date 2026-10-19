@@ -29,7 +29,9 @@ def render(model: Path) -> str:
         EmbeddingGemma2RotaryEmbedding,
     )
 
-    config = EmbeddingGemma2Config.from_pretrained(model, local_files_only=True).text_config
+    config = EmbeddingGemma2Config.from_pretrained(
+        model, local_files_only=True
+    ).text_config
     rotary = EmbeddingGemma2RotaryEmbedding(config, device="cpu")
     result = [
         "// Copyright 2026 Antfly, Inc.",
@@ -66,7 +68,11 @@ def render(model: Path) -> str:
             f"static __device__ __constant__ unsigned int eg2_training_rope_{name}_bits[{len(bits)}] = {{"
         )
         for offset in range(0, len(bits), 8):
-            result.append("    " + ", ".join(f"0x{value:08x}u" for value in bits[offset : offset + 8]) + ",")
+            result.append(
+                "    "
+                + ", ".join(f"0x{value:08x}u" for value in bits[offset : offset + 8])
+                + ","
+            )
         result.extend(["};", ""])
     result.extend(
         [
@@ -90,7 +96,8 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(__file__).resolve().parents[2] / "src/ops/cuda/kernels/embedding_gemma2_training_rope.cuh",
+        default=Path(__file__).resolve().parents[2]
+        / "src/ops/cuda/kernels/embedding_gemma2_training_rope.cuh",
     )
     parser.add_argument("--write", action="store_true")
     args = parser.parse_args()
@@ -98,7 +105,9 @@ def main() -> None:
     if args.write:
         args.output.write_text(expected)
     elif args.output.read_text() != expected:
-        raise SystemExit("training RoPE constants differ from the pinned reference initialization")
+        raise SystemExit(
+            "training RoPE constants differ from the pinned reference initialization"
+        )
     print("official training RoPE: 384 FP32 frequencies verified")
 
 
