@@ -338,6 +338,79 @@ pub const Program = struct {
         if (self.output_type.kind != .integer) return false;
         return self.affineInstruction(self.root, 0, .shared) != null;
     }
+    /// Syntactic candidate only. The producer supplies bounded, typed lineage
+    /// before this can authorize representative rows.
+    pub fn numericLinearCandidate(self: Program) bool {
+        if (self.output_type.kind != .integer and self.output_type.kind != .number) return false;
+        for (self.instructions) |instruction| {
+            if (instruction.input_function or (instruction.type.kind != .integer and instruction.type.kind != .number)) return false;
+            switch (instruction.operation) {
+                .column, .literal, .parameter => {},
+                .cast => |c| if (c.type != .number or (c.element_type != null and c.element_type != .float64)) return false,
+                .unary => |u| if (u.op != .positive and u.op != .negative) return false,
+                .binary => |b| if (b.op != .add and b.op != .subtract and b.op != .multiply and b.op != .divide) return false,
+                else => return false,
+            }
+        }
+        return true;
+    }
+    pub fn numericProof(self: Program, a: Allocator, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, scalars: []const ?@import("cypher").linear_numeric.Lattice) !?@import("cypher").linear_numeric.Form {
+        return self.numericInstruction(a, self.root, 0, columns, fields, scalars);
+    }
+    fn numericInstruction(self: Program, a: Allocator, index: u32, depth: usize, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, scalars: []const ?@import("cypher").linear_numeric.Lattice) anyerror!?@import("cypher").linear_numeric.Form {
+        const N = @import("cypher").linear_numeric;
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or (instruction.type.kind != .integer and instruction.type.kind != .number) or instruction.type.element_type == .float32) return null;
+        return switch (instruction.operation) {
+            .column => |column| blk: {
+                if (column >= columns.len) break :blk null;
+                for (fields) |field| if (std.mem.eql(u8, field.name, columns[column].name)) break :blk field.numeric;
+                break :blk null;
+            },
+            .literal => |value| switch (value) {
+                .integer => |n| N.Form.literal(.integer(n)),
+                .float => |n| N.Form.literal(N.Lattice.number(n) orelse return null),
+                .number_string => |text| N.Form.literal(N.Lattice.decimal(text) orelse return null),
+                else => null,
+            },
+            .parameter => |slot| if (slot < scalars.len) (if (scalars[slot]) |value| N.Form.literal(value) else null) else null,
+            .unary => |u| blk: {
+                const operand = (try self.numericInstruction(a, u.operand, depth + 1, columns, fields, scalars)) orelse return null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => try operand.negative(a),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const left = (try self.numericInstruction(a, b.left, depth + 1, columns, fields, scalars)) orelse return null;
+                const right = (try self.numericInstruction(a, b.right, depth + 1, columns, fields, scalars)) orelse return null;
+                const op: N.Op = switch (b.op) {
+                    .add => .add,
+                    .subtract => .subtract,
+                    .multiply => .multiply,
+                    .divide => .divide,
+                    else => return null,
+                };
+                const result = (try N.Form.combine(left, right, a, op)) orelse return null;
+                // NUMERIC division selects a display scale from each row's
+                // magnitude. Even an exact quotient can change the aggregate's
+                // retained scale when representatives omit an interior value.
+                // Binary64 division has no such observable decimal metadata.
+                if (op == .divide and instruction.type.element_type == .numeric and (!left.constant() or result.range.shift < -16)) return null;
+                break :blk result;
+            },
+            .cast => |c| blk: {
+                if (c.type != .number or (c.element_type != null and c.element_type != .float64)) return null;
+                var result = (try self.numericInstruction(a, c.operand, depth + 1, columns, fields, scalars)) orelse return null;
+                if (!result.range.exactFloat()) return null;
+                result.range.floating = true;
+                break :blk result;
+            },
+            else => null,
+        };
+    }
     /// A request-local totality proof for linear consumers. Unknown parameter
     /// or column bounds decline compression rather than speculating about an
     /// error. Every intermediate instruction must fit the integer domain.
@@ -7177,4 +7250,41 @@ test "SQL quantified JSONB compatibility inputs are logical while text casts sti
     defer arena.deinit();
     try std.testing.expect((try program.evaluate(arena.allocator(), &.{ .json(.{ .string = "\"alpha\"" }), .typedArray(&source) }, &.{}, .{})).value.bool);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, program.evaluate(arena.allocator(), &.{ .json(.{ .string = "alpha" }), .typedArray(&source) }, &.{}, .{}));
+}
+
+test "SQL bounded linear certificates retain segment axes and exact numeric domains" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const N = @import("cypher").linear_numeric;
+    const columns = [_]Column{ .{ .name = "a", .type = .integer }, .{ .name = "b", .type = .integer } };
+    const fields = [_]@import("cypher").linear_bounds.Field{
+        .{ .name = "a", .bounds = .{ .low = 0, .high = 1024 }, .numeric = try N.Form.column(arena.allocator(), .{ .low = 0, .high = 1024 }, 2, 0) },
+        .{ .name = "b", .bounds = .{ .low = 0, .high = 1024 }, .numeric = try N.Form.column(arena.allocator(), .{ .low = 0, .high = 1024 }, 2, 1) },
+    };
+    const Case = struct { sql: []const u8, admitted: bool, total: bool = false };
+    for ([_]Case{
+        .{ .sql = "a+b", .admitted = true, .total = true },
+        .{ .sql = "a-b", .admitted = true },
+        .{ .sql = "2.0*a", .admitted = true },
+        .{ .sql = "(a+b)/2.0", .admitted = false },
+        .{ .sql = "CAST(a+b AS float8)/2.0", .admitted = true, .total = true },
+        .{ .sql = "CAST(a AS float8)*2", .admitted = true },
+        .{ .sql = "0.1*a", .admitted = false },
+        .{ .sql = "a/3.0", .admitted = false },
+        .{ .sql = "a/2", .admitted = false },
+        .{ .sql = "a/0.0", .admitted = false },
+        .{ .sql = "a/1152921504606846976.0", .admitted = false },
+        .{ .sql = "(a+9223372036854775807)-b", .admitted = false },
+        .{ .sql = "a*b", .admitted = false },
+    }) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &columns, &.{}, .{});
+        defer program.deinit();
+        const proof = try program.numericProof(arena.allocator(), &columns, &fields, &.{});
+        try std.testing.expectEqual(entry.admitted, proof != null);
+        if (entry.admitted) try std.testing.expect(program.numericLinearCandidate());
+        if (proof) |form| try std.testing.expectEqual(entry.total, form.total());
+    }
 }

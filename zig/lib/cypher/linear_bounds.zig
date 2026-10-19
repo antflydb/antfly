@@ -39,9 +39,12 @@ pub const Interval = struct {
         return .{ .low = std.math.cast(i64, low) orelse return null, .high = std.math.cast(i64, high) orelse return null };
     }
 };
-pub const Field = struct { name: []const u8, bounds: ?Interval };
+pub const Field = struct { name: []const u8, bounds: ?Interval, numeric: ?@import("linear_numeric.zig").Form = null };
 pub const Check = struct {
     ptr: *const anyopaque,
+    total_only: bool = false,
+    numeric_required: bool = false,
+    scalars: []const ?@import("linear_numeric.zig").Lattice = &.{},
     /// Invocation-local known integer slots for composed proof programs.
     /// NULL and other types remain unknown; they never become zero.
     integers: []const ?i64 = &.{},

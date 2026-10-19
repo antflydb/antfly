@@ -120,6 +120,7 @@ pub const NodeCursor = struct {
     multiplicity: Multiplicity = .exact,
     summary: ?[]const u8 = null,
     linear_summary: bool = false,
+    total_axis: bool = false,
     weighted_seeds: ?Engine.AnchorBatch = null,
     fallback_seed: ?usize = null,
     weighted_arena: std.heap.ArenaAllocator,
@@ -129,7 +130,7 @@ pub const NodeCursor = struct {
     /// Compact prefix counts; exact consumers must read last_counts.
     last_weights: std.ArrayList(u64) = .empty,
     last_counts: std.ArrayList(Count) = .empty,
-    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity, summary: ?[]const u8 = null, linear: bool = false };
+    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity, summary: ?[]const u8 = null, linear: bool = false, total_axis: bool = false };
     /// Plan a projected endpoint bag without advancing or rebinding the read
     /// cut. Plans and their AST storage belong to this cursor.
     pub fn planWeightFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity) !?WeightPlan {
@@ -194,26 +195,40 @@ pub const NodeCursor = struct {
         if (targets.len == 0 or (targets.len != 1 and check == null)) return null;
         const target = targets[0].name;
         var names: Engine.MomentNames = .empty;
-        for (targets, 0..) |part, index| try names.put(self.engine.a, part.name, .{ .scalar = Engine.Affine.column(index).bounded(.{ .low = 0, .high = std.math.cast(i64, self.engine.limits.path_depth) orelse std.math.maxInt(i64) }) });
+        for (targets, 0..) |part, index| {
+            var form = Engine.Affine.column(index).bounded(.{ .low = 0, .high = std.math.cast(i64, self.engine.limits.path_depth) orelse std.math.maxInt(i64) });
+            form.numeric = try Engine.Numeric.Form.column(self.engine.a, .{ .low = 0, .high = form.interval.?.high }, if (targets.len == 1) 1 else plan.path.edges.len, if (targets.len == 1) null else part.edge);
+            try names.put(self.engine.a, part.name, .{ .scalar = form });
+        }
         var found = false;
         var bounds: std.ArrayList(@import("linear_bounds.zig").Field) = .empty;
+        var total_projections = true;
         for (plan.projection.items) |item| {
             const name = item.alias orelse try self.engine.expressionName(item.expression);
             const reads = Engine.referencesAny(item.expression, names);
-            const form = self.engine.momentArgument(item.expression, names);
+            const form = try self.engine.momentArgument(item.expression, names);
+            if (reads and (form == null or form.?.numeric == null)) total_projections = false;
             if (std.mem.eql(u8, name, field)) {
                 const proof = form orelse return null;
                 if (proof.field == null) return null;
                 found = true;
             } else if (reads and (!joint or form == null or (targets.len == 1 and form.?.multiple))) return null;
             for (invariants) |invariant| if (std.mem.eql(u8, invariant, name) and reads) return null;
-            try bounds.append(self.engine.a, .{ .name = name, .bounds = if (form) |proof| proof.interval else null });
+            try bounds.append(self.engine.a, .{ .name = name, .bounds = if (form) |proof| proof.interval else null, .numeric = if (form) |proof| proof.numeric else null });
         }
         if (!found or Engine.referencesAny(.{ plan.projection.predicate, self.original_match.predicate }, names)) return null;
-        if (targets.len > 1) {
-            if (!try check.?.accepts(self.engine.a, bounds.items)) return null;
-            plan.linear = true;
+        if (check) |proof| {
+            // The existing single integer marginal preserves intermediate
+            // errors by evaluating its actual extrema. Only new numeric or
+            // multi-marginal transports need a totality obligation.
+            const floating = for (bounds.items) |bound| {
+                if (bound.numeric) |numeric| if (numeric.range.floating) break true;
+            } else false;
+            if ((targets.len > 1 or proof.numeric_required or floating) and !try proof.accepts(self.engine.a, bounds.items)) return null;
+            plan.total_axis = proof.total_only and targets.len > 1;
+            if (plan.total_axis and !total_projections) return null;
         }
+        if (targets.len > 1) plan.linear = true;
         plan.summary = target;
         return plan;
     }
@@ -259,6 +274,7 @@ pub const NodeCursor = struct {
         self.multiplicity = plan.multiplicity;
         self.summary = plan.summary;
         self.linear_summary = plan.linear;
+        self.total_axis = plan.total_axis;
         const predicates = try self.engine.batchPredicates(plan.path, &.{}, clauses[0].operation.match.predicate);
         self.weighted_seeds = .{ .admission = predicates.admission, .residual = predicates.residual, .path = plan.path, .input = .{ .row = &.{} }, .mode = clauses[0].operation.match.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
     }
@@ -300,11 +316,13 @@ pub const NodeCursor = struct {
         e.weighted_sink = .{ .ptr = self, .emit = emitWeighted, .multiplicity = self.multiplicity };
         e.external_summary = self.summary;
         e.external_linear_summary = self.linear_summary;
+        e.external_total_axis = self.total_axis;
         e.stream_predicate = if (self.weighted_seeds != null and input.row.len == 0) self.weighted_seeds.?.residual else self.query.clauses[0].operation.match.predicate;
         defer {
             e.weighted_sink = null;
             e.external_summary = null;
             e.external_linear_summary = false;
+            e.external_total_axis = false;
             e.stream_predicate = null;
         }
         var ignored: std.ArrayList(Engine.MatchState) = .empty;
@@ -1028,6 +1046,8 @@ const Engine = struct {
     moment_targets: []const SummaryTarget = &.{},
     external_summary: ?[]const u8 = null,
     external_linear_summary: bool = false,
+    external_total_axis: bool = false,
+    moment_total_axis: bool = false,
     moment_input: Row = &.{},
     moment_endpoint: ?[]const u8 = null,
     moment_invariants: std.ArrayList(*const ast.Expr) = .empty,
@@ -4321,6 +4341,7 @@ const Engine = struct {
         const prior_endpoint = self.moment_endpoint;
         const prior_invariants = self.moment_invariants;
         const prior_representatives = self.moment_representatives;
+        const prior_axis = self.moment_total_axis;
         self.moment_input = input.row;
         self.moment_endpoint = path.nodes[path.nodes.len - 1].alias;
         self.moment_invariants = .empty;
@@ -4330,6 +4351,7 @@ const Engine = struct {
             self.moment_endpoint = prior_endpoint;
             self.moment_invariants = prior_invariants;
             self.moment_representatives = prior_representatives;
+            self.moment_total_axis = prior_axis;
         }
         if (try self.momentTargets(path)) |targets| {
             const saved = self.moment_targets;
@@ -4368,7 +4390,7 @@ const Engine = struct {
     // alias keeps its original bag binding without reviving a shadowed value.
     const MomentBinding = union(enum) { scalar: Affine, entity: []const u8, blocked };
     const MomentNames = std.StringHashMapUnmanaged(MomentBinding);
-    const SummaryTarget = struct { name: []const u8, edge: ?usize = null };
+    const SummaryTarget = struct { name: []const u8, edge: ?usize = null, zero: bool = false };
     const MomentStats = struct { sum: Count = Count.init(0), min: usize = 0, max: usize = 0 };
     /// The fields are independent marginals. Their joint distribution is never
     /// synthesized unless every downstream consumer observes only a certified
@@ -4406,7 +4428,7 @@ const Engine = struct {
             const parts = try a.alloc(MomentStats, targets.len);
             for (parts, targets, 0..) |*out, target, i| {
                 out.* = self.part(i);
-                if (target.edge == null or target.edge.? == edge) {
+                if (!target.zero and (target.edge == null or target.edge.? == edge)) {
                     out.sum = try out.sum.add(a, self.count);
                     out.min += 1;
                     out.max += 1;
@@ -4434,35 +4456,79 @@ const Engine = struct {
         if (self.moment_endpoint) |endpoint| if (std.mem.eql(u8, endpoint, name)) return name;
         return null;
     }
-    fn momentArgument(self: *Engine, expression: *const ast.Expr, names: MomentNames) ?Affine {
+    const Numeric = @import("linear_numeric.zig");
+    fn numericLiteral(value: v.Value) ?Numeric.Form {
+        return switch (value) {
+            .integer => |n| Numeric.Form.literal(.integer(n)),
+            .number => |n| Numeric.Form.literal(Numeric.Lattice.number(n) orelse return null),
+            else => null,
+        };
+    }
+    fn numericAffine(proof: Numeric.Form, field: ?usize, multiple: bool) Affine {
+        return .{ .field = field, .multiple = multiple, .symbolic = true, .floating = proof.range.floating, .numeric = proof, .sign = if (proof.range.low >= 0) .nonnegative else if (proof.range.high <= 0) .nonpositive else .unknown };
+    }
+    fn momentLiteral(value: v.Value) ?Affine {
+        const proof = numericLiteral(value) orelse return null;
+        if (value == .integer) {
+            var form = Affine.literal(value.integer);
+            form.numeric = proof;
+            return form;
+        }
+        return numericAffine(proof, null, false);
+    }
+    fn momentArgument(self: *Engine, expression: *const ast.Expr, names: MomentNames) anyerror!?Affine {
         return switch (expression.value) {
-            .variable => |name| if (names.get(name)) |proof| (if (proof == .scalar) proof.scalar else null) else if (lookup(self.moment_input, name)) |value| (if (value == .integer) Affine.literal(value.integer) else null) else null,
-            .parameter => |name| if (lookup(self.parameters, name)) |value| (if (value == .integer) Affine.literal(value.integer) else null) else null,
+            .variable => |name| if (names.get(name)) |binding| (if (binding == .scalar) binding.scalar else null) else if (lookup(self.moment_input, name)) |value| momentLiteral(value) else null,
+            .parameter => |name| if (lookup(self.parameters, name)) |value| momentLiteral(value) else null,
             .property => |property| if (self.momentEntity(property.base, names) != null) Affine.invariant() else null,
-            .literal => |value| if (value == .integer) Affine.literal(value.integer) else null,
+            .literal => |value| switch (value) {
+                .integer => |n| momentLiteral(.{ .integer = n }),
+                .number => |n| momentLiteral(.{ .number = n }),
+                else => null,
+            },
             .unary => |u| blk: {
-                const operand = self.momentArgument(u.operand, names) orelse return null;
-                break :blk switch (u.op) {
-                    .positive => operand,
-                    .negative => operand.negative(),
-                    else => null,
+                const operand = (try self.momentArgument(u.operand, names)) orelse return null;
+                if (u.op == .positive) break :blk operand;
+                if (u.op != .negative) return null;
+                const numeric = if (operand.numeric) |n| try n.negative(self.a) else null;
+                if (!operand.floating) if (operand.negative()) |original| {
+                    var result = original;
+                    result.numeric = numeric;
+                    break :blk result;
                 };
+                break :blk numericAffine(numeric orelse return null, operand.field, operand.multiple);
             },
             .binary => |b| blk: {
-                const left = self.momentArgument(b.left, names) orelse return null;
-                const right = self.momentArgument(b.right, names) orelse return null;
-                break :blk switch (b.op) {
-                    .add => Affine.combineMarginals(left, right, .add),
-                    .subtract => Affine.combineMarginals(left, right, .subtract),
-                    .multiply => Affine.combineMarginals(left, right, .multiply),
-                    else => null,
+                const op: Numeric.Op = switch (b.op) {
+                    .add => .add,
+                    .subtract => .subtract,
+                    .multiply => .multiply,
+                    .divide => .divide,
+                    else => return null,
                 };
+                const left = (try self.momentArgument(b.left, names)) orelse return null;
+                const right = (try self.momentArgument(b.right, names)) orelse return null;
+                const numeric = if (left.numeric) |l| (if (right.numeric) |r| try Numeric.Form.combine(l, r, self.a, op) else null) else null;
+                if (!left.floating and !right.floating and op != .divide) {
+                    const original = switch (op) {
+                        .add => Affine.combineMarginals(left, right, .add),
+                        .subtract => Affine.combineMarginals(left, right, .subtract),
+                        .multiply => Affine.combineMarginals(left, right, .multiply),
+                        .divide => unreachable,
+                    };
+                    if (original) |form| {
+                        var result = form;
+                        result.numeric = numeric;
+                        break :blk result;
+                    }
+                }
+                break :blk numericAffine(numeric orelse return null, left.field orelse right.field, left.multiple or right.multiple or (left.field != null and right.field != null and left.field.? != right.field.?));
             },
             else => null,
         };
     }
     fn retainMomentChecks(self: *Engine, expression: *const ast.Expr, names: MomentNames) anyerror!void {
-        const optional = self.momentArgument(expression, names);
+        const optional = try self.momentArgument(expression, names);
         if (optional) |form| if (form.symbolic) {
             self.moment_representatives = true;
         };
@@ -4544,11 +4610,14 @@ const Engine = struct {
         std.debug.assert(!form.symbolic);
         return std.math.cast(i64, @as(i128, form.scale) * @as(i128, input) + form.offset) orelse error.CypherNumericOverflow;
     }
-    fn momentKind(self: *Engine, aggregate_function: ast.Function, names: MomentNames) ?MomentCall {
+    fn momentKind(self: *Engine, aggregate_function: ast.Function, names: MomentNames) !?MomentCall {
         if (aggregate_function.args.len != 1) return null;
-        const form = self.momentArgument(aggregate_function.args[0], names) orelse return null;
+        const form = (try self.momentArgument(aggregate_function.args[0], names)) orelse return null;
         if (form.field == null) return null;
-        if (form.multiple and (form.interval == null or aggregate_function.distinct or
+        if (self.moment_total_axis) {
+            const proof = form.numeric orelse return null;
+            if (!proof.total() or (aggregate_function.distinct and !(std.ascii.eqlIgnoreCase(aggregate_function.name, "min") or std.ascii.eqlIgnoreCase(aggregate_function.name, "max")))) return null;
+        } else if (form.multiple and ((form.interval == null and form.numeric == null) or aggregate_function.distinct or
             !(std.ascii.eqlIgnoreCase(aggregate_function.name, "avg") or std.ascii.eqlIgnoreCase(aggregate_function.name, "sum") or std.ascii.eqlIgnoreCase(aggregate_function.name, "count")))) return null;
         if (std.ascii.eqlIgnoreCase(aggregate_function.name, "sum") and !form.oneSign()) return null;
         inline for (@typeInfo(MomentCall).@"enum".field_names) |name| {
@@ -4564,7 +4633,7 @@ const Engine = struct {
             if (value.value == .call) {
                 const invocation = value.value.call;
                 if (std.ascii.eqlIgnoreCase(invocation.name, "collect")) return false;
-                if (self.momentKind(invocation, names) != null) {
+                if ((try self.momentKind(invocation, names)) != null) {
                     try self.retainMomentChecks(invocation.args[0], names);
                     return true;
                 }
@@ -4592,7 +4661,8 @@ const Engine = struct {
         if (projection.distinct or projection.skip != null or projection.limit != null or projection.order.len != 0) return null;
         var next: MomentNames = if (projection.wildcard) try names.clone(self.a) else .empty;
         for (projection.items) |item| {
-            if (self.momentArgument(item.expression, names)) |form| {
+            if (try self.momentArgument(item.expression, names)) |form| {
+                if (self.moment_total_axis and form.field != null and form.numeric == null) return null;
                 try self.retainMomentChecks(item.expression, names);
                 try next.put(self.a, item.alias orelse try self.expressionName(item.expression), .{ .scalar = form });
                 continue;
@@ -4614,7 +4684,7 @@ const Engine = struct {
                 var proven = true;
                 const items = if (u.expression.value == .list) u.expression.value.list else &.{u.expression};
                 for (items) |item| {
-                    if (self.momentArgument(item, names)) |candidate| {
+                    if (try self.momentArgument(item, names)) |candidate| {
                         if (entity != null) {
                             proven = false;
                             break;
@@ -4682,11 +4752,41 @@ const Engine = struct {
         return targets.items;
     }
     fn momentTargets(self: *Engine, path: ast.Path) !?[]const SummaryTarget {
+        if (self.weighted_sink == null and path.edges.len > 1 and (try self.summaryTargets(path)).len > 1) {
+            self.moment_total_axis = true;
+            if (try self.planMomentTargets(path)) |targets| return try self.totalTargets(targets);
+            self.moment_checks = .empty;
+            self.moment_invariants = .empty;
+            self.moment_representatives = false;
+            self.moment_calls = null;
+        }
+        self.moment_total_axis = self.external_total_axis;
+        const targets = (try self.planMomentTargets(path)) orelse return null;
+        return if (self.moment_total_axis) try self.totalTargets(targets) else targets;
+    }
+    fn totalTargets(self: *Engine, targets: []const SummaryTarget) ![]const SummaryTarget {
+        const out = try self.a.dupe(SummaryTarget, targets);
+        for (out) |*target| {
+            target.zero = target.edge != null and target.edge.? != 0;
+            target.edge = null;
+        }
+        // Original expressions run on the canonical representative: the first
+        // segment carries the total, all others are zero. The certificate proves
+        // that every consumer is invariant under this substitution.
+        self.moment_representatives = true;
+        self.moment_calls = null;
+        return out;
+    }
+    fn planMomentTargets(self: *Engine, path: ast.Path) !?[]const SummaryTarget {
         if (self.component_leaves.len != 0) return null;
         const targets = try self.summaryTargets(path);
         if (targets.len == 0) return null;
         var names: MomentNames = .empty;
-        for (targets, 0..) |target, i| try names.put(self.a, target.name, .{ .scalar = Affine.column(i).bounded(.{ .low = 0, .high = std.math.cast(i64, self.limits.path_depth) orelse std.math.maxInt(i64) }) });
+        for (targets, 0..) |target, i| {
+            var form = Affine.column(i).bounded(.{ .low = 0, .high = std.math.cast(i64, self.limits.path_depth) orelse std.math.maxInt(i64) });
+            form.numeric = try Numeric.Form.column(self.a, .{ .low = 0, .high = form.interval.?.high }, path.edges.len, target.edge);
+            try names.put(self.a, target.name, .{ .scalar = form });
+        }
         if (referencesAny(self.stream_predicate, names)) return null;
         if (self.weighted_sink) |_| {
             // External consumers negotiate this certificate before advancing.
@@ -4712,7 +4812,7 @@ const Engine = struct {
                         const calls = try self.a.alloc(?DirectMoment, fold.calls.len);
                         for (fold.calls, calls) |expression, *call_input| {
                             const invocation = expression.value.call;
-                            call_input.* = if (self.momentKind(invocation, names)) |kind| .{ .kind = kind, .form = self.momentArgument(invocation.args[0], names).?, .expression = invocation.args[0] } else null;
+                            call_input.* = if (try self.momentKind(invocation, names)) |kind| .{ .kind = kind, .form = (try self.momentArgument(invocation.args[0], names)).?, .expression = invocation.args[0] } else null;
                             if (call_input.* != null) try self.retainMomentChecks(invocation.args[0], names);
                         }
                         if (!self.moment_representatives) self.moment_calls = calls;

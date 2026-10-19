@@ -325,7 +325,11 @@ fn supportsWeights(bound: *const binding.Bound) bool {
     if (bound.ordered.len != 0) return false;
     for (bound.specs) |spec| {
         if (spec.kind == .pattern_set) return false;
-        if (!spec.distinct and (spec.kind == .sum or spec.kind == .avg) and spec.input_type != .integer and spec.input_element != .numeric) return false;
+        if (!spec.distinct and (spec.kind == .sum or spec.kind == .avg) and spec.input_type != .integer and spec.input_element != .numeric) {
+            // AVG can retain an exact weighted binary64 total. SUM keeps its
+            // ordered overflow behavior and REAL keeps its own rounding rules.
+            if (spec.kind != .avg or spec.input_type != .number or (spec.input_element != null and spec.input_element != .float64)) return false;
+        }
     }
     if (bound.input.predicate) |program| if (!program.repeatable()) return false;
     for (bound.input.projections) |program| if (program) |value| if (!value.repeatable()) return false;
@@ -350,14 +354,23 @@ const LinearConsumer = struct {
     program: scalar.Program,
     columns: []const scalar.Column,
     integers: []const ?i64,
-    fn validate(ptr: *const anyopaque, _: std.mem.Allocator, fields: []const @import("cypher").linear_bounds.Field) !bool {
+    scalars: []const ?@import("cypher").linear_numeric.Lattice,
+    total_only: bool,
+    fn validate(ptr: *const anyopaque, a: std.mem.Allocator, fields: []const @import("cypher").linear_bounds.Field) !bool {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
-        return self.program.linearBounds(self.columns, fields, self.integers) != null;
+        if (try self.program.numericProof(a, self.columns, fields, self.scalars)) |proof| return !self.total_only or proof.total();
+        return !self.total_only and self.program.linearBounds(self.columns, fields, self.integers) != null;
     }
 };
 fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: catalog.Table, conditions: []const catalog.Condition, parameters: []const Json) ![]const catalog.AggregateWeight {
     const integers = try a.alloc(?i64, parameters.len);
     for (parameters, integers) |parameter, *integer| integer.* = if (parameter == .integer) parameter.integer else null;
+    const scalars = try a.alloc(?@import("cypher").linear_numeric.Lattice, parameters.len);
+    for (parameters, scalars) |parameter, *value| value.* = switch (parameter) {
+        .integer => |n| .integer(n),
+        .float => |n| @import("cypher").linear_numeric.Lattice.number(n),
+        else => null,
+    };
     const requests = try a.alloc(catalog.AggregateWeight, bound.specs.len);
     var stable: std.StringHashMapUnmanaged(void) = .empty;
     for (conditions) |condition| try stable.put(a, condition.column, {});
@@ -392,17 +405,17 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
             (spec.kind == .count or spec.kind == .sum or spec.kind == .avg or spec.kind == .min or spec.kind == .max))
         {
             if (input) |slot| if (bound.input.projections[slot]) |program| {
-                if (program.required_columns.len != 0 and program.affineTogether()) {
+                if (program.required_columns.len != 0 and (program.affineTogether() or program.numericLinearCandidate())) {
                     var stable_fields: std.ArrayList([]const u8) = .empty;
                     var stable_inputs = invariant.keyIterator();
                     while (stable_inputs.next()) |key| try stable_fields.append(a, key.*);
                     var linear: ?@import("cypher").linear_bounds.Check = null;
-                    if (spec.kind == .count or spec.kind == .sum or spec.kind == .avg) {
+                    {
                         const consumer = try a.create(LinearConsumer);
                         const columns = try a.dupe(scalar.Column, bound.input.columns);
                         for (program.required_columns) |ordinal| columns[ordinal].name = (try table.column(columns[ordinal].name)).path;
-                        consumer.* = .{ .program = program, .columns = columns, .integers = integers };
-                        linear = .{ .ptr = consumer, .validate = LinearConsumer.validate, .integers = integers };
+                        consumer.* = .{ .program = program, .columns = columns, .integers = integers, .scalars = scalars, .total_only = spec.kind == .min or spec.kind == .max };
+                        linear = .{ .ptr = consumer, .validate = LinearConsumer.validate, .integers = integers, .scalars = scalars, .total_only = consumer.total_only, .numeric_required = !program.affineTogether() };
                     }
                     try summaries.append(a, .{ .field = (try table.column(bound.input.columns[program.required_columns[0]].name)).path, .invariants = stable_fields.items, .joint = true, .linear = linear });
                 }

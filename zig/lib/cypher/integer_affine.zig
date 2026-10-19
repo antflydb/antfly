@@ -19,6 +19,8 @@ const std = @import("std");
 pub const bounds = @import("linear_bounds.zig");
 pub const Form = struct {
     field: ?usize = null,
+    numeric: ?@import("linear_numeric.zig").Form = null,
+    floating: bool = false,
     /// Multiple independent marginals certify only first moments. No concrete
     /// coefficient or joint extremum is inferred from this symbolic form.
     multiple: bool = false,
@@ -57,7 +59,7 @@ pub const Form = struct {
         if (left.field != null and right.field != null and left.field.? != right.field.?) return null;
         const l = left.signs();
         const r = right.signs();
-        return .{ .field = left.field orelse right.field, .multiple = left.multiple or right.multiple, .interval = if (left.interval != null and right.interval != null) .{ .low = @min(left.interval.?.low, right.interval.?.low), .high = @max(left.interval.?.high, right.interval.?.high) } else null, .symbolic = true, .sign = if (l == r) l else if (l == .zero) r else if (r == .zero) l else .unknown };
+        return .{ .numeric = if (left.numeric) |left_numeric| (if (right.numeric) |right_numeric| @import("linear_numeric.zig").Form.choice(left_numeric, right_numeric) else null) else null, .field = left.field orelse right.field, .multiple = left.multiple or right.multiple, .floating = left.floating or right.floating, .interval = if (left.interval != null and right.interval != null) .{ .low = @min(left.interval.?.low, right.interval.?.low), .high = @max(left.interval.?.high, right.interval.?.high) } else null, .symbolic = true, .sign = if (l == r) l else if (l == .zero) r else if (r == .zero) l else .unknown };
     }
     pub fn column(field: usize) Form {
         return .{ .field = field, .scale = 1, .direct = true };
@@ -71,7 +73,7 @@ pub const Form = struct {
         return result;
     }
     pub fn negative(self: Form) ?Form {
-        var result: Form = if (self.symbolic) .{ .field = self.field, .symbolic = true, .multiple = self.multiple, .sign = negateSign(self.sign) } else .{ .field = self.field, .scale = std.math.negate(self.scale) catch return null, .offset = std.math.negate(self.offset) catch return null };
+        var result: Form = if (self.symbolic) .{ .field = self.field, .symbolic = true, .multiple = self.multiple, .floating = self.floating, .sign = negateSign(self.sign) } else .{ .field = self.field, .scale = std.math.negate(self.scale) catch return null, .offset = std.math.negate(self.offset) catch return null };
         result.interval = if (self.interval) |interval| interval.negative() else null;
         return result;
     }

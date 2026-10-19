@@ -95,7 +95,13 @@ pub const Plan = struct {
         fn validate(ptr: *const anyopaque, a: A, fields: []const FieldBounds) !bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             const renamed = try a.alloc(FieldBounds, self.from.len);
-            for (self.from, self.to, renamed) |from, to, *out| out.* = .{ .name = from, .bounds = fieldBounds(fields, to) };
+            for (self.from, self.to, renamed) |from, to, *out| {
+                out.* = .{ .name = from, .bounds = fieldBounds(fields, to) };
+                for (fields) |field| if (std.mem.eql(u8, field.name, to)) {
+                    out.numeric = field.numeric;
+                    break;
+                };
+            }
             return self.next.accepts(a, renamed);
         }
     };
@@ -103,7 +109,7 @@ pub const Plan = struct {
         const original = check orelse return null;
         const owned = try a.create(RenamedCheck);
         owned.* = .{ .next = original, .from = from, .to = to };
-        return .{ .ptr = owned, .validate = RenamedCheck.validate, .integers = original.integers };
+        return .{ .ptr = owned, .validate = RenamedCheck.validate, .integers = original.integers, .scalars = original.scalars, .total_only = original.total_only, .numeric_required = original.numeric_required };
     }
     const ProjectedCheck = struct {
         next: LinearCheck,
@@ -121,7 +127,12 @@ pub const Plan = struct {
                 // A demanded or otherwise observed arithmetic projection must
                 // retain every intermediate error, even if a reducer ignores it.
                 if (program) |p| if (p.affineTogether() and interval == null) return false;
-                out.* = .{ .name = field, .bounds = interval };
+                const numeric = if (program) |p| try p.numericProof(a, bound.columns, fields, self.next.scalars) else blk: {
+                    for (fields) |input| if (std.mem.eql(u8, input.name, query.statement.columns[ordinal].field)) break :blk input.numeric;
+                    break :blk null;
+                };
+                if (program) |p| if (p.numericLinearCandidate() and numeric == null and (interval == null or self.next.total_only)) return false;
+                out.* = .{ .name = field, .bounds = interval, .numeric = numeric };
             }
             return self.next.accepts(a, projected);
         }
@@ -130,7 +141,7 @@ pub const Plan = struct {
         const original = check orelse return null;
         const owned = try a.create(ProjectedCheck);
         owned.* = .{ .next = original, .node = node, .fields = try names(a, wanted) };
-        return .{ .ptr = owned, .validate = ProjectedCheck.validate, .integers = original.integers };
+        return .{ .ptr = owned, .validate = ProjectedCheck.validate, .integers = original.integers, .scalars = original.scalars, .total_only = original.total_only, .numeric_required = original.numeric_required };
     }
     fn projectCertificates(a: A, node: *const binding.Node, request: catalog.AggregateWeight, wanted: Names) ![]const catalog.SummaryCertificate {
         const query = node.operation.query;
@@ -146,7 +157,7 @@ pub const Plan = struct {
                     if (!wanted.contains(column.internal)) continue;
                     try projectionInputs(a, &inputs, node, ordinal);
                     if (ordinal < bound.projections.len) if (bound.projections[ordinal]) |program| {
-                        if (!program.affineTogether()) try programFields(a, &stable, program, bound.columns);
+                        if (!program.affineTogether() and !program.numericLinearCandidate()) try programFields(a, &stable, program, bound.columns);
                     };
                 }
                 var input_keys = inputs.keyIterator();

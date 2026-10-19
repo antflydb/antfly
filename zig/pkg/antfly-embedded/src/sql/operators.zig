@@ -1770,9 +1770,17 @@ pub const Grouped = struct {
     /// Merge one exact SQL reducer contribution for a compressed source bag.
     /// Importing typed states shares admission, DISTINCT and spill machinery
     /// with ordinary partial aggregation, without narrowing BIGINT sums.
+    fn hasFloatingAverage(self: *const Grouped, inputs: []const Datum) bool {
+        if (inputs.len != self.specs.len) return false;
+        for (self.specs, inputs) |spec, input| {
+            if (!input.sql_null and !spec.distinct and spec.kind == .avg and spec.input_type == .number and (spec.input_element == null or spec.input_element == .float64)) return true;
+        }
+        return false;
+    }
     pub fn addWeighted(self: *Grouped, keys: []const Datum, inputs: []const Datum, weight: u64) !void {
         if (weight == 1) return self.add(keys, inputs);
         if (self.failed or self.finished or inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len) or weight == 0 or weight > std.math.maxInt(i64)) return error.InvalidSqlBackendResponse;
+        if (weight > 1 and self.hasFloatingAverage(inputs)) return self.addCount(keys, inputs, @import("catalog.zig").Count.init(weight));
         var arena = std.heap.ArenaAllocator.init(self.backing);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1804,7 +1812,7 @@ pub const Grouped = struct {
     }
 
     pub fn addCount(self: *Grouped, keys: []const Datum, inputs: []const Datum, count: @import("catalog.zig").Count) !void {
-        if (count.exact()) |weight| if (weight <= std.math.maxInt(i64)) return self.addWeighted(keys, inputs, weight);
+        if (count.exact()) |weight| if (weight <= std.math.maxInt(i64) and (weight <= 1 or !self.hasFloatingAverage(inputs))) return self.addWeighted(keys, inputs, weight);
         if (self.failed or self.finished or inputs.len != self.specs.len or count.cap(1) == 0) return error.InvalidSqlBackendResponse;
         var arena = std.heap.ArenaAllocator.init(self.backing);
         defer arena.deinit();
@@ -1821,8 +1829,14 @@ pub const Grouped = struct {
                 try state.update(input);
                 continue;
             }
-            if (spec.kind == .count) return error.SqlNumericOutOfRange;
+            if (spec.kind == .count) {
+                const weight = count.exact() orelse return error.SqlNumericOutOfRange;
+                if (weight > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+                state.count = weight;
+                continue;
+            }
             if (spec.kind != .sum and spec.kind != .avg) return error.InvalidSqlBackendResponse;
+            if (input.value == .float and (spec.kind != .avg or spec.input_element == .float32)) return error.InvalidSqlBackendResponse;
             if (state.numeric) |reducer| {
                 reducer.deinit();
                 a.destroy(reducer);

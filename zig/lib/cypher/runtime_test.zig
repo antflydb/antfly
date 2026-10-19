@@ -3101,3 +3101,21 @@ test "constant bounds cross total unknown bindings without crossing errors" {
     var fixture: Fixture = .{};
     try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
 }
+
+test "exact floating summaries and total-axis bags retain aggregate values and allocation failures" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN min(2.0*length(p)),max(length(p)/2.0),avg(length(p)/2.0)>0.33 AND avg(length(p)/2.0)<0.34", "[[0,0.5,true]]");
+    try check("MATCH p=(a:Document {id:'a'})-[xs:CITES*0..1]->()-[ys:CITES*0..1]->(b) RETURN min(size(xs)+size(ys)),max(size(xs)+size(ys)),min(size(xs)-size(ys)),max(size(xs)-size(ys))", "[[0,2,-1,1]]");
+    const Campaign = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH p=(a:Document {id:'a'})-[xs:CITES*0..1]->()-[ys:CITES*0..1]->(b) WITH size(xs) AS x,size(ys) AS y RETURN min(x+y),max(0.5*(x+y))", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 0), result.rows[0][0].integer);
+            try std.testing.expectEqual(@as(f64, 1), result.rows[0][1].number);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}

@@ -377,7 +377,7 @@ pub const Cursor = struct {
                     var selected: ?usize = null;
                     for (candidates.items, 0..) |candidate, position| {
                         if (candidate.plan.summary == null or !std.mem.eql(u8, candidate.plan.summary.?, plan.summary.?) or
-                            candidate.plan.linear != plan.linear or candidate.plan.path.execution_reversed != plan.path.execution_reversed or candidate.plan.projection.items.len != plan.projection.items.len) continue;
+                            candidate.plan.linear != plan.linear or candidate.plan.total_axis != plan.total_axis or candidate.plan.path.execution_reversed != plan.path.execution_reversed or candidate.plan.projection.items.len != plan.projection.items.len) continue;
                         const same_fields = for (plan.projection.items) |item| {
                             const name = item.alias.?;
                             const present = for (candidate.plan.projection.items) |other| {

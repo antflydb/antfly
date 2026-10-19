@@ -1752,7 +1752,7 @@ expressions, such as `avg(size(xs)+size(ys))`. Coupled integer marginal bins
 preserve every linear first moment without constructing a Cartesian product.
 An interval proof over the statement's path-depth bound must establish that
 every intermediate integer operation is total for every possible coupling.
-Unknown bounds, multiplication of varying inputs, possible overflow and joint
+Unknown bounds, multiplication of varying inputs, possible overflow and unproved joint
 MIN/MAX or DISTINCT consumers retain exact distributions. Native integer
 parameters specialize the proof per invocation; transparent projections,
 returning CALL and finite linear UNWIND branches preserve the proof.
@@ -1768,6 +1768,37 @@ execution. Filters, grouping keys and computed error observations cannot lose
 their invariant obligations while a proof crosses a projection. Proof failures
 return to exact execution before publishing any contribution; they do not
 raise speculative arithmetic errors.
+
+Bounded numeric certificates also retain exact binary lattices: multiplication
+by `2.0`, division by `2.0`, and invocation-local floating parameters can share
+length moments when every conversion and intermediate operation is exact over
+the producer's bounds. Lattice numerators must fit binary64's significand and
+results must remain finite without subnormal rounding. Arbitrary floating
+scales and reciprocals that may round retain exact distributions. SQL preserves
+the distinction between integer division, binary floating arithmetic and exact
+NUMERIC literals; decimal literals must equal the certified lattice. Varying NUMERIC
+division retains exact distributions because its row-dependent display scale
+is observable even when the quotient is exact. Original scalar evaluation
+still produces the public value and type. Proof construction visits each native
+expression once and propagates allocation failures. SQL binary64 AVG transports
+exact weighted totals and arbitrary-precision counts through the existing wide
+reducer and spill format. Its inputs use exact binary64 decomposition rather
+than SQL's rounded float-to-NUMERIC cast, with guard digits at the final float
+conversion. Ordinary unweighted states stay compact. Floating SUM retains its
+ordered overflow behavior and REAL retains its own rounding rules.
+
+Segment provenance identifies a further shared axis: a linear consumer whose
+coefficient is identical for every path segment depends only on total length.
+For example, `min(size(xs)+size(ys))` on a two-segment path uses total-length
+extrema. This is an algebraic certificate, not an inference from independent
+marginal extrema. The executor substitutes a canonical segment vector carrying
+the total in the first segment and zero in the others; bounded totality proofs
+cover all intermediate projections before substitution. Every native aggregate
+in that pass must factor through the same axis. SQL reducers negotiate separate
+passes, and certificates compose through CTE projections and positional UNION
+ALL mappings. Invariant predicates and grouping observations cannot read a
+collapsed segment. Partial segment sums, unequal segment coefficients, unknown
+arithmetic and expressions that may fail retain their original distributions.
 
 Unproved length predicates, length grouping keys, non-extremum DISTINCT
 arguments and other distribution-dependent expressions retain exact hop states. Cyclic
