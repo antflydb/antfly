@@ -859,6 +859,10 @@ pub const Detail = enum(c_int) {
     partial_index_predicate_not_implied,
     // Append only: existing detail integers are a released runtime contract.
     relational_check_violation,
+    row_policy_denied,
+    row_policy_authentication_required,
+    check_constraint_validation_required,
+    foreign_key_match_full_violation,
 };
 
 test "partial index proof rejection preserves exact callback error identity" {
@@ -1096,6 +1100,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
         error.InvalidRelationalGeneratedValue => status(.invalid_argument, .invalid_relational_generated_value),
         error.GeneratedColumnRewriteRequired => status(.conflict, .generated_column_rewrite_required),
+        error.CheckConstraintValidationRequired => status(.conflict, .check_constraint_validation_required),
         error.RestoreJobCommitNotApplied => status(.retryable, .restore_job_commit_not_applied),
         error.CoordinatedStandaloneHAMetadataRequired => status(.unsupported, .coordinated_standalone_ha_metadata_required),
         error.StorageBusy => status(.retryable, .storage_busy),
@@ -1219,8 +1224,11 @@ pub fn statusFromError(err: anyerror) Status {
         error.ConstraintRetirementChanged => status(.conflict, .constraint_retirement_changed),
         error.ForeignKeyParentMissing => status(.conflict, .foreign_key_parent_missing),
         error.ForeignKeyReferenced => status(.conflict, .foreign_key_referenced),
+        error.ForeignKeyMatchFullViolation => status(.conflict, .foreign_key_match_full_violation),
         error.UniqueConstraintViolation => status(.conflict, .unique_constraint_violation),
         error.RelationalCheckViolation => status(.invalid_argument, .relational_check_violation),
+        error.RowPolicyDenied => status(.forbidden, .row_policy_denied),
+        error.RowPolicyAuthenticationRequired => status(.forbidden, .row_policy_authentication_required),
         error.UnsupportedNativeIndexOwner => status(.unsupported, .unsupported_native_index_owner),
         error.InvalidPrivateIndexClaimInventory => status(.invalid_argument, .invalid_private_index_claim_inventory),
         error.InvalidPrivateIndexClaimReceipt => status(.corrupt, .invalid_private_index_claim_receipt),
@@ -1741,6 +1749,8 @@ pub fn errorFromStatus(value: Status) anyerror {
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
         .relational_check_violation => "RelationalCheckViolation",
+        .row_policy_denied => "RowPolicyDenied",
+        .row_policy_authentication_required => "RowPolicyAuthenticationRequired",
         .model_chunk_audio_too_large => "AudioTooLarge",
         .model_chunk_chunk_output_too_large => "ChunkOutputTooLarge",
         .model_chunk_chunk_request_failed => "ChunkRequestFailed",
@@ -1944,6 +1954,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_relational_expression_input => "InvalidRelationalExpressionInput",
         .invalid_relational_generated_value => "InvalidRelationalGeneratedValue",
         .generated_column_rewrite_required => "GeneratedColumnRewriteRequired",
+        .check_constraint_validation_required => "CheckConstraintValidationRequired",
         .invalid_retained_effects_admission => "InvalidRetainedEffectsAdmission",
         .retained_effects_fence_mismatch => "RetainedEffectsFenceMismatch",
         .retained_effects_mixed_control => "RetainedEffectsMixedControl",
@@ -2065,6 +2076,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .constraint_retirement_changed => "ConstraintRetirementChanged",
         .foreign_key_parent_missing => "ForeignKeyParentMissing",
         .foreign_key_referenced => "ForeignKeyReferenced",
+        .foreign_key_match_full_violation => "ForeignKeyMatchFullViolation",
         .unique_constraint_violation => "UniqueConstraintViolation",
         .unsupported_native_index_owner => "UnsupportedNativeIndexOwner",
         .invalid_private_index_claim_inventory => "InvalidPrivateIndexClaimInventory",
@@ -2872,11 +2884,13 @@ pub fn errorFromStableName(name: []const u8) ?anyerror {
 }
 
 test "native normalization failures retain exact stable identities without accepting arbitrary names" {
-    for ([_]anyerror{ error.RelationalCheckViolation, error.InvalidBatchRequest, error.UniqueConstraintViolation, error.OutOfMemory, error.DeadlineExceeded }) |err| {
+    for ([_]anyerror{ error.RelationalCheckViolation, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired, error.InvalidBatchRequest, error.UniqueConstraintViolation, error.OutOfMemory, error.DeadlineExceeded }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
         try std.testing.expectEqual(err, errorFromStableName(@errorName(err)).?);
     }
     try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.RelationalCheckViolation).code);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.RowPolicyDenied).code);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.RowPolicyAuthenticationRequired).code);
     try std.testing.expectEqual(@backingInt(Detail.partial_index_predicate_not_implied) + 1, @backingInt(Detail.relational_check_violation));
     for ([_][]const u8{ "RelationalCheckViolation\n", "relationalcheckviolation", "PrivateProviderSecret", "RuntimeBoundaryFailure" }) |name| try std.testing.expect(errorFromStableName(name) == null);
 }

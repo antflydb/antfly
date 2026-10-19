@@ -2170,6 +2170,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation",
             "mounted SQL original nullability validates staged generations and preserves relaxation across restart",
             "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+            "mounted SQL original FK schema lifecycles preserve parent references and cold owners",
+            "mounted SQL original row policies publish default denial compose filters and recover owner enforcement",
+            "system catalog active policy edits atomically enqueue immutable generations and reject forged owner cuts",
             "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
             "SQL catalog lifecycle retries only explicit definite DDL nonadmission",
             "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
@@ -2212,6 +2215,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite publication and failure cases")
         .dependOn(&sql_primary_key_rewrite_run.step);
     const sql_schema_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original schema lifecycles preserve postimages enforcement and cold owners"});
+    const sql_policy_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original row policies publish default denial compose filters and recover owner enforcement", "system catalog active policy edits atomically enqueue immutable generations and reject forged owner cuts" });
+    sql_policy_lifecycle_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-policy-lifecycle-test", "Run exact policy DDL through native owner publication, write checks, mandatory filters and recovery")
+        .dependOn(&sql_policy_lifecycle_run.step);
     sql_schema_lifecycle_run.addArg("--require-no-skips");
     const sql_indexed_mutation_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart"});
     sql_indexed_mutation_lifecycle_run.addArg("--require-no-skips");
@@ -2227,6 +2234,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&sql_session_control_run.step);
     b.step("antfly-api-sql-schema-lifecycle-test", "Run original schema lifecycle DDL, future-write enforcement, postimages and cold owner recovery")
         .dependOn(&sql_schema_lifecycle_run.step);
+    const sql_fk_schema_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original FK schema lifecycles preserve parent references and cold owners"});
+    sql_fk_schema_lifecycle_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-fk-schema-lifecycle-test", "Run original FK DDL through parent generation admission, future-write checks and cold recovery")
+        .dependOn(&sql_fk_schema_lifecycle_run.step);
     const sql_nullability_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original nullability validates staged generations and preserves relaxation across restart"});
     sql_nullability_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-nullability-lifecycle-test", "Run original nullability DDL through staged validation, publication, enforcement and cold owner recovery")

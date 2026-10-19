@@ -3454,6 +3454,7 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_sql_policies) return metadata_topology_protocol.sql_row_policy_intent_version;
     // AIPH v2 also applies to unmarked plans. Classify it before the older
     // table-definition profile can return a weaker decoder requirement.
     if (command == .complete_relational_index_source or command == .accept_relational_index_delivery or command == .begin_relational_index_publication or command == .ack_relational_index_publication or command == .cancel_relational_index_publication)
@@ -3488,6 +3489,8 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
     }
     if (command == .apply_fk_generation_publication and @import("constraint_name_wire.zig").requiresCatalogChecks(command.apply_fk_generation_publication, fk_generation_publication.max_bytes))
         return metadata_topology_protocol.checks_catalog_identity_version;
+    if (command == .apply_fk_initial_create and @import("constraint_name_wire.zig").requiresCatalogChecks(command.apply_fk_initial_create, fk_generation_publication.max_bytes))
+        return metadata_topology_protocol.initial_fk_checks_catalog_version;
     if (command == .apply_system_catalog and carriesConstraintNameAdmission(command.apply_system_catalog))
         return metadata_topology_protocol.constraint_occupancy_version;
     if (command == .apply_fk_initial_create and carriesConstraintNameAdmission(command.apply_fk_initial_create))
@@ -3669,6 +3672,14 @@ test "system catalog CHECK identity decoder barrier covers admission and planles
     try std.testing.expectEqual(protocol.fk_generation_publication_version, transitionRequiredCoordinatedDecoderVersion(legacy));
     const unknown: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"future\"}" };
     try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(unknown));
+    const initial: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"catalog_coverage\":\"checks_v1\",\"plan\":null}" };
+    try std.testing.expectEqual(protocol.initial_fk_checks_catalog_version, transitionRequiredCoordinatedDecoderVersion(initial));
+    const initial_plan: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"plan\":{\"catalog_coverage\":\"checks_v1\"}}" };
+    try std.testing.expectEqual(protocol.initial_fk_checks_catalog_version, transitionRequiredCoordinatedDecoderVersion(initial_plan));
+    const initial_legacy: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{}" };
+    try std.testing.expectEqual(protocol.fk_initial_create_version, transitionRequiredCoordinatedDecoderVersion(initial_legacy));
+    const initial_future: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"catalog_coverage\":\"future\"}" };
+    try std.testing.expectEqual(protocol.initial_fk_checks_catalog_version, transitionRequiredCoordinatedDecoderVersion(initial_future));
 }
 
 pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.TransitionCommand) bool {

@@ -3,6 +3,185 @@
   "reference": "PostgreSQL exact SQL",
   "cases": [
     {
+      "id": "sql-0674",
+      "table": "inline_constraints",
+      "setup": [
+        {
+          "statement": "CREATE TABLE tenants(id TEXT PRIMARY KEY)",
+          "table": "tenants"
+        },
+        {
+          "statement": "INSERT INTO tenants(id) VALUES ('tenant-a')"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,tenant_id,email,amount::text AS amount FROM inline_constraints",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO inline_constraints(id,tenant_id,email,amount) VALUES ('00000000-0000-0000-0000-000000000003','tenant-a','one@example.test',1)",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0674",
+            "columns": [
+              "id",
+              "tenant_id",
+              "email",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "tenant-a",
+                "one@example.test",
+                "1"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO inline_constraints(id,tenant_id,email,amount) VALUES ('00000000-0000-0000-0000-000000000004','missing','two@example.test',2)",
+          "sqlstate": "23503",
+          "after": {
+            "id": "sql-0674",
+            "columns": [
+              "id",
+              "tenant_id",
+              "email",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "tenant-a",
+                "one@example.test",
+                "1"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO inline_constraints(id,tenant_id,email,amount) VALUES ('00000000-0000-0000-0000-000000000004','tenant-a','one@example.test',2)",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-0674",
+            "columns": [
+              "id",
+              "tenant_id",
+              "email",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "tenant-a",
+                "one@example.test",
+                "1"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO inline_constraints(id,tenant_id,email,amount) VALUES ('00000000-0000-0000-0000-000000000004','tenant-a','two@example.test',-1)",
+          "sqlstate": "23514",
+          "after": {
+            "id": "sql-0674",
+            "columns": [
+              "id",
+              "tenant_id",
+              "email",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "tenant-a",
+                "one@example.test",
+                "1"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "after_ddl": {
+        "id": "sql-0674",
+        "columns": [
+          "id",
+          "tenant_id",
+          "email",
+          "amount"
+        ],
+        "rows": [],
+        "sql_nulls": [],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
       "id": "sql-0677",
       "table": "usage_stage",
       "setup": [
@@ -1694,6 +1873,397 @@
       }
     },
     {
+      "id": "sql-0735",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE users(id TEXT,region TEXT,PRIMARY KEY(id,region))",
+          "table": "users"
+        },
+        {
+          "statement": "INSERT INTO users(id,region) VALUES ('parent-a','us')"
+        },
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,user_id TEXT,region TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,user_id,region) VALUES ('00000000-0000-0000-0000-000000000001',NULL,NULL),('00000000-0000-0000-0000-000000000002','parent-a','us')"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,user_id,region FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,user_id,region) VALUES ('00000000-0000-0000-0000-000000000004','parent-a',NULL)",
+          "sqlstate": "23503",
+          "after": {
+            "id": "sql-0735",
+            "columns": [
+              "id",
+              "user_id",
+              "region"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                null,
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "parent-a",
+                "us"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                true,
+                true
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,user_id,region) VALUES ('00000000-0000-0000-0000-000000000004','missing','us')",
+          "sqlstate": "23503",
+          "after": {
+            "id": "sql-0735",
+            "columns": [
+              "id",
+              "user_id",
+              "region"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                null,
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "parent-a",
+                "us"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                true,
+                true
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,user_id,region) VALUES ('00000000-0000-0000-0000-000000000003','parent-a','us')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0735",
+            "columns": [
+              "id",
+              "user_id",
+              "region"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                null,
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "parent-a",
+                "us"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "parent-a",
+                "us"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                true,
+                true
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "after_ddl": {
+        "id": "sql-0735",
+        "columns": [
+          "id",
+          "user_id",
+          "region"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            null,
+            null
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "parent-a",
+            "us"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            true,
+            true
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-0737",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,user_id TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','unknown',5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002',NULL,'tenant-b','ready',NULL,NULL)"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000004','unknown')",
+          "sqlstate": "23514",
+          "after": {
+            "id": "sql-0737",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "unknown",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "declared_not_valid": true
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000003','active')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0737",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "unknown",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                null,
+                null,
+                "active",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                true,
+                true,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "declared_not_valid": true
+        }
+      ],
+      "check_name": "usage_records_status_known_check",
+      "after_ddl": {
+        "id": "sql-0737",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "tenant-a",
+            "unknown",
+            "5"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            null,
+            "tenant-b",
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "declared_not_valid": true
+    },
+    {
       "id": "sql-0738",
       "table": "usage_records",
       "setup": [
@@ -1883,6 +2453,202 @@
       }
     },
     {
+      "id": "sql-0739",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,user_id TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','active',5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002',NULL,'tenant-b','ready',NULL,NULL)"
+        },
+        {
+          "statement": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK(status != 'unknown') NOT VALID"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000004','unknown')",
+          "sqlstate": "23514",
+          "after": {
+            "id": "sql-0739",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "declared_not_valid": false
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000003','active')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0739",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                null,
+                null,
+                "active",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                true,
+                true,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "declared_not_valid": false
+        }
+      ],
+      "check_name": "usage_records_status_known_check",
+      "after_ddl": {
+        "id": "sql-0739",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "tenant-a",
+            "active",
+            "5"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            null,
+            "tenant-b",
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "declared_not_valid": false
+    },
+    {
       "id": "sql-0740",
       "table": "usage_records",
       "setup": [
@@ -1971,6 +2737,333 @@
       ],
       "after_ddl": {
         "id": "sql-0740",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "tenant-a",
+            "active",
+            "5"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            null,
+            "tenant-b",
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-0744",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,user_id TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','active',5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002',NULL,'tenant-b','ready',NULL,NULL)"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000004',NULL)",
+          "sqlstate": "23502",
+          "after": {
+            "id": "sql-0744",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000003','active')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0744",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                null,
+                null,
+                "active",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                true,
+                true,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "after_ddl": {
+        "id": "sql-0744",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "tenant-a",
+            "active",
+            "5"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            null,
+            "tenant-b",
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-0745",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,user_id TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','active',5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002',NULL,'tenant-b','ready',NULL,NULL)"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000003',NULL)",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0745",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                null,
+                null,
+                null,
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                true,
+                true,
+                true,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "after_ddl": {
+        "id": "sql-0745",
         "columns": [
           "id",
           "email",
@@ -2352,11 +3445,14 @@
       "table": "usage_records",
       "setup": [
         {
-          "statement": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,CONSTRAINT positive_amount CHECK(amount >= 0),user_id TEXT)",
+          "statement": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,user_id TEXT)",
           "table": "usage_records"
         },
         {
-          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','active',5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002',NULL,'tenant-b','ready',NULL,NULL)"
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','active',-5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002',NULL,'tenant-b','ready',NULL,NULL)"
+        },
+        {
+          "statement": "ALTER TABLE usage_records ADD CONSTRAINT positive_amount CHECK(amount >= 0) NOT VALID"
         }
       ],
       "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount FROM usage_records",
@@ -2380,7 +3476,7 @@
                 "a@example.test",
                 "tenant-a",
                 "active",
-                "5"
+                "-5"
               ],
               [
                 "00000000-0000-0000-0000-000000000002",
@@ -2414,7 +3510,8 @@
               25
             ],
             "affected": 0
-          }
+          },
+          "declared_not_valid": true
         },
         {
           "statement": "INSERT INTO usage_records(id,amount) VALUES ('00000000-0000-0000-0000-000000000003',42)",
@@ -2434,7 +3531,7 @@
                 "a@example.test",
                 "tenant-a",
                 "active",
-                "5"
+                "-5"
               ],
               [
                 "00000000-0000-0000-0000-000000000002",
@@ -2482,9 +3579,11 @@
               25
             ],
             "affected": 0
-          }
+          },
+          "declared_not_valid": true
         }
       ],
+      "check_name": "positive_amount",
       "after_ddl": {
         "id": "sql-1412",
         "columns": [
@@ -2500,6 +3599,144 @@
             "a@example.test",
             "tenant-a",
             "active",
+            "-5"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            null,
+            "tenant-b",
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "declared_not_valid": true
+    },
+    {
+      "id": "sql-0738",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,user_id TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','unknown',5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002',NULL,'tenant-b','ready',NULL,NULL)"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount FROM usage_records",
+      "ddl_sqlstate": "23514",
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000003','unknown')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0738",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "unknown",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                null,
+                null,
+                "unknown",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                true,
+                true,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "scenario": "invalid historical CHECK leaves predecessor published",
+      "native_job_error": "ConstraintActivationFailed",
+      "after_ddl": {
+        "id": "sql-0738",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "tenant-a",
+            "unknown",
             "5"
           ],
           [
@@ -2535,6 +3772,597 @@
         ],
         "affected": 0
       }
+    },
+    {
+      "id": "sql-0730",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,user_id TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','active',5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002','a@example.test','tenant-b','ready',NULL,NULL)"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount FROM usage_records",
+      "ddl_sqlstate": "23505",
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email) VALUES ('00000000-0000-0000-0000-000000000003','a@example.test')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0730",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "a@example.test",
+                "tenant-b",
+                "ready",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                "a@example.test",
+                null,
+                null,
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "scenario": "duplicate historical UNIQUE leaves predecessor published",
+      "native_job_error": "ConstraintActivationFailed",
+      "after_ddl": {
+        "id": "sql-0730",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "tenant-a",
+            "active",
+            "5"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "a@example.test",
+            "tenant-b",
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-0739",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,user_id TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','unknown',5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002',NULL,'tenant-b','ready',NULL,NULL)"
+        },
+        {
+          "statement": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK(status != 'unknown') NOT VALID"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount FROM usage_records",
+      "ddl_sqlstate": "23514",
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000004','unknown')",
+          "sqlstate": "23514",
+          "after": {
+            "id": "sql-0739",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "unknown",
+                "5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "declared_not_valid": true
+        },
+        {
+          "statement": "UPDATE usage_records SET status='active' WHERE status='unknown'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0739",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "5"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "declared_not_valid": true
+        }
+      ],
+      "check_name": "usage_records_status_known_check",
+      "scenario": "failed explicit validation preserves NOT VALID declaration",
+      "native_job_error": "ConstraintActivationFailed",
+      "after_ddl": {
+        "id": "sql-0739",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "tenant-a",
+            "unknown",
+            "5"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            null,
+            "tenant-b",
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "declared_not_valid": true
+    },
+    {
+      "id": "sql-0739",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT,user_id TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,tenant_id,status,amount,metadata) VALUES ('00000000-0000-0000-0000-000000000001','a@example.test','tenant-a','active',-5,'{\"source\":\"old\"}'),('00000000-0000-0000-0000-000000000002',NULL,'tenant-b','ready',NULL,NULL)"
+        },
+        {
+          "statement": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK(status != 'unknown') NOT VALID"
+        },
+        {
+          "statement": "ALTER TABLE usage_records ADD CONSTRAINT positive_amount CHECK(amount>=0) NOT VALID"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,email,tenant_id,status,amount::text AS amount FROM usage_records",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000004','unknown')",
+          "sqlstate": "23514",
+          "after": {
+            "id": "sql-0739",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "-5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "declared_not_valid": false
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000003','active')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0739",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "-5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                null,
+                null,
+                "active",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                true,
+                true,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "declared_not_valid": false
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,status,amount) VALUES ('00000000-0000-0000-0000-000000000005','active',-1)",
+          "sqlstate": "23514",
+          "after": {
+            "id": "sql-0739",
+            "columns": [
+              "id",
+              "email",
+              "tenant_id",
+              "status",
+              "amount"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "a@example.test",
+                "tenant-a",
+                "active",
+                "-5"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                null,
+                "tenant-b",
+                "ready",
+                null
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                null,
+                null,
+                "active",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false,
+                false,
+                true
+              ],
+              [
+                false,
+                true,
+                true,
+                false,
+                true
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "declared_not_valid": false
+        }
+      ],
+      "check_name": "usage_records_status_known_check",
+      "scenario": "validating one CHECK preserves unrelated NOT VALID history",
+      "retained_not_valid_check": "positive_amount",
+      "after_ddl": {
+        "id": "sql-0739",
+        "columns": [
+          "id",
+          "email",
+          "tenant_id",
+          "status",
+          "amount"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "a@example.test",
+            "tenant-a",
+            "active",
+            "-5"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            null,
+            "tenant-b",
+            "ready",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false,
+            false,
+            true
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "declared_not_valid": false
     }
   ]
 }

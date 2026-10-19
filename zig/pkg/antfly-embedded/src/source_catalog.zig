@@ -200,6 +200,7 @@ pub const sql_relation_binding = @import("sql/relation_binding.zig");
 pub const sql_relation_runtime = @import("sql/relation_runtime.zig");
 pub const sql_runtime = @import("sql/runtime.zig");
 pub const sql_scalar = @import("sql/scalar.zig");
+pub const sql_document_patch = @import("sql/json_document_patch.zig");
 pub const sql_temporal_value = @import("sql/temporal_value.zig");
 pub const sql_temporal_text = @import("sql/temporal_text.zig");
 pub const sql_temporal_reference = @embedFile("sql/fixtures/sql_temporal_reference.json");

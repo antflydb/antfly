@@ -30,6 +30,7 @@ test {
     _ = @import("api/sql_catalog.zig");
     _ = @import("api/sql_nullability_lifecycle_integration_test.zig");
     _ = @import("api/sql_schema_lifecycle_integration_test.zig");
+    _ = @import("api/sql_policy_lifecycle_integration_test.zig");
     _ = @import("api/sql_index_lifecycle_integration_test.zig");
     _ = @import("api/sql_view_lifecycle_integration_test.zig");
     _ = @import("api/sql_view_document_integration_test.zig");

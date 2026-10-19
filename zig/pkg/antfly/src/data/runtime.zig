@@ -11474,7 +11474,7 @@ pub const DataServer = struct {
         if (!std.mem.eql(u8, &catalog_digest, &decision.catalog_digest)) return error.IntegrityCatalogChanged;
         var parsed = try schema.parseValidatedTableSchema(scratch, decision.child.schema_json);
         defer parsed.deinit(scratch);
-        var compiled = try publication.compileCatalogWithCoverage(scratch, parsed, request.child_table_id, null, .legacy);
+        var compiled = try publication.compileCatalogWithCoverage(scratch, parsed, request.child_table_id, null, decision.catalog_coverage);
         defer compiled.deinit();
         if (!std.mem.eql(u8, compiled.value, catalog_bytes) or
             !std.mem.eql(u8, &compiled.catalog.schema_digest, &decision.schema_digest)) return error.IntegrityCatalogChanged;

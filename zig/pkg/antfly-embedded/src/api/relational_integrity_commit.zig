@@ -58,6 +58,17 @@ fn boundedControl(request: RequestContext) !RequestContext {
     return result;
 }
 
+fn authorizedLookupOptions(control: RequestContext, alloc: Allocator, table: []const u8, options: types.LookupOptions) !types.LookupOptions {
+    var result = options;
+    if (options.include_primary_digest) if (control.row_policy_integrity_read) |authority| {
+        if (try authority.authorize(authority.ptr, alloc, table)) |proof| {
+            result.row_policy_principal_proof = proof.token;
+            result.row_policy_database = proof.database;
+        }
+    };
+    return result;
+}
+
 pub fn requiresCoordination(alloc: Allocator, schema_json: []const u8) !bool {
     if (schema_json.len == 0) return false;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
@@ -72,9 +83,12 @@ pub fn requiresActivation(alloc: Allocator, schema_json: []const u8) !bool {
     if (schema_json.len == 0) return false;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
-    return (if (parsed.unique_constraints) |values| values.value.len != 0 else false) or
-        (if (parsed.foreign_keys) |values| values.value.len != 0 else false) or
-        (if (parsed.checks) |values| values.value.len != 0 else false);
+    if ((if (parsed.unique_constraints) |values| values.value.len != 0 else false) or
+        (if (parsed.foreign_keys) |values| values.value.len != 0 else false)) return true;
+    if (parsed.checks) |values| for (values.value) |check| {
+        if (!(check.not_valid orelse false)) return true;
+    };
+    return false;
 }
 
 /// Public schema epochs are fences, not evidence that dependency expansion
@@ -303,6 +317,7 @@ const Builder = struct {
         opts.execution_deadline_ns = self.control.deadline_ns;
         opts.execution_io = self.control.deadline_io;
         opts.cancellation = self.control.cancellation;
+        opts = try authorizedLookupOptions(self.control, self.alloc, table, opts);
         return self.source.lookup(self.alloc, table, key, opts, .read_index) catch |err| {
             if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs())) std.log.warn("preparation lookup failed catalog={} jobs={} work={d} class={s}", .{ opts.relational_integrity_catalog, opts.relational_integrity_jobs_json.len != 0, self.work.items.len, @errorName(err) });
             return err;
@@ -534,7 +549,11 @@ const Builder = struct {
             row: ?reads.LookupResponse = null,
             failure: ?anyerror = null,
             fn run(slot: *@This(), source: reads.TableReadSource, name: []const u8, key: []const u8, control: RequestContext) void {
-                slot.row = source.lookup(slot.arena.allocator(), name, key, .{ .include_primary_digest = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }, .read_index) catch |err| {
+                const options = authorizedLookupOptions(control, slot.arena.allocator(), name, .{ .include_primary_digest = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }) catch |err| {
+                    slot.failure = err;
+                    return;
+                };
+                slot.row = source.lookup(slot.arena.allocator(), name, key, options, .read_index) catch |err| {
                     slot.failure = err;
                     return;
                 };
@@ -938,7 +957,7 @@ const Builder = struct {
         var schema_digest: planner.storage.Digest = undefined;
         std.crypto.hash.Blake3.hash(native_schema, &schema_digest, .{});
         if (!std.mem.eql(u8, &schema_digest, &bindings.schema_digest)) return error.PreparedGenerationChanged;
-        const checks_digest: [32]u8 = if (view.validator().?.execution.checks) |checks| checks.fingerprint() else @splat(0);
+        const checks_digest: [32]u8 = if (view.validator().?.execution.checks) |checks| checks.validationFingerprint() else @splat(0);
         if (!std.mem.eql(u8, &checks_digest, &bindings.checks_digest)) return error.PreparedGenerationChanged;
         const expected = try declarations.definitionFingerprints(self.alloc, view.validator().?.schema, view.tableSchema().*);
         defer declarations.freeDefinitions(self.alloc, expected);

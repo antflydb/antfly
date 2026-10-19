@@ -37,6 +37,38 @@ pub const pending_key = "\x00\x00__metadata__:row_policy_pending";
 pub const max_bytes: usize = policies.max_install_snapshot_bytes;
 pub const receipt_encoded_len: usize = 112;
 
+/// One bounded index per commit, not a per-row linear search through its
+/// predicates. Nondefault requirements need a signed SQL intent capability.
+pub const MutationRequirements = struct {
+    values: std.StringHashMapUnmanaged(role_authority.MutationRequirement) = .empty,
+    sql: bool,
+
+    pub fn init(alloc: std.mem.Allocator, predicates: anytype, principal: *const role_authority.Payload) !MutationRequirements {
+        var result: MutationRequirements = .{ .sql = principal.purpose == .sql_write };
+        errdefer result.deinit(alloc);
+        for (predicates) |predicate| {
+            const requirement = predicate.row_policy_requirement;
+            if (requirement == .native) continue;
+            if (!result.sql) return error.RowPolicyAuthenticationRequired;
+            const entry = try result.values.getOrPut(alloc, predicate.key);
+            if (entry.found_existing) return error.RowPolicyAuthenticationRequired;
+            entry.value_ptr.* = requirement;
+        }
+        return result;
+    }
+    pub fn deinit(self: *MutationRequirements, alloc: std.mem.Allocator) void {
+        self.values.deinit(alloc);
+    }
+    pub fn needsSelect(self: *const MutationRequirements) bool {
+        var values = self.values.valueIterator();
+        while (values.next()) |value| if (value.requiresSelect()) return true;
+        return false;
+    }
+    pub fn forKey(self: *const MutationRequirements, key_bytes: []const u8) !role_authority.MutationRequirement {
+        return self.values.get(key_bytes) orelse if (self.sql) error.RowPolicyAuthenticationRequired else .native;
+    }
+};
+
 /// Exact owner-local durable evidence returned only after the bundle,
 /// catalog phase and Raft applied marker have committed in one transaction.
 pub const Receipt = struct {
@@ -97,8 +129,10 @@ pub const ReadEvaluation = struct {
     policy_view: policies.View,
     evaluator: policies.Evaluator,
     scratch: gate.EvaluationScratch,
+    conjunction: ?*ReadEvaluation = null,
 
     pub fn deinit(self: *@This()) void {
+        if (self.conjunction) |other| other.deinit();
         self.scratch.deinit();
         self.evaluator.deinit();
         self.policy_view.deinit();
@@ -107,7 +141,8 @@ pub const ReadEvaluation = struct {
     }
 
     pub fn permits(self: *@This(), row: @import("algebraic/relational_row_codec.zig").OrdinalRowView) !bool {
-        return self.scratch.permits(row);
+        if (!try self.scratch.permits(row)) return false;
+        return if (self.conjunction) |other| other.permits(row) else true;
     }
 };
 
@@ -180,6 +215,7 @@ pub const Installed = struct {
         const result = try alloc.create(ReadEvaluation);
         errdefer alloc.destroy(result);
         result.alloc = alloc;
+        result.conjunction = null;
         const SettingOwner = struct {
             fn load(ptr: *anyopaque, arena: std.mem.Allocator, scope: settings.Scope) !settings.Snapshot {
                 const installed: *const Installed = @ptrCast(@alignCast(ptr));
@@ -222,7 +258,17 @@ pub const Installed = struct {
 
     pub fn captureReadEvaluation(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, principal: *const role_authority.Payload) !*ReadEvaluation {
         if (principal.access != .read) return error.RowPolicyAuthenticationRequired;
-        return self.captureEvaluation(alloc, schema, principal, .select);
+        const action: policies.Evaluator.Action = switch (principal.purpose) {
+            .ordinary, .normalize_select => .select,
+            .update, .update_select => .update_old,
+            .delete, .delete_select => .delete,
+            .normalize, .integrity, .sql_write => return error.RowPolicyAuthenticationRequired,
+        };
+        const evaluation = try self.captureEvaluation(alloc, schema, principal, action);
+        errdefer evaluation.deinit();
+        if (principal.purpose == .update_select or principal.purpose == .delete_select)
+            evaluation.conjunction = try self.captureEvaluation(alloc, schema, principal, .select);
+        return evaluation;
     }
 };
 

@@ -300,6 +300,11 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         return inspected;
     }
     if (explicit_parameter_types.len > compiled.parameter_count) return error.InvalidSqlParameters;
+    if (compiled.statement == .select and compiled.statement.select.distinct != null) {
+        var lowered = compiled.*;
+        lowered.statement = .{ .select = try @import("distinct_lowering.zig").lower(allocator, backend, compiled, explicit_parameter_types) };
+        return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
+    }
     if (compiled.statement == .select) try @import("window_binding.zig").validatePlacement(compiled.statement.select);
     if (compiled.statement == .select and compiled.statement.select.source == null and compiled.statement.select.table != null and backend.vtable.resolve_read != null and backend.prepared_read == null and !@import("relation_binding.zig").accepts(compiled.statement.select) and !@import("subquery_lowering.zig").accepts(compiled.statement.select)) {
         const name = compiled.statement.select.table.?;
@@ -452,7 +457,8 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     if (compiled.statement == .merge) {
         try backend.vtable.checkpoint(backend.ptr);
         const merge = compiled.statement.merge;
-        const target_table = try backend.vtable.resolve(backend.ptr, allocator, merge.table, .read_write);
+        var target_table = try backend.vtable.resolve(backend.ptr, allocator, merge.table, .read_write);
+        target_table.sql_select_required = true;
         const bound = try allocator.create(@import("merge_mutation.zig").Candidates);
         bound.* = try @import("merge_mutation.zig").bindCandidates(allocator, backend, target_table, compiled, explicit_parameter_types);
         return .{ .table = target_table, .action = .read_write, .columns = if (bound.returning_plan) |plan| plan.columns else &.{}, .parameter_types = bound.parameter_types, .json_literals = .empty, .merge_mutation = bound };
@@ -460,12 +466,14 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     const target: struct { name: ast.Name, action: catalog.Action } = switch (compiled.statement) {
         .select => |statement| .{ .name = statement.table.?, .action = .read },
         .insert => |statement| .{ .name = statement.table, .action = if (statement.returning != null or statement.conflict != null) .read_write else .write },
-        .update => |statement| .{ .name = statement.table, .action = .read_write },
-        .delete => |statement| .{ .name = statement.table, .action = .read_write },
+        .update => |statement| .{ .name = statement.table, .action = if (@import("mutation_policy.zig").selectRequired(compiled.statement)) .read_write else .write },
+        .delete => |statement| .{ .name = statement.table, .action = if (@import("mutation_policy.zig").selectRequired(compiled.statement)) .read_write else .write },
         else => return error.UnsupportedSqlExecution,
     };
     try backend.vtable.checkpoint(backend.ptr);
-    const table = try backend.vtable.resolve(backend.ptr, allocator, target.name, target.action);
+    var table = try backend.vtable.resolve(backend.ptr, allocator, target.name, target.action);
+    table.row_policy_purpose = @import("mutation_policy.zig").scanPurpose(compiled.statement);
+    table.sql_select_required = @import("mutation_policy.zig").selectRequired(compiled.statement);
     const parameters = try allocator.alloc(?ast.ColumnType, compiled.parameter_count);
     @memset(parameters, null);
     @memcpy(parameters[0..explicit_parameter_types.len], explicit_parameter_types);
@@ -644,6 +652,14 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const returning_compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = selection }, .parameter_count = compiled.parameter_count };
         const returning_bound = try allocator.create(BoundStatement);
         returning_bound.* = try bindInternal(allocator, adapter.iface(), &returning_compiled, result.parameter_types);
+        // A write RETURNING image is prepared before publication. Its version
+        // is not the later durable commit timestamp. Do not expose the old
+        // predicate version as the new version until commit receipts provide
+        // an allocation-free, outcome-preserving result binding.
+        if (table.storage_mode == .document and compiled.statement != .delete) {
+            for (selection.columns) |projection| if (!projection.wildcard and projection.expression == null and table.isDocumentVersion(projection.field)) return error.UnsupportedSqlShape;
+            for (returning_bound.scalars.required) |ordinal| if (table.isDocumentVersion(returning_bound.scalars.columns[ordinal].name)) return error.UnsupportedSqlShape;
+        }
         result.returning = returning_bound;
         result.returning_projections = selection.columns;
         if (relational_returning) result.returning_query = selection;

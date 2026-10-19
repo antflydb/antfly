@@ -151,7 +151,7 @@ const Rows = struct {
     sql_nulls: []const []const bool,
     affected: u64,
 };
-const Probe = struct { statement: []const u8, sqlstate: ?[]const u8, after: Rows, repeat_on_reopen: bool = false, absent_table: ?[]const u8 = null };
+const Probe = struct { statement: []const u8, sqlstate: ?[]const u8, after: Rows, repeat_on_reopen: bool = false, absent_table: ?[]const u8 = null, declared_not_valid: ?bool = null };
 const Outcome = struct { command_tag: []const u8, result: Rows };
 
 test "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart" {
@@ -176,6 +176,11 @@ const Case = struct {
     after_ddl: Rows,
     probes: []const Probe,
     outcome: ?Outcome = null,
+    scenario: ?[]const u8 = null,
+    native_job_error: ?[]const u8 = null,
+    check_name: ?[]const u8 = null,
+    declared_not_valid: ?bool = null,
+    retained_not_valid_check: ?[]const u8 = null,
 };
 
 fn execute(ctx: *fixture.Context, statement: []const u8, read: bool) !@import("../raft/transport/http_common.zig").HttpResponse {
@@ -212,8 +217,82 @@ fn expectAbsent(ctx: *fixture.Context, table: []const u8) !void {
     try std.testing.expect(parsed.value.relations[0] == null);
 }
 
+fn schemaFingerprint(ctx: *fixture.Context, table: []const u8) ![32]u8 {
+    const domain = local.system_catalog_domain;
+    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .name = table }}, .include_query_definitions = true };
+    const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const bytes = try source.systemCatalog(ctx.alloc, .{ .deadline_ns = platform.time.monotonicNs() +| 15 * std.time.ns_per_s }, .{ .resolve_many = lookup });
+    defer ctx.alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(domain.ResolvedMany, ctx.alloc, bytes, .{});
+    defer parsed.deinit();
+    try parsed.value.validateRelations(lookup);
+    const relation = parsed.value.relations[0] orelse return error.TableNotFound;
+    const definition = relation.table.query_definition orelse return error.MissingSchemaDefinition;
+    var result: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(definition.schema_json, &result, .{});
+    return result;
+}
+
+fn expectDeclaredValidity(ctx: *fixture.Context, table: []const u8, check_name: []const u8, not_valid: bool) !void {
+    const domain = local.system_catalog_domain;
+    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .name = table }}, .include_query_definitions = true };
+    const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const bytes = try source.systemCatalog(ctx.alloc, .{ .deadline_ns = platform.time.monotonicNs() +| 15 * std.time.ns_per_s }, .{ .resolve_many = lookup });
+    defer ctx.alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(domain.ResolvedMany, ctx.alloc, bytes, .{});
+    defer parsed.deinit();
+    try parsed.value.validateRelations(lookup);
+    const relation = parsed.value.relations[0] orelse return error.TableNotFound;
+    const definition = relation.table.query_definition orelse return error.MissingSchemaDefinition;
+    var schema = try std.json.parseFromSlice(Json, ctx.alloc, definition.schema_json, .{});
+    defer schema.deinit();
+    const checks = try fixture.field(schema.value, "checks");
+    for (checks.array.items) |check| {
+        const name = try fixture.field(check, "name");
+        if (!std.mem.eql(u8, check_name, name.string)) continue;
+        const declared = check.object.get("not_valid") orelse Json{ .bool = false };
+        try std.testing.expect(declared == .bool);
+        try std.testing.expectEqual(not_valid, declared.bool);
+        return;
+    }
+    return error.ConstraintNotFound;
+}
+
+fn expectPublicValidationRequiresRewrite(ctx: *fixture.Context, table: []const u8, check_name: []const u8) !void {
+    const domain = local.system_catalog_domain;
+    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .name = table }}, .include_query_definitions = true };
+    const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const bytes = try source.systemCatalog(ctx.alloc, .{ .deadline_ns = platform.time.monotonicNs() +| 15 * std.time.ns_per_s }, .{ .resolve_many = lookup });
+    defer ctx.alloc.free(bytes);
+    var catalog = try std.json.parseFromSlice(domain.ResolvedMany, ctx.alloc, bytes, .{});
+    defer catalog.deinit();
+    try catalog.value.validateRelations(lookup);
+    const relation = catalog.value.relations[0] orelse return error.TableNotFound;
+    var schema = try std.json.parseFromSlice(Json, ctx.alloc, relation.table.query_definition.?.schema_json, .{});
+    defer schema.deinit();
+    const a = schema.arena.allocator();
+    _ = schema.value.object.orderedRemove("version");
+    const checks = schema.value.object.getPtr("checks").?.array.items;
+    for (checks) |*check| {
+        if (std.mem.eql(u8, check.object.get("name").?.string, check_name)) {
+            try check.object.put(a, "not_valid", .{ .bool = false });
+            break;
+        }
+    } else return error.ConstraintNotFound;
+    const body = try std.json.Stringify.valueAlloc(a, schema.value, .{});
+    const path = try std.fmt.allocPrint(a, "/db/v1/tables/{s}/schema", .{table});
+    const before = try schemaFingerprint(ctx, table);
+    var response = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.base, path, .PUT, body);
+    defer response.deinit(ctx.alloc);
+    if (response.status != 409) std.debug.print("NOT VALID public admission status={d} body={s}\n", .{ response.status, response.body });
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "rewrite=true") != null);
+    try std.testing.expectEqualDeep(before, try schemaFingerprint(ctx, table));
+    try expectDeclaredValidity(ctx, table, check_name, true);
+}
+
 fn command(ctx: *fixture.Context, statement: []const u8, expected_error: ?[]const u8) !void {
-    return commandParameters(ctx, statement, expected_error, &.{}, null);
+    return commandParameters(ctx, statement, expected_error, &.{}, null, null);
 }
 
 fn awaitConstraintReceipt(ctx: *fixture.Context, receipt: wire.SQLDDLReceipt, version: u32) !void {
@@ -250,7 +329,7 @@ fn awaitConstraintReceipt(ctx: *fixture.Context, receipt: wire.SQLDDLReceipt, ve
     return error.SchemaLifecyclePublicationTimeout;
 }
 
-fn commandParameters(ctx: *fixture.Context, statement: []const u8, expected_error: ?[]const u8, parameters: []const Json, outcome: ?Outcome) !void {
+fn commandParameters(ctx: *fixture.Context, statement: []const u8, expected_error: ?[]const u8, parameters: []const Json, outcome: ?Outcome, expected_job_error: ?[]const u8) !void {
     var response = if (parameters.len == 0) try execute(ctx, statement, false) else response: {
         const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .parameters = parameters }, .{});
         defer ctx.alloc.free(body);
@@ -282,8 +361,17 @@ fn commandParameters(ctx: *fixture.Context, statement: []const u8, expected_erro
             var job = try std.json.parseFromSlice(Json, ctx.alloc, observed.body, .{});
             defer job.deinit();
             const phase = (try fixture.field(job.value, "phase")).string;
-            if (std.mem.eql(u8, phase, "succeeded")) return;
+            if (std.mem.eql(u8, phase, "succeeded")) {
+                try std.testing.expect(expected_job_error == null);
+                return;
+            }
             if (std.mem.eql(u8, phase, "failed")) {
+                if (expected_job_error) |expected| {
+                    const failure = try fixture.field(job.value, "staging_failure");
+                    try std.testing.expect(failure == .string);
+                    try std.testing.expectEqualStrings(expected, failure.string);
+                    return;
+                }
                 std.debug.print("schema job failed sql={s} body={s}\n", .{ statement, observed.body });
                 return error.SchemaLifecyclePublicationFailed;
             }
@@ -291,6 +379,7 @@ fn commandParameters(ctx: *fixture.Context, statement: []const u8, expected_erro
         }
         return error.SchemaLifecyclePublicationTimeout;
     }
+    try std.testing.expect(expected_job_error == null);
     // Pending FK/index/constraint receipts are observed through serving
     // publication. Never repeat the admitted ALTER or allocate another job.
     if (receipt.state == .invalid) return error.SchemaLifecycleInvalidConstraint;
@@ -340,6 +429,7 @@ const Campaign = struct {
     case: Case,
     credentials: client.ApiKeyHeaders = .{},
     final_owner: fixture.ServingSchema = undefined,
+    failed_predecessor_digest: ?[32]u8 = null,
 
     pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
         try self.credentials.activate(ctx);
@@ -354,29 +444,49 @@ const Campaign = struct {
         var parameters_arena = std.heap.ArenaAllocator.init(ctx.alloc);
         defer parameters_arena.deinit();
         const parameters = try local.sql_parity_fixtures.Corpus.logicalParameters(parameters_arena.allocator(), original);
-        try commandParameters(ctx, original.sql, self.case.ddl_sqlstate, parameters, self.case.outcome);
+        const predecessor: ?fixture.ServingSchema = if (self.case.native_job_error != null) try readyTable(ctx, self.case.table, 0) else null;
+        if (predecessor != null) self.failed_predecessor_digest = try schemaFingerprint(ctx, self.case.table);
+        try commandParameters(ctx, original.sql, if (self.case.native_job_error != null) null else self.case.ddl_sqlstate, parameters, self.case.outcome, self.case.native_job_error);
+        if (predecessor) |owner|
+            try std.testing.expectEqualDeep(owner, try readyTable(ctx, self.case.table, owner.version));
+        if (self.failed_predecessor_digest) |digest|
+            try std.testing.expectEqualDeep(digest, try schemaFingerprint(ctx, self.case.table));
         _ = try readyTable(ctx, self.case.table, 0);
         try expectRows(ctx, self.case.read_sql, self.case.after_ddl);
+        if (self.case.declared_not_valid) |state|
+            try expectDeclaredValidity(ctx, self.case.table, self.case.check_name.?, state);
+        if (self.case.declared_not_valid orelse false)
+            try expectPublicValidationRequiresRewrite(ctx, self.case.table, self.case.check_name.?);
+        if (self.case.retained_not_valid_check) |name|
+            try expectDeclaredValidity(ctx, self.case.table, name, true);
         for (self.case.probes) |probe| {
             try command(ctx, probe.statement, probe.sqlstate);
             if (probe.absent_table) |name| try expectAbsent(ctx, name);
             try expectRows(ctx, self.case.read_sql, probe.after);
+            if (probe.declared_not_valid) |state|
+                try expectDeclaredValidity(ctx, self.case.table, self.case.check_name.?, state);
         }
         self.final_owner = try readyTable(ctx, self.case.table, 0);
     }
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
         errdefer std.debug.print("schema lifecycle id={s} after restart\n", .{self.case.id});
         try std.testing.expectEqualDeep(self.final_owner, try readyTable(ctx, self.case.table, self.final_owner.version));
+        if (self.failed_predecessor_digest) |digest|
+            try std.testing.expectEqualDeep(digest, try schemaFingerprint(ctx, self.case.table));
         const final = self.case.probes[self.case.probes.len - 1].after;
         try expectRows(ctx, self.case.read_sql, final);
-        if (self.case.ddl_sqlstate) |code| {
+        if (self.case.retained_not_valid_check) |name|
+            try expectDeclaredValidity(ctx, self.case.table, name, true);
+        if (self.case.probes[self.case.probes.len - 1].declared_not_valid) |state|
+            try expectDeclaredValidity(ctx, self.case.table, self.case.check_name.?, state);
+        if (self.case.ddl_sqlstate) |code| if (self.case.native_job_error == null) {
             var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
             defer corpus.deinit();
             const original = try corpus.get(self.case.id);
             try std.testing.expectEqual(@as(usize, 0), original.params.len);
             try command(ctx, original.sql, code);
             try expectRows(ctx, self.case.read_sql, final);
-        }
+        };
         for (self.case.probes) |probe| if (probe.sqlstate != null or probe.repeat_on_reopen) {
             try command(ctx, probe.statement, probe.sqlstate);
             if (probe.absent_table) |name| try expectAbsent(ctx, name);
@@ -388,15 +498,35 @@ const Campaign = struct {
 test "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners" {
     const ids = [_][]const u8{
         "sql-0677", "sql-0678", "sql-0680", "sql-0681", "sql-0727", "sql-0728", "sql-0729", "sql-0730", "sql-0731",
-        "sql-0733", "sql-0738", "sql-0740", "sql-0779", "sql-1408", "sql-1412",
+        "sql-0733", "sql-0737", "sql-0738", "sql-0739", "sql-0740", "sql-0744", "sql-0745", "sql-0779", "sql-1408",
+        "sql-1412", "sql-0738", "sql-0730", "sql-0739", "sql-0739",
     };
     var parsed = try std.json.parseFromSlice(struct { format: u8, reference: []const u8, cases: []const Case }, std.testing.allocator, local.sql_parity_fixtures.schema_lifecycle_reference, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u8, 1), parsed.value.format);
     try std.testing.expectEqualStrings("PostgreSQL exact SQL", parsed.value.reference);
-    try std.testing.expectEqual(ids.len, parsed.value.cases.len);
-    for (ids, parsed.value.cases) |id, case| {
-        try std.testing.expectEqualStrings(id, case.id);
+    var completed: usize = 0;
+    for (parsed.value.cases) |case| {
+        if (std.mem.eql(u8, case.id, "sql-0674") or std.mem.eql(u8, case.id, "sql-0735")) continue;
+        try std.testing.expect(completed < ids.len);
+        try std.testing.expectEqualStrings(ids[completed], case.id);
         try fixture.runWithState(Campaign, .{ .case = case });
+        completed += 1;
     }
+    try std.testing.expectEqual(ids.len, completed);
+}
+
+test "mounted SQL original FK schema lifecycles preserve parent references and cold owners" {
+    const ids = [_][]const u8{ "sql-0674", "sql-0735" };
+    var parsed = try std.json.parseFromSlice(struct { format: u8, reference: []const u8, cases: []const Case }, std.testing.allocator, local.sql_parity_fixtures.schema_lifecycle_reference, .{});
+    defer parsed.deinit();
+    var completed: usize = 0;
+    for (parsed.value.cases) |case| {
+        if (!std.mem.eql(u8, case.id, "sql-0674") and !std.mem.eql(u8, case.id, "sql-0735")) continue;
+        try std.testing.expect(completed < ids.len);
+        try std.testing.expectEqualStrings(ids[completed], case.id);
+        try fixture.runWithState(Campaign, .{ .case = case });
+        completed += 1;
+    }
+    try std.testing.expectEqual(ids.len, completed);
 }

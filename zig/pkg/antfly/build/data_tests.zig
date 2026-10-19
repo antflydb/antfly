@@ -285,7 +285,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const private_initial_owner_predicate_tests = b.addTest(.{
         .name = "data-private-initial-owner-predicate-tests",
         .root_module = options.data_implementation_module,
-        .filters = &.{"ordinary unpublished placement does not require a private initial FK owner snapshot"},
+        .filters = &.{ "ordinary unpublished placement does not require a private initial FK owner snapshot", "initial FK private owner" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-data-private-initial-owner-predicate-test", "Verify hidden initial-FK owner preflight excludes ordinary unpublished placements")

@@ -116,7 +116,15 @@ const std = @import("std");
 /// command guard encoding. Earlier private cancellation bytes are not accepted.
 /// Version 55 decodes stored-view lifecycle commands and delegated read proofs
 /// separating caller, policy-selection, and credential-settings principals.
-pub const current_version: u16 = 55;
+/// Version 56 atomically publishes edits to enabled row-policy definitions,
+/// including empty default-deny epochs and implicit USING write checks.
+/// Version 58 carries purpose-bound SQL RLS read/normalization capabilities
+/// and per-mutation command provenance through private prepare/journal bytes.
+pub const current_version: u16 = 58;
+pub const sql_row_policy_intent_version: u16 = 58;
+pub const sql_deferred_check_validation_version: u16 = 57;
+pub const initial_fk_checks_catalog_version: u16 = 57;
+pub const sql_row_policy_mutation_version: u16 = 56;
 pub const sql_view_catalog_version: u16 = 55;
 pub const index_publication_release_version: u16 = 54;
 // One coordinated floor for this unreleased protocol. A cohort capable only

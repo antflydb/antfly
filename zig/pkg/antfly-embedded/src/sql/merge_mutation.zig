@@ -1050,6 +1050,16 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
     const arms = try bindArms(alloc, backend, target, statement, input);
     const parameters = try alloc.dupe(?ast.ColumnType, arms.parameters);
     const returning_plan = if (statement.returning != null) try bindReturning(alloc, backend, statement, input, parameters) else null;
+    if (target.storage_mode == .document) if (returning_plan) |plan| {
+        const updates_target = for (statement.arms) |arm| {
+            if (arm.action == .insert or arm.action == .update) break true;
+        } else false;
+        if (updates_target) if (targetProjectionOrdinal(input, alias, "_version")) |version_ordinal| {
+            for (plan.programs) |program| for (program.required_columns) |ordinal| {
+                if (ordinal == version_ordinal) return error.UnsupportedSqlShape;
+            };
+        };
+    };
     const field_ordinals = try alloc.alloc(?usize, target.columns.len);
     for (target.columns, field_ordinals) |field, *ordinal| {
         ordinal.* = targetProjectionOrdinal(input, alias, field.name);

@@ -287,6 +287,9 @@ pub const Adapter = struct {
         try self.read_requirements.validate(.sql);
         if (self.read_requirements.visibility) |visibility| self.lake_visibility = if (visibility == .accepted) .accepted else .committed;
         const previous_context = self.context;
+        var integrity_reads = @import("sql_policy_integrity_reads.zig").Cache.init(self.server, self.context);
+        defer integrity_reads.deinit();
+        self.context = integrity_reads.attach(self.context);
         defer self.lake_visibility = previous_visibility;
         defer self.context = previous_context;
         var zig017_return_error: ?anyerror = null;
@@ -919,7 +922,7 @@ pub const Adapter = struct {
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const identity: ?*const http_server.AuthenticatedIdentity = if (self.identity.*) |*value| value else null;
         const proof_alloc = if (self.policy_proofs != null) self.server.alloc else alloc;
-        const signed = if (authority_api.context(table)) |authority| delegated: {
+        const signed = if (table.row_policy_purpose != .ordinary) try self.server.rowPolicyMutationReadProof(proof_alloc, identity, self.context, table.id, table.physical_name, scope.database, table.schema_version, table.row_policy_purpose) else if (authority_api.context(table)) |authority| delegated: {
             const caller = identity orelse return error.Forbidden;
             if (authority.delegation) |grant| {
                 if (!std.mem.eql(u8, authority.effective.username, grant.owner) or !std.mem.eql(u8, &authority.instance, &grant.owner_instance)) return error.Forbidden;
@@ -944,6 +947,12 @@ pub const Adapter = struct {
             return signed;
         }
         return signed;
+    }
+
+    fn normalizationProof(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !?[]const u8 {
+        var normalizing = table;
+        normalizing.row_policy_purpose = .normalize;
+        return self.rowPolicyProof(alloc, normalizing);
     }
 
     fn prepareScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !helpers.OwnedScanKeysRequest {
@@ -1036,9 +1045,12 @@ pub const Adapter = struct {
             const Reader = struct {
                 rows: []const catalog.Row,
                 columns: []const catalog.Column,
+                document_envelope: bool,
                 fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !catalog.Row.Cell {
                     const view_: *@This() = @ptrCast(@alignCast(raw));
-                    return view_.rows[row].cell(if (column == view_.columns.len) "_id" else view_.columns[column].name);
+                    var item = view_.rows[row];
+                    item.document_envelope = view_.document_envelope;
+                    return item.cell(if (column == view_.columns.len) "_id" else view_.columns[column].name);
                 }
                 fn frozen(raw: *anyopaque, row: usize, column: usize) !?@import("antfly_local_sources").sql_execution_batch.FrozenJson {
                     const view_: *@This() = @ptrCast(@alignCast(raw));
@@ -1052,7 +1064,7 @@ pub const Adapter = struct {
                 }
             };
             const reader = try a.create(Reader);
-            reader.* = .{ .rows = self.column_page.?.rows, .columns = self.projection.columns };
+            reader.* = .{ .rows = self.column_page.?.rows, .columns = self.projection.columns, .document_envelope = self.projection.document_root };
             const values = try a.create(@import("antfly_local_sources").sql_execution_batch.Batch);
             values.* = .{ .reader = .{ .ptr = reader, .read = Reader.cell, .read_json = Reader.json, .read_frozen = Reader.frozen, .count = reader.rows.len, .width = reader.columns.len + 1 } };
             const names = try a.alloc([]const u8, values.width());
@@ -1876,11 +1888,19 @@ pub const Adapter = struct {
         if (writes.len == 0) return input;
         const source = self.server.table_reads orelse return error.UnsupportedSqlExecution;
         const upper = try pointUpperBound(alloc, writes[0].key);
+        const scope = table.scope orelse return error.InvalidSqlBackendResponse;
+        const policy_proof = try self.normalizationProof(alloc, table);
+        defer if (self.policy_proofs == null) if (policy_proof) |proof| alloc.free(proof);
+        const mandatory_filter = try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name);
+        defer if (mandatory_filter) |filter| alloc.free(filter);
         const view = (source.openRelationalRead(alloc, table.physical_name, writes[0].key, upper, .{
             .limit = 1,
             .inclusive_from = true,
             .exclusive_to = true,
-            .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version },
+            .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version, .require_normalized_visibility = true },
+            .row_policy_principal_proof = policy_proof orelse "",
+            .row_policy_database = scope.database,
+            .filter_query_json = mandatory_filter orelse "",
             .execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns,
             .cancellation = self.context.cancellation,
         }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.UnsupportedSqlExecution;
@@ -1919,7 +1939,7 @@ pub const Adapter = struct {
             var deletes: std.ArrayList([]const u8) = .empty;
             const predicates = try alloc.alloc(db_types.TransactionVersionPredicate, input.len);
             for (input, predicates) |mutation, *predicate| {
-                predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence };
+                predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence, .row_policy_requirement = mutation.row_policy_requirement };
                 if (mutation.predicate_only) continue;
                 if (self.inserting and mutation.expected_version == 0) if (self.staged) |staged| for (staged.tables) |existing| {
                     if (!std.mem.eql(u8, staged.physicalName(existing.table_name), table.physical_name)) continue;
@@ -1945,7 +1965,7 @@ pub const Adapter = struct {
             const normalized = if (!already_prepared and writes.items.len != 0 and table.storage_mode == .relational) blk: {
                 const source = self.server.table_reads orelse return error.UnsupportedSqlExecution;
                 const scope = table.scope orelse return error.InvalidSqlBackendResponse;
-                const policy_proof = try self.rowPolicyProof(alloc, table);
+                const policy_proof = try self.normalizationProof(alloc, table);
                 const first_key = writes.items[0].key;
                 const upper = try pointUpperBound(alloc, first_key);
                 const view = (source.openRelationalRead(alloc, table.physical_name, first_key, upper, .{
@@ -1979,7 +1999,7 @@ pub const Adapter = struct {
         var deletes: std.ArrayList([]const u8) = .empty;
         const predicates = try alloc.alloc(db_types.TransactionVersionPredicate, input.len);
         for (input, predicates) |mutation, *predicate| {
-            predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence };
+            predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence, .row_policy_requirement = mutation.row_policy_requirement };
             if (mutation.predicate_only) continue;
             if (mutation.row) |row| {
                 try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
@@ -3862,6 +3882,7 @@ test "SQL mutation classification preserves wrapped definite conflicts and const
     const cases = [_]struct { status: u16, body: []const u8, expected: anyerror }{
         .{ .status = 409, .body = "{\"error\":\"batch transaction conflicted\"}", .expected = error.SqlWriteConflict },
         .{ .status = 409, .body = "{\"error\":\"ForeignKeyReferenced\"}", .expected = error.ForeignKeyViolation },
+        .{ .status = 409, .body = "{\"error\":\"ForeignKeyMatchFullViolation\"}", .expected = error.ForeignKeyViolation },
         .{ .status = 400, .body = "{\"error\":\"RelationalCheckViolation\"}", .expected = error.RelationalCheckViolation },
         .{ .status = 413, .body = "{\"error\":\"RelationalIndexKeyTooLarge\"}", .expected = error.RelationalIndexKeyTooLarge },
         .{ .status = 409, .body = "{\"error\":\"standby is read-only\"}", .expected = error.HAReadOnlyStandby },

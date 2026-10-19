@@ -307,6 +307,8 @@ pub const TableSchema = struct {
     requires_json_expressions: bool = false,
     /// JSONB array elements preserve display scale independently of logical hashes.
     requires_jsonb_array_display: bool = false,
+    /// Declared CHECK validity is independent of future-write enforcement.
+    requires_deferred_check_validation: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -369,8 +371,8 @@ test "relational index system schema reader floor joins independent dimensions w
         .{ .semantic_version = 30, .encoding_version = 0 },
         .{ .semantic_version = 0, .encoding_version = 31 },
         .{ .semantic_version = 10, .encoding_version = 31 },
-        .{ .semantic_version = 32, .encoding_version = 31 },
-        .{ .semantic_version = 30, .encoding_version = 32 },
+        .{ .semantic_version = 33, .encoding_version = 31 },
+        .{ .semantic_version = 30, .encoding_version = 33 },
     }) |bad| {
         try std.testing.expectError(error.InvalidSchemaReaderRequirements, joined.include(bad));
         try std.testing.expect(!joined.covers(bad));
@@ -403,8 +405,8 @@ test "relational index system schema reader capabilities distinguish semantics f
         .{ .encoding_ceiling = 31 },
         .{ .semantic_ceiling = 10, .encoding_ceiling = 31 },
         .{ .semantic_ceiling = 31, .encoding_ceiling = 10 },
-        .{ .semantic_ceiling = 32, .encoding_ceiling = 31 },
-        .{ .semantic_ceiling = 31, .encoding_ceiling = 32 },
+        .{ .semantic_ceiling = 33, .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 31, .encoding_ceiling = 33 },
     };
     for (invalid) |profile| {
         try std.testing.expect(profile.known());
@@ -442,6 +444,7 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         .{ "requires_jsonb_display", 29 },
         .{ "requires_json_expressions", 30 },
         .{ "requires_jsonb_array_display", 31 },
+        .{ "requires_deferred_check_validation", 32 },
     }) |requirement| {
         if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
     }
@@ -480,6 +483,7 @@ test "relational index system schema reader requirements cover every durable exp
         .{ "requires_jsonb_display", 29 },
         .{ "requires_json_expressions", 30 },
         .{ "requires_jsonb_array_display", 31 },
+        .{ "requires_deferred_check_validation", 32 },
     }) |expected| {
         var schema: TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true };
         @field(schema, expected[0]) = true;
@@ -586,7 +590,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_check_validation) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -667,6 +671,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_jsonb_display = false;
     projection_schema.requires_json_expressions = false;
     projection_schema.requires_jsonb_array_display = false;
+    projection_schema.requires_deferred_check_validation = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -853,6 +858,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 29) try buf.append(alloc, @intFromBool(schema.requires_jsonb_display));
     if (format_version >= 30) try buf.append(alloc, @intFromBool(schema.requires_json_expressions));
     if (format_version >= 31) try buf.append(alloc, @intFromBool(schema.requires_jsonb_array_display));
+    if (format_version >= 32) try buf.append(alloc, @intFromBool(schema.requires_deferred_check_validation));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1273,6 +1279,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_jsonb_display = if (fmt_version >= 29) data[pos + 10] == 1 else false,
         .requires_json_expressions = if (fmt_version >= 30) data[pos + 11] == 1 else false,
         .requires_jsonb_array_display = if (fmt_version >= 31) data[pos + 12] == 1 else false,
+        .requires_deferred_check_validation = if (fmt_version >= 32) data[pos + 13] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1531,11 +1538,13 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 29) try cursor.readBool();
     if (format_version >= 30) try cursor.readBool();
     if (format_version >= 31) try cursor.readBool();
+    if (format_version >= 32) try cursor.readBool();
     try cursor.finish();
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
     if (schema.requires_jsonb_array_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_deferred_check_validation and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_json_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_jsonb_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_numeric_functions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;

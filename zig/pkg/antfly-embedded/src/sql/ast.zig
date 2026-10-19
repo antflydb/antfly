@@ -117,6 +117,9 @@ pub const Window = struct {
     pub const Frame = struct { mode: enum { rows, range, groups }, start: Bound, end: Bound = .current, exclusion: Exclusion = .no_others };
 };
 pub const Select = struct {
+    /// null is a bag; an empty list is DISTINCT over output slots; otherwise
+    /// the expressions identify PostgreSQL DISTINCT ON's first-row groups.
+    distinct: ?[]const *const Scalar = null,
     /// Compiler-owned INSERT VALUES source, bounded by max_insert_rows. Its
     /// additional relation nodes must not raise the budget for user SQL.
     generated_values: bool = false,
@@ -341,7 +344,7 @@ pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,
     validate_constraint: []const u8,
     add_unique: struct { name: []const u8, columns: []const []const u8, name_generated: bool = false, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", nulls_not_distinct: bool = false },
-    add_check: struct { name: []const u8, expression: *const Scalar, name_generated: bool = false },
+    add_check: struct { name: []const u8, expression: *const Scalar, name_generated: bool = false, not_valid: bool = false },
     add_foreign_key: struct {
         name: []const u8,
         name_generated: bool = false,

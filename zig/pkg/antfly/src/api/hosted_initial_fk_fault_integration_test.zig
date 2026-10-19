@@ -387,6 +387,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
                     .setting_admin = true,
                     .fk_generation_publication_authority = true,
                 }, .{ .fk_initial_create_mutate = .{
+                    .catalog_coverage = before.catalog_coverage,
                     .plan_id = before.plan_id,
                     .child_table_id = child_id,
                     .expected_revision = before.revision,
@@ -613,6 +614,7 @@ fn pendingTicket(alloc: std.mem.Allocator, metadata: *metadata_runtime.Server, s
     return null;
 }
 const Position = struct {
+    catalog_coverage: publication.CatalogCoverage,
     plan_id: publication.Id,
     phase: publication.InitialPhase,
     revision: u64,
@@ -630,6 +632,7 @@ fn position(alloc: std.mem.Allocator, metadata: *metadata_runtime.Server, child_
     var parsed = try std.json.parseFromSlice(publication.InitialPublication, alloc, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     return .{
+        .catalog_coverage = parsed.value.plan.catalog_coverage,
         .plan_id = parsed.value.plan.id,
         .phase = parsed.value.phase,
         .revision = parsed.value.revision,

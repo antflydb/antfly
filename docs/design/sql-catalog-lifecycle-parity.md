@@ -12849,3 +12849,30 @@ regression also pass. No failing, leaked or silently empty native campaign is
 counted as evidence. The 20 inventory tests pass again at the final 399 count;
 Zig/Python formatting, source licenses, the Apache boundary, storage discovery,
 generated engine-error names and generated control-source catalog checks pass.
+
+### In-progress integration checkpoint (2026-10-19)
+
+This checkpoint preserves the next implementation batch before synchronizing
+with main. The inventory remains **399 unresolved**: no pending or failed native
+campaign has received completion credit.
+
+The batch adds shared ARRAY_AGG execution/spill support, PostgreSQL temporal
+extraction, DISTINCT lowering, volatile UUID generation, assignment-to-TEXT
+coercion, document JSON patching and physical-version predicate handling. It
+also implements per-CHECK NOT VALID historical coverage, staged validation,
+initial-FK coverage propagation and exact deterministic constraint diagnostics.
+Targeted Debug tests and PostgreSQL reference campaigns qualify portions of
+these changes; the combined current-source native gates still need completion.
+
+RLS changes add atomic policy publication, command-specific signed authority,
+private integrity observations and durable write provenance. This is not full
+activation: repeated writes in session overlays, first/final action lineage,
+epoch/role fencing and distributed fault qualification remain unfinished.
+An isolated staged-policy evaluator is present but not wired into execution.
+
+Before recording further case dispositions, rerun the combined native document,
+read/binding, typed-array/UUID, CHECK/FK and policy campaigns on the merged Debug
+snapshot. Verify complete postimages and cold recovery, not only compilation.
+Tablespace rename/drop has an independent PostgreSQL oracle but no new native
+case credit. Publication/subscription and database-scoped WASM SQL extension
+integration are now explicitly in scope, not implemented by this checkpoint.

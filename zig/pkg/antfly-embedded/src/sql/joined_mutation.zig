@@ -280,6 +280,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
             var source_ordinals: std.ArrayList(usize) = .empty;
             for (scope, slots, required, 0..) |field, slot, used, ordinal| {
                 if (!used) continue;
+                // A prepared postimage does not own the eventual commit
+                // version. Other joined sources and DELETE preimages retain
+                // their pinned versions; an updated target needs a receipt.
+                if (!deleting and table.storage_mode == .document and std.mem.eql(u8, field.qualifier, alias) and std.mem.eql(u8, field.name, "_version")) return error.UnsupportedSqlShape;
                 try dense_scope.append(alloc, field);
                 try dense_slots.append(alloc, slot);
                 try source_ordinals.append(alloc, ordinal);

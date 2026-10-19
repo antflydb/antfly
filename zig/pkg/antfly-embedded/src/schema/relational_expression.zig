@@ -3265,10 +3265,10 @@ test "relational declarations NUMERIC defaults generated topology and strict res
             try std.testing.expectEqualStrings("9007199254740993.0003", document.value.object.get("sum").?.number_string);
             try std.testing.expectEqualStrings("-9007199254740993.0003", document.value.object.get("negative").?.number_string);
             try set.verifyJson(alloc, document.value);
-            // Restore accepts logically equivalent display scales but never
-            // repairs missing or forged generated values.
+            // Logical comparison ignores display scale, but authenticated
+            // restoration must preserve the canonical generated display.
             try document.value.object.put(document.arena.allocator(), "sum", .{ .number_string = "9007199254740993.000300" });
-            try set.verifyJson(alloc, document.value);
+            try invalidGenerated(alloc, set, document.value);
             try document.value.object.put(document.arena.allocator(), "sum", .{ .number_string = "9007199254740993.0004" });
             try invalidGenerated(alloc, set, document.value);
             _ = document.value.object.swapRemove("sum");

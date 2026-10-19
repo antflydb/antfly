@@ -170,7 +170,7 @@ pub fn needsResidual(table: ?catalog.Table, predicate: ?*const ast.Predicate) bo
 fn typedComparisonColumn(table: ?catalog.Table, name: []const u8) bool {
     const definition = table orelse return false;
     const column = definition.column(name) catch return false;
-    return column.type == .json or column.type == .array or column.element_type == .numeric;
+    return definition.isDocumentVersion(name) or column.type == .json or column.type == .array or column.element_type == .numeric;
 }
 
 // Floating native columns may receive an explicitly typed NUMERIC parameter.

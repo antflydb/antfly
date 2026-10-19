@@ -275,6 +275,13 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
     const a = arena.allocator();
     const records = try loadPolicies(a, txn, group_id);
     var next_id = meta.next_id;
+    const table_id = switch (command.change) {
+        .put => |record| record.table_id,
+        .drop => |identity| identity.table_id,
+    };
+    if (command.publication) |publication| {
+        if (publication.table_id != table_id or publication.phase != .pending_install) return error.InvalidRowPolicyPublication;
+    }
     switch (command.change) {
         .put => |record| {
             try record.validateShape();
@@ -313,6 +320,9 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
             try txn.delete(key);
         },
     }
+    if (command.publication) |publication| {
+        return applyPolicyPublicationCommandWithNextId(alloc, txn, group_id, .{ .expected_revision = command.expected_revision, .change = .{ .begin = publication } }, command_hash, next_id);
+    }
     try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id }, meta, command_hash);
 }
 
@@ -320,6 +330,10 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
 /// verifies the owner topology cut before proposing `begin` and `promote`;
 /// apply independently checks monotonic identity and exact committed ACKs.
 pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.PublicationCommand, command_hash: [32]u8) !void {
+    return applyPolicyPublicationCommandWithNextId(alloc, txn, group_id, command, command_hash, null);
+}
+
+fn applyPolicyPublicationCommandWithNextId(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.PublicationCommand, command_hash: [32]u8, next_id: ?u64) !void {
     if (command.version != 1) return error.InvalidRowPolicyPublication;
     const meta = try readMeta(alloc, txn, group_id);
     if (meta.revision != command.expected_revision) return;
@@ -353,7 +367,6 @@ pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.Do
                 if (record.schema_version != incoming.schema_version or !std.mem.eql(u8, &record.schema_digest, &incoming.schema_digest)) return error.RowPolicyCatalogChanged;
                 try selected.append(a, record);
             };
-            if (incoming.phase == .pending_install and selected.items.len == 0) return error.RowPolicyCatalogChanged;
             const setting_records = try loadSettings(a, txn, group_id);
             try putPolicyInstallSnapshot(a, txn, group_id, .{
                 .table_id = incoming.table_id,
@@ -443,7 +456,7 @@ pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.Do
         try txn.put(work_key, &.{1})
     else
         try txn.delete(work_key);
-    try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = meta.next_id }, meta, command_hash);
+    try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id orelse meta.next_id }, meta, command_hash);
 }
 
 pub fn loadSettings(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const settings.Record {

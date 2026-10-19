@@ -3138,6 +3138,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.RowPolicyMutationUnsupported;
             const bundle = if (S.ownerField(self, "local_execution").*.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
             const schema = schema_view.tableSchema().*;
+            var requirements = try @import("row_policy_bundle.zig").MutationRequirements.init(S.ownerField(self, "alloc").*, req.predicates, principal);
+            defer requirements.deinit(S.ownerField(self, "alloc").*);
+            const select_check = if (requirements.needsSelect()) try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .select) else null;
+            defer if (select_check) |evaluation| evaluation.deinit();
             var insert_check = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .insert);
             defer insert_check.deinit();
             var update_old = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .update_old);
@@ -3150,6 +3154,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer probe.abort();
             for (req.writes, 0..) |write, i| {
                 if (isMetadataKey(write.key)) return error.RowPolicyMutationUnsupported;
+                const requirement = try requirements.forKey(write.key);
+                if (requirement.isDelete()) return error.RowPolicyAuthenticationRequired;
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
                 defer S.ownerField(self, "alloc").*.free(store_key);
                 const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
@@ -3157,20 +3163,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else => return err,
                 };
                 if (old_bytes) |bytes| {
+                    if (requirement.isInsert()) return error.RowPolicyDenied;
                     if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
                     const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
                         try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
                     else
                         try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
                     if (!try update_old.permits(old)) return error.RowPolicyDenied;
+                    if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
                 }
+                if (old_bytes == null and requirement.isUpdate()) return error.RowPolicyDenied;
                 const prepared = prepared_rows.?[i] orelse return error.RowPolicyMutationUnsupported;
                 const new = try relational_row_codec.ordinalRowViewTrusted(prepared.packed_row, schema, schema_view.physicalLayout());
                 if (!try (if (old_bytes != null) update_new else insert_check).permits(new))
                     return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(new)) return error.RowPolicyDenied;
             }
             for (req.deletes) |key| {
                 if (isMetadataKey(key)) return error.RowPolicyMutationUnsupported;
+                const requirement = try requirements.forKey(key);
+                if (requirement.isInsert() or requirement.isUpdate()) return error.RowPolicyAuthenticationRequired;
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, key);
                 defer S.ownerField(self, "alloc").*.free(store_key);
                 const bytes = probe.getLeased(store_key) catch |err| switch (err) {
@@ -3183,6 +3195,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else
                     try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
                 if (!try delete_old.permits(old)) return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
             }
         }
 

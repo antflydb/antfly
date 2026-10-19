@@ -8087,6 +8087,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text(@import("antfly_local_sources").schema_relational_expression_errors.rewrite_required_message);
             },
+            error.CheckConstraintValidationRequired => {
+                _ = ctx.status(409);
+                return ctx.text(@import("antfly_local_sources").schema_relational_checks.validation_required_message);
+            },
             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest, error.SchemaVersionManagedByBackend => {
                 invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
                 _ = ctx.status(400);
@@ -8164,6 +8168,10 @@ pub const AntflyApiHandler = struct {
                     error.GeneratedColumnRewriteRequired => {
                         _ = ctx.status(409);
                         return ctx.text(@import("antfly_local_sources").schema_relational_expression_errors.rewrite_required_message);
+                    },
+                    error.CheckConstraintValidationRequired => {
+                        _ = ctx.status(409);
+                        return ctx.text(@import("antfly_local_sources").schema_relational_checks.validation_required_message);
                     },
                     error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                         _ = ctx.status(400);
@@ -13626,6 +13634,16 @@ test "httpx SQL document campaign verifies exact native mutation and storage out
     try documentMutationCampaign(@import("antfly_local_sources").sql_parity_fixtures.document_reference);
 }
 
+test "httpx SQL original document assignments enforce readonly versions and JSONB types" {
+    const ids = [_][]const u8{ "sql-0912", "sql-0915", "sql-0916", "sql-0921", "sql-0943", "sql-1083" };
+    const bytes = @import("antfly_local_sources").sql_parity_fixtures.document_boundary_reference;
+    var parsed = try std.json.parseFromSlice(struct { entries: []const struct { id: []const u8 } }, std.testing.allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(ids.len, parsed.value.entries.len);
+    for (ids, parsed.value.entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    try documentMutationCampaign(bytes);
+}
+
 test "httpx SQL original floating document MOD rejects signatures without changing primary bytes" {
     const ids = [_][]const u8{ "sql-0970", "sql-0971", "sql-0972", "sql-0973" };
     const bytes = @import("antfly_local_sources").sql_parity_fixtures.document_numeric_rejection_reference;
@@ -14107,8 +14125,8 @@ test "httpx SQL PostgreSQL original users alias read preserves the bounded match
 }
 
 test "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access" {
-    const ids = [_][]const u8{ "sql-0215", "sql-0261", "sql-0262", "sql-0263", "sql-0552", "sql-1370", "sql-1501" };
-    const codes = [_][]const u8{ "42883", "42883", "42883", "42883", "42804", "42P20", "42601" };
+    const ids = [_][]const u8{ "sql-0215", "sql-0259", "sql-0261", "sql-0262", "sql-0263", "sql-0267", "sql-0268", "sql-0269", "sql-0270", "sql-0552", "sql-1370", "sql-1501" };
+    const codes = [_][]const u8{ "42883", "42883", "42883", "42883", "42883", "42883", "42883", "42883", "42883", "42804", "42P20", "42601" };
     try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.binding_rejection_reference, "usage_records", &ids, &codes);
 }
 
@@ -14117,6 +14135,11 @@ test "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggreg
         "sql-0203", "sql-0204", "sql-1224", "sql-1229", "sql-1266", "sql-1302", "sql-1378", "sql-1379", "sql-1380", "sql-1381",
     };
     try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.extended_read_reference, "usage_records", &ids, null);
+}
+
+test "httpx SQL PostgreSQL original remaining reads preserve distinct frontiers and typed aggregates" {
+    const ids = [_][]const u8{ "sql-0292", "sql-0641", "sql-0642", "sql-1231", "sql-1237", "sql-1253" };
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.remaining_read_reference, "usage_records", &ids, null);
 }
 
 test "httpx SQL PostgreSQL original stored array reads preserve typed column semantics" {
@@ -14484,10 +14507,24 @@ test "httpx SQL transaction timestamp results retain typed values through public
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
+    var corpus = try local.sql_parity_fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    const clock_contracts = try std.json.parseFromSlice(struct {
+        clock_contracts: []const struct { id: []const u8, columns: []const []const u8, column_oids: []const u32, semantics: []const u8 },
+        uuid_contract: struct { id: []const u8, columns: []const []const u8, column_oids: []const u32, version: u8, variant: []const u8 },
+    }, alloc, local.sql_parity_fixtures.remaining_read_reference, .{ .ignore_unknown_fields = true });
+    defer clock_contracts.deinit();
+    try std.testing.expectEqual(@as(usize, 3), clock_contracts.value.clock_contracts.len);
+    for (clock_contracts.value.clock_contracts, [_][]const u8{ "sql-0174", "sql-0175", "sql-0176" }) |entry, id| {
+        try std.testing.expectEqualStrings(id, entry.id);
+        try std.testing.expectEqualStrings("planned_at_ns", entry.columns[0]);
+        try std.testing.expectEqual(@as(u32, 1184), entry.column_oids[0]);
+        try std.testing.expectEqualStrings("transaction_start_microseconds", entry.semantics);
+    }
     for ([_][]const u8{
-        "SELECT now() AS planned_at_ns FROM usage_records WHERE id=$1",
-        "SELECT CURRENT_TIMESTAMP AS planned_at_ns FROM usage_records WHERE id=$1",
-        "SELECT CURRENT_TIMESTAMP(6) AS planned_at_ns FROM usage_records WHERE id=$1",
+        (try corpus.get("sql-0174")).sql,
+        (try corpus.get("sql-0175")).sql,
+        (try corpus.get("sql-0176")).sql,
         "SELECT now() AS planned_at_ns, transaction_timestamp() AS txn, CURRENT_TIMESTAMP(6) AS rounded FROM usage_records WHERE id=$1",
         "SELECT now() AS planned_at_ns FROM usage_records WHERE id=$1 ORDER BY id",
     }) |sql| {
@@ -14498,7 +14535,9 @@ test "httpx SQL transaction timestamp results retain typed values through public
         request.body = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .statement = sql, .parameters = .{"u1"} }, .{});
         var context = httpx.Context.init(alloc, std.testing.io, &request);
         defer context.deinit();
+        const before = std.Io.Clock.now(.real, std.testing.io).nanoseconds;
         var response = try handler.executeSQL(&context);
+        const after = std.Io.Clock.now(.real, std.testing.io).nanoseconds;
         defer response.deinit();
         if (response.status.code != 200) std.debug.print("transaction timestamp rejected: {s}\n", .{response.body orelse ""});
         try std.testing.expectEqual(@as(u16, 200), response.status.code);
@@ -14511,7 +14550,40 @@ test "httpx SQL transaction timestamp results retain typed values through public
             try std.testing.expectEqualStrings(result.value.rows[0][0].string, value.string);
             const parsed = try local.sql_temporal_text.parseCanonical(.timestamp_tz, value.string);
             try std.testing.expect(parsed.timestamp_tz.micros != std.math.minInt(i64) and parsed.timestamp_tz.micros != std.math.maxInt(i64));
+            const ns = parsed.timestamp_tz.unixNanoseconds().?;
+            try std.testing.expect(ns >= @divFloor(before, 1000) * 1000 and ns <= after);
         }
+    }
+    const uuid_contract = clock_contracts.value.uuid_contract;
+    try std.testing.expectEqualStrings("sql-0177", uuid_contract.id);
+    try std.testing.expectEqualStrings("request_id", uuid_contract.columns[0]);
+    try std.testing.expectEqual(@as(u32, 2950), uuid_contract.column_oids[0]);
+    try std.testing.expectEqual(@as(u8, 4), uuid_contract.version);
+    try std.testing.expectEqualStrings("RFC4122", uuid_contract.variant);
+    const original = try corpus.get(uuid_contract.id);
+    var seen: [32][16]u8 = undefined;
+    for (&seen, 0..) |*next, count| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .statement = original.sql, .parameters = .{"u1"} }, .{});
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("UUID original rejected: {s}\n", .{response.body orelse ""});
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, arena.allocator(), response.body.?, .{});
+        try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.value.columns.len);
+        try std.testing.expect(@import("sql_parity_reference.zig").postgresColumnMatches(result.value.columns[0], 2950));
+        try std.testing.expectEqualStrings(uuid_contract.columns[0], result.value.columns[0].name);
+        try std.testing.expect(!result.value.sql_nulls.?[0][0]);
+        next.* = try local.common_uuid.parse(result.value.rows[0][0].string);
+        try std.testing.expectEqual(@as(u8, 4), next[6] >> 4);
+        try std.testing.expectEqual(@as(u8, 2), next[8] >> 6);
+        for (seen[0..count]) |previous| try std.testing.expect(!std.mem.eql(u8, &previous, next));
     }
 }
 

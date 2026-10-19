@@ -19,8 +19,8 @@
 const std = @import("std");
 
 pub const minimum_semantic_version: u32 = 11;
-pub const current_semantic_version: u32 = 31;
-pub const current_encoding_version: u32 = 31;
+pub const current_semantic_version: u32 = 32;
+pub const current_encoding_version: u32 = 32;
 
 pub const ReaderCapabilities = struct {
     semantic_ceiling: u32 = 0,
@@ -119,8 +119,8 @@ test "schema admission pure contract keeps semantic and physical requirements in
         .{ .semantic_version = 0, .encoding_version = 0 },
         .{ .semantic_version = 10, .encoding_version = 31 },
         .{ .semantic_version = 30, .encoding_version = 0 },
-        .{ .semantic_version = 32, .encoding_version = 31 },
-        .{ .semantic_version = 30, .encoding_version = 32 },
+        .{ .semantic_version = 33, .encoding_version = 31 },
+        .{ .semantic_version = 30, .encoding_version = 33 },
     }) |invalid| {
         try std.testing.expect(!invalid.valid());
         try std.testing.expectError(error.InvalidSchemaReaderRequirements, floor.include(invalid));

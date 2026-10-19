@@ -291,6 +291,42 @@ const ProjectedBatch = struct {
         return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .count = self.selection.len, .width = self.columns.len } };
     }
 };
+test "SQL native document version conditions remain typed residuals not stored properties" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const context: Context = .{
+        .alloc = a,
+        .arena = a,
+        .backend = undefined,
+        .binding = .{ .table = null, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty },
+        .parameters = &.{},
+        .limits = .{},
+    };
+    var table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{} };
+    for ([_]ast.Comparison{ .eq, .neq, .lt, .lte, .gt, .gte }) |op| {
+        const predicate: ast.Predicate = .{ .comparison = .{ .field = "_version", .op = op, .value = .{ .integer = 42 } } };
+        const bound = try context.conditions(table, &predicate);
+        try std.testing.expectEqual(@as(usize, 0), bound.terms.items.len);
+        try std.testing.expect(!bound.complete);
+        try std.testing.expect(@import("bound_scalars.zig").needsResidual(table, &predicate));
+    }
+    for ([_]bool{ false, true }) |negated| {
+        const predicate: ast.Predicate = .{ .is_null = .{ .field = "_version", .negated = negated } };
+        const bound = try context.conditions(table, &predicate);
+        try std.testing.expectEqual(!negated, bound.empty);
+        try std.testing.expectEqual(@as(usize, 0), bound.terms.items.len);
+    }
+    // A genuine relational user column with this name keeps ordinary native
+    // pushdown. This metadata rule must not become an unqualified-name hack.
+    table.storage_mode = .relational;
+    table.columns = &.{.{ .name = "_version", .path = "_version", .type = .integer }};
+    const real: ast.Predicate = .{ .comparison = .{ .field = "_version", .op = .eq, .value = .{ .integer = 42 } } };
+    const pushed = try context.conditions(table, &real);
+    try std.testing.expectEqual(@as(usize, 1), pushed.terms.items.len);
+    try std.testing.expect(pushed.complete);
+}
+
 pub const Context = struct {
     sink: ?RowSink = null,
     spill: ?*@import("spill.zig").Manager = null,
@@ -690,7 +726,7 @@ pub const Context = struct {
                 // Native condition values cannot carry typed arrays or exact
                 // NUMERIC limbs. Keep these comparisons in the typed residual
                 // instead of interpreting their JSON placeholder as SQL NULL.
-                if (column.type == .array or column.element_type == .numeric or table_def.isDocumentRoot(column.name)) {
+                if (column.type == .array or column.element_type == .numeric or table_def.isDocumentRoot(column.name) or table_def.isDocumentVersion(column.name)) {
                     output.complete = false;
                     return;
                 }
@@ -753,6 +789,10 @@ pub const Context = struct {
             },
             .is_null => |test_null| {
                 const column = try table_def.column(test_null.field);
+                if (table_def.isDocumentVersion(column.name)) {
+                    if (!test_null.negated) output.empty = true;
+                    return;
+                }
                 if (column.type == .json) {
                     output.complete = false;
                     return;
@@ -1802,10 +1842,23 @@ pub const Context = struct {
         // No iterator may borrow the captured cut past publication. Native
         // proof/version fences have already joined the atomic write read-set.
         if (self.statement_capture) |capture| capture.release();
-        const committed = if (fences.items.len == 0) prepared else blk: {
+        const committed_base = if (fences.items.len == 0) prepared else blk: {
             try fences.appendSlice(self.arena, prepared);
             break :blk fences.items;
         };
+        // Provenance belongs to each effective mutation, not the enclosing
+        // batch: ON CONFLICT and MERGE can mix inserts, updates and deletes.
+        const committed = try self.arena.dupe(catalog.Mutation, committed_base);
+        for (committed) |*mutation| {
+            if (mutation.predicate_only) continue;
+            const select_required = if (mutation.unique_absence) returning != null or self.binding.returning != null else table.sql_select_required;
+            mutation.row_policy_requirement = if (mutation.row == null)
+                (if (select_required) .delete_select else .delete)
+            else if (mutation.unique_absence)
+                (if (select_required) .insert_select else .insert)
+            else
+                (if (select_required) .update_select else .update);
+        }
         // Commit-only wire buffers have their own lifetime. Growing them in
         // the result arena amplifies retained preimages and cannot reclaim
         // serialization capacity before the statement result is released.

@@ -52,7 +52,7 @@ pub fn checksFingerprint(alloc: std.mem.Allocator, public: schema.TableSchema) !
     errdefer native.freeSchema(alloc, runtime);
     const checks = try @import("relational_checks.zig").Set.createOwned(alloc, runtime, definitions.value);
     defer checks.deinit();
-    return checks.fingerprint();
+    return checks.validationFingerprint();
 }
 
 pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSchema, runtime: native.TableSchema) ![]catalog.Definition {

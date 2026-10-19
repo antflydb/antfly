@@ -295,7 +295,22 @@ pub const CompiledTableValidator = struct {
             const cell = (try row.findCell(@intCast(ordinal))) orelse continue;
             if (!cell.is_null and std.mem.eql(u8, cell.value.bytes_val, "null")) try names.append(alloc, column.name);
         }
-        try self.prepareTypedValue(alloc, alloc, value, names.items, true);
+        // Stored-row imports retain historical NOT VALID intent. Structural
+        // and generated-value verification remains identical; ordinary API
+        // preparation retains the original all-rule execution plan.
+        try self.requireCanonicalUuid(value.*);
+        var historical = self.execution;
+        historical.checks = null;
+        var historical_schema = self.schema;
+        historical_schema.checks = null;
+        try impl.prepareTypedDocumentValueWithPlan(alloc, alloc, historical_schema, value, self.physical_fields, &historical, names.items, true);
+        if (historical.expressions != null) try self.requireCanonicalUuid(value.*);
+        if (self.execution.checks) |checks| {
+            const expressions = @import("relational_expression.zig");
+            var budget: usize = expressions.max_allocated_bytes;
+            var execution = expressions.Execution.init(alloc, &budget);
+            if (try checks.firstFailureRowWithExecution(&execution, row)) |failure| return failure.reason;
+        }
     }
 
     /// The caller must first validate canonical bytes/hash against the runtime
@@ -312,7 +327,7 @@ pub const CompiledTableValidator = struct {
         std.debug.assert(!self.restore.full_root);
         try execution.charge(0);
         if (self.execution.expressions) |expressions| try expressions.verifyRowWithExecution(execution, row);
-        if (self.execution.checks) |checks| if (try checks.firstViolationRowWithExecution(execution, row) != null) return error.RelationalCheckViolation;
+        if (self.execution.checks) |checks| if (try checks.firstFailureRowWithExecution(execution, row)) |failure| return failure.reason;
         for (self.restore.properties) |index| {
             try execution.charge(1);
             const property = self.schema.document_schemas[0].properties[index];
@@ -356,6 +371,84 @@ test "relational UUID preparation canonicalizes before durable row and index ext
 const compiled_check_fixture =
     \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":"9007199254740992"},{"name":"known","column":"name","op":"is_not_null"},{"name":"active","column":"name","op":"eq","value":"ACTIVE","collation":"ci"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"}},"additionalProperties":false}}}}
 ;
+
+test "relational index system NOT VALID CHECK enforces writes without historical coverage" {
+    const a = std.testing.allocator;
+    const deferred_json =
+        \\{"version":7,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gte","value":0,"not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var validator = try CompiledTableValidator.init(a, deferred_json);
+    defer validator.deinit(a);
+    const checks = validator.execution.checks.?;
+    try std.testing.expectEqual(@as(usize, 1), checks.dependency_fields.len);
+    try std.testing.expectEqual(@as(usize, 0), checks.validation_dependency_fields.len);
+    try std.testing.expect(std.mem.allEqual(u8, &checks.validationFingerprint(), 0));
+    try std.testing.expect(!std.mem.allEqual(u8, &checks.fingerprint(), 0));
+    var row = try std.json.parseFromSlice(std.json.Value, a, "{\"n\":-1}", .{});
+    defer row.deinit();
+    try std.testing.expectError(error.RelationalCheckViolation, validator.validateValue(a, &row.value));
+    try std.testing.expectEqual(@as(?@import("relational_checks.zig").Set.Failure, null), try checks.firstFailureJson(a, row.value));
+    const runtime = try deriveRuntimeTableSchema(a, validator.schema);
+    defer storage_schema.freeSchema(a, runtime);
+    try std.testing.expect(runtime.requires_deferred_check_validation);
+    try std.testing.expectEqual(@as(u32, 32), storage_schema.requiredReaderVersion(runtime));
+    const bytes = try storage_schema.serializeSchema(a, runtime);
+    defer a.free(bytes);
+    const restored = try storage_schema.deserializeSchema(a, bytes);
+    defer storage_schema.freeSchema(a, restored);
+    try std.testing.expect(restored.requires_deferred_check_validation);
+    try std.testing.expectEqual(@as(u32, 32), restored.decoded_format_version);
+    for (0..bytes.len) |length| {
+        const truncated = storage_schema.deserializeSchema(a, bytes[0..length]) catch continue;
+        storage_schema.freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const corrupt = try a.dupe(u8, bytes);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] = 2;
+    try std.testing.expectError(error.InvalidSchema, storage_schema.deserializeSchema(a, corrupt));
+    // The new flag extends, rather than relabels, the deployed v31 frame.
+    // Its prefix remains the canonical legacy representation without the bit.
+    const legacy_bytes = try a.dupe(u8, bytes[0 .. bytes.len - 1]);
+    defer a.free(legacy_bytes);
+    std.mem.writeInt(u32, legacy_bytes[4..8], 31, .little);
+    const legacy = try storage_schema.deserializeSchema(a, legacy_bytes);
+    defer storage_schema.freeSchema(a, legacy);
+    try std.testing.expectEqual(@as(u32, 31), legacy.decoded_format_version);
+    try std.testing.expect(!legacy.requires_deferred_check_validation);
+    var projection_only = runtime;
+    projection_only.requires_deferred_check_validation = false;
+    const old_projection = try storage_schema.serializeTextProjectionSchema(a, projection_only);
+    defer a.free(old_projection);
+    const next_projection = try storage_schema.serializeTextProjectionSchema(a, runtime);
+    defer a.free(next_projection);
+    try std.testing.expectEqualStrings(old_projection, next_projection);
+    const requirements = storage_schema.readerRequirementsForSchema(restored);
+    try std.testing.expect(!(storage_schema.ReaderCapabilities{ .semantic_ceiling = 31, .encoding_ceiling = 32 }).supports(requirements));
+    try std.testing.expect(!(storage_schema.ReaderCapabilities{ .semantic_ceiling = 32, .encoding_ceiling = 31 }).supports(requirements));
+
+    var mixed = try CompiledTableValidator.init(a,
+        \\{"version":8,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gte","value":0,"not_valid":true},{"name":"required","column":"k","op":"gte","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"k":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    defer mixed.deinit(a);
+    const historical = mixed.execution.checks.?;
+    try std.testing.expectEqual(@as(usize, 2), historical.dependency_fields.len);
+    try std.testing.expectEqual(@as(usize, 1), historical.validation_dependency_fields.len);
+    try std.testing.expectEqualStrings("k", historical.validation_dependency_fields[0]);
+    try row.value.object.put(row.arena.allocator(), "k", .{ .integer = 1 });
+    try std.testing.expectEqual(@as(?@import("relational_checks.zig").Set.Failure, null), try historical.firstFailureJson(a, row.value));
+    try std.testing.expectError(error.RelationalCheckViolation, mixed.validateValue(a, &row.value));
+    row.value.object.getPtr("k").?.* = .{ .integer = -1 };
+    try std.testing.expectEqual(@as(usize, 1), (try historical.firstFailureJson(a, row.value)).?.index);
+    var candidate = try std.json.parseFromSlice(std.json.Value, a, deferred_json, .{});
+    defer candidate.deinit();
+    const next_check = &candidate.value.object.getPtr("checks").?.array.items[0];
+    try next_check.object.put(candidate.arena.allocator(), "not_valid", .{ .bool = false });
+    try next_check.object.put(candidate.arena.allocator(), "name", .{ .string = "renamed" });
+    const next_json = try std.json.Stringify.valueAlloc(candidate.arena.allocator(), candidate.value, .{});
+    try std.testing.expectError(error.CheckConstraintValidationRequired, @import("relational_checks.zig").validateSchemaUpdate(a, deferred_json, next_json));
+    try @import("relational_checks.zig").validateSchemaUpdate(a, deferred_json, deferred_json);
+}
 
 const precise_sql_fixture =
     \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","x-antfly-sql-type":"int16"},"f":{"type":"number","x-antfly-sql-type":"float32"},"id":{"type":"keyword","x-antfly-sql-type":"uuid"},"text":{"type":"keyword","x-antfly-sql-type":"text"}},"additionalProperties":false}}}}
@@ -1301,12 +1394,13 @@ test "relational declarations exact NUMERIC generated programs publish capabilit
 
 test "relational declarations NUMERIC cast modifiers publish capability for nonnumeric results" {
     const a = std.testing.allocator;
-    for ([_][]const u8{
-        "CREATE TABLE t (n bigint DEFAULT CAST(CAST(1.245 AS numeric(4,2)) AS bigint))",
-        "CREATE TABLE t (n bigint GENERATED ALWAYS AS (CAST(CAST(1.245 AS numeric(4,2)) AS bigint)) STORED)",
-        "CREATE TABLE t (n bigint, CHECK (CAST(1.245 AS numeric(4,2)) > 0))",
-    }) |sql| {
-        var compiled = try @import("../sql/compiler.zig").compile(a, sql, .{});
+    for ([_]struct { sql: []const u8, requires_modifiers: bool }{
+        .{ .sql = "CREATE TABLE t (n bigint DEFAULT CAST(CAST(1.245 AS numeric(4,2)) AS bigint))", .requires_modifiers = false },
+        .{ .sql = "CREATE TABLE t (source numeric, n bigint GENERATED ALWAYS AS (CAST(CAST(source AS numeric(4,2)) AS bigint)) STORED)", .requires_modifiers = true },
+        .{ .sql = "CREATE TABLE t (n bigint, CHECK (CAST(n AS numeric(4,2)) > 0))", .requires_modifiers = true },
+        .{ .sql = "CREATE TABLE t (n bigint, CHECK (CAST(1.245 AS numeric(4,2)) > 0))", .requires_modifiers = false },
+    }) |case| {
+        var compiled = try @import("../sql/compiler.zig").compile(a, case.sql, .{});
         defer compiled.deinit();
         const source = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
         defer a.free(source);
@@ -1316,13 +1410,13 @@ test "relational declarations NUMERIC cast modifiers publish capability for nonn
         defer storage_schema.freeSchema(a, runtime);
         const checks = try deriveRelationalCheckLayout(a, validator.schema);
         defer storage_schema.freeSchema(a, checks);
-        try std.testing.expect(runtime.requires_numeric_modifiers);
-        try std.testing.expect(checks.requires_numeric_modifiers);
+        try std.testing.expectEqual(case.requires_modifiers, runtime.requires_numeric_modifiers);
+        try std.testing.expectEqual(case.requires_modifiers, checks.requires_numeric_modifiers);
         const bytes = try storage_schema.serializeSchema(a, runtime);
         defer a.free(bytes);
         const restored = try storage_schema.deserializeSchema(a, bytes);
         defer storage_schema.freeSchema(a, restored);
-        try std.testing.expect(restored.requires_numeric_modifiers);
+        try std.testing.expectEqual(case.requires_modifiers, restored.requires_numeric_modifiers);
         try std.testing.expect(restored.requires_exact_numeric_expressions);
     }
 }
@@ -1775,7 +1869,14 @@ fn expressionCapabilitySchema(schema: ParsedTableSchema) storage_schema.TableSch
         .requires_jsonb_display = requiresJsonbDisplay(schema),
         .requires_json_expressions = requiresJsonExpressions(schema),
         .requires_jsonb_array_display = requiresJsonbArrayDisplay(schema),
+        .requires_deferred_check_validation = deferredCheckValidation(schema),
     };
+}
+
+fn deferredCheckValidation(schema: ParsedTableSchema) bool {
+    const declarations = schema.checks orelse return false;
+    for (declarations.value) |check| if (check.not_valid orelse false) return true;
+    return false;
 }
 
 fn deriveRuntimeRelationalColumns(

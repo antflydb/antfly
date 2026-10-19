@@ -1,0 +1,534 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": "document-readonly-version-and-jsonb-assignment",
+  "seeds": [
+    {
+      "key": "doc:a",
+      "value": {
+        "title": "Launch",
+        "status": "draft",
+        "category": "release",
+        "amount": 12,
+        "enabled": true,
+        "note": "keep-a",
+        "metadata": {
+          "source": "api",
+          "billing": {
+            "plan": "pro"
+          },
+          "flags": [
+            "rated"
+          ]
+        }
+      }
+    },
+    {
+      "key": "doc:b",
+      "value": {
+        "title": "Other",
+        "status": "ready",
+        "category": "other",
+        "amount": 20,
+        "enabled": false,
+        "note": "keep-b",
+        "metadata": {
+          "source": "internal",
+          "billing": {
+            "plan": "free"
+          },
+          "flags": []
+        }
+      }
+    },
+    {
+      "key": "doc:c",
+      "value": {
+        "title": "Untouched",
+        "status": "closed",
+        "category": "other",
+        "amount": 4,
+        "enabled": false,
+        "note": "keep-c",
+        "metadata": {
+          "source": "manual",
+          "flags": []
+        }
+      }
+    }
+  ],
+  "entries": [
+    {
+      "id": "sql-0912",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "428C9",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0915",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "428C9",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0916",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "keyword"
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "42804",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0921",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "428C9",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0943",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "428C9",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1083",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "keyword"
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "42804",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": []
+}

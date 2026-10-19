@@ -693,6 +693,8 @@ pub const LakeCatalogConfig = struct {
 
 /// A typed CHECK. Supply either expression or column and op (with optional value and collation), never both forms. Expressions must return boolean and use the shared bounded immutable scalar expression vocabulary. New writes are checked from schema publication; existing rows are validated separately. SQL UNKNOWN satisfies CHECK. Comparison values must match the column type. Integer values may also use exact decimal strings to avoid client-side floating-point rounding.
 pub const RelationalCheckConstraint = struct {
+    /// Enforce this CHECK on every new or changed row without asserting that historical rows satisfy it. Explicit validation clears this declaration only after an unpublished generation has validated all rows and atomically replaced the active generation. Disposable background scan coverage does not change this declaration.
+    not_valid: ?bool = null,
     name: []const u8,
     column: ?[]const u8 = null,
     op: ?RelationalComparisonOp = null,
@@ -704,6 +706,7 @@ pub const RelationalCheckConstraint = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "not_valid", "not_valid", true },
         .{ "name", "name", false },
         .{ "column", "column", true },
         .{ "op", "op", true },
@@ -722,6 +725,10 @@ pub const RelationalCheckConstraint = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.not_valid) |value| {
+            try jw.objectField("not_valid");
+            try jw.write(value);
+        }
         try jw.objectField("name");
         try jw.write(self.name);
         if (self.column) |value| {

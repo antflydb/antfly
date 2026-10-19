@@ -315,7 +315,7 @@ pub fn beginPolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: o
 pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("antfly_local_sources").system_catalog_policies.PublicationCommand) ![]u8 {
     if (!context.setting_admin or !context.row_policy_install_authority) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_publication_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_intent_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -1068,7 +1068,8 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     try command.validateShape();
     try context.ensureActive();
     const naming = if (command.plan) |plan| plan.constraint_name_admission != null else false;
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (naming) @max(protocol.fk_initial_create_version, protocol.constraint_occupancy_version) else protocol.fk_initial_create_version);
+    const minimum = if (command.catalog_coverage == .checks_v1) protocol.initial_fk_checks_catalog_version else if (naming) @max(protocol.fk_initial_create_version, protocol.constraint_occupancy_version) else protocol.fk_initial_create_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, minimum);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
@@ -1104,7 +1105,7 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
 pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("antfly_local_sources").system_catalog_policies.Command) ![]u8 {
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_publication_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_intent_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -1112,7 +1113,7 @@ pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: o
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const current = try store.systemCatalogMeta(alloc, svc.metadata_group_id);
     if (current.revision != command.expected_revision) return error.RowPolicyCatalogChanged;
-    const bytes = try serializePolicyDefinitionCommand(alloc, command);
+    const bytes = try store.sqlPolicyDefinitionCommandJson(alloc, svc.metadata_group_id, command);
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_policies = bytes });
@@ -1254,7 +1255,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.fkInitialChildDecisionJson(alloc, svc.metadata_group_id, request);
         },
-        .fk_initial_create_begin => |plan| mutateFkInitialCreate(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }),
+        .fk_initial_create_begin => |plan| mutateFkInitialCreate(svc, alloc, context, .{ .catalog_coverage = plan.catalog_coverage, .plan_id = plan.id, .child_table_id = plan.child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }),
         .fk_initial_create_mutate => |command| mutateFkInitialCreate(svc, alloc, context, command),
         .fk_initial_create_status => |child_table_id| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;

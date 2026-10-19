@@ -13,8 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Administrator SQL for durable policy drafts. No operation in this module
-//! installs a bundle or changes the serving policy generation.
+//! Administrator SQL for durable policies. Disabled tables retain drafts;
+//! metadata atomically enqueues successor epochs for enabled-table changes.
 const std = @import("std");
 const ast = @import("antfly_local_sources").sql_ast;
 const catalog = @import("antfly_local_sources").sql_catalog;
@@ -139,7 +139,8 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
                 .roles = if (ddl.roles_specified) ddl.roles else if (prior) |value| value.roles else &.{"PUBLIC"},
                 .permissive = if (prior) |value| value.permissive else ddl.permissive,
                 .using = if (ddl.using_specified or ddl.action == .create) if (using_program) |program| .{ .instructions = program.instructions, .root = program.root } else null else prior.?.using,
-                .with_check = if (ddl.check_specified or ddl.action == .create) if (check_program) |program| .{ .instructions = program.instructions, .root = program.root } else null else prior.?.with_check,
+                .with_check = if (ddl.check_specified or ddl.action == .create) if (check_program) |program| .{ .instructions = program.instructions, .root = program.root } else null else if (ddl.using_specified and prior.?.check_uses_using) if (using_program) |program| .{ .instructions = program.instructions, .root = program.root } else null else prior.?.with_check,
+                .check_uses_using = if (ddl.action == .create) !ddl.check_specified and commands.update else if (ddl.check_specified) false else prior.?.check_uses_using,
             };
             try record.validate(table, schema_digest, view);
             break :blk .{ .expected_revision = state.revision, .change = .{ .put = record } };
@@ -148,6 +149,8 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     var internal_context = context;
     internal_context.setting_admin = true;
     _ = try server.source.systemCatalog(a, internal_context, .{ .policy_definition_mutate = change });
+    for (state.policy_publications) |publication| if (publication.table_id == physical.table_id and publication.phase == .active)
+        return .{ .mutation_outcome = .committed_pending };
     return .{};
 }
 

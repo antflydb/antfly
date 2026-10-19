@@ -1727,6 +1727,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
     const schema_changed = !comparison.equal;
     if (schema_changed and !rewrite) {
         try @import("antfly_local_sources").schema_relational_expression.validateSchemaUpdate(alloc, table.schema_json, schema_json);
+        try @import("antfly_local_sources").schema_relational_checks.validateSchemaUpdate(alloc, table.schema_json, schema_json);
         if (!fk_publication and !try foreignKeyDefinitionsUnchanged(alloc, table.schema_json, schema_json))
             return error.ForeignKeyGenerationPublicationRequired;
     }
@@ -1889,6 +1890,34 @@ pub fn foreignKeyDefinitionsUnchanged(alloc: std.mem.Allocator, previous_json: [
         next_count += 1;
     };
     return prior_count == next_count;
+}
+
+test "relational declarations metadata CHECK validity admission precedes catalog publication" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gte","value":0,"not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = json, .indexes_json = "{}" };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const a = parsed.arena.allocator();
+    const check = &parsed.value.object.getPtr("checks").?.array.items[0];
+    try check.object.put(a, "not_valid", .{ .bool = false });
+    const validated = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    try std.testing.expectError(error.CheckConstraintValidationRequired, applySchemaUpdateRecord(alloc, &table, validated));
+    const candidate = try prepareSchemaRewriteRecord(alloc, &table, validated);
+    defer metadata_table_manager.freeTable(alloc, candidate);
+    try std.testing.expectEqual(@as(u32, 2), try schemaVersion(candidate.schema_json));
+    // Names and omitted default spelling are not historical authority either.
+    try check.object.put(a, "name", .{ .string = "renamed" });
+    _ = check.object.orderedRemove("not_valid");
+    const renamed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    try std.testing.expectError(error.CheckConstraintValidationRequired, applySchemaUpdateRecord(alloc, &table, renamed));
+    try check.object.put(a, "not_valid", .{ .bool = true });
+    const still_deferred = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    const updated = try applySchemaUpdateRecord(alloc, &table, still_deferred);
+    defer metadata_table_manager.freeTable(alloc, updated);
+    try std.testing.expectEqual(@as(u32, 2), try schemaVersion(updated.schema_json));
 }
 
 test "ordinary schema update rejects unacknowledged FK generation but permits unrelated columns" {

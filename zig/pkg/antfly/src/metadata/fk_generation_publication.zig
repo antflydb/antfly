@@ -600,6 +600,7 @@ pub const InitialCreatePlan = struct {
     }
 
     id: Id,
+    catalog_coverage: CatalogCoverage = .legacy,
     retirement_scope: InitialRetirementScope,
     catalog_id: u64,
     expected_catalog_revision: u64,
@@ -623,7 +624,8 @@ pub const InitialCreatePlan = struct {
     pub fn jsonStringify(self: InitialCreatePlan, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(InitialCreatePlan).@"struct".field_names) |field_name| {
-            if (!std.mem.eql(u8, field_name, "constraint_name_admission") or self.constraint_name_admission != null) {
+            const include = if (comptime std.mem.eql(u8, field_name, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field_name, "constraint_name_admission")) self.constraint_name_admission != null else true;
+            if (include) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
             }
@@ -654,7 +656,7 @@ pub const InitialCreatePlan = struct {
         const fks = try parsed.relationalForeignKeyDefinitions(alloc);
         defer if (fks.len > 0) alloc.free(fks);
         if (fks.len == 0 or fks.len > max_constraints) return error.InvalidGenerationPublication;
-        var compiled = try compileCatalogWithCoverage(alloc, parsed, self.child.table_id, null, .legacy);
+        var compiled = try compileCatalogWithCoverage(alloc, parsed, self.child.table_id, null, self.catalog_coverage);
         defer compiled.deinit();
         try table_manager.validateCompleteKeyspaceRanges(self.child_ranges);
         for (self.child_ranges) |range| if (range.table_id != self.child.table_id) return error.InvalidGenerationPublication;
@@ -798,7 +800,7 @@ pub const InitialCreatePlan = struct {
     pub fn candidateIdentity(self: InitialCreatePlan, alloc: std.mem.Allocator) !CandidateIdentity {
         var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, self.child.schema_json);
         defer parsed.deinit(alloc);
-        var compiled = try compileCatalogWithCoverage(alloc, parsed, self.child.table_id, null, .legacy);
+        var compiled = try compileCatalogWithCoverage(alloc, parsed, self.child.table_id, null, self.catalog_coverage);
         defer compiled.deinit();
         var json_digest: Digest = undefined;
         std.crypto.hash.Blake3.hash(self.child.schema_json, &json_digest, .{});
@@ -953,6 +955,7 @@ pub const InitialCreatePrepare = struct {
 };
 
 pub const InitialChildDecision = struct {
+    catalog_coverage: CatalogCoverage = .legacy,
     plan_id: Id,
     plan_digest: Digest,
     revision: u64,
@@ -966,6 +969,10 @@ pub const InitialChildDecision = struct {
     metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     metadata_epoch: u64,
     routable: bool = false,
+
+    pub fn jsonStringify(self: InitialChildDecision, writer: anytype) !void {
+        try writeCoverageFields(self, writer);
+    }
 
     pub fn validate(self: InitialChildDecision) !void {
         if (std.mem.allEqual(u8, &self.plan_id, 0) or std.mem.allEqual(u8, &self.plan_digest, 0) or
@@ -1004,6 +1011,7 @@ pub const InitialPhase = enum {
 };
 
 pub const InitialCommand = struct {
+    catalog_coverage: CatalogCoverage = .legacy,
     plan_id: Id,
     child_table_id: u64,
     expected_revision: u64,
@@ -1012,8 +1020,13 @@ pub const InitialCommand = struct {
     child_receipt: ?@import("../api/relational_fk_generation_publication.zig").InitialChildReceipt = null,
     parent_receipt: ?@import("../api/relational_fk_generation_publication.zig").Receipt = null,
 
+    pub fn jsonStringify(self: InitialCommand, writer: anytype) !void {
+        try writeCoverageFields(self, writer);
+    }
+
     pub fn validateShape(self: InitialCommand) !void {
         if (std.mem.allEqual(u8, &self.plan_id, 0) or self.child_table_id == 0) return error.InvalidGenerationPublication;
+        if (self.plan) |plan| if (plan.catalog_coverage != self.catalog_coverage) return error.InvalidGenerationPublication;
         switch (self.action) {
             .begin => if (self.expected_revision != 0 or self.plan == null or self.child_receipt != null or self.parent_receipt != null or
                 !std.mem.eql(u8, &self.plan_id, &self.plan.?.id) or self.child_table_id != self.plan.?.child.table_id) return error.InvalidGenerationPublication,
@@ -1042,7 +1055,7 @@ pub const InitialPublication = struct {
 
     pub fn apply(self: InitialPublication, alloc: std.mem.Allocator, command: InitialCommand) !InitialPublication {
         try command.validateShape();
-        if (command.action == .begin or command.child_table_id != self.plan.child.table_id or
+        if (command.catalog_coverage != self.plan.catalog_coverage or command.action == .begin or command.child_table_id != self.plan.child.table_id or
             !std.mem.eql(u8, &command.plan_id, &self.plan.id) or command.expected_revision != self.revision)
             return error.GenerationPublicationChanged;
         var next = self;
@@ -1056,6 +1069,7 @@ pub const InitialPublication = struct {
                 if (sealed.catalog_id != self.plan.catalog_id or sealed.namespace_id != self.plan.namespace_id or
                     sealed.expected_catalog_revision != self.plan.expected_catalog_revision or
                     sealed.retirement_scope != self.plan.retirement_scope or
+                    sealed.catalog_coverage != self.plan.catalog_coverage or
                     sealed.tablespace_id != self.plan.tablespace_id or
                     sealed.min_ranges_explicit != self.plan.min_ranges_explicit or
                     !std.mem.eql(u8, sealed.logical_name, self.plan.logical_name) or
@@ -1249,7 +1263,7 @@ pub const InitialPublication = struct {
             },
             .published, .canceled => return null,
         };
-        return .{ .plan_id = self.plan.id, .child_table_id = self.plan.child.table_id, .child_table_name = self.plan.child.name, .revision = self.revision, .phase = self.phase, .target = target };
+        return .{ .catalog_coverage = self.plan.catalog_coverage, .plan_id = self.plan.id, .child_table_id = self.plan.child.table_id, .child_table_name = self.plan.child.name, .revision = self.revision, .phase = self.phase, .target = target };
     }
 
     fn nextChild(self: InitialPublication, receipts: []const Receipt, action: @import("../api/relational_fk_generation_publication.zig").InitialChildAction) !InitialWork.Target {
@@ -1273,12 +1287,17 @@ pub const InitialPublication = struct {
 };
 
 pub const InitialWork = struct {
+    catalog_coverage: CatalogCoverage = .legacy,
     plan_id: Id,
     child_table_id: u64,
     child_table_name: []const u8,
     revision: u64,
     phase: InitialPhase,
     target: Target,
+
+    pub fn jsonStringify(self: InitialWork, writer: anytype) !void {
+        try writeCoverageFields(self, writer);
+    }
 
     pub const Target = union(enum) {
         seal_support,
@@ -1806,6 +1825,39 @@ test "FK generation publication catalog coverage preserves legacy plan and comma
     try std.testing.expectError(error.InvalidGenerationPublication, command.validateShape());
     command.catalog_coverage = .checks_v1;
     try command.validateShape();
+}
+
+test "initial FK catalog coverage is immutable and legacy bytes retain their digest" {
+    const a = std.testing.allocator;
+    const plan: InitialCreatePlan = .{
+        .id = @splat(1),
+        .retirement_scope = .hosted_store,
+        .catalog_id = 3,
+        .expected_catalog_revision = 1,
+        .child = .{ .table_id = 101, .name = "child" },
+        .child_ranges = &.{},
+        .parents = &.{},
+        .logical_name = "child",
+        .namespace_id = 2,
+    };
+    const legacy = try std.json.Stringify.valueAlloc(a, plan, .{});
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "catalog_coverage") == null);
+    var restored = try std.json.parseFromSlice(InitialCreatePlan, a, legacy, .{});
+    defer restored.deinit();
+    const roundtrip = try std.json.Stringify.valueAlloc(a, restored.value, .{});
+    defer a.free(roundtrip);
+    try std.testing.expectEqualStrings(legacy, roundtrip);
+    var marked = plan;
+    marked.catalog_coverage = .checks_v1;
+    const command: InitialCommand = .{ .catalog_coverage = .checks_v1, .plan_id = plan.id, .child_table_id = plan.child.table_id, .expected_revision = 0, .action = .begin, .plan = marked };
+    try command.validateShape();
+    const encoded = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(encoded);
+    try std.testing.expect(@import("constraint_name_wire.zig").requiresCatalogChecks(encoded, max_bytes));
+    var forged = command;
+    forged.catalog_coverage = .legacy;
+    try std.testing.expectError(error.InvalidGenerationPublication, forged.validateShape());
 }
 
 test "FK generation publication catalog rejects new CHECK blind admission without reinterpreting old plans" {

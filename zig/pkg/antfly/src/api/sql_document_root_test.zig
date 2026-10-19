@@ -136,6 +136,19 @@ test "httpx SQL original PostgreSQL mutation syntax errors never access storage"
 }
 
 fn expectClosedSyntax(ids: []const []const u8) !void {
+    return expectClosedDiagnostic(ids, "42601");
+}
+
+test "httpx SQL original routine definitions reject missing bodies before catalog access" {
+    const ids = [_][]const u8{
+        "sql-0156", "sql-0384", "sql-0385", "sql-0386", "sql-0387", "sql-0388", "sql-0389",
+        "sql-0390", "sql-0391", "sql-0392", "sql-0393", "sql-0396", "sql-0413",
+    };
+    try expectClosedDiagnostic(&ids, "42P13");
+    try expectClosedSyntax(&.{"sql-0395"});
+}
+
+fn expectClosedDiagnostic(ids: []const []const u8, code: []const u8) !void {
     const a = std.testing.allocator;
     const Closed = struct {
         calls: usize = 0,
@@ -158,7 +171,7 @@ fn expectClosedSyntax(ids: []const []const u8) !void {
     var handler: Handler = .{ .api_server = &server };
     for (ids) |id| {
         errdefer std.debug.print("PostgreSQL syntax original {s}\\n", .{id});
-        try @import("sql_parity_reference.zig").expectRejection(a, &handler, id, "42601");
+        try @import("sql_parity_reference.zig").expectRejection(a, &handler, id, code);
         try std.testing.expectEqual(@as(usize, 0), closed.calls);
     }
 }
@@ -450,6 +463,131 @@ test "httpx SQL document root originals prepare durable replacements and preserv
     defer cold.deinit(a);
     try std.testing.expectEqual(prior.version, cold.version);
     try std.testing.expectEqual(prior.expected_content_digest, cold.expected_content_digest);
+}
+
+test "httpx SQL original document patches preserve complete native postimages and cold versions" {
+    const ids = [_][]const u8{ "sql-0895", "sql-0896", "sql-0897", "sql-0898", "sql-0899", "sql-0900", "sql-0901", "sql-0902", "sql-0903" };
+    try runDocumentRootCampaign(local.sql_parity_fixtures.document_patch_reference, &ids);
+}
+
+test "httpx SQL original document root extensions preserve identities JSON and restart" {
+    const ids = [_][]const u8{ "sql-0884", "sql-0885", "sql-0889", "sql-0894" };
+    try runDocumentRootCampaign(local.sql_parity_fixtures.document_root_extension_reference, &ids);
+}
+
+test "httpx SQL original document envelope mutations retain opaque fields and durable versions" {
+    const ids = [_][]const u8{ "sql-0907", "sql-0908", "sql-0914", "sql-0931", "sql-0936", "sql-0937", "sql-1078", "sql-1080" };
+    try runDocumentRootCampaign(local.sql_parity_fixtures.document_envelope_reference, &ids);
+}
+
+fn runDocumentRootCampaign(bytes: []const u8, ids: []const []const u8) !void {
+    const a = std.testing.allocator;
+    const Seed = struct { key: []const u8, value: std.json.Value };
+    var golden = try std.json.parseFromSlice(struct {
+        seed_version: u64,
+        seeds: []const Seed,
+        entries: []const struct { id: []const u8, schema: std.json.Value, command_tag: []const u8 = "UPDATE", affected: i64, final: []const Seed, generated_final: []const std.json.Value = &.{} },
+    }, a, bytes, .{ .ignore_unknown_fields = true });
+    defer golden.deinit();
+    try std.testing.expectEqual(ids.len, golden.value.entries.len);
+    var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    for (ids, golden.value.entries) |id, entry| {
+        errdefer std.debug.print("original document patch {s}\n", .{id});
+        try std.testing.expectEqualStrings(id, entry.id);
+        const schema = try std.json.Stringify.valueAlloc(a, entry.schema, .{});
+        defer a.free(schema);
+        var directory = try local.common_test_directory.TestDirectory.init("sql-document-patch");
+        defer directory.cleanup();
+        var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        var db_open = true;
+        defer if (db_open) db.close();
+        try db.setSchemaJson(a, schema);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const writes = try arena.allocator().alloc(db_mod.types.BatchWrite, golden.value.seeds.len);
+        for (golden.value.seeds, writes) |seed, *write| write.* = .{ .key = seed.key, .value = try std.json.Stringify.valueAlloc(arena.allocator(), seed.value, .{}) };
+        try db.batch(.{ .writes = writes, .timestamp_ns = golden.value.seed_version });
+        {
+            var reads = reads_mod.BoundTableReadSource.init("docs", 7, &db, @import("../raft/mod.zig").read_gate.alreadyReadSafeBarrier());
+            var writes_source = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("docs", &db);
+            var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+            defer runtime.deinit();
+            var source: Source = .{ .schema = schema, .records = .{.{ .table_id = 7, .name = "docs", .schema_json = schema }} };
+            var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, reads.source(), writes_source.source());
+            defer server.deinit();
+            var handler: Handler = .{ .api_server = &server };
+            const original = try corpus.get(id);
+            try std.testing.expectEqual(@as(usize, 0), original.params.len);
+            var result = try execute(a, &handler, original.sql, 200);
+            defer result.deinit();
+            try std.testing.expectEqualStrings(entry.command_tag, result.value.command_tag);
+            try std.testing.expectEqual(entry.affected, result.value.rows_affected);
+            try std.testing.expectEqual(@as(usize, 0), result.value.rows.len);
+            if (std.mem.eql(u8, id, "sql-0896") or std.mem.eql(u8, id, "sql-0897") or
+                std.mem.eql(u8, id, "sql-0907") or std.mem.eql(u8, id, "sql-0908") or
+                std.mem.eql(u8, id, "sql-1078") or std.mem.eql(u8, id, "sql-1080"))
+            {
+                // The original compares the actual physical seed version42.
+                // Its successful commit retires that version: replay is now
+                // a definite zero-effect predicate miss, not a second write.
+                var stale = try execute(a, &handler, original.sql, 200);
+                defer stale.deinit();
+                try std.testing.expectEqual(@as(i64, 0), stale.value.rows_affected);
+            }
+            var visible = try execute(a, &handler, "SELECT _id,_version FROM docs ORDER BY _id", 200);
+            defer visible.deinit();
+            try std.testing.expectEqual(entry.final.len + entry.generated_final.len, visible.value.rows.len);
+            for (visible.value.rows) |row| {
+                var primary = (try db.lookup(a, row[0].string, .{ .include_primary_digest = true })) orelse return error.MissingVisibleDocument;
+                defer primary.deinit(a);
+                const version = if (row[1] == .string) try std.fmt.parseUnsigned(u64, row[1].string, 10) else @as(u64, @intCast(row[1].integer));
+                try std.testing.expectEqual(primary.version orelse return error.MissingVisibleVersion, version);
+            }
+        }
+        var postimage = try db.scan(arena.allocator(), "", "", .{ .include_documents = true, .limit = 4097 });
+        defer postimage.deinit(arena.allocator());
+        try std.testing.expectEqual(entry.final.len + entry.generated_final.len, postimage.documents.len);
+        const versions = try arena.allocator().alloc(u64, postimage.documents.len);
+        const digests = try arena.allocator().alloc([32]u8, postimage.documents.len);
+        var generated: usize = 0;
+        for (postimage.documents, versions, digests) |document, *version, *digest| {
+            const want: Seed = for (entry.final) |known| {
+                if (std.mem.eql(u8, known.key, document.id)) break known;
+            } else unknown: {
+                if (generated >= entry.generated_final.len) return error.UnexpectedDocumentIdentity;
+                for (golden.value.seeds) |seed| try std.testing.expect(!std.mem.eql(u8, seed.key, document.id));
+                try std.testing.expectEqual(@as(usize, 32), document.id.len);
+                for (document.id) |digit| try std.testing.expect(std.ascii.isHex(digit));
+                const value = entry.generated_final[generated];
+                generated += 1;
+                break :unknown .{ .key = document.id, .value = value };
+            };
+            var stored = (try db.lookup(a, want.key, .{ .include_primary_digest = true })) orelse return error.MissingDocumentPostimage;
+            defer stored.deinit(a);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, stored.json, .{});
+            defer parsed.deinit();
+            try std.testing.expect(try @import("sql_parity_reference.zig").rowMatchesWithNulls(a, &.{.{ .name = "_doc", .type = .json }}, &.{parsed.value}, &.{false}, &.{want.value}, &.{false}));
+            version.* = stored.version orelse return error.MissingDocumentVersion;
+            digest.* = stored.expected_content_digest orelse return error.MissingDocumentDigest;
+            if (entry.affected == 0 or std.mem.eql(u8, want.key, "doc:c")) try std.testing.expectEqual(golden.value.seed_version, version.*);
+        }
+        try std.testing.expectEqual(entry.generated_final.len, generated);
+        db.close();
+        db_open = false;
+        var reopened = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer reopened.close();
+        var cold_rows = try reopened.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
+        defer cold_rows.deinit(a);
+        try std.testing.expectEqual(postimage.documents.len, cold_rows.documents.len);
+        for (postimage.documents, versions, digests) |want, version, digest| {
+            var stored = (try reopened.lookup(a, want.id, .{ .include_primary_digest = true })) orelse return error.MissingColdDocument;
+            defer stored.deinit(a);
+            try std.testing.expectEqual(version, stored.version orelse return error.MissingColdVersion);
+            try std.testing.expectEqual(digest, stored.expected_content_digest orelse return error.MissingColdDigest);
+            try std.testing.expectEqualStrings(want.json, stored.json);
+        }
+    }
 }
 
 fn expectConflictDocument(a: std.mem.Allocator, bytes: []const u8, seeded: bool, title: []const u8, note: []const u8) !void {

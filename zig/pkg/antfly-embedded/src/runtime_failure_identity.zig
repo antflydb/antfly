@@ -30,6 +30,8 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .relational_check_violation, .err = error.RelationalCheckViolation },
+    .{ .status = .foreign_key_match_full_violation, .err = error.ForeignKeyMatchFullViolation },
     .{ .status = .invalid_sql_view_record, .err = error.InvalidSqlViewRecord },
     .{ .status = .sql_view_cycle, .err = error.SqlViewCycle },
     .{ .status = .sql_view_column_rename, .err = error.SqlViewColumnRename },
@@ -1103,6 +1105,8 @@ test "registered storage-kernel errors are unique and round trip without losing 
     // restore validation as its exact error, not generic kernel pressure.
     try std.testing.expectEqual(abi.Status.invalid_relational_row, statusFromError(error.InvalidRelationalRow));
     try std.testing.expectError(error.InvalidRelationalRow, statusToError(.invalid_relational_row));
+    try std.testing.expectEqual(abi.Status.relational_check_violation, statusFromError(error.RelationalCheckViolation));
+    try std.testing.expectError(error.RelationalCheckViolation, statusToError(.relational_check_violation));
     try validateForTest();
 }
 

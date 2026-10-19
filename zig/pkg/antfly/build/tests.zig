@@ -252,7 +252,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const parser_source = schema_contract_mod.import_table.get("antfly_local_sources").?;
     const parser_selection = b.addOptions();
-    parser_selection.addOption([]const []const u8, "names", &.{"schema_table_schema_impl"});
+    parser_selection.addOption([]const []const u8, "names", &.{ "schema_table_schema_impl", "schema_mod" });
     parser_source.addOptions("antfly_local_test_sources", parser_selection);
     const schema_parser_tests = b.addTest(.{
         .root_module = parser_source,
@@ -763,6 +763,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const deferred_check_storage_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"NOT VALID history"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const deferred_check_storage_run = addFilteredTestRunArtifact(b, deferred_check_storage_tests);
+    deferred_check_storage_run.addArg("--require-no-skips");
+    b.step("antfly-relational-deferred-check-storage-test", "Verify historical CHECK import, rewrite, restore and new-write enforcement")
+        .dependOn(&deferred_check_storage_run.step);
     const nullability_scan_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{"relational index system nullability scan"},
@@ -6303,6 +6312,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     relational_read_layout_run.addArg("--require-no-skips");
     b.step("antfly-relational-read-layout-test", "Verify owned native scan pages across mixed physical schema versions")
         .dependOn(&relational_read_layout_run.step);
+
+    const deferred_check_validation_tests = b.addTest(.{
+        .root_module = parser_source,
+        .filters = &.{"relational index system NOT VALID CHECK enforces writes without historical coverage"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const deferred_check_validation_run = addFilteredTestRunArtifact(b, deferred_check_validation_tests);
+    deferred_check_validation_run.addArg("--require-no-skips");
+    b.step("antfly-relational-deferred-check-test", "Verify independent CHECK write enforcement, historical validity, and reader capabilities")
+        .dependOn(&deferred_check_validation_run.step);
 
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);

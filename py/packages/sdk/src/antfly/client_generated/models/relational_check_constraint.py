@@ -27,6 +27,10 @@ class RelationalCheckConstraint:
 
         Attributes:
             name (str):
+            not_valid (bool | Unset): Enforce this CHECK on every new or changed row without asserting that historical rows
+                satisfy it. Explicit validation clears this declaration only after an unpublished generation has validated all
+                rows and atomically replaced the active generation. Disposable background scan coverage does not change this
+                declaration. Default: False.
             column (str | Unset):
             op (RelationalComparisonOp | Unset):
             value (Any | Unset): Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
@@ -136,6 +140,7 @@ class RelationalCheckConstraint:
     """
 
     name: str
+    not_valid: bool | Unset = False
     column: str | Unset = UNSET
     op: RelationalComparisonOp | Unset = UNSET
     value: Any | Unset = UNSET
@@ -144,6 +149,8 @@ class RelationalCheckConstraint:
 
     def to_dict(self) -> dict[str, Any]:
         name = self.name
+
+        not_valid = self.not_valid
 
         column = self.column
 
@@ -166,6 +173,8 @@ class RelationalCheckConstraint:
                 "name": name,
             }
         )
+        if not_valid is not UNSET:
+            field_dict["not_valid"] = not_valid
         if column is not UNSET:
             field_dict["column"] = column
         if op is not UNSET:
@@ -185,6 +194,8 @@ class RelationalCheckConstraint:
 
         d = dict(src_dict)
         name = d.pop("name")
+
+        not_valid = d.pop("not_valid", UNSET)
 
         column = d.pop("column", UNSET)
 
@@ -208,6 +219,7 @@ class RelationalCheckConstraint:
 
         relational_check_constraint = cls(
             name=name,
+            not_valid=not_valid,
             column=column,
             op=op,
             value=value,

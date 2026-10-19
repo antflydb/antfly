@@ -1540,7 +1540,7 @@ pub const DBCore = struct {
         const previous_integrity = try self.getStoreValue(self.alloc, integrity_catalog_mod.key);
         defer if (previous_integrity) |bytes| self.alloc.free(bytes);
         const checks_digest: [32]u8 = if (next_view.validator()) |validator| checks: {
-            if (validator.execution.checks) |checks| break :checks checks.fingerprint();
+            if (validator.execution.checks) |checks| break :checks checks.validationFingerprint();
             break :checks @splat(0);
         } else @splat(0);
         // Even an unconstrained relational schema has an authoritative empty

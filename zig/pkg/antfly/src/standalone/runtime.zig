@@ -2972,6 +2972,7 @@ const LocalStandaloneMetadata = struct {
                 const command: publication.InitialCommand = switch (call) {
                     .fk_initial_create_begin => |plan| blk: {
                         break :blk .{
+                            .catalog_coverage = plan.catalog_coverage,
                             .plan_id = plan.id,
                             .child_table_id = plan.child.table_id,
                             .expected_revision = 0,
@@ -3030,11 +3031,8 @@ const LocalStandaloneMetadata = struct {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.RowPolicyUnsupported;
                 if (!self.localPolicyPublicationSupported()) return error.RowPolicyUnsupported;
-                var encoded: std.Io.Writer.Allocating = .init(alloc);
-                defer encoded.deinit();
-                var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
-                try @import("antfly_local_sources").storage_db_relational_integrity_json.write(command, &stream);
-                const bytes = encoded.written();
+                const bytes = try store.sqlPolicyDefinitionCommandJson(alloc, group_ids.main_metadata_group_id, command);
+                defer alloc.free(bytes);
                 if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
                 try context.ensureActive();
                 try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_sql_policies = bytes });
@@ -12343,6 +12341,7 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
         // phase; waiting for a receipt lets a fast local driver publish first.
         if (cancel_before_activation and lost_parent_reply and !cancel_requested and status.value.phase == .staging_parents) {
             const canceled = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_mutate = .{
+                .catalog_coverage = status.value.plan.catalog_coverage,
                 .plan_id = accepted.plan_id,
                 .child_table_id = accepted.child_table_id,
                 .expected_revision = status.value.revision,
@@ -12679,7 +12678,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
         var work = try std.json.parseFromSlice(?publication.InitialWork, alloc, work_json, .{});
         defer work.deinit();
         const value = work.value orelse break;
-        var command: publication.InitialCommand = .{ .plan_id = value.plan_id, .child_table_id = value.child_table_id, .expected_revision = value.revision, .action = undefined };
+        var command: publication.InitialCommand = .{ .catalog_coverage = value.catalog_coverage, .plan_id = value.plan_id, .child_table_id = value.child_table_id, .expected_revision = value.revision, .action = undefined };
         switch (value.target) {
             .child => |target| {
                 const request: control.InitialChildRequest = .{ .plan_id = value.plan_id, .child_table_id = value.child_table_id, .child_table_name = value.child_table_name, .child_group_id = target.group_id, .action = target.action };
@@ -13099,6 +13098,7 @@ test "standalone canceled initial self FK retires exact private owners after res
         .action = .provision,
     }, context);
     const first_applied = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_mutate = .{
+        .catalog_coverage = work.catalog_coverage,
         .plan_id = id,
         .child_table_id = child.table_id,
         .expected_revision = work.revision,
@@ -13137,6 +13137,7 @@ test "standalone canceled initial self FK retires exact private owners after res
     try std.testing.expectEqual(@as(usize, 2), server.kernel_owner_source.?.ownerCountForTest());
 
     const cancel_applied = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_mutate = .{
+        .catalog_coverage = work.catalog_coverage,
         .plan_id = id,
         .child_table_id = child.table_id,
         .expected_revision = work.revision + 1,
@@ -13174,6 +13175,7 @@ test "standalone canceled initial self FK retires exact private owners after res
             .action = .cancel,
         }, context);
         const applied = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_mutate = .{
+            .catalog_coverage = step.catalog_coverage,
             .plan_id = id,
             .child_table_id = child.table_id,
             .expected_revision = step.revision,

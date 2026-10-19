@@ -315,6 +315,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     defer reader_permission.deinit(alloc);
     var reader_user = try auth_manager.createUser("pk-reader", "pk-reader-durable-password", &.{reader_permission});
     defer reader_user.deinit(alloc);
+    if (@hasDecl(Campaign, "configureAuth")) try Campaign.configureAuth(&auth_manager);
     const rewrite_authorization = try basicAuthorization(alloc, rewrite_username, rewrite_password);
     defer alloc.free(rewrite_authorization);
     const rewrite_headers = [_]http.RequestHeader{.{ .name = "authorization", .value = rewrite_authorization }};

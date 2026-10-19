@@ -783,6 +783,8 @@ pub const Status = enum(u32) {
     sql_view_column_dropped = 823,
     sql_dependent_objects_exist = 824,
     sql_program_limit_exceeded = 825,
+    relational_check_violation = 826,
+    foreign_key_match_full_violation = 827,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

@@ -980,11 +980,16 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
                 digest = bytes;
             }
             const unique_absence = if (item.object.get("unique_absence")) |flag| if (flag == .bool and (version == 0 or !flag.bool)) flag.bool else return error.InvalidBatchRequest else false;
+            const policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = if (item.object.get("row_policy_requirement")) |flag| requirement: {
+                if (flag != .string) return error.InvalidBatchRequest;
+                break :requirement std.meta.stringToEnum(@import("../usermgr/row_policy_authority.zig").MutationRequirement, flag.string) orelse return error.InvalidBatchRequest;
+            } else .native;
             items[i] = .{
                 .key = try alloc.dupe(u8, key_value.string),
                 .expected_version = version,
                 .expected_content_digest = digest,
                 .unique_absence = unique_absence,
+                .row_policy_requirement = policy_requirement,
             };
             initialized += 1;
         }
@@ -1991,6 +1996,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             });
             if (predicate.expected_content_digest) |digest| try writer.print(",\"expected_content_digest\":\"{s}\"", .{std.fmt.bytesToHex(digest, .lower)});
             if (predicate.unique_absence) try writer.writeAll(",\"unique_absence\":true");
+            if (predicate.row_policy_requirement != .native) try writer.print(",\"row_policy_requirement\":\"{s}\"", .{@tagName(predicate.row_policy_requirement)});
             try writer.writeByte('}');
         }
         try writer.writeByte(']');

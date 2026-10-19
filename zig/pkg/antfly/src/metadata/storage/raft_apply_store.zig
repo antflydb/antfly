@@ -18222,12 +18222,9 @@ pub const RaftApplyStore = struct {
         } else if (!request.enable) return error.RowPolicyCatalogChanged;
         if (request.enable) {
             const records = try system_catalog_storage.loadPolicies(a, &txn, group_id);
-            var found = false;
             for (records) |record| if (record.table_id == request.table_id) {
                 if (record.schema_version != identity.version or !std.mem.eql(u8, &record.schema_digest, &identity.digest)) return error.RowPolicyCatalogChanged;
-                found = true;
             };
-            if (!found) return error.RowPolicyCatalogChanged;
         }
         const publication: sql_policies.Publication = .{
             .table_id = request.table_id,
@@ -18266,11 +18263,10 @@ pub const RaftApplyStore = struct {
         const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed);
         if (native.storage_mode != .relational) return error.RowPolicyCatalogChanged;
         var has_schema_search = native.index_sort.len != 0;
-        for (native.full_text_documents) |document| {
-            if (document.fields.len != 0 or document.dynamic_rules.len != 0 or
-                document.open_dynamic_paths.len != 0 or document.infer_type_dynamic_paths.len != 0)
-                has_schema_search = true;
-        }
+        // These mappings also describe ordinary keyword SQL columns when no
+        // search artifact exists. Their presence is not a search capability:
+        // actual artifact indexes are checked above, and search entry points
+        // independently reject active policies before producing candidates.
         for (native.relational_columns) |column| {
             if (column.column_type == .dense_vector) has_schema_search = true;
         }
@@ -18280,11 +18276,50 @@ pub const RaftApplyStore = struct {
         return .{ .version = native.version, .digest = digest, .record_digest = record_digest, .has_indexes = has_indexes, .has_schema_search = has_schema_search };
     }
 
+    /// Shared distributed/standalone admission. The caller owns its catalog
+    /// mutation mutex; apply repeats the revision and physical-owner cut.
+    pub fn sqlPolicyDefinitionCommandJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: sql_policies.Command) ![]u8 {
+        if ((try self.systemCatalogMeta(alloc, group_id)).revision != command.expected_revision) return error.RowPolicyCatalogChanged;
+        var admitted = command;
+        admitted.publication = null;
+        const table_id = switch (command.change) {
+            .put => |record| record.table_id,
+            .drop => |identity| identity.table_id,
+        };
+        const status_bytes = try self.sqlPolicyPublicationStatusJson(alloc, group_id, table_id);
+        defer alloc.free(status_bytes);
+        var status = try std.json.parseFromSlice(?sql_policies.PublicationStamp, alloc, status_bytes, .{});
+        defer status.deinit();
+        var publication: ?std.json.Parsed(sql_policies.PublicationCommand) = null;
+        defer if (publication) |*value| value.deinit();
+        if (status.value) |prior| {
+            if (prior.phase == .active) {
+                const begin_bytes = try self.sqlPolicyBeginCommandJson(alloc, group_id, .{ .table_id = table_id, .enable = true, .expected_revision = command.expected_revision });
+                defer alloc.free(begin_bytes);
+                publication = try std.json.parseFromSlice(sql_policies.PublicationCommand, alloc, begin_bytes, .{});
+                admitted.publication = publication.?.value.change.begin;
+            } else if (prior.phase != .disabled) return error.RowPolicyCatalogChanged;
+        }
+        var output: std.Io.Writer.Allocating = .init(alloc);
+        defer output.deinit();
+        var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(admitted, &stream);
+        return output.toOwnedSlice();
+    }
+
     fn applySqlPoliciesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
         var parsed = try std.json.parseFromSlice(sql_policies.Command, self.alloc, bytes, .{});
         defer parsed.deinit();
         const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
+        if (previous.revision == parsed.value.expected_revision) {
+            if (parsed.value.publication) |publication| {
+                if (try backupCohortLocksTableTxn(txn, group_id, publication.table_id) or
+                    try restoreStagingLocksTableTxn(txn, group_id, publication.table_id) or
+                    try self.fkGenerationTableLockedTxn(txn, group_id, publication.table_id)) return error.RowPolicyCatalogChanged;
+                try self.validatePolicyOwnerCutTxn(txn, group_id, publication);
+            }
+        }
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
         try system_catalog_storage.applyPolicyCommand(self.alloc, txn, group_id, parsed.value, hash);
@@ -18677,7 +18712,7 @@ pub const RaftApplyStore = struct {
             return error.GenerationPublicationChanged;
         var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, publication.plan.child.schema_json);
         defer schema.deinit(a);
-        var catalog = try fk_generation_publication.compileCatalogWithCoverage(a, schema, publication.plan.child.table_id, null, .legacy);
+        var catalog = try fk_generation_publication.compileCatalogWithCoverage(a, schema, publication.plan.child.table_id, null, publication.plan.catalog_coverage);
         defer catalog.deinit();
         const catalog_b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(catalog.value.len));
         _ = std.base64.standard.Encoder.encode(catalog_b64, catalog.value);
@@ -18685,6 +18720,7 @@ pub const RaftApplyStore = struct {
         const incarnation_bytes = txn.get(try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id)) catch return error.InvalidMetadataIncarnation;
         const incarnation = (try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation;
         const decision: fk_generation_publication.InitialChildDecision = .{
+            .catalog_coverage = publication.plan.catalog_coverage,
             .plan_id = publication.plan.id,
             .plan_digest = publication.plan_digest,
             .revision = publication.revision,
@@ -28642,6 +28678,7 @@ pub const RaftApplyStore = struct {
             for (publication.plan.child_ranges) |range| {
                 try ranges.append(alloc, try metadata_table_manager.cloneRange(alloc, range));
                 try initial_fk_owners.append(alloc, .{
+                    .catalog_coverage = publication.plan.catalog_coverage,
                     .plan_id = publication.plan.id,
                     .plan_digest = publication.plan_digest,
                     .child_table_id = publication.plan.child.table_id,
@@ -45403,6 +45440,103 @@ test "SQL settings apply through Raft and survive catalog restart" {
         try std.testing.expectEqual(@as(u64, 1), snapshot.value.revision);
         try std.testing.expectEqual(@as(usize, 1), snapshot.value.settings.len);
         try std.testing.expectEqualStrings("app.tenant", snapshot.value.settings[0].name);
+    }
+}
+
+test "system catalog active policy edits atomically enqueue immutable generations and reject forged owner cuts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/policy-atomic-edit", .{tmp.sub_path});
+    defer alloc.free(root);
+    const group = group_ids.main_metadata_group_id;
+    // SQL TEXT columns derive keyword mappings even without a search index.
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "table:policies", .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"tenant_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}}}" };
+    const binding: system_catalog.Resource = .{ .kind = .table, .id = 7, .parent_id = system_catalog.default_namespace_id, .name = "policies", .storage_name = table.name };
+    const range: metadata.RangeRecord = .{ .table_id = 7, .group_id = 17, .range_id = 17, .start_key = "", .end_key = null };
+    var expected_install: ?[]u8 = null;
+    defer if (expected_install) |bytes| alloc.free(bytes);
+    var candidate: sql_policies.Publication = undefined;
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        try store.updateStandaloneCatalog(group, 0, .{ .tables = &.{table}, .ranges = &.{range}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = 8, .resources = &.{binding} } });
+        const empty_begin = try store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = true, .expected_revision = 1 });
+        defer alloc.free(empty_begin);
+        var initial = try std.json.parseFromSlice(sql_policies.PublicationCommand, alloc, empty_begin, .{});
+        defer initial.deinit();
+        try store.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = empty_begin });
+        for ([_]sql_policies.Publication.Phase{ .pending_install, .serving_install }) |phase| {
+            const status_bytes = try store.sqlPolicyPublicationWorkJson(alloc, group, 0);
+            defer alloc.free(status_bytes);
+            var work = try std.json.parseFromSlice(sql_policies.PublicationWork, alloc, status_bytes, .{});
+            defer work.deinit();
+            const publication = work.value.publication.?;
+            try std.testing.expectEqual(phase, publication.phase);
+            const owner = publication.required_owners[0];
+            const install = try store.sqlPolicyInstallSnapshotJson(alloc, group, .{ .table_id = 7, .expected_generation = publication.generation, .expected_catalog_epoch = publication.catalog_epoch, .expected_phase = phase, .owner_group_id = owner.group_id, .expected_descriptor_digest = owner.descriptor_digest });
+            defer alloc.free(install);
+            var empty = try std.json.parseFromSlice(sql_policies.InstallSnapshot, alloc, install, .{});
+            defer empty.deinit();
+            try std.testing.expectEqual(@as(usize, 0), empty.value.records.len);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(install, &digest, .{});
+            const ack = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = work.value.revision, .change = .{ .acknowledge = .{ .table_id = 7, .generation = publication.generation, .receipt = .{ .owner = owner, .catalog_epoch = publication.catalog_epoch, .phase = phase, .applied_term = 1, .applied_index = work.value.revision + 1, .bundle_digest = digest } } } }, .{});
+            defer alloc.free(ack);
+            try store.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = ack });
+            const promote = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = work.value.revision + 1, .change = .{ .promote = .{ .table_id = 7, .generation = publication.generation, .phase = if (phase == .pending_install) .serving_install else .active } } }, .{});
+            defer alloc.free(promote);
+            try store.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = promote });
+        }
+        const meta = try store.systemCatalogMeta(alloc, group);
+        const status_bytes = try store.sqlPolicyPublicationStatusJson(alloc, group, 7);
+        defer alloc.free(status_bytes);
+        var status = try std.json.parseFromSlice(sql_policies.PublicationStamp, alloc, status_bytes, .{});
+        defer status.deinit();
+        const record: sql_policies.Record = .{ .id = 8, .generation = 1, .table_id = 7, .schema_version = 1, .schema_digest = initial.value.change.begin.schema_digest, .name = "visible", .commands = .{ .select = true }, .roles = &.{"PUBLIC"}, .using = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0 } };
+        const bytes = try store.sqlPolicyDefinitionCommandJson(alloc, group, .{ .expected_revision = meta.revision, .change = .{ .put = record } });
+        defer alloc.free(bytes);
+        var admitted = try std.json.parseFromSlice(sql_policies.Command, alloc, bytes, .{});
+        defer admitted.deinit();
+        candidate = admitted.value.publication.?;
+        candidate.required_owners = &.{}; // Do not retain the parsed arena.
+        var forged = admitted.value;
+        var changed_owner = admitted.value.publication.?.required_owners[0];
+        changed_owner.descriptor_digest = @splat(8);
+        forged.publication.?.required_owners = &.{changed_owner};
+        const forged_bytes = try std.json.Stringify.valueAlloc(alloc, forged, .{});
+        defer alloc.free(forged_bytes);
+        try std.testing.expectError(error.RowPolicyCatalogChanged, store.applyStandaloneCommand(group, .{ .apply_sql_policies = forged_bytes }));
+        var rejected = try store.systemCatalogSnapshot(alloc, group);
+        defer rejected.deinit();
+        try std.testing.expectEqual(meta.revision, rejected.value.revision);
+        try std.testing.expectEqual(@as(usize, 0), rejected.value.policies.len);
+        try std.testing.expectEqual(sql_policies.Publication.Phase.active, rejected.value.policy_publications[0].phase);
+        try store.applyStandaloneCommand(group, .{ .apply_sql_policies = bytes });
+        try store.applyStandaloneCommand(group, .{ .apply_sql_policies = bytes });
+        const committed = try store.systemCatalogMeta(alloc, group);
+        try std.testing.expectEqual(meta.revision + 1, committed.revision);
+        try std.testing.expectEqual(@as(u64, 9), committed.next_id);
+        const owner = admitted.value.publication.?.required_owners[0];
+        expected_install = try store.sqlPolicyInstallSnapshotJson(alloc, group, .{ .table_id = 7, .expected_generation = candidate.generation, .expected_catalog_epoch = candidate.catalog_epoch, .expected_phase = .pending_install, .owner_group_id = owner.group_id, .expected_descriptor_digest = owner.descriptor_digest });
+    }
+    {
+        var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer reopened.deinit();
+        var state = try reopened.systemCatalogSnapshot(alloc, group);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(usize, 1), state.value.policies.len);
+        try std.testing.expectEqual(@as(u64, 9), state.value.next_id);
+        const publication = state.value.policy_publications[0];
+        try std.testing.expectEqual(candidate.generation, publication.generation);
+        try std.testing.expectEqual(sql_policies.Publication.Phase.pending_install, publication.phase);
+        const owner = publication.required_owners[0];
+        const recovered = try reopened.sqlPolicyInstallSnapshotJson(alloc, group, .{ .table_id = 7, .expected_generation = publication.generation, .expected_catalog_epoch = publication.catalog_epoch, .expected_phase = .pending_install, .owner_group_id = owner.group_id, .expected_descriptor_digest = owner.descriptor_digest });
+        defer alloc.free(recovered);
+        try std.testing.expectEqualStrings(expected_install.?, recovered);
+        var installed = try std.json.parseFromSlice(sql_policies.InstallSnapshot, alloc, recovered, .{});
+        defer installed.deinit();
+        try std.testing.expectEqual(@as(u64, 8), installed.value.records[0].id);
     }
 }
 

@@ -273,6 +273,7 @@ pub fn buildWithGeneratedNamesAndScratch(
     }.less);
     const plan: publication.InitialCreatePlan = .{
         .id = id,
+        .catalog_coverage = .checks_v1,
         .retirement_scope = retirementScopeForDeployment(server.cfg.deployment_mode),
         .catalog_id = prepared.catalog_id,
         .expected_catalog_revision = prepared.expected_catalog_revision,

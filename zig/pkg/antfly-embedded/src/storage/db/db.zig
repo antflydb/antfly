@@ -20134,10 +20134,14 @@ pub const DB = struct {
     /// evaluated on typed ordinals, not reconstructed JSON projections.
     pub const enforceRowPolicyMutationLocked = local_mutation.enforceRowPolicyMutationLocked;
 
-    fn enforceRowPolicyIntentsLocked(self: *DB, schema_view: schema_registry_mod.SchemaView, intents: []const transactions_mod.WriteIntent, principal: *const row_policy_authority_mod.Payload) !void {
+    fn enforceRowPolicyIntentsLocked(self: *DB, schema_view: schema_registry_mod.SchemaView, intents: []const transactions_mod.WriteIntent, input_predicates: []const types.TransactionVersionPredicate, principal: *const row_policy_authority_mod.Payload) !void {
         if (principal.access != .write) return error.RowPolicyAuthenticationRequired;
         const bundle = if (self.local_execution.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
         const schema = schema_view.tableSchema().*;
+        var requirements = try row_policy_bundle_mod.MutationRequirements.init(self.alloc, input_predicates, principal);
+        defer requirements.deinit(self.alloc);
+        const select_check = if (requirements.needsSelect()) try bundle.captureEvaluation(self.alloc, schema, principal, .select) else null;
+        defer if (select_check) |evaluation| evaluation.deinit();
         var insert_check = try bundle.captureEvaluation(self.alloc, schema, principal, .insert);
         defer insert_check.deinit();
         var update_old = try bundle.captureEvaluation(self.alloc, schema, principal, .update_old);
@@ -20150,6 +20154,9 @@ pub const DB = struct {
         defer probe.abort();
         for (intents) |intent| {
             if (isMetadataKey(intent.key)) return error.RowPolicyMutationUnsupported;
+            const requirement = try requirements.forKey(intent.key);
+            if ((intent.value == null and (requirement.isInsert() or requirement.isUpdate())) or
+                (intent.value != null and requirement.isDelete())) return error.RowPolicyAuthenticationRequired;
             const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, intent.key);
             defer self.alloc.free(store_key);
             const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
@@ -20157,17 +20164,21 @@ pub const DB = struct {
                 else => return err,
             };
             if (old_bytes) |bytes| {
+                if (requirement.isInsert()) return error.RowPolicyDenied;
                 if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
                 const old = if (self.core.store.valuesAreAuthenticated())
                     try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
                 else
                     try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
                 if (!try (if (intent.value == null) delete_old else update_old).permits(old)) return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
             }
+            if (old_bytes == null and requirement.isUpdate()) return error.RowPolicyDenied;
             if (intent.value != null) {
                 const encoded = intent.prepared_row orelse return error.RowPolicyMutationUnsupported;
                 const new = try relational_row_codec.ordinalRowViewTrusted(encoded, schema, schema_view.physicalLayout());
                 if (!try (if (old_bytes == null) insert_check else update_new).permits(new)) return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(new)) return error.RowPolicyDenied;
             }
         }
     }
@@ -20230,6 +20241,8 @@ pub const DB = struct {
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
             verified_principal = try self.verifyRowPolicyPrincipal(alloc, opts.row_policy_principal_proof, opts.row_policy_database, .read, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (verified_principal.?.value.purpose != .ordinary and
+                !(verified_principal.?.value.purpose == .integrity and opts.include_primary_digest)) return error.RowPolicyAuthenticationRequired;
             break :bound try self.local_execution.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         } else try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
@@ -20274,9 +20287,11 @@ pub const DB = struct {
         if (verified_principal) |*principal| {
             const row = ordinal_row orelse return error.RowPolicyCatalogChanged;
             const bundle = if (self.local_execution.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
-            var evaluation = try bundle.captureReadEvaluation(alloc, row.table_schema, &principal.value);
-            defer evaluation.deinit();
-            if (!try evaluation.permits(row)) return null;
+            if (principal.value.purpose != .integrity) {
+                var evaluation = try bundle.captureReadEvaluation(alloc, row.table_schema, &principal.value);
+                defer evaluation.deinit();
+                if (!try evaluation.permits(row)) return null;
+            }
             try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         }
         if (!internal_keys.isInternalUserKey(key)) {
@@ -25578,6 +25593,15 @@ pub const DB = struct {
                 .value = null,
             });
         }
+        var policy_by_key: std.StringHashMapUnmanaged(row_policy_authority_mod.MutationRequirement) = .empty;
+        defer policy_by_key.deinit(preparation_alloc);
+        for (req.predicates) |predicate| if (predicate.row_policy_requirement != .native) {
+            const entry = try policy_by_key.getOrPut(preparation_alloc, predicate.key);
+            if (entry.found_existing) return error.RowPolicyAuthenticationRequired;
+            entry.value_ptr.* = predicate.row_policy_requirement;
+        };
+        for (intents.items) |*intent|
+            intent.row_policy_requirement = policy_by_key.get(intent.key) orelse .native;
         for (req.predicates) |predicate| {
             if (isProtectedIntegrityKey(predicate.key)) return error.InvalidIntegrityOperation;
             try predicates.append(preparation_alloc, .{
@@ -25726,7 +25750,7 @@ pub const DB = struct {
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
-            try self.enforceRowPolicyIntentsLocked(view, intents.items, principal);
+            try self.enforceRowPolicyIntentsLocked(view, intents.items, req.predicates, principal);
         }
         const integrity_mod = @import("relational_integrity.zig");
         const activation_mod = @import("relational_integrity_activation.zig");
@@ -41396,7 +41420,8 @@ pub const DB = struct {
                 active.source = try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json);
             if (verified_principal) |*proof| {
                 const bundle = if (self.local_execution.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
-                active.policy = try bundle.captureReadEvaluation(alloc, view.tableSchema().*, &proof.value);
+                if (proof.value.purpose != .normalize)
+                    active.policy = try bundle.captureReadEvaluation(alloc, view.tableSchema().*, &proof.value);
             }
             break :blk active;
         } else null;
@@ -41419,6 +41444,8 @@ pub const DB = struct {
         }, statement);
         session.filter_context = filter;
         session.destroy_filter = Filter.destroy;
+        session.require_normalized_visibility = parsed.value.require_normalized_visibility;
+        session.normalization_only = if (verified_principal) |proof| proof.value.purpose.normalizationOnly() else false;
         errdefer session.reader.deinit();
         if (opts.include_range_proofs) {
             const tracking = @import("../range_protection.zig");

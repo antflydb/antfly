@@ -166,6 +166,9 @@ pub const Record = struct {
     permissive: bool = true,
     using: ?Predicate = null,
     with_check: ?Predicate = null,
+    /// USING is also the implicit write check unless WITH CHECK was explicit.
+    /// Retain this provenance so ALTER USING cannot keep a stale write gate.
+    check_uses_using: bool = false,
 
     pub fn validateShape(self: @This()) !void {
         if (self.id == 0 or self.generation == 0 or self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or
@@ -197,6 +200,9 @@ pub const Command = struct {
     version: u16 = 1,
     expected_revision: u64,
     change: union(enum) { put: Record, drop: struct { id: u64, generation: u64, table_id: u64 } },
+    /// Active-table edits atomically freeze and enqueue their successor epoch.
+    /// Only metadata admission may populate this topology-fenced descriptor.
+    publication: ?Publication = null,
 };
 
 pub const Snapshot = struct {
@@ -312,7 +318,7 @@ pub const InstallSnapshot = struct {
         if (self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or self.policy_generation == 0 or
             self.catalog_epoch == 0 or self.records.len > 1024 or self.settings.len > 1024)
             return error.InvalidRowPolicyRecord;
-        if (self.phase != .disabled and self.records.len == 0) return error.InvalidRowPolicyRecord;
+        // An enabled table with no policies is a valid default-deny epoch.
         for (self.records, 0..) |record, i| {
             try record.validateShape();
             if (record.table_id != self.table_id or record.schema_version != self.schema_version or
@@ -328,6 +334,30 @@ pub const InstallSnapshot = struct {
         }
     }
 };
+
+test "empty enabled row-policy installation is default deny for every action" {
+    const alloc = std.testing.allocator;
+    const empty: InstallSnapshot = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(9), .policy_generation = 1, .catalog_epoch = 2, .phase = .pending_install, .records = &.{}, .settings = &.{} };
+    try empty.validateShape();
+    const OwnerFixture = struct {
+        fn settings(_: *anyopaque, _: std.mem.Allocator, scope: @import("settings.zig").Scope) !@import("settings.zig").Snapshot {
+            return .{ .scope = scope, .epoch = 2, .definitions = &.{} };
+        }
+        fn policy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8) !Snapshot {
+            return .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(9), .policy_generation = 1, .catalog_epoch = 2, .principal = "alice", .database = "main", .records = &.{} };
+        }
+    };
+    var dummy: u8 = 0;
+    var settings = try setting_catalog.View.capture(alloc, .{ .ptr = &dummy, .load = OwnerFixture.settings }, .{ .principal = "alice", .database = "main" }, &.{});
+    defer settings.deinit();
+    var view = try View.capture(alloc, .{ .ptr = &dummy, .load = OwnerFixture.policy }, .{ .id = 7, .physical_name = "table:7", .schema_version = 1, .columns = &.{} }, @splat(9), &settings);
+    defer view.deinit();
+    for (std.enums.values(Evaluator.Action)) |action| {
+        var evaluator = try Evaluator.init(alloc, &view, &settings, action);
+        defer evaluator.deinit();
+        try std.testing.expect(!try evaluator.permits(alloc, &.{}));
+    }
+}
 
 /// Metadata-owned distributed publication. ACKs are exact owner-descriptor
 /// identities, not just group IDs: a split, relocation, or generation swap

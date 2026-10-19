@@ -1923,6 +1923,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.sqlPolicyBeginCommandJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .sql_policy_definition_command => |input| {
+                    const value = handle.store.sqlPolicyDefinitionCommandJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .require_policy_index_mutation_allowed => |input| {
                     handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);

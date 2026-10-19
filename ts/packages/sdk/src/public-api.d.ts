@@ -14602,6 +14602,11 @@ export interface components {
          *     use exact decimal strings to avoid client-side floating-point rounding.
          */
         RelationalCheckConstraint: {
+            /**
+             * @description Enforce this CHECK on every new or changed row without asserting that historical rows satisfy it. Explicit validation clears this declaration only after an unpublished generation has validated all rows and atomically replaced the active generation. Disposable background scan coverage does not change this declaration.
+             * @default false
+             */
+            not_valid?: boolean;
             name: string;
             column?: string;
             op?: components["schemas"]["RelationalComparisonOp"];

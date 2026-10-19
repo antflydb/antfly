@@ -1507,6 +1507,10 @@ pub const RelationalRowQuery = struct {
         value: ?std.json.Value = null,
         collation: ?[]const u8 = null,
     };
+    /// Private mutation preparation: exposed RETURNING postimages must pass
+    /// the same owner-side SELECT policy and mandatory filter as a read.
+    /// Ordinary write normalization deliberately does not require visibility.
+    require_normalized_visibility: bool = false,
     /// Retained typed readers bound bytes as well as rows. Transported with
     /// the query so every owner uses the same requested page envelope.
     page_bytes: usize = 16 * 1024 * 1024,
@@ -1719,6 +1723,8 @@ pub const TransactionWrite = struct {
 };
 
 pub const TransactionVersionPredicate = struct {
+    /// Private SQL command provenance; public batch parsers never populate it.
+    row_policy_requirement: @import("../../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     key: []const u8,
     expected_version: u64,
     /// Internal observation guard. TTL timestamps need not change on updates.

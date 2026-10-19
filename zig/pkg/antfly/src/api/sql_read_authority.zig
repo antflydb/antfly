@@ -114,6 +114,7 @@ pub const ProofKey = struct {
     schema_version: u32,
     revision: u64,
     authority: ?*const anyopaque,
+    purpose: @import("../usermgr/mod.zig").row_policy_authority.Purpose,
 
     pub fn from(table: catalog.Table) !ProofKey {
         return .{
@@ -121,6 +122,7 @@ pub const ProofKey = struct {
             .schema_version = table.schema_version,
             .revision = (table.scope orelse return error.InvalidSqlBackendResponse).revision,
             .authority = table.read_authority,
+            .purpose = table.row_policy_purpose,
         };
     }
 };

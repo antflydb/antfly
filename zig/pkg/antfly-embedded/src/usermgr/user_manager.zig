@@ -1146,6 +1146,20 @@ pub const UserManager = struct {
             }
         }
         if (!allowed) return error.Forbidden;
+        if (scope.purpose.requiresWritePermission() and permission_type != .write) return error.Forbidden;
+        if (scope.purpose.requiresSelectPermission()) {
+            var read_allowed = false;
+            for (current_permissions) |permission| {
+                if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                    catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                    (permission.type == .read or permission.type == .admin))
+                {
+                    read_allowed = true;
+                    break;
+                }
+            }
+            if (!read_allowed) return error.Forbidden;
+        }
         if (delegation) |value| {
             if (value.invoker) {
                 var base_allowed = false;

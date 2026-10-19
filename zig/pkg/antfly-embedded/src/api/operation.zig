@@ -112,7 +112,15 @@ pub const RequestDiagnostics = struct {
     }
 };
 
+pub const RowPolicyIntegrityRead = struct {
+    pub const Proof = struct { token: []const u8, database: []const u8 };
+    ptr: *anyopaque,
+    authorize: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?Proof,
+};
+
 pub const RequestContext = struct {
+    /// Private coordinator capability; never serialized or accepted publicly.
+    row_policy_integrity_read: ?RowPolicyIntegrityRead = null,
     /// Granted only after administrator authentication by a trusted native
     /// ingress. Metadata HTTP never reconstructs this from request JSON.
     setting_admin: bool = false,

@@ -316,6 +316,7 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_policy_publication_status: u64,
     sql_policy_publication_work: u64,
     sql_policy_begin_command: @import("antfly_local_sources").system_catalog_policies.BeginRequest,
+    sql_policy_definition_command: @import("antfly_local_sources").system_catalog_policies.Command,
     require_policy_index_mutation_allowed: u64,
     require_policy_topology_mutation_allowed: u64,
     fk_generation_publication_status: u64,

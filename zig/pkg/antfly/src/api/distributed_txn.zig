@@ -2473,6 +2473,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
             .expected_version = predicate.expected_version,
             .unique_absence = if (predicate.unique_absence) @as(?bool, true) else null,
             .expected_content_digest = if (predicate.expected_content_digest != null) @as(?[]const u8, &digest_hex) else null,
+            .row_policy_requirement = if (predicate.row_policy_requirement != .native) @as(?@TypeOf(predicate.row_policy_requirement), predicate.row_policy_requirement) else null,
         }, .{ .emit_null_optional_fields = false });
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
@@ -3361,11 +3362,16 @@ fn parseTxnPredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
             content_digest = digest;
         }
         const unique_absence = if (obj.get("unique_absence")) |flag| if (flag == .bool and (expected_version == 0 or !flag.bool)) flag.bool else return error.InvalidTxnRequest else false;
+        const policy_requirement: @import("../usermgr/mod.zig").row_policy_authority.MutationRequirement = if (obj.get("row_policy_requirement")) |flag| requirement: {
+            if (flag != .string) return error.InvalidTxnRequest;
+            break :requirement std.meta.stringToEnum(@import("../usermgr/mod.zig").row_policy_authority.MutationRequirement, flag.string) orelse return error.InvalidTxnRequest;
+        } else .native;
         out[i] = .{
             .key = try alloc.dupe(u8, requireString(obj, "key")),
             .expected_version = expected_version,
             .expected_content_digest = content_digest,
             .unique_absence = unique_absence,
+            .row_policy_requirement = policy_requirement,
         };
         initialized += 1;
     }

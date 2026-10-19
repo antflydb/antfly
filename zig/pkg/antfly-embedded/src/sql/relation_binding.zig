@@ -48,6 +48,12 @@ pub const Column = struct {
     grouped_scope: ?*const []const Column = null,
 };
 
+/// Lowering passes resolve against the complete authorized lexical domain
+/// before narrowing projection liveness; ambiguity is never guessed from names.
+pub fn lookupColumn(columns: []const Column, name: []const u8) !Column {
+    return Builder.field(columns, name);
+}
+
 /// Expand only authorized visible columns, before allocating expression
 /// programs. RETURNING's unqualified * is target-only even for a MERGE join;
 /// qualified stars resolve in the caller's already-bound relation domain.
@@ -1757,6 +1763,7 @@ const Builder = struct {
                             column.qualifier = source_column.qualifier;
                             column.scope = source_column.scope;
                             column.visible = source_column.visible;
+                            column.unqualified_visible = source_column.unqualified_visible;
                         } else column.visible = false;
                     }
                     if (result.columns.len != 0) @constCast(result.columns)[0].grouped_scope = grouped_scope;

@@ -368,6 +368,8 @@ pub const Table = struct {
     /// Request-owned logical authority. Never use a mutable adapter's last
     /// resolved name to validate an earlier table in a join or subquery.
     scope: ?Scope = null,
+    row_policy_purpose: @import("../usermgr/row_policy_authority.zig").Purpose = .ordinary,
+    sql_select_required: bool = false,
     /// Stored SQL keeps creation-time lexical names independently of the
     /// current logical scope used for catalog and authorization checks.
     binding_scope: ?Scope = null,
@@ -381,7 +383,10 @@ pub const Table = struct {
     /// Hidden SQL columns owned by the row envelope, not the user schema.
     /// Binders enumerate these explicitly so SELECT * keeps its stored shape.
     const identity_virtual_columns = [_]Column{.{ .name = "_id", .path = "_id", .type = .string, .nullable = false }};
-    const document_virtual_columns = identity_virtual_columns ++ [_]Column{.{ .name = "_doc", .path = "_doc", .type = .json, .element_type = .jsonb, .nullable = false }};
+    const document_virtual_columns = identity_virtual_columns ++ [_]Column{
+        .{ .name = "_doc", .path = "_doc", .type = .json, .element_type = .jsonb, .nullable = false },
+        .{ .name = "_version", .path = "_version", .type = .integer, .element_type = .int64, .nullable = false, .generated = true },
+    };
 
     pub fn virtualColumns(self: Table) []const Column {
         if (self.virtual_columns_override) |columns| return columns;
@@ -395,6 +400,12 @@ pub const Table = struct {
         if (!std.mem.endsWith(u8, name, "\x00_doc")) return false;
         const resolved = self.column(name) catch return false;
         return std.mem.eql(u8, resolved.name, "_doc");
+    }
+
+    pub fn isDocumentVersion(self: Table, name: []const u8) bool {
+        if (self.storage_mode != .document) return false;
+        const resolved = self.column(name) catch return false;
+        return std.mem.eql(u8, resolved.name, "_version");
     }
 
     pub fn validateDocumentWriteColumns(self: Table, names: []const []const u8) !void {
@@ -551,11 +562,11 @@ pub const Scan = struct {
     /// fictitious storage field. Ordinary narrow projections borrow unchanged.
     pub fn physicalFields(self: Scan, alloc: std.mem.Allocator, table: Table) ![]const []const u8 {
         var count: usize = 0;
-        for (self.fields) |name| count += @intFromBool(!table.isDocumentRoot(name));
+        for (self.fields) |name| count += @intFromBool(!table.isDocumentRoot(name) and !table.isDocumentVersion(name));
         if (count == self.fields.len) return self.fields;
         const fields = try alloc.alloc([]const u8, count);
         var index: usize = 0;
-        for (self.fields) |name| if (!table.isDocumentRoot(name)) {
+        for (self.fields) |name| if (!table.isDocumentRoot(name) and !table.isDocumentVersion(name)) {
             fields[index] = name;
             index += 1;
         };
@@ -614,6 +625,9 @@ pub const Row = struct {
     /// are not a version fence when a custom TTL field is unchanged.
     expected_content_digest: ?[32]u8 = null,
     document: ?std.json.Value = null,
+    /// Native document metadata is not a relational user column of the same
+    /// spelling. Only schema-bound document projections grant this identity.
+    document_envelope: bool = false,
     /// Authoritative native null flags aligned with value.object insertion
     /// order. Null means a legacy JSON-only backend without that distinction.
     sql_nulls: ?[]const bool = null,
@@ -727,6 +741,7 @@ pub const Row = struct {
     }
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
+        if (self.document_envelope and std.mem.eql(u8, name, "_version")) return Cell.json(.{ .integer = std.math.cast(i64, self.version) orelse return error.SqlNumericOutOfRange });
         if (std.mem.eql(u8, name, "_doc")) if (self.document) |document| {
             if (document != .object) return error.InvalidSqlBackendResponse;
             return Cell.json(document);
@@ -768,6 +783,7 @@ pub const Row = struct {
     }
 
     pub fn hasField(self: Row, name: []const u8) !bool {
+        if (self.document_envelope and std.mem.eql(u8, name, "_version")) return true;
         if (std.mem.eql(u8, name, "_doc")) if (self.document) |document| {
             if (document != .object) return error.InvalidSqlBackendResponse;
             return true;
@@ -1087,6 +1103,7 @@ pub const StatementRead = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Mutation = struct {
+    row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     /// Owned native authority envelope. The SQL engine carries but never
     /// interprets native claim keys, generation fences or commands.
     conflict_guard: ?*const anyopaque = null,

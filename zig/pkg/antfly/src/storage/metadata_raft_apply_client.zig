@@ -532,6 +532,13 @@ pub const RaftApplyStore = struct {
     pub fn sqlPolicyBeginCommandJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: sql_policies.BeginRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_begin_command = request });
     }
+    pub fn sqlPolicyDefinitionCommandJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: sql_policies.Command) ![]u8 {
+        var output: std.Io.Writer.Allocating = .init(alloc);
+        defer output.deinit();
+        var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(contract.CatalogProjectionRequest{ .sql_policy_definition_command = command }, &stream);
+        return self.projectionWithAllocator([]u8, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(output.written()) });
+    }
     pub fn requirePolicyIndexMutationAllowed(self: *RaftApplyStore, group_id: u64, table_id: u64) !void {
         const value = try self.catalogProjection(bool, self.alloc, group_id, .{ .require_policy_index_mutation_allowed = table_id });
         if (!value) return error.RowPolicyUnsupported;

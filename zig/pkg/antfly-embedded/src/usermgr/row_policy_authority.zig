@@ -26,6 +26,57 @@ pub const maximum_name_bytes: usize = 256;
 
 pub const Access = enum { read, write };
 
+/// Per-row command provenance carried by the private native predicate/intent
+/// envelope, covered by durable sealing and authenticated native transport.
+/// Ordinary REST mutations retain their existing native action semantics.
+pub const MutationRequirement = enum(u8) {
+    native,
+    insert,
+    insert_select,
+    update,
+    update_select,
+    delete,
+    delete_select,
+
+    pub fn requiresSelect(self: MutationRequirement) bool {
+        return self == .insert_select or self == .update_select or self == .delete_select;
+    }
+    pub fn isInsert(self: MutationRequirement) bool {
+        return self == .insert or self == .insert_select;
+    }
+    pub fn isUpdate(self: MutationRequirement) bool {
+        return self == .update or self == .update_select;
+    }
+    pub fn isDelete(self: MutationRequirement) bool {
+        return self == .delete or self == .delete_select;
+    }
+};
+
+/// Authenticated SQL execution intent, never a public request field. Mutation
+/// scans use their own USING policy; SELECT is an additional requirement only
+/// when the statement actually reads target columns or returns their values.
+pub const Purpose = enum {
+    ordinary,
+    update,
+    update_select,
+    delete,
+    delete_select,
+    normalize,
+    normalize_select,
+    integrity,
+    sql_write,
+
+    pub fn requiresWritePermission(self: Purpose) bool {
+        return self != .ordinary;
+    }
+    pub fn normalizationOnly(self: Purpose) bool {
+        return self == .normalize or self == .normalize_select;
+    }
+    pub fn requiresSelectPermission(self: Purpose) bool {
+        return self == .update_select or self == .delete_select or self == .normalize_select;
+    }
+};
+
 pub const Scope = struct {
     table_id: u64,
     table: []const u8,
@@ -33,6 +84,7 @@ pub const Scope = struct {
     policy_generation: u64,
     catalog_epoch: u64,
     access: Access = .read,
+    purpose: Purpose = .ordinary,
 };
 
 pub const PinnedRoles = struct {
@@ -58,8 +110,24 @@ pub const Payload = struct {
     catalog_epoch: u64,
     access: Access,
     expires: i64,
+    purpose: Purpose = .ordinary,
 
     pub fn jsonStringify(self: Payload, writer: anytype) !void {
+        if (self.purpose != .ordinary) return writer.write(.{
+            .principal = self.principal,
+            .policy_principal = self.policy_principal,
+            .setting_principal = self.setting_principal,
+            .roles = self.roles,
+            .auth_revision = self.auth_revision,
+            .table_id = self.table_id,
+            .table = self.table,
+            .database = self.database,
+            .policy_generation = self.policy_generation,
+            .catalog_epoch = self.catalog_epoch,
+            .access = self.access,
+            .expires = self.expires,
+            .purpose = self.purpose,
+        });
         // Ordinary proofs retain their original shape for strict older
         // decoders. View extensions require the coordinated view capability.
         if (self.policy_principal == null and self.setting_principal == null) return writer.write(.{
@@ -100,6 +168,8 @@ pub fn sign(
     now_seconds: i64,
 ) ![]u8 {
     if (secret.len < 32 or issuer.len == 0) return error.RowPolicyAuthorityUnavailable;
+    if ((scope.purpose == .sql_write and scope.access != .write) or
+        (scope.purpose != .ordinary and scope.purpose != .sql_write and scope.access != .read)) return error.InvalidRowPolicyPrincipal;
     if (!validName(pinned.principal) or !validName(scope.table) or !validName(scope.database) or
         pinned.roles.len > maximum_roles or pinned.auth_revision == 0 or scope.table_id == 0 or
         scope.policy_generation == 0 or scope.catalog_epoch == 0)
@@ -123,6 +193,7 @@ pub fn sign(
         .catalog_epoch = scope.catalog_epoch,
         .access = scope.access,
         .expires = expires,
+        .purpose = scope.purpose,
     }, .{});
     defer alloc.free(payload);
     const payload_size = std.base64.url_safe_no_pad.Encoder.calcSize(payload.len);
@@ -166,6 +237,9 @@ pub fn verify(
     };
     errdefer parsed.deinit();
     const value = parsed.value;
+    if ((value.purpose == .sql_write and value.access != .write) or
+        (value.purpose != .ordinary and value.purpose != .sql_write and value.access != .read) or
+        (scope.purpose != .ordinary and value.purpose != scope.purpose)) return error.Forbidden;
     if (!validName(value.principal) or !validName(value.table) or !validName(value.database) or
         value.roles.len > maximum_roles or value.auth_revision == 0 or
         value.table_id != scope.table_id or

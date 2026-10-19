@@ -17,6 +17,7 @@
 """Exact original schema lifecycle DDL, future-write enforcement and postimages."""
 
 import argparse
+import copy
 import json
 from pathlib import Path
 
@@ -26,6 +27,7 @@ FIRST = "00000000-0000-0000-0000-000000000001"
 SECOND = "00000000-0000-0000-0000-000000000002"
 PROBE = "00000000-0000-0000-0000-000000000003"
 IDS = [
+    674,
     677,
     678,
     680,
@@ -36,17 +38,97 @@ IDS = [
     730,
     731,
     733,
+    735,
+    737,
     738,
+    739,
     740,
+    744,
+    745,
     779,
     1408,
     1412,
 ]
 
 
+def foreign_key_declaration(number):
+    """Keep both sides real: parent key, historical children, and future writes."""
+    if number == 674:
+        table = "inline_constraints"
+        setup = [
+            {
+                "statement": "CREATE TABLE tenants(id TEXT PRIMARY KEY)",
+                "table": "tenants",
+            },
+            {"statement": "INSERT INTO tenants(id) VALUES ('tenant-a')"},
+        ]
+        columns = "id::text AS id,tenant_id,email,amount::text AS amount"
+        statements = [
+            (
+                f"INSERT INTO {table}(id,tenant_id,email,amount) VALUES ('{PROBE}','tenant-a','one@example.test',1)",
+                None,
+            ),
+            (
+                f"INSERT INTO {table}(id,tenant_id,email,amount) VALUES ('00000000-0000-0000-0000-000000000004','missing','two@example.test',2)",
+                "23503",
+            ),
+            (
+                f"INSERT INTO {table}(id,tenant_id,email,amount) VALUES ('00000000-0000-0000-0000-000000000004','tenant-a','one@example.test',2)",
+                "23505",
+            ),
+            (
+                f"INSERT INTO {table}(id,tenant_id,email,amount) VALUES ('00000000-0000-0000-0000-000000000004','tenant-a','two@example.test',-1)",
+                "23514",
+            ),
+        ]
+    elif number == 735:
+        table = "usage_records"
+        setup = [
+            {
+                "statement": "CREATE TABLE users(id TEXT,region TEXT,PRIMARY KEY(id,region))",
+                "table": "users",
+            },
+            {"statement": "INSERT INTO users(id,region) VALUES ('parent-a','us')"},
+            {
+                "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,user_id TEXT,region TEXT)",
+                "table": table,
+            },
+            {
+                "statement": f"INSERT INTO usage_records(id,user_id,region) VALUES ('{FIRST}',NULL,NULL),('{SECOND}','parent-a','us')"
+            },
+        ]
+        columns = "id::text AS id,user_id,region"
+        statements = [
+            (
+                f"INSERT INTO {table}(id,user_id,region) VALUES ('00000000-0000-0000-0000-000000000004','parent-a',NULL)",
+                "23503",
+            ),
+            (
+                f"INSERT INTO {table}(id,user_id,region) VALUES ('00000000-0000-0000-0000-000000000004','missing','us')",
+                "23503",
+            ),
+            (
+                f"INSERT INTO {table}(id,user_id,region) VALUES ('{PROBE}','parent-a','us')",
+                None,
+            ),
+        ]
+    else:
+        raise ValueError("unknown foreign-key lifecycle")
+    return {
+        "id": f"sql-{number:04}",
+        "table": table,
+        "setup": setup,
+        "read_sql": f"SELECT {columns} FROM {table}",
+        "ddl_sqlstate": None,
+        "probes": [{"statement": sql, "sqlstate": code} for sql, code in statements],
+    }
+
+
 def declaration(number):
     if number not in IDS:
         raise ValueError("schema lifecycle case is outside the qualified cohort")
+    if number in {674, 735}:
+        return foreign_key_declaration(number)
     identity = f"sql-{number:04}"
     stage = number in {677, 678, 680, 681}
     table = "usage_stage" if stage else "usage_records"
@@ -59,8 +141,6 @@ def declaration(number):
         columns = "id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT"
         if number in {1408, 1412}:
             columns = columns.replace("id UUID", "id TEXT")
-        if number == 1412:
-            columns += ",CONSTRAINT positive_amount CHECK(amount >= 0)"
         columns += ",user_id TEXT"
     setup = []
     setup.append({"statement": f"CREATE TABLE {table}({columns})", "table": table})
@@ -82,10 +162,28 @@ def declaration(number):
                 "statement": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK(status != 'unknown')"
             }
         )
+    if number == 745:
+        setup.append(
+            {"statement": "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL"}
+        )
     seed = f"INSERT INTO {table}(tenant_id,id,status) VALUES ('tenant-a','{FIRST}','active'),('tenant-b','{SECOND}','ready')"
     if not stage:
         seed = f"INSERT INTO {table}(id,email,tenant_id,status,amount,metadata) VALUES ('{FIRST}','a@example.test','tenant-a','active',5,'{{\"source\":\"old\"}}'),('{SECOND}',NULL,'tenant-b','ready',NULL,NULL)"
+    if number == 737:
+        seed = seed.replace("'active',5", "'unknown',5")
+    if number == 1412:
+        seed = seed.replace("'active',5", "'active',-5")
     setup.append({"statement": seed})
+    if number in {739, 1412}:
+        name = (
+            "positive_amount" if number == 1412 else "usage_records_status_known_check"
+        )
+        expression = "amount >= 0" if number == 1412 else "status != 'unknown'"
+        setup.append(
+            {
+                "statement": f"ALTER TABLE {table} ADD CONSTRAINT {name} CHECK({expression}) NOT VALID"
+            }
+        )
     fields = (
         "tenant_id,id::text AS id,status"
         if stage
@@ -152,7 +250,7 @@ def declaration(number):
             "23505",
         )
         probe(f"INSERT INTO usage_records(id,email) VALUES ('{PROBE}',NULL)")
-    elif number == 738:
+    elif number in {737, 738, 739}:
         probe(
             f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','unknown')",
             "23514",
@@ -160,10 +258,15 @@ def declaration(number):
         probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','active')")
     elif number == 740:
         probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','unknown')")
+    elif number == 744:
+        probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}',NULL)", "23502")
+        probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','active')")
+    elif number == 745:
+        probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}',NULL)")
     elif number == 779:
         probe("SELECT metadata FROM usage_records", "42703")
         probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','new')")
-    return {
+    result = {
         "id": identity,
         "table": table,
         "setup": setup,
@@ -171,6 +274,11 @@ def declaration(number):
         "ddl_sqlstate": {733: "42809", 1408: "42P10", 1412: "23514"}.get(number),
         "probes": probes,
     }
+    if number in {737, 739, 1412}:
+        result["check_name"] = (
+            "positive_amount" if number == 1412 else "usage_records_status_known_check"
+        )
+    return result
 
 
 def reference():
@@ -183,9 +291,81 @@ def reference():
         ]
     }
     result = []
+    declarations = [declaration(number) for number in IDS]
+    invalid_history = copy.deepcopy(declaration(738))
+    invalid_history["scenario"] = (
+        "invalid historical CHECK leaves predecessor published"
+    )
+    invalid_history["native_job_error"] = "ConstraintActivationFailed"
+    invalid_history["ddl_sqlstate"] = "23514"
+    invalid_history["setup"][-1]["statement"] = invalid_history["setup"][-1][
+        "statement"
+    ].replace("'active',5", "'unknown',5")
+    invalid_history["probes"] = [
+        {
+            "statement": f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','unknown')",
+            "sqlstate": None,
+        }
+    ]
+    declarations.append(invalid_history)
+    duplicate_history = copy.deepcopy(declaration(730))
+    duplicate_history["scenario"] = (
+        "duplicate historical UNIQUE leaves predecessor published"
+    )
+    duplicate_history["native_job_error"] = "ConstraintActivationFailed"
+    duplicate_history["ddl_sqlstate"] = "23505"
+    duplicate_history["setup"][-1]["statement"] = duplicate_history["setup"][-1][
+        "statement"
+    ].replace(f"'{SECOND}',NULL", f"'{SECOND}','a@example.test'")
+    duplicate_history["probes"] = [
+        {
+            "statement": f"INSERT INTO usage_records(id,email) VALUES ('{PROBE}','a@example.test')",
+            "sqlstate": None,
+        }
+    ]
+    declarations.append(duplicate_history)
+    invalid_validation = copy.deepcopy(declaration(739))
+    invalid_validation["scenario"] = (
+        "failed explicit validation preserves NOT VALID declaration"
+    )
+    invalid_validation["native_job_error"] = "ConstraintActivationFailed"
+    invalid_validation["ddl_sqlstate"] = "23514"
+    invalid_validation["setup"][-2]["statement"] = invalid_validation["setup"][-2][
+        "statement"
+    ].replace("'active',5", "'unknown',5")
+    invalid_validation["probes"] = [
+        {
+            "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000004','unknown')",
+            "sqlstate": "23514",
+        },
+        {
+            "statement": "UPDATE usage_records SET status='active' WHERE status='unknown'",
+            "sqlstate": None,
+        },
+    ]
+    declarations.append(invalid_validation)
+    mixed_validation = copy.deepcopy(declaration(739))
+    mixed_validation["scenario"] = (
+        "validating one CHECK preserves unrelated NOT VALID history"
+    )
+    mixed_validation["retained_not_valid_check"] = "positive_amount"
+    mixed_validation["setup"][-2]["statement"] = mixed_validation["setup"][-2][
+        "statement"
+    ].replace("'active',5", "'active',-5")
+    mixed_validation["setup"].append(
+        {
+            "statement": "ALTER TABLE usage_records ADD CONSTRAINT positive_amount CHECK(amount>=0) NOT VALID"
+        }
+    )
+    mixed_validation["probes"].append(
+        {
+            "statement": "INSERT INTO usage_records(id,status,amount) VALUES ('00000000-0000-0000-0000-000000000005','active',-1)",
+            "sqlstate": "23514",
+        }
+    )
+    declarations.append(mixed_validation)
     with postgres() as db:
-        for number in IDS:
-            case = declaration(number)
+        for case in declarations:
             with db.transaction(force_rollback=True):
                 for step in case["setup"]:
                     db.execute(step["statement"])
@@ -205,13 +385,34 @@ def reference():
                             cursor,
                             {"id": case["id"], "sql": case["read_sql"], "params": []},
                             read=True,
+                            allow_empty=case["id"] == "sql-0674",
                         )
 
                 case["after_ddl"] = snapshot()
+                if "retained_not_valid_check" in case:
+                    assert not db.execute(
+                        "SELECT convalidated FROM pg_constraint WHERE conrelid=%s::regclass AND conname=%s",
+                        (case["table"], case["retained_not_valid_check"]),
+                    ).fetchone()[0]
+
+                def declaration_state():
+                    return not db.execute(
+                        "SELECT convalidated FROM pg_constraint WHERE conrelid=%s::regclass AND conname=%s",
+                        (case["table"], case["check_name"]),
+                    ).fetchone()[0]
+
+                if "check_name" in case:
+                    case["declared_not_valid"] = declaration_state()
                 for probe in case["probes"]:
                     try:
                         with db.transaction():
                             db.execute(probe["statement"])
+                            # The native campaign uses implicit one-statement
+                            # transactions. The oracle's enclosing rollback
+                            # transaction must exercise their commit-time FK
+                            # check, not silently defer it until rollback.
+                            if case["id"] == "sql-0735":
+                                db.execute("SET CONSTRAINTS ALL IMMEDIATE")
                     except psycopg.Error as error:
                         if error.sqlstate != probe["sqlstate"]:
                             raise
@@ -219,6 +420,8 @@ def reference():
                         if probe["sqlstate"] is not None:
                             raise ValueError(f"{case['id']}: rejection probe succeeded")
                     probe["after"] = snapshot()
+                    if "check_name" in case:
+                        probe["declared_not_valid"] = declaration_state()
                 result.append(case)
     return {"format": 1, "reference": "PostgreSQL exact SQL", "cases": result}
 

@@ -3988,6 +3988,7 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
                     .version = try std.fmt.bufPrint(&version_buf, "{d}", .{predicate.expected_version}),
                     .digest = predicate.expected_content_digest,
                     .unique_absence = predicate.unique_absence,
+                    .row_policy_requirement = predicate.row_policy_requirement,
                 }, .{});
                 defer alloc.free(encoded);
                 try out.appendSlice(alloc, encoded);
@@ -4258,7 +4259,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
             const table = for (request.tables) |*table| {
                 if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
             } else return error.InvalidTransactionSessionRecord;
-            const Stored = struct { key: []const u8, version: []const u8, digest: ?[32]u8, unique_absence: bool = false };
+            const Stored = struct { key: []const u8, version: []const u8, digest: ?[32]u8, unique_absence: bool = false, row_policy_requirement: @import("../usermgr/mod.zig").row_policy_authority.MutationRequirement = .native };
             var parsed = try std.json.parseFromValue([]const Stored, alloc, entry.value_ptr.*, .{});
             defer parsed.deinit();
             const predicates = try alloc.alloc(db_mod.types.TransactionVersionPredicate, parsed.value.len);
@@ -4268,6 +4269,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
                 .expected_version = try parseVersionString(stored.version),
                 .expected_content_digest = stored.digest,
                 .unique_absence = stored.unique_absence,
+                .row_policy_requirement = stored.row_policy_requirement,
             };
             try appendPredicates(alloc, &table.predicates, predicates);
         }
@@ -4517,6 +4519,7 @@ fn clonePredicatesInto(
             .expected_version = predicate.expected_version,
             .expected_content_digest = predicate.expected_content_digest,
             .unique_absence = predicate.unique_absence,
+            .row_policy_requirement = predicate.row_policy_requirement,
         });
     }
 }
@@ -4906,6 +4909,8 @@ fn appendPredicates(
                 if (predicate.expected_content_digest) |next| if (!std.mem.eql(u8, &digest, &next)) return error.VersionConflict;
             } else previous.expected_content_digest = predicate.expected_content_digest;
             previous.unique_absence = previous.unique_absence or predicate.unique_absence;
+            if (predicate.row_policy_requirement != .native)
+                previous.row_policy_requirement = predicate.row_policy_requirement;
             continue;
         }
         predicates.appendAssumeCapacity(.{
@@ -4913,6 +4918,7 @@ fn appendPredicates(
             .expected_version = predicate.expected_version,
             .expected_content_digest = predicate.expected_content_digest,
             .unique_absence = predicate.unique_absence,
+            .row_policy_requirement = predicate.row_policy_requirement,
         });
         by_key.putAssumeCapacity(predicates.items[predicates.items.len - 1].key, predicates.items.len - 1);
     }

@@ -67,6 +67,7 @@ fn kindId(kind: operators.Aggregate.Kind) u8 {
         .bool_and => 6,
         .bool_or => 7,
         .pattern_set => 8,
+        .array_agg => 9,
     };
 }
 fn typeId(type_: ?@import("ast.zig").ColumnType) u8 {
@@ -220,8 +221,13 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
         try reducer.state.encode(&context, &writer);
     }
     try encoder.datum(if (state.selected) |v| v.row.values[0] else .{});
-    try encoder.integer(u64, @intCast(state.distinct_values.items.len));
-    for (state.distinct_values.items) |entry| try encoder.datum(entry.row.row.values[0]);
+    if (state.collection) |collection| {
+        try encoder.integer(u64, @intCast(collection.values.items.len));
+        for (collection.values.items) |value| try encoder.datum(value);
+    } else {
+        try encoder.integer(u64, @intCast(state.distinct_values.items.len));
+        for (state.distinct_values.items) |entry| try encoder.datum(entry.row.row.values[0]);
+    }
     const null_position: u64 = if (state.patterns) |patterns| blk: {
         for (patterns.values.items, 0..) |value, index| if (value == .null) break :blk @intCast(index);
         break :blk std.math.maxInt(u64);
@@ -370,7 +376,7 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
         std.mem.copyBackwards(std.json.Value, items[index + 1 ..], items[index .. items.len - 1]);
         items[index] = .null;
     }
-    if (spec.distinct) {
+    if (spec.distinct or spec.kind == .array_agg) {
         if (state.count != count or state.integer_sum != sum or state.number_sum != numbers[0] or state.compensation != numbers[1] or state.mean != numbers[2] or state.boolean != (signature[3] == 1)) return error.InvalidSqlSpill;
     } else if (members != 0) return error.InvalidSqlSpill;
     if (checkpoint) |incoming| {
@@ -507,6 +513,10 @@ test "SQL NUMERIC aggregate extrema partials retain exact values and display sca
 /// numeric states merge without narrowing intermediate sums.
 pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
     if (target.kind != source.kind or target.input_type != source.input_type or target.input_element != source.input_element or target.distinct != source.distinct) return error.InvalidSqlSpill;
+    if (source.collection) |collection| {
+        for (collection.values.items) |value| try target.update(value);
+        return;
+    }
     if (source.distinct) {
         if (source.patterns) |patterns| {
             for (patterns.values.items) |value| try target.update(if (value == .null) Datum{} else Datum.json(value));
@@ -559,7 +569,7 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
         .bool_and => target.boolean = target.boolean and source.boolean,
         .bool_or => target.boolean = target.boolean or source.boolean,
         .min, .max => try target.update(source.selected.?.row.values[0]),
-        .pattern_set => return error.InvalidSqlSpill,
+        .pattern_set, .array_agg => return error.InvalidSqlSpill,
     }
     target.count = total;
 }

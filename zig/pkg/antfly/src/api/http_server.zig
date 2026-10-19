@@ -5562,6 +5562,7 @@ pub const ApiHttpServer = struct {
         const value = work orelse return;
         self.fk_initial_create_cursor.store(value.child_table_id, .monotonic);
         var command: publication.InitialCommand = .{
+            .catalog_coverage = value.catalog_coverage,
             .plan_id = value.plan_id,
             .child_table_id = value.child_table_id,
             .expected_revision = value.revision,
@@ -7927,6 +7928,10 @@ pub const ApiHttpServer = struct {
             .write => .write,
             else => return error.RowPolicyAuthenticationRequired,
         };
+        if (scope.purpose != .ordinary and scope.purpose != .sql_write) {
+            if (permission != .write) return error.RowPolicyAuthenticationRequired;
+            bound_scope.access = .read;
+        }
         return manager.signRowPolicyRolesAuthorized(
             self.alloc,
             identity.username,
@@ -7954,7 +7959,12 @@ pub const ApiHttpServer = struct {
         database: []const u8,
         schema_version: ?u32,
     ) !?[]u8 {
-        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .read, null);
+        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .read, null, .ordinary);
+    }
+
+    pub fn rowPolicyMutationReadProof(self: *ApiHttpServer, alloc: std.mem.Allocator, identity: ?*const AuthenticatedIdentity, context: api_operation.RequestContext, table_id: u64, physical_table: []const u8, database: []const u8, schema_version: u32, purpose: usermgr.row_policy_authority.Purpose) !?[]u8 {
+        if (purpose == .ordinary or purpose == .sql_write) return error.RowPolicyAuthenticationRequired;
+        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .write, null, purpose);
     }
 
     pub const ViewPolicyDelegation = struct {
@@ -7963,7 +7973,7 @@ pub const ApiHttpServer = struct {
     };
     pub fn rowPolicyViewReadProof(self: *ApiHttpServer, alloc: std.mem.Allocator, identity: *const AuthenticatedIdentity, context: api_operation.RequestContext, table_id: u64, physical_table: []const u8, database: []const u8, schema_version: u32, delegation: ViewPolicyDelegation) !?[]u8 {
         if (!try tablePermissionCurrentlyAllowed(identity.*, delegation.grant.logical_view, .read)) return error.Forbidden;
-        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .read, delegation);
+        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .read, delegation, .ordinary);
     }
 
     fn rowPolicyProof(
@@ -7977,6 +7987,7 @@ pub const ApiHttpServer = struct {
         schema_version: ?u32,
         permission: usermgr.PermissionType,
         delegation: ?ViewPolicyDelegation,
+        purpose: usermgr.row_policy_authority.Purpose,
     ) !?[]u8 {
         if (table_id == 0 or physical_table.len == 0 or database.len == 0) return error.RowPolicyCatalogChanged;
         var internal_context = context;
@@ -7998,6 +8009,7 @@ pub const ApiHttpServer = struct {
             .database = database,
             .policy_generation = serving.generation,
             .catalog_epoch = serving.catalog_epoch,
+            .purpose = purpose,
         };
         const signed = if (delegation) |value| delegated: {
             if (permission != .read or authenticated.is_internal_service) return error.Forbidden;
@@ -8027,11 +8039,19 @@ pub const ApiHttpServer = struct {
         database: []const u8,
         schema_version: ?u32,
     ) !?[]u8 {
+        return self.rowPolicyWriteProofForPurpose(alloc, context, table_id, physical_table, database, schema_version, .ordinary);
+    }
+
+    fn rowPolicyWriteProofForPurpose(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, table_id: u64, physical_table: []const u8, database: []const u8, schema_version: ?u32, purpose: usermgr.row_policy_authority.Purpose) !?[]u8 {
         const identity: ?*const AuthenticatedIdentity = if (context.row_policy_credential) |credential| blk: {
             const admitted: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(credential));
             break :blk if (admitted.*) |*value| value else null;
         } else null;
-        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .write, null);
+        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .write, null, purpose);
+    }
+
+    pub fn rowPolicyIntegrityReadProof(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, table_id: u64, physical_table: []const u8, database: []const u8) !?[]u8 {
+        return self.rowPolicyWriteProofForPurpose(alloc, context, table_id, physical_table, database, null, .integrity);
     }
 
     pub fn authorizeInferenceRequest(
@@ -13598,7 +13618,9 @@ pub const ApiHttpServer = struct {
     /// schema/catalog fencing and cascade dependency expansion unchanged.
     pub fn preparePublicCommitWithIntegrity(self: *ApiHttpServer, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, request: api_operation.RequestContext) !@import("antfly_local_sources").api_relational_integrity_commit.Prepared {
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
-        var preparation_request = request;
+        var integrity_reads = @import("sql_policy_integrity_reads.zig").Cache.init(self, request);
+        defer integrity_reads.deinit();
+        var preparation_request = integrity_reads.attach(request);
         if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse
             return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
@@ -13662,7 +13684,10 @@ pub const ApiHttpServer = struct {
                     if (std.mem.eql(u8, record.name, physical)) break record;
                 } else return error.RowPolicyCatalogChanged;
                 const target = try system_catalog.Target.parse(logical orelse return error.RowPolicyCatalogChanged);
-                if (try self.rowPolicyWriteProof(a, request, table.table_id, physical, target.database, signed[index].relational_schema_version)) |proof| {
+                const sql_intent = for (signed[index].predicates) |predicate| {
+                    if (predicate.row_policy_requirement != .native) break true;
+                } else false;
+                if (try self.rowPolicyWriteProofForPurpose(a, request, table.table_id, physical, target.database, signed[index].relational_schema_version, if (sql_intent) .sql_write else .ordinary)) |proof| {
                     signed[index].row_policy_principal_proof = proof;
                     signed[index].row_policy_database = target.database;
                     signed[index].row_policy_admitted_at_seconds = @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s));
@@ -13835,7 +13860,9 @@ pub const ApiHttpServer = struct {
             try @import("relational_constraint_recovery.zig").retry(alloc, reader, source, snapshot.tables, snapshot.ranges, tables[0], request);
             return .{ .committed = .{ .participant_count = 0 } };
         }
-        var preparation_request = request;
+        var integrity_reads = @import("sql_policy_integrity_reads.zig").Cache.init(self, request);
+        defer integrity_reads.deinit();
+        var preparation_request = integrity_reads.attach(request);
         if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         retained_preparation.* = if (request.relational_recovery == .repair)
             integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], preparation_request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err
@@ -13919,6 +13946,7 @@ pub const ApiHttpServer = struct {
             error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.ForeignKeyParentMissing => return error.ForeignKeyParentMissing,
             error.ForeignKeyReferenced => return error.ForeignKeyReferenced,
+            error.ForeignKeyMatchFullViolation => return error.ForeignKeyMatchFullViolation,
             error.Forbidden => return error.Forbidden,
             error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => return error.Forbidden,
             error.RowPolicyMutationUnsupported, error.RowPolicyTopologyUnsupported => return error.Conflict,
@@ -13943,7 +13971,6 @@ pub const ApiHttpServer = struct {
             error.DecisionConflict,
             error.TxnNotFound,
             error.InvalidTxnRecord,
-            error.ForeignKeyMatchFullViolation,
             error.ForeignKeyActionInProgress,
             error.ForeignKeyActionConflict,
             error.ForeignKeyTargetNotUnique,

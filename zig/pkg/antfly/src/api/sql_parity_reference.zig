@@ -274,7 +274,7 @@ fn expectMutationRejected(alloc: std.mem.Allocator, handler: anytype, statement:
     try std.testing.expectEqualStrings(sqlstate, diagnostic.value.code);
 }
 
-fn execute(alloc: std.mem.Allocator, handler: anytype, case: *const fixtures.Corpus.Case) !std.json.Parsed(wire.SQLResponse) {
+pub fn execute(alloc: std.mem.Allocator, handler: anytype, case: *const fixtures.Corpus.Case) !std.json.Parsed(wire.SQLResponse) {
     return executeWithTransport(alloc, handler, case, false);
 }
 
@@ -534,14 +534,17 @@ pub const PostgresMutationReference = struct {
 
 /// Fixture writes use the production integrity planner and native transaction
 /// boundary. Resetting primary rows alone would strand logical unique claims.
-fn commitMutationFixture(a: std.mem.Allocator, source: @import("antfly_local_sources").api_table_read_source.TableReadSource, records: []const @import("antfly_local_sources").common_topology_records.TableRecord, table: anytype, writes: []const @import("antfly_local_sources").storage_db_types.TransactionWrite, deletes: []const []const u8, sequence: u64) !void {
+pub fn commitMutationFixture(a: std.mem.Allocator, source: @import("antfly_local_sources").api_table_read_source.TableReadSource, records: []const @import("antfly_local_sources").common_topology_records.TableRecord, table: anytype, writes: []const @import("antfly_local_sources").storage_db_types.TransactionWrite, deletes: []const []const u8, sequence: u64) !void {
     const local = @import("antfly_local_sources");
     var prepared = try local.api_relational_integrity_commit.prepare(a, source, records, &.{.{ .table_name = table.name, .relational_schema_version = 1, .writes = writes, .deletes = deletes }});
     defer prepared.deinit();
     try std.testing.expectEqual(@as(usize, 1), prepared.tables.len);
     const request = prepared.tables[0];
     try std.testing.expectEqualStrings(table.name, request.table_name);
-    try std.testing.expect(request.relational_integrity_generation_set != null);
+    // Unconstrained typed tables legitimately have no integrity publication;
+    // owner fixtures retain the strict proof assertion by default.
+    const owns_integrity = if (@hasField(@TypeOf(table), "requires_integrity")) table.requires_integrity else true;
+    if (owns_integrity) try std.testing.expect(request.relational_integrity_generation_set != null);
     var id: [16]u8 = @splat(0);
     std.mem.writeInt(u64, id[0..8], sequence, .little);
     _ = try table.db.beginTransactionWithId(id, sequence);
@@ -592,7 +595,7 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
             for (seeds, writes) |seed, *write| write.* = .{ .key = seed.key, .value = try std.json.Stringify.valueAlloc(a, seed.value, .{}) };
             try commitMutationFixture(a, handler.api_server.table_reads.?, records, table, writes, &.{}, @intCast((ordinal * tables.len + table_index) * 2 + 1001));
         }
-        if (ordinal == 0) {
+        if (ordinal == 0 and reference.profile.primary_key.len == 1 and std.mem.eql(u8, reference.profile.primary_key[0], "id")) {
             var before = try tables[0].db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
             defer before.deinit(a);
             // These logical identities differ from physical document keys.
@@ -690,51 +693,58 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
         }
         for (tables) |table| {
             const final = final_tables.map.get(table.name) orelse return error.MissingPostgresMutationTable;
-            try std.testing.expectEqual(final.columns.len, final.column_oids.len);
-            try std.testing.expectEqual(final.rows.len, final.sql_nulls.len);
-            var stored = try table.db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
-            defer stored.deinit(a);
-            try std.testing.expectEqual(final.rows.len, stored.documents.len);
-            try std.testing.expectEqual(stored.documents.len, stored.hashes.len);
-            const storage_used = try a.alloc(bool, final.rows.len);
-            @memset(storage_used, false);
-            for (stored.documents, stored.hashes) |document, hash| {
-                try std.testing.expectEqualStrings(document.id, hash.id);
-                const parsed = try std.json.parseFromSlice(Json, a, document.json, .{});
-                defer parsed.deinit();
-                try std.testing.expect(parsed.value == .object);
-                for (parsed.value.object.keys()) |key| {
-                    var known = false;
-                    for (final.columns) |column| if (std.mem.eql(u8, key, column)) {
-                        known = true;
-                        break;
-                    };
-                    try std.testing.expect(known);
-                }
-                var matched = false;
-                for (final.rows, final.sql_nulls, 0..) |want, nulls, target| {
-                    if (storage_used[target]) continue;
-                    try std.testing.expectEqual(final.columns.len, want.len);
-                    try std.testing.expectEqual(want.len, nulls.len);
-                    var equal = true;
-                    for (final.columns, want, nulls) |column, cell, sql_null| {
-                        const value = parsed.value.object.get(column) orelse .null;
-                        var json_null = false;
-                        for (hash.json_null_fields) |name| if (std.mem.eql(u8, name, column)) {
-                            json_null = true;
-                            break;
-                        };
-                        equal = equal and equivalent(value, cell) and sql_null == (value == .null and !json_null);
-                    }
-                    if (!equal) continue;
-                    storage_used[target] = true;
-                    matched = true;
-                    break;
-                }
-                if (!matched) std.debug.print("POSTGRES MUTATION STORAGE {s}/{s}: {s}\n", .{ id, table.name, document.json });
-                try std.testing.expect(matched);
-            }
+            try expectPostgresMutationStorage(a, table.db, final);
         }
+    }
+}
+
+/// Independent primary-row validation is shared by live and cold-reopened
+/// mutation campaigns. SQL binding cannot hide missing fields or array bounds.
+pub fn expectPostgresMutationStorage(a: std.mem.Allocator, db: anytype, final: PostgresMutationReference.Rows) !void {
+    try std.testing.expectEqual(final.columns.len, final.column_oids.len);
+    try std.testing.expectEqual(final.rows.len, final.sql_nulls.len);
+    var stored = try db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
+    defer stored.deinit(a);
+    try std.testing.expectEqual(final.rows.len, stored.documents.len);
+    try std.testing.expectEqual(stored.documents.len, stored.hashes.len);
+    const storage_used = try a.alloc(bool, final.rows.len);
+    defer a.free(storage_used);
+    @memset(storage_used, false);
+    for (stored.documents, stored.hashes) |document, hash| {
+        try std.testing.expectEqualStrings(document.id, hash.id);
+        const parsed = try std.json.parseFromSlice(Json, a, document.json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        for (parsed.value.object.keys()) |key| {
+            var known = false;
+            for (final.columns) |column| if (std.mem.eql(u8, key, column)) {
+                known = true;
+                break;
+            };
+            try std.testing.expect(known);
+        }
+        var matched = false;
+        for (final.rows, final.sql_nulls, 0..) |want, nulls, target| {
+            if (storage_used[target]) continue;
+            try std.testing.expectEqual(final.columns.len, want.len);
+            try std.testing.expectEqual(want.len, nulls.len);
+            var equal = true;
+            for (final.columns, want, nulls) |column, cell, sql_null| {
+                const value = parsed.value.object.get(column) orelse .null;
+                var json_null = false;
+                for (hash.json_null_fields) |name| if (std.mem.eql(u8, name, column)) {
+                    json_null = true;
+                    break;
+                };
+                equal = equal and equivalent(value, cell) and sql_null == (value == .null and !json_null);
+            }
+            if (!equal) continue;
+            storage_used[target] = true;
+            matched = true;
+            break;
+        }
+        if (!matched) std.debug.print("POSTGRES MUTATION STORAGE {s}: {s}\n", .{ document.id, document.json });
+        try std.testing.expect(matched);
     }
 }
 

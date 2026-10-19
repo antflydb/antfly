@@ -521,6 +521,56 @@ test "relational index system NUMERIC public scalar constraints survive LSM reop
     }
 }
 
+test "relational index system NOT VALID history survives LSM reopen and portable restore without write bypass" {
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("deferred-check-history");
+    defer directory.cleanup();
+    var target_directory = try TestDirectory.init("deferred-check-history-restore");
+    defer target_directory.cleanup();
+    const initial =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"k":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const checked =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"deferred","column":"n","op":"gte","value":0,"not_valid":true},{"name":"required","column":"k","op":"gte","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"k":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(alloc, initial);
+        try db.batch(.{ .writes = &.{.{ .key = "historical", .value = "{\"n\":-1,\"k\":2}" }} });
+        try db.setSchemaJson(alloc, checked);
+        for (0..256) |_| {
+            if ((try db.constraintValidationStatus()).state == .enforced) break;
+            _ = try db.validateConstraintsStep(.{});
+        } else return error.ConstraintValidationDidNotConverge;
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{.{ .key = "new-bad", .value = "{\"n\":-1,\"k\":2}" }} }));
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target_directory.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        for (0..256) |_| {
+            if ((try db.constraintValidationStatus()).state == .enforced) break;
+            _ = try db.validateConstraintsStep(.{});
+        } else return error.ConstraintValidationDidNotConverge;
+        try std.testing.expect(db.core.schema.?.requires_deferred_check_validation);
+        const bytes = (try db.get(alloc, "historical")) orelse return error.MissingHistoricalRow;
+        defer alloc.free(bytes);
+        var row = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer row.deinit();
+        try std.testing.expectEqual(@as(i64, -1), row.value.object.get("n").?.integer);
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{.{ .key = "historical", .value = "{\"n\":-1,\"k\":3}" }} }));
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{.{ .key = "bad-required", .value = "{\"n\":1,\"k\":-1}" }} }));
+        try db.batch(.{ .writes = &.{.{ .key = "valid", .value = "{\"n\":1,\"k\":3}" }} });
+    }
+}
+
 test "relational index system SQL NUMERIC defaults CHECK and covering expression index survive reopen restore" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

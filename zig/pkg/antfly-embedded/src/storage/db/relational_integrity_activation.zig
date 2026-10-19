@@ -70,6 +70,13 @@ const nextPhase = @import("relational_integrity_activation_contract.zig").nextPh
 
 pub fn status(txn: anytype, catalog: catalog_mod.Catalog) !Progress {
     const owner = try ownership(txn);
+    if (!hasActive(catalog)) return .{
+        .generation_set = generationSet(catalog),
+        .owner = owner,
+        .schema_version = catalog.schema_version,
+        .state = .enforced,
+        .phase = .check,
+    };
     if (try optional(txn, key)) |bytes| {
         var progress = try Progress.decode(bytes);
         if (progress.matches(catalog, owner)) {
@@ -321,7 +328,7 @@ pub const Page = struct {
                 };
             },
             .check => if (reader.active.validator().?.execution.checks) |checks| {
-                for (checks.dependency_fields) |column| {
+                for (checks.validation_dependency_fields) |column| {
                     if (!(try selected.getOrPut(alloc, column)).found_existing) try selected_fields.append(alloc, column);
                 }
             },

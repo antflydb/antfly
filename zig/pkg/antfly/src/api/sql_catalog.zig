@@ -211,6 +211,21 @@ fn beginIndex(server: *server_mod.ApiHttpServer, context: operation.RequestConte
     return @import("relational_index_admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
 }
 
+fn validatesDeferredCheck(schema: std.json.Value, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl) bool {
+    const change = ddl.schema_change orelse return false;
+    if (change != .validate_constraint or schema != .object) return false;
+    const checks = schema.object.get("checks") orelse return false;
+    if (checks != .array) return false;
+    for (checks.array.items) |check| {
+        if (check != .object) continue;
+        const name = check.object.get("name") orelse continue;
+        if (name != .string or !std.mem.eql(u8, name.string, change.validate_constraint)) continue;
+        const not_valid = check.object.get("not_valid") orelse return false;
+        return not_valid == .bool and not_valid.bool;
+    }
+    return false;
+}
+
 fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, requested_target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission, path: ?*const SearchPath) !catalog.DdlOutcome {
     const alloc = allocators.result;
     // Compiler labels are not public identities. Do not publish an anonymous
@@ -290,6 +305,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     table = captured.table;
     definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
     var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, definition.schema_json, .{ .parse_numbers = false });
+    const declared_check_validation = validatesDeferredCheck(schema, ddl);
     var guard = captured.guard;
     var preparation_context = context;
     const Checkpoint = struct {
@@ -318,6 +334,8 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const proposed = try std.json.Stringify.valueAlloc(a, schema, .{});
     const updated = try server.bindForeignKeySchema(a, target, table.name, proposed, definition.schema_json, identity, context);
     try context.ensureActive();
+    if (declared_check_validation)
+        return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, null);
     if (!try tables.foreignKeyDefinitionsUnchanged(a, definition.schema_json, updated)) {
         var current = (try server.source.adminSnapshot()) orelse return error.UnsupportedSqlExecution;
         defer server.source.freeAdminSnapshot(&current);
@@ -357,7 +375,13 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}, null),
         .set_nullability => if (row_validation_required)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, null),
-        .add_unique => |constraint| if (constraint.primary)
+        // A validated declaration must not become visible until every old
+        // row passes. Reuse the unpublished generation's snapshot/tail barrier
+        // instead of publishing first and turning invalid history into a
+        // committed, repair-required table. The same job receipt survives
+        // cancellation, lost replies, and metadata/owner restart.
+        .add_unique => return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, if (guard.constraint_name_admission != null) guard else null),
+        .add_check => |check| if (!check.not_valid)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, if (guard.constraint_name_admission != null) guard else null),
         else => {},
     };

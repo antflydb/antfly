@@ -252,6 +252,54 @@ test "SQL typed array rows survive scalar join and grouped relation adapters" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
+test "SQL DISTINCT boundaries preserve typed outputs nulls priority and post deduplication pagination" {
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]bool{ false, true }) |with_io| {
+        var fixture: SetTestBackend = .{};
+        var backend = fixture.backend();
+        backend.execution_io = if (with_io) std.testing.io else null;
+        for ([_]Case{
+            .{ .sql = "SELECT DISTINCT x FROM (VALUES(2),(1),(2),(NULL),(NULL)) q(x) ORDER BY x NULLS LAST", .expected = "[[\"1\"],[\"2\"],[null]]" },
+            .{ .sql = "SELECT DISTINCT x FROM (VALUES(2),(1),(2)) q(x) ORDER BY x DESC LIMIT 1 OFFSET 1", .expected = "[[\"1\"]]" },
+            .{ .sql = "SELECT DISTINCT x FROM (VALUES(2),(1),(2)) q(x) ORDER BY q.x", .expected = "[[\"1\"],[\"2\"]]" },
+            .{ .sql = "SELECT DISTINCT lower(t) FROM (VALUES('B'),('A'),('a')) q(t) ORDER BY lower(q.t)", .expected = "[[\"a\"],[\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT lower(t) FROM (VALUES('B'),('A'),('a')) q(t) ORDER BY pg_catalog.lower(q.t)", .expected = "[[\"a\"],[\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT * FROM (VALUES(2),(1),(2)) q(x) ORDER BY 1", .expected = "[[\"1\"],[\"2\"]]" },
+            .{ .sql = "SELECT DISTINCT * FROM (VALUES(2),(1),(2)) q(x) ORDER BY q.x", .expected = "[[\"1\"],[\"2\"]]" },
+            .{ .sql = "SELECT count(*) FROM (SELECT DISTINCT x FROM (VALUES(2),(1),(2)) q(x)) d", .expected = "[[\"2\"]]" },
+            .{ .sql = "SELECT DISTINCT count(*) AS n FROM (VALUES(1),(2),(3)) q(x) GROUP BY x ORDER BY n", .expected = "[[\"1\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (g) g,v FROM (VALUES(1,2),(1,3),(2,4)) q(g,v) ORDER BY g,v DESC", .expected = "[[\"1\",\"3\"],[\"2\",\"4\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (g) g,v FROM (VALUES(1,2),(1,3),(2,4)) q(g,v) ORDER BY q.g,v DESC", .expected = "[[\"1\",\"3\"],[\"2\",\"4\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (g) * FROM (VALUES(1,2),(1,3),(2,4)) q(g,v) ORDER BY g,v DESC LIMIT 1 OFFSET 1", .expected = "[[\"2\",\"4\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (lower(t)) id,lower(t) AS k FROM (VALUES(1,'A',1),(2,'a',2),(3,'B',3)) q(id,t,at) ORDER BY lower(t),at DESC", .expected = "[[\"2\",\"a\"],[\"3\",\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (k) id,lower(t) AS k FROM (VALUES(1,'A',1),(2,'a',2),(3,'B',3)) q(id,t,at) ORDER BY k,at DESC", .expected = "[[\"2\",\"a\"],[\"3\",\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (2) id,lower(t) AS k FROM (VALUES(1,'A',1),(2,'a',2),(3,'B',3)) q(id,t,at) ORDER BY 2,at DESC", .expected = "[[\"2\",\"a\"],[\"3\",\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (k) 2 AS k FROM (VALUES(1),(2)) q(x)", .expected = "[[\"2\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (g) 10/v AS late FROM (VALUES(1,0),(1,1)) q(g,v) ORDER BY g,v DESC", .expected = "[[\"10\"]]" },
+        }) |case| {
+            errdefer std.debug.print("DISTINCT query failed: {s}\n", .{case.sql});
+            var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+            defer compiled.deinit();
+            var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+            defer std.testing.allocator.free(encoded);
+            try std.testing.expectEqualStrings(case.expected, encoded);
+        }
+        for ([_][]const u8{
+            "SELECT DISTINCT x FROM (VALUES(1,2)) q(x,y) ORDER BY y",
+            "SELECT DISTINCT ON (x) x FROM (VALUES(1,2)) q(x,y) ORDER BY y,x",
+            "SELECT DISTINCT ON (0) x FROM (VALUES(1)) q(x)",
+            "SELECT DISTINCT ON (-1) x FROM (VALUES(1)) q(x)",
+            "SELECT DISTINCT ON (1.0) x FROM (VALUES(1)) q(x)",
+        }, [_]anyerror{ error.SqlDistinctOrderMismatch, error.SqlDistinctOnOrderMismatch, error.SqlDistinctOrderMismatch, error.SqlDistinctOrderMismatch, error.InvalidSqlSyntax }) |sql, expected| {
+            var compiled = try @import("compiler.zig").compile(std.testing.allocator, sql, .{});
+            defer compiled.deinit();
+            try std.testing.expectError(expected, @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+        }
+    }
+}
+
 test "SQL internal array query boundaries preserve values in memory and spill execution" {
     const Case = struct { sql: []const u8, expected: []const u8 };
     for ([_]bool{ false, true }) |with_io| {

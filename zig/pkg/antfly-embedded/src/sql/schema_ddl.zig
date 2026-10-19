@@ -384,6 +384,11 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
                     if (change == .validate_constraint and std.mem.eql(u8, key, "unique_constraints")) return error.SqlWrongObjectType;
                     if (change == .drop_constraint) {
                         _ = constraints.orderedRemove(position);
+                    } else if (std.mem.eql(u8, key, "checks")) {
+                        // The caller must validate this unpublished candidate
+                        // before publishing its cleared declaration. Background
+                        // coverage alone never changes declared SQL validity.
+                        try constraints.items[position].object.put(alloc, "not_valid", .{ .bool = false });
                     }
                     return true;
                 }
@@ -404,7 +409,7 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
             const expression = try @import("schema_expression.zig").lower(alloc, schema.*, constraint.expression, .boolean);
             const constraints = try list(schema, alloc, "checks");
             if (named(constraints.items, constraint.name, "name") != null) return error.SqlConstraintAlreadyExists;
-            try constraints.append(try value(alloc, .{ .name = constraint.name, .expression = expression }));
+            try constraints.append(try value(alloc, .{ .name = constraint.name, .expression = expression, .not_valid = constraint.not_valid }));
         },
         .add_foreign_key => |constraint| {
             if (constraintExists(schema.*, constraint.name)) return error.SqlConstraintAlreadyExists;

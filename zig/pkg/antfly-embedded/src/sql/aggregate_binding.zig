@@ -222,6 +222,7 @@ const Builder = struct {
                 .avg => self.node(.{ .cast = .{ .operand = call.args[0], .type = .number } }),
                 .bool_and, .bool_or => self.node(.{ .cast = .{ .operand = call.args[0], .type = .boolean } }),
                 .pattern_set => self.node(.{ .cast = .{ .operand = try self.node(.{ .cast = .{ .operand = call.args[0], .type = .string } }), .type = .json } }),
+                .array_agg => self.node(.{ .call = .{ .name = "$array", .args = call.args } }),
                 else => call.args[0],
             };
             for (self.aggregates.items, 0..) |aggregate, index| if (same(input, aggregate)) return self.slot(self.groups.len + index);
@@ -384,11 +385,21 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
             .avg => .number,
             .bool_and, .bool_or => .boolean,
             .pattern_set => .json,
+            .array_agg => .array,
             else => input_type orelse .string,
         };
         // Extrema retain the complete input domain, not just its coarse
         // number/array tag. Exact decimals must not become float results.
         if (column.type == .array or kind == .min or kind == .max) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
+        if (kind == .array_agg and column.element_type == null) column.element_type = switch (input_type orelse .string) {
+            .string => .text,
+            .uuid => .uuid,
+            .integer => .int64,
+            .number => .float64,
+            .boolean => .boolean,
+            .json => .jsonb,
+            else => return error.UnsupportedSqlShape,
+        };
         if ((kind == .sum or kind == .avg) and input_element == .numeric) column.element_type = .numeric;
         if (kind == .sum or kind == .avg) {
             const domain: scalar.Type = .{ .kind = input_type, .element_type = input_element };
