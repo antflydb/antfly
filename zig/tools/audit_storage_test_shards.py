@@ -146,12 +146,15 @@ def audit_manifest(
     return failures
 
 
-def audit_runtime_partition(source: Path, filters: Sequence[str]) -> list[str]:
-    """Verify a name-filtered lane and its complement both retain tests."""
-    if not source.is_file():
-        return [f"runtime partition source does not exist: {source}"]
+def audit_runtime_partition(sources: Sequence[Path], filters: Sequence[str]) -> list[str]:
+    """Verify a name-filtered lane and its complement both retain tests.
 
-    names = QUOTED_TEST_DECLARATION.findall(source.read_text(encoding="utf-8"))
+    The lane spans every source compiled into the partitioned artifact."""
+    names: list[str] = []
+    for source in sources:
+        if not source.is_file():
+            return [f"runtime partition source does not exist: {source}"]
+        names.extend(QUOTED_TEST_DECLARATION.findall(source.read_text(encoding="utf-8")))
     failures: list[str] = []
     for test_filter in filters:
         # The custom runner applies filters containing a dot to fully-qualified
@@ -195,7 +198,7 @@ def main() -> int:
         default=[],
         help="local test source owned by a separately configured module suite",
     )
-    parser.add_argument("--runtime-partition-source", type=Path)
+    parser.add_argument("--runtime-partition-source", type=Path, action="append", default=[])
     parser.add_argument("--runtime-partition-filter", action="append", default=[])
     args = parser.parse_args()
     if not args.filter:

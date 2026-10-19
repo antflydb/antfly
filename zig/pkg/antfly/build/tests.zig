@@ -6609,6 +6609,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.column_scan_plan.",
             "storage.db.column_source.",
             "storage.db.db.",
+            "storage.db.db_document.",
+            "storage.db.db_search.",
+            "storage.db.db_transaction.",
+            "storage.db.db_restore.",
+            "storage.db.db_split.",
+            "storage.db.db_dense.",
+            "storage.db.db_relational.",
             "storage.db.db_graph.",
             "storage.db.dense_exact.",
             "storage.db.doc_filter_wire.",
@@ -6862,8 +6869,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         unit_storage_shard_audit.addArg("--local-dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly-embedded/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
-    unit_storage_shard_audit.addArg("--runtime-partition-source");
-    unit_storage_shard_audit.addFileArg(b.path("pkg/antfly-embedded/src/storage/db/db.zig"));
+    // db.zig's DB operations are split across db_<area>.zig; the runtime
+    // lanes partition their tests together.
+    for ([_][]const u8{ "db", "db_dense", "db_document", "db_graph", "db_relational", "db_restore", "db_search", "db_split", "db_transaction" }) |source| {
+        unit_storage_shard_audit.addArg("--runtime-partition-source");
+        unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly-embedded/src/storage/db/{s}.zig", .{source})));
+    }
     for (unit_storage_db_core_lane_filters) |lane_filter| {
         unit_storage_shard_audit.addArgs(&.{ "--runtime-partition-filter", lane_filter });
     }
