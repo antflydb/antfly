@@ -1459,7 +1459,8 @@ def test_inline_resolver_background_work_settles_after_writes(aflite_path, promo
                     and graph_name in {index["name"] for index in docs.list_indexes()}
                 ):
                     break
-                assert time.monotonic() < deadline, stats
+                if time.monotonic() >= deadline:
+                    pytest.fail(f"background resolver work did not settle: {json.dumps(stats, sort_keys=True)}")
                 time.sleep(0.1)
             assert docs.edges(graph_name, "d0", "about", antfly_embedded.GraphDirection.OUT)
             sequence = stats["derived_target_sequence"]
