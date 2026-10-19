@@ -22878,9 +22878,38 @@ pub const RaftApplyStore = struct {
             else => false,
         };
     }
+    /// Namespace projection must not silently discard a newly requested source
+    /// correction. Config-only writes and unchanged legacy metadata may still
+    /// inherit authority; edited unowned policy must use the entity API instead.
+    fn resolverSourceCurationAllowedTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord, root: std.json.Value) !bool {
+        const next = try resolver_curation.metadataFromValue(a, root);
+        var previous: ?resolver_curation.Metadata = null;
+        for (next.identities) |identity| {
+            if (identity.dropped or identity.namespace_owned) continue;
+            if (previous == null) {
+                var key_buf: [160]u8 = undefined;
+                previous = .{};
+                if (try stagingGet(txn, try tableKeyForGroup(&key_buf, group_id, record.table_id))) |bytes| {
+                    const old = try decodeTableRecord(a, bytes);
+                    if (old.indexes_json.len > 0) previous = try resolver_curation.metadataFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, old.indexes_json, .{}));
+                }
+            }
+            const unchanged = for (previous.?.identities) |prior| {
+                if (std.mem.eql(u8, prior.name, identity.name)) break std.mem.eql(u8, try std.json.Stringify.valueAlloc(a, prior, .{}), try std.json.Stringify.valueAlloc(a, identity, .{}));
+            } else false;
+            if (unchanged) continue;
+            const destination = (try self.resolverDestinationForRecordTxn(a, txn, group_id, identity.table, record)) orelse continue;
+            if (destination.indexes_json.len == 0) continue;
+            const namespaces = try resolver_curation.namespacesFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, destination.indexes_json, .{}));
+            for (namespaces.namespaces) |namespace| if (std.mem.eql(u8, namespace.key_template, identity.key_template)) return false;
+        }
+        return true;
+    }
     fn admittedResolverProjectionTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !?metadata.TableRecord {
         if (record.indexes_json.len == 0) return record;
-        const projected = self.projectResolverNamespacesTxn(a, txn, group_id, record) catch |err| {
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, a, record.indexes_json, .{});
+        if (!try self.resolverSourceCurationAllowedTxn(a, txn, group_id, record, root)) return null;
+        const projected = self.projectResolverNamespacesValueTxn(a, txn, group_id, record, root) catch |err| {
             if (resolverAdmissionRejected(err)) return null;
             return err;
         };
@@ -23108,7 +23137,10 @@ pub const RaftApplyStore = struct {
     /// New consumers therefore inherit it before their first owner is opened.
     fn projectResolverNamespacesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !metadata.TableRecord {
         if (record.indexes_json.len == 0) return record;
-        var root = try std.json.parseFromSliceLeaky(std.json.Value, a, record.indexes_json, .{});
+        return self.projectResolverNamespacesValueTxn(a, txn, group_id, record, try std.json.parseFromSliceLeaky(std.json.Value, a, record.indexes_json, .{}));
+    }
+    fn projectResolverNamespacesValueTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord, value: std.json.Value) !metadata.TableRecord {
+        var root = value;
         const configs = try resolverConfigs(a, root);
         var changed = false;
         for (configs) |cfg| {
@@ -39363,4 +39395,51 @@ test "resolver curation namespace propagation rejects alias cycles without poiso
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 60, .name = "entities", .indexes_json = "{}" } });
     const recreated = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "concept/a", .standalone = true }), .{});
     try std.testing.expect(recreated.indexed and recreated.consumers.len == 16 and recreated.next_cursor != null);
+}
+
+test "resolver curation namespace propagation rejects source edits racing adoption without losing receipts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/namespace-source-race", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = path });
+    defer store.deinit();
+    const group: u64 = 42;
+    const destination: metadata.TableRecord = .{ .table_id = 1, .name = "entities", .indexes_json = "{}" };
+    const source: metadata.TableRecord = .{ .table_id = 2, .name = "source", .indexes_json =
+        \\{"knowledge":{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","promote":false}]}}
+    };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = destination });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = source });
+    const plan = try resolver_curation.planMetadata(a, source.indexes_json, "concepts", .{ .action = .merge, .from = "concept/a", .to = "concept/b" });
+    var replacement = source;
+    replacement.indexes_json = plan.indexes_json;
+    try std.testing.expect(try store.resolverProjectionValid(a, group, replacement));
+    // Destination ownership wins after source admission but before its CAS;
+    // replay has not yet visited the source, so its expected bytes still match.
+    var adopted = destination;
+    adopted.indexes_json =
+        \\{"_resolver_namespaces":{"namespaces":[{"key_template":"concept/{{uslug _entity.text}}","revision":1,"merges":[{"key":"concept/a","target":"concept/c"}]}]}}
+    ;
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = destination, .replacement = adopted } });
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
+    try std.testing.expect(!try store.resolverProjectionValid(a, group, replacement));
+    const command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = source, .replacement = replacement } });
+    var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 9, .index = 1, .entry_type = .normal, .data = command }});
+    outcome.deinit();
+    try std.testing.expect(try store.resolverNamespaceReplacementRejected(a, group, 9, 1, source, replacement));
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
+    // An ordinary source definition edit is allowed to inherit the namespace.
+    var ordinary = source;
+    ordinary.schema_json = "{\"type\":\"object\"}";
+    try std.testing.expect(try store.resolverProjectionValid(a, group, ordinary));
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = source, .replacement = ordinary } });
+    while (try store.pendingResolverNamespaceTable(a, group)) |job| try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = job, .replacement = job } });
+    const current = (try store.getTable(a, group, 2)).?;
+    const identities = try resolver_curation.metadataFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, current.indexes_json, .{}));
+    try std.testing.expect(identities.identities[0].namespace_owned);
+    try std.testing.expectEqualStrings("concept/c", identities.identities[0].merges[0].target);
+    try std.testing.expectEqualStrings(ordinary.schema_json, current.schema_json);
 }

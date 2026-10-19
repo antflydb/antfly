@@ -58108,6 +58108,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         stress_pages: usize = 0,
         stress_reads: usize = 0,
         incompatible_last_page: bool = false,
+        destination_cut_changed: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -58143,9 +58144,17 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
+            if (call == .resolve_many) {
+                const input = call.resolve_many;
+                try std.testing.expectEqual(@as(?u64, null), input.expected_revision);
+                try std.testing.expectEqual(@as(usize, 1), input.targets.len);
+                return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = self.commits, .tables = &.{.{ .table_id = 2, .name = "entities" }} }, .{});
+            }
             if (call != .resolver_catalog_read) return error.UnexpectedCatalogRead;
             self.narrow_reads += 1;
             const input = call.resolver_catalog_read;
+            if (input.expected_revision) |revision| try std.testing.expectEqual(self.commits, revision);
+            if (self.destination_cut_changed and input.mode == .table and std.mem.eql(u8, input.table_name, "entities")) return error.CatalogGenerationChanged;
             const wire = @import("../metadata/resolver_catalog_read.zig");
             if (input.mode == .table and std.mem.eql(u8, input.table_name, "source")) {
                 if (self.observation_failure) |err| return err;
@@ -58202,6 +58211,14 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             try std.testing.expectEqual(expected, result.status);
         }
     };
+    source.forbid_snapshot = true;
+    server.source = source.narrowIface();
+    // A destination policy read must be fenced to the source cut. Losing that
+    // cut rejects before publication, without falling back to a full snapshot.
+    source.destination_cut_changed = true;
+    try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/race\",\"to\":\"concept/target\"}", 409);
+    try std.testing.expectEqual(@as(u64, 0), source.commits);
+    source.destination_cut_changed = false;
     try Run.call(&server, .list, "source", "", "", "", 200);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
@@ -58228,6 +58245,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     source.stress_pages = 0;
     source.stress_reads = 0;
     server.source = source.iface();
+    source.forbid_snapshot = false;
     const Denied = struct {
         fn allows(_: *const anyopaque, _: []const u8) bool {
             return false;
@@ -58265,6 +58283,16 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try Run.call(&server, .entity_suppress, "entities", "", "concept/scoped", "{}", 202);
     try Run.call(&server, .entity_redirects, "entities", "", "concept/scoped", "", 200);
     try std.testing.expect(source.narrow_reads >= 7);
+    try Run.call(&server, .list, "source", "", "", "", 200);
+    try Run.call(&server, .get, "source", "concepts", "", "", 200);
+    try Run.call(&server, .redirects, "source", "concepts", "", "", 200);
+    try Run.call(&server, .suppressions, "source", "concepts", "", "", 200);
+    try Run.call(&server, .reviews, "source", "concepts", "", "", 503);
+    try Run.call(&server, .render, "source", "concepts", "", "{\"text\":\"A\",\"label\":\"concept\"}", 200);
+    // Source corrections stay views after namespace ownership, even through
+    // the scoped path. Never bypass this guard by dropping other tables.
+    try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/guard\",\"to\":\"concept/target\"}", 409);
+
     // Every admitted mutation keeps its commit receipt even if observation
     // sees a deleted consumer, a new catalog cut, or request cancellation.
     for ([_]anyerror{ error.TableNotFound, error.CatalogGenerationChanged, error.Canceled, error.DeadlineExceeded }) |failure| {
@@ -58354,6 +58382,8 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         replacement.indexes_json = retired;
         break :blk replacement;
     });
+    server.source = source.narrowIface();
+    source.forbid_snapshot = true;
     try Run.call(&server, .get, "source", "concepts", "", "", 200);
     try Run.call(&server, .drop, "source", "concepts", "", "", 202);
     try Run.call(&server, .drop, "source", "concepts", "", "", 202);

@@ -116,7 +116,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, req.indexes_json.?);
         try managed_embedder.validateEmbeddingProducerOwnershipJson(a, req.indexes_json.?);
         var table = tables_api.deriveTableRecord(storage_name, req);
-        if (!try store.resolverProjectionValid(a, svc.metadata_group_id, table)) return error.InvalidCreateTableRequest;
+        if (!try store.resolverProjectionValid(a, svc.metadata_group_id, table)) return error.ResolverCurationConflict;
         if (try fk_publication.schemaHasForeignKeys(a, table.schema_json)) return error.ForeignKeyGenerationPublicationRequired;
         const policy = admission.placement_policy;
         try policy.validate();

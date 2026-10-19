@@ -1750,8 +1750,11 @@ namespace corrections. Lite retains its local resolver curation contract.
 Namespace projection is read-only; reverse dependency edges change only after
 table admission succeeds, in the same metadata transaction. Updates apply the edge
 set difference, so policy-only replay pages do not rewrite unchanged edges.
-Entity requests read one destination and seek its declared-target consumer index;
-progress polling reads only the source table and its ranges. Consumer pages visit
+Resolver resources read only their source definition and ranges. Source policy
+mutations additionally resolve and inspect their destination against the source
+metadata cut; logical catalog revisions and physical metadata cuts remain separate
+clocks. Entity requests read one destination and seek its declared-target consumer
+index; progress polling reads only the source table and its ranges. Consumer pages visit
 at most 16 edges and stop after a 1 MiB source-record budget (one record may be up
 to 8 MiB). Cursors bind the destination identity, entity key, and catalog revision.
 Declared-target edges retain qualified logical names independently of physical
@@ -1763,12 +1766,20 @@ does not retain observation identities. Legacy folds replace and free the prior
 aggregate. Mutations validate full consumer policies in a second pass over the
 same revision-fenced cut before CAS, so memory does not accumulate source schemas
 or unrelated index declarations across pages.
+Initial ownership is published even when a requested correction matches folded
+legacy policy. An entity merge matching an inline alias materializes a shared
+redirect for consumers that lack that local alias. Subsequent identical requests
+are idempotent once the authority and correction are durable.
 Every changed namespace fences its validated consumer cut, including local alias
-edits. Incompatible alias cycles, distinct pins, and suppressed redirect targets
+edits. Source policy edits racing ownership publication are rejected at apply
+with an exact no-commit receipt, instead of being overwritten by projection;
+ordinary definition edits and unchanged legacy policy still inherit authority. Incompatible alias cycles, distinct pins, and suppressed redirect targets
 are rejected before proposal and rechecked before any apply writes. A rejected
 namespace CAS retains one digest and exact Raft term/index per destination, allowing a certified
 retry without treating a committed outcome as retryable; acceptance or deletion
-clears it. Semantic rejection cannot stall metadata apply.
+clears it. Semantic rejection cannot stall metadata apply. Standalone and Raft preserve
+the same typed admission conflict through transport and return HTTP 409. A
+forwarded conflict is definitive only with an explicit non-admission outcome.
 
 Destination namespace records are private metadata and are excluded from index
 reconciliation and public table/index resources. Owner route discovery shares

@@ -400,19 +400,19 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     defer arena.deinit();
     const a = arena.allocator();
     const entity_mutation = op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress;
-    if (server.source.vtable.supports_resolver_catalog_read and (entity_mutation or op == .entity_redirects)) {
-        const page = try readResolverCatalog(server, a, .{ .table_name = table_name }, request);
-        var scoped = page.snapshot();
-        return entityOperation(server, alloc, a, &scoped, &page.table, op, key, body, request, page.revision);
-    }
-
-    const adoption_revision = if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
+    // All resolver resources use the same scoped source cut. Full snapshots
+    // remain only for sources without the private catalog-read capability.
+    const page: ?catalog_read.Page = if (server.source.vtable.supports_resolver_catalog_read)
+        try readResolverCatalog(server, a, .{ .table_name = table_name }, request)
+    else
+        null;
+    const adoption_revision = if (page) |value| @as(?u64, value.revision) else if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
         var cut = try server.source.linearizableRoutingSnapshot(request.deadline_ns);
         defer server.source.freeRoutingSnapshot(&cut);
         break :blk @as(?u64, cut.catalog_revision);
     } else null;
-    var snapshot = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
-    defer server.source.freeAdminSnapshot(&snapshot);
+    var snapshot = if (page) |*value| value.snapshot() else (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
+    defer if (page == null) server.source.freeAdminSnapshot(&snapshot);
     const table = try tableByName(&snapshot, table_name);
     if (op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress)
         return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request, adoption_revision);
@@ -482,10 +482,15 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
                 if (bound.tables.len != 1) return error.InvalidCatalogRecord;
                 destination_name = if (bound.tables[0]) |target| target.name else "";
             }
-            for (snapshot.tables) |destination| {
-                if (!std.mem.eql(u8, destination.name, destination_name) or destination.indexes_json.len == 0) continue;
-                const namespaces = try curation.namespacesFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, destination.indexes_json, .{}));
-                for (namespaces.namespaces) |namespace| if (std.mem.eql(u8, namespace.key_template, cfg.key_template)) return error.ResolverNamespaceCurationRequired;
+            if (page) |source_cut| {
+                if (destination_name.len > 0) {
+                    // Bind the destination and inspect its authority at the
+                    // same cut as the source, without cloning unrelated tables.
+                    const destination = try readResolverCatalog(server, a, .{ .table_name = destination_name, .expected_revision = source_cut.revision }, request);
+                    try requireSourceCuration(a, destination.table.indexes_json, cfg.key_template);
+                }
+            } else for (snapshot.tables) |destination| {
+                if (std.mem.eql(u8, destination.name, destination_name)) try requireSourceCuration(a, destination.indexes_json, cfg.key_template);
             }
             const intent = try mutationRequest(a, op, key, body, query);
             const plan = try curation.planMetadata(a, table.indexes_json, resolver_name, intent);
@@ -500,6 +505,17 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
         },
         else => return error.UnsupportedOperation,
     }
+}
+
+fn requireSourceCuration(a: std.mem.Allocator, indexes_json: []const u8, key_template: []const u8) !void {
+    if (indexes_json.len == 0) return;
+    const namespaces = try curation.namespacesFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{}));
+    for (namespaces.namespaces) |namespace| if (std.mem.eql(u8, namespace.key_template, key_template)) return error.ResolverNamespaceCurationRequired;
+}
+
+fn namespaceAdopted(stored: curation.Namespaces, key_template: []const u8) bool {
+    for (stored.namespaces) |namespace| if (std.mem.eql(u8, namespace.key_template, key_template)) return true;
+    return false;
 }
 
 // Only the compact observation identity survives a catalog page. Full source
@@ -533,9 +549,7 @@ const EntityDiscovery = struct {
             entry.value_ptr.* = .{ .key_template = entry.key_ptr.*, .adoption_revision = self.adoption_revision, .adoption_standalone = self.standalone };
         }
         const template = entry.key_ptr.*;
-        const authoritative = for (self.stored.namespaces) |item| {
-            if (std.mem.eql(u8, item.key_template, template)) break true;
-        } else false;
+        const authoritative = namespaceAdopted(self.stored, template);
         if (!authoritative) {
             // Folding may borrow policy strings from this page. Own the new
             // aggregate, and release its predecessor instead of retaining every
@@ -673,6 +687,8 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     for (namespaces.values()) |*namespace| {
         if (input.into) |target| if (!curation.keyInNamespace(namespace.key_template, target)) return error.InvalidResolverCurationRequest;
         if (input.expected_revision) |expected| if (expected != namespace.revision) return error.ResolverCurationConflict;
+        var materialized_alias = false;
+        var policy_merges = namespace.merges;
         var effective: std.ArrayListUnmanaged(resolver.KeyAlias) = .empty;
         try effective.appendSlice(a, namespace.merges);
         const redirected = for (namespace.merges) |alias| {
@@ -682,12 +698,19 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             if (discovery.local_targets.get(namespace.key_template)) |local_target| {
                 if (local_target.conflict) return error.ResolverNamespaceMigrationConflict;
                 try effective.append(a, .{ .key = key, .target = local_target.target });
+                if (action == .merge and std.mem.eql(u8, local_target.target, input.into.?)) {
+                    // An identical source-local alias is not yet a shared
+                    // correction. Publish that explicit assertion for every
+                    // consumer, including when this namespace is already owned.
+                    policy_merges = effective.items;
+                    materialized_alias = true;
+                }
             }
         }
-        const plan = try resolver.curation.plan(a, try std.json.Stringify.valueAlloc(a, namespace.state, .{}), namespace.merges, effective.items, intent);
+        const plan = try resolver.curation.plan(a, try std.json.Stringify.valueAlloc(a, namespace.state, .{}), policy_merges, effective.items, intent);
         const check: Config = .{ .name = "namespace", .table = entity_table.name, .source_artifact = "metadata", .resolution_artifact = "resolved", .key_template = namespace.key_template, .merges = plan.merges, .curation_json = try std.json.Stringify.valueAlloc(a, plan.state, .{}) };
         try check.validate();
-        if (plan.changed or namespace.revision == 0) {
+        if (plan.changed or materialized_alias or !namespaceAdopted(stored, namespace.key_template)) {
             namespace.adoption_revision = adoption_revision;
             namespace.adoption_standalone = server.cfg.deployment_mode == .standalone;
             namespace.state = plan.state;

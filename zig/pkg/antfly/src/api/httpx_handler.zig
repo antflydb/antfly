@@ -7472,6 +7472,7 @@ pub const AntflyApiHandler = struct {
         while (true) {
             metadata_create_attempts += 1;
             self.createCatalogTable(ctx, decoded_table_name, logical_table_name, create_req, authenticated_identity) catch |err| switch (err) {
+                error.ResolverCurationConflict => return jsonErrorResponse(ctx, system_catalog.httpStatus(err), "resolver configuration conflicts with the destination namespace"),
                 error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => return witnessDDLError(ctx, err),
                 error.TableAlreadyExists, error.CatalogAlreadyExists, error.CatalogGenerationChanged => {
                     _ = ctx.status(409);

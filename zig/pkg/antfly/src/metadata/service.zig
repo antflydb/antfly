@@ -963,7 +963,7 @@ fn preflightTableRecordWithContextImpl(service: anytype, request: api_operation.
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
         try service.ensureLinearizableReadWithContext(request);
         const store = service.projectedStore() orelse return error.MissingMetadataStore;
-        if (!try store.resolverProjectionValid(service.alloc, service.metadata_group_id, table)) return error.InvalidCreateTableRequest;
+        if (!try store.resolverProjectionValid(service.alloc, service.metadata_group_id, table)) return error.ResolverCurationConflict;
     }
     const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table });
     if (required_version != 0)

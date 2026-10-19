@@ -272,7 +272,7 @@ def test_namespace_rejects_incompatible_consumer_without_blocking_metadata(
     with pytest.raises(requests.HTTPError) as rejected:
         api.create_table(f"alias_rejected_{suffix}", indexes={"knowledge": graph})
     rejected_response = rejected.value.response
-    assert rejected_response.status_code in (400, 409), (
+    assert rejected_response.status_code == 409, (
         rejected_response.status_code,
         rejected_response.text,
         api.debug_logs(),
@@ -289,3 +289,90 @@ def test_namespace_rejects_incompatible_consumer_without_blocking_metadata(
         assert (
             api.get(entity + "/redirects")["results"][0]["canonical_key"] == "concept/b"
         )
+
+
+@pytest.mark.parametrize("raft", [False, True], ids=["standalone", "raft"])
+@pytest.mark.parametrize("policy", ["legacy", "inline", "adopted-inline"])
+def test_entity_merge_adopts_matching_local_policy(request, monkeypatch, raft, policy):
+    import copy
+
+    if raft:
+        monkeypatch.setenv("ANTFLY_E2E_STATEFUL_RAFT", "1")
+    api = request.getfixturevalue("stateful_api")
+    suffix = uuid4().hex[:8]
+    destination, first, second = (
+        f"adopt_entities_{suffix}",
+        f"adopt_first_{suffix}",
+        f"adopt_second_{suffix}",
+    )
+    api.create_table(destination)
+    graph = {
+        "type": "graph",
+        "source": {
+            "artifact": "kg",
+            "format": "extraction_graph",
+            "mention_edge_type": "mentions",
+        },
+        "artifact": {
+            "name": "kg",
+            "kind": "asset",
+            "source": {"type": "field", "value": "kg"},
+            "content_type": "application/json",
+        },
+        "edge_types": [{"name": "mentions"}],
+        "resolvers": [
+            {
+                "name": "concepts",
+                "table": destination,
+                "promote": False,
+                "source_artifact": "kg",
+                "resolution_artifact": "resolved",
+                "key_template": "concept/{{uslug _entity.text}}",
+            }
+        ],
+    }
+    first_graph = copy.deepcopy(graph)
+    if policy != "legacy":
+        first_graph["resolvers"][0]["aliases"] = [
+            {"key": "concept/a", "target": "concept/b"}
+        ]
+    api.create_table(first, indexes={"knowledge": first_graph})
+    api.create_table(second, indexes={"knowledge": graph})
+    wait = {"timeout_ms": 5000}
+    if policy == "legacy":
+        local = api.post(
+            f"/tables/{first}/resolvers/concepts/redirects",
+            {"from": "concept/a", "to": "concept/b", "wait": wait},
+        )
+        assert local["applied"], local
+    elif policy == "adopted-inline":
+        adopted = api.post(
+            f"/tables/{destination}/entities/{quote('concept/noise', safe='')}:suppress",
+            {"wait": wait},
+        )
+        assert adopted["applied"], adopted
+    entity = f"/tables/{destination}/entities/{quote('concept/a', safe='')}:merge"
+    merged = api.post(entity, {"into": "concept/b", "wait": wait})
+    assert merged["changed"] and merged["applied"], merged
+    assert all(row["accepted"] for row in merged["results"]), merged
+    revision = merged["results"][0]["revision"]
+    assert revision == (1 if policy == "inline" else 2), merged
+    for source_name in (first, second):
+        rendered = api.post(
+            f"/tables/{source_name}/resolvers/concepts:render",
+            {"text": "A", "label": "concept"},
+        )
+        assert rendered["key"] == "concept/b", rendered
+    # Once authority is published, retries do not create another revision.
+    retried = api.post(entity, {"into": "concept/b", "wait": wait})
+    assert not retried["changed"] and retried["applied"], retried
+    assert retried["metadata_commit"] is None, retried
+    assert all(row["revision"] == revision for row in retried["results"]), retried
+    if api.supports_restart:
+        api.restart_server()
+        for source_name in (first, second):
+            rendered = api.post(
+                f"/tables/{source_name}/resolvers/concepts:render",
+                {"text": "A", "label": "concept"},
+            )
+            assert rendered["key"] == "concept/b", rendered
