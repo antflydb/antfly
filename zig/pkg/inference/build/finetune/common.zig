@@ -201,6 +201,7 @@ fn configureCommand(ctx: Context, spec: CommandSpec, exe: *std.Build.Step.Compil
         .onnx_data = ctx.onnx.data,
         .jinja = ctx.jinja_mod,
         .platform = ctx.antfly_platform_mod,
+        .runtime_abi = ctx.runtime_abi_mod,
     }));
     configureNative(ctx, exe, spec.native_link, spec.imports);
     if (spec.release_metadata) {
@@ -267,6 +268,7 @@ pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Ste
             // Commands keep their declared imports even when their link-compatible
             // checks share an executable. A union of imports would mask missing
             // dependency declarations in standalone commands.
+            module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);
             for (command.imports) |dependency| {
                 const name = @tagName(dependency);
                 if (!check.root_module.import_table.contains(name))
