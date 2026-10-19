@@ -20,7 +20,7 @@ const document = @import("document.zig");
 const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
-pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
+pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", accounted_misses: bool = false, candidate_index: ?CandidateIndex = null };
 pub const Config = struct {
     version: u32,
     endpoint: []const u8,
@@ -97,8 +97,11 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     defer filters.deinit();
     const filter_arena = filters.allocator();
     const user_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, filter_arena, raw, .{ .allocate = .alloc_always })).value else null;
-    const filter = try candidateFilter(filter_arena, search, table, user_filter);
-    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
+    const accounted = try accountedScan(filter_arena, search, table);
+    // Accounted scans retain all hits; caller-maintained candidate fields can
+    // never suppress the validation or logical accounting of a document.
+    const filter = if (accounted != null) user_filter else try candidateFilter(filter_arena, search, table, user_filter);
+    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .accounted = accounted, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
     defer search.summary.index_requests += fetcher.summary.index_requests;
     // Finite decision budgets preserve foreground order: speculative page
     // requests must not consume the budget reserved by the user for evidence.
@@ -164,7 +167,8 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             const id = try document.string(hit, "_id");
             const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
             const value = document.at(source, table.document_field) orelse return error.MissingGrepDocument;
-            var doc = if (metadataListing(search.options))
+            const accounted_bytes = if (accounted) |control| try accountedBytes(a, control, hit, value, current_snapshot, id) else null;
+            var doc = if (accounted_bytes != null or metadataListing(search.options))
                 try document.Document.parseListing(value, table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds())
             else
                 try document.Document.parse(value, table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds());
@@ -174,6 +178,11 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             }
             if (!try discovery.indexedAllowed(doc.path)) {
                 search.skipped();
+                continue;
+            }
+            if (accounted_bytes) |bytes_count| {
+                search.summary.files += 1;
+                search.summary.bytes += bytes_count;
                 continue;
             }
             // Scope evidence by the current authorized revision and endpoint.
@@ -224,6 +233,7 @@ const Fetch = struct {
     url: []const u8,
     document_field: []const u8,
     filter: ?std.json.Value,
+    accounted: ?@import("antfly_grep_document").Scan = null,
     fields: []const []const u8,
     http: *httpx.Client,
     summary: struct { index_requests: usize = 0 } = .{},
@@ -318,7 +328,7 @@ const Fetch = struct {
             defer if (!retained) page.deinit(self.a);
             const a = page.arena.allocator();
             const memory = &page.memory;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .query = .{ .match_all = .{} }, .filter_query = self.filter, .fields = self.fields, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const body = try std.json.Stringify.valueAlloc(a, .{ .query = .{ .match_all = .{} }, .filter_query = self.filter, .fields = self.fields, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms, .grep_scan = self.accounted }, .{ .emit_null_optional_fields = false });
             const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
             const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
             var attempt: usize = 0;
@@ -393,6 +403,26 @@ fn backoff(search: anytype, attempt: usize, requested: u64) !void {
 /// v1 indexes contain every overlapping raw-content byte trigram as six lowercase
 /// hexadecimal keyword bytes. Sample at most eight mandatory grams. Candidate
 /// filtering can admit false positives; the original matcher verifies content.
+fn accountedScan(a: A, search: anytype, table: Table) !?@import("antfly_grep_document").Scan {
+    const o = search.options;
+    if (!table.accounted_misses or !(o.json or o.stats) or o.ask != null or o.files or o.invert or o.files_without_match or o.files_with_matches or o.count or o.count_matches or o.include_zero or o.passthru or o.multiline or o.sort != null or o.quiet or o.null_data or o.max_source_bytes != std.math.maxInt(usize) or o.max_count != std.math.maxInt(usize) or (!std.mem.eql(u8, o.encoding, "auto") and !std.mem.eql(u8, o.encoding, "none"))) return null;
+    const literals = (try search.matcher.requiredLiterals(a)) orelse return null;
+    const control: @import("antfly_grep_document").Scan = .{ .document_field = table.document_field, .alternatives = literals, .max_content_bytes = o.max_file_bytes };
+    control.validate() catch return null;
+    return control;
+}
+fn accountedBytes(a: A, scan_request: @import("antfly_grep_document").Scan, hit: std.json.Value, value: std.json.Value, snapshot: []const u8, id: []const u8) !?usize {
+    const computed = document.field(hit, "_computed") orelse return null;
+    const proof = document.field(computed, "antfly_grep_miss_v1") orelse return null;
+    const Wire = struct { version: u32, request: []const u8, snapshot: []const u8, document_id: []const u8, revision: []const u8, content_bytes: u64 };
+    var parsed = std.json.parseFromValue(Wire, a, proof, .{}) catch return error.InvalidIndexAccounting;
+    defer parsed.deinit();
+    const p = parsed.value;
+    const expected = scan_request.identity();
+    if (p.version != 1 or !std.mem.eql(u8, p.request, &expected) or !std.mem.eql(u8, p.snapshot, snapshot) or !std.mem.eql(u8, p.document_id, id) or !std.mem.eql(u8, p.revision, try document.string(value, "revision")) or p.content_bytes > scan_request.max_content_bytes or document.field(value, "content") != null) return error.InvalidIndexAccounting;
+    return std.math.cast(usize, p.content_bytes) orelse error.InvalidIndexAccounting;
+}
+
 fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.Value) !?std.json.Value {
     const index = table.candidate_index orelse return user_filter;
     const o = search.options;
@@ -497,4 +527,27 @@ test "prefetch completion preserves errors and transfers page ownership" {
     fetch.result = &page;
     try std.testing.expect(try fetch.take() == &page);
     try std.testing.expect(fetch.result == null);
+}
+
+test "accounted miss proofs bind request snapshot document and revision" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    const control: @import("antfly_grep_document").Scan = .{ .document_field = "grep", .alternatives = &.{"needle"}, .max_content_bytes = 1024 };
+    const digest = control.identity();
+    const bytes = try std.json.Stringify.valueAlloc(sa, .{ ._computed = .{ .antfly_grep_miss_v1 = .{ .version = @as(u32, 1), .request = digest[0..], .snapshot = "snapshot", .document_id = "id", .revision = "r1", .content_bytes = @as(u64, 123) } } }, .{});
+    const hit = try std.json.parseFromSliceLeaky(std.json.Value, sa, bytes, .{});
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"revision\":\"r1\"}", .{});
+    try std.testing.expectEqual(@as(?usize, 123), try accountedBytes(sa, control, hit, value, "snapshot", "id"));
+    try std.testing.expectError(error.InvalidIndexAccounting, accountedBytes(sa, control, hit, value, "other-snapshot", "id"));
+    try std.testing.expectError(error.InvalidIndexAccounting, accountedBytes(sa, control, hit, value, "snapshot", "other-id"));
+    var changed = control;
+    changed.alternatives = &.{"other-query"};
+    try std.testing.expectError(error.InvalidIndexAccounting, accountedBytes(sa, changed, hit, value, "snapshot", "id"));
+    try value.object.put(sa, "revision", .{ .string = "r2" });
+    try std.testing.expectError(error.InvalidIndexAccounting, accountedBytes(sa, control, hit, value, "snapshot", "id"));
+    try value.object.put(sa, "revision", .{ .string = "r1" });
+    try value.object.put(sa, "content", .{ .string = "body was not elided" });
+    try std.testing.expectError(error.InvalidIndexAccounting, accountedBytes(sa, control, hit, value, "snapshot", "id"));
 }

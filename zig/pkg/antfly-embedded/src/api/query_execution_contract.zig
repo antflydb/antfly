@@ -3310,6 +3310,8 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.order_by.len > 0) try appendQueryOrderByField(alloc, &out, &first, req.order_by);
     if (req.search_after.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_after", req.search_after);
     if (req.search_before.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_before", req.search_before);
+    // grep_scan is coordinator response accounting. Workers must retain full
+    // source bodies so the final snapshot owner can validate and certify them.
     if (req.document_authority_mode != .none) {
         try appendJsonFieldName(alloc, &out, &first, "_document_authority");
         const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .mode = req.document_authority_mode, .group = req.document_authority_group, .defer_stored_projection = req.defer_stored_projection }, .{});

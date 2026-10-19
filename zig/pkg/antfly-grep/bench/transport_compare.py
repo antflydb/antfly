@@ -162,7 +162,13 @@ def main():
         for name, count in (("tiny", 1), ("dense", args.dense_lines)):
             (root / "src/dense.txt").write_text("STOP é original\n" * count)
             clients, handles = {}, {}
-            modes = ("baseline_v2", "current_v2", "baseline_v3", "current_v3")
+            modes = (
+                "baseline_v2",
+                "current_v2",
+                "baseline_v3",
+                "current_v3",
+                "current_v4",
+            )
             trials = report["trials"][name] = []
             try:
                 for mode in modes:
@@ -171,7 +177,13 @@ def main():
                     _, rows = client.exchange(
                         "register",
                         args=["STOP", "--threads=1"],
-                        **({"batches": True} if mode.endswith("v3") else {}),
+                        **(
+                            {"batches": True, "row_format": "tuples"}
+                            if mode.endswith("v4")
+                            else {"batches": True}
+                            if mode.endswith("v3")
+                            else {}
+                        ),
                     )
                     handles[mode] = rows[0]["query_handle"]
                     delivery(client, handles[mode])

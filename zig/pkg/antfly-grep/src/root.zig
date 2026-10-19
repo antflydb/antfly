@@ -286,7 +286,7 @@ const WorkspaceReuse = struct {
     // This deliberately includes every option, including auth and policy, so a
     // new option cannot accidentally reuse outcomes from an incompatible query.
     fn presentationField(comptime name: []const u8) bool {
-        inline for (.{ "before", "after", "max_result_files", "max_regions_per_file", "max_columns", "max_columns_preview", "source_excerpt_bytes", "line_numbers", "line_numbers_explicit", "column", "byte_offset", "heading", "filename", "color", "colors", "json_compact", "json_batches", "stats", "suppress_progress", "line_buffered", "block_buffered", "field_match_separator", "field_context_separator", "context_separator", "path_separator", "null_paths", "trim", "hyperlink_format" }) |field| if (std.mem.eql(u8, name, field)) return true;
+        inline for (.{ "before", "after", "max_result_files", "max_regions_per_file", "max_columns", "max_columns_preview", "source_excerpt_bytes", "line_numbers", "line_numbers_explicit", "column", "byte_offset", "heading", "filename", "color", "colors", "json_compact", "json_batches", "json_tuples", "stats", "suppress_progress", "line_buffered", "block_buffered", "field_match_separator", "field_context_separator", "context_separator", "path_separator", "null_paths", "trim", "hyperlink_format" }) |field| if (std.mem.eql(u8, name, field)) return true;
         return false;
     }
     pub fn identity(a: Allocator, o: *const Options) ![32]u8 {
@@ -3771,6 +3771,9 @@ pub const Search = struct {
         hits: ?[]const @import("matcher.zig").Match,
         runs: ?[]const SpanRun = null,
         pub fn jsonStringify(self: @This(), json_writer: *std.json.Stringify) !void {
+            // A bounded batch writer may retry this row after flushing its
+            // prefix. Capture belongs to the row, never to an encoding attempt.
+            if (self.capture) |collector| collector.spans.clearRetainingCapacity();
             try json_writer.beginArray();
             if (self.spans) |spans| {
                 for (spans) |span| try self.item(json_writer, span);
@@ -4064,6 +4067,7 @@ pub const Search = struct {
             source: @TypeOf(self.provenance),
             compact: bool,
             batches: bool,
+            tuples: bool,
             bulk_fields: bool,
             file_id: ?[64]u8,
             pub fn jsonStringify(envelope: @This(), json_writer: *std.json.Stringify) !void {
@@ -4085,7 +4089,7 @@ pub const Search = struct {
                 }
                 if (envelope.compact) {
                     try @import("json_fields.zig").field(json_writer, "result_schema_version");
-                    try json_writer.write(if (envelope.batches) @as(u32, 3) else 2);
+                    try json_writer.write(if (envelope.tuples) @as(u32, 4) else if (envelope.batches) @as(u32, 3) else 2);
                     if (envelope.file_id) |id| {
                         try @import("json_fields.zig").field(json_writer, "file_id");
                         // IDs are generated internally as exactly 64 lowercase hex bytes.
@@ -4105,7 +4109,7 @@ pub const Search = struct {
                 try json_writer.endObject();
             }
         };
-        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .batches = self.options.json_batches, .bulk_fields = self.output_bytes >= 128 * 1024 or self.lexical_patch != null, .file_id = if (self.options.json_compact and ((std.mem.eql(u8, eventKind(value), "begin") or (self.json_started and !std.mem.eql(u8, eventKind(value), "summary") and !std.mem.eql(u8, eventKind(value), "inventory") and !std.mem.eql(u8, eventKind(value), "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
+        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .batches = self.options.json_batches, .tuples = self.options.json_tuples, .bulk_fields = self.output_bytes >= 128 * 1024 or self.lexical_patch != null, .file_id = if (self.options.json_compact and ((std.mem.eql(u8, eventKind(value), "begin") or (self.json_started and !std.mem.eql(u8, eventKind(value), "summary") and !std.mem.eql(u8, eventKind(value), "inventory") and !std.mem.eql(u8, eventKind(value), "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
         try writer.writeByte('\n');
     }
     fn flushBatch(self: *Search) !void {
@@ -4115,10 +4119,29 @@ pub const Search = struct {
         // The complete frame is bounded: at most 64 rows / 32 KiB body. No
         // whole-transaction buffering; first row is always published directly.
         var header: [192]u8 = undefined;
-        const frame_header = try std.fmt.bufPrint(&header, "{{\"type\":\"batch\",\"result_schema_version\":3,\"file_id\":\"{s}\",\"events\":[", .{self.compact_file_id});
+        const frame_header = try std.fmt.bufPrint(&header, "{{\"type\":\"batch\",\"result_schema_version\":{d},\"file_id\":\"{s}\",\"{s}\":[", .{ @as(u32, if (self.options.json_tuples) 4 else 3), self.compact_file_id, if (self.options.json_tuples) "rows" else "events" });
         try self.write(frame_header);
         try self.write(self.batch.items);
         try self.write("]}\n");
+    }
+    fn encodeBatchRow(self: *Search, writer: *std.json.Stringify, value: anytype) !void {
+        // Only lexical match/context rows enter batches. Preserve arbitrary
+        // byte lines and submatch payloads without re-decoding source text.
+        if (comptime @hasField(@TypeOf(value), "data")) {
+            if (comptime @hasField(@TypeOf(value.data), "submatches")) {
+                if (self.options.json_tuples) {
+                    try writer.beginArray();
+                    try writer.write(@as(u8, if (std.mem.eql(u8, eventKind(value), "match")) 0 else 1));
+                    try writer.write(value.data.line_number);
+                    try writer.write(value.data.absolute_offset);
+                    try writer.write(value.data.lines);
+                    try writer.write(value.data.submatches);
+                    try writer.endArray();
+                    return;
+                }
+            }
+        }
+        try @import("json_fields.zig").write(writer, value);
     }
     fn json(self: *Search, value: anytype) !void {
         const kind = eventKind(value);
@@ -4135,7 +4158,7 @@ pub const Search = struct {
                     const start = self.batch.items.len + @intFromBool(self.batch_rows != 0);
                     var writer: std.Io.Writer = .fixed(self.batch.allocatedSlice()[start..32768]);
                     var json_writer: std.json.Stringify = .{ .writer = &writer, .options = .{} };
-                    if (@import("json_fields.zig").write(&json_writer, value)) |_| {
+                    if (self.encodeBatchRow(&json_writer, value)) |_| {
                         if (self.batch_rows != 0) self.batch.allocatedSlice()[self.batch.items.len] = ',';
                         self.batch.items.len = start + writer.buffered().len;
                         self.batch_rows += 1;

@@ -29,6 +29,7 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     const http = b.createModule(.{ .root_source_file = b.path("lib/httpx/src/httpx.zig"), .target = target, .optimize = optimize });
     http.addImport("antfly-json", json);
     const lib = b.addModule("antfly-grep", .{ .root_source_file = b.path("pkg/antfly-grep/src/root.zig"), .target = target, .optimize = optimize });
+    lib.addImport("antfly_grep_document", b.createModule(.{ .root_source_file = b.path("lib/grep_document/src/mod.zig"), .target = target, .optimize = optimize }));
     lib.addImport("antfly_encoding", b.createModule(.{ .root_source_file = b.path("lib/encoding/src/mod.zig"), .target = target, .optimize = optimize }));
     const hash = b.createModule(.{ .root_source_file = b.path("lib/hash/src/mod.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const compress = b.createModule(.{ .root_source_file = b.path("lib/compress/src/mod.zig"), .target = target, .optimize = optimize });

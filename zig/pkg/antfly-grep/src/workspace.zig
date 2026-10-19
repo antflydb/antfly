@@ -42,6 +42,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     const watch: ?*Watch = if (base.workspace_watch) blk: {
         const watcher = try a.create(Watch);
         watcher.* = Watch.initSources();
+        watcher.limit = @min(watcher.limit, base.workspace_watch_limit);
         break :blk watcher;
     } else null;
     defer if (watch) |watcher| {
@@ -51,7 +52,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     const Journal = @import("discovery_journal.zig").Journal;
     const journal: ?*Journal = if (watch != null) blk: {
         const value = try a.create(Journal);
-        value.* = Journal.init(a, io);
+        value.* = Journal.initLimited(a, io, base.workspace_watch_memory_limit, base.workspace_watch_limit);
         break :blk value;
     } else null;
     defer if (journal) |value| {
@@ -83,7 +84,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
         // Registrations and generations copy every value they retain.
         defer _ = arena.reset(.{ .retain_with_limit = 16 * 1024 });
         const scratch = arena.allocator();
-        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false, query_handle: ?[]const u8 = null, compact: bool = true, batches: bool = false, delta: bool = false, acknowledgement: enum { full, minimal } = .full };
+        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false, query_handle: ?[]const u8 = null, compact: bool = true, batches: bool = false, row_format: enum { objects, tuples } = .objects, delta: bool = false, acknowledgement: enum { full, minimal } = .full };
         const request = std.json.parseFromSliceLeaky(Request, scratch, line, .{}) catch {
             try emit(a, io, .{ .type = "workspace_error", .id = @as(?u64, null), .message = "InvalidWorkspaceRequest" });
             continue;
@@ -102,7 +103,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                 continue;
             }
         }
-        if (request.batches and !std.mem.eql(u8, request.op, "register")) {
+        if ((request.batches or request.row_format == .tuples) and !std.mem.eql(u8, request.op, "register")) {
             try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidBatchRegistration" });
             continue;
         }
@@ -123,11 +124,11 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
             continue;
         }
         if (std.mem.eql(u8, request.op, "register")) {
-            const plan = registrations.register(base, request.args, request.compact, request.batches) catch |err| {
+            const plan = registrations.register(base, request.args, request.compact, request.batches, request.row_format == .tuples) catch |err| {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 continue;
             };
-            try emit(a, io, .{ .type = "query_registered", .id = request.id, .query_handle = plan.handle, .result_schema_version = if (plan.options.json_batches) @as(u32, 3) else if (plan.options.json_compact) @as(u32, 2) else 1, .supports_lexical_delta = Search.lexicalDeltaEligible(&plan.options) });
+            try emit(a, io, .{ .type = "query_registered", .id = request.id, .query_handle = plan.handle, .result_schema_version = if (plan.options.json_tuples) @as(u32, 4) else if (plan.options.json_batches) @as(u32, 3) else if (plan.options.json_compact) @as(u32, 2) else 1, .supports_lexical_delta = Search.lexicalDeltaEligible(&plan.options) });
         } else if (std.mem.eql(u8, request.op, "forget")) {
             if (request.query_handle == null or !registrations.forget(request.query_handle.?)) {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnknownQueryHandle" });

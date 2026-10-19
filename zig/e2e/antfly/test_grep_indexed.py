@@ -61,7 +61,14 @@ def document(path, content):
 
 
 def run_grep(
-    tmp_path, endpoint, table, *flags, token=None, page_size=1, candidate_index=None
+    tmp_path,
+    endpoint,
+    table,
+    *flags,
+    token=None,
+    page_size=1,
+    candidate_index=None,
+    accounted_misses=False,
 ):
     config = tmp_path / "tables.json"
     config.write_text(
@@ -73,6 +80,7 @@ def run_grep(
                 "tables": [
                     {
                         "name": table,
+                        "accounted_misses": accounted_misses,
                         **(
                             {"candidate_index": candidate_index}
                             if candidate_index
@@ -461,3 +469,108 @@ def test_native_grep_json_projects_versioned_contract(stateful_api, tmp_path):
     assert match["source"]["metadata"] == item["grep"]["metadata"]
     assert match["source"]["source_regions"] == item["grep"]["regions"]
     assert rows[-1]["stats"]["complete"]
+
+
+def test_native_grep_accounted_misses_preserve_snapshot_stats_and_validation(
+    stateful_api, tmp_path
+):
+    table = f"grep_accounted_{time.time_ns()}"
+    stateful_api.create_table(table)
+    denied = document("private.py", "private ordinary text\n")
+    denied["grep"]["permissions"] = {"public": False, "readers": ["other"]}
+    rows = {
+        "a": document("large.py", "ordinary text\n" * 16384),
+        "b": document("hit.py", "needle MATCH\n"),
+        "c": denied,
+        "d": document("binary.py", "ordinary\x00text\n"),
+        "e": document("another.py", "ordinary text\n" * 8192),
+    }
+    stateful_api.batch_write(table, inserts=rows, sync_level="full_text")
+    control = {
+        "version": 1,
+        "document_field": "grep",
+        "alternatives": ["needle"],
+        "max_content_bytes": 1000000,
+    }
+    query = {
+        "query": {"match_all": {}},
+        "order_by": [{"field": "_id", "desc": False}],
+        "limit": 1,
+        "grep_scan": control,
+    }
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query", json=query, timeout=60
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["responses"][0]
+    hit = result["hits"]["hits"][0]
+    proof = hit["_computed"]["antfly_grep_miss_v1"]
+    assert "content" not in hit["_source"]["grep"]
+    assert proof["content_bytes"] == len(rows["a"]["grep"]["content"].encode())
+    assert proof["snapshot"] == result["remote_snapshot"]
+    assert proof["document_id"] == "a" and proof["revision"] == "rev-original"
+    assert len(response.content) < len(rows["a"]["grep"]["content"].encode()) // 8
+    # The same retained cut must certify the old body after a concurrent write.
+    stateful_api.batch_write(
+        table,
+        inserts={"a": document("large.py", "needle NEW\n")},
+        sync_level="full_text",
+    )
+    query["remote_snapshot"] = result["remote_snapshot"]
+    frozen = requests.post(
+        stateful_api.url + f"/tables/{table}/query", json=query, timeout=60
+    )
+    assert frozen.status_code == 200, frozen.text
+    assert (
+        frozen.json()["responses"][0]["hits"]["hits"][0]["_computed"][
+            "antfly_grep_miss_v1"
+        ]
+        == proof
+    )
+    # Compare complete, fresh scans including client-side permission skips and
+    # binary fallback. Timing and independently issued snapshots vary by design.
+    ordinary = run_grep(
+        tmp_path, stateful_api.url, table, "--json", "needle", page_size=2
+    )
+    accounted = run_grep(
+        tmp_path,
+        stateful_api.url,
+        table,
+        "--json",
+        "needle",
+        page_size=2,
+        accounted_misses=True,
+    )
+    assert ordinary.returncode == accounted.returncode == 0, accounted.stderr.decode()
+    left, right = (
+        [json.loads(line) for line in run.stdout.splitlines()]
+        for run in (ordinary, accounted)
+    )
+    keys = (
+        "files",
+        "bytes",
+        "matches",
+        "occurrences",
+        "occurrences_exact",
+        "files_with_matches",
+        "skipped_paths",
+        "errors",
+        "complete",
+    )
+    assert {k: left[-1]["stats"][k] for k in keys} == {
+        k: right[-1]["stats"][k] for k in keys
+    }
+    assert [r["data"] for r in left if r["type"] == "match"] == [
+        r["data"] for r in right if r["type"] == "match"
+    ]
+    malformed = document("bad.py", "ordinary\n")
+    malformed["grep"]["regions"] = [{"start_line": 1, "end_line": 999}]
+    stateful_api.batch_write(table, inserts={"f": malformed}, sync_level="full_text")
+    invalid = run_grep(
+        tmp_path, stateful_api.url, table, "--json", "needle", accounted_misses=True
+    )
+    assert invalid.returncode == 2
+    assert (
+        b"InvalidDocumentRegions" in invalid.stderr
+        or b"InvalidDocumentRegions" in invalid.stdout
+    )

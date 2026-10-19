@@ -7452,6 +7452,55 @@ class CliTests(unittest.TestCase):
                     expected = values
                 self.assertEqual(values, expected)
 
+    def test_workspace_tuple_batches_and_retry_capture_preserve_warm_spans(self):
+        # Several batch boundaries while the entire source still fits lexical
+        # retention. A retry must not append a second copy of the row's spans.
+        self.write("src/file.txt", "STOP é STOP\r\n" * 500)
+        with self.workspace("src") as (ready, request):
+            expected = None
+            for tuples in (False, True):
+                registered = request(
+                    "register",
+                    args=["STOP", "--threads=1"],
+                    batches=True,
+                    row_format="tuples" if tuples else "objects",
+                )[0]
+                self.assertEqual(
+                    registered["result_schema_version"], 4 if tuples else 3
+                )
+                for _ in range(2):
+                    rows = request(
+                        "search",
+                        revision=ready["revision"],
+                        query_handle=registered["query_handle"],
+                    )
+                    values = []
+                    for row in rows:
+                        if row["type"] == "batch":
+                            if tuples:
+                                values.extend(
+                                    {
+                                        "line_number": line,
+                                        "absolute_offset": offset,
+                                        "lines": text,
+                                        "submatches": spans,
+                                    }
+                                    for kind, line, offset, text, spans in row["rows"]
+                                )
+                            else:
+                                values.extend(event["data"] for event in row["events"])
+                        elif row["type"] == "match":
+                            values.append(row["data"])
+                    self.assertEqual(len(values), 500)
+                    self.assertTrue(
+                        all(len(value["submatches"]) == 2 for value in values)
+                    )
+                    if expected is None:
+                        expected = values
+                    self.assertEqual(values, expected)
+            rejected = request("register", args=["STOP"], row_format="tuples")[0]
+            self.assertEqual(rejected["type"], "workspace_error")
+
     def test_workspace_source_route_growth_preserves_later_dirty_updates(self):
         for i in range(250):
             self.write(f"src/f{i:04}.txt", "original\n")
@@ -7469,6 +7518,72 @@ class CliTests(unittest.TestCase):
                 request("refresh", force_rescan=True)[0]["revision"],
                 changed["revision"],
             )
+
+    def test_workspace_namespace_coverage_extends_beyond_4096_directories(self):
+        import resource
+
+        if sys.platform not in ("darwin", "linux"):
+            self.skipTest("native namespace events require macOS or Linux")
+        if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 40000:
+            self.skipTest("requires descriptor headroom for a wide repository")
+        for i in range(4200):
+            self.write(f"src/d{i:05}/file.txt", "STOP old\n")
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            self.assertFalse(ready["watch_fallback"], ready)
+            stable = request("refresh")[0]
+            self.assertTrue(stable["discovery_reused"], stable)
+            self.assertEqual(stable["refresh_entries_visited"], 0)
+            target = self.root / "src/d04199/file.txt"
+            target.write_text("STOP changed\n")
+            changed = request("refresh")[0]
+            self.assertEqual(changed["sources_opened"], 1, changed)
+            self.assertEqual(changed["refresh_entries_visited"], 1, changed)
+            self.assertEqual(
+                request("refresh", force_rescan=True)[0]["revision"],
+                changed["revision"],
+            )
+            self.write("src/d04199/added.txt", "STOP added\n")
+            added = request("refresh")[0]
+            self.assertEqual(added["files"], 4201)
+            self.assertEqual(
+                request("refresh", force_rescan=True)[0]["revision"], added["revision"]
+            )
+            (self.root / "src/d04199/added.txt").unlink()
+            (self.root / "src/d04199").rename(self.root / "src/renamed")
+            renamed = request("refresh")[0]
+            self.assertEqual(renamed["files"], 4200)
+            self.assertEqual(
+                request("refresh", force_rescan=True)[0]["revision"],
+                renamed["revision"],
+            )
+            self.write("src/.ignore", "d00000/\n")
+            ignored = request("refresh")[0]
+            self.assertEqual(ignored["files"], 4199)
+            self.assertEqual(
+                request("refresh", force_rescan=True)[0]["revision"],
+                ignored["revision"],
+            )
+
+    def test_workspace_namespace_budget_exhaustion_falls_back_exactly(self):
+        target = self.write("src/file.txt", "STOP old\n")
+        for args in (
+            ("--workspace-watch-memory-limit=0",),
+            ("--workspace-watch-limit=0",),
+            ("--workspace-watch-memory-limit=512", "--workspace-watch-limit=1"),
+        ):
+            with (
+                self.subTest(args=args),
+                self.workspace("--workspace-watch", *args, "src") as (ready, request),
+            ):
+                self.assertTrue(ready["watch_fallback"], ready)
+                target.write_text("STOP " + str(args) + "\n")
+                changed = request("refresh")[0]
+                self.assertNotEqual(changed["revision"], ready["revision"])
+                self.assertTrue(changed["watch_fallback"], changed)
+                self.assertEqual(
+                    request("refresh", force_rescan=True)[0]["revision"],
+                    changed["revision"],
+                )
 
     def test_workspace_strict_source_witnesses_extend_beyond_4096(self):
         import resource

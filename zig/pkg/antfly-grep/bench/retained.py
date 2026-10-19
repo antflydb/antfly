@@ -41,6 +41,32 @@ def path_bytes(value):
 
 
 def validate_batch(row, encoded_size):
+    if row.get("result_schema_version") == 4:
+        rows = row.get("rows")
+        if (
+            set(row) != {"type", "result_schema_version", "file_id", "rows"}
+            or not isinstance(rows, list)
+            or not 1 <= len(rows) <= 64
+            or encoded_size > 33000
+        ):
+            raise RuntimeError("invalid batch envelope")
+        for event in rows:
+            if (
+                not isinstance(event, list)
+                or len(event) != 5
+                or type(event[0]) is not int
+                or event[0] not in (0, 1)
+                or type(event[1]) is not int
+                or event[1] < 1
+                or type(event[2]) is not int
+                or event[2] < 0
+                or not isinstance(event[3], dict)
+                or set(event[3]) not in ({"text"}, {"bytes"})
+                or not isinstance(next(iter(event[3].values())), str)
+                or not isinstance(event[4], list)
+            ):
+                raise RuntimeError("invalid batch tuple")
+        return
     events = row.get("events")
     if (
         set(row) != {"type", "result_schema_version", "file_id", "events"}
@@ -114,23 +140,53 @@ class View:
     files: dict = field(default_factory=dict)
     payload_bytes: int = 0
 
+    def iter_file(self, path):
+        """Decode one file on demand; untouched retained files stay serialized.
+
+        Iteration pins this file payload and the provenance observation before
+        yielding, so a subsequent refresh cannot mix generations within a file.
+        """
+        if not self.revision or not self.token:
+            raise RuntimeError("view requires a complete transaction")
+        payload = self.files[path]
+        revision, observed_at = self.revision, self.observed_at
+        for row in json.loads(payload):
+            if row["type"] == "begin":
+                row["source"]["snapshot"] = revision
+                row["source"]["observed_at"] = observed_at
+            if row["type"] == "batch":
+                if row["result_schema_version"] == 4:
+                    for kind, line, offset, text, matches in row["rows"]:
+                        yield {
+                            "type": "match" if kind == 0 else "context",
+                            "data": {
+                                "lines": text,
+                                "line_number": line,
+                                "absolute_offset": offset,
+                                "submatches": matches,
+                            },
+                            "probability": None,
+                            "scope": "line",
+                            "file_id": row["file_id"],
+                            "result_schema_version": 4,
+                        }
+                else:
+                    for event in row["events"]:
+                        yield {
+                            **event,
+                            "file_id": row["file_id"],
+                            "result_schema_version": 3,
+                        }
+            else:
+                yield row
+
+    def materialize_file(self, path):
+        return list(self.iter_file(path))
+
     def materialize(self):
         if not self.revision or not self.token:
             raise RuntimeError("view requires a complete transaction")
-        rows = []
-        for path in sorted(self.files):
-            for row in json.loads(self.files[path]):
-                if row["type"] == "begin":
-                    row["source"]["snapshot"] = self.revision
-                    row["source"]["observed_at"] = self.observed_at
-                if row["type"] == "batch":
-                    rows.extend(
-                        {**event, "file_id": row["file_id"], "result_schema_version": 3}
-                        for event in row["events"]
-                    )
-                else:
-                    rows.append(row)
-        return rows
+        return [row for path in sorted(self.files) for row in self.iter_file(path)]
 
     def apply(self, rows, revision, observed_at, *, payloads=None):
         terminal = rows[-1]
@@ -287,7 +343,7 @@ class RetainedClient(Client):
             row = rows[-1]
             self.handles[row["query_handle"]] = row.get(
                 "supports_lexical_delta", False
-            ) and row["result_schema_version"] in (2, 3)
+            ) and row["result_schema_version"] in (2, 3, 4)
             if len(self.handles) > 8:
                 self.handles.popitem(last=False)
         if op == "refresh":

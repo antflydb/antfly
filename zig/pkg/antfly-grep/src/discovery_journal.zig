@@ -35,12 +35,9 @@ pub const Journal = struct {
     native_covered: bool = false,
     native_epoch: u64 = 0,
     rejection: []const u8 = "none",
-    approved_sequences: [4096]u64 = @splat(std.math.maxInt(u64)),
-    approved_generations: [4096]u64 = @splat(0),
     tokens: std.StringHashMapUnmanaged(Token) = .empty,
     // Borrowed paths route ancestor invalidations to dependent descendants.
-    routes: [4096]std.ArrayList([]const u8) = @splat(.empty),
-    dependency_routes: [4096]std.ArrayList([]const u8) = @splat(.empty),
+    routing: std.ArrayList(Routing) = .empty,
     roots: std.ArrayList(Root) = .empty,
     membership_dirs: std.ArrayList(Membership) = .empty,
     allow_membership: bool = false,
@@ -51,10 +48,29 @@ pub const Journal = struct {
     source_epoch: u64 = 0,
     dependency_epoch: u64 = 0,
     sealed: bool = false,
+    const Routing = struct {
+        sequence: u64 = std.math.maxInt(u64),
+        generation: u64 = 0,
+        paths: std.ArrayList([]const u8) = .empty,
+        dependencies: std.ArrayList([]const u8) = .empty,
+    };
     pub const Root = struct { path: []const u8, display: []const u8 };
     pub const Membership = struct { path: []const u8, display: []const u8, stamp: @import("directory_stamp.zig").Stamp, native_names: bool = false };
     pub fn init(a: std.mem.Allocator, io: std.Io) Journal {
-        return .{ .io = io, .budget = .{ .backing = a, .limit = 1024 * 1024 }, .watch = Watch.init(), .native = .init(a, io) };
+        return initLimited(a, io, 32 * 1024 * 1024, 65536);
+    }
+    pub fn initLimited(a: std.mem.Allocator, io: std.Io, memory: usize, slots: usize) Journal {
+        var native = @import("path_watch.zig").Events.init(a, io);
+        native.budget.limit = memory / 4;
+        return .{ .io = io, .budget = .{ .backing = a, .limit = memory - memory / 4 }, .watch = Watch.initNamespace(slots), .native = native };
+    }
+    fn ensureRouting(self: *Journal) !void {
+        const count = self.watch.slots.items.len;
+        if (count <= self.routing.items.len) return;
+        const old = self.routing.items.len;
+        try self.routing.ensureTotalCapacityPrecise(self.budget.allocator(), count);
+        self.routing.items.len = count;
+        @memset(self.routing.items[old..], .{});
     }
     pub fn deinit(self: *Journal) void {
         self.watch.deinit();
@@ -70,10 +86,12 @@ pub const Journal = struct {
         self.roots = .empty;
         self.membership_dirs.deinit(self.budget.allocator());
         self.membership_dirs = .empty;
-        for (&self.routes) |*route| route.deinit(self.budget.allocator());
-        self.routes = @splat(.empty);
-        for (&self.dependency_routes) |*route| route.deinit(self.budget.allocator());
-        self.dependency_routes = @splat(.empty);
+        for (self.routing.items) |*route| {
+            route.paths.deinit(self.budget.allocator());
+            route.dependencies.deinit(self.budget.allocator());
+        }
+        self.routing.deinit(self.budget.allocator());
+        self.routing = .empty;
         self.freeDisplays();
         var inventories = self.inventories.keyIterator();
         while (inventories.next()) |key| self.budget.allocator().free(key.*);
@@ -89,9 +107,11 @@ pub const Journal = struct {
         self.tokens = .empty;
     }
     pub fn reset(self: *Journal) void {
+        const native_limit = self.native.budget.limit;
         self.deinit();
         self.watch.reset();
         self.native = .init(self.budget.backing, self.io);
+        self.native.budget.limit = native_limit;
         self.native_active = false;
         self.directory_aliases = false;
         self.generation = null;
@@ -147,14 +167,22 @@ pub const Journal = struct {
         };
     }
     pub fn rearmDirectories(self: *Journal) void {
+        if (!self.coverage) return;
         const count = self.watch.event_count;
-        for (self.watch.events.items[0..count]) |slot| for (self.routes[slot].items) |path| {
+        for (self.watch.events.items[0..count]) |slot| for (self.routing.items[slot].paths.items) |path| {
             const prior = self.tokens.getPtr(path) orelse continue;
             if (self.watch.intact(prior.*)) continue;
             var dir = std.Io.Dir.cwd().openDir(self.io, path, .{}) catch continue;
             defer dir.close(self.io);
             const token = self.watch.armDirectory(dir) orelse continue;
-            if (token.generation != prior.generation or token.generation != self.approved_generations[token.slot] or token.sequence != self.approved_sequences[token.slot]) {
+            // A racing replacement can admit a new slot while rearming. Its
+            // event route must exist before any subsequent poll can expose it.
+            self.ensureRouting() catch {
+                self.watch.release(token);
+                self.failMetadata();
+                return;
+            };
+            if (token.slot >= self.routing.items.len or token.generation != prior.generation or token.generation != self.routing.items[token.slot].generation or token.sequence != self.routing.items[token.slot].sequence) {
                 self.watch.release(token);
                 continue;
             }
@@ -163,7 +191,7 @@ pub const Journal = struct {
             prior.* = token;
         };
         self.watch.poll();
-        for (self.watch.events.items[0..self.watch.event_count]) |slot| for (self.routes[slot].items) |path| {
+        for (self.watch.events.items[0..self.watch.event_count]) |slot| for (self.routing.items[slot].paths.items) |path| {
             if (!self.watch.intact(self.tokens.get(path).?)) return;
         };
         self.dependency_epoch = self.watch.epoch;
@@ -268,7 +296,7 @@ pub const Journal = struct {
             dir.close(self.io);
             self.directoryWitness(path_name);
             if (self.tokens.get(path_name)) |token| {
-                self.dependency_routes[token.slot].append(a, absolute) catch self.failMetadata();
+                self.routing.items[token.slot].dependencies.append(a, absolute) catch self.failMetadata();
             } else self.failMetadata();
             return;
         }
@@ -292,7 +320,7 @@ pub const Journal = struct {
         const count = self.watch.event_count;
         for (self.watch.events.items[0..count]) |slot| {
             if (!namespace_dirty) break;
-            for (self.routes[slot].items) |path| {
+            for (self.routing.items[slot].paths.items) |path| {
                 const witness = self.tokens.get(path) orelse return self.reject("lost-path-route");
                 self.path_checks += 1;
                 if (!self.watch.identityMatchesPath(witness, path)) return self.reject("changed-path-identity");
@@ -344,10 +372,10 @@ pub const Journal = struct {
                     }
                 }
                 const checkpoint = self.watch.observed(witness) orelse return self.reject("lost-directory-witness");
-                self.approved_sequences[checkpoint.slot] = checkpoint.sequence;
-                self.approved_generations[checkpoint.slot] = checkpoint.generation;
+                self.routing.items[checkpoint.slot].sequence = checkpoint.sequence;
+                self.routing.items[checkpoint.slot].generation = checkpoint.generation;
             }
-            for (self.dependency_routes[slot].items) |path| {
+            for (self.routing.items[slot].dependencies.items) |path| {
                 self.path_checks += 1;
                 const present = if (std.Io.Dir.cwd().statFile(self.io, path, .{})) |_| true else |err| blk: {
                     if (err != error.FileNotFound and err != error.NotDir) return self.reject("unreadable-configuration");
@@ -395,6 +423,11 @@ pub const Journal = struct {
             self.coverage = false;
             return;
         };
+        self.ensureRouting() catch {
+            self.failMetadata();
+            self.watch.release(value);
+            return;
+        };
         const a = self.budget.allocator();
         const key = a.dupe(u8, path) catch {
             self.coverage = false;
@@ -407,12 +440,12 @@ pub const Journal = struct {
             self.watch.release(value);
             return;
         };
-        self.routes[value.slot].append(a, key) catch self.failMetadata();
+        self.routing.items[value.slot].paths.append(a, key) catch self.failMetadata();
         var parent = std.fs.path.dirname(key);
         if (parent == null and !std.mem.eql(u8, key, ".")) parent = ".";
         while (parent) |path_name| {
             if (self.tokens.get(path_name)) |ancestor| if (ancestor.slot != value.slot) {
-                self.routes[ancestor.slot].append(a, key) catch self.failMetadata();
+                self.routing.items[ancestor.slot].paths.append(a, key) catch self.failMetadata();
             };
             const next = std.fs.path.dirname(path_name);
             if (next != null and std.mem.eql(u8, next.?, path_name)) break;
@@ -424,6 +457,9 @@ pub const Journal = struct {
         self.directoryWitness(path);
     }
     fn directoryWitness(self: *Journal, path: []const u8) void {
+        // Bind after the owning Journal reaches its stable address. Watch
+        // arrays/maps and routing share this metadata allowance.
+        self.watch.allocator = self.budget.allocator();
         if (!self.coverage or self.tokens.contains(path)) return;
         if (std.fs.path.dirname(path)) |parent| {
             if (!std.mem.eql(u8, parent, path) and parent.len != 0) self.directoryWitness(parent);
@@ -437,6 +473,7 @@ pub const Journal = struct {
         self.insert(path, self.watch.armDirectory(dir));
     }
     pub fn dependency(self: *Journal, path: []const u8) void {
+        self.watch.allocator = self.budget.allocator();
         self.rememberDependency(path, null);
         // Native directory coverage is independent of the bounded inode set.
         // Keep collecting it even when the latter has exhausted its quota.
@@ -591,4 +628,61 @@ test "directory rearming cannot acknowledge a membership event after validation"
     try tmp.dir.writeFile(io, .{ .sub_path = "after-reset.txt", .data = "new generation" });
     journal.rearmDirectories();
     try std.testing.expect(!journal.clean());
+}
+
+test "namespace metadata and watch tables share admission and reset releases ownership" {
+    const a = std.testing.allocator;
+    var journal = Journal.initLimited(a, std.testing.io, 1024 * 1024, 8);
+    defer journal.deinit();
+    if (journal.watch.fd < 0) return error.SkipZigTest;
+    journal.directory(".");
+    try std.testing.expect(journal.budget.live > 0);
+    try std.testing.expect(journal.budget.live <= journal.budget.limit);
+    try std.testing.expect(journal.routing.items.len <= 8);
+    journal.reset();
+    try std.testing.expectEqual(@as(usize, 0), journal.budget.live);
+    try std.testing.expectEqual(@as(usize, 256 * 1024), journal.native.budget.limit);
+    journal.budget.limit = 0;
+    journal.directory(".");
+    try std.testing.expect(!journal.coverage);
+    journal.rearmDirectories();
+    try std.testing.expectEqual(@as(usize, 0), journal.budget.live);
+}
+
+test "racing directory rearm grows routing before publishing new watch slots" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var name_buffer: [32]u8 = undefined;
+    for (0..512) |i| try tmp.dir.createDir(io, try std.fmt.bufPrint(&name_buffer, "d{d}", .{i}), .default_dir);
+    const relative = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(relative);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, a);
+    defer a.free(root);
+    var journal = Journal.init(a, io);
+    defer journal.deinit();
+    if (journal.watch.fd < 0 or journal.watch.limit < 512) return error.SkipZigTest;
+    var i: usize = 0;
+    while (journal.watch.slots.items.len == 0 or journal.watch.free_head != null) : (i += 1) {
+        if (i == 512) return error.TestUnexpectedResult;
+        const path = try std.fmt.allocPrint(a, "{s}/d{d}", .{ root, i });
+        defer a.free(path);
+        journal.directory(path);
+        if (!journal.coverage) return error.SkipZigTest;
+    }
+    const old_size = journal.routing.items.len;
+    const target = try std.fmt.allocPrint(a, "{s}/d0", .{root});
+    defer a.free(target);
+    const token = journal.tokens.get(target).?;
+    journal.watch.clearEvents();
+    journal.watch.events.appendAssumeCapacity(token.slot);
+    journal.watch.event_count = 1;
+    journal.watch.slots.items[token.slot].event_seen = true;
+    try tmp.dir.rename("d0", tmp.dir, "old", io);
+    try tmp.dir.createDir(io, "d0", .default_dir);
+    journal.rearmDirectories();
+    try std.testing.expect(journal.routing.items.len > old_size);
+    try std.testing.expectEqual(journal.watch.slots.items.len, journal.routing.items.len);
+    try std.testing.expect(!journal.watch.intact(token));
 }

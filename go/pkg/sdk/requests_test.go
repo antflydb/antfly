@@ -522,3 +522,28 @@ func TestQueryRequestMarshalPreservesDirectGraphMetricQuery(t *testing.T) {
 		t.Fatalf("unexpected graph_metric payload: %#v", metric)
 	}
 }
+
+func TestQueryRequestGrepScanRoundTrip(t *testing.T) {
+	input := QueryRequest{GrepScan: GrepScan{Version: 1, DocumentField: "grep", Alternatives: []string{"needle"}, MaxContentBytes: 1024}}
+	body, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"grep_scan":{"alternatives":["needle"],"document_field":"grep","max_content_bytes":1024,"version":1}`)) {
+		t.Fatalf("missing accounting request: %s", body)
+	}
+	var decoded QueryRequest
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.GrepScan.Version != 1 || decoded.GrepScan.DocumentField != "grep" || decoded.GrepScan.MaxContentBytes != 1024 || len(decoded.GrepScan.Alternatives) != 1 || decoded.GrepScan.Alternatives[0] != "needle" {
+		t.Fatalf("lost accounting request: %#v", decoded.GrepScan)
+	}
+	empty, err := json.Marshal(QueryRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(empty, []byte(`"grep_scan"`)) {
+		t.Fatalf("zero request emitted opt-in accounting: %s", empty)
+	}
+}

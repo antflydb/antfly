@@ -3537,3 +3537,77 @@ Evidence: [qualification and release identities](bench/results/linear-validation
 [macOS native encoding](bench/results/linear-encoding-macos.json),
 [Linux native encoding](bench/results/linear-encoding-linux.json), and
 [fragmented reader controls](bench/results/linear-framing.json).
+
+
+## Dynamic namespace coverage and tuple delivery
+
+Namespace coverage grows lazily instead of stopping at 4,096 route slots.
+`workspace serve --workspace-watch` admits up to 65,536 namespace witnesses,
+subject to descriptor headroom. `--workspace-watch-limit N` lowers or raises
+that admission limit (maximum 1,048,576); it also caps strict source witnesses,
+whose platform-specific ceiling can be lower. Namespace maps, watch tables,
+routes and native directory events share `--workspace-watch-memory-limit SIZE`
+(default 32 MiB): three quarters for metadata/strict namespace witnesses and
+one quarter for native directory event subscriptions. These are admission
+ceilings, not startup allocations. Source blobs, strict source-watch tables
+and retained query evidence have their own existing bounds. Allocation failure,
+watch exhaustion and lost events preserve conservative discovery/source reads.
+No journal or extra source index is written to disk.
+
+Registered lexical consumers can opt into tuple batches:
+
+```json
+{"version":1,"id":1,"op":"register","args":["STOP"],"compact":true,"batches":true,"row_format":"tuples"}
+```
+
+This advertises result schema v4. Batch `rows` contain
+`[kind, line_number, absolute_offset, lines, submatches]`, where kind 0 means
+match and 1 means context. Probability is null and scope is line. The existing
+byte-preserving lines and submatch representations are retained. First and
+oversized rows remain ordinary events, with the same 64-row/32-KiB batch-body
+bounds. Default v1/v2/v3 formats are unchanged. A retried encoding attempt
+resets row-local span capture, preventing duplicate spans in later cache replay.
+
+The reference consumer retains original frames and offers `View.iter_file(path)`
+and `materialize_file(path)`. Applications can decode only a visible file;
+`materialize()` remains an explicit whole-view operation. Validation and atomic
+view publication still precede reuse. Unknown files raise `KeyError`. Iteration
+pins a file's serialized payload and observation before yielding its rows.
+
+## Server-owned exact miss accounting
+
+Set `accounted_misses: true` on a configured Antfly table to request the public
+`grep_scan` v1 contract for supported JSON/statistics lexical scans. The complete
+source-document contract now lives in `zig/lib/grep_document`; the CLI and native
+query server use the same validation code. This is response-body elision: the
+server still reads and validates content, and every document retains its ordered
+hit. It is not an ingestion-time synopsis or an index-level skipping guarantee.
+
+The request supplies a document field, bounded necessary byte-literal
+alternatives and a content-size bound. The server validates the complete v1
+contract against the retained source, including permissions, metadata shape and
+region ranges. Only a proven miss can omit content. Its server-owned
+`_computed.antfly_grep_miss_v1` record binds the request digest, retained snapshot,
+document ID, source revision, validator version and original content byte count.
+The result source retains metadata, path and permission fields. Storage workers
+keep full source bodies; the final response owner performs certification once,
+including column-backed and deferred-hydration responses. Source containers are
+copied only along the content path; retained source/cache objects are immutable.
+
+The client verifies the proof before accepting an omitted body, then applies
+its ordinary permission/path filters and accounts eligible files/original bytes.
+All ordered IDs still participate in document budgets and cursor checks.
+Malformed proofs fail explicitly. Invalid documents retain their bodies and
+ordinary errors. NUL-containing content, UTF-8 BOMs and unsupported encodings or
+modes retain full content. Finite source-byte budgets, multiline, decision,
+inverted, count/list, zero-count, sorted and early-stop searches do not request
+this optimization. Missing proof support retains ordinary full-body scanning;
+snapshot loss/expiry retains the existing explicit error behavior. The feature
+is opt-in for server-version compatibility.
+
+Caller-provided trigram markers remain insufficient for exact JSON pruning.
+A future ingestion-owned, revision-bound validation/synopsis index could avoid
+server content reads too, but must preserve the same logical validation,
+authorization, ordering and accounting contract. This implementation establishes
+the response contract without trusting caller-maintained certificates or adding
+a new persistent cache.

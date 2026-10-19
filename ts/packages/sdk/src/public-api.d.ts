@@ -10750,6 +10750,26 @@ export interface components {
              */
             search_effort?: number;
             /**
+             * @description Opt-in v1 exact grep miss accounting for ascending _id snapshot scans.
+             *     Necessary UTF-8 byte literal alternatives permit the server to omit only
+             *     validated nonmatching content. Every document retains its ordered hit,
+             *     metadata and permissions. Server-owned _computed.antfly_grep_miss_v1
+             *     binds request identity, snapshot, ID, revision and original byte count.
+             *     Unsupported or malformed documents retain their complete bodies.
+             *     This reduces wire bytes, not storage scanning. Clients must verify the
+             *     accounting proof before skipping lexical evaluation. Requires stored
+             *     sources; incompatible with graph, hierarchy or evaluation queries.
+             */
+            grep_scan?: {
+                /** @enum {integer} */
+                version: 1;
+                document_field: string;
+                /** @description Necessary byte literals; total UTF-8 bytes may not exceed 16384. */
+                alternatives: string[];
+                /** Format: uint64 */
+                max_content_bytes: number;
+            };
+            /**
              * @description List of fields to include in the results. If not specified, all fields are returned.
              *     Use to reduce response size and improve performance. This field is required when
              *     hierarchy.group_by is present so a grouped query cannot accidentally hydrate an

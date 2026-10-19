@@ -76,6 +76,11 @@
               }
             },
             "description": "Complete raw-content byte trigrams encoded as lowercase hex keyword terms; atomic with the source revision. Opt-in acceleration only."
+          },
+          "accounted_misses": {
+            "type": "boolean",
+            "default": false,
+            "description": "Request server-owned v1 exact miss proofs for supported JSON/statistics scans. Retains all ordered hits and logical accounting; unsupported documents carry full content."
           }
         }
       }

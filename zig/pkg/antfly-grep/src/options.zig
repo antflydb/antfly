@@ -22,6 +22,8 @@ pub const Options = struct {
     workspace_watch: bool = false,
     workspace_parallel_open: bool = false,
     workspace_memory_limit: usize = 256 * 1024 * 1024,
+    workspace_watch_memory_limit: usize = 32 * 1024 * 1024,
+    workspace_watch_limit: usize = 65536,
     workspace_max_files: usize = 100000,
     table_config: ?[]const u8 = null,
     tables: std.ArrayList([]const u8) = .empty,
@@ -164,6 +166,7 @@ pub const Options = struct {
     json_compact: bool = false,
     // Private workspace registration negotiation; never enabled by CLI flags.
     json_batches: bool = false,
+    json_tuples: bool = false,
     help: bool = false,
     version: bool = false,
     before: usize = 0,
@@ -541,6 +544,11 @@ pub const Options = struct {
                     self.workspace_memory_limit = try size(value);
                 } else if (std.mem.eql(u8, name, "--workspace-max-files")) {
                     self.workspace_max_files = try number(value);
+                } else if (std.mem.eql(u8, name, "--workspace-watch-memory-limit")) {
+                    self.workspace_watch_memory_limit = try size(value);
+                } else if (std.mem.eql(u8, name, "--workspace-watch-limit")) {
+                    self.workspace_watch_limit = try number(value);
+                    if (self.workspace_watch_limit > 1048576) return error.InvalidNumber;
                 } else if (std.mem.eql(u8, name, "--regex-size-limit")) {
                     self.regex_size_limit = try size(value);
                 } else if (std.mem.eql(u8, name, "--dfa-size-limit")) {

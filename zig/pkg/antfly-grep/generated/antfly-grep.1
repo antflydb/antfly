@@ -55,6 +55,8 @@ Use '-' for stdin; '--' ends option parsing.
       --decision-batch-wait-ms N  Cross-file gather window (default 1ms; 0 disables)
       --max-spill-bytes N     Ranked/inventory scratch cap (default 1GiB)
       --workspace-memory-limit SIZE  Retained snapshot cap (default 256M)
+      --workspace-watch-memory-limit SIZE  Namespace metadata/event cap (default 32M)
+      --workspace-watch-limit N  Namespace/source watch admission cap (default 65536)
       --workspace-watch        Use kernel witnesses for explicit refresh
       --workspace-parallel-open  Overlap cold opens (may use more CPU)
       --workspace-max-files N  Snapshot entry cap (default 100000)
@@ -667,6 +669,12 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --workspace-watch
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --workspace-watch-limit
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --workspace-watch-memory-limit
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --yes

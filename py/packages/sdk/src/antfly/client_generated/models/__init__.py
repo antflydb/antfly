@@ -1170,6 +1170,8 @@ from .query_request import QueryRequest
 from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
 from .query_request_foreign_sources import QueryRequestForeignSources
+from .query_request_grep_scan import QueryRequestGrepScan
+from .query_request_grep_scan_version import QueryRequestGrepScanVersion
 from .query_request_query import QueryRequestQuery
 from .query_responses import QueryResponses
 from .query_result import QueryResult
@@ -2702,6 +2704,8 @@ __all__ = (
     "QueryRequestAggregations",
     "QueryRequestEmbeddings",
     "QueryRequestForeignSources",
+    "QueryRequestGrepScan",
+    "QueryRequestGrepScanVersion",
     "QueryRequestQuery",
     "QueryResponses",
     "QueryResult",

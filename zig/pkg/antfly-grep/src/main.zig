@@ -68,6 +68,8 @@ const help =
     \\      --decision-batch-wait-ms N  Cross-file gather window (default 1ms; 0 disables)
     \\      --max-spill-bytes N     Ranked/inventory scratch cap (default 1GiB)
     \\      --workspace-memory-limit SIZE  Retained snapshot cap (default 256M)
+    \\      --workspace-watch-memory-limit SIZE  Namespace metadata/event cap (default 32M)
+    \\      --workspace-watch-limit N  Namespace/source watch admission cap (default 65536)
     \\      --workspace-watch        Use kernel witnesses for explicit refresh
     \\      --workspace-parallel-open  Overlap cold opens (may use more CPU)
     \\      --workspace-max-files N  Snapshot entry cap (default 100000)

@@ -132,6 +132,70 @@ class StreamingViewTests(unittest.TestCase):
         self.assertEqual(v.materialize()[1]["file_id"], "a")
         self.assertIn(b'"batch"', v.files[b"a"])
 
+    def test_v4_tuples_decode_only_the_requested_file(self):
+        frames = [
+            {
+                "type": "begin",
+                "file_id": "a",
+                "data": {"path": {"text": "a"}},
+                "source": {},
+            },
+            {
+                "type": "batch",
+                "file_id": "a",
+                "result_schema_version": 4,
+                "rows": [
+                    [0, 2, 9, {"text": "é STOP\n"}, []],
+                    [1, 3, 17, {"bytes": "/w=="}, []],
+                ],
+            },
+            {"type": "end", "file_id": "a", "data": {}},
+        ]
+        p = Payloads()
+        for row in frames:
+            p.consume(row, json.dumps(row).encode())
+        v = View(
+            "h",
+            revision="rev",
+            token="token",
+            observed_at=42,
+            files={**p.finish(), b"unread": b"deliberately invalid JSON"},
+        )
+        rows = v.materialize_file(b"a")
+        self.assertEqual(
+            [r["type"] for r in rows], ["begin", "match", "context", "end"]
+        )
+        self.assertEqual(rows[1]["data"]["line_number"], 2)
+        self.assertEqual(rows[2]["data"]["lines"], {"bytes": "/w=="})
+        self.assertEqual(rows[0]["source"], {"snapshot": "rev", "observed_at": 42})
+        with self.assertRaises(KeyError):
+            v.materialize_file(b"missing")
+
+    def test_malformed_v4_tuples_fail_before_publication(self):
+        from retained import validate_batch
+
+        for event in (
+            [],
+            [0, 1, 0, {}, []],
+            [False, 1, 0, {"text": ""}, []],
+            [0, -1, 0, {"text": ""}, []],
+            [0, 1, 0, {"text": 4}, []],
+            [2, 1, 0, {"text": ""}, []],
+        ):
+            with (
+                self.subTest(event=event),
+                self.assertRaisesRegex(RuntimeError, "invalid batch"),
+            ):
+                validate_batch(
+                    {
+                        "type": "batch",
+                        "result_schema_version": 4,
+                        "file_id": "a",
+                        "rows": [event],
+                    },
+                    200,
+                )
+
     def test_malformed_batches_are_rejected_before_staging(self):
         for events in (
             [],

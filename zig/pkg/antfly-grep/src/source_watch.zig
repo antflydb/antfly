@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const supported = builtin.link_libc and (builtin.os.tag == .macos or builtin.os.tag == .linux);
 pub const Token = struct { slot: usize, generation: u64, sequence: u64 };
 pub const Watch = struct {
+    allocator: std.mem.Allocator = std.heap.page_allocator,
     fd: c_int = -1,
     failed: bool = false,
     // Strict kqueue witnesses consume one FD per inode. Reserve descriptor
@@ -57,8 +58,13 @@ pub const Watch = struct {
         self.open();
         return self;
     }
+    pub fn initNamespace(limit: usize) Watch {
+        var self: Watch = .{ .limit = limit };
+        self.open();
+        return self;
+    }
     /// Source witnesses grow lazily and retain strict per-inode certification.
-    /// Namespace journals keep their independent 4096-route bound. Never use
+    /// Namespace journals use an independently budgeted dynamic route table. Never use
     /// advisory asynchronous events as proof of unchanged source contents.
     pub fn initSources() Watch {
         // Synchronous Linux directory queues already extend regular-file
@@ -90,14 +96,14 @@ pub const Watch = struct {
             _ = std.c.close(self.fd);
         };
         self.fd = -1;
-        self.handles.deinit(std.heap.page_allocator);
+        self.handles.deinit(self.allocator);
         self.handles = .empty;
-        self.identities.deinit(std.heap.page_allocator);
+        self.identities.deinit(self.allocator);
         self.identities = .empty;
-        self.events.deinit(std.heap.page_allocator);
+        self.events.deinit(self.allocator);
         self.events = .empty;
         self.event_count = 0;
-        self.slots.deinit(std.heap.page_allocator);
+        self.slots.deinit(self.allocator);
         self.slots = .empty;
         self.free_head = null;
     }
@@ -146,8 +152,8 @@ pub const Watch = struct {
         const size = @min(self.limit, @max(256, old * 2));
         // Both allocations finish before any slots are published. Event
         // delivery and slot recycling never allocate or walk the whole table.
-        self.events.ensureTotalCapacityPrecise(std.heap.page_allocator, size) catch return null;
-        self.slots.ensureTotalCapacityPrecise(std.heap.page_allocator, size) catch return null;
+        self.events.ensureTotalCapacityPrecise(self.allocator, size) catch return null;
+        self.slots.ensureTotalCapacityPrecise(self.allocator, size) catch return null;
         self.slots.items.len = size;
         for (old..size) |i| self.slots.items[i] = .{ .next_free = if (i + 1 < size) i + 1 else null };
         self.free_head = old;
@@ -219,11 +225,11 @@ pub const Watch = struct {
                 return null;
             }
         }
-        if (comptime builtin.os.tag == .linux) self.handles.put(std.heap.page_allocator, handle, free) catch {
+        if (comptime builtin.os.tag == .linux) self.handles.put(self.allocator, handle, free) catch {
             _ = std.c.inotify_rm_watch(self.fd, handle);
             return null;
         };
-        self.identities.put(std.heap.page_allocator, id, free) catch {
+        self.identities.put(self.allocator, id, free) catch {
             if (comptime builtin.os.tag == .linux) {
                 _ = self.handles.remove(handle);
                 _ = std.c.inotify_rm_watch(self.fd, handle);

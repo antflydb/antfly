@@ -35,6 +35,7 @@ pub fn prepare(a: std.mem.Allocator, base: *const Options, args: []const []const
     if (o.paths.items.len != 0 or o.table_config != null or o.pre != null or o.hostname_bin != null or o.search_zip or o.pattern_files.items.len != 0 or o.inventory or o.files or o.cache_clear or o.generate != null or o.help or o.version or o.pcre2_version or o.type_list or o.sort != null or
         o.globs.items.len != 0 or o.iglobs.items.len != 0 or o.types.items.len != 0 or o.types_not.items.len != 0 or o.ignore_files.items.len != 0 or o.type_clear.items.len != 0 or o.type_add.items.len != 0 or o.exclude.items.len != 0 or o.triage or o.workspace_watch or o.workspace_parallel_open) return error.UnsupportedWorkspaceQueryOptions;
     const defaults: Options = .{};
+    if (o.workspace_watch_memory_limit != defaults.workspace_watch_memory_limit or o.workspace_watch_limit != defaults.workspace_watch_limit) return error.UnsupportedWorkspaceQueryOptions;
     inline for (.{ "hidden", "no_ignore", "no_ignore_vcs", "no_ignore_global", "no_ignore_parent", "no_ignore_dot", "no_ignore_exclude", "no_ignore_files", "follow", "one_file_system", "max_depth", "max_files", "include_dependencies", "include_sensitive" }) |name| {
         if (@field(o, name) != @field(defaults, name)) return error.UnsupportedWorkspaceQueryOptions;
     }

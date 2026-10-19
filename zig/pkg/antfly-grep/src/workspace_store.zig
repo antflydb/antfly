@@ -189,6 +189,7 @@ pub const Generation = struct {
             return fallback;
         };
         j.sealGeneration(w, next);
+        if (o.trace) std.debug.print("antfly-grep: coverage namespace={} sources={} routes={d} metadata={d}/{d} denied={}\n", .{ j.coverage, j.sources_covered, j.routing.items.len, j.budget.live, j.budget.limit, j.budget.denied });
         next.watch_fallback = !j.sources_covered or !j.coverage;
         return next;
     }

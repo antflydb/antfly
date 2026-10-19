@@ -4396,6 +4396,8 @@ pub const GlobalStatefulQueryRequest = struct {
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
+    /// Opt-in v1 exact grep miss accounting for ascending _id snapshot scans. Necessary UTF-8 byte literal alternatives permit the server to omit only validated nonmatching content. Every document retains its ordered hit, metadata and permissions. Server-owned _computed.antfly_grep_miss_v1 binds request identity, snapshot, ID, revision and original byte count. Unsupported or malformed documents retain their complete bodies. This reduces wire bytes, not storage scanning. Clients must verify the accounting proof before skipping lexical evaluation. Requires stored sources; incompatible with graph, hierarchy or evaluation queries.
+    grep_scan: ?std.json.Value = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
@@ -4469,6 +4471,7 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "aggregations", "aggregations", true },
         .{ "embeddings", "embeddings", true },
         .{ "search_effort", "search_effort", true },
+        .{ "grep_scan", "grep_scan", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "highlight", "highlight", true },
@@ -4579,6 +4582,10 @@ pub const GlobalStatefulQueryRequest = struct {
         }
         if (self.search_effort) |value| {
             try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.grep_scan) |value| {
+            try jw.objectField("grep_scan");
             try jw.write(value);
         }
         if (self.fields) |value| {
@@ -8165,6 +8172,8 @@ pub const QueryRequest = struct {
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
+    /// Opt-in v1 exact grep miss accounting for ascending _id snapshot scans. Necessary UTF-8 byte literal alternatives permit the server to omit only validated nonmatching content. Every document retains its ordered hit, metadata and permissions. Server-owned _computed.antfly_grep_miss_v1 binds request identity, snapshot, ID, revision and original byte count. Unsupported or malformed documents retain their complete bodies. This reduces wire bytes, not storage scanning. Clients must verify the accounting proof before skipping lexical evaluation. Requires stored sources; incompatible with graph, hierarchy or evaluation queries.
+    grep_scan: ?std.json.Value = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
@@ -8229,6 +8238,7 @@ pub const QueryRequest = struct {
         .{ "aggregations", "aggregations", true },
         .{ "embeddings", "embeddings", true },
         .{ "search_effort", "search_effort", true },
+        .{ "grep_scan", "grep_scan", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "highlight", "highlight", true },
@@ -8334,6 +8344,10 @@ pub const QueryRequest = struct {
         }
         if (self.search_effort) |value| {
             try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.grep_scan) |value| {
+            try jw.objectField("grep_scan");
             try jw.write(value);
         }
         if (self.fields) |value| {
@@ -14161,6 +14175,8 @@ pub const StatefulQueryRequest = struct {
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
+    /// Opt-in v1 exact grep miss accounting for ascending _id snapshot scans. Necessary UTF-8 byte literal alternatives permit the server to omit only validated nonmatching content. Every document retains its ordered hit, metadata and permissions. Server-owned _computed.antfly_grep_miss_v1 binds request identity, snapshot, ID, revision and original byte count. Unsupported or malformed documents retain their complete bodies. This reduces wire bytes, not storage scanning. Clients must verify the accounting proof before skipping lexical evaluation. Requires stored sources; incompatible with graph, hierarchy or evaluation queries.
+    grep_scan: ?std.json.Value = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
@@ -14229,6 +14245,7 @@ pub const StatefulQueryRequest = struct {
         .{ "aggregations", "aggregations", true },
         .{ "embeddings", "embeddings", true },
         .{ "search_effort", "search_effort", true },
+        .{ "grep_scan", "grep_scan", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "highlight", "highlight", true },
@@ -14336,6 +14353,10 @@ pub const StatefulQueryRequest = struct {
         }
         if (self.search_effort) |value| {
             try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.grep_scan) |value| {
+            try jw.objectField("grep_scan");
             try jw.write(value);
         }
         if (self.fields) |value| {

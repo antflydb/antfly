@@ -189,5 +189,7 @@ _arguments -s \
  '--workspace-memory-limit[workspace-memory-limit]:value:' \
  '--workspace-parallel-open[workspace-parallel-open]' \
  '--workspace-watch[workspace-watch]' \
+ '--workspace-watch-limit[workspace-watch-limit]:value:' \
+ '--workspace-watch-memory-limit[workspace-watch-memory-limit]:value:' \
  '--yes[yes]' \
  '1:command or pattern:(ask files auth doctor skill cache workspace)' '*:path:_files'
