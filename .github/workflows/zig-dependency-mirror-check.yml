@@ -19,6 +19,8 @@ jobs:
           submodules: true
       - uses: ./.github/actions/load-toolchain-policy
         id: toolchain
+      - name: Install Zig archive tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xz-utils
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
