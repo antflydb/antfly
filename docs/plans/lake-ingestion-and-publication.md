@@ -2771,8 +2771,9 @@ A complete authenticated materialized aggregate cohort can transfer a finalized
 group stream into SQL execution. The reader proves unique final groups and full
 requested-slot coverage, and the executor retains only its current result page.
 It skips rebuilding a hash table and spilling already reduced groups. Queries
-with an upper predicate or aggregate FILTER, or recipes spanning independent
-cohorts, retain partial-state merging. Group counts, scan pages, current table
+with an aggregate FILTER, or recipes spanning independent cohorts, retain
+partial-state merging. Group-key predicates now use the bounded finalized
+stream described below. Group counts, scan pages, current table
 and reader authority, cancellation and final response limits still apply.
 NUMERIC finalization clones borrowed reducer state before populating its result
 memo, preserving shared cache immutability. Stream ownership transfers only on
@@ -2796,3 +2797,44 @@ including active read-ahead cancellation and main's encoded grouping fallback.
 The broad affected lake/native selection passes 361 native and 255 shared
 regressions with zero failures or leaks. The large-directory and spilled
 pack-proof stress cases are included in that selection.
+
+
+### Protocol 61: persistent native generations and selective finalized groups
+
+Dense and sparse metadata version 4 stores generation version 2: an authenticated
+file map whose values reference ordinal chunk maps. Checkpoints retain immutable
+prefix subtrees and path-copy only changed file descriptors, partial tails and
+new chunks. An unchanged large prefix needs no source reads or page writes; the
+root no longer serializes every historical chunk reference. Logical generation
+bytes and newly published data/page work keep independent limits. File descriptor
+enumeration remains bounded by the existing 8,192-file ceiling; this change removes
+the growing chunk-array copy, not every file-level planning operation. Metadata
+versions 2 and 3 and inline generation roots remain readable and migrate when
+next published.
+
+Readers resolve only the requested file/chunk pages and use the authenticated
+read cache. Both audit collection and durable resumable collection trace file
+maps, chunk maps and payloads, including maps retained by older reader roots.
+Protocol 61 prevents an older reader/collector from accepting this publication
+without understanding those dependencies.
+
+A mixed cold publication keeps eligible incremental builders in the file-major
+shared scan even when another aggregate requires ordinary non-incremental
+execution or Iceberg delete handling. Fallback units finish separately under the
+same final atomic publication; contribution directories transfer with their
+owning result.
+
+Complete finalized aggregate cohorts accept residual predicates over grouping
+keys before finalizing aggregate states. Equality on every grouping key can
+select a single radix path when literals have the exact stored representation;
+SQL NULL keys are supported. Mixed comparison domains retain residual evaluation
+without hash pruning. Aggregate FILTERs and filtered global aggregates retain
+partial-state execution, preserving the empty global COUNT result.
+
+The adapter retains one bounded input page and its accepted positions, independently
+of result fragment size. Raw provider pages consume the input-page quota; a late
+selective predicate with LIMIT 1 does not degrade into one source pull per group.
+Explicit unordered LIMIT/OFFSET stops finalized result consumption after enough
+rows pass HAVING. Ordered aggregates, ORDER BY and external decision evaluation
+keep their established paths. Authority, cancellation, grouping and response
+limits remain active. Attachment, index configuration and SQL syntax are unchanged.

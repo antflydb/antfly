@@ -26,29 +26,57 @@ const Storage = local.storage_lsm_backend.Storage;
 pub const chunk_bytes = 256 * 1024;
 pub const max_chunks = 65536;
 pub const max_root_bytes = 16 * 1024 * 1024;
-pub const File = struct { path: []const u8, bytes: u64, chunks: []const artifacts.ChunkRef };
+const native_directory = @import("lake_index_native_directory.zig");
+pub const File = struct {
+    path: []const u8,
+    bytes: u64,
+    chunks: []const artifacts.ChunkRef = &.{},
+    chunk_root: ?native_directory.tree.Ref = null,
+    pub fn validate(self: File, domain: [32]u8) !void {
+        if (!validPath(self.path)) return error.InvalidNativeLakeFiles;
+        const expected = self.bytes / chunk_bytes + @intFromBool(self.bytes % chunk_bytes != 0);
+        if (expected > max_chunks) return error.InvalidNativeLakeFiles;
+        if (self.chunk_root) |root| {
+            try root.validate();
+            if (self.chunks.len != 0 or root.records != expected) return error.InvalidNativeLakeFiles;
+        } else {
+            if (self.chunks.len != expected) return error.InvalidNativeLakeFiles;
+            for (self.chunks, 0..) |ref, ordinal| {
+                if (ref.byte_len != @min(chunk_bytes, self.bytes - @as(u64, @intCast(ordinal)) * chunk_bytes)) return error.InvalidNativeLakeFiles;
+                try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
+                const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeFiles;
+                if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeFiles;
+            }
+        }
+    }
+};
 pub const Root = struct {
     version: u16 = 1,
     domain: [32]u8,
-    files: []const File,
+    files: []const File = &.{},
+    directory: ?native_directory.tree.Ref = null,
+    file_count: u32 = 0,
+    chunk_count: u64 = 0,
     pub fn validate(self: Root) !void {
-        if (self.version != 1 or std.mem.allEqual(u8, &self.domain, 0) or self.files.len > 8192) return error.InvalidNativeLakeFiles;
+        if (std.mem.allEqual(u8, &self.domain, 0)) return error.InvalidNativeLakeFiles;
+        if (self.version == 2) {
+            if (self.files.len != 0 or self.file_count > 8192 or self.chunk_count > max_chunks) return error.InvalidNativeLakeFiles;
+            if (self.directory) |root| {
+                try root.validate();
+                if (root.records != self.file_count) return error.InvalidNativeLakeFiles;
+            } else if (self.file_count != 0 or self.chunk_count != 0) return error.InvalidNativeLakeFiles;
+            return;
+        }
+        if (self.version != 1 or self.directory != null or self.files.len > 8192) return error.InvalidNativeLakeFiles;
         var count: usize = 0;
         var previous: ?[]const u8 = null;
         for (self.files) |file| {
             if (!validPath(file.path)) return error.InvalidNativeLakeFiles;
             if (previous) |prior| if (std.mem.order(u8, prior, file.path) != .lt) return error.InvalidNativeLakeFiles;
             previous = file.path;
-            const expected = file.bytes / chunk_bytes + @intFromBool(file.bytes % chunk_bytes != 0);
-            if (file.chunks.len != expected) return error.InvalidNativeLakeFiles;
-            count = std.math.add(usize, count, file.chunks.len) catch return error.InvalidNativeLakeFiles;
+            try file.validate(self.domain);
+            count = std.math.add(usize, count, @intCast(file.bytes / chunk_bytes + @intFromBool(file.bytes % chunk_bytes != 0))) catch return error.InvalidNativeLakeFiles;
             if (count > max_chunks) return error.InvalidNativeLakeFiles;
-            for (file.chunks, 0..) |chunk, ordinal| {
-                if (chunk.byte_len != @min(chunk_bytes, file.bytes - @as(u64, @intCast(ordinal)) * chunk_bytes)) return error.InvalidNativeLakeFiles;
-                try stores.validateSha256ArtifactIdentity(chunk.artifact_id, chunk.checksum);
-                const scope = (try stores.uploadScopeFromArtifactId(chunk.artifact_id)) orelse return error.InvalidNativeLakeFiles;
-                if (!std.mem.eql(u8, &scope.domain, &self.domain)) return error.InvalidNativeLakeFiles;
-            }
         }
     }
     pub fn find(self: Root, path: []const u8) ?File {
@@ -84,11 +112,23 @@ pub const Reuse = struct {
         @memcpy(buffer[self.prefix.len..][0..path.len], path);
         return self.root.find(buffer[0 .. self.prefix.len + path.len]);
     }
-    fn prior(self: Reuse, store: *stores.ArtifactStore, path: []const u8, ordinal: usize) !?artifacts.ChunkRef {
+    pub fn lookup(self: Reuse, store: stores.ArtifactStore, path: []const u8, token: Cancellation) !?File {
+        var buffer: [4096]u8 = undefined;
+        if (self.prefix.len + path.len > buffer.len) return null;
+        @memcpy(buffer[0..self.prefix.len], self.prefix);
+        @memcpy(buffer[self.prefix.len..][0..path.len], path);
+        var file = (try native_directory.lookup(self.root, store, buffer[0 .. self.prefix.len + path.len], token, null)) orelse return null;
+        file.path = path;
+        return file;
+    }
+    fn prior(self: Reuse, a: A, store: *stores.ArtifactStore, path: []const u8, ordinal: usize, token: Cancellation) !?artifacts.ChunkRef {
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
         if (!std.mem.eql(u8, &scope.domain, &self.root.domain)) return error.InvalidNativeLakeFiles;
-        const file = self.find(path) orelse return null;
-        return if (ordinal < file.chunks.len) file.chunks[ordinal] else null;
+        const file = (try self.lookup(store.*, path, token)) orelse return null;
+        if (ordinal >= file.bytes / chunk_bytes + @intFromBool(file.bytes % chunk_bytes != 0)) return null;
+        var access: native_directory.Access = undefined;
+        access.init(store.*, self.root.domain, token, null);
+        return try native_directory.chunk(a, &access, file, ordinal);
     }
 };
 /// Logical generation size and new physical publication work have independent
@@ -106,7 +146,7 @@ pub const OutputBudget = struct {
 };
 fn putChunk(out: A, path: []const u8, ordinal: usize, bytes: []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, reuse: ?Reuse, budget: OutputBudget) !artifacts.ChunkRef {
     try cancellation.check();
-    if (reuse) |old| if (try old.prior(store, path, ordinal)) |ref| {
+    if (reuse) |old| if (try old.prior(out, store, path, ordinal, cancellation)) |ref| {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         if (ref.byte_len == bytes.len and std.mem.eql(u8, &digest, &try stores.sha256DigestFromChecksum(ref.checksum))) return .{ .artifact_id = try out.dupe(u8, ref.artifact_id), .checksum = try out.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
@@ -135,13 +175,14 @@ pub fn publishPrefix(a: A, out: A, source: Storage, physical: []const u8, relati
     if (!validPath(relative)) return error.InvalidNativeLakeFiles;
     const n = std.math.cast(usize, size / chunk_bytes + @intFromBool(size % chunk_bytes != 0)) orelse return error.NativeLakeFilesTooLarge;
     if (n > max_chunks) return error.NativeLakeFilesTooLarge;
+    if (n > 8 or (if (reuse) |old| old.root.directory != null else false)) return native_directory.publishPrefix(a, out, source, physical, relative, size, store, cancellation, budget, reuse);
     try stores.chargeReadBudget(budget.generation, size);
     const chunks = try out.alloc(artifacts.ChunkRef, n);
     for (chunks, 0..) |*chunk, ordinal| {
         const offset = @as(u64, @intCast(ordinal)) * chunk_bytes;
         try cancellation.check();
         const length = @min(chunk_bytes, size - offset);
-        if (reuse) |old| if (try old.prior(store, relative, ordinal)) |ref| {
+        if (reuse) |old| if (try old.prior(out, store, relative, ordinal, cancellation)) |ref| {
             // A full old block is immutable even when this WAL prefix grows.
             if (ref.byte_len == length) {
                 chunk.* = .{ .artifact_id = try out.dupe(u8, ref.artifact_id), .checksum = try out.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
@@ -238,7 +279,7 @@ pub const Reader = struct {
     block_bytes: usize = 0,
     block_tick: u64 = 0,
     const Block = struct {
-        id: []const u8,
+        id: []u8,
         size: usize,
         used: u64,
         refs: std.atomic.Value(usize) = .init(1),
@@ -249,6 +290,7 @@ pub const Reader = struct {
         fn release(self: *Block) void {
             if (self.refs.fetchSub(1, .acq_rel) != 1) return;
             if (self.state.load(.acquire) == .ready) self.data.deinit(std.heap.page_allocator);
+            std.heap.page_allocator.free(self.id);
             std.heap.page_allocator.destroy(self);
         }
     };
@@ -318,7 +360,12 @@ pub const Reader = struct {
             self.block_mutex.unlock();
             return err;
         };
-        block.* = .{ .id = ref.artifact_id, .size = @intCast(ref.byte_len), .used = self.block_tick };
+        const owned_id = std.heap.page_allocator.dupe(u8, ref.artifact_id) catch |err| {
+            std.heap.page_allocator.destroy(block);
+            self.block_mutex.unlock();
+            return err;
+        };
+        block.* = .{ .id = owned_id, .size = @intCast(ref.byte_len), .used = self.block_tick };
         if (target) |slot| {
             _ = block.refs.fetchAdd(1, .monotonic);
             self.blocks[slot] = block;
@@ -361,11 +408,15 @@ pub const Reader = struct {
     fn file(self: *Reader, path: []const u8) !File {
         try self.check();
         if (!std.mem.startsWith(u8, path, self.prefix) or path.len <= self.prefix.len or path[self.prefix.len] != '/') return error.FileNotFound;
-        return self.root.find(path[self.prefix.len + 1 ..]) orelse error.FileNotFound;
+        return (try native_directory.lookup(self.root, self.store, path[self.prefix.len + 1 ..], self.cancellation, self.cache)) orelse error.FileNotFound;
     }
     fn readInto(raw: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
         const self = from(raw);
         const entry = try self.file(path);
+        var metadata = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer metadata.deinit();
+        var access: native_directory.Access = undefined;
+        access.init(self.store, self.root.domain, self.cancellation, self.cache);
         if (offset > entry.bytes or out.len > entry.bytes - offset) return error.EndOfStream;
         // Start at most two requested successor chunks, and join them before
         // returning so no task can outlive this request's reader/context.
@@ -377,17 +428,20 @@ pub const Reader = struct {
             const first: usize = @intCast(offset / chunk_bytes);
             const last: usize = @intCast((offset + out.len - 1) / chunk_bytes);
             for (0..@min(2, last - first)) |slot| {
-                const ref = entry.chunks[first + slot + 1];
+                const ref = try native_directory.chunk(metadata.allocator(), &access, entry, first + slot + 1);
                 tasks[slot] = local.sql_parallel_scheduler.global().submitTransient(io, @intCast(ref.byte_len), prefetch, .{ self, ref });
             }
         };
+        var chunk_metadata = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer chunk_metadata.deinit();
         var copied: usize = 0;
         while (copied < out.len) {
+            _ = chunk_metadata.reset(.free_all);
             try self.check();
             const position = offset + copied;
             const ordinal: usize = @intCast(position / chunk_bytes);
             const inside: usize = @intCast(position % chunk_bytes);
-            const block = try self.acquireBlock(entry.chunks[ordinal]);
+            const block = try self.acquireBlock(try native_directory.chunk(chunk_metadata.allocator(), &access, entry, ordinal));
             defer block.release();
             const bytes = block.data.bytes();
             const n = @min(out.len - copied, bytes.len - inside);
@@ -449,7 +503,9 @@ pub fn materialize(a: A, io: std.Io, root: Root, store: stores.ArtifactStore, ta
     const buffer = try a.alloc(u8, chunk_bytes);
     defer a.free(buffer);
     var budget: u64 = 1024 * 1024 * 1024;
-    for (root.files) |file| {
+    var metadata = std.heap.ArenaAllocator.init(a);
+    defer metadata.deinit();
+    for (try native_directory.entries(metadata.allocator(), root, store, cancellation)) |file| {
         try context.ensureActive();
         try cancellation.check();
         try stores.chargeReadBudget(&budget, file.bytes);
@@ -856,7 +912,9 @@ pub const Overlay = struct {
             try names.put(a, copy_name, {});
         }
         const relative = if (path.len == self.base.prefix.len) "" else path[self.base.prefix.len + 1 ..];
-        for (self.base.root.files) |file_entry| {
+        var metadata = std.heap.ArenaAllocator.init(a);
+        defer metadata.deinit();
+        for (try native_directory.entries(metadata.allocator(), self.base.root, self.base.store, self.base.cancellation)) |file_entry| {
             const parent = std.fs.path.dirname(file_entry.path) orelse "";
             if (!std.mem.eql(u8, relative, parent)) continue;
             const name = std.fs.path.basename(file_entry.path);
@@ -952,7 +1010,11 @@ test "external lake native chunk flights overlap distinct loads and share identi
 test "external lake chunk wait observes its own deadline" {
     const io = std.testing.io;
     const block = try std.heap.page_allocator.create(Reader.Block);
-    block.* = .{ .id = "pending", .size = 0, .used = 0, .refs = .init(2) };
+    const id = std.heap.page_allocator.dupe(u8, "pending") catch |err| {
+        std.heap.page_allocator.destroy(block);
+        return err;
+    };
+    block.* = .{ .id = id, .size = 0, .used = 0, .refs = .init(2) };
     defer block.release();
     var reader: Reader = .{ .root = undefined, .prefix = "", .store = undefined, .scratch = std.testing.allocator, .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 100 * std.time.ns_per_ms } };
     const Worker = struct {

@@ -130,6 +130,11 @@ fn append(comptime T: type, a: A, left: []const T, right: []const T) ![]const T 
     return joined;
 }
 fn merge(a: A, result: *Result, part: Result) !void {
+    if (part.contribution_root) |root| {
+        if (result.contribution_root != null) return error.InvalidLakeIndexCatalog;
+        result.contribution_root = root;
+        result.contribution_roots = part.contribution_roots;
+    }
     result.native.declarations = try append(Declared, a, result.native.declarations, part.native.declarations);
     result.native.contributions = try append(Contribution, a, result.native.contributions, part.native.contributions);
     result.ordered = try append(Declared, a, result.ordered, part.ordered);
@@ -164,14 +169,30 @@ pub fn build(args: Args) !?Result {
     const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(args.a) orelse return null;
     var desired = args.provider.limits.max_input_bytes +| args.provider.limits.max_decoded_bytes *| 2;
     for (units) |unit| desired +|= allowance(unit.kind);
-    if (units.len > Pipeline.width or desired +| (1024 * 1024) > @min(available, scheduler.max_pull_bytes)) {
-        if (try buildFileMajor(args, units)) |result| return result;
-    }
     const pending = try arena.allocator().alloc(bool, units.len);
     @memset(pending, true);
     var remaining = units.len;
     var completed = false;
     var result: Result = .{};
+    if (units.len > Pipeline.width or desired +| (1024 * 1024) > @min(available, scheduler.max_pull_bytes)) {
+        try args.provider.source.ensureInventory(args.provider.context);
+        const source = args.provider.source;
+        const deletes = source.inventory.deleted_row_groups.len != 0 or (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len != 0 else false);
+        var eligible: std.ArrayList(Unit) = .empty;
+        var positions: std.ArrayList(usize) = .empty;
+        for (units, 0..) |unit, index| if (unit.incremental and !(unit.kind == .aggregate and deletes)) {
+            try eligible.append(arena.allocator(), unit);
+            try positions.append(arena.allocator(), index);
+        };
+        // Independent fallbacks must not force compatible text/vector/ordered
+        // builders to repeat the archive scan for every retained-state cohort.
+        if (eligible.items.len >= 2) if (try buildFileMajor(args, eligible.items)) |part| {
+            try merge(args.out, &result, part);
+            for (positions.items) |index| pending[index] = false;
+            remaining -= positions.items.len;
+            completed = true;
+        };
+    }
     while (remaining >= 2) {
         var cohort: [Pipeline.width]Unit = undefined;
         var indexes: [Pipeline.width]usize = undefined;
@@ -1048,6 +1069,19 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(u64, 36), windows_rows);
     try std.testing.expectEqual(@as(usize, 0), file_major.pull_bytes);
     try std.testing.expectEqual(@as(usize, 0), file_major.workers);
+    // One non-incremental AVG must leave the nine compatible configurations
+    // on their shared file-major pass. Only AVG needs its separate full pass.
+    const original_table = args.table;
+    var mixed_table = original_table;
+    mixed_table.indexes_json = try std.mem.concat(out, u8, &.{ original_table.indexes_json[0 .. original_table.indexes_json.len - 1], ",\"averages\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"avg_amount\",\"op\":\"avg\",\"measure\":\"amount\"}]}}" });
+    args.table = mixed_table;
+    const before_mixed = replay.captures;
+    const mixed = (try build(args)) orelse return error.TestUnexpectedResult;
+    args.table = original_table;
+    try std.testing.expectEqual(@as(usize, 9), replay.captures - before_mixed);
+    try std.testing.expectEqual(@as(usize, 4), mixed.native.declarations.len);
+    try std.testing.expectEqual(windows_result.text.len, mixed.text.len);
+    try std.testing.expect(mixed.contribution_root != null);
     // Interrupt current consumers after scheduling the next capture. Both
     // windows and all reservations must retire before the failed build returns.
     interrupt.after = replay.captures + 4;

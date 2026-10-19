@@ -954,6 +954,12 @@ pub const Adapter = struct {
         composition: ?*@import("lake_index_aggregate_composition.zig").Composition = null,
         transferred: bool = false,
         started: bool = false,
+        final_request: ?catalog.FinalGroupRequest = null,
+        final_page: std.heap.ArenaAllocator,
+        final_rows: []const @import("antfly_local_sources").sql_operators.GroupResult = &.{},
+        final_positions: []const usize = &.{},
+        final_position: usize = 0,
+        visited_pages: usize = 0,
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             self.adapter.context.ensureActive() catch return true;
@@ -975,7 +981,7 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!self.transferred) close(raw);
         }
-        fn adoptFinal(raw: *anyopaque, grouped: *@import("antfly_local_sources").sql_operators.Grouped, page_limit: usize) anyerror!bool {
+        fn adoptFinal(raw: *anyopaque, grouped: *@import("antfly_local_sources").sql_operators.Grouped, request: catalog.FinalGroupRequest) anyerror!bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.started or self.transferred) return error.InvalidSqlBackendResponse;
             const first = if (self.composition) |composition| try composition.prime() else self.child;
@@ -988,37 +994,65 @@ pub const Adapter = struct {
             }
             for (grouped.specs, self.recipe.inputs) |spec, input| if (!std.meta.eql(spec, input.spec)) return error.InvalidSqlBackendResponse;
             try self.adapter.verify(self.a, self.table);
-            try grouped.adoptFinalized(.{ .ptr = self, .count = std.math.cast(usize, proof.count) orelse return error.SqlProgramLimitExceeded, .next = nextFinal, .close = close }, page_limit);
+            if (request.point) |point| if (first.select_point) |select| try select(first.ptr, point);
+            self.final_request = request;
+            try grouped.adoptFinalized(.{ .ptr = self, .count = std.math.cast(usize, proof.count) orelse return error.SqlProgramLimitExceeded, .exact_count = request.predicate == null and request.point == null, .next = nextFinal, .close = close }, request.page_limit);
             self.transferred = true;
             return true;
         }
         fn nextFinal(raw: *anyopaque, a: std.mem.Allocator, maximum: usize, exact: bool) anyerror!?@import("antfly_local_sources").sql_operators.GroupBatch {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const local = @import("antfly_local_sources");
-            const rows = (try next(raw, a, std.math.cast(u32, maximum) orelse return error.InvalidSqlLimit)) orelse return null;
-            const keys = try a.alloc([]const local.sql_scalar.Datum, rows.len);
-            const values = try a.alloc([]const local.sql_scalar.Datum, rows.len);
-            const ordinals = try a.alloc(u64, rows.len);
-            for (rows, keys, values, ordinals) |row, *key, *value, *ordinal| {
-                if (row.keys.len != self.recipe.keys.len or try local.sql_aggregate_partial.partialCount(row) != self.recipe.inputs.len) return error.InvalidSqlBackendResponse;
-                const slots = row.aggregate_slots;
+            const request = self.final_request.?;
+            // Retain one bounded provider page while small result pulls consume it.
+            // Quotas count provider pages, independent of LIMIT and result framing.
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            while (self.final_position == self.final_positions.len) {
+                _ = self.final_page.reset(.free_all);
+                const pa = self.final_page.allocator();
+                const rows = (try next(raw, pa, request.batch_rows)) orelse return null;
+                self.visited_pages += 1;
+                if (self.visited_pages > request.page_limit) return error.SqlProgramLimitExceeded;
+                const positions = try pa.alloc(usize, rows.len);
+                var accepted: usize = 0;
+                for (rows, 0..) |row, index| {
+                    if (row.keys.len != self.recipe.keys.len or try local.sql_aggregate_partial.partialCount(row) != self.recipe.inputs.len) return error.InvalidSqlBackendResponse;
+                    _ = scratch.reset(.free_all);
+                    if (request.predicate) |predicate| if (!try predicate.matches(predicate.ptr, scratch.allocator(), row.keys)) continue;
+                    positions[accepted] = index;
+                    accepted += 1;
+                }
+                self.final_rows = rows;
+                self.final_positions = positions[0..accepted];
+                self.final_position = 0;
+            }
+            const count = @min(maximum, self.final_positions.len - self.final_position);
+            const keys = try a.alloc([]const local.sql_scalar.Datum, count);
+            const values = try a.alloc([]const local.sql_scalar.Datum, count);
+            const ordinals = try a.alloc(u64, count);
+            for (self.final_positions[self.final_position..][0..count], 0..) |index, output| {
+                const row = self.final_rows[index];
                 const cells = try a.alloc(local.sql_scalar.Datum, self.recipe.inputs.len);
                 var populated: [256]bool = @splat(false);
+                _ = scratch.reset(.free_all);
                 for (0..cells.len) |logical| {
-                    const slot = if (slots) |map| map[logical] else logical;
+                    const slot = if (row.aggregate_slots) |map| map[logical] else logical;
                     if (slot >= cells.len or populated[slot]) return error.InvalidSqlBackendResponse;
                     populated[slot] = true;
-                    const state = try local.sql_aggregate_partial.read(a, row, logical, self.recipe.inputs[slot].spec);
+                    const state = try local.sql_aggregate_partial.read(scratch.allocator(), row, logical, self.recipe.inputs[slot].spec);
                     cells[slot] = if (exact) try local.sql_aggregate_partial.cell(a, state) else try local.sql_aggregate_partial.finishBorrowed(a, state);
                 }
                 const key_cells = try a.alloc(local.sql_scalar.Datum, row.keys.len);
                 for (key_cells, row.keys) |*cell, input| cell.* = try local.sql_operators.cloneDatum(a, input);
-                key.* = key_cells;
-                value.* = cells;
-                ordinal.* = row.ordinal;
+                keys[output] = key_cells;
+                values[output] = cells;
+                ordinals[output] = row.ordinal;
             }
+            self.final_position += count;
             return .{ .keys = .{ .rows = keys }, .aggregates = .{ .rows = values }, .ordinals = ordinals };
         }
+
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const cursor = self.child;
@@ -1031,6 +1065,7 @@ pub const Adapter = struct {
         fn destroyControl(self: *@This()) void {
             const a = self.a;
             if (self.reader_lease) |lease| lease.deinit();
+            self.final_page.deinit();
             self.arena.deinit();
             a.destroy(self);
         }
@@ -1087,6 +1122,7 @@ pub const Adapter = struct {
         owner.a = a;
         owner.reader_lease = null;
         owner.arena = .init(a);
+        owner.final_page = .init(a);
         var keep_owner = false;
         defer if (!keep_owner) owner.destroyControl();
         owner.store = @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir) catch |err| {
@@ -1124,6 +1160,11 @@ pub const Adapter = struct {
         owner.composition = null;
         owner.transferred = false;
         owner.started = false;
+        owner.final_request = null;
+        owner.final_rows = &.{};
+        owner.final_positions = &.{};
+        owner.final_position = 0;
+        owner.visited_pages = 0;
         owner.a = a;
         owner.adapter = self;
         owner.table = table;
@@ -3787,6 +3828,7 @@ test "lake SQL failed aggregate admission releases control before its descriptor
             owner.a = a;
             owner.reader_lease = null;
             owner.arena = .init(a);
+            owner.final_page = .init(a);
             defer owner.destroyControl();
             _ = try owner.arena.allocator().alloc(u8, 128);
             return error.NativeArtifactStorageRequired;

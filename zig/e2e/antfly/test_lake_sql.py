@@ -6417,9 +6417,11 @@ def test_compact_parquet_encodings_attach_query_and_restart(
         server.stop(test_failed=failed)
 
 
-@pytest.mark.parametrize("text_copies,parts", [(7, 3), (33, 3), (33, 9)])
+@pytest.mark.parametrize(
+    "text_copies,parts,key_count", [(7, 3, 17), (33, 3, 17), (33, 9, 17), (7, 3, 521)]
+)
 def test_native_configuration_cohorts_and_group_directories_survive_restart(
-    tmp_path, text_copies, parts
+    tmp_path, text_copies, parts, key_count
 ):
     """Resident and file-major builds retain exact results through source loss/restart."""
     pa = pytest.importorskip("pyarrow")
@@ -6433,7 +6435,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         *(f"words_{i}" for i in range(text_copies - 2)),
     )
     base = 9007199254740993
-    expected = {k: [0, 0] for k in range(17)}
+    expected = {k: [0, 0] for k in range(key_count)}
     originals = []
     for part in range(parts):
         ids = list(range(part * 512, (part + 1) * 512))
@@ -6441,7 +6443,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         pq.write_table(
             pa.table(
                 {
-                    "k": pa.array([i % 17 for i in ids], type=pa.int64()),
+                    "k": pa.array([i % key_count for i in ids], type=pa.int64()),
                     "amount": pa.array(
                         [None if i % 19 == 0 else base + i % 7 for i in ids],
                         type=pa.int64(),
@@ -6470,8 +6472,8 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         target.write_bytes(header + payload)
         originals.append((target, header, payload))
         for i in ids:
-            expected[i % 17][0] += 1
-            expected[i % 17][1] += 0 if i % 19 == 0 else base + i % 7
+            expected[i % key_count][0] += 1
+            expected[i % key_count][1] += 0 if i % 19 == 0 else base + i % 7
     server = StandaloneAntflyServer(
         resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
         "127.0.0.1",
@@ -6481,6 +6483,8 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
     try:
 
         def call(method, route, body=None, *, ddl=False):
+            if route == "/sql":
+                body = {**body, "limit": max(128, key_count)}
             response = _request_with_idle_ddl_retry(
                 server, method, route, body, retry_ddl=ddl
             )
@@ -6573,6 +6577,10 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
             for k, (count, total) in sorted(expected.items())
         ]
         assert call("POST", "/sql", {"statement": statement})["rows"] == rows
+        # Filtered global aggregates preserve their ordinary empty-input path.
+        assert call(
+            "POST", "/sql", {"statement": "SELECT COUNT(*) FROM native_cohorts WHERE FALSE"}
+        )["rows"] == [["0"]]
         server.pause()
         for target, header, payload in originals:
             footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
@@ -6589,6 +6597,32 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         assert call(
             "POST", "/sql", {"statement": "SELECT COUNT(*) FROM native_cohorts"}
         )["rows"] == [[str(parts * 512)]]
+        for predicate, matches in [
+            ("k = 3", [3]),
+            ("k >= 12", list(range(12, key_count))),
+            ("k = 3.0", [3]),
+            ("k IS NULL", []),
+        ]:
+            filtered = f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts WHERE {predicate} GROUP BY k ORDER BY k"
+            assert call("POST", "/sql", {"statement": filtered})["rows"] == [
+                [str(k), str(expected[k][0]), str(expected[k][1])] for k in matches
+            ]
+        last = key_count - 1
+        for predicate in (f"k = {last}", f"k >= {last}"):
+            selective = call(
+                "POST", "/sql",
+                {"statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts WHERE {predicate} GROUP BY k LIMIT 1"},
+            )["rows"]
+            assert selective == [[str(last), str(expected[last][0]), str(expected[last][1])]]
+        limited = call(
+            "POST", "/sql",
+            {"statement": "SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k LIMIT 3 OFFSET 2"},
+        )["rows"]
+        assert len(limited) == 3
+        assert len({row[0] for row in limited}) == 3
+        for row in limited:
+            k = int(row[0])
+            assert row == [str(k), str(expected[k][0]), str(expected[k][1])]
         failed = False
     finally:
         server.stop(test_failed=failed)

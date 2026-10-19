@@ -230,17 +230,64 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
     }
 }
 
-fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner: **operators.Grouped, table: catalog.Table) !bool {
+/// Only an exactly typed full key may select a persisted hash bucket. Mixed
+/// comparison domains keep residual filtering without speculative pruning.
+fn materializedPoint(a: std.mem.Allocator, recipe: @import("aggregate_materialization.zig").Recipe, conditions: []const catalog.Condition) !?[]const Datum {
+    if (recipe.keys.len == 0) return null;
+    const keys = try a.alloc(Datum, recipe.keys.len);
+    for (recipe.keys, keys) |key, *out| {
+        const condition = for (conditions) |condition| {
+            if (std.mem.eql(u8, key.path, condition.column) and (condition.op == .eq or condition.op == .is_null)) break condition;
+        } else return null;
+        const value = if (condition.op == .is_null) Datum{} else condition.datum();
+        if (!value.sql_null) {
+            const valid = switch (key.type) {
+                .integer => value.numeric == null and value.value == .integer,
+                .string, .datetime => value.numeric == null and value.value == .string,
+                .boolean => value.numeric == null and value.value == .bool,
+                .number => if (key.element_type == .numeric) value.numeric != null else value.numeric == null and value.value == .float,
+                else => false,
+            };
+            if (!valid) return null;
+        }
+        out.* = value;
+    }
+    return keys;
+}
+
+fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner: **operators.Grouped, table: catalog.Table, conditions: []const catalog.Condition) !bool {
     const open = context.backend.vtable.aggregate_partials orelse return false;
     const reuse = (try @import("aggregate_materialization.zig").reuseFromBound(context.arena, table, bound.*)) orelse return false;
     const recipe = reuse.recipe;
     const cursor = (try open(context.backend.ptr, context.alloc, table, recipe)) orelse return false;
     defer cursor.close(cursor.ptr);
-    if (bound.input.predicate == null and for (bound.filters) |filter| {
+    if ((bound.input.predicate == null or bound.group_count != 0) and for (bound.filters) |filter| {
         if (filter != null) break false;
     } else true) {
-        if (cursor.adopt_final_groups) |adopt| if (try adopt(cursor.ptr, grouped_owner.*, context.limits.scan_pages)) return true;
-        if (cursor.take_final_groups) |take| if (try take(cursor.ptr)) |final| {
+        if (cursor.adopt_final_groups) |adopt| {
+            const Predicate = struct {
+                context: @TypeOf(context),
+                bound: *const binding.Bound,
+                columns: []const u32,
+                fn matches(raw: *anyopaque, a: std.mem.Allocator, keys: []const Datum) anyerror!bool {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (keys.len != self.columns.len) return error.InvalidSqlBackendResponse;
+                    const cells = try a.alloc(Datum, self.bound.input.columns.len);
+                    @memset(cells, .{});
+                    for (self.columns, keys) |column, key| cells[column] = key;
+                    return self.bound.input.matchesWithLimits(a, cells, self.context.parameters, self.context.backend.decision_provider, @import("decision_eval.zig").limitsFor(self.context.backend));
+                }
+            };
+            var request: catalog.FinalGroupRequest = .{ .page_limit = context.limits.scan_pages, .batch_rows = context.limits.executionRows() };
+            if (bound.input.predicate != null) {
+                const predicate = try context.arena.create(Predicate);
+                predicate.* = .{ .context = context, .bound = bound, .columns = reuse.key_columns };
+                request.predicate = .{ .ptr = predicate, .matches = Predicate.matches };
+                request.point = try materializedPoint(context.arena, recipe, conditions);
+            }
+            if (try adopt(cursor.ptr, grouped_owner.*, request)) return true;
+        }
+        if (bound.input.predicate == null) if (cursor.take_final_groups) |take| if (try take(cursor.ptr)) |final| {
             grouped_owner.*.deinit();
             grouped_owner.* = final;
             return true;
@@ -353,7 +400,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         var pages: usize = 0;
         var visited: usize = 0;
         var native_quota: @import("native_scan_quota.zig").Quota = .{ .capacity = context.limits.executionRows(), .row_limit = context.limits.scan_rows, .page_limit = context.limits.scan_pages };
-        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, &grouped, table) else false;
+        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, &grouped, table, predicates.terms.items) else false;
         collector.grouped = grouped;
         const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
             if (spec.kind != .count or spec.distinct or input != null or filter != null) break false;
@@ -430,13 +477,17 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         const projection = try decision.SortedProjection.init(context.arena, bound.outputs, bound.orders, bound.order_outputs);
         try addGroupedDecisionPages(context, bound, &collector, &top, projection);
         return projection.finish(context, &top, offset, limit, statement.limit == null);
-    } else while (true) {
+    }
+    const early_limit = grouped.finalized != null and bound.ordered.len == 0 and statement.order_by.len == 0 and statement.limit != null;
+    var delivered: usize = 0;
+    result_pages: while (true) {
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
+        const maximum: u32 = @intCast(if (early_limit and bound.having == null) @min(context.limits.executionRows(), capacity - delivered) else context.limits.executionRows());
         const groups: operators.GroupBatch = if (bound.ordered.len == 0)
-            (try grouped.nextResultBatch(alloc, context.limits.executionRows(), false)) orelse break
+            (try grouped.nextResultBatch(alloc, maximum, false)) orelse break
         else ordered: {
             const group = (try collector.nextResult(context, alloc)) orelse break;
             const keys = try alloc.alloc([]const Datum, 1);
@@ -485,6 +536,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             for (outputs, values) |column, *value| value.* = column[row];
             for (ordering, keys) |column, *key| key.* = column[row];
             try top.add(.{ .values = values, .keys = keys, .ordinal = groups.ordinals[physical] });
+            delivered += 1;
+            if (early_limit and delivered == capacity) break :result_pages;
         }
     }
     if (context.sink != null) return context.emitTop(&top, offset, limit, statement.limit == null);

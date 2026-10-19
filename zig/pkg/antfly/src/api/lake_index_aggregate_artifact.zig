@@ -608,6 +608,7 @@ pub const Reader = struct {
     partition_states: ?[]const PartitionMap = null,
     cohort: ?Cohort = null,
     blocks_decoded: usize = 0,
+    point_hash: ?u64 = null,
 
     /// The caller selects an authorized publication first. Errors after that
     /// selection abort the query, never combine partials with a fresh scan.
@@ -679,6 +680,7 @@ pub const Reader = struct {
         const reader = try Reader.openWithCache(self.a, self.store, part.artifact, self.root.recipe, self.cancellation, self.cached);
         errdefer reader.cursor().close(reader);
         reader.max_typed_bytes = self.max_typed_bytes;
+        reader.point_hash = self.point_hash;
         if (isPartitioned(part.artifact.metadata_version) and reader.root.radix_depth != self.root.radix_depth + 1) return error.InvalidNativeAggregateArtifact;
         if (reader.root.groups != part.groups) return error.InvalidNativeAggregateArtifact;
         if (self.partition_states) |maps| {
@@ -755,8 +757,13 @@ pub const Reader = struct {
     pub fn groupCount(self: *const Reader) u64 {
         return self.root.groups;
     }
+    fn selectPoint(raw: *anyopaque, keys: []const local.sql_scalar.Datum) !void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        if (self.emitted != 0 or self.child != null or keys.len != self.root.recipe.keys.len) return error.InvalidNativeAggregateArtifact;
+        self.point_hash = try groupHash(keys);
+    }
     pub fn cursor(self: *Reader) local.sql_catalog.AggregatePartialCursor {
-        return .{ .ptr = self, .next = next, .close = close, .final_group_proof = .{ .count = self.root.groups, .slots = self.output_slots orelse &.{0} } };
+        return .{ .ptr = self, .next = next, .close = close, .select_point = selectPoint, .final_group_proof = .{ .count = self.root.groups, .slots = self.output_slots orelse &.{0} } };
     }
     fn next(raw: *anyopaque, a: A, maximum: u32) !?[]const operators.GroupResult {
         const self: *Reader = @ptrCast(@alignCast(raw));
@@ -766,9 +773,13 @@ pub const Reader = struct {
         if (self.root.partitions.len != 0) while (true) {
             if (self.child == null) {
                 if (self.partition_index == self.root.partitions.len) {
-                    if (self.emitted != self.root.groups) return error.InvalidNativeAggregateArtifact;
+                    if (self.point_hash == null and self.emitted != self.root.groups) return error.InvalidNativeAggregateArtifact;
                     return null;
                 }
+                if (self.point_hash) |hash| if (self.root.partitions[self.partition_index].bucket != (hash >> partitionShift(self.root.radix_depth)) % partitionFanout(self.root.radix_depth)) {
+                    self.partition_index += 1;
+                    continue;
+                };
                 self.child = try self.partitionReader(self.partition_index);
                 self.partition_index += 1;
             }
@@ -1960,4 +1971,54 @@ test "external lake adaptive packs split wide resident groups by encoded bytes" 
     var count: usize = 0;
     while (try reader.cursor().next(reader, out, 256)) |rows| count += rows.len;
     try std.testing.expectEqual(@as(usize, 128), count);
+}
+
+test "external lake aggregate point selection reads one authenticated radix bucket" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var temporary = try local.common_test_directory.TestDirectory.init("aggregate-point-read");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false };
+    defer manager.deinit();
+    const specs = [_]operators.AggregateSpec{.{ .kind = .count }};
+    const recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "k", .type = .integer, .nullable = true }}, .inputs = &.{.{ .spec = specs[0], .column = null }} };
+    const group = try operators.Grouped.create(a, &specs, .{ .bytes = 8 * 1024 * 1024 });
+    defer group.deinit();
+    for (0..512) |index| try group.add(&.{local.sql_scalar.Datum.json(.{ .integer = @intCast(index) })}, &.{local.sql_scalar.Datum.json(.{ .integer = 1 })});
+    try group.add(&.{.{}}, &.{local.sql_scalar.Datum.json(.{ .integer = 1 })});
+    const refs = try publishPartitioned(a, out, &store, &.{"stats.count"}, group, recipe, &manager, .none);
+    const reader = try Reader.open(a, store, refs[0], recipe, .none);
+    defer reader.cursor().close(reader);
+    try std.testing.expect(reader.root.partitions.len > 1);
+    try reader.cursor().select_point.?(reader, &.{local.sql_scalar.Datum.json(.{ .integer = 123 })});
+    var found = false;
+    var seen: usize = 0;
+    while (try reader.cursor().next(reader, out, 256)) |rows| for (rows) |row| {
+        seen += 1;
+        if (!row.keys[0].sql_null and row.keys[0].value.integer == 123) found = true;
+    };
+    try std.testing.expect(found);
+    try std.testing.expect(seen < 32);
+    try std.testing.expectEqual(@as(usize, 1), reader.blocks_decoded);
+    const null_reader = try Reader.open(a, store, refs[0], recipe, .none);
+    defer null_reader.cursor().close(null_reader);
+    try null_reader.cursor().select_point.?(null_reader, &.{.{}});
+    found = false;
+    seen = 0;
+    while (try null_reader.cursor().next(null_reader, out, 256)) |rows| for (rows) |row| {
+        seen += 1;
+        found = found or row.keys[0].sql_null;
+    };
+    try std.testing.expect(found);
+    try std.testing.expect(seen < 32);
+    try std.testing.expectEqual(@as(usize, 1), null_reader.blocks_decoded);
 }

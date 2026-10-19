@@ -1488,6 +1488,7 @@ pub const Grouped = struct {
     pub const Finalized = struct {
         ptr: *anyopaque,
         count: usize,
+        exact_count: bool = true,
         next: *const fn (*anyopaque, Allocator, usize, bool) anyerror!?GroupBatch,
         close: *const fn (*anyopaque) void,
     };
@@ -1539,7 +1540,7 @@ pub const Grouped = struct {
             self.finalized_pages += 1;
             if (self.finalized_pages > self.finalized_page_limit or batch.ordinals.len > source.count -| self.output_count) return error.SqlProgramLimitExceeded;
             self.output_count += batch.ordinals.len;
-        } else if (self.output_count != source.count) return error.InvalidSqlBackendResponse;
+        } else if (source.exact_count and self.output_count != source.count) return error.InvalidSqlBackendResponse;
         return result;
     }
     fn clearGroups(self: *Grouped) void {

@@ -761,13 +761,26 @@ pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed,
 /// Keys and versioned aggregate cells borrow the supplied page allocator until the next pull.
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
+pub const FinalGroupRequest = struct {
+    page_limit: usize,
+    /// Input batch size is independent of the requested result fragment.
+    batch_rows: u32 = 4096,
+    /// Complete, exactly typed grouping key for native hash/range pruning.
+    point: ?[]const @import("scalar.zig").Datum = null,
+    predicate: ?struct {
+        ptr: *anyopaque,
+        matches: *const fn (*anyopaque, std.mem.Allocator, []const @import("scalar.zig").Datum) anyerror!bool,
+    } = null,
+};
+
 pub const AggregatePartialCursor = struct {
     /// Providers may prove a unique complete cohort before the first pull.
     /// Slots refer to the requested recipe, independent of physical order.
     final_group_proof: ?struct { count: u64, slots: []const u16 } = null,
+    select_point: ?*const fn (*anyopaque, []const @import("scalar.zig").Datum) anyerror!void = null,
     /// Transfer the cursor's ownership into an empty result operator. False
     /// preserves the ordinary partial path; a successful transfer is streamed.
-    adopt_final_groups: ?*const fn (*anyopaque, *@import("operators.zig").Grouped, usize) anyerror!bool = null,
+    adopt_final_groups: ?*const fn (*anyopaque, *@import("operators.zig").Grouped, FinalGroupRequest) anyerror!bool = null,
     /// Optional ownership transfer before the first pull. The provider proves
     /// one state per final recipe key, with the exact recipe slots and limits.
     /// A successful transfer leaves close responsible only for cursor resources.

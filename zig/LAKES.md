@@ -1316,8 +1316,27 @@ fallback. Only complete final roots enter serving/recovery publication.
 Wide aggregate groups fall back from flat packs to byte-bounded immutable blocks
 without requiring a grouping spill. Complete authenticated aggregate cohorts can
 stream final groups directly to SQL result execution, avoiding a second hash
-reducer and spill pass. Full slot coverage and absence of an upper predicate or
-aggregate FILTER are required. Group/page/response limits, current authority and
+reducer and spill pass. Full slot coverage and absence of an aggregate FILTER are required; grouping-key
+predicates can use the selective finalized stream below. Group/page/response limits, current authority and
 reader lifetime checks remain active. Exact NUMERIC finalization leaves shared
-cached states immutable. No durable format, attachment or query syntax changes
-are required.
+cached states immutable. Attachment and query syntax are unchanged.
+
+
+Protocol 61 adds dense/sparse metadata version 4 with authenticated persistent
+native generation maps (generation version 2). File descriptors reference ordinal
+chunk trees; immutable prefixes survive checkpoints by reference, while partial
+tails and appended chunks path-copy bounded pages. Legacy inline generations and
+metadata versions 2/3 remain readable. Logical generation size and newly written
+payload/page work remain independently bounded. File descriptor enumeration keeps
+the existing 8,192-file limit. Readers cache authenticated navigation pages, and
+both audit and resumable GC follow map pages and payloads under reader protection.
+
+Mixed cold publications retain eligible shared-scan builders while incompatible
+aggregate units use their ordinary fallback. Final publication remains atomic.
+Complete aggregate cohorts filter grouping keys before state finalization and
+prune to one radix path for exactly typed full-key equality, including NULL.
+Mixed-domain comparisons keep residual filtering. One bounded input page survives
+small result pulls, so source page limits are independent of result framing.
+Unordered explicit LIMIT/OFFSET stops consumption after HAVING accepts enough rows.
+Aggregate FILTERs, filtered global aggregates, ordered evaluation and independent
+cohorts preserve their existing fallback behavior.

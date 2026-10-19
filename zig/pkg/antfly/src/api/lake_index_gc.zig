@@ -448,9 +448,7 @@ pub const Collector = struct {
                     for (root.file_states) |file| for (file.docs) |document_ref| {
                         _ = try self.mark(document_ref);
                     };
-                    for (root.generation.files) |file| for (file.chunks) |chunk| {
-                        _ = try self.mark(chunk);
-                    };
+                    try self.markNativeGeneration(a, root.generation);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .vector_segment => {
@@ -461,14 +459,52 @@ pub const Collector = struct {
                     for (root.file_states) |file| for (file.docs) |document_ref| {
                         _ = try self.mark(document_ref);
                     };
-                    for (root.generation.files) |file| for (file.chunks) |chunk| {
-                        _ = try self.mark(chunk);
-                    };
+                    try self.markNativeGeneration(a, root.generation);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .graph_metric_segment => if (ref.metadata_version != local.serverless_manifest_artifact_ref.graph_metric_segment_wire_version) return error.InvalidNativeLakeGcReference,
             else => return error.InvalidNativeLakeGcReference,
         }
+    }
+    fn markNativeGeneration(self: *Collector, a: A, root: @import("lake_index_native_files.zig").Root) !void {
+        if (root.directory) |page| return self.markGenerationPage(a, root.domain, page, false);
+        for (root.files) |file| {
+            if (file.chunk_root) |page| try self.markGenerationPage(a, root.domain, page, true);
+            for (file.chunks) |ref| _ = try self.mark(ref);
+        }
+    }
+    pub fn markGenerationPage(self: *Collector, a: A, domain: [32]u8, root: @import("../serverless/graph_segment/page_tree.zig").Ref, chunks: bool) anyerror!void {
+        if (self.progress) |progress| {
+            try progress.enqueue(.{ .page = .{ .ref = root, .ordered_rows = false, .native_generation = !chunks, .native_chunks = chunks } });
+            return;
+        }
+        const directory = @import("lake_index_native_directory.zig");
+        var writes: u64 = 0;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.cancellation(), .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &writes };
+        const Walker = struct {
+            collector: *Collector,
+            a: A,
+            domain: [32]u8,
+            chunks: bool,
+            pub fn visitRecord(w: *@This(), _: directory.tree.Ref, key: []const u8, bytes: []const u8) !void {
+                var scratch = std.heap.ArenaAllocator.init(w.a);
+                defer scratch.deinit();
+                if (w.chunks) {
+                    if (key.len != 8) return error.InvalidNativeLakeGcReference;
+                    _ = try w.collector.mark(try directory.decodeChunk(scratch.allocator(), bytes, w.domain));
+                } else {
+                    const file = try directory.decodeFile(scratch.allocator(), key, bytes, w.domain);
+                    if (file.chunk_root) |page| try w.collector.markGenerationPage(w.a, w.domain, page, true);
+                }
+            }
+            pub fn skip(w: *@This(), page: directory.tree.Ref) !bool {
+                const ref: artifacts.ChunkRef = .{ .artifact_id = &try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(w.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes };
+                return !try w.collector.expand(ref, .native_page, if (w.chunks) "native-generation-chunks" else "native-generation-files");
+            }
+            pub fn visit(_: *@This(), _: directory.tree.Ref) !void {}
+        };
+        var walker: Walker = .{ .collector = self, .a = a, .domain = domain, .chunks = chunks };
+        try directory.tree.walkPostOrder(a, pages.store(), root, &walker, false);
     }
     pub fn markNativeFiles(self: *Collector, a: A, domain: [32]u8, root: @import("../serverless/graph_segment/page_tree.zig").Ref) !void {
         return self.markPagesMode(a, domain, root, false, true);
@@ -679,10 +715,11 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     sparse_binding.sidecar_kind = .sparse;
     var sparse_child = try store.put("authenticated native sparse file block");
     defer sparse_child.deinit(a);
+    const paged_generation = try @import("lake_index_native_directory.zig").persist(a, ca, &store, .{ .domain = domain, .files = &.{.{ .path = "manifest.bin", .bytes = sparse_child.byte_len, .chunks = &.{.{ .artifact_id = sparse_child.artifact_id, .checksum = sparse_child.checksum, .byte_len = sparse_child.byte_len }} }} }, null, .none, null);
     const sparse_bytes = try std.json.Stringify.valueAlloc(ca, @import("lake_index_native_sparse.zig").Root{
         .binding = sparse_binding,
         .config_json = "{}",
-        .generation = .{ .domain = domain, .files = &.{.{ .path = "manifest.bin", .bytes = sparse_child.byte_len, .chunks = &.{.{ .artifact_id = sparse_child.artifact_id, .checksum = sparse_child.checksum, .byte_len = sparse_child.byte_len }} }} },
+        .generation = paged_generation,
     }, .{});
     var sparse_upload = try store.put(sparse_bytes);
     defer sparse_upload.deinit(a);
