@@ -32,6 +32,10 @@ pub fn status(operation: c_int, request_json: []const u8, has_deadline: bool, er
 }
 
 fn statusWithLogger(operation: c_int, request_json: []const u8, has_deadline: bool, err: anyerror, comptime log: anytype) bridge.Status {
+    // A publication race is retryable across the provider boundary too. It
+    // must not become a permanent per-document InferenceProviderFailure.
+    if (err == error.ModelArtifactsChanging or err == error.IncompleteManagedDownload)
+        return bridge.statusFromError(error.ResourceTemporarilyUnavailable);
     if (bridge.errorHasStableDetail(err)) return bridge.statusFromError(err);
     const fingerprint = diagnostics.fingerprint(operation, err, request_json);
     const noted = diagnostics.note(&failures, fingerprint);
@@ -77,4 +81,12 @@ test "provider owner logs private cause before stable transport without double r
     const forwarded = statusWithLogger(0, "", false, bridge.errorFromStatus(owned), Probe.log);
     try std.testing.expectEqual(error.InferenceProviderFailure, bridge.errorFromStatus(forwarded));
     try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+}
+
+test "model publication races remain transient through repeated provider hops" {
+    for ([_]anyerror{ error.ModelArtifactsChanging, error.IncompleteManagedDownload }) |cause| {
+        const first = status(0, "", false, cause);
+        const second = status(0, "", false, bridge.errorFromStatus(first));
+        try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, bridge.errorFromStatus(second));
+    }
 }

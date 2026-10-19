@@ -4203,6 +4203,9 @@ fn preserveArtifactVisibilityUsingLookup(
         else
             false;
         const targeted_sibling_continuity = untouched_targeted_sibling and
+            // Continuity bridges missing/older observations. An ordered owner
+            // publication already proves progress, including real deletes.
+            serving_order != .newer and
             (exact_structural_sibling or
                 incoming.metadata.freshness == .opening or
                 incoming.metadata.freshness == .catching_up) and
@@ -9474,6 +9477,62 @@ fn consumerTests() type {
                 try cache.publishGroups(stale_token, "docs", &statuses),
             );
             try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
+        }
+
+        test "targeted structural publication accepts newer sibling counters (#1207)" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var rows = [_]db_mod.types.DBIndexStats{.{
+                .name = @constCast("full_text_index_v0"),
+                .kind = .full_text,
+                .coverage_generation = 1,
+                .coverage_config_hash = 91,
+                .coverage_identity_ready = true,
+                .projection_checkpoint_config_hash = 91,
+                .serving_publication = .{ .owner_epoch = 1, .revision = 1, .applied_through = 0 },
+            }};
+            const initial = try cache.capturePublicationToken("docs");
+            _ = try cache.publishGroup(initial, "docs", .{
+                .group_id = 7,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+                .stats = .{ .index_count = 1, .indexes = &rows },
+            });
+            _ = cache.fenceTargetedIndexPublications("docs", "vectors");
+            // An in-place sibling publication observed after writes is newer
+            // than the retained pre-DDL observation, even while DDL is active.
+            rows[0].serving_publication = .{ .owner_epoch = 1, .revision = 2, .applied_through = 2 };
+            rows[0].doc_count = 2;
+            rows[0].term_count = 3;
+            rows[0].replay_applied_sequence = 2;
+            rows[0].replay_target_sequence = 2;
+            const token = try cache.capturePublicationToken("docs");
+            _ = try cache.publishTargetedGroups(token, "docs", "vectors", &.{.{
+                .group_id = 7,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+                .stats = .{ .doc_count = 2, .index_count = 1, .indexes = &rows },
+            }});
+            var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer observed.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 2), observed.stats.indexes[0].doc_count);
+            try std.testing.expectEqual(@as(u64, 3), observed.stats.indexes[0].term_count);
+            // A later delete is equally authoritative; continuity must not
+            // turn into a monotonic-count floor.
+            rows[0].serving_publication = .{ .owner_epoch = 1, .revision = 3, .applied_through = 3 };
+            rows[0].doc_count = 1;
+            rows[0].term_count = 2;
+            rows[0].replay_applied_sequence = 3;
+            rows[0].replay_target_sequence = 3;
+            const delete_token = try cache.capturePublicationToken("docs");
+            _ = try cache.publishTargetedGroups(delete_token, "docs", "vectors", &.{.{
+                .group_id = 7,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+                .stats = .{ .doc_count = 1, .index_count = 1, .indexes = &rows },
+            }});
+            var deleted = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer deleted.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 1), deleted.stats.indexes[0].doc_count);
+            try std.testing.expectEqual(@as(u64, 2), deleted.stats.indexes[0].term_count);
         }
 
         test "targeted structural publication cannot regress an untouched sibling generation" {

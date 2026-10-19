@@ -30,24 +30,57 @@ import test_backup_restore as backups
 import test_standalone as standalone
 
 
-@pytest.mark.parametrize(
-    "missing",
-    [
-        None,
-        "clipclap-clip.Q4_K.gguf",
-        "clipclap-clap.Q4_K.gguf",
-        "antfly_inference_variants.json",
-    ],
-)
-def test_clipclap_availability_matches_current_model_artifacts(tmp_path, missing):
-    for name in (
-        "clipclap-clip.Q4_K.gguf",
-        "clipclap-clap.Q4_K.gguf",
-        "antfly_inference_variants.json",
-    ):
+@pytest.mark.parametrize("missing", [None, *e2e_conftest.EMBEDDINGGEMMA2_FILES])
+def test_embeddinggemma2_availability_requires_complete_bundle(tmp_path, missing):
+    for name in e2e_conftest.EMBEDDINGGEMMA2_FILES:
         if name != missing:
-            (tmp_path / name).write_bytes(b"fixture")
-    assert e2e_conftest._clipclap_gguf_available(tmp_path) == (missing is None)
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fixture")
+    assert e2e_conftest._embeddinggemma2_available(tmp_path) == (missing is None)
+    (tmp_path / ".antfly-download-in-progress").touch()
+    assert not e2e_conftest._embeddinggemma2_available(tmp_path)
+
+
+def test_embeddinggemma2_model_dir_uses_managed_variant_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert e2e_conftest._embeddinggemma2_model_dir() == (
+        tmp_path
+        / ".antfly/inference/models/google/embeddinggemma-2--antfly-b093c73188527d2b"
+    )
+
+
+def test_embeddinggemma2_download_uses_quickstart_bundle(tmp_path, monkeypatch):
+    model_dir = tmp_path / "model"
+    binary = tmp_path / "antfly"
+    binary.touch()
+    monkeypatch.setenv(e2e_conftest.ALLOW_REAL_MODEL_DOWNLOAD_ENV, "1")
+    monkeypatch.setenv("ANTFLY_BIN", str(binary))
+    monkeypatch.setattr(e2e_conftest, "_embeddinggemma2_model_dir", lambda: model_dir)
+    commands = []
+
+    def download(command, **kwargs):
+        commands.append(command)
+        for name in e2e_conftest.EMBEDDINGGEMMA2_FILES:
+            path = model_dir / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+
+    monkeypatch.setattr(e2e_conftest.subprocess, "run", download)
+    assert e2e_conftest.embeddinggemma2_model_available.__wrapped__() == model_dir
+    assert commands == [
+        [
+            str(binary),
+            "inference",
+            "pull",
+            f"hf:{e2e_conftest.EMBEDDINGGEMMA2_MODEL}",
+            "--tasks",
+            "embed",
+        ]
+    ]
+    # Reuse a complete install without pulling again.
+    assert e2e_conftest.embeddinggemma2_model_available.__wrapped__() == model_dir
+    assert len(commands) == 1
 
 
 @pytest.mark.parametrize(
