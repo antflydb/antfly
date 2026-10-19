@@ -3604,6 +3604,16 @@ file/byte totals. The older raw-trigram `candidate_index` remains compatible.
 records the earlier companion-routing binary and its exact validation results;
 it is not qualification of the logical-field server planner.
 
+[Logical-field qualification](bench/results/logical-field-validation.json) records
+the implementation commit, source and artifact hashes, and current macOS checks:
+253 CLI cases (two skipped), 21 native logical-query checks without leaks,
+143 existing query contracts, compiled error identities, generated SDKs, and 11
+real-server HTTP cases across one/three shards. The HTTP suite covers original-value
+semantics, policy errors, authorization, retained updates/expiry, narrow projections,
+capability associations and logical keyword sorting. It includes immutable-storage
+checkpoint reads for retained remote views. This is correctness qualification;
+new indexed throughput and broader provider/platform qualification remain separate.
+
 ### Qualification of namespace and tuple changes
 
 The final-artifact controls compare code at `8f1a78f679` with the preceding

@@ -137,3 +137,19 @@ explicit companion queries preserve their behavior.
 Implementation status and remaining qualification must be stated separately
 from this decision; this design is not evidence that every provider or optimized
 execution path has been qualified.
+
+
+## Implementation and qualification
+
+The native primary-backed planner implements the operations above, shared
+verification budgets and executable-plan profiling. Antfly-grep uses the ordinary
+logical query contract, and generated Go, TypeScript, Python and native models
+include the public types. Logical keyword sorting resolves the same source
+associations at both HTTP admission and database execution.
+
+The [qualification report](../../zig/pkg/antfly-grep/bench/results/logical-field-validation.json)
+pins source and binary hashes and records local CLI, native-contract, SDK and
+real-server HTTP checks. Qualification covers macOS and native one/three-shard
+HTTP execution, including retained remote storage views. It does not establish
+new throughput guarantees, every external provider's original-value support,
+or Linux/Windows runtime qualification of these new server paths.

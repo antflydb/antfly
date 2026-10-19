@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "24bbaaf2df558420d597ce899a253f1e46a2fbde",
+  "qualified_at_utc": "2026-10-19T23:56:31.922718+00:00",
+  "host": "macOS-27.0.1-arm64-arm-64bit",
+  "compiler": "0.17.0",
+  "artifacts": {
+    "cli": {
+      "sha256": "ba920fa50fef141b0687167a94a70b785020fe59908c1d6747e8f222d3330c21",
+      "optimization": "ReleaseFast"
+    },
+    "server": {
+      "sha256": "c9717707dcb0bb7f3237a6c277f234e6b383b7bc1426cd01f9ae63c6cb0cdc47",
+      "optimization": "Debug"
+    }
+  },
+  "source_files_sha256": {
+    "specs/openapi/antfly/query.yaml": "a5efb3f888d5b9b12c0279cdd26beba0503bff2f008620a231b78435d9a79ad3",
+    "specs/openapi/antfly/metadata.yaml": "66cb6e0499088262ba5b76412863f1c5bf209f90ee26c261b2380e3d518951eb",
+    "zig/pkg/antfly-embedded/src/search/value_query.zig": "f7ebe40554e7f32ec03bff3dcad288516aee2b80aa0b3eba20f4cef650c08fb1",
+    "zig/pkg/antfly-embedded/src/api/public_text_query.zig": "036e2f297a0c0d8e93631c60427d969cda4ba05df76369ced4e2825dee2b3be4",
+    "zig/pkg/antfly-embedded/src/api/query_contract.zig": "f285c2566d5f34b1c5f256ce6653c6abe66cd38a13b5a17ce6c592cf9408b8ec",
+    "zig/pkg/antfly-embedded/src/api/query_execution_contract.zig": "1ab43712b925feb22c3e847389e27df4bdaa79801d17ea51b4420dfcc7ebc4d5",
+    "zig/pkg/antfly-embedded/src/storage/schema.zig": "81c02033db5dd0939624c7e203ceaae697fb09fc0783593c7e4477105da1e162",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig": "a1092bd78baefc66a1155ca4e04923329d307dbf6aa8fb60d91409916cf5e1cb",
+    "zig/pkg/antfly-embedded/src/storage/db/query/search_exec.zig": "41b04b983f3de7c224c0b4ed30ad11caf7e75eb0b55cdec696064ce0ea64333a",
+    "zig/pkg/antfly-embedded/src/storage/db/derived/apply_state.zig": "b9755a5793b94ef7272dd1c48ae76dc28f091b28520a85ff5a94bd3de0ce43ad",
+    "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig": "ae74924b38f0be87e76d129fc785201ad0fdb33e4c1f6157f2977e2235e7da4a",
+    "zig/pkg/antfly-embedded/src/runtime_failure_identity.zig": "c2647b53eda90a2dc52cb5e7a5671543e76fc18e9428e42171c300b949b22ef6",
+    "zig/pkg/antfly/src/api/tables.zig": "40d1e70ba7c6b430fa5769a7fc7da1d3c0f013ec71f2a61e8a76cffdafb7c8f0",
+    "zig/pkg/antfly/src/api/http_server.zig": "22927ce4f54de521e18afca04334ca1a36063057dddcc085667271c0315be4c6",
+    "zig/pkg/antfly-grep/src/indexed.zig": "fc506185665324a1373d30390279a93886780f96b559d3393d027445ac7d4b01"
+  },
+  "checks_sha256": {
+    "native-final10.log": "da116eeb1dcd4da89588ea3fbf53cecdb4cf0b47db10b1c94b8490cfc038222a",
+    "native-contract-final.log": "3a57c168cbb5d3a38a039ea6315ee899c4a363ecf94d5b874a3392d63945e70c",
+    "native-test-summary.log": "9973deb02f05d0bd2e373f3f5330f362a2631d2f4e5357737afecd66ce81236f",
+    "http-native-final4.log": "2a9ced29ca534870cdcca2e63a978e50b95d472292c86cd90dbd93621970f0ee",
+    "cli-release.log": "7e32f7c886bfa18cbca70f0aea8a0c6ebe41f4227dd8f7cf94ff2410afd5c98f",
+    "kernel-errors.log": "d998182447ba8b1d6c1cdb9d00da80d9fe0d3da93efbf752a1086344fd5d3a81",
+    "runtime-errors.log": "8b8467d284ada322dac16affd226c25e90e7a751eb1b907e9025f25355a4eb55",
+    "sdk-go-final3.log": "abea8509cd3e336eca8077e87d70cbf20006dbd5908556f99ef0f1ba161ed4c4",
+    "sdk-ts-final3.log": "e3cd242915b8c4515b33bb726c751da703d6390d64b5fc05554337a0d46d8e1a",
+    "sdk-python-final.log": "0c9e22a14dbcca29d40702b6964bedced2fba003bc20f2b92a2ada03299ddbe9",
+    "generate-final3.log": "256f7f0223805743d01d138375bbdb19c064c360a723cdee40edf98098b805e0",
+    "license-boundary-final2.log": "4f9721e81514746646183b65330851e0d053b524af8c5afde314ab4158b799cf",
+    "compatibility-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "validation": {
+    "macos_cli": {
+      "run": 253,
+      "skipped": 2
+    },
+    "logical_query_suite": {
+      "passed": 21,
+      "leaked": 0
+    },
+    "existing_query_contract_suite": {
+      "passed": 143,
+      "leaked": 0
+    },
+    "schema_and_api_contract_target": "pass",
+    "compiled_storage_error_identity": {
+      "passed": 6
+    },
+    "real_native_http": {
+      "passed": 11,
+      "shards": [
+        1,
+        3
+      ]
+    },
+    "go_sdk": "pass",
+    "typescript_sdk": "typecheck pass",
+    "python_capabilities": {
+      "passed": 3
+    },
+    "generation": "make generate pass",
+    "apache_boundary_sources": 2350,
+    "compatibility_check": "pass"
+  },
+  "qualification_scope": [
+    "Logical source string operations, original-value verification, boolean filters/exclusions, counts, retained pagination, source projection, authorization and logical sorting on the native server.",
+    "Existing match/term/prefix/regexp semantics are preserved; autocomplete retains existing analyzed bool-prefix alternatives.",
+    "Verification budgets are per shard request, shared by its scoring/filter/exclusion components; no global budget or successful partial exact response is promised.",
+    "Incomplete/backfilling native text projections fail closed; readiness uses persisted/live checkpoints and the maintained text-relevant replay tail, with a dual source/index emptiness proof for empty replicated batches.",
+    "This report does not claim indexed throughput improvements or qualify every external/source-less provider. Previous Linux/Windows and benchmark reports retain their original artifacts; these server changes were qualified on macOS."
+  ]
+}
