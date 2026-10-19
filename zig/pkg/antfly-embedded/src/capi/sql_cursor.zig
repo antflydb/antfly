@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const h = @import("handles.zig");
+const capi_exports = @import("exports.zig");
 const api = @import("db.zig");
 const sql = @import("sql.zig");
 const dependencies = h.antfly.capi_dependencies;
@@ -123,8 +124,7 @@ fn prepare(cursor: *Cursor, handle: *h.Handle, table_name: []const u8, request_j
     return request;
 }
 pub fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, out_id: *u64, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_open_cursor_json), .{ .name = "antfly_db_sql_open_cursor_json" }), .{ ptr, request, out_id, out });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_sql_open_cursor_json, @src().fn_name, .{ ptr, request, out_id, out });
     h.capi.clearLastError();
     out.* = .{};
     out_id.* = 0;
@@ -144,8 +144,7 @@ pub fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, o
     return .ok;
 }
 pub fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u32, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_fetch_cursor_json), .{ .name = "antfly_db_sql_fetch_cursor_json" }), .{ ptr, id, rows, out });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_sql_fetch_cursor_json, @src().fn_name, .{ ptr, id, rows, out });
     h.capi.clearLastError();
     out.* = .{};
     const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
@@ -177,8 +176,7 @@ pub fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u32, out
     return .ok;
 }
 pub fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_close_cursor), .{ .name = "antfly_db_sql_close_cursor" }), .{ ptr, id });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_sql_close_cursor, @src().fn_name, .{ ptr, id });
     h.capi.clearLastError();
     const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
@@ -192,9 +190,5 @@ pub fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) callconv(.c) h.capi
 }
 
 comptime {
-    @import("exports.zig").publish(@This(), &.{
-        "antfly_db_sql_open_cursor_json",
-        "antfly_db_sql_fetch_cursor_json",
-        "antfly_db_sql_close_cursor",
-    });
+    capi_exports.publishAll(@This());
 }

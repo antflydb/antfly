@@ -17,6 +17,7 @@
 //! plus their own staged postimages. COMMIT prepares native intents and uses
 //! the durable database coordinator; SQL is never replayed to commit a session.
 const h = @import("handles.zig");
+const capi_exports = @import("exports.zig");
 const api = @import("db.zig");
 const sql = @import("sql.zig");
 const std = h.std;
@@ -376,8 +377,7 @@ pub fn closeAll(handle: *h.Handle) void {
     handle.sql_sessions.deinit(handle.alloc);
 }
 pub fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_session_open), .{ .name = "antfly_db_sql_session_open" }), .{ ptr, out });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_sql_session_open, @src().fn_name, .{ ptr, out });
     h.capi.clearLastError();
     out.* = 0;
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
@@ -406,8 +406,7 @@ pub fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) callconv(.c) h.ca
     return .ok;
 }
 pub fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_session_close), .{ .name = "antfly_db_sql_session_close" }), .{ ptr, id });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_sql_session_close, @src().fn_name, .{ ptr, id });
     h.capi.clearLastError();
     const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
@@ -425,8 +424,5 @@ pub fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) callconv(.c) h.cap
 }
 
 comptime {
-    @import("exports.zig").publish(@This(), &.{
-        "antfly_db_sql_session_open",
-        "antfly_db_sql_session_close",
-    });
+    capi_exports.publishAll(@This());
 }

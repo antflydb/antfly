@@ -16,6 +16,7 @@
 //! Durable logical table ownership for an embedded database. Table IDs never
 //! repeat: DROP followed by CREATE cannot expose the previous table's data.
 const h = @import("handles.zig");
+const capi_exports = @import("exports.zig");
 const api = @import("db.zig");
 const std = h.std;
 const catalog_key = "\x00antfly/embedded/tables/v1";
@@ -351,8 +352,7 @@ fn checkDependency(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8) !void 
 }
 
 pub fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, schema: h.capi.Slice) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_create_table_json), .{ .name = "antfly_db_create_table_json" }), .{ ptr, name, schema });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_create_table_json, @src().fn_name, .{ ptr, name, schema });
     h.capi.clearLastError();
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
@@ -364,8 +364,7 @@ pub fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, schema:
     return .ok;
 }
 pub fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_drop_table), .{ .name = "antfly_db_drop_table" }), .{ ptr, name });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_drop_table, @src().fn_name, .{ ptr, name });
     h.capi.clearLastError();
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
@@ -377,8 +376,7 @@ pub fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) callconv(.c) h
     return .ok;
 }
 pub fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_list_tables_json), .{ .name = "antfly_db_list_tables_json" }), .{ ptr, out });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_list_tables_json, @src().fn_name, .{ ptr, out });
     h.capi.clearLastError();
     out.* = .{};
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
@@ -407,8 +405,7 @@ pub fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) callcon
 /// Table handles use the existing document, index, and enrichment APIs. They
 /// borrow the namespace and are invalidated safely when the database closes.
 pub fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopaque) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_open_table), .{ .name = "antfly_db_open_table" }), .{ ptr, name, out });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_open_table, @src().fn_name, .{ ptr, name, out });
     h.capi.clearLastError();
     out.* = null;
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
@@ -451,10 +448,5 @@ pub fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopa
 }
 
 comptime {
-    @import("exports.zig").publish(@This(), &.{
-        "antfly_db_create_table_json",
-        "antfly_db_drop_table",
-        "antfly_db_list_tables_json",
-        "antfly_db_open_table",
-    });
+    capi_exports.publishAll(@This());
 }
