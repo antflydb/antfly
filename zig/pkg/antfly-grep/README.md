@@ -3606,6 +3606,10 @@ Tables without an index declaration also use full traversal through the query
 API. `content_index` and legacy raw-trigram `candidate_index` are mutually
 exclusive. Query/index errors remain explicit.
 
+[Query-planning validation](bench/results/query-planning-validation.json) records
+253 CLI cases on each of macOS and Linux, 143 native query-contract cases,
+nine native HTTP cases, SDK checks, cross-compilation and artifact hashes.
+
 ### Qualification of namespace and tuple changes
 
 The final-artifact controls compare code at `8f1a78f679` with the preceding
