@@ -3383,34 +3383,64 @@ request and wakes its consumer. A consumer awaiting a page observes atomic
 signal cancellation through a bounded 10 ms condition timeout. Successful
 handoffs remain signaled immediately; idle producers do not periodically wake.
 
-The paired transport qualification uses the preceding PR binary (`ecde7aa255`)
-and the new product binaries, with the same optimized reference consumer for
-all modes. Nine rotated warm trials verify complete logical summaries, exact
-match/context data, provenance and file statistics outside timing. Every mixed
-refresh trial also checks its revision against an untimed forced rescan. The
-fixtures contain either one matching line, 20,000 matching lines, or 6,000 small
+The final transport qualification uses product source `46f721cb9a`, the preceding
+PR binary (`ecde7aa255`), and measurement driver `cf673e4e43`. Nine rotated warm
+trials verify complete logical summaries, exact match/context data, provenance
+and file statistics outside timing. The same optimized consumer serves every
+mode. A separate conservative oracle process forces a fresh capture after each
+mixed refresh trial; it never resets either timed client's generation or caches.
+The fixtures contain one matching line, 20,000 matching lines, or 6,000 small
 files in one flat directory with rotating edits/additions/deletions.
 
-| macOS control | Previous v2 → current v3 |
-|---|---:|
-| Dense complete delivery | 54.71 → 33.13 ms |
-| Dense consumer CPU | 53.81 → 31.94 ms |
-| Dense response bytes | 6,084,767 → 4,065,873 |
-| Dense first row | 0.353 → 0.115 ms |
-| One-line complete delivery | 0.101 → 0.107 ms |
+| Dense delivery control | Previous binary v2 | Current binary v2 | Current opt-in v3 |
+|---|---:|---:|---:|
+| macOS elapsed | 97.33 ms | 108.50 ms | 71.87 ms |
+| macOS consumer CPU | 72.24 ms | 73.92 ms | 46.33 ms |
+| Linux VM elapsed | 149.42 ms | 158.91 ms | 129.71 ms |
+| Linux VM consumer CPU | 148.22 ms | 155.06 ms | 117.71 ms |
 
-Default v2 dense delivery remains similar (56.30 ms and 54.14 ms consumer CPU
-in the current binary). Small timings vary with the shared host; the current
-v2 one-line control measured 0.141 ms, while producer time remained about 16–17
-microseconds across all one-line modes. These measurements establish a dense
-transport benefit, not a universal startup or tiny-request speedup.
+V3 reduces dense response bytes by about 33% (6.08 → 4.07 MB). Against the
+same-binary v2 control it reduces consumer CPU about 37% on macOS and 24% in the
+Linux VM. First dense rows arrive earlier in these controls. One-line timings
+vary: macOS baseline/v2/v3 measure 1.119/0.837/1.278 ms, and Linux measures
+0.254/0.282/0.215 ms. An early foreground flush can cost tiny requests; v3 is
+explicit opt-in. These are dense transport improvements, not universal startup
+or tiny-request speedups.
 
-For watched macOS refresh plus full result delivery, the mixed 6,000-file median
-falls from 74.25 to 44.02 ms. Content-only edits fall from 49.59 to 5.89 ms;
-additions and deletions still scan directory names (80.09→44.52 and
-94.41→49.21 ms). Current refreshes read only 14–27 changed source bytes, versus
-more than 228 KiB of unwitnessed source reads in the baseline. One untimed
-startup sample costs 307 ms versus 196 ms when admitting the additional strict
-witnesses; its resident-set sample is 9,568 versus 10,080 KiB. These are single
-setup/RSS observations, not cold-cache or peak-memory measurements. More witness
-coverage trades setup and kernel resources for cheaper repeated freshness checks.
+Watched macOS refresh plus full delivery falls from 211.79 to 134.95 ms in the
+mixed 6,000-file control. Content-only edits measure 150.08→59.38 ms; flat-directory
+additions/deletions still scan names (180.76→157.35 and 294.51→170.15 ms). Current
+refreshes read only 14–27 changed source bytes versus >228 KiB of unwitnessed
+reads in the baseline. A single startup sample costs 747 versus 660 ms when
+admitting additional witnesses; its resident-set sample is 8,224 versus 10,128
+KiB. These single setup/RSS observations are neither cold-cache nor peak-memory
+measurements. More coverage trades setup/kernel resources for cheaper repeated
+freshness checks.
+
+Linux already has selective reads through synchronous directory queues and
+retains its smaller witness ceiling. Mixed refresh plus delivery measures
+136.66→131.11 ms, with substantial per-trial variation; no general Linux freshness
+speedup is established. A prior expanded-witness experiment is retained as a
+resource-policy negative control, labeled with its older asymmetric oracle
+methodology and used only diagnostically. It is not a distributed binary.
+
+The host was shared with other work, and load increased between runs. Final
+reports preserve every trial, the prior-binary and same-binary controls,
+versions, hashes, work counters and startup/RSS samples. No independent Linux
+hardware, cold-storage or hardware-independent performance guarantee follows.
+No new regex JIT path was warranted by these transport/freshness measurements.
+
+Final checks cover 248 CLI cases on macOS/Linux (two/three expected skips),
+106 package passes with one skip each, all 16 ReleaseSafe conformance/hardening
+steps, 1,000 generated ripgrep comparisons without mismatches/timeouts, 20 tooling
+cases (one skip), Windows cross-compilation, release packaging and
+license/toolchain/compatibility checks. Seven real-server indexed scenarios
+collect, including the new JSON projection regression; they were not executed
+locally. Provider checks remain local fixtures. JSON candidate pruning still
+requires the accounting/validation contract described above.
+
+Evidence: [final source/binary/report/archive qualification](bench/results/transport-validation.json),
+[macOS paired trials](bench/results/transport-macos.json),
+[Linux paired trials](bench/results/transport-linux.json),
+[historical Linux witness experiment](bench/results/transport-linux-expanded-witness-prototype.json), and
+[generated oracle comparisons](bench/results/transport-differential.json).
