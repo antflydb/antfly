@@ -11720,7 +11720,7 @@ pub const Node = struct {
         var embedding_config: embedding_mod.EmbeddingConfig = .{ .text_prefix = manifest.embedding_profile.document.prefix, .ensure_trailing_eos_id = if (manifest.isLastTokenDecoderEmbedder() and manifest.embedding_style != .embedding_gemma2 and tokenizer.specialTokens().sep_id >= 0) tokenizer.specialTokens().sep_id else null };
         const owned_prefix = try applyDenseEmbeddingConfigRequestOptions(a, &embedding_config, manifest, .{ .model = target.model, .input = .null, .encoding_format = null, .dimensions = if (target.dimensions) |d| @intCast(d) else null, .task_type = task });
         defer if (owned_prefix) |prefix| a.free(prefix);
-        const planning_digest = std.fmt.bytesToHex(if (loaded) |model| try model.chunkPlanningIdentity() else planning_assets.?.planning.digest, .lower);
+        const planning_digest = std.fmt.bytesToHex(if (loaded) |model| try model.chunkPlanningIdentityWithControl(control) else planning_assets.?.planning.digest, .lower);
         const planning_identity = try std.fmt.allocPrint(a, "antfly-media-chunk-model-v1:{s}:{s}:{s}:{?d}", .{ planning_digest, @tagName(manifest.embedding_style), embedding_config.text_prefix, embedding_config.ensure_trailing_eos_id });
         defer a.free(planning_identity);
         const dimensions = target.dimensions orelse if (manifest.embedding_style == .embedding_gemma2) @as(usize, 768) else manifest.hidden_size;
@@ -11956,7 +11956,7 @@ pub const Node = struct {
             failure = if (err == error.OutOfMemory and bounded_source.denied) error.ChunkWorkingBudgetExceeded else if (err == error.OutOfMemory) admitted_source.admission_error orelse err else err;
             break :blk runner.summary;
         };
-        if (loaded) |model| _ = try model.chunkPlanningIdentity() else try planning_assets.?.verify();
+        if (loaded) |model| _ = try model.chunkPlanningIdentityWithControl(control) else try planning_assets.?.verify();
         return .{ .summary = summary, .model_identity = identity, .model_revision = std.fmt.bytesToHex(revision, .lower), .dimensions = adapter.dimensions, .failure = failure };
     }
 
