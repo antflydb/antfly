@@ -57,6 +57,11 @@ pub const Tokenizer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    pub const TokenPiece = struct {
+        bytes: []u8,
+        is_byte_fallback: bool = false,
+    };
+
     pub const VTable = struct {
         /// Encode text into token IDs (without special tokens or padding).
         encode: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]i32,
@@ -82,6 +87,10 @@ pub const Tokenizer = struct {
         encodeGeneration: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!EncodeResult,
         /// Decode token IDs back to text.
         decode: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, ids: []const i32) anyerror![]u8,
+        /// Owned additive continuation bytes, without sequence-level cleanup.
+        /// Stateful decoders must provide this for grammar/evidence decoding.
+        /// Null reports allocation failure without a foreign Zig error ID.
+        tokenPiece: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i32) ?TokenPiece = null,
         /// Get special token IDs.
         specialTokens: *const fn (ptr: *anyopaque) SpecialTokens,
         /// Return every tokenizer-declared special token ID. Implementations
@@ -161,6 +170,14 @@ pub const Tokenizer = struct {
 
     pub fn decode(self: Tokenizer, allocator: std.mem.Allocator, ids: []const i32) ![]u8 {
         return self.vtable.decode(self.ptr, allocator, ids);
+    }
+
+    pub fn tokenPiece(self: Tokenizer, allocator: std.mem.Allocator, id: i32) !TokenPiece {
+        if (self.vtable.tokenPiece) |decode_piece| return decode_piece(self.ptr, allocator, id) orelse error.OutOfMemory;
+        return .{ .bytes = try self.decode(allocator, &.{id}) };
+    }
+    pub fn tokenBytes(self: Tokenizer, allocator: std.mem.Allocator, id: i32) ![]u8 {
+        return (try self.tokenPiece(allocator, id)).bytes;
     }
 
     pub fn specialTokens(self: Tokenizer) SpecialTokens {

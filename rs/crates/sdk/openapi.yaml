@@ -41162,8 +41162,11 @@ components:
         atomicity:
           type: string
           enum:
+            - namespace
             - source_table
             - resolver
+          description: Server entity corrections commit once on the destination table, atomically across
+            matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
         results:
           type: array
           items:
@@ -41176,6 +41179,13 @@ components:
                 type: string
               resolver:
                 type: string
+              key_template:
+                type: string
+              canonical_key:
+                type: string
+              curation:
+                type: object
+                additionalProperties: true
               revision:
                 type: integer
                 format: uint64

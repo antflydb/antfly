@@ -1649,18 +1649,14 @@ that mention's graph contribution and preserves existing canonical aliases,
 which can still be used by other mentions; global key/text suppression owns
 destination alias cleanup and scoped retirement.
 
-Remote policy mutations publish through the source table's authoritative
-metadata CAS, in reserved `_resolver_curation` records. Owner reconciliation
-installs the policy through the ordinary resolver configuration/backfill path;
-public requests never patch individual shard catalogs. Entity fanout preflights
-all matching policies and source-table write permissions, then commits one CAS
-per source table. It is not a transaction across unrelated source tables. HTTP
-207 reports partial acceptance with each resolver's accepted revision; retrying
-the same corrections is safe. Native fanout reports atomicity per resolver.
-Entity-state GET additionally requires read permission on every matching source
-table, using the ingress credential scopes and revision-fenced reverse catalog
-bindings rather than physical IDs. A denied source fails the complete read with
-403. Entity inspection returns redirects, key suppressions, distinct pins and
+Per-resolver policy mutations publish through the source table's authoritative
+metadata CAS until namespace adoption. Entity corrections publish through one
+destination-table CAS; source projections enqueue ordinary resolver backfill.
+Entity writes require destination write permission, and entity-state GET requires
+destination read permission. Background propagation uses internal metadata
+authority and does not delegate source-table authorization to the caller.
+Native Lite curation retains per-resolver atomicity.
+Entity inspection returns redirects, key suppressions, distinct pins and
 unmerged keys for the requested redirect component; text suppressions and
 unrelated keys remain available only through the source resolver resources.
 HTTP and embedded entity inspection share this projection.
@@ -1726,15 +1722,40 @@ namespaced operations; successful accepted replay is returned without automatic
 mutation retries.
 
 
-The entity routes deliberately identify the destination entity table and key,
-rather than exposing source-table enumeration to clients. A future namespace-owned
-store (entity table plus key template) can replace the current fanout behind
-these routes. That change must register durable namespace dependencies during
-resolver admission/replacement/retirement, fence resolution artifacts with the
-namespace revision, and enqueue dependent source replay from the authoritative
-namespace commit. New source resolvers must inherit the current revision before
-processing their first document. Migration must coalesce identical legacy
-redirects and report conflicting targets before switching ownership. Resolver-local
-inline aliases remain configuration; namespace redirects apply after aliases.
-This release implements the first step: source-owned durable corrections and the
-stable entity API, with explicit per-source acceptance and replay progress.
+The server stores authoritative entity corrections on the destination table,
+keyed by the exact key template. A correction commits once across the matching
+namespaces (`atomicity: "namespace"`); the response lists asynchronous source replay
+progress. Adding a source resolver reads the current namespace in its metadata
+admission transaction, so its first document inherits existing corrections.
+
+A durable namespace-to-consumer index is maintained by table admission,
+replacement and removal. Metadata lifecycle rounds advance at most 16 dependent
+records per Raft transaction, atomically publishing source projections and the
+resume cursor. A bounded bootstrap rebuilds the index for legacy tables. Both
+the dependency index and pending work survive metadata snapshots and restarts.
+Destination deletion retires obsolete dependency rows in the same bounded
+metadata lifecycle. Adoption checks its catalog cut so concurrent source edits
+cannot disappear when legacy corrections move to the namespace.
+Resolution artifacts record `namespace_curation_generation`; stale cached work
+cannot cross that generation. Identical legacy runtime corrections are folded
+when the namespace is adopted, and conflicting redirect targets reject adoption
+with `ResolverNamespaceMigrationConflict`. Source projections are derived views;
+per-resolver runtime edits return `ResolverNamespaceCurationRequired` after
+adoption. Inline aliases remain source configuration, applied before shared
+namespace corrections. Lite retains its local resolver curation contract.
+
+Curator REVIEW decisions use a private ordered data-Raft command. The artifact,
+configuration, policy bundle and prior override are checked at apply; override,
+outcome receipt, source replay and ordered marker commit together. Retrying an
+older decision cannot replace a newer override. Public batch JSON cannot submit
+this control. Native/Lite decisions use the same atomic batch and full HA
+mutation stream; HA payload versions 22/23 reject older decoders before apply.
+Metadata protocol 34, data batch protocol 24 and native reader 9
+fence the new state during upgrades.
+
+Native resolver owners retain the full candidate interface through a borrowed,
+layout-checked same-toolchain view (kernel owner ABI 80). Batch catalog bindings,
+bulk reads, generated adjudication, model revisions, descriptions, and caches
+survive the boundary. Batch leases and callback error identities retain their
+originating owner. Resolver review entry points dispatch through the storage
+engine rather than reading the control proxy's store.

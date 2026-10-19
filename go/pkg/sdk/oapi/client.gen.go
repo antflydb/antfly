@@ -2714,6 +2714,7 @@ func (e EnrichmentRuntimeStatusStallReason) Valid() bool {
 
 // Defines values for EntityCurationResultAtomicity.
 const (
+	EntityCurationResultAtomicityNamespace   EntityCurationResultAtomicity = "namespace"
 	EntityCurationResultAtomicityResolver    EntityCurationResultAtomicity = "resolver"
 	EntityCurationResultAtomicitySourceTable EntityCurationResultAtomicity = "source_table"
 )
@@ -2721,6 +2722,8 @@ const (
 // Valid indicates whether the value is a known member of the EntityCurationResultAtomicity enum.
 func (e EntityCurationResultAtomicity) Valid() bool {
 	switch e {
+	case EntityCurationResultAtomicityNamespace:
+		return true
 	case EntityCurationResultAtomicityResolver:
 		return true
 	case EntityCurationResultAtomicitySourceTable:
@@ -16810,16 +16813,20 @@ type EnrichmentRuntimeStatusStallReason string
 
 // EntityCurationResult defines model for EntityCurationResult.
 type EntityCurationResult struct {
+	// Atomicity Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
 	Atomicity   EntityCurationResultAtomicity `json:"atomicity"`
 	Complete    bool                          `json:"complete"`
 	EntityTable string                        `json:"entity_table"`
 	Key         string                        `json:"key"`
 	Results     []struct {
 		Applied              bool                   `json:"applied,omitempty,omitzero"`
+		CanonicalKey         string                 `json:"canonical_key,omitempty,omitzero"`
 		Changed              bool                   `json:"changed,omitempty,omitzero"`
 		ConfiguredSuppressed bool                   `json:"configured_suppressed,omitempty,omitzero"`
+		Curation             map[string]interface{} `json:"curation,omitempty,omitzero"`
 		Distinct             []ResolverDistinctPair `json:"distinct,omitempty,omitzero"`
 		Error                string                 `json:"error,omitempty,omitzero"`
+		KeyTemplate          string                 `json:"key_template,omitempty,omitzero"`
 		Redirects            []ResolverRedirect     `json:"redirects,omitempty,omitzero"`
 		ReplaySequence       uint64                 `json:"replay_sequence,omitempty,omitzero"`
 		Resolver             string                 `json:"resolver"`
@@ -16830,7 +16837,7 @@ type EntityCurationResult struct {
 	} `json:"results"`
 }
 
-// EntityCurationResultAtomicity defines model for EntityCurationResult.Atomicity.
+// EntityCurationResultAtomicity Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
 type EntityCurationResultAtomicity string
 
 // EntityMergeRequest defines model for EntityMergeRequest.

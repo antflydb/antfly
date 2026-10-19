@@ -165,6 +165,7 @@ pub const ResolvedEntity = struct {
 pub const Resolution = struct {
     arena: std.heap.ArenaAllocator,
     config_generation: u64,
+    namespace_curation_generation: u64 = 0,
     entities: []const ResolvedEntity,
     skipped_mentions: usize = 0,
     work: ?WorkCache = null,
@@ -183,6 +184,10 @@ pub const Resolution = struct {
 
         try out.appendSlice(allocator, "{\"config_generation\":");
         try appendInt(allocator, &out, self.config_generation);
+        if (self.namespace_curation_generation != 0) {
+            try out.appendSlice(allocator, ",\"namespace_curation_generation\":");
+            try appendInt(allocator, &out, self.namespace_curation_generation);
+        }
         try out.appendSlice(allocator, ",\"skipped_mentions\":");
         try appendInt(allocator, &out, self.skipped_mentions);
         try out.appendSlice(allocator, ",\"entities\":[");
@@ -983,6 +988,7 @@ pub const MentionEmbedder = struct {
 pub const ParsedResolution = struct {
     arena: std.heap.ArenaAllocator,
     config_generation: u64,
+    namespace_curation_generation: u64 = 0,
     entities: []const ResolvedEntity,
 
     pub fn deinit(self: *ParsedResolution) void {
@@ -1058,7 +1064,8 @@ pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedRe
             .adjudication = if (o.get("adjudication")) |value| try std.json.parseFromSliceLeaky(adjudication.Evidence, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{ .allocate = .alloc_always }) else null,
         };
     }
-    return .{ .arena = arena, .config_generation = config_generation, .entities = out };
+    const namespace_generation = obj.get("namespace_curation_generation");
+    return .{ .arena = arena, .config_generation = config_generation, .namespace_curation_generation = if (namespace_generation) |value| if (value == .integer and value.integer >= 0) @intCast(value.integer) else return error.InvalidResolution else 0, .entities = out };
 }
 
 /// Parse the `entities` array of an extraction artifact (the shape produced by
@@ -1919,6 +1926,7 @@ pub const ResolutionStage = struct {
     doc_ref_binding: ?struct { ptr: *anyopaque, bind: *const fn (*anyopaque, []const u8) anyerror!?[]const u8 } = null,
     resolver: *const Resolver,
     config_generation: u64,
+    namespace_curation_generation: u64 = 0,
     adjudicate: ?adjudication.Config = null,
     adjudicator: ?adjudication.Executor = null,
     candidate_validator: ?CandidateValidator = null,
@@ -2053,7 +2061,7 @@ pub const ResolutionStage = struct {
             reused[i] = null;
             if (alias_mask[i] or (if (self.overrides) |overrides| overrides.overrideFor(entity.local_id) != null else false)) continue;
             if (receipts) |prior_resolution| {
-                if (prior_resolution.config_generation != self.config_generation) continue;
+                if (prior_resolution.config_generation != self.config_generation or prior_resolution.namespace_curation_generation != self.namespace_curation_generation) continue;
                 for (prior_resolution.entities) |prior_entity| {
                     if (!std.mem.eql(u8, prior_entity.local_id, entity.local_id)) continue;
                     if (prior_entity.adjudication) |evidence| {
@@ -2239,6 +2247,7 @@ pub const ResolutionStage = struct {
                 }
             }
         }
+        resolution.namespace_curation_generation = self.namespace_curation_generation;
         resolution.max_work_bytes = self.max_work_bytes;
         if (self.retain_work and self.work_retention != .none) {
             if (self.work_retention == .embeddings) for (work) |*mention| {

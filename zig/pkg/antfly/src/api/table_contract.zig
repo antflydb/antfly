@@ -1234,7 +1234,7 @@ fn appendDefaultFullTextIndexEntry(
 }
 
 fn validateCreateTableIndexName(index_name: []const u8) !void {
-    if (index_name.len == 0 or std.mem.eql(u8, index_name, "_resolver_curation")) return error.InvalidCreateTableRequest;
+    if (index_name.len == 0 or (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces"))) return error.InvalidCreateTableRequest;
     if (isReservedFullTextIndexName(index_name)) return error.InvalidCreateTableRequest;
 }
 
@@ -1243,7 +1243,7 @@ fn isReservedFullTextIndexName(index_name: []const u8) bool {
 }
 
 fn isReservedPublicCreateIndexName(index_name: []const u8) bool {
-    return std.mem.eql(u8, index_name, "_resolver_curation") or isReservedFullTextIndexName(index_name) or
+    return (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces")) or isReservedFullTextIndexName(index_name) or
         std.mem.eql(u8, index_name, "default");
 }
 

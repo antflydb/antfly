@@ -69,7 +69,8 @@ pub const adjudication_reader_version: u32 = 5;
 pub const curation_reader_version: u32 = 6;
 pub const generated_producers_reader_version: u32 = 7;
 pub const grouped_sources_reader_version: u32 = 8;
-pub const supported_reader_version: u32 = grouped_sources_reader_version;
+pub const namespace_curation_reader_version: u32 = 9;
+pub const supported_reader_version: u32 = namespace_curation_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -81,6 +82,7 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         6 => "6",
         7 => "7",
         8 => "8",
+        9 => "9",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -113,6 +115,7 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
                 };
             }
         }
+        if (entry.object.contains("namespace_curation_generation")) required = @max(required, namespace_curation_reader_version);
         if (entry.object.contains("suppress_json") or entry.object.contains("curation_json") or entry.object.contains("curation_revision")) required = @max(required, curation_reader_version);
         if (entry.object.contains("replacement_index") or entry.object.contains("replacement_resolver")) required = @max(required, 3);
         for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
@@ -226,6 +229,7 @@ pub const ResolverConfig = struct {
     /// Runtime identity state, preserved across graph replacement/retirement.
     curation_json: []const u8 = "",
     curation_revision: u64 = 0,
+    namespace_curation_generation: u64 = 0,
     /// Candidate blocking strategy: "" (none, deterministic mint) or
     /// "exact_key" (look up the rendered canonical key as a candidate so the
     /// scorer can link to an existing entity). ANN/prefix blocking over the
@@ -360,7 +364,7 @@ pub const ResolverConfig = struct {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime (std.mem.eql(u8, field, "adjudicate_json") or std.mem.eql(u8, field, "suppress_json") or std.mem.eql(u8, field, "curation_json"))) @field(self, field).len == 0 else if (comptime std.mem.eql(u8, field, "curation_revision")) self.curation_revision == 0 else if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "replacement_index")) self.replacement_index.len == 0 else if (comptime std.mem.eql(u8, field, "replacement_resolver")) self.replacement_resolver.len == 0 else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
+                const omit = if (comptime (std.mem.eql(u8, field, "adjudicate_json") or std.mem.eql(u8, field, "suppress_json") or std.mem.eql(u8, field, "curation_json"))) @field(self, field).len == 0 else if (comptime std.mem.eql(u8, field, "namespace_curation_generation")) self.namespace_curation_generation == 0 else if (comptime std.mem.eql(u8, field, "curation_revision")) self.curation_revision == 0 else if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "replacement_index")) self.replacement_index.len == 0 else if (comptime std.mem.eql(u8, field, "replacement_resolver")) self.replacement_resolver.len == 0 else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));

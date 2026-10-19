@@ -21,6 +21,31 @@ const std = @import("std");
 const named = @import("../named_callback.zig");
 
 pub const CandidateSource = struct {
+    const native = @import("antfly_runtime_abi").native_abi;
+    const native_contract = blk: {
+        @setEvalBranchQuota(100_000);
+        var contract = native.TypeContract.of(CandidateSource);
+        // The view contains a vtable pointer and inline iteration methods;
+        // both layouts must match before reading any callback slot.
+        contract.layout_id ^= std.math.rotl(u64, native.shallowLayoutId(VTable), 17) ^
+            std.math.rotl(u64, native.shallowLayoutId(IterationMethods), 41);
+        break :blk contract;
+    };
+    pub fn nativeContractBytes() []const u8 {
+        return std.mem.asBytes(&native_contract);
+    }
+    /// Copy the borrowed interface only after checking its originating layout.
+    /// Its callback dispatchers retain the source compilation unit's errors.
+    pub fn receiveNative(view: []const u8, contract: []const u8) !?CandidateSource {
+        if (view.len == 0 and contract.len == 0) return null;
+        if (view.len != @sizeOf(CandidateSource) or contract.len != @sizeOf(native.TypeContract)) return error.InvalidAbiVersion;
+        var supplied: native.TypeContract = undefined;
+        @memcpy(std.mem.asBytes(&supplied), contract);
+        if (!supplied.matches(native_contract)) return error.InvalidAbiVersion;
+        var source: CandidateSource = undefined;
+        @memcpy(std.mem.asBytes(&source), view);
+        return source;
+    }
     const NativeBoundary = named.Boundary(VTable);
     // Reverse callbacks are received in the source compilation unit, so both
     // directions translate their owning error domain before it is inspected.
@@ -343,7 +368,7 @@ pub const DenseNativeMigrationPolicySource = struct {
     }
 };
 
-test "candidate and promotion callbacks preserve source errors and batch leases" {
+test "resolver curation native candidate and promotion callbacks preserve source errors and batch leases" {
     const native = @import("antfly_runtime_abi").native_abi;
     const status = @import("antfly_runtime_abi").error_abi;
     const Fixture = struct {
@@ -370,8 +395,14 @@ test "candidate and promotion callbacks preserve source errors and batch leases"
         fn begin(raw: *anyopaque, _: std.mem.Allocator, _: []const []const u8) anyerror!CandidateSource.Batch {
             return .{ .source = source(raw), .release = release };
         }
+        fn adjudicate(_: *anyopaque, a: std.mem.Allocator, _: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
+            return a.dupe(u8, "generated-verdict");
+        }
+        fn bound(_: *anyopaque, _: []const u8) anyerror!?[]const u8 {
+            return "physical-entities";
+        }
         fn source(raw: *anyopaque) CandidateSource {
-            return .{ .ptr = raw, .vtable = &.{ .get = get, .begin_batch = begin, .embedding_cache_get = cacheGet, .scan_prefix = scan }, .callback_dispatch = dispatch };
+            return .{ .ptr = raw, .vtable = &.{ .get = get, .begin_batch = begin, .embedding_cache_get = cacheGet, .scan_prefix = scan, .adjudicate = adjudicate, .bound_table = bound }, .callback_dispatch = dispatch };
         }
         fn dispatch(contract: *const native.CallContract, callback: *const anyopaque, args: *const anyopaque, output: *anyopaque) callconv(.c) status.Status {
             return CandidateSource.NativeBoundary.local_dispatch(contract, callback, args, output);
@@ -387,12 +418,22 @@ test "candidate and promotion callbacks preserve source errors and batch leases"
         }
     };
     var fixture: Fixture = .{};
-    const source = Fixture.source(&fixture);
+    const original = Fixture.source(&fixture);
+    const source = (try CandidateSource.receiveNative(std.mem.asBytes(&original), CandidateSource.nativeContractBytes())).?;
+    try std.testing.expectError(error.InvalidAbiVersion, CandidateSource.receiveNative(std.mem.asBytes(&original), "invalid"));
+    var incompatible = native.TypeContract.of(CandidateSource);
+    incompatible.layout_id ^= 1;
+    try std.testing.expectError(error.InvalidAbiVersion, CandidateSource.receiveNative(std.mem.asBytes(&original), std.mem.asBytes(&incompatible)));
     const batch = try source.beginBatch(std.testing.allocator, &.{"entities"});
     try std.testing.expect(batch.source.ptr == source.ptr);
     try std.testing.expect(batch.source.callback_dispatch == source.callback_dispatch);
     var receiver = batch.source.receive();
     const received = receiver.sourceView();
+    try std.testing.expectEqualStrings("physical-entities", (try received.boundTable("entities")).?);
+    try std.testing.expect(received.vtable.adjudicate != null);
+    const verdict = try received.adjudicate(std.testing.allocator, .{ .specification_json = "{}", .input = "candidate pair", .source_fingerprint = "fixture", .timeout_ms = 1000 });
+    defer std.testing.allocator.free(verdict);
+    try std.testing.expectEqualStrings("generated-verdict", verdict);
     try std.testing.expectError(error.TestWindowFailed, received.get(std.testing.allocator, "entities", "key"));
     try std.testing.expectError(error.TestWindowFailed, received.vtable.embedding_cache_get.?(received.ptr, std.testing.allocator, @splat(0)));
     const reverse = CandidateSource.Consumer{ .context = &fixture, .callback = Fixture.consume, .dispatch = Fixture.reverseDispatch };

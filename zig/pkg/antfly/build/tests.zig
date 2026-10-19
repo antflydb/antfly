@@ -1991,6 +1991,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-resolver-adjudication-api-test", "Validate resolver adjudication admission and distributed candidate adapters")
         .dependOn(&addFilteredTestRunArtifact(b, resolver_adjudication_api_tests).step);
 
+    const resolver_namespace_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "resolver curation namespace propagation", "snapshot key registry covers every durable projection class" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-resolver-namespace-test", "Validate durable namespace dependencies, bounded replay and restart inheritance")
+        .dependOn(&addFilteredTestRunArtifact(b, resolver_namespace_tests).step);
+
     const resolver_curation_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{ "resolver curation HTTP", "resolver curation progress", "resolver curation public policy", "DistributedEntitySink" },

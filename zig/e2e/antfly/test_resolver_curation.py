@@ -18,8 +18,10 @@
 from urllib.parse import quote
 from uuid import uuid4
 
+import pytest
 
-def test_entity_curation_fanout_wait_and_resolver_routes(stateful_api):
+
+def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
     api = stateful_api
     suffix = uuid4().hex[:8]
     destination = f"curation_entities_{suffix}"
@@ -71,6 +73,16 @@ def test_entity_curation_fanout_wait_and_resolver_routes(stateful_api):
         assert api.post(f"/tables/{source}/resolvers/concepts:render", mention)[
             "suppressed"
         ]
+    assert suppressed["atomicity"] == "namespace"
+    # A consumer created after the correction inherits it before its first row.
+    late = f"curation_late_{suffix}"
+    api.create_table(late, indexes={"knowledge": graph})
+    sources.append(late)
+    late_state = api.post(f"/tables/{late}/resolvers/concepts:render", mention)
+    assert late_state["suppressed"], late_state
+    redirects = api.get(entity + "/redirects")
+    assert redirects["atomicity"] == "namespace"
+    assert len(redirects["results"]) == 1
     restored = api.post(entity + ":unsuppress", {"wait": wait})
     assert restored["complete"] and restored["applied"], restored
     for source in sources:
@@ -90,14 +102,113 @@ def test_entity_curation_fanout_wait_and_resolver_routes(stateful_api):
         )
         assert preview["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/alpha"
     resolver = f"/tables/{sources[0]}/resolvers/concepts"
-    api.post(resolver + "/redirects", {"from": "concept/zeta", "to": "concept/eta"})
-    response = api._request(
-        "DELETE",
-        resolver
-        + "/redirects/"
-        + quote("concept/zeta", safe="")
-        + "?pin_distinct=true",
+    # Once adopted, source resources are views; corrections use the destination.
+    rejected = api._request(
+        "POST", resolver + "/redirects", {"from": "concept/zeta", "to": "concept/eta"}
     )
-    decision = api._check(response)
+    assert rejected.status_code == 409, rejected.text
+    zeta = f"/tables/{destination}/entities/" + quote("concept/zeta", safe="")
+    api.post(zeta + ":merge", {"into": "concept/eta", "wait": wait})
+    decision = api.post(zeta + ":unmerge", {"pin_distinct": True, "wait": wait})
     assert decision["changed"], decision
     assert api.get(resolver + "/redirects")["redirects"] == []
+
+
+@pytest.mark.parametrize("raft", [False, True], ids=["standalone", "raft"])
+def test_curator_review_decisions_survive_restart(request, monkeypatch, raft):
+    import json
+
+    from helpers import wait_until
+
+    if raft:
+        monkeypatch.setenv("ANTFLY_E2E_STATEFUL_RAFT", "1")
+    api = request.getfixturevalue("stateful_api")
+    suffix = uuid4().hex[:8]
+    destination, source = f"review_entities_{suffix}", f"review_sources_{suffix}"
+    api.create_table(destination)
+    api.batch_write(
+        destination,
+        inserts={
+            "concept/alpha": {
+                "canonical_name": "Alpha",
+                "label": "concept",
+            }
+        },
+        sync_level="full_index",
+    )
+    api.create_table(
+        source,
+        indexes={
+            "knowledge": {
+                "type": "graph",
+                "source": {
+                    "artifact": "kg",
+                    "format": "extraction_graph",
+                    "mention_edge_type": "mentions",
+                },
+                "edge_types": [{"name": "mentions"}],
+                "artifact": {
+                    "name": "kg",
+                    "kind": "asset",
+                    "source": {"type": "field", "value": "kg"},
+                    "content_type": "application/json",
+                },
+                "resolvers": [
+                    {
+                        "name": "concepts",
+                        "table": destination,
+                        "promote": False,
+                        "config_generation": 1,
+                        "source_artifact": "kg",
+                        "resolution_artifact": "resolved",
+                        "key_template": "concept/{{uslug _entity.text}}",
+                        "candidate_search": "exact_key",
+                        "scorer": {
+                            "comparisons": [],
+                            "combine": {"bias": 1.0},
+                            "decision": {"match": 0.95, "review": 0.6},
+                        },
+                    }
+                ],
+            }
+        },
+    )
+    resolver = f"/tables/{source}/resolvers/concepts"
+    assert wait_until(
+        lambda: all(
+            row["available"] and row["fresh"] and row["config_generation"] >= 1
+            for row in api.get(resolver)["progress"]["shards"]
+        ),
+        timeout_s=30,
+        interval_s=0.1,
+    ), api.get(resolver)
+    api.batch_write(
+        source,
+        inserts={
+            "doc": {
+                "kg": json.dumps(
+                    {"entities": [{"id": "e0", "label": "concept", "text": "Alpha"}]}
+                )
+            }
+        },
+        sync_level="full_index",
+    )
+    reviews = []
+
+    def pending_review():
+        reviews[:] = api.get(resolver + "/reviews")["reviews"]
+        return bool(reviews)
+
+    assert wait_until(pending_review, timeout_s=30, interval_s=0.1), api.debug_logs()[
+        -16000:
+    ]
+    review_id = quote(reviews[0]["id"], safe="")
+    accepted = api.post(
+        resolver + "/reviews/" + review_id,
+        {"decision": "suppressed", "wait": {"timeout_ms": 5000}},
+    )
+    assert accepted["replay_sequence_kind"] == "source_journal", accepted
+    assert accepted["applied"], accepted
+    assert api.get(resolver + "/reviews")["reviews"] == []
+    api.restart_server()
+    assert api.get(resolver + "/reviews")["reviews"] == []

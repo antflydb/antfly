@@ -3242,7 +3242,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             .coordinated_ttl_enqueue_fn = if (self.coordinated_ttl != null) enqueueCoordinatedTtl else null,
             .native_authority_ctx = if (self.native_migration_policy != null) self else null,
             .native_authority_fn = if (self.native_migration_policy != null) nativeAuthorityPermitted else null,
-            .resolution_candidates = if (self.resolution_candidate_source != null) .{
+            .resolution_candidates = if (self.resolution_candidate_source) |*source| .{
+                .native_view = .fromSlice(std.mem.asBytes(source)),
+                .native_view_contract = .fromSlice(runtime_callbacks.CandidateSource.nativeContractBytes()),
                 .callback_ctx = self,
                 .get_fn = resolutionCandidateGet,
                 .scan_prefix_fn = resolutionCandidateScanPrefix,

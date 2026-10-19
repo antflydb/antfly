@@ -607,7 +607,7 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         return error.MetadataMutationOutcomeUnknown;
     };
     defer metadata_table_manager.freeTable(service.alloc, current);
-    if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return .{
+    if (try store.resolverNamespaceReplacementMatches(service.alloc, service.metadata_group_id, current, replacement)) return .{
         .metadata_group_id = service.metadata_group_id,
         .metadata_incarnation = metadata_incarnation,
         .term = receipt.term,
@@ -3406,6 +3406,23 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const namespace_indexes = switch (command) {
+        .apply_restore_staging => |bytes| bytes,
+        .upsert_table => |table| table.indexes_json,
+        .compare_and_replace_table => |cas| cas.replacement.indexes_json,
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| create.table.indexes_json,
+            .drop => "",
+        },
+        else => "",
+    };
+    if (std.mem.indexOf(u8, namespace_indexes, "_resolver_namespaces") != null or std.mem.indexOf(u8, namespace_indexes, "namespace_owned") != null or std.mem.indexOf(u8, namespace_indexes, "resolvers") != null) return metadata_topology_protocol.resolver_namespaces_version;
+    switch (command) {
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| for (delta.upsert_tables) |table| {
+            if (transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }) >= metadata_topology_protocol.resolver_namespaces_version) return metadata_topology_protocol.resolver_namespaces_version;
+        },
+        else => {},
+    }
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
         return metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
@@ -4294,6 +4311,22 @@ fn closeRelationPublicationPreparation(service: anytype) void {
     service.relation_reconciliation_worker.closing = true;
     service.relation_publication_preparation.cancel();
     if (service.projectedStore()) |store| store.closeRelationPublicationProof(service.metadata_group_id);
+}
+
+/// Namespace replay is metadata work, with one bounded page per lifecycle
+/// round. The catalog CAS binds the exact canonical cut and fences retries.
+fn runResolverNamespaceRound(service: anytype) !void {
+    const store = service.projectedStore() orelse return;
+    if (!try service.ensureReconcileLease()) return;
+    var arena = std.heap.ArenaAllocator.init(service.alloc);
+    defer arena.deinit();
+    const table = (try store.pendingResolverNamespaceTable(arena.allocator(), service.metadata_group_id)) orelse {
+        const id = (try store.pendingResolverNamespaceDrop(arena.allocator(), service.metadata_group_id)) orelse return;
+        const fence = try store.getTableTransitionFence(service.metadata_group_id, id);
+        _ = try service.proposeTransitionCommandWithReceipt(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
+        return;
+    };
+    _ = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } });
 }
 
 fn runRelationReconciliationRound(service: anytype) !void {
@@ -7174,6 +7207,7 @@ pub const MetadataService = struct {
         }
         if (!try self.ensureMetadataIncarnation()) return;
         try runRelationReconciliationRound(self);
+        try runResolverNamespaceRound(self);
         if (!self.observe_local_replica_root) return;
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
@@ -7211,6 +7245,7 @@ pub const MetadataService = struct {
         }
         if (!try self.ensureMetadataIncarnation()) return;
         try runRelationReconciliationRound(self);
+        try runResolverNamespaceRound(self);
         if (!self.observe_local_replica_root) return;
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
@@ -10820,6 +10855,7 @@ pub const MetadataHttpService = struct {
         self.refreshProbeReady();
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         try runRelationReconciliationRound(self);
+        try runResolverNamespaceRound(self);
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
@@ -10924,6 +10960,7 @@ pub const MetadataHttpService = struct {
         }
         self.refreshProbeReady();
         try runRelationReconciliationRound(self);
+        try runResolverNamespaceRound(self);
         if (!self.observe_local_replica_root) return;
 
         var local_transition_inputs = try captureLocalTransitionInputs(self);
@@ -13187,6 +13224,15 @@ test "metadata service reallocation barrier requires a current protocol from the
     ));
     current_status.metadata_incarnation = null;
     try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 7, incarnation));
+}
+
+test "metadata table topology protocol fences namespace writers and restored declarations" {
+    const version = metadata_topology_protocol.resolver_namespaces_version;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "source", .indexes_json = "{\"knowledge\":{\"resolvers\":[]}}" };
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"indexes_json\":\"{\\\"_resolver_namespaces\\\":{}}\"}" }));
 }
 
 test "metadata table topology protocol checks the command's required version and exact replica" {

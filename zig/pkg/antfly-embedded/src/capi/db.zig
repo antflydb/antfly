@@ -7728,7 +7728,7 @@ pub fn antfly_db_resolver_reviews_json(handle_ptr: ?*anyopaque, request_json: ca
     var admitted = true;
     defer if (admitted) guard.leave();
     if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
-    const bytes = @import("../storage/db/resolver_curation.zig").reviewOperation(guard.handle.database(), guard.handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
+    const bytes = guard.handle.database().resolverReviewsJsonAlloc(guard.handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer guard.handle.alloc.free(bytes);
     out.* = copyJsonBuffer(bytes) catch |err| return capi.mapError(err);
     if (input.value.operation != .review) return .ok;

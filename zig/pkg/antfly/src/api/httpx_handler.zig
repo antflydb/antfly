@@ -3573,9 +3573,8 @@ pub const AntflyApiHandler = struct {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         try operationContext(ctx, null).ensureActive();
-        const writes = self.api_server.table_writes orelse return textResponse(ctx, 404, "not found");
         const body = (try ctx.body()) orelse "";
-        const json = (writes.resolverOperationGroupLocal(ctx.allocator, params.group_id, params.table_name, body) catch |err| return textResponse(ctx, @import("resolvers.zig").failureStatus(err), @errorName(err))) orelse return textResponse(ctx, 404, "not found");
+        const json = self.api_server.executeResolverOperation(ctx.allocator, params.table_name, params.group_id, body, operationContext(ctx, null)) catch |err| return textResponse(ctx, @import("resolvers.zig").failureStatus(err), @errorName(err));
         defer ctx.allocator.free(json);
         return jsonResponse(ctx, 200, json);
     }

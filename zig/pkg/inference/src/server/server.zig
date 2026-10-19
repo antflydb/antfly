@@ -3037,7 +3037,7 @@ const transient_capacity_retry_after_seconds = "1";
 const transient_capacity_retry_after_ms = 1000;
 
 fn isTransientInferenceCapacityError(err: anyerror) bool {
-    return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable;
+    return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable or err == error.GenerationCapacityUnavailable;
 }
 
 fn transientCapacityFailureResponse(
@@ -13009,7 +13009,7 @@ pub const Node = struct {
                         .message = "response_format.json_schema.schema is required for type=json_schema",
                     });
                 };
-                config.grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, .{ .object = schema.map }) catch |err| {
+                config.grammar = grammar_mod.buildJsonSchemaGrammarWithEvidence(ctx.allocator, .{ .object = schema.map }, body.logprobs orelse false) catch |err| {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
                         .message = @errorName(err),
@@ -20317,13 +20317,9 @@ pub const Node = struct {
             defer response.deinit();
             try self.control.check();
             if (!response.ok()) {
-                if (response.status.code == 429) return error.RateLimit;
-                if (response.status.code == 504) return error.Timeout;
-                if (response.status.code == 500) if (response.body) |raw| {
-                    const failure = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return error.GenerateRequestFailed;
-                    if (failure == .object) if (failure.object.get("error")) |code| if (code == .string and std.mem.eql(u8, code.string, "STRUCTURED_OUTPUT_INVALID")) return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[]}", .{}) };
-                };
-                return error.GenerateRequestFailed;
+                const failure = c.localGenerationStatusError(a, response.status.code, response.body);
+                if (failure == error.InvalidStructuredOutput) return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[]}", .{}) };
+                return failure;
             }
             if ((response.body orelse return error.InvalidConstrainedOutput).len > 1024 * 1024) return error.ResponseTooLarge;
             const result = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body orelse return error.InvalidConstrainedOutput, .{ .allocate = .alloc_always });
@@ -20867,6 +20863,7 @@ pub const Node = struct {
     }
 
     fn decideFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.UnsupportedConstrainedProbabilities) return generationErrorResponse(ctx, err);
         return switch (err) {
             error.EmbeddingIdentityMismatch => ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = @errorName(err) }),
             error.InvalidEmbeddingCalibration, error.EmbeddingCalibrationMismatch, error.UnqualifiedEmbeddingCalibration => ctx.status(400).json(.{ .@"error" = "INVALID_CALIBRATION", .message = @errorName(err) }),
@@ -22441,6 +22438,7 @@ fn extractionV2FailureResponse(ctx: *httpx.Context, err: anyerror, failure: extr
 }
 
 fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.UnsupportedConstrainedProbabilities) return generationErrorResponse(ctx, err);
     if (isInferenceExecutorContractError(err))
         return inferenceExecutorContractFailureResponse(ctx, err);
     return switch (err) {
@@ -36110,6 +36108,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
             .message = "model generated malformed tool arguments; request a corrected tool call",
             .retryable = true,
         },
+        error.UnsupportedConstrainedProbabilities => .{
+            .status = 400,
+            .code = "UNSUPPORTED_CONSTRAINED_PROBABILITIES",
+            .message = "token_logprobs requires every finite value to have a standalone vocabulary token; use verdict_only for other values",
+            .retryable = false,
+        },
         error.PromptTooLong => .{
             .status = 400,
             .code = "INVALID_REQUEST",
@@ -38661,4 +38665,35 @@ test "generated constrained public routes admit native models and reject proxy c
     var extract_response = try node.extractJSON(&extract_ctx);
     defer extract_response.deinit();
     try std.testing.expectEqual(@as(u16, 400), extract_response.status.code);
+}
+
+test "local generation bridge keeps generated decider load admission retryable" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/decisions");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    const busy = "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true,\"retry_after_ms\":1000}";
+    const err = @import("antfly_structured").localGenerationStatusError(a, 503, busy);
+    var response = try Node.decideFailureResponse(&ctx, err);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer body.deinit();
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", body.value.object.get("error").?.string);
+    try std.testing.expect(body.value.object.get("retryable").?.bool);
+    try std.testing.expectEqual(@as(i64, 1000), body.value.object.get("retry_after_ms").?.integer);
+}
+
+test "local generation bridge reports unsupported finite vocabulary as permanent admission failure" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/decisions");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try Node.decideFailureResponse(&ctx, error.UnsupportedConstrainedProbabilities);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "UNSUPPORTED_CONSTRAINED_PROBABILITIES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":false") != null);
 }

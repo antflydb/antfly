@@ -145,6 +145,32 @@ pub fn create(ctx: Context) Suite {
     }
     build_test_filters.addRuntimeControls(run_cli_tests, ctx.args orelse &.{});
     const run_tests = ctx.addRunArtifact(tests);
+    const evidence_module = b.createModule(.{
+        .root_source_file = ctx.path("src/pipelines/grammar.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    evidence_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
+    const evidence_tests = b.addTest(.{ .root_module = evidence_module, .filters = &.{ "canonical evidence", "gbnf", "json schema grammar" } });
+    const run_evidence_tests = ctx.addRunArtifact(evidence_tests);
+    run_tests.step.dependOn(&run_evidence_tests.step);
+    ctx.step("test-structured-token-evidence", "Check canonical finite-value token admission and masking").dependOn(&run_evidence_tests.step);
+    const structured_module = ctx.graph.inference_mod.import_table.get("antfly_structured").?;
+    const attribution_module = b.createModule(.{ .root_source_file = structured_module.root_source_file, .target = ctx.target, .optimize = ctx.optimize });
+    for (structured_module.import_table.keys(), structured_module.import_table.values()) |name, module| attribution_module.addImport(name, module);
+    const attribution_tests = b.addTest(.{ .root_module = attribution_module, .filters = &.{"gemma native"} });
+    const run_attribution_tests = ctx.addRunArtifact(attribution_tests);
+    ctx.step("test-structured-attribution", "Check real native finite-value evidence attribution").dependOn(&run_attribution_tests.step);
+    const token_bytes_step = ctx.step("test-token-bytes", "Check additive tokenizer bytes without sequence cleanup");
+    for ([_]*std.Build.Module{ ctx.graph.inference_tokenizer_mod, ctx.graph.inference_hf_tokenizer_mod }, 0..) |source, i| {
+        const root = if (i == 0) b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/tokenizer/src/sentencepiece.zig" })) else source.root_source_file;
+        const module = b.createModule(.{ .root_source_file = root, .target = ctx.target, .optimize = ctx.optimize });
+        for (source.import_table.keys(), source.import_table.values()) |name, dependency| module.addImport(name, dependency);
+        const token_tests = b.addTest(.{ .root_module = module, .filters = &.{"raw token bytes"} });
+        const run = ctx.addRunArtifact(token_tests);
+        token_bytes_step.dependOn(&run.step);
+        run_tests.step.dependOn(&run.step);
+    }
     // Keep backend packaging covered even when CUDA implementation tests are
     // excluded. A CPU/Metal test product must not retain a device image.
     const artifact_module = b.createModule(.{

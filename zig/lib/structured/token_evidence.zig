@@ -213,3 +213,28 @@ test "constrained token evidence uses byte witnesses rather than lossy UTF8 disp
     try std.testing.expect(measured[0] > 0.89);
     try std.testing.expectApproxEqAbs(@as(f64, 1), measured[0] + measured[1], 1e-12);
 }
+
+test "gemma native canonical finite choice evidence binds the structured field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const reply = try std.json.parseFromSliceLeaky(V, a,
+        \\{"text":"{\"items\":[{\"item\":0,\"value\":{\"relation\":\"1\"}}]}","logprobs":{"content":[{"token":"{\"","bytes":[123,34],"logprob":-0.1696060119632996,"top_logprobs":[]},{"token":"items","bytes":[105,116,101,109,115],"logprob":-0.00497975947895668,"top_logprobs":[]},{"token":"\":[{\"","bytes":[34,58,91,123,34],"logprob":-0.0594303724658829,"top_logprobs":[]},{"token":"item","bytes":[105,116,101,109],"logprob":-5.901648403394688e-05,"top_logprobs":[]},{"token":"\":","bytes":[34,58],"logprob":-4.452598362902904e-05,"top_logprobs":[]},{"token":"0","bytes":[48],"logprob":-4.557632319546201e-06,"top_logprobs":[]},{"token":",\"","bytes":[44,34],"logprob":-0.002455740341744672,"top_logprobs":[]},{"token":"value","bytes":[118,97,108,117,101],"logprob":-1.7697326981647166e-05,"top_logprobs":[]},{"token":"\":{\"","bytes":[34,58,123,34],"logprob":-0.004863284887163033,"top_logprobs":[]},{"token":"relation","bytes":[114,101,108,97,116,105,111,110],"logprob":-1.5050175939279598e-05,"top_logprobs":[]},{"token":"\":\"","bytes":[34,58,34],"logprob":-9.491172392017688e-05,"top_logprobs":[]},{"token":"1","bytes":[49],"logprob":-0.000300252438069748,"top_logprobs":[{"token":"1","bytes":[49],"logprob":-0.000300252438069748},{"token":"2","bytes":[50],"logprob":-8.111037099361898}]},{"token":"\"}}","bytes":[34,125,125],"logprob":-0.10492873772312272,"top_logprobs":[]},{"token":"]}","bytes":[93,125],"logprob":-0.000278061431064458,"top_logprobs":[]}]}}
+    , .{});
+    const index = try Index.init(a, reply.object.get("text").?.string, reply.object.get("logprobs").?);
+    const p = try distribution(a, index.evidence(), 0, &.{"relation"}, &.{ .{ .string = "1" }, .{ .string = "2" } });
+    try std.testing.expectApproxEqAbs(@as(f64, 1), p[0] + p[1], 1e-9);
+    try std.testing.expect(p[0] > 0.99);
+}
+
+test "gemma native pretty JSON evidence retains whitespace positions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const reply = try std.json.parseFromSliceLeaky(V, a,
+        \\{"text":"{\n  \"items\": [\n    {\n      \"item\":\n        0,\n        \"value\": {\n          \"relation\": \"1\"\n        }\n    }\n  ]\n}","logprobs":{"content":[{"token":"{\n  \"items\": [\n    {\n      \"item\":\n        0,\n        \"value\": {\n          \"relation\": \""},{"token":"1","top_logprobs":[{"token":"1","logprob":-0.1},{"token":"2","logprob":-2.4}]},{"token":"\"\n        }\n    }\n  ]\n}"}]}}
+    , .{});
+    const index = try Index.init(a, reply.object.get("text").?.string, reply.object.get("logprobs").?);
+    const p = try distribution(a, index.evidence(), 0, &.{"relation"}, &.{ .{ .string = "1" }, .{ .string = "2" } });
+    try std.testing.expect(p[0] > 0.9);
+}

@@ -1006,6 +1006,7 @@ pub const RelationalPriorMembership = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
     /// Native-only completion observation; never encoded in a replicated command.
     legacy_group_completed_through: ?u64 = null,

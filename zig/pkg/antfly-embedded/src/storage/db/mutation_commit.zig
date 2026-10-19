@@ -2267,6 +2267,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // the in-memory generation move backwards after restart) or require a
             // synthetic replay item that every managed consumer must drain.
             var group_overlay = group_mutations.Overlay{ .completion_root = S.ownerField(self, "root_incarnation").*, .source_revision = if (opts.ordered_apply_receipt) |receipt| receipt.index else null, .owner_incarnation = @import("group_source_owner_identity.zig").fromNamespace(S.ownerField(self, "core").*.identity_namespace, S.ownerField(self, "root_incarnation").*), .allocator = group_alloc, .reader = group_mutations.Reader.fromStore(S.ownerField(self, "core").*.store) };
+            const review_plan = if (opts.resolver_review_command) |command| try @import("resolver_review.zig").plan(group_alloc, S.ownerField(self, "core").*, command.*, true) else null;
+            if (review_plan) |review| if (review.source_key) |key| try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
             var group_staged = @import("group_source_snapshot.zig").Staged{ .changed = &.{}, .deleted = &.{}, .sequence = 0 };
             var transferred_group_changed: std.ArrayList([]const u8) = .empty;
             var transferred_group_deleted: std.ArrayList([]const u8) = .empty;
@@ -2355,7 +2357,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             }
             const group_control_without_replay = opts.group_source_command != null and !group_staged.hasReplay() and changed_graph_artifact_keys.items.len == 0;
-            const elide_semantic_noop_replay = group_control_without_replay or (group_plan == null and use_thin_replay_fast_path and
+            const elide_semantic_noop_replay = group_control_without_replay or (opts.resolver_review_command == null and group_plan == null and use_thin_replay_fast_path and
                 opts.extra_store_writes.len == 0 and
                 opts.transaction_resolution == null and
                 opts.replication_applied_lsn_marker == null and
@@ -2392,6 +2394,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 while (effects.next()) |effect| {
                     if (effect.value_ptr.*) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key_ptr.*, .value = value }) else try delete_keys.append(S.ownerField(self, "alloc").*, effect.key_ptr.*);
                 }
+            }
+            if (review_plan) |review| {
+                // Plan strings live in the bounded transaction arena. KV list
+                // storage uses the writer allocator, so copy only its entries.
+                var review_writes: std.ArrayList(docstore_mod.KVPair) = .empty;
+                try review.stage(group_alloc, &review_writes, sequence);
+                try store_writes.appendSlice(S.ownerField(self, "alloc").*, review_writes.items);
             }
             if (profile) |active_profile| active_profile.source_sequence = sequence;
             const identity_metadata_start_ns = monotonicTimeNs();
@@ -3053,6 +3062,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
                 return;
             }
+            if (review_plan) |review| if (review.accepted) S.ownerField(self, "core").*.index_manager.minimum_reader_version.store(review.minimum_reader, .release);
             if (next_table_catalog) |catalog| S.ownerField(self, "core").*.table_catalog = catalog;
             if (persisted_range != null) {
                 S.ownerField(self, "core").*.adoptPersistedRangeOwned(persisted_range_start_owned.?, persisted_range_end_owned.?);

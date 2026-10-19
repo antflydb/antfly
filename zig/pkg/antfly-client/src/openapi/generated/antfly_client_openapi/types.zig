@@ -12027,6 +12027,7 @@ pub const EntityCurationResult = struct {
     entity_table: []const u8,
     key: []const u8,
     complete: bool,
+    /// Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
     atomicity: []const u8,
     results: []const std.json.Value,
 };

@@ -601,6 +601,7 @@ fn processChangedExtractionWithConfigOptions(
         .mention_descriptions_json = mention_descriptions,
         .now_ns = replayNowNs,
         .config_generation = cfg.effectiveGeneration(),
+        .namespace_curation_generation = cfg.namespace_curation_generation,
         .promotion_enabled = cfg.promote and cfg.replacement_index.len == 0,
         .retain_work = retain_work,
         .work_retention = cfg.retain_work,

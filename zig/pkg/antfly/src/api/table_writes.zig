@@ -20205,7 +20205,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            return try @import("antfly_local_sources").storage_db_resolver_curation.reviewOperation(cached.db, alloc, body);
+            return try cached.db.resolverReviewsJsonAlloc(alloc, body);
         }
 
         var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror) catch |err| switch (err) {
@@ -20213,7 +20213,7 @@ pub const ProvisionedTableWriteSource = struct {
             else => return err,
         };
         defer db.close();
-        return try @import("antfly_local_sources").storage_db_resolver_curation.reviewOperation(&db, alloc, body);
+        return try db.resolverReviewsJsonAlloc(alloc, body);
     }
 
     fn graphMetricAction(
@@ -25642,7 +25642,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
         defer cached.deinit(hosted_cache.write_cache.alloc);
-        return try @import("antfly_local_sources").storage_db_resolver_curation.reviewOperation(cached.db, alloc, body);
+        return try cached.db.resolverReviewsJsonAlloc(alloc, body);
     }
 
     fn graphMetricActionForRoute(

@@ -336,6 +336,8 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Private ordered curator decision; never accepted from public batch JSON.
+    resolver_review: ?@import("resolver_review.zig").Command = null,
     /// Trusted ingress attaches a signed write principal and the admission
     /// instant after authenticating the live request. Replicas verify against
     /// that committed instant so delayed Raft replay is deterministic.

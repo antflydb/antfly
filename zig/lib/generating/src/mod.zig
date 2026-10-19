@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const localGenerationStatusError = @import("local_failure.zig").localGenerationStatusError;
 const json = @import("antfly-json");
 const openapi = @import("antfly_generating_openapi");
 pub const apple_native = @import("antfly_apple_native");

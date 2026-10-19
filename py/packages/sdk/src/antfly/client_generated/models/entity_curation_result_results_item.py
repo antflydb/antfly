@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
     from ..models.resolver_distinct_pair import ResolverDistinctPair
     from ..models.resolver_redirect import ResolverRedirect
 
@@ -22,6 +23,9 @@ class EntityCurationResultResultsItem:
     Attributes:
         source_table (str):
         resolver (str):
+        key_template (str | Unset):
+        canonical_key (str | Unset):
+        curation (EntityCurationResultResultsItemCuration | Unset):
         revision (int | Unset):
         changed (bool | Unset):
         replay_sequence (int | Unset):
@@ -36,6 +40,9 @@ class EntityCurationResultResultsItem:
 
     source_table: str
     resolver: str
+    key_template: str | Unset = UNSET
+    canonical_key: str | Unset = UNSET
+    curation: EntityCurationResultResultsItemCuration | Unset = UNSET
     revision: int | Unset = UNSET
     changed: bool | Unset = UNSET
     replay_sequence: int | Unset = UNSET
@@ -52,6 +59,14 @@ class EntityCurationResultResultsItem:
         source_table = self.source_table
 
         resolver = self.resolver
+
+        key_template = self.key_template
+
+        canonical_key = self.canonical_key
+
+        curation: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.curation, Unset):
+            curation = self.curation.to_dict()
 
         revision = self.revision
 
@@ -91,6 +106,12 @@ class EntityCurationResultResultsItem:
                 "resolver": resolver,
             }
         )
+        if key_template is not UNSET:
+            field_dict["key_template"] = key_template
+        if canonical_key is not UNSET:
+            field_dict["canonical_key"] = canonical_key
+        if curation is not UNSET:
+            field_dict["curation"] = curation
         if revision is not UNSET:
             field_dict["revision"] = revision
         if changed is not UNSET:
@@ -116,6 +137,7 @@ class EntityCurationResultResultsItem:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
         from ..models.resolver_distinct_pair import ResolverDistinctPair
         from ..models.resolver_redirect import ResolverRedirect
 
@@ -123,6 +145,17 @@ class EntityCurationResultResultsItem:
         source_table = d.pop("source_table")
 
         resolver = d.pop("resolver")
+
+        key_template = d.pop("key_template", UNSET)
+
+        canonical_key = d.pop("canonical_key", UNSET)
+
+        _curation = d.pop("curation", UNSET)
+        curation: EntityCurationResultResultsItemCuration | Unset
+        if isinstance(_curation, Unset):
+            curation = UNSET
+        else:
+            curation = EntityCurationResultResultsItemCuration.from_dict(_curation)
 
         revision = d.pop("revision", UNSET)
 
@@ -161,6 +194,9 @@ class EntityCurationResultResultsItem:
         entity_curation_result_results_item = cls(
             source_table=source_table,
             resolver=resolver,
+            key_template=key_template,
+            canonical_key=canonical_key,
+            curation=curation,
             revision=revision,
             changed=changed,
             replay_sequence=replay_sequence,

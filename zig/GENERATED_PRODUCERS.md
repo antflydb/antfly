@@ -77,9 +77,18 @@ array, predicates a boolean, and scores a number in `[0,1]`. Answers retain
 
 `token_logprobs` is the default. It requires actual, complete decoder evidence
 for every allowed value. Evidence must bind to the correct batch item and JSON
-field. The implementation rejects partial top-k distributions, ambiguous token
-boundaries, and values spanning multiple tokens; it never fills missing labels
-with zero or interprets a model-written number as probability. Choice and
+field. Native JSON-schema decoding uses additive vocabulary bytes for grammar masks,
+streaming, final text, and evidence. SentencePiece whitespace and byte fallback
+survive without sequence-level cleanup. It isolates punctuation from each finite value
+and admits one deterministic vocabulary token per value, preferring a regular
+vocabulary piece over an equivalent byte-fallback piece. Quote-fused tokens and
+alternate tokenizations cannot compete with those tokens. Every choice's JSON
+escaped content (and both boolean literals) must exist as a standalone token in
+the loaded model's vocabulary. Unsupported values, including multi-token labels,
+are rejected before decoding with `UNSUPPORTED_CONSTRAINED_PROBABILITIES`; use
+`verdict_only` for those questions. The diagnostic identifies the unsupported
+value. The implementation rejects partial top-k evidence; it never fills missing
+labels with zero or interprets a model-written number as probability. Choice and
 predicate questions can use this mode. Multiple-choice and numeric score
 questions currently require explicit `verdict_only`.
 
@@ -130,3 +139,7 @@ failures when reported by the server, and measured token use. Supply an explicit
 `evaluation_pricing` object with `input_usd_per_million` and
 `output_usd_per_million` to calculate cost. Missing usage or pricing
 remains unknown; it is not estimated as zero.
+
+Generated execution preserves transient load and run admission failures as
+`MODEL_RESOURCE_BUSY` with `retryable: true` and `retry_after_ms`, so callers can
+back off using the same policy as ordinary generation and typed decisions.

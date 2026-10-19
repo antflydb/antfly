@@ -22,7 +22,8 @@ class EntityCurationResult:
         entity_table (str):
         key (str):
         complete (bool):
-        atomicity (EntityCurationResultAtomicity):
+        atomicity (EntityCurationResultAtomicity): Server entity corrections commit once on the destination table,
+            atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
         results (list[EntityCurationResultResultsItem]):
     """
 

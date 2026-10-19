@@ -3514,6 +3514,7 @@ const LocalStandaloneMetadata = struct {
     fn runRound(ptr: *anyopaque) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try self.reconcileRelations();
+        try self.reconcileResolverNamespaces();
         try self.provisionRestoreOwners();
         self.finalizeReadySchemaMigrations() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.LmdbUnexpected, error.Corrupted => {},
@@ -3549,6 +3550,32 @@ const LocalStandaloneMetadata = struct {
         }
     }
 
+    fn reconcileResolverNamespaces(self: *LocalStandaloneMetadata) !void {
+        const store = self.lifecycle_store orelse return;
+        if (!self.mutex.tryLock()) return;
+        defer self.mutex.unlock();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const group = group_ids.main_metadata_group_id;
+        const job = (try store.pendingResolverNamespaceTable(a, group)) orelse {
+            const id = (try store.pendingResolverNamespaceDrop(a, group)) orelse return;
+            const fence = try store.getTableTransitionFence(group, id);
+            try self.applyJobCommandLocked(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
+            return;
+        };
+        const sources = try store.pendingResolverNamespaceSources(a, group);
+        try store.updateStandaloneCatalog(group, self.durable_revision, .{ .table_replacements = &.{.{ .expected = job, .replacement = job }} });
+        // Certify the new projection only after each touched table is refreshed.
+        self.durable_revision = 0;
+        for (sources) |source| {
+            const actual = (try store.getTable(a, group, source.table_id)) orelse continue;
+            try self.manager.upsertTable(actual);
+        }
+        self.durable_revision = try store.standaloneRevision();
+        self.epoch = self.durable_revision;
+    }
+
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {
         // HA has a separate writer/replica authority contract. A standalone
         // coordinator cannot activate a single-owner capability for it.
@@ -3568,7 +3595,10 @@ const LocalStandaloneMetadata = struct {
         // the next catalog reader. No full projection scan on control rounds.
         if (self.durable_revision != 0 and self.durable_revision == before and
             applied and before != std.math.maxInt(u64) and after == before + 1)
+        {
             self.durable_revision = after;
+            self.epoch = after;
+        }
     }
 
     fn provisionRestoreOwners(self: *LocalStandaloneMetadata) !void {
@@ -4468,6 +4498,15 @@ const LocalStandaloneMetadata = struct {
         mutation.committed = true;
         self.durable_revision += 1;
         self.epoch = self.durable_revision;
+        var projected_tables = mutation.previous_tables.keyIterator();
+        while (projected_tables.next()) |id| {
+            if (!self.manager.tables.contains(id.*)) continue;
+            const actual = (try self.lifecycle_store.?.getTable(a, group_ids.main_metadata_group_id, id.*)) orelse return error.TableLifecycleConflict;
+            self.manager.upsertTable(actual) catch {
+                self.durable_revision = 0;
+                return error.MetadataMutationOutcomeUnknown;
+            };
+        }
     }
 
     fn persistMutationLocked(self: *LocalStandaloneMetadata, mutation: *CatalogMutation) !void {

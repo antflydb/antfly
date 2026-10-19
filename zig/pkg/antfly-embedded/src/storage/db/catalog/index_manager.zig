@@ -12788,6 +12788,7 @@ pub const IndexManager = struct {
 
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return existing.promote != next.promote or
+            existing.namespace_curation_generation != next.namespace_curation_generation or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.merges, next.merges) or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.aliases, next.aliases) or
             !std.mem.eql(u8, existing.table, next.table) or

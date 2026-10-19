@@ -19756,7 +19756,7 @@ pub const ApiHttpServer = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
         defer route.deinit(alloc);
         switch (route) {
-            .local => return (try (self.table_writes orelse return error.UnsupportedOperation).resolverOperationGroupLocal(alloc, group_id, table_name, body)) orelse return error.UnknownGroup,
+            .local => return self.executeResolverOperationLocal(alloc, table_name, group_id, body, context),
             .remote => |remote| {
                 var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
                 _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
@@ -19772,6 +19772,36 @@ pub const ApiHttpServer = struct {
                 return alloc.dupe(u8, reply.body);
             },
         }
+    }
+
+    fn executeResolverOperationLocal(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, body: []const u8, context: api_operation.RequestContext) ![]u8 {
+        const curation = @import("antfly_local_sources").storage_db_resolver_curation;
+        const writes = self.table_writes orelse return error.UnsupportedOperation;
+        var parsed = try std.json.parseFromSlice(curation.ReviewRequest, alloc, body, .{});
+        defer parsed.deinit();
+        var request = parsed.value;
+        if (request.operation == .prepare_review or request.operation == .review_status) return error.InvalidResolverCurationRequest;
+        if (request.operation != .review) return (try writes.resolverOperationGroupLocal(alloc, group_id, table_name, body)) orelse error.UnknownGroup;
+        request.operation = .prepare_review;
+        const prepared_body = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(prepared_body);
+        const prepared = (try writes.resolverOperationGroupLocal(alloc, group_id, table_name, prepared_body)) orelse return error.UnknownGroup;
+        defer alloc.free(prepared);
+        const Command = @typeInfo(@TypeOf(request.command)).optional.child;
+        var command = try std.json.parseFromSlice(Command, alloc, prepared, .{});
+        defer command.deinit();
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalogSource(), table_name, context.deadline_ns)) orelse return error.UnknownTable;
+        defer routing.deinit(alloc);
+        const document = try command.value.ownerDocumentAlloc(alloc);
+        defer alloc.free(document);
+        const route = routing.resolveRouteForKey(document) orelse return error.GroupLeaderUnavailable;
+        if (route.group_id != group_id) return error.ResolverCurationConflict;
+        const writer = self.cfg.routed_raft_batch_writer orelse return error.UnsupportedOperation;
+        const forwarding = @import("internal_batch_forwarding.zig");
+        _ = (try writer.write(alloc, .{ .catalog = routing.fenceForRoute(route) }, group_id, table_name, .{ .resolver_review = command.value, .sync_level = .write }, .{ .remaining_ms = @min((try context.remainingTimeoutMs()) orelse forwarding.max_remaining_ms, forwarding.max_remaining_ms), .forwards_remaining = forwarding.max_forwards, .campaign_allowed = false }, context)) orelse return error.UnknownGroup;
+        const status_body = try std.json.Stringify.valueAlloc(alloc, curation.ReviewRequest{ .operation = .review_status, .command = command.value }, .{});
+        defer alloc.free(status_body);
+        return (try writes.resolverOperationGroupLocal(alloc, group_id, table_name, status_body)) orelse error.UnknownGroup;
     }
 
     pub fn executeRestoreOwner(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("restore_owner.zig").Request, context: api_operation.RequestContext) !@import("restore_owner.zig").Response {
@@ -58039,7 +58069,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             .{ .table_id = 1, .name = "source", .indexes_json = "{}", .placement_role = "data" },
             .{ .table_id = 2, .name = "entities", .indexes_json = "{}", .placement_role = "data" },
         },
-        owned: ?[]u8 = null,
+        owned: [2]?[]u8 = .{ null, null },
         commits: u64 = 0,
         expire_wait: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -58062,11 +58092,12 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         }
         fn replace(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (!std.mem.eql(u8, expected.indexes_json, self.tables[0].indexes_json)) return error.Conflict;
+            const slot: usize = if (expected.table_id == 1) 0 else 1;
+            if (!std.mem.eql(u8, expected.indexes_json, self.tables[slot].indexes_json)) return error.Conflict;
             const bytes = try std.testing.allocator.dupe(u8, replacement.indexes_json);
-            if (self.owned) |old| std.testing.allocator.free(old);
-            self.owned = bytes;
-            self.tables[0].indexes_json = bytes;
+            if (self.owned[slot]) |old| std.testing.allocator.free(old);
+            self.owned[slot] = bytes;
+            self.tables[slot].indexes_json = bytes;
             self.commits += 1;
             return .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .term = 1, .index = self.commits };
         }
@@ -58075,7 +58106,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         }
     };
     var source: Source = .{};
-    defer if (source.owned) |bytes| alloc.free(bytes);
+    defer for (source.owned) |owned| if (owned) |bytes| alloc.free(bytes);
     source.tables[0].indexes_json =
         \\{"knowledge":{"name":"knowledge","type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","promote":false}]}}
     ;
@@ -58096,6 +58127,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/b\"]}", 400);
     try std.testing.expectEqual(@as(u64, 1), source.commits);
     try Run.call(&server, .unmerge, "source", "concepts", "concept/a", "{\"pin_distinct\":true}", 202);
+    try Run.call(&server, .suppress, "source", "concepts", "", "{\"texts\":[\"private source text\"]}", 202);
     try Run.call(&server, .entity_merge, "entities", "", "concept/a", "{\"into\":\"concept/b\"}", 400);
     try Run.call(&server, .entity_suppress, "entities", "", "concept/noise", "{}", 202);
     const Denied = struct {
@@ -58109,14 +58141,13 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     defer denied.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), denied.status);
     try std.testing.expectEqual(before_denial, source.commits);
-    try Run.call(&server, .suppress, "source", "concepts", "", "{\"texts\":[\"private source text\"]}", 202);
     var denied_read = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "limited" }, .table_read_authorization = .{ .ptr = &authority_context, .allows = Denied.allows } });
     defer denied_read.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), denied_read.status);
     try std.testing.expect(std.mem.indexOf(u8, denied_read.body, "private source text") == null);
     const ReadSource = struct {
         fn allows(_: *const anyopaque, name: []const u8) bool {
-            return std.mem.eql(u8, name, "source");
+            return std.mem.eql(u8, name, "entities");
         }
     };
     var allowed_read = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "source-reader" }, .table_read_authorization = .{ .ptr = &authority_context, .allows = ReadSource.allows } });
@@ -58132,7 +58163,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     // The authoritative CAS succeeds before the clipped observation expires.
     source.expire_wait = true;
     const before_wait = source.commits;
-    var timed_out = try resources.handle(&server, alloc, .merge, "source", "concepts", "", "{\"from\":\"concept/wait\",\"to\":\"concept/target\",\"wait\":{\"timeout_ms\":1}}", "", .{});
+    var timed_out = try resources.handle(&server, alloc, .entity_merge, "entities", "", "concept/wait", "{\"into\":\"concept/target\",\"wait\":{\"timeout_ms\":1}}", "", .{});
     defer timed_out.deinit(alloc);
     source.expire_wait = false;
     try std.testing.expectEqual(@as(u16, 202), timed_out.status);

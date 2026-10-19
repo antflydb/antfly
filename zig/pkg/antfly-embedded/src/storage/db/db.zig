@@ -8552,6 +8552,14 @@ pub const DB = struct {
         try @import("online_source_contract.zig").validateRequest(req);
         try @import("artifact_inventory.zig").validateRequest(req);
         try @import("artifact_publication_transport.zig").validateBatchRequest(req);
+        try @import("resolver_review.zig").validateRequest(req);
+        if (req.resolver_review) |command| {
+            var review_opts = opts;
+            review_opts.resolver_review_command = &command;
+            review_opts.restore_replication_request = req;
+            review_opts.wait_for_sync_level = false;
+            return self.batchInternal(.{ .sync_level = .write }, profile, review_opts);
+        }
         try @import("group_source_contract.zig").validateRequest(req);
         if (req.group_source) |command| {
             var control_opts = opts;
@@ -29704,115 +29712,31 @@ pub const DB = struct {
     }
 
     pub fn recordReviewDecisionChecked(self: *DB, doc_key: []const u8, source_artifact: []const u8, resolution_artifact: []const u8, local_id: []const u8, decision: resolver_lib.Decision, table: []const u8, key: []const u8, expected_hash: ?[]const u8, expected_revision: ?u64) !u64 {
-        var policy_lease = try self.local_execution.row_policy_gate.enterRaw();
-        defer policy_lease.release();
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
-        defer snapshot_mutation.release();
-        try self.lockApplyForPortableRuntime();
-        var apply_mutex_held = true;
-        errdefer if (apply_mutex_held) self.core.unlockApply();
-
-        const resolvers = try self.core.listResolvers(self.alloc);
-        defer {
-            for (resolvers) |*cfg| cfg.deinit(self.alloc);
-            if (resolvers.len > 0) self.alloc.free(resolvers);
-        }
-        var selected_config: ?index_manager_mod.ResolverConfig = null;
-        for (resolvers) |cfg| {
-            if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
-                std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
-            {
-                selected_config = cfg;
-                break;
-            }
+        if (try self.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
+        var policy = try self.local_execution.row_policy_gate.enterRaw();
+        defer policy.release();
+        var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const review = @import("resolver_review.zig");
+        const resolvers = try self.core.listResolvers(a);
+        const cfg = for (resolvers) |cfg| {
+            if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) break cfg;
         } else return error.ResolverNotFound;
-
-        if (expected_revision) |revision| if (selected_config.?.curation_revision != revision) return error.ResolverCurationConflict;
-        if (expected_hash) |expected| {
-            const artifact = try internal_keys.artifactNamedPrefixAlloc(self.alloc, doc_key, "resolution", resolution_artifact);
-            defer self.alloc.free(artifact);
-            const bytes = self.core.store.get(self.alloc, artifact) catch |err| switch (err) {
-                error.NotFound => return error.ResolverCurationConflict,
-                else => return err,
-            };
-            defer self.alloc.free(bytes);
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-            const actual = std.fmt.bytesToHex(digest, .lower);
-            if (!std.mem.eql(u8, expected, &actual)) return error.ResolverCurationConflict;
-            var current = try resolver_lib.parseResolution(self.alloc, bytes);
-            defer current.deinit();
-            const cfg = selected_config.?;
-            if (current.config_generation != cfg.effectiveGeneration()) return error.ResolverCurationConflict;
-            for (current.entities) |entity| {
-                if (entity.decision != .review or !std.mem.eql(u8, entity.local_id, local_id)) continue;
-                if (decision != .suppressed) {
-                    if (!std.mem.eql(u8, table, cfg.table)) return error.InvalidResolverCurationRequest;
-                    var arena = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena.deinit();
-                    const scratch = arena.allocator();
-                    var policy = try resolver_lib.curation.Index.init(scratch, cfg.suppress_json, cfg.curation_json);
-                    const redirects = try resolver_lib.curation.RedirectIndex.init(scratch, try cfg.effectiveAliasesAlloc(scratch));
-                    try policy.bindRedirects(scratch, redirects);
-                    if (policy.keySuppressed(key) or policy.keySuppressed(redirects.canonical(key))) return error.SuppressedResolverRedirectTarget;
-                    var renderer = try resolver_lib.Resolver.initFromParts(scratch, cfg.table, cfg.key_template, .{}, cfg.type_must_match, "");
-                    defer renderer.deinit();
-                    const original = try renderer.renderKeyAlloc(scratch, .{ .text = entity.surface_form, .label = entity.label, .local_id = entity.local_id });
-                    if (try policy.pinnedDistinct(scratch, original, key)) return error.ResolverDistinctPair;
-                }
-                break;
-            } else return error.ResolverCurationConflict;
-        }
-
-        const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(self.alloc, doc_key, source_artifact, resolution_artifact);
-        defer self.alloc.free(override_key);
-        const existing = self.core.store.get(self.alloc, override_key) catch |err| switch (err) {
-            error.NotFound => null,
+        const raw = self.core.store.get(a, try internal_keys.resolutionArtifactKeyAlloc(a, doc_key, resolution_artifact)) catch |err| switch (err) {
+            error.NotFound => return error.ResolverCurationConflict,
             else => return err,
         };
-        defer if (existing) |raw| self.alloc.free(raw);
-        const override_bytes = try resolution_runtime_mod.buildReviewDecisionBytesAlloc(self.alloc, existing, local_id, decision, table, key);
-        defer self.alloc.free(override_bytes);
-
-        const source_key = try internal_keys.artifactNamedPrefixAlloc(self.alloc, doc_key, "asset", source_artifact);
-        defer self.alloc.free(source_key);
-        const sequence = self.core.reserveDerivedAppendSequence();
-        const changed_artifact_keys = [_][]const u8{source_key};
-        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
-            .sequence = sequence,
-            .changed_artifact_keys = changed_artifact_keys[0..],
-        }, sequence);
-        defer self.alloc.free(replay_payload);
-
-        const catalog = @import("catalog/resolver_catalog.zig");
-        const previous_reader = self.core.index_manager.minimum_reader_version.load(.acquire);
-        const upgrade_reader = decision == .suppressed and previous_reader < catalog.curation_reader_version;
-        const writes = [_]docstore_mod.KVPair{ .{ .key = override_key, .value = override_bytes }, .{ .key = catalog.minimum_reader_key, .value = try catalog.readerVersionBytes(@max(previous_reader, catalog.curation_reader_version)) } };
-        var backlog_admission = try self.executor.admitBacklogBytes(@intCast(replay_payload.len));
-        defer backlog_admission.cancel();
-        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..if (upgrade_reader) 2 else 1], &.{}, .{
-            .sequence = sequence,
-            .payload = replay_payload,
-        });
-        if (upgrade_reader) self.core.index_manager.minimum_reader_version.store(catalog.curation_reader_version, .release);
-        self.mirrorReplicationReplayPayloadBestEffort(replay_payload);
-        self.executor.commitBacklogAdmission(sequence, &backlog_admission);
-        self.core.unlockApply();
-        apply_mutex_held = false;
-        snapshot_mutation.release();
-        notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
-
-        if (self.executor.hasWorkers()) {
-            self.executor.forceSequence(sequence);
-        } else {
-            self.executor.notifySequence(sequence);
-        }
-        self.notifyResolverReplayRuntimes(sequence);
-        return sequence;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
+        var namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+        const command: review.Command = .{ .namespace = namespace, .policy_digest = try review.policyDigest(a, self.core.store), .override_digest = try review.overrideDigest(a, self.core.store, doc_key, source_artifact, resolution_artifact), .resolver = cfg.name, .document = doc_key, .source_artifact = source_artifact, .resolution_artifact = resolution_artifact, .local_id = local_id, .expected_hash = expected_hash orelse &std.fmt.bytesToHex(hash, .lower), .config_generation = cfg.effectiveGeneration(), .curation_revision = expected_revision orelse cfg.curation_revision, .decision = decision, .table = table, .key = key };
+        policy.release();
+        try self.batch(.{ .resolver_review = command, .sync_level = .write });
+        const result = (try review.receipt(a, self.core.store, command)) orelse return error.StorageUnavailable;
+        if (!result.accepted) return error.ResolverCurationConflict;
+        return result.sequence;
     }
 
     /// Eager edge rewrite for an entity merge: repoint every inbound edge of

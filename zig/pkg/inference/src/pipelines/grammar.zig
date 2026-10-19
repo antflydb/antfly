@@ -38,6 +38,7 @@ pub const TokenByteTable = struct {
     token_lengths: []u16,
     /// Concatenated decoded bytes for all tokens.
     byte_data: []u8,
+    byte_fallback_tokens: ?[]bool = null,
 
     pub fn init(allocator: std.mem.Allocator, tok: tokenizer_mod.Tokenizer, vocab_size: usize) !TokenByteTable {
         var offsets = try allocator.alloc(u32, vocab_size);
@@ -45,18 +46,23 @@ pub const TokenByteTable = struct {
         var lengths = try allocator.alloc(u16, vocab_size);
         errdefer allocator.free(lengths);
 
+        const fallback = try allocator.alloc(bool, vocab_size);
+        errdefer allocator.free(fallback);
+        @memset(fallback, false);
         // Single pass: decode all tokens, accumulate bytes into a growable list.
         var byte_list = std.ArrayListUnmanaged(u8).empty;
         errdefer byte_list.deinit(allocator);
         for (0..vocab_size) |token_id| {
-            const ids = [1]i32{@intCast(token_id)};
-            const token_bytes = tok.decode(allocator, &ids) catch {
+            const piece = tok.tokenPiece(allocator, @intCast(token_id)) catch |err| {
+                if (err == error.OutOfMemory) return err;
                 offsets[token_id] = std.math.cast(u32, byte_list.items.len) orelse return error.VocabTooLarge;
                 lengths[token_id] = 0;
                 continue;
             };
+            const token_bytes = piece.bytes;
+            fallback[token_id] = piece.is_byte_fallback;
             defer allocator.free(token_bytes);
-            const capped_len: u16 = @intCast(@min(token_bytes.len, std.math.maxInt(u16)));
+            const capped_len = std.math.cast(u16, token_bytes.len) orelse return error.VocabTooLarge;
             offsets[token_id] = std.math.cast(u32, byte_list.items.len) orelse return error.VocabTooLarge;
             lengths[token_id] = capped_len;
             try byte_list.appendSlice(allocator, token_bytes[0..capped_len]);
@@ -67,6 +73,7 @@ pub const TokenByteTable = struct {
             .token_offsets = offsets,
             .token_lengths = lengths,
             .byte_data = byte_data,
+            .byte_fallback_tokens = fallback,
         };
     }
 
@@ -78,7 +85,28 @@ pub const TokenByteTable = struct {
         return self.byte_data[off..][0..len];
     }
 
+    pub fn isByteFallback(self: *const TokenByteTable, id: usize) bool {
+        return if (self.byte_fallback_tokens) |flags| id < flags.len and flags[id] else false;
+    }
+
+    pub fn decodeTokens(self: *const TokenByteTable, allocator: std.mem.Allocator, ids: []const i32) ![]u8 {
+        var size: usize = 0;
+        for (ids) |id| {
+            if (id < 0 or id >= self.token_lengths.len) return error.InvalidTokenEvidence;
+            size = std.math.add(usize, size, self.getTokenBytes(@intCast(id)).len) catch return error.VocabTooLarge;
+        }
+        const bytes = try allocator.alloc(u8, size);
+        var offset: usize = 0;
+        for (ids) |id| {
+            const piece = self.getTokenBytes(@intCast(id));
+            @memcpy(bytes[offset..][0..piece.len], piece);
+            offset += piece.len;
+        }
+        return bytes;
+    }
+
     pub fn deinit(self: *TokenByteTable, allocator: std.mem.Allocator) void {
+        if (self.byte_fallback_tokens) |fallback| allocator.free(fallback);
         allocator.free(self.token_offsets);
         allocator.free(self.token_lengths);
         allocator.free(self.byte_data);
@@ -190,8 +218,10 @@ pub const JsonGrammar = struct {
 
         // For each token in the vocabulary, simulate advancing a copy of the FSM.
         for (0..vocab_size) |token_id| {
-            const ids = [1]i32{@intCast(token_id)};
-            const token_bytes = tok.decode(allocator, &ids) catch continue;
+            const token_bytes = tok.tokenBytes(allocator, @intCast(token_id)) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
             defer allocator.free(token_bytes);
 
             if (token_bytes.len == 0) continue;
@@ -694,6 +724,7 @@ pub const GbnfGrammar = struct {
     // A request owns one mask, bounded by vocabulary size. Repeated characters
     // inside a schema string often leave the continuation state unchanged.
     mask_cache: ?*MaskCache,
+    evidence_tokens: std.StringHashMapUnmanaged([]usize) = .empty,
     const MaskCache = struct {
         key: ?[32]u8 = null,
         mask: ?[]bool = null,
@@ -742,6 +773,9 @@ pub const GbnfGrammar = struct {
     }
 
     pub fn deinit(self: *GbnfGrammar) void {
+        var evidence_it = self.evidence_tokens.valueIterator();
+        while (evidence_it.next()) |ids| self.allocator.free(ids.*);
+        self.evidence_tokens.deinit(self.allocator);
         if (self.mask_cache) |cache| {
             if (cache.mask) |mask| self.allocator.free(mask);
             self.allocator.destroy(cache);
@@ -754,6 +788,54 @@ pub const GbnfGrammar = struct {
         // Rules and their contents are allocated from arena_slices, so no
         // per-rule cleanup needed — we just free all arena slices above.
         self.rules.deinit(self.allocator);
+    }
+
+    pub fn admitTokenEvidence(self: *GbnfGrammar, table: *const TokenByteTable) !void {
+        // Index only required values, then visit the vocabulary once. Repeated
+        // question schemas in a batch share admission work and borrowed bytes.
+        var required = std.StringHashMapUnmanaged(?usize).empty;
+        defer required.deinit(self.allocator);
+        for (self.rules.values()) |rule| {
+            if (!std.mem.startsWith(u8, rule.name, "antfly_finite_token_v1_")) continue;
+            for (rule.alternatives) |alternative| {
+                if (alternative.elements.len != 1 or alternative.elements[0].element != .literal) return error.UnsupportedConstrainedProbabilities;
+                try required.put(self.allocator, alternative.elements[0].element.literal, null);
+            }
+        }
+        for (0..table.token_lengths.len) |candidate| {
+            const bytes = table.getTokenBytes(candidate);
+            if (bytes.len == 0 or bytes.len > 4096) continue;
+            if (required.getPtr(bytes)) |id| {
+                if (id.* == null or (table.isByteFallback(id.*.?) and !table.isByteFallback(candidate))) id.* = candidate;
+            }
+        }
+        for (self.rules.values()) |rule| {
+            if (!std.mem.startsWith(u8, rule.name, "antfly_finite_token_v1_")) continue;
+            const ids = try self.allocator.alloc(usize, rule.alternatives.len);
+            errdefer self.allocator.free(ids);
+            for (rule.alternatives, ids) |alternative, *id| {
+                const bytes = alternative.elements[0].element.literal;
+                id.* = required.get(bytes).? orelse {
+                    std.log.warn("token_logprobs requires a standalone vocabulary token for value {s}", .{bytes});
+                    return error.UnsupportedConstrainedProbabilities;
+                };
+            }
+            try self.evidence_tokens.put(self.allocator, rule.name, ids);
+        }
+    }
+
+    fn advanceTokenPosition(self: *const GbnfGrammar, pos: *const ParsePosition, byte: u8, token_id: usize, token_len: usize, offset: usize, next: *std.ArrayListUnmanaged(ParsePosition)) void {
+        var expanded = std.ArrayListUnmanaged(ParsePosition).empty;
+        defer expanded.deinit(self.allocator);
+        self.expandPosition(pos, &expanded);
+        for (expanded.items) |*terminal| {
+            const frame = terminal.topFrame() orelse continue;
+            if (self.evidence_tokens.get(frame.rule_name)) |ids| {
+                const literal = self.rules.get(frame.rule_name).?.alternatives[frame.alt_idx].elements[0].element.literal;
+                if (token_id != ids[frame.alt_idx] or literal.len != token_len or frame.literal_offset != offset) continue;
+            }
+            self.tryConsumeByte(terminal, byte, next);
+        }
     }
 
     /// Feed a sequence of bytes and advance all parse positions.
@@ -809,8 +891,10 @@ pub const GbnfGrammar = struct {
         var any_allowed = false;
 
         for (0..vocab_size) |token_id| {
-            const ids = [1]i32{@intCast(token_id)};
-            const token_bytes = tok.decode(allocator, &ids) catch continue;
+            const token_bytes = tok.tokenBytes(allocator, @intCast(token_id)) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
             defer allocator.free(token_bytes);
 
             if (token_bytes.len == 0) continue;
@@ -856,6 +940,37 @@ pub const GbnfGrammar = struct {
         token_table: *const TokenByteTable,
         vocab_size: usize,
     ) ![]bool {
+        // At an unambiguous finite-value boundary, skip optional whitespace
+        // and mask directly to the admitted IDs. Whitespace vocabulary must
+        // not turn a two-value predicate into incomplete top-k evidence.
+        if (self.evidence_tokens.count() != 0) {
+            var terminals = std.ArrayListUnmanaged(ParsePosition).empty;
+            defer terminals.deinit(allocator);
+            for (self.positions.items) |*position| self.expandPosition(position, &terminals);
+            var finite = false;
+            var only_finite_or_space = true;
+            for (terminals.items) |*terminal| {
+                const frame = terminal.topFrame() orelse {
+                    only_finite_or_space = false;
+                    break;
+                };
+                if (self.evidence_tokens.contains(frame.rule_name) and frame.literal_offset == 0) {
+                    finite = true;
+                } else if (!std.mem.eql(u8, frame.rule_name, "ws")) {
+                    only_finite_or_space = false;
+                    break;
+                }
+            }
+            if (finite and only_finite_or_space) {
+                const mask = try allocator.alloc(bool, vocab_size);
+                @memset(mask, false);
+                for (terminals.items) |*terminal| {
+                    const frame = terminal.topFrame() orelse continue;
+                    if (self.evidence_tokens.get(frame.rule_name)) |ids| mask[ids[frame.alt_idx]] = true;
+                }
+                return mask;
+            }
+        }
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("gbnf-token-mask-v1");
         inline for (.{ token_table.token_offsets.len, token_table.token_lengths.len, token_table.byte_data.len, self.positions.items.len }) |length| hash.update(std.mem.asBytes(&length));
@@ -893,10 +1008,10 @@ pub const GbnfGrammar = struct {
             sim_positions.appendSlice(allocator, self.positions.items) catch continue;
 
             var valid = true;
-            for (token_bytes) |b| {
+            for (token_bytes, 0..) |b, offset| {
                 var next = std.ArrayListUnmanaged(ParsePosition).empty;
                 for (sim_positions.items) |*pos| {
-                    self.advancePosition(pos, b, &next);
+                    self.advanceTokenPosition(pos, b, token_id, token_bytes.len, offset, &next);
                 }
                 sim_positions.deinit(allocator);
                 sim_positions = next;
@@ -915,6 +1030,10 @@ pub const GbnfGrammar = struct {
         }
 
         if (!any_allowed) {
+            if (self.evidence_tokens.count() != 0) {
+                allocator.free(mask);
+                return error.UnsupportedConstrainedProbabilities;
+            }
             @memset(mask, true);
         }
 
@@ -1506,7 +1625,12 @@ fn skipWsAndComments(source: []const u8, start: usize) usize {
 }
 
 pub fn buildJsonSchemaGrammar(allocator: std.mem.Allocator, schema: std.json.Value) ![]u8 {
+    return buildJsonSchemaGrammarWithEvidence(allocator, schema, false);
+}
+
+pub fn buildJsonSchemaGrammarWithEvidence(allocator: std.mem.Allocator, schema: std.json.Value, canonical_evidence: bool) ![]u8 {
     var builder = JsonSchemaGrammarBuilder{
+        .canonical_evidence = canonical_evidence,
         .allocator = allocator,
     };
     errdefer builder.deinit();
@@ -1516,6 +1640,7 @@ pub fn buildJsonSchemaGrammar(allocator: std.mem.Allocator, schema: std.json.Val
 }
 
 const JsonSchemaGrammarBuilder = struct {
+    canonical_evidence: bool = false,
     allocator: std.mem.Allocator,
     out: std.ArrayListUnmanaged(u8) = .empty,
     rule_names: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -1600,6 +1725,11 @@ const JsonSchemaGrammarBuilder = struct {
         }
         if (schema_obj.get("enum")) |enum_values| {
             if (enum_values != .array) return error.InvalidSchema;
+            // Integer enums include positional IDs in the batch envelope;
+            // they are not confidence-bearing choice or predicate fields.
+            if (self.canonical_evidence and enum_values.array.items.len > 0 and
+                (enum_values.array.items[0] == .string or enum_values.array.items[0] == .bool))
+                return self.emitEvidenceRule(enum_values.array.items);
             var rules = std.ArrayListUnmanaged([]const u8).empty;
             defer rules.deinit(self.allocator);
             for (enum_values.array.items) |item| {
@@ -1626,11 +1756,40 @@ const JsonSchemaGrammarBuilder = struct {
             if (std.mem.eql(u8, type_name, "string")) return "json_string";
             if (std.mem.eql(u8, type_name, "number")) return "json_number";
             if (std.mem.eql(u8, type_name, "integer")) return self.emitIntegerRule(schema_obj);
-            if (std.mem.eql(u8, type_name, "boolean")) return "json_boolean";
+            if (std.mem.eql(u8, type_name, "boolean")) return if (self.canonical_evidence) self.emitEvidenceRule(&.{ .{ .bool = false }, .{ .bool = true } }) else "json_boolean";
             if (std.mem.eql(u8, type_name, "null")) return "json_null";
         }
 
         return "json_value_generic";
+    }
+
+    // Isolate finite values from JSON punctuation. These named rules are
+    // admitted against the actual vocabulary and consumed in one decoder step.
+    fn emitEvidenceRule(self: *JsonSchemaGrammarBuilder, values: []const std.json.Value) ![]const u8 {
+        if (values.len == 0 or values.len > 64) return error.UnsupportedConstrainedProbabilities;
+        const quoted = values[0] == .string;
+        const finite = try self.nextRuleName("antfly_finite_token_v1");
+        try self.out.appendSlice(self.allocator, finite);
+        try self.out.appendSlice(self.allocator, " ::= ");
+        for (values, 0..) |value, i| {
+            if ((value == .string) != quoted) return error.UnsupportedConstrainedProbabilities;
+            const encoded = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+            defer self.allocator.free(encoded);
+            if (i != 0) try self.out.appendSlice(self.allocator, " | ");
+            try self.appendGrammarLiteral(if (quoted) encoded[1 .. encoded.len - 1] else encoded);
+        }
+        try self.out.append(self.allocator, '\n');
+        if (!quoted) return finite;
+        const wrapper = try self.nextRuleName("finite_string");
+        try self.out.appendSlice(self.allocator, wrapper);
+        try self.out.appendSlice(self.allocator, " ::= ");
+        try self.appendGrammarLiteral("\"");
+        try self.out.appendSlice(self.allocator, " ");
+        try self.out.appendSlice(self.allocator, finite);
+        try self.out.appendSlice(self.allocator, " ");
+        try self.appendGrammarLiteral("\"");
+        try self.out.append(self.allocator, '\n');
+        return wrapper;
     }
 
     fn emitSchemaUnion(self: *JsonSchemaGrammarBuilder, schemas: std.json.Value) anyerror![]const u8 {
@@ -2540,5 +2699,68 @@ test "gbnf token masks bound ambiguous repetition and preserve rejection" {
         try std.testing.expectEqualSlices(bool, continued, uncached);
     }
     grammar.advance("b");
+    try std.testing.expect(grammar.isComplete());
+}
+
+test "canonical evidence isolates asymmetric vocabulary tokens and rejects unsupported values" {
+    const a = std.testing.allocator;
+    var schema = try std.json.parseFromSlice(std.json.Value, a, "{\"enum\":[\"1\",\"2\"]}", .{});
+    defer schema.deinit();
+    const source = try buildJsonSchemaGrammarWithEvidence(a, schema.value, true);
+    defer a.free(source);
+    var grammar = try GbnfGrammar.parse(a, source);
+    defer grammar.deinit();
+    const offsets = [_]u32{ 0, 1, 2, 3, 5, 7 };
+    const lengths = [_]u16{ 1, 1, 1, 2, 2, 1 };
+    const fallback = [_]bool{ false, true, false, false, false, false };
+    const table = TokenByteTable{ .byte_data = @constCast("\"121\"\"21"), .token_offsets = @constCast(&offsets), .token_lengths = @constCast(&lengths), .byte_fallback_tokens = @constCast(&fallback) };
+    try grammar.admitTokenEvidence(&table);
+    const first = try grammar.allowedTokenMaskFast(a, &table, lengths.len);
+    defer a.free(first);
+    try std.testing.expect(first[0]);
+    try std.testing.expect(!first[4]); // opening quote fused with 2
+    grammar.advance("\"");
+    const values = try grammar.allowedTokenMaskFast(a, &table, lengths.len);
+    defer a.free(values);
+    try std.testing.expect(values[5] and values[2]);
+    try std.testing.expect(!values[3]); // 1 fused with closing quote
+    try std.testing.expect(!values[1]); // Prefer a regular piece over its byte fallback alias.
+    grammar.advance("1");
+    const closing = try grammar.allowedTokenMaskFast(a, &table, lengths.len);
+    defer a.free(closing);
+    try std.testing.expect(closing[0]);
+
+    var unsupported = try GbnfGrammar.parse(a, "root ::= antfly_finite_token_v1_0\nantfly_finite_token_v1_0 ::= \"a_is_b\" | \"none\"\n");
+    defer unsupported.deinit();
+    try std.testing.expectError(error.UnsupportedConstrainedProbabilities, unsupported.admitTokenEvidence(&table));
+}
+
+test "canonical evidence predicates exclude optional whitespace from the finite distribution" {
+    const a = std.testing.allocator;
+    var grammar = try GbnfGrammar.parse(a, "root ::= ws antfly_finite_token_v1_0 ws\nws ::= [ \\t\\n]*\nantfly_finite_token_v1_0 ::= \"true\" | \"false\"\n");
+    defer grammar.deinit();
+    const offsets = [_]u32{ 0, 4, 9, 10 };
+    const lengths = [_]u16{ 4, 5, 1, 1 };
+    const table = TokenByteTable{ .byte_data = @constCast("truefalse \n"), .token_offsets = @constCast(&offsets), .token_lengths = @constCast(&lengths) };
+    try grammar.admitTokenEvidence(&table);
+    const mask = try grammar.allowedTokenMaskFast(a, &table, lengths.len);
+    defer a.free(mask);
+    try std.testing.expect(mask[0] and mask[1]);
+    try std.testing.expect(!mask[2] and !mask[3]);
+}
+
+test "canonical evidence preserves large positional batch ID enums" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema: std.json.Value = .{ .object = .empty };
+    var ids: std.json.Value = .{ .array = std.json.Array.init(a) };
+    for (0..128) |id| try ids.array.append(.{ .integer = @intCast(id) });
+    try schema.object.put(a, "enum", ids);
+    const source = try buildJsonSchemaGrammarWithEvidence(a, schema, true);
+    try std.testing.expect(std.mem.indexOf(u8, source, "antfly_finite_token_v1_") == null);
+    var grammar = try GbnfGrammar.parse(a, source);
+    defer grammar.deinit();
+    grammar.advance("127");
     try std.testing.expect(grammar.isComplete());
 }

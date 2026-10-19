@@ -28,8 +28,87 @@ pub const MetadataIdentity = struct {
     revision: u64,
     namespace_generation: u64 = 0,
     dropped: bool = false,
+    namespace_owned: bool = false,
 };
 pub const Metadata = struct { version: u32 = 1, identities: []const MetadataIdentity = &.{} };
+/// Authoritative corrections belong to a destination table and exact key template.
+pub const namespaces_key = "_resolver_namespaces";
+pub const Namespace = struct {
+    /// One-time adoption cut; later edits use the destination-table CAS.
+    adoption_revision: ?u64 = null,
+    adoption_standalone: bool = false,
+    key_template: []const u8,
+    revision: u64 = 0,
+    merges: []const resolver.KeyAlias = &.{},
+    state: resolver.curation.State = .{},
+};
+pub const Namespaces = struct { version: u32 = 1, namespaces: []const Namespace = &.{} };
+pub fn namespacesFromValue(a: std.mem.Allocator, root: std.json.Value) !Namespaces {
+    const value = if (root == .object) root.object.get(namespaces_key) orelse return .{} else return .{};
+    const result = try std.json.parseFromSliceLeaky(Namespaces, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{});
+    if (result.version != 1 or result.namespaces.len > 4096) return error.InvalidResolverCurationVersion;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (result.namespaces) |item| {
+        if (item.key_template.len == 0 or item.revision == 0) return error.InvalidResolverCurationRequest;
+        if ((try seen.getOrPut(a, item.key_template)).found_existing) return error.InvalidResolverCurationRequest;
+        _ = try resolver.curation.RedirectIndex.init(a, item.merges);
+        _ = try resolver.curation.Index.init(a, "", try std.json.Stringify.valueAlloc(a, item.state, .{}));
+    }
+    return result;
+}
+pub fn replaceNamespace(a: std.mem.Allocator, root: *std.json.Value, next: Namespace) !void {
+    const current = try namespacesFromValue(a, root.*);
+    var items: std.ArrayListUnmanaged(Namespace) = .empty;
+    var found = false;
+    for (current.namespaces) |item| {
+        const match = std.mem.eql(u8, item.key_template, next.key_template);
+        try items.append(a, if (match) next else item);
+        found = found or match;
+    }
+    if (!found) try items.append(a, next);
+    try root.object.put(a, namespaces_key, try json(a, Namespaces{ .namespaces = items.items }));
+}
+/// Upgrade folds identical legacy corrections and rejects disagreements before
+/// publishing the shared authority. Declarative aliases remain source-local.
+pub fn foldNamespace(a: std.mem.Allocator, current: Namespace, cfg: catalog.ResolverConfig) !Namespace {
+    var next = current;
+    var aliases: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    for (current.merges) |item| try aliases.put(a, item.key, item.target);
+    for (cfg.merges) |item| {
+        if (aliases.get(item.key)) |target| {
+            if (!std.mem.eql(u8, target, item.target)) return error.ResolverNamespaceMigrationConflict;
+        } else try aliases.put(a, item.key, item.target);
+    }
+    const merged = try a.alloc(resolver.KeyAlias, aliases.count());
+    for (aliases.keys(), aliases.values(), merged) |key, target, *item| item.* = .{ .key = key, .target = target };
+    _ = try resolver.curation.RedirectIndex.init(a, merged);
+    const prior = try resolver.curation.parseState(a, cfg.curation_json);
+    var keys: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (current.state.suppress.keys) |key| try keys.put(a, key, {});
+    for (prior.suppress.keys) |key| try keys.put(a, key, {});
+    var texts: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (current.state.suppress.texts) |text| try texts.put(a, text, {});
+    for (prior.suppress.texts) |text| try texts.put(a, text, {});
+    var removed: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (current.state.removed_aliases) |key| try removed.put(a, key, {});
+    for (prior.removed_aliases) |key| try removed.put(a, key, {});
+    var distinct: std.ArrayListUnmanaged(resolver.curation.Pair) = .empty;
+    try distinct.appendSlice(a, current.state.distinct);
+    for (prior.distinct) |pair| {
+        const exists = for (distinct.items) |old| {
+            if ((std.mem.eql(u8, old.from, pair.from) and std.mem.eql(u8, old.to, pair.to)) or (std.mem.eql(u8, old.from, pair.to) and std.mem.eql(u8, old.to, pair.from))) break true;
+        } else false;
+        if (!exists) try distinct.append(a, pair);
+    }
+    next.merges = merged;
+    next.state = .{ .suppress = .{ .keys = keys.keys(), .texts = texts.keys(), .min_text_chars = @max(current.state.suppress.min_text_chars, prior.suppress.min_text_chars) }, .removed_aliases = removed.keys(), .distinct = distinct.items };
+    var index = try resolver.curation.Index.init(a, "", try std.json.Stringify.valueAlloc(a, next.state, .{}));
+    try index.bindRedirects(a, try resolver.curation.RedirectIndex.init(a, merged));
+    for (merged) |item| if (index.keySuppressed(item.target) or try index.pinnedDistinct(a, item.key, item.target)) return error.ResolverNamespaceMigrationConflict;
+    next.revision = @max(next.revision, cfg.curation_revision);
+    return next;
+}
+
 pub const MetadataPlan = struct { indexes_json: []const u8, changed: bool, revision: u64, config_generation: u64 };
 
 /// Scratch-arena result used by the metadata CAS path. Index declarations are
@@ -70,6 +149,7 @@ pub fn planMetadataBatch(a: std.mem.Allocator, indexes_json: []const u8, request
         const unique = try seen.getOrPut(a, named.name);
         if (unique.found_existing) return error.InvalidResolverCurationRequest;
         const cfg = definitions.get(named.name) orelse return error.ResolverNotFound;
+        if (by_name.get(named.name)) |i| if (records.items[i].namespace_owned) return error.ResolverNamespaceCurationRequired;
         const request = named.request;
         if (request.expected_revision) |expected| if (expected != cfg.curation_revision) return error.ResolverCurationConflict;
         const edit = try resolver.curation.plan(a, cfg.curation_json, cfg.merges, try cfg.effectiveAliasesAlloc(a), request);
@@ -121,6 +201,7 @@ pub fn overlayMetadata(a: std.mem.Allocator, cfg: catalog.ResolverConfig, identi
     next.merges = identity.merges;
     next.curation_json = try std.json.Stringify.valueAlloc(a, identity.state, .{});
     next.curation_revision = identity.revision;
+    next.namespace_curation_generation = if (identity.namespace_owned) identity.revision else 0;
     next.namespace_generation = identity.namespace_generation;
     if (next.merges.len > 0) {
         next.merge_generation = @max(identity.revision, cfg.effectiveGeneration());
@@ -412,7 +493,7 @@ pub fn progressReportAlloc(db: anytype, alloc: std.mem.Allocator) ![]u8 {
     return std.json.Stringify.valueAlloc(alloc, ProgressReport{ .resolvers = rows }, .{});
 }
 
-pub const ReviewRequest = struct { expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null, operation: enum { reviews, review, progress }, resolver: []const u8 = "", cursor: ?[]const u8 = null, limit: u16 = 64, id: ?[]const u8 = null, decision: ?resolver.Decision = null, table: ?[]const u8 = null, key: ?[]const u8 = null };
+pub const ReviewRequest = struct { command: ?@import("resolver_review.zig").Command = null, expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null, operation: enum { reviews, review, prepare_review, review_status, progress }, resolver: []const u8 = "", cursor: ?[]const u8 = null, limit: u16 = 64, id: ?[]const u8 = null, decision: ?resolver.Decision = null, table: ?[]const u8 = null, key: ?[]const u8 = null };
 const ReviewToken = struct { doc_key: []const u8, local_id: []const u8, hash: []const u8 };
 const ReviewCursor = struct { after: ?[]const u8 = null, row: ?[]const u8 = null, offset: usize = 0 };
 pub fn encodeToken(a: std.mem.Allocator, value: anytype) ![]const u8 {
@@ -443,6 +524,13 @@ pub fn reviewOperation(db: anytype, alloc: std.mem.Allocator, body: []const u8) 
     if (input.operation == .progress) return progressReportAlloc(db, alloc);
     var policy_lease = if (input.operation == .reviews) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
     defer policy_lease.release();
+    if (input.operation == .review_status) {
+        const command = input.command orelse return error.InvalidResolverCurationRequest;
+        try command.validate();
+        const result = (try @import("resolver_review.zig").receipt(a, db.core.store, command)) orelse return error.StorageUnavailable;
+        if (!result.accepted) return error.ResolverCurationConflict;
+        return std.json.Stringify.valueAlloc(alloc, .{ .resolver = command.resolver, .changed = true, .revision = command.curation_revision, .replay_sequence = result.sequence, .replay_sequence_kind = "source_journal", .applied = false }, .{});
+    }
     const all = try db.listResolvers(a);
     var selected: ?catalog.ResolverConfig = null;
     for (all) |cfg| if (std.mem.eql(u8, cfg.name, input.resolver)) {
@@ -450,7 +538,7 @@ pub fn reviewOperation(db: anytype, alloc: std.mem.Allocator, body: []const u8) 
         break;
     };
     const cfg = selected orelse return error.ResolverNotFound;
-    if (input.operation == .review) {
+    if (input.operation == .review or input.operation == .prepare_review) {
         const token = try decodeToken(ReviewToken, a, input.id orelse return error.InvalidResolverCurationRequest);
         const decision = input.decision orelse return error.InvalidResolverCurationRequest;
         if (decision == .review) return error.InvalidResolverCurationRequest;
@@ -466,8 +554,25 @@ pub fn reviewOperation(db: anytype, alloc: std.mem.Allocator, body: []const u8) 
             if (policy.keySuppressed(key) or policy.keySuppressed(aliases.canonical(key))) return error.SuppressedResolverRedirectTarget;
             if (try policy.pinnedDistinct(a, original, key)) return error.ResolverDistinctPair;
         }
-        const sequence = try db.recordReviewDecisionChecked(token.doc_key, cfg.source_artifact, cfg.resolution_artifact, token.local_id, decision, table, key, token.hash, input.expected_revision);
-        return std.json.Stringify.valueAlloc(alloc, .{ .resolver = cfg.name, .changed = true, .revision = cfg.curation_revision, .replay_sequence = sequence, .replay_sequence_kind = "source_journal", .applied = false }, .{});
+        var namespace: [24]u8 = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace, db.core.identity_namespace);
+        const review = @import("resolver_review.zig");
+        const command = review.Command{ .namespace = namespace, .policy_digest = try review.policyDigest(a, db.core.store), .override_digest = try review.overrideDigest(a, db.core.store, token.doc_key, cfg.source_artifact, cfg.resolution_artifact), .resolver = cfg.name, .document = token.doc_key, .source_artifact = cfg.source_artifact, .resolution_artifact = cfg.resolution_artifact, .local_id = token.local_id, .expected_hash = token.hash, .config_generation = cfg.effectiveGeneration(), .curation_revision = input.expected_revision orelse cfg.curation_revision, .decision = decision, .table = table, .key = key };
+        if (input.operation == .prepare_review) {
+            const prepared = try review.plan(a, db.core, command, true);
+            if (!prepared.accepted) return error.ResolverCurationConflict;
+            return std.json.Stringify.valueAlloc(alloc, command, .{});
+        }
+        if (try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
+        // Native/Lite and HA use the same primary batch and full mutation
+        // replication contract; no replay-only side channel owns an override.
+        // Batch admission acquires its own policy lease. Do not retain this
+        // read lease while it finalizes a concurrent policy publication.
+        policy_lease.release();
+        try db.batch(.{ .resolver_review = command, .sync_level = .write });
+        const outcome = (try review.receipt(a, db.core.store, command)) orelse return error.StorageUnavailable;
+        if (!outcome.accepted) return error.ResolverCurationConflict;
+        return std.json.Stringify.valueAlloc(alloc, .{ .resolver = cfg.name, .changed = true, .revision = cfg.curation_revision, .replay_sequence = outcome.sequence, .replay_sequence_kind = "source_journal", .applied = false }, .{});
     }
     const cursor = if (input.cursor) |value| try decodeToken(ReviewCursor, a, value) else ReviewCursor{};
     const keys = @import("../internal_keys.zig");
@@ -649,6 +754,7 @@ pub fn retainRetiredMetadata(alloc: std.mem.Allocator, before: []const u8, after
     const reconcile = @import("../../metadata/index_reconcile.zig");
     try reconcile.collectDesiredResolvers(a, prior, &old);
     try reconcile.collectDesiredResolvers(a, next, &desired);
+    if (prior.object.get(namespaces_key)) |value| try next.object.put(a, namespaces_key, value);
     const metadata = try metadataFromValue(a, next);
     var retained: std.StringHashMapUnmanaged(void) = .empty;
     for (metadata.identities) |identity| try retained.put(a, identity.name, {});
@@ -701,4 +807,96 @@ test "resolver curation durable drop fence cannot delete a reactivated fresh ide
     }
     try std.testing.expectEqual(@as(usize, 1), retained.len);
     try std.testing.expectEqual(catalog.curation_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
+}
+
+test "resolver curation ordered review commits outcomes replay and receipts together" {
+    const DB = @import("selected_root.zig").db.DB;
+    const review = @import("resolver_review.zig");
+    const keys = @import("../internal_keys.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try @import("../../common/test_directory.zig").TestDirectory.init("ordered-resolver-review");
+    defer tmp.cleanup();
+    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .start_index_workers = false, .start_optional_runtimes = false };
+    var db = try DB.open(std.testing.allocator, tmp.path(), options);
+    var closed = false;
+    defer if (!closed) db.close();
+    try db.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false, .config_generation = 1 });
+    const artifact = try keys.resolutionArtifactKeyAlloc(a, "source", "resolved");
+    const raw = "{\"config_generation\":1,\"entities\":[{\"local_id\":\"a\",\"doc_ref\":{\"table\":\"entities\",\"key\":\"concept/alpha\"},\"confidence\":0.7,\"decision\":\"review\",\"label\":\"concept\",\"surface_form\":\"Alpha\"}]}";
+    try db.core.store.put(artifact, raw);
+    var namespace: [24]u8 = undefined;
+    @import("doc_identity.zig").encodeNamespace(&namespace, db.core.identity_namespace);
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
+    const command: review.Command = .{ .namespace = namespace, .resolver = "concepts", .document = "source", .source_artifact = "kg", .resolution_artifact = "resolved", .local_id = "a", .expected_hash = &std.fmt.bytesToHex(hash, .lower), .config_generation = 1, .curation_revision = 0, .decision = .suppressed, .table = "entities", .key = "" };
+    // Unit-scoped decisions re-drive the original extraction unit, rather
+    // than inventing another asset nested beneath its internal key.
+    const unit = try keys.documentUnitArtifactKeyAlloc(a, "source", "kg", "unit:1");
+    try db.core.store.put(try keys.resolutionArtifactKeyAlloc(a, unit, "resolved"), raw);
+    var unit_command = command;
+    unit_command.document = unit;
+    const unit_plan = try review.plan(a, db.core, unit_command, true);
+    try std.testing.expect(unit_plan.accepted);
+    try std.testing.expectEqualStrings(unit, unit_plan.source_key.?);
+    try std.testing.expectEqualStrings("source", try unit_command.ownerDocumentAlloc(a));
+    try std.testing.expectEqualStrings("source", try @import("artifact_publication_owner.zig").documentAlloc(a, try unit_command.receiptKey(a)));
+    const replication = @import("replication_effects.zig");
+    for ([_]bool{ false, true }) |ordered| {
+        const payload = if (ordered) try replication.encodeRaftBatchMutationRequestAlloc(a, .{ .resolver_review = command }, .{ .term = 1, .index = 1 }) else try replication.encodeBatchMutationRequestAlloc(a, .{ .resolver_review = command });
+        const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = payload };
+        var parsed = try replication.decodeBatchMutationRequest(std.testing.allocator, record);
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(u32, if (ordered) 23 else 22), parsed.value.schema_version);
+        try std.testing.expectEqual(command.config_generation, parsed.value.request.resolver_review.?.config_generation);
+        try std.testing.expect(try replication.decodeRestoreFinishForReplay(std.testing.allocator, record) == null);
+    }
+    const codec = @import("../../api/batch.zig");
+    const encoded = try codec.encodeBatchRequest(a, .{ .resolver_review = command });
+    try std.testing.expectError(error.InvalidBatchRequest, codec.parseBatchRequest(std.testing.allocator, encoded));
+    var decoded = try codec.parseInternalBatchRequest(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(command.config_generation, decoded.req.resolver_review.?.config_generation);
+    try db.applyOrderedCommittedMutation(.{ .resolver_review = command }, .{ .term = 1, .index = 1 }, false);
+    const accepted = (try review.receipt(a, db.core.store, command)).?;
+    try std.testing.expect(accepted.accepted);
+    try std.testing.expect(accepted.sequence > 0);
+    const override_key = try @import("resolution_runtime.zig").reviewOverrideArtifactKeyAlloc(a, "source", "kg", "resolved");
+    const override = try db.core.store.get(a, override_key);
+    try std.testing.expect(std.mem.indexOf(u8, override, "suppressed") != null);
+    try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
+    const sequence = db.core.store.lastReplaySequence(0);
+    try db.applyOrderedCommittedMutation(.{ .resolver_review = command }, .{ .term = 1, .index = 1 }, false);
+    try std.testing.expectEqual(sequence, db.core.store.lastReplaySequence(0));
+    // A stale command records rejection and advances Raft even though its
+    // override cannot be applied. No failed CAS can wedge follower replay.
+    var stale = command;
+    stale.curation_revision = 1;
+    try db.applyOrderedCommittedMutation(.{ .resolver_review = stale }, .{ .term = 1, .index = 2 }, false);
+    try std.testing.expect(!(try review.receipt(a, db.core.store, stale)).?.accepted);
+    try std.testing.expectEqualStrings(override, try db.core.store.get(a, override_key));
+    try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
+    db.close();
+    closed = true;
+    var reopened = try DB.open(std.testing.allocator, tmp.path(), options);
+    defer reopened.close();
+    try std.testing.expect(!(try review.receipt(a, reopened.core.store, stale)).?.accepted);
+    try std.testing.expectEqualStrings(override, try reopened.core.store.get(a, override_key));
+    try std.testing.expectEqual(@as(u64, 2), (try reopened.orderedApplyReceipt()).?.index);
+}
+
+test "resolver curation namespace migration folds identical state and rejects conflicts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg: catalog.ResolverConfig = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .merges = &.{.{ .key = "concept/a", .target = "concept/b" }}, .curation_json = "{\"suppress\":{\"keys\":[\"concept/noise\"]}}", .curation_revision = 3 };
+    const first = try foldNamespace(a, .{ .key_template = cfg.key_template }, cfg);
+    const identical = try foldNamespace(a, first, cfg);
+    try std.testing.expectEqual(@as(usize, 1), identical.merges.len);
+    try std.testing.expectEqual(@as(usize, 1), identical.state.suppress.keys.len);
+    try std.testing.expectEqual(@as(u64, 3), identical.revision);
+    var conflicting = cfg;
+    conflicting.merges = &.{.{ .key = "concept/a", .target = "concept/c" }};
+    try std.testing.expectError(error.ResolverNamespaceMigrationConflict, foldNamespace(a, first, conflicting));
 }

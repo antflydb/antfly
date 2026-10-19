@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class EntityCurationResultAtomicity(StrEnum):
+    NAMESPACE = "namespace"
     RESOLVER = "resolver"
     SOURCE_TABLE = "source_table"
 

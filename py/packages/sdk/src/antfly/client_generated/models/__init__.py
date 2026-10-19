@@ -347,6 +347,7 @@ from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStall
 from .entity_curation_result import EntityCurationResult
 from .entity_curation_result_atomicity import EntityCurationResultAtomicity
 from .entity_curation_result_results_item import EntityCurationResultResultsItem
+from .entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
 from .entity_merge_request import EntityMergeRequest
 from .error import Error
 from .eval_config import EvalConfig
@@ -1988,6 +1989,7 @@ __all__ = (
     "EntityCurationResult",
     "EntityCurationResultAtomicity",
     "EntityCurationResultResultsItem",
+    "EntityCurationResultResultsItemCuration",
     "EntityMergeRequest",
     "Error",
     "EvalConfig",

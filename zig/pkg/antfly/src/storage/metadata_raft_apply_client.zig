@@ -695,6 +695,21 @@ pub const RaftApplyStore = struct {
         return try self.projectionWithAllocator(?metadata.TableRecord, alloc, .{ .kind = .table, .group_id = group_id, .arg0 = table_id });
     }
 
+    pub fn pendingResolverNamespaceTable(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?metadata.TableRecord {
+        return self.projectionWithAllocator(?metadata.TableRecord, alloc, .{ .kind = .resolver_namespace_work, .group_id = group_id });
+    }
+    pub fn pendingResolverNamespaceDrop(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?u64 {
+        return self.projectionWithAllocator(?u64, alloc, .{ .kind = .resolver_namespace_work, .group_id = group_id, .arg0 = 2 });
+    }
+    pub fn pendingResolverNamespaceSources(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
+        return self.projectionWithAllocator([]metadata.TableRecord, alloc, .{ .kind = .resolver_namespace_work, .group_id = group_id, .arg0 = 1 });
+    }
+    pub fn resolverNamespaceReplacementMatches(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
+        const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .current = current, .replacement = replacement }, .{});
+        defer alloc.free(bytes);
+        return self.projectionWithAllocator(bool, alloc, .{ .kind = .resolver_namespace_replacement_matches, .group_id = group_id, .key = .fromSlice(bytes) });
+    }
+
     pub fn getRange(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, range_group_id: u64) !?metadata.RangeRecord {
         return try self.projectionWithAllocator(?metadata.RangeRecord, alloc, .{
             .kind = .range,

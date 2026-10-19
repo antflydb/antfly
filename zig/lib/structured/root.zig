@@ -16,6 +16,7 @@
 //! Shared constrained-output contract. Callers own the request arena and
 //! provider execution; this layer owns item identity, validation and repair.
 const std = @import("std");
+pub const localGenerationStatusError = @import("antfly_generating").localGenerationStatusError;
 const schema_validator = @import("antfly_jsonschema");
 pub const extraction = @import("generated_extractor.zig");
 pub const token_evidence = @import("token_evidence.zig");

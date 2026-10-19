@@ -6893,6 +6893,7 @@ pub const DataServer = struct {
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
         // Reuse the Raft host's transport unless the caller supplied one.
+        if (api_server_cfg.session_router == null) api_server_cfg.session_router = self.dataReadGroupRouter();
         if (api_server_cfg.session_executor == null) {
             if (self.data_raft) |raft| api_server_cfg.session_executor = raft.host.http_host.request_executor;
         }
@@ -12455,7 +12456,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12485,6 +12486,7 @@ pub const DataServer = struct {
         };
         if (req.merge_page) |page| if (page.source.artifact_catalog) |binding| if (binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |binding| if (binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        if (req.resolver_review != null) return @import("../common/data_raft_protocol.zig").batch_resolver_review_protocol_version;
         if (req.group_source != null) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
         if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))

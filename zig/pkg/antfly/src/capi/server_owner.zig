@@ -578,7 +578,9 @@ pub const StorageOwnerRuntimeHooks = struct {
         }
     };
 
-    pub fn candidateSource(self: *StorageOwnerRuntimeHooks) ?db_mod.CandidateSource {
+    pub fn candidateSource(self: *StorageOwnerRuntimeHooks) !?db_mod.CandidateSource {
+        const config = self.config.resolution_candidates;
+        if (try db_mod.CandidateSource.receiveNative(config.native_view.slice(), config.native_view_contract.slice())) |source| return source;
         if (self.config.resolution_candidates.get_fn == null) return null;
         return .{ .ptr = self, .vtable = &candidate_vtable };
     }
@@ -2058,6 +2060,29 @@ pub fn metadataApplyStoreProjection(
             defer handle.store.freeRanges(alloc, value.ranges);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .resolver_namespace_work => blk: {
+            if (request.arg0 == 2) {
+                const value = handle.store.pendingResolverNamespaceDrop(alloc, request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                break :blk metadataProjectionJson(alloc, out_json, value);
+            }
+            if (request.arg0 == 1) {
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const value = handle.store.pendingResolverNamespaceSources(arena.allocator(), request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                break :blk metadataProjectionJson(alloc, out_json, value);
+            }
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = handle.store.pendingResolverNamespaceTable(arena.allocator(), request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .resolver_namespace_replacement_matches => blk: {
+            const Input = struct { current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord };
+            var parsed = std.json.parseFromSlice(Input, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const value = handle.store.resolverNamespaceReplacementMatches(alloc, request.group_id, parsed.value.current, parsed.value.replacement) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .catalog_cursor => blk: {
             const value = handle.store.captureCatalogCursor(request.group_id) catch |err|
                 break :blk storageOwnerStatusFromError(err);
@@ -3239,7 +3264,7 @@ pub fn storageOwnerOpen(
     if ((runtime_hooks_config.artifact_publication_ctx == null) != (runtime_hooks_config.artifact_publication_enqueue_fn == null)) return .invalid_argument;
     if ((runtime_hooks_config.coordinated_ttl_ctx == null) != (runtime_hooks_config.coordinated_ttl_enqueue_fn == null))
         return .invalid_argument;
-    const candidate_configured = runtime_hooks_config.resolution_candidates.get_fn != null or
+    const candidate_configured = runtime_hooks_config.resolution_candidates.native_view.len != 0 or runtime_hooks_config.resolution_candidates.native_view_contract.len != 0 or runtime_hooks_config.resolution_candidates.get_fn != null or
         runtime_hooks_config.resolution_candidates.scan_prefix_fn != null or
         runtime_hooks_config.resolution_candidates.nearest_fn != null;
     if (candidate_configured and
@@ -3323,7 +3348,7 @@ pub fn storageOwnerOpen(
         .initial_child_bootstrap = if (initial_child_bootstrap) |value| value.value else null,
         .prefer_existing_identity_namespace = identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
-        .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
+        .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() catch |err| return storageOwnerStatusFromError(err) else null,
         .artifact_publication_dispatcher = if (runtime_hooks) |value| value.artifactPublicationDispatcher() else null,
         .entity_sink = if (runtime_hooks) |value| value.entitySink() else null,
         .promotion_owner = if (runtime_hooks) |value| value.promotionOwner() else null,
@@ -5271,7 +5296,7 @@ pub fn storageOwnerResolverOperationJson(
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     _ = storageOwnerOperationTableName(handle, request) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    const response = @import("antfly_local_sources").storage_db_resolver_curation.reviewOperation(&handle.db, handle.alloc, request.request_json.slice()) catch |err|
+    const response = handle.db.resolverReviewsJsonAlloc(handle.alloc, request.request_json.slice()) catch |err|
         return storageOwnerQueryFailure(err, .graph_metric_maintenance, out_failure);
     defer handle.alloc.free(response);
     const owned = dupBytes(response) catch return storageOwnerQueryFailure(error.OutOfMemory, .encode_internal_response, out_failure);

@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 78;
+pub const abi_version: u32 = 80;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -596,6 +596,8 @@ pub const MetadataProjectionKind = enum(u32) {
     merge_transition = 62,
     lake_index_lifecycle = 66,
     lake_index_lifecycle_work = 67,
+    resolver_namespace_work = 68,
+    resolver_namespace_replacement_matches = 69,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };
@@ -989,6 +991,11 @@ pub const ResolutionCandidateNearestFn = *const fn (
 ) callconv(.c) Status;
 
 pub const ResolutionCandidateConfig = extern struct {
+    /// Same-toolchain native view, guarded by a runtime TypeContract before
+    /// reconstruction. Retains batching, binding, adjudication, and caches.
+    /// Source callbacks and context must outlive every opened owner and batch.
+    native_view: BorrowedBytes = .{},
+    native_view_contract: BorrowedBytes = .{},
     callback_ctx: ?*anyopaque = null,
     get_fn: ?ResolutionCandidateGetFn = null,
     scan_prefix_fn: ?ResolutionCandidateScanPrefixFn = null,

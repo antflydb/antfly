@@ -20426,11 +20426,19 @@ export interface components {
             entity_table: string;
             key: string;
             complete: boolean;
-            /** @enum {string} */
-            atomicity: "source_table" | "resolver";
+            /**
+             * @description Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
+             * @enum {string}
+             */
+            atomicity: "namespace" | "source_table" | "resolver";
             results: {
                 source_table: string;
                 resolver: string;
+                key_template?: string;
+                canonical_key?: string;
+                curation?: {
+                    [key: string]: unknown;
+                };
                 /** Format: uint64 */
                 revision?: number;
                 changed?: boolean;
