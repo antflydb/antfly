@@ -538,9 +538,7 @@ pub const EmbeddingPipeline = struct {
     /// One result per ordered content group; text parts concatenate without
     /// inserted spaces. Media soft tokens join the same bidirectional encoder.
     pub fn embedContent(self: *EmbeddingPipeline, inputs: []const EmbeddingContentInput) ![][]f32 {
-        self.last_input_tokens = 0;
         if (!self.config.resident_embedding_gemma2) return error.OrderedEmbeddingContentNotSupported;
-        if (inputs.len == 0) return self.allocator.alloc([]f32, 0);
         var text_only = true;
         for (inputs) |item| {
             if (item.content.len == 0) return error.EmptyEmbeddingInput;
@@ -553,6 +551,8 @@ pub const EmbeddingPipeline = struct {
         }
         const lane = try self.enterExecutionLane();
         defer self.leaveExecutionLane(lane);
+        self.last_input_tokens = 0;
+        if (inputs.len == 0) return self.allocator.alloc([]f32, 0);
         if (text_only) {
             const texts = try self.allocator.alloc([]const u8, inputs.len);
             defer self.allocator.free(texts);
@@ -4586,6 +4586,7 @@ test "text-only embedding capability rejects media before decoder or backend acc
         .config = .{ .allow_image = false, .allow_audio = false, .resident_embedding_gemma2 = true },
         .execution_lane = &lane,
         .execution_control = .{ .ptr = &admission, .check_fn = AdmissionProbe.check },
+        .last_input_tokens = 7,
     };
     const malformed = [_][]const u8{"this must never reach a decoder"};
     var errors = [_]?anyerror{null};
@@ -4601,11 +4602,15 @@ test "text-only embedding capability rejects media before decoder or backend acc
     try std.testing.expectError(error.UnsupportedInput, pipeline.embedAudioPcmReported(&.{.{ .samples = &.{0}, .sample_rate = 16000 }}));
     try std.testing.expectError(error.UnsupportedInput, pipeline.embedAudioInterleavedPcm(&.{.{ .samples = &.{0}, .sample_rate = 16000, .channels = 1 }}));
     try std.testing.expectEqual(@as(usize, 0), admission.calls);
+    try std.testing.expectEqual(@as(usize, 7), pipeline.last_input_tokens);
     try std.testing.expect(!lane.owned);
     // A supported request must still honor cancellation at admission.
     pipeline.config.allow_image = true;
     try std.testing.expectError(error.Cancelled, pipeline.embedImagesReported(&malformed));
     try std.testing.expectEqual(@as(usize, 1), admission.calls);
+    try std.testing.expectError(error.Cancelled, pipeline.embedContent(&.{.{ .content = &.{.{ .text = "supported" }} }}));
+    try std.testing.expectEqual(@as(usize, 2), admission.calls);
+    try std.testing.expectEqual(@as(usize, 7), pipeline.last_input_tokens);
     try std.testing.expect(!lane.owned);
 }
 
