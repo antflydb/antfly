@@ -16351,7 +16351,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const projection_rows = if (try std.math.add(usize, full_projection, full_norms) > 64 * 1024 * 1024) @min(spec.rows, 512) else spec.rows;
         const projection_bytes = std.mem.alignForward(usize, try std.math.mul(usize, try std.math.mul(usize, projection_rows, widest), 4), 4096);
         const norm_bytes = std.mem.alignForward(usize, try std.math.mul(usize, try std.math.mul(usize, spec.rows, spec.hidden), 4), 4096);
-        const bytes = try std.math.add(usize, projection_bytes, try std.math.mul(usize, norm_bytes, 5));
+        const product_bytes = if (projection_rows < spec.rows) try std.math.mul(usize, try std.math.mul(usize, projection_rows, spec.widths[2] / 2), 4) else 0;
+        const bytes = try std.math.add(usize, try std.math.add(usize, projection_bytes, try std.math.mul(usize, norm_bytes, 5)), product_bytes);
         if (bytes > 96 * 1024 * 1024 or spec.rows > 8192) return error.AudioScheduleAdmission;
         const cache = if (self.data.tier_cache) |*v| v else return error.AudioScheduleAdmission;
         self.data.prefetch.lock();
@@ -16380,9 +16381,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var storage = (try self.audioPlanBuffer(&workspace.owner, bytes, false)) orelse return error.AudioScheduleAdmission;
         defer storage.deinit();
         for (&workspace.views, 0..) |*dest, i| {
-            const width = if (i < 6) spec.widths[i] else if (i == 11) spec.alternate_qkv_width else spec.hidden;
-            const offset = if (i < 6 or i == 11) 0 else projection_bytes + (i - 6) * norm_bytes;
-            const view_rows = if (i < 6 or i == 11) projection_rows else spec.rows;
+            if (i == 12 and product_bytes == 0) continue;
+            const width = if (i < 6) spec.widths[i] else if (i == 11) spec.alternate_qkv_width else if (i == 12) spec.widths[2] / 2 else spec.hidden;
+            const offset = if (i < 6 or i == 11) 0 else if (i == 12) projection_bytes + 5 * norm_bytes else projection_bytes + (i - 6) * norm_bytes;
+            const view_rows = if (i < 6 or i >= 11) projection_rows else spec.rows;
             var view = try storage.retainedView(offset, view_rows * width * 4, &.{ @intCast(view_rows), @intCast(width) });
             dest.* = self.audioPersistentCt(&workspace.owner, view) catch |err| {
                 view.deinit();
@@ -16481,6 +16483,150 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         committed = true;
         return template.view;
     }
+    fn embeddingCompactVisibilityOp(ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?ops.EmbeddingCompactVisibility {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const state = self.provider_impl.embedding_bindings orelse return null;
+        if (!self.embedding_bindings_enabled or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_CACHE")) return null;
+        if (batch == 0 or batch > 64 or seq == 0 or seq > 8192 or mask.len != try std.math.mul(usize, batch, seq)) return error.InvalidTensorShape;
+        const clock = self.provider_impl.embedding_binding_clock;
+        var victim: usize = 0;
+        for (state.compact_geometries, 0..) |entry, i| {
+            if (entry) |geometry| if (geometry.batch == batch and geometry.sequence == seq and geometry.window == window and std.mem.eql(i64, geometry.mask, mask)) {
+                geometry.stamp = clock;
+                state.compact_hits += 1;
+                return geometry.view;
+            };
+            if (entry == null or (state.compact_geometries[victim] != null and entry.?.stamp < state.compact_geometries[victim].?.stamp)) victim = i;
+        }
+        if (clock < state.compact_retry) return null;
+        const fresh = self.prepareCompactGeometry(mask, batch, seq, window, clock) catch |err| {
+            state.compact_retry = clock + 8;
+            switch (err) {
+                error.OutOfMemory, error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return null,
+                else => return err,
+            }
+        };
+        if (state.compact_geometries[victim]) |old| {
+            old.deinit();
+            state.owner.host_bytes -= old.owner.host_bytes;
+            state.owner.backend_bytes -= old.owner.backend_bytes;
+            if (self.data.tier_cache) |*cache| {
+                self.data.prefetch.lock();
+                cache.noteRelease(.host, old.owner.host_bytes);
+                cache.noteRelease(.backend, old.owner.backend_bytes);
+                self.data.prefetch.unlock();
+            }
+            std.heap.c_allocator.destroy(old);
+        }
+        state.owner.host_bytes += fresh.owner.host_bytes;
+        state.owner.backend_bytes += fresh.owner.backend_bytes;
+        state.compact_geometries[victim] = fresh;
+        return fresh.view;
+    }
+    fn prepareCompactGeometry(self: *MetalCompute, mask: []const i64, batch: usize, seq: usize, window: u32, clock: u64) !*@import("metal_embedding_bindings.zig").CompactGeometry {
+        const architecture = @import("../architectures/embedding_gemma2.zig");
+        const Geometry = @import("metal_embedding_bindings.zig").CompactGeometry;
+        var original = try architecture.visibility(self.allocator, mask, batch, seq);
+        defer original.deinit();
+        const count = original.gather.len;
+        if (count > 8192) return error.InvalidEmbeddingInputLength;
+        var compact = try architecture.compactVisibility(self.allocator, original);
+        defer compact.deinit();
+        compact.windowed = try architecture.windowedRanges(self.allocator, compact, window);
+        const bytes = (mask.len + count * 10 + batch + 1) * 8;
+        const cache = if (self.data.tier_cache) |*c| c else return error.AudioScheduleAdmission;
+        self.data.prefetch.lock();
+        cache.reserve(.host, bytes + @sizeOf(Geometry)) catch |err| {
+            self.data.prefetch.unlock();
+            return err;
+        };
+        self.data.prefetch.unlock();
+        const a = std.heap.c_allocator;
+        const geometry = a.create(Geometry) catch |err| {
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, bytes + @sizeOf(Geometry));
+            self.data.prefetch.unlock();
+            return err;
+        };
+        geometry.* = .{ .batch = batch, .sequence = seq, .window = window, .stamp = clock };
+        geometry.owner.host_bytes += bytes;
+        geometry.owner.metadata_bytes += bytes;
+        geometry.owner.outputs = &geometry.tensors;
+        errdefer {
+            geometry.deinit();
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, geometry.owner.host_bytes);
+            cache.noteRelease(.backend, geometry.owner.backend_bytes);
+            self.data.prefetch.unlock();
+            a.destroy(geometry);
+        }
+        geometry.storage = try a.alloc(u64, bytes / 8);
+        const base = std.mem.sliceAsBytes(geometry.storage);
+        const mask_ptr: [*]i64 = @ptrCast(@alignCast(base.ptr));
+        geometry.mask = mask_ptr[0..mask.len];
+        @memcpy(geometry.mask, mask);
+        var at = mask.len * 8;
+        const range_ptr: [*]u32 = @ptrCast(@alignCast(base.ptr + at));
+        at += count * 48;
+        const ranges = range_ptr[0 .. count * 6];
+        const windows = range_ptr[count * 6 ..][0 .. count * 6];
+        const pos_ptr: [*]i32 = @ptrCast(@alignCast(base.ptr + at));
+        at += count * 8;
+        const positions = pos_ptr[0..count];
+        const id_ptr: [*]i64 = @ptrCast(@alignCast(base.ptr + at));
+        at += count * 8;
+        const ids = id_ptr[0..count];
+        const source_ptr: [*]i64 = @ptrCast(@alignCast(base.ptr + at));
+        at += count * 8;
+        const source = source_ptr[0..count];
+        const one_ptr: [*]i64 = @ptrCast(@alignCast(base.ptr + at));
+        at += count * 8;
+        const ones = one_ptr[0..count];
+        const offset_ptr: [*]usize = @ptrCast(@alignCast(base.ptr + at));
+        const offsets = offset_ptr[0 .. batch + 1];
+        @memcpy(ranges, compact.ranges);
+        @memcpy(windows, compact.windowed.?);
+        @memcpy(positions, compact.positions);
+        @memcpy(ids, compact.gather);
+        @memcpy(source, original.gather);
+        @memset(ones, 1);
+        offsets[0] = 0;
+        for (0..batch) |item| {
+            var active: usize = 0;
+            for (mask[item * seq ..][0..seq]) |value| active += @intFromBool(value != 0);
+            offsets[item + 1] = offsets[item] + active;
+        }
+        const query_at = std.mem.alignForward(usize, count * 6, 64);
+        const key_at = std.mem.alignForward(usize, query_at + count, 64);
+        const stride = std.mem.alignForward(usize, key_at + count, 64);
+        const words = try self.allocator.alloc(i32, stride * 2 + count);
+        defer self.allocator.free(words);
+        @memset(words, 0);
+        for ([_][]const u32{ ranges, windows }, 0..) |r, i| {
+            for (r, words[i * stride ..][0..r.len]) |value, *dest| dest.* = @intCast(value);
+            @memcpy(words[i * stride + query_at ..][0..count], positions);
+            @memcpy(words[i * stride + key_at ..][0..count], positions);
+        }
+        @memcpy(words[stride * 2 ..], positions);
+        var storage = (try self.audioPlanBuffer(&geometry.owner, words.len * 4, true)) orelse return error.AudioScheduleAdmission;
+        defer storage.deinit();
+        try storage.uploadBytes(std.mem.sliceAsBytes(words));
+        for (0..3) |i| {
+            const length = if (i == 2) count else key_at + count;
+            var view = try storage.retainedView(i * stride * 4, length * 4, &.{@intCast(length)});
+            view.dtype = .i32;
+            const tensor = self.audioPersistentCt(&geometry.owner, view) catch |err| {
+                view.deinit();
+                return err;
+            };
+            toBuf(tensor).persistent_model = true;
+            toBuf(tensor).resident_index_bounds = .{ .minimum = 0, .maximum = @intCast(seq - 1) };
+            geometry.tensors[i] = tensor;
+        }
+        geometry.view = .{ .visibility = .{ .ranges = ranges, .windowed = windows, .positions = positions, .gather = ids, .global_metadata = geometry.tensors[0].?, .window_metadata = geometry.tensors[1].? }, .source_rows = source, .offsets = offsets, .ones = ones, .device_positions = geometry.tensors[2].? };
+        return geometry;
+    }
+
     fn embeddingModelVisibilityOp(ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?ops.EmbeddingModelVisibility {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.embedding_bindings_enabled or batch == 0 or seq == 0) return null;
@@ -19080,7 +19226,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer x.deinit();
         var w = if (weight) |tensor| try self.ownedDeviceMetalTensorFromCt(tensor) else try x.retainedCopy();
         defer w.deinit();
-        var g = if (gather) |tensor| try self.residentTrainingTensor(tensor, .i32, .{}) else try x.retainedCopy();
+        // Model-owned compact position tables survive request wrappers and
+        // deliberately carry no pointer to their creating MetalCompute.
+        var g = if (gather) |tensor| (if (toBuf(tensor).persistent_model) model: {
+            const mt = toBuf(tensor).metal_tensor orelse return error.InvalidTensorShape;
+            if (!mt.isDevice() or mt.dtype != .i32 or !toBuf(tensor).integer_storage) return error.InvalidTensorShape;
+            break :model mt;
+        } else try self.residentTrainingTensor(tensor, .i32, .{})) else try x.retainedCopy();
         // residentTrainingTensor borrows the source; retainedCopy owns the dummy.
         defer if (gather == null) g.deinit();
         if (gather) |tensor| {
@@ -26389,8 +26541,65 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(view);
     }
 
+    fn embeddingStreamedFFNOp(ctx: *anyopaque, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_FFN")) return null;
+        const workspace = self.embedding_workspace orelse return null;
+        if (workspace.spec.rows != rows or workspace.projection_rows >= rows or workspace.spec.hidden != hidden or workspace.spec.widths[2] != intermediate * 2) return null;
+        const packed_slot = (try self.embeddingFFNProjectionSlot(ctx, layer, hidden, intermediate)) orelse return null;
+        const down_slot = (try self.embeddingProjectionSlot(layer, .down, intermediate, hidden)) orelse cold: {
+            var name: [192]u8 = undefined;
+            const weight = try getWeightOp(ctx, try std.fmt.bufPrint(&name, "language_model.layers.{d}.mlp.down_proj.weight", .{layer}));
+            defer freeOp(ctx, weight);
+            const cb = self.computeBackend();
+            const bias = try zeroBiasTensor(&cb, hidden);
+            defer freeOp(ctx, bias);
+            break :cold (try self.ensureEmbeddingGemma2LinearSlot(weight, bias, intermediate, hidden)) orelse return null;
+        };
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        const x = denseDeviceF32(input) orelse return null;
+        if (x.elemCount() != rows * hidden) return error.InvalidTensorShape;
+        toBuf(workspace.views[2].?).metal_tensor.?.invalidateHostMirror();
+        toBuf(workspace.views[12].?).metal_tensor.?.invalidateHostMirror();
+        const packed_storage = denseDeviceF32(workspace.views[2].?).?;
+        const product_storage = denseDeviceF32(workspace.views[12].?).?;
+        var output = try MetalTensor.deviceAllocate(runtime, rows * hidden * 4, .private, &.{ @intCast(rows), @intCast(hidden) });
+        errdefer output.deinit();
+        var start: usize = 0;
+        while (start < rows) {
+            try self.computeBackend().checkExecutionControl();
+            const count = @min(workspace.projection_rows, rows - start);
+            var source = try x.retainedView(start * hidden * 4, count * hidden * 4, &.{ @intCast(count), @intCast(hidden) });
+            defer source.deinit();
+            var projection = try packed_storage.retainedView(0, count * intermediate * 8, &.{ @intCast(count), @intCast(intermediate * 2) });
+            defer projection.deinit();
+            var product = try product_storage.retainedView(0, count * intermediate * 4, &.{ @intCast(count), @intCast(intermediate) });
+            defer product.deinit();
+            var destination = try output.retainedView(start * hidden * 4, count * hidden * 4, &.{ @intCast(count), @intCast(hidden) });
+            defer destination.deinit();
+            if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, packed_slot, source, count, hidden, intermediate * 2, projection)) return error.AudioSchedulePreparedSlotMissing;
+            if (metal_runtime.termite_metal_decode_runtime_packed_gelu(runtime, projection.deviceHandle(), projection.deviceByteOffset(), product.deviceHandle(), product.deviceByteOffset(), @intCast(count), @intCast(intermediate)) != 0) return error.MetalKernelDispatchFailed;
+            if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, down_slot, product, count, intermediate, hidden, destination)) return error.AudioSchedulePreparedSlotMissing;
+            start += count;
+        }
+        return self.ctFromOwnedMetalTensor(output);
+    }
+    fn embeddingFFNProjectionSlot(self: *MetalCompute, ctx: *anyopaque, layer: usize, hidden: usize, intermediate: usize) !?usize {
+        return (try self.embeddingProjectionSlot(layer, .packed_ffn, hidden, 2 * intermediate)) orelse cold: {
+            var gate_name: [192]u8 = undefined;
+            var up_name: [192]u8 = undefined;
+            const gate = try getWeightOp(ctx, try std.fmt.bufPrint(&gate_name, "language_model.layers.{d}.mlp.gate_proj.weight", .{layer}));
+            defer freeOp(ctx, gate);
+            const up = try getWeightOp(ctx, try std.fmt.bufPrint(&up_name, "language_model.layers.{d}.mlp.up_proj.weight", .{layer}));
+            defer freeOp(ctx, up);
+            _ = (try self.packedMediaLinearsSlot(&.{ gate, up }, hidden, &.{ intermediate, intermediate })) orelse return null;
+            break :cold (try self.embeddingProjectionSlot(layer, .packed_ffn, hidden, 2 * intermediate)) orelse return null;
+        };
+    }
+
     fn embeddingGatedFFNOp(ctx: *anyopaque, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN")) return null;
         const workspace = self.embedding_workspace orelse return null;
         if (workspace.projection_rows >= rows or workspace.spec.rows != rows or workspace.spec.hidden != hidden or workspace.spec.widths[2] != 2 * intermediate) return null;
         const state = self.provider_impl.embedding_bindings orelse return null;
@@ -35062,6 +35271,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.rmsNormClamped = audioTapeRmsNormClamped;
         vt.audioPreparedLinear = audioPreparedLinearOp;
         vt.audioNodeInto = audioNodeIntoOp;
+        vt.embeddingStreamedFFN = embeddingStreamedFFNOp;
         vt.embeddingGatedFFN = embeddingGatedFFNOp;
         vt.embeddingWorkspacePrepare = embeddingWorkspacePrepareOp;
         vt.embeddingWorkspaceNorm = embeddingWorkspaceNormOp;
@@ -35070,6 +35280,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.embeddingMediaTemplate = embeddingMediaTemplateOp;
         vt.embeddingComposeRows = embeddingComposeRowsOp;
         vt.embeddingModelPrepare = embeddingModelPrepareOp;
+        vt.embeddingCompactVisibility = embeddingCompactVisibilityOp;
         vt.embeddingModelVisibility = embeddingModelVisibilityOp;
         vt.embeddingModelWeight = embeddingModelWeightOp;
         vt.embeddingModelScalar = embeddingModelScalarOp;
@@ -46203,6 +46414,21 @@ test "embeddinggemma2 Metal indexed backbone bindings survive wrappers and yield
             try std.testing.expect(long.owner.backend_bytes <= 96 * 1024 * 1024);
             try std.testing.expectEqual(@as(usize, 8192 * 512), MetalCompute.toBuf(long.views[6].?).metal_tensor.?.elemCount());
         }
+        const compact_mask = [_]i64{ 1, 0, 1, 1, 1, 0 };
+        const compact = (try cb.vtable.embeddingCompactVisibility.?(cb.ptr, &compact_mask, 2, 3, 1)).?;
+        try std.testing.expectEqualSlices(i64, &.{ 0, 2, 3, 4 }, compact.source_rows);
+        try std.testing.expectEqualSlices(i32, &.{ 0, 2, 0, 1 }, compact.visibility.positions);
+        try std.testing.expectEqualSlices(usize, &.{ 0, 2, 4 }, compact.offsets);
+        try std.testing.expectEqual(@as(?*anyopaque, null), MetalCompute.toBuf(compact.device_positions).resident_owner);
+        var deny = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        compute.allocator = deny.allocator();
+        const reused = cb.vtable.embeddingCompactVisibility.?(cb.ptr, &compact_mask, 2, 3, 1) catch |err| {
+            compute.allocator = a;
+            return err;
+        };
+        compute.allocator = a;
+        try std.testing.expectEqual(compact.device_positions, reused.?.device_positions);
+        try std.testing.expectEqual(@as(usize, 0), deny.alloc_index);
         ones[0] = 9;
         scalar[0] = 3; // The prepared snapshot never borrows source bytes.
     }

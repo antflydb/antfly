@@ -324,7 +324,7 @@ fn linear(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, 
     return cb.linearNoBias(input, w, rows, in_dim, out_dim);
 }
 
-const Visibility = struct {
+pub const Visibility = struct {
     ranges: []u32,
     positions: []i32,
     key_positions: []i32,
@@ -336,7 +336,7 @@ const Visibility = struct {
     windowed: ?[]u32 = null,
     allocator: std.mem.Allocator,
     borrowed: bool = false,
-    fn deinit(self: Visibility) void {
+    pub fn deinit(self: Visibility) void {
         if (self.borrowed) return;
         self.allocator.free(self.ranges);
         self.allocator.free(self.positions);
@@ -346,7 +346,7 @@ const Visibility = struct {
     }
 };
 
-fn visibility(allocator: std.mem.Allocator, mask: []const i64, batch: usize, seq: usize) !Visibility {
+pub fn visibility(allocator: std.mem.Allocator, mask: []const i64, batch: usize, seq: usize) !Visibility {
     const count = batch * seq;
     const ranges = try allocator.alloc(u32, count * 6);
     errdefer allocator.free(ranges);
@@ -398,7 +398,7 @@ fn visibilityMetadata(cb: *const ComputeBackend, a: std.mem.Allocator, vis: Visi
 // Keys are position-sorted within each item's range. Restrict the work itself,
 // rather than computing a full-sequence score tile and masking it afterwards.
 // Keep the original positions so padding holes do not change window semantics.
-fn windowedRanges(allocator: std.mem.Allocator, vis: Visibility, window: u32) ![]u32 {
+pub fn windowedRanges(allocator: std.mem.Allocator, vis: Visibility, window: u32) ![]u32 {
     const ranges = try allocator.dupe(u32, vis.ranges);
     for (vis.positions, 0..) |position, row| {
         const first: i64 = @as(i64, position) - window;
@@ -700,8 +700,9 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     const fnorm = try norm(cb, layer, "pre_feedforward_layernorm.weight", residual, h, cfg.rms_norm_eps);
     defer cb.free(fnorm);
     var down: ?CT = blk: {
+        if (try cb.embeddingFFN(layer, fnorm, rows, h, cfg.intermediate_size, true)) |output| break :blk output;
         const product = product: {
-            if (cb.vtable.embeddingGatedFFN) |run| if (try run(cb.ptr, layer, fnorm, rows, h, cfg.intermediate_size)) |fused| break :product fused;
+            if (try cb.embeddingFFN(layer, fnorm, rows, h, cfg.intermediate_size, false)) |fused| break :product fused;
             var names: [2][128]u8 = undefined;
             const prepared = if (cb.vtable.embeddingModelLinear) |run| try run(cb.ptr, layer, .packed_ffn, fnorm, rows, h, 2 * cfg.intermediate_size) else null;
             if (prepared orelse try cb.linearPackedNamed(fnorm, &.{
@@ -883,7 +884,7 @@ pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocat
 pub fn forwardPooledEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
     if (!validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
     if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
-    if (cb.kind() == .metal and cb.vtable.embeddingHeadPrepare != null and cb.vtable.maskedMeanSegments != null and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD") and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_ROWS")) {
+    if (compactRowsEnabled(cb.kind() == .metal) and cb.vtable.embeddingHeadPrepare != null and cb.vtable.maskedMeanSegments != null and cb.vtable.maskedMeanBatch != null) {
         if (batch == 0 or seq == 0 or seq > max_tokens or mask.len != try std.math.mul(usize, batch, seq)) return error.InvalidEmbeddingInputLength;
         var active: usize = 0;
         for (mask) |value| {
@@ -895,9 +896,35 @@ pub fn forwardPooledEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.A
     return forwardEmbeddingsImpl(cb, allocator, cfg, embeddings, mask, batch, seq, dimensions, null);
 }
 
+pub fn compactRowsEnabled(metal: bool) bool {
+    const env = @import("antfly_platform").env;
+    return metal and !env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD") and !env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_ROWS");
+}
+
+/// Inputs already contain active rows in original item/position order.
+pub fn forwardPackedPooledEmbeddingsCT(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize, compact_input: bool) !CT {
+    if (!compact_input) return forwardPooledEmbeddingsCT(cb, a, cfg, embeddings, mask, batch, seq, dimensions);
+    if (!validDimension(dimensions) or !compactRowsEnabled(cb.kind() == .metal)) return error.InvalidEmbeddingInputLength;
+    if (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return error.EmbeddingGemma2ExternalFrame;
+    if (batch == 0 or batch > 64 or seq == 0 or seq > max_tokens or mask.len != try std.math.mul(usize, batch, seq)) return error.InvalidEmbeddingInputLength;
+    return forwardCompactInput(cb, a, cfg, embeddings, mask, batch, seq, dimensions, true);
+}
+
 const CompactOutput = struct { offsets: []const usize };
 
 fn forwardCompactPooled(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
+    return forwardCompactInput(cb, a, cfg, embeddings, mask, batch, seq, dimensions, false);
+}
+fn forwardCompactInput(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize, compact_input: bool) !CT {
+    if (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return error.EmbeddingGemma2ExternalFrame;
+    if (cb.vtable.embeddingModelPrepare) |prepare| try prepare(cb.ptr, cfg.num_hidden_layers);
+    if (cb.vtable.embeddingCompactVisibility) |get| if (try get(cb.ptr, mask, batch, seq, cfg.sliding_window)) |cached| {
+        const v = cached.visibility;
+        const vis = Visibility{ .ranges = v.ranges, .positions = v.positions, .key_positions = v.positions, .gather = v.gather, .windowed = v.windowed, .global_metadata = v.global_metadata, .window_metadata = v.window_metadata, .device_positions = cached.device_positions, .allocator = a, .borrowed = true };
+        const input = if (compact_input) embeddings else try cb.embeddingLookup(embeddings, cached.source_rows, cached.source_rows.len, cfg.hidden_size);
+        defer if (!compact_input) cb.free(input);
+        return forwardEmbeddingsImpl(cb, a, cfg, input, cached.ones, 1, cached.ones.len, dimensions, .{ .visibility = vis, .output = .{ .offsets = cached.offsets } });
+    };
     var original = try visibility(a, mask, batch, seq);
     defer original.deinit();
     var vis = try compactVisibility(a, original);
@@ -909,8 +936,8 @@ fn forwardCompactPooled(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Co
     defer if (vis.window_metadata) |tensor| cb.free(tensor);
     vis.device_positions = (try cb.fromInt32Shape(vis.positions, &.{@intCast(vis.positions.len)})) orelse return error.EmbeddingGemma2OperationUnavailable;
     defer cb.free(vis.device_positions.?);
-    const input = try cb.embeddingLookup(embeddings, original.gather, original.gather.len, cfg.hidden_size);
-    defer cb.free(input);
+    const input = if (compact_input) embeddings else try cb.embeddingLookup(embeddings, original.gather, original.gather.len, cfg.hidden_size);
+    defer if (!compact_input) cb.free(input);
     const offsets = try a.alloc(usize, batch + 1);
     defer a.free(offsets);
     offsets[0] = 0;
@@ -946,32 +973,32 @@ test "embeddinggemma2 compact visibility preserves holes positions windows and i
 /// masked reference, including holes, uneven items and non-finite padding.
 pub fn qualifyCompactPooled(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config) !void {
     const count = 512;
-    const data = try a.alloc(f32, count * cfg.hidden_size);
-    defer a.free(data);
-    for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.017);
-    var mask: [count]i64 = @splat(1);
-    for (0..256) |row| if (row % 4 == 1) {
-        mask[row] = 0;
-    };
-    for (mask, 0..) |valid, row| if (valid == 0) @memset(data[row * cfg.hidden_size ..][0..cfg.hidden_size], std.math.nan(f32));
-    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ count, @intCast(cfg.hidden_size) }));
-    defer cb.free(input);
-    var expected: ?[]f32 = null;
-    defer if (expected) |values| a.free(values);
-    var elapsed: [2][7]u64 = undefined;
-    for (0..9) |iteration| for (0..2) |phase| {
-        const route = phase ^ (iteration & 1);
-        const started = @import("antfly_platform").time.monotonicNs();
-        const output = if (route == 0) try forwardEmbeddingsImpl(cb, a, cfg, input, &mask, 2, 256, 128, null) else try forwardCompactPooled(cb, a, cfg, input, &mask, 2, 256, 128);
-        defer cb.free(output);
-        const values = try cb.toFloat32(output, a);
-        defer a.free(values);
-        if (iteration >= 2) elapsed[route][iteration - 2] = @import("antfly_platform").time.monotonicNs() -| started;
-        if (expected == null) expected = try a.dupe(f32, values);
-        for (expected.?, values) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-4);
-    };
-    for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
-    std.debug.print("embeddinggemma2 compact_checkpoint dense_rows=512 compact_rows=448 dense_completed_ns={d} compact_completed_ns={d} holes=true nan_padding=true parity=true\n", .{ elapsed[0][3], elapsed[1][3] });
+    for ([_]usize{ 1, 64 }) |padding| {
+        const data = try a.alloc(f32, count * cfg.hidden_size);
+        defer a.free(data);
+        for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.017);
+        var mask: [count]i64 = @splat(1);
+        for (0..padding) |hole| mask[hole * 4 + 1] = 0;
+        for (mask, 0..) |valid, row| if (valid == 0) @memset(data[row * cfg.hidden_size ..][0..cfg.hidden_size], std.math.nan(f32));
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ count, @intCast(cfg.hidden_size) }));
+        defer cb.free(input);
+        var expected: ?[]f32 = null;
+        defer if (expected) |values| a.free(values);
+        var elapsed: [2][7]u64 = undefined;
+        for (0..9) |iteration| for (0..2) |phase| {
+            const route = phase ^ (iteration & 1);
+            const started = @import("antfly_platform").time.monotonicNs();
+            const output = if (route == 0) try forwardEmbeddingsImpl(cb, a, cfg, input, &mask, 2, 256, 128, null) else try forwardCompactPooled(cb, a, cfg, input, &mask, 2, 256, 128);
+            defer cb.free(output);
+            const values = try cb.toFloat32(output, a);
+            defer a.free(values);
+            if (iteration >= 2) elapsed[route][iteration - 2] = @import("antfly_platform").time.monotonicNs() -| started;
+            if (expected == null) expected = try a.dupe(f32, values);
+            for (expected.?, values) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-4);
+        };
+        for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("embeddinggemma2 compact_checkpoint dense_rows=512 compact_rows={d} dense_completed_ns={d} compact_completed_ns={d} holes=true nan_padding=true parity=true\n", .{ count - padding, elapsed[0][3], elapsed[1][3] });
+    }
 }
 
 /// Projection/GELU qualification uses the actual checkpoint's prepared MPS slot.
@@ -1015,7 +1042,81 @@ pub fn qualifyTiledFFN(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Con
     std.debug.print("embeddinggemma2 long_ffn rows=3000 dense_completed_ns={d} tiled_completed_ns={d} avoided_packed_bytes={d} parity=true\n", .{ elapsed[0][3], elapsed[1][3], rows * cfg.intermediate_size * 8 });
 }
 
-fn compactVisibility(a: std.mem.Allocator, original: Visibility) !Visibility {
+/// Compare full 24-layer execution, including tail tiles and completed output.
+/// This is an offline qualification hook, never a serving-time calibration.
+pub fn qualifyStreamedEncoder(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config) !void {
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const env = @import("antfly_platform").env;
+    const flags = [_][*:0]const u8{ "ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_FFN", "ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN" };
+    var saved: [2]?[:0]u8 = @splat(null);
+    for (flags, &saved) |flag, *value| if (env.getenv(std.mem.span(flag))) |old| {
+        value.* = try a.dupeSentinel(u8, old, 0);
+    };
+    defer for (flags, saved) |flag, value| {
+        if (value) |old| {
+            _ = Env.setenv(flag, old, 1);
+            a.free(old);
+        } else {
+            _ = Env.unsetenv(flag);
+        }
+    };
+    for ([_]usize{ 2560, 3000, 4096 }) |rows| {
+        const data = try a.alloc(f32, rows * cfg.hidden_size);
+        defer a.free(data);
+        for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 8192)) * 0.017);
+        const mask = try a.alloc(i64, rows);
+        defer a.free(mask);
+        @memset(mask, 1);
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ @intCast(rows), @intCast(cfg.hidden_size) }));
+        defer cb.free(input);
+        var samples: [3][5]u64 = undefined;
+        var reference: ?[]f32 = null;
+        defer if (reference) |vector| a.free(vector);
+        for (0..7) |iteration| for (0..3) |phase| {
+            const route = (iteration + phase) % 3;
+            try std.testing.expect(Env.setenv(flags[0], if (route < 2) "1" else "0", 1) == 0);
+            try std.testing.expect(Env.setenv(flags[1], if (route == 0) "1" else "0", 1) == 0);
+            const started = @import("antfly_platform").time.monotonicNs();
+            const output = try forwardPooledEmbeddingsCT(cb, a, cfg, input, mask, 1, rows, 128);
+            defer cb.free(output);
+            const vector = try cb.toFloat32(output, a);
+            defer a.free(vector);
+            if (iteration >= 2) samples[route][iteration - 2] = @import("antfly_platform").time.monotonicNs() -| started;
+            if (reference == null) reference = try a.dupe(f32, vector);
+            for (reference.?, vector) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-4);
+        };
+        for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
+        std.debug.print("embeddinggemma2 full_encoder rows={d} dense_ns={d} tiled_product_ns={d} streamed_down_ns={d} samples=5 parity=true\n", .{ rows, samples[0][2], samples[1][2], samples[2][2] });
+        // A cancelled retry must drain its frame and leave the next request usable.
+        var cancelled = cb.*;
+        const Stop = struct {
+            backend: *const ComputeBackend,
+            active_checks: usize = 0,
+            fn check(raw: ?*anyopaque) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                if (self.backend.decoderRuntimeHasActiveFrame()) {
+                    self.active_checks += 1;
+                    if (self.active_checks >= 32) return error.Cancelled;
+                }
+            }
+        };
+        var stop = Stop{ .backend = cb };
+        cancelled.execution_control = .{ .ptr = &stop, .check_fn = Stop.check };
+        try std.testing.expectError(error.Cancelled, forwardPooledEmbeddingsCT(&cancelled, a, cfg, input, mask, 1, rows, 128));
+        try std.testing.expect(stop.active_checks >= 32);
+        try std.testing.expect(!cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame());
+        const retry = try forwardPooledEmbeddingsCT(cb, a, cfg, input, mask, 1, rows, 128);
+        defer cb.free(retry);
+        const vector = try cb.toFloat32(retry, a);
+        defer a.free(vector);
+        for (reference.?, vector) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-4);
+    }
+}
+
+pub fn compactVisibility(a: std.mem.Allocator, original: Visibility) !Visibility {
     const count = original.gather.len;
     const ranges = try a.alloc(u32, count * 6);
     errdefer a.free(ranges);

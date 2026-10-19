@@ -626,12 +626,38 @@ original positions preserve RoPE and sliding windows across holes; per-item
 ranges isolate attention, and segmented pooling restores output order without
 reintroducing padded activations. Token-level outputs retain rectangular layout.
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_ROWS=1` selects the rectangular reference.
-Long-context FFNs project into a reusable 512-row tile and immediately consume
-its GELU product into final product rows, avoiding the full packed gate/up
-activation. Ordinary MPS projections remain the capability fallback.
+Long-context FFNs can project into a reusable 512-row tile, apply GELU into a
+second tile and immediately run the down projection into final hidden rows.
+This avoids both full gate/up and full intermediate product activations. The
+product-only tiled route and ordinary MPS projections remain qualified fallbacks.
+Long layouts add one admitted product descriptor (13 total); layouts remain
+bounded at 96 MiB, including this tile.
 
 General mixed-media and video composition also uses compact wrapper lookups and
 indexed composition. A single resident media tensor is consumed directly;
 multiple media tensors are packed once into one admitted request output instead
 of repeatedly concatenating a growing table. Original tokenizer IDs are committed
 to video IDs only after successful composition.
+
+
+Compact Metal cohorts are selected by summed token counts, capped at 8192 active
+rows and four items. Portable/CUDA policies retain rectangular padding limits.
+Encoder phase admission uses the compact physical shape and explicit output
+bytes; preprocessing and retained source allocations keep their separate host
+and device reservations. Text, prepared groups and resident media compose or
+look up active rows directly, preserving the original rectangular mask solely
+as layout metadata. Capability declines retain the rectangular composition route.
+
+Two model-owned compact-layout entries cache exact masks, original positions,
+per-item offsets, source rows and uploaded attention tables. Retention is admitted,
+evicted by LRU and released under model pressure; position tensors carry no
+request-owner pointer. Denied retention uses request-owned layout construction.
+
+Vision can encode a successor while its predecessor is submitted, using two
+one-layer groups within the existing two-layer scratch envelope. Images that
+admit only one layer and external frame owners keep synchronous execution.
+Cancellation drains or cancels both owned frame slots before freeing views.
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION=1` selects synchronous vision;
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_FFN=1` selects the product-only FFN path,
+and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN=1` also disables that candidate.
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_CACHE=1` bypasses retained mask metadata.

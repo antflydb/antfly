@@ -2855,12 +2855,26 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
     const can_group = cb.kind() == .metal and cfg.embedding_gemma2_f32_attention and
         !platform.env.getenvBool("TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES") and
         platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
-        !cb.decoderRuntimeHasActiveFrame();
+        !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame();
     const policy = @import("../pipelines/media_batch_policy.zig");
-    const group = if (can_group) policy.layerCapacity(@intCast(geometry.width), @intCast(geometry.height), batch, try visionLayerGroup(cfg, geometry.grid_x * geometry.grid_y)) else 1;
+    const admitted_layers = try visionLayerGroup(cfg, geometry.grid_x * geometry.grid_y);
+    // Two live one-layer groups fit the same admitted two-layer envelope.
+    // Larger images that admit only one layer keep the synchronous route.
+    const pipeline = can_group and admitted_layers >= 2 and store.gguf == null and
+        !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION") and
+        cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+    const group = if (pipeline) @max(@as(usize, 1), admitted_layers / 2) else if (can_group) policy.layerCapacity(@intCast(geometry.width), @intCast(geometry.height), batch, admitted_layers) else 1;
     const started = platform.time.monotonicNs();
     var frame = false;
-    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+    var pending = false;
+    defer {
+        if (frame) cb.decoderRuntimeCancelFrame() catch {};
+        if (pending) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        if (pipeline) {
+            _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+            @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb) catch {};
+        }
+    }
     const resident_tower = if (store.huggingface and cb.kind() == .cuda)
         try cb.runEmbeddingGemma2VisionTower(hidden, geometry.grid_x * geometry.grid_y, geometry.grid_x, geometry.grid_y, batch)
     else
@@ -2876,9 +2890,24 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
             cb.free(hidden);
             hidden = next;
             if (frame and ((layer + 1) % group == 0 or layer + 1 == cfg.block_count)) {
-                try cb.decoderRuntimeSubmitAndWaitFrame();
-                frame = false;
-                if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                if (pipeline and layer + 1 < cfg.block_count) {
+                    try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+                    if (pending) {
+                        try cb.decoderRuntimeWaitSubmittedFrame();
+                        pending = false;
+                    }
+                    try cb.decoderRuntimeSubmitFrame();
+                    frame = false;
+                    pending = true;
+                } else {
+                    if (pending) {
+                        try cb.decoderRuntimeWaitSubmittedFrame();
+                        pending = false;
+                    }
+                    try cb.decoderRuntimeSubmitAndWaitFrame();
+                    frame = false;
+                    if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                }
             }
             store.releaseCompletedNativeLayer();
             if (store.gguf == null) {
@@ -2887,7 +2916,7 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
             }
         }
     }
-    if (can_group) policy.layerCompleted(@intCast(geometry.width), @intCast(geometry.height), batch, group, cfg.block_count, platform.time.monotonicNs() - started);
+    if (can_group and !pipeline) policy.layerCompleted(@intCast(geometry.width), @intCast(geometry.height), batch, group, cfg.block_count, platform.time.monotonicNs() - started);
     const standardized = try prepareSpatialProjector(cb, allocator, store, hidden, cfg, geometry, batch);
     cb.free(hidden);
     hidden_live = false;

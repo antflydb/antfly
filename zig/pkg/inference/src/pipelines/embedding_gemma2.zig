@@ -584,14 +584,19 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         host = @max(host, try plan.hostBytes());
     }
     // Avoid padding-heavy cohorts. The runner falls back to independent calls.
-    if (longest > 2048 or raw_longest * items.len * 4 > total * 5) return error.BatchIncompatible;
-    if (session.backend() == .metal and encoder.metalBatchCapacity(raw_longest, items.len) < items.len) return error.BatchIncompatible;
+    const compact_policy = encoder.compactRowsEnabled(session.backend() == .metal);
+    if (compact_policy) {
+        if (total + items.len * 128 > 8192) return error.BatchIncompatible;
+    } else {
+        if (longest > 2048 or raw_longest * items.len * 4 > total * 5) return error.BatchIncompatible;
+        if (session.backend() == .metal and encoder.metalBatchCapacity(raw_longest, items.len) < items.len) return error.BatchIncompatible;
+    }
     preflight.deinit();
     preflight_live = false;
     bounded.limit = 512 * 1024 * 1024;
     if (host > bounded.limit) return error.MemoryBudgetExceeded;
     const workspace = try std.math.add(usize, (if (session.backend() == .metal) @as(usize, 1536) else 512) * 1024 * 1024, if (session.backend() == .metal) device else 0);
-    var permit = try admitWithVisionCacheReclaim(session, .{ .batch = items.len, .sequence = longest, .host_preprocess_bytes = bounded.limit, .workspace_bytes = workspace, .output_bytes = items.len * options.dimensions * 4 }, control);
+    var permit = try admitWithVisionCacheReclaim(session, .{ .batch = if (compact_policy) 1 else items.len, .sequence = if (compact_policy) total + items.len * 128 else longest, .host_preprocess_bytes = bounded.limit, .workspace_bytes = workspace, .output_bytes = items.len * options.dimensions * 4 }, control);
     defer permit.deinit();
     var pool = media_admission.Pool{ .limits = .{ .host_bytes = host, .device_bytes = if (session.backend() == .metal) device else 0, .commands = if (session.backend() == .metal) commands else 0 } };
     defer std.debug.assert(std.meta.eql(pool.snapshot(), media_admission.Resources{}));
@@ -616,12 +621,19 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     // Use the established activation/attention envelope over all padded rows.
     // Treating rows as one sequence deliberately overestimates cross-row
     // attention; it can never under-admit a batch with independent masks.
-    const phase = try executionBounds(true, items.len * batch_inputs.sequence, 0, 0, 0, workspace);
+    var encoder_rows = items.len * batch_inputs.sequence;
+    if (batch_inputs.compact_input) {
+        encoder_rows = 0;
+        for (batch_inputs.mask) |value| {
+            encoder_rows += @intFromBool(value != 0);
+        }
+    }
+    const phase = try executionBounds(true, encoder_rows, 0, 0, 0, workspace);
     const phase_host = @min(bounded.limit, @max(bounded.live, phase.host));
-    try permit.retainForRun(.{ .batch = items.len, .sequence = batch_inputs.sequence, .host_preprocess_bytes = phase_host, .workspace_bytes = phase.workspace, .output_bytes = items.len * options.dimensions * 4 });
+    try permit.retainForRun(.{ .batch = if (batch_inputs.compact_input) 1 else items.len, .sequence = if (batch_inputs.compact_input) encoder_rows else batch_inputs.sequence, .host_preprocess_bytes = phase_host, .workspace_bytes = phase.workspace, .output_bytes = items.len * options.dimensions * 4 });
     bounded.limit = phase_host;
     if (options.video_prepared) |hook| try hook.ready(hook.context);
-    const output = try encoder.forwardPooledEmbeddingsCT(cb, a, cfg, batch_inputs.embeddings, batch_inputs.mask, items.len, batch_inputs.sequence, options.dimensions);
+    const output = try encoder.forwardPackedPooledEmbeddingsCT(cb, a, cfg, batch_inputs.embeddings, batch_inputs.mask, items.len, batch_inputs.sequence, options.dimensions, batch_inputs.compact_input);
     defer cb.free(output);
     const vectors = try readPooledBatch(a, cb, output, items.len, options.dimensions);
     defer {
@@ -644,13 +656,16 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
 }
 
 pub fn preparedCohortCount(lengths: []const usize, maximum: usize) usize {
+    return preparedCohortCountForBackend(lengths, maximum, false);
+}
+pub fn preparedCohortCountForBackend(lengths: []const usize, maximum: usize, compact: bool) usize {
     var count: usize = 0;
     var tokens: usize = 0;
     var longest: usize = 0;
     for (lengths[0..@min(lengths.len, @min(maximum, 4))]) |length| {
         if (length == 0 or length > 8192) break;
         const next = @max(longest, length);
-        if (next * (count + 1) > 8192 or (count > 0 and next * (count + 1) * 4 > (tokens + length) * 5)) break;
+        if (if (compact) tokens + length > 8192 else next * (count + 1) > 8192 or (count > 0 and next * (count + 1) * 4 > (tokens + length) * 5)) break;
         longest = next;
         tokens += length;
         count += 1;
@@ -861,7 +876,7 @@ const CohortReady = struct {
         while (offset < prepared) {
             var lengths: [4]usize = undefined;
             for (rows[offset..prepared], lengths[0 .. prepared - offset]) |row, *length| length.* = row.ids.len;
-            var take = preparedCohortCount(lengths[0 .. prepared - offset], 4);
+            var take = preparedCohortCountForBackend(lengths[0 .. prepared - offset], 4, encoder.compactRowsEnabled(cb.kind() == .metal));
             var longest: usize = 0;
             if (take == 0) return error.EmbeddingInputTooLong;
             // Model intermediates are bounded by the same per-row envelope as
@@ -869,7 +884,12 @@ const CohortReady = struct {
             var request: @import("../backends/session.zig").RunRequest = undefined;
             while (true) {
                 longest = rows[offset + take - 1].ids.len;
-                request = .{ .batch = take, .sequence = longest, .input_bytes = inputs, .host_preprocess_bytes = if (cb.kind() == .cuda and force) 1024 * 1024 + prepared * options.max_tokens * 16 else host, .workspace_bytes = (if (cb.kind() == .cuda) try cudaEncoderWorkspace(longest, take) else 256 * 1024 * 1024 + take * longest * 192 * 1024) + retained, .preprocessing_complete = cb.kind() == .cuda, .output_bytes = take * options.dimensions * @sizeOf(f32) };
+                var active: usize = 0;
+                for (rows[offset..][0..take]) |row| for (row.mask) |value| {
+                    active += @intFromBool(value != 0);
+                };
+                const packed_geometry = encoder.compactRowsEnabled(cb.kind() == .metal);
+                request = .{ .batch = if (packed_geometry) 1 else take, .sequence = if (packed_geometry) active else longest, .input_bytes = inputs, .host_preprocess_bytes = if (cb.kind() == .cuda and force) 1024 * 1024 + prepared * options.max_tokens * 16 else host, .workspace_bytes = (if (cb.kind() == .cuda) try cudaEncoderWorkspace(longest, take) else 256 * 1024 * 1024 + (if (packed_geometry) active else take * longest) * 192 * 1024) + retained, .preprocessing_complete = cb.kind() == .cuda, .output_bytes = take * options.dimensions * @sizeOf(f32) };
                 if (take == 1 or try session.fitsRun(request)) break;
                 take -= 1;
             }
@@ -900,7 +920,7 @@ const CohortReady = struct {
             const packed_rows = try packVideoRows(a, cb, rows[offset..][0..take]);
             defer packed_rows.deinit(a, cb);
             const compact = if (cb.kind() == .cuda) try runCudaPackedGroups(a, cb, cfg, packed_rows, take, options.dimensions, control) else read: {
-                const output = try encoder.forwardPooledEmbeddingsCT(cb, a, cfg, packed_rows.embeddings, packed_rows.mask, take, packed_rows.sequence, options.dimensions);
+                const output = try encoder.forwardPackedPooledEmbeddingsCT(cb, a, cfg, packed_rows.embeddings, packed_rows.mask, take, packed_rows.sequence, options.dimensions, packed_rows.compact_input);
                 defer cb.free(output);
                 break :read try readPooledBatch(a, cb, output, take, options.dimensions);
             };
@@ -1179,6 +1199,7 @@ fn runCudaPackedGroups(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: enc
 }
 
 fn packVideoRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: []const PreparedGroup) !ResidentPackedGroups {
+    if (encoder.compactRowsEnabled(cb.kind() == .metal)) return packCompactPreparedRows(a, cb, rows);
     var sequence: usize = 0;
     for (rows) |row| sequence = @max(sequence, row.ids.len);
     const mask = try a.alloc(i64, sequence * rows.len);
@@ -1219,6 +1240,66 @@ fn packVideoRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: []const 
         if (!try cb.copyRows2D(a, input, index * sequence, source, 0, row.ids.len, 512)) return error.UnsupportedPrimitiveOp;
     }
     return .{ .embeddings = input, .mask = mask, .sequence = sequence };
+}
+
+fn packCompactPreparedRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: []const PreparedGroup) !ResidentPackedGroups {
+    if (rows.len == 0 or rows.len > 4) return error.InvalidInputShape;
+    var sequence: usize = 0;
+    var active: usize = 0;
+    for (rows) |row| {
+        if (row.mask.len != row.ids.len or row.ids.len == 0 or row.ids.len > 8192) return error.InvalidInputShape;
+        sequence = @max(sequence, row.ids.len);
+        var count: usize = 0;
+        for (row.mask) |value| {
+            if (value != 0 and value != 1) return error.InvalidAttentionMask;
+            count += @intFromBool(value != 0);
+        }
+        if (count == 0) return error.EmptyEmbeddingInput;
+        active += count;
+    }
+    if (active > 8192) return error.EmbeddingInputTooLong;
+    const mask = try a.alloc(i64, rows.len * sequence);
+    errdefer a.free(mask);
+    @memset(mask, 0);
+    const output = (try cb.allocUninitF32Shape(&.{ @intCast(active), 512 })) orelse return error.ResidentImageOperationUnavailable;
+    errdefer cb.free(output);
+    var destination: usize = 0;
+    for (rows, 0..) |row, item| {
+        @memcpy(mask[item * sequence ..][0..row.mask.len], row.mask);
+        const source = row.tensor orelse if (row.embeddings) |values| try cb.fromFloat32Shape(values, &.{ @intCast(row.ids.len), 512 }) else {
+            var count: usize = 0;
+            for (row.mask) |value| count += @intFromBool(value != 0);
+            const ids = try a.alloc(i64, count);
+            defer a.free(ids);
+            var at: usize = 0;
+            for (row.ids, row.mask) |id, valid| if (valid != 0) {
+                ids[at] = id;
+                at += 1;
+            };
+            const weight = try cb.getWeight("language_model.embed_tokens.weight");
+            defer cb.free(weight);
+            const raw = try cb.embeddingLookup(weight, ids, count, 512);
+            defer cb.free(raw);
+            const scaled = (try cb.multiplyScalar(raw, @sqrt(@as(f32, 512)))) orelse return error.ResidentImageOperationUnavailable;
+            defer cb.free(scaled);
+            if (!try cb.copyRows2D(a, output, destination, scaled, 0, count, 512)) return error.UnsupportedPrimitiveOp;
+            destination += count;
+            continue;
+        };
+        defer if (row.tensor == null) cb.free(source);
+        var cursor: usize = 0;
+        while (cursor < row.mask.len) {
+            if (row.mask[cursor] == 0) {
+                cursor += 1;
+                continue;
+            }
+            const first = cursor;
+            while (cursor < row.mask.len and row.mask[cursor] != 0) : (cursor += 1) {}
+            if (!try cb.copyRows2D(a, output, destination, source, first, cursor - first, 512)) return error.UnsupportedPrimitiveOp;
+            destination += cursor - first;
+        }
+    }
+    return .{ .embeddings = output, .mask = mask, .sequence = sequence, .compact_input = true };
 }
 
 /// One clip produces one pooled vector. All decoded pixels, projected frame rows,
@@ -2195,6 +2276,13 @@ fn embedPreparedMedia(out: std.mem.Allocator, session: Session, tokenizer: Token
 /// Vision intermediates drain before the embedding encoder starts. Projected
 /// rows stay resident across that boundary and are covered by output storage.
 /// Reserve the larger phase workspace rather than adding disjoint lifetimes.
+fn retainPackedPhase(permit: *RunPermit, batch: usize, packed_rows: ResidentPackedGroups) !void {
+    if (!packed_rows.compact_input) return retainPreparedPhase(permit, batch, packed_rows.sequence);
+    const old = permit.request orelse return;
+    var active: usize = 0;
+    for (packed_rows.mask) |value| active += @intFromBool(value != 0);
+    try permit.retainForRun(.{ .batch = 1, .sequence = active, .input_bytes = old.input_bytes, .pre_admitted_host_bytes = old.pre_admitted_host_bytes, .host_preprocess_bytes = old.host_preprocess_bytes, .workspace_bytes = @min(old.workspace_bytes, 256 * 1024 * 1024 + active * 192 * 1024), .output_bytes = batch * 768 * 4 });
+}
 fn retainPreparedPhase(permit: *RunPermit, batch: usize, sequence: usize) !void {
     const old = permit.request orelse return;
     var phase = try preparedRunRequest(permit.session.backend(), old.input_bytes, old.pre_admitted_host_bytes, batch, sequence, 0);
@@ -2555,7 +2643,7 @@ fn runResidentMediaBatchObserved(a: std.mem.Allocator, cb: *const ComputeBackend
     defer batch_inputs.deinit(a, cb);
     if (options.timings) |t| t.pack_ns += mediaNow() - started;
     const encoder_started = mediaNow();
-    if (permit) |phase| try retainPreparedPhase(phase, batch, batch_inputs.sequence);
+    if (permit) |phase| try retainPackedPhase(phase, batch, batch_inputs);
     if (comptime @import("build_options").enable_cuda) {
         if (cb.kind() == .cuda) {
             const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -2575,7 +2663,7 @@ fn runResidentMediaBatchObserved(a: std.mem.Allocator, cb: *const ComputeBackend
             return vectors;
         }
     }
-    const output = try encoder.forwardPooledEmbeddingsCT(cb, a, cfg, batch_inputs.embeddings, batch_inputs.mask, batch, batch_inputs.sequence, options.dimensions);
+    const output = try encoder.forwardPackedPooledEmbeddingsCT(cb, a, cfg, batch_inputs.embeddings, batch_inputs.mask, batch, batch_inputs.sequence, options.dimensions, batch_inputs.compact_input);
     defer cb.free(output);
     if (options.timings) |t| t.encoder_ns += mediaNow() - encoder_started;
     const pool_started = mediaNow();
@@ -2588,6 +2676,7 @@ const ResidentPackedGroups = struct {
     embeddings: @import("../ops/ops.zig").CT,
     mask: []i64,
     sequence: usize,
+    compact_input: bool = false,
     fn deinit(self: @This(), a: std.mem.Allocator, cb: *const ComputeBackend) void {
         cb.free(self.embeddings);
         a.free(self.mask);
@@ -2598,6 +2687,9 @@ fn packResidentImageRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: 
     return packResidentMediaRows(a, cb, rows, projected, lengths, 258880, raster_max_sequence);
 }
 fn packResidentMediaRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: []const PreparedGroup, projected: @import("../ops/ops.zig").CT, lengths: []const usize, marker: i64, max_sequence: usize) !ResidentPackedGroups {
+    return packResidentMediaRowsPolicy(a, cb, rows, projected, lengths, marker, max_sequence, true);
+}
+fn packResidentMediaRowsPolicy(a: std.mem.Allocator, cb: *const ComputeBackend, rows: []const PreparedGroup, projected: CT, lengths: []const usize, marker: i64, max_sequence: usize, allow_compact: bool) !ResidentPackedGroups {
     if (rows.len == 0 or rows.len > raster_max_batch or rows.len != lengths.len or !cb.supportsCopyRows2D()) return error.InvalidInputShape;
     var sequence: usize = 0;
     for (rows) |row| {
@@ -2618,12 +2710,15 @@ fn packResidentMediaRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: 
     const weight = try cb.getWeight("language_model.embed_tokens.weight");
     defer cb.free(weight);
     const compact_lookup = cb.kind() == .metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES");
+    const compact_input = allow_compact and compact_lookup and encoder.compactRowsEnabled(cb.kind() == .metal) and cb.vtable.embeddingComposeRows != null;
+    var active_rows: usize = 0;
+    for (mask) |value| active_rows += @intFromBool(value != 0);
     const compact_ids = if (compact_lookup) blk: {
         var count: usize = 0;
-        for (ids) |id| count += @intFromBool(id != marker);
+        for (ids, mask) |id, valid| count += @intFromBool(id != marker and (!compact_input or valid != 0));
         const selected = try a.alloc(i64, count);
         var cursor: usize = 0;
-        for (ids) |id| if (id != marker) {
+        for (ids, mask) |id, valid| if (id != marker and (!compact_input or valid != 0)) {
             selected[cursor] = id;
             cursor += 1;
         };
@@ -2635,15 +2730,19 @@ fn packResidentMediaRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: 
     const scaled: ?CT = if (raw) |tensor| (try cb.multiplyScalar(tensor, if (cb.kind() == .cuda) @as(f32, 22.625) else @sqrt(@as(f32, 512)))) orelse return error.ResidentImageOperationUnavailable else null;
     defer if (compact_lookup) if (scaled) |tensor| cb.free(tensor);
     if (compact_lookup) if (cb.vtable.embeddingComposeRows) |compose| {
-        const map = try a.alloc(i32, ids.len);
+        const map = try a.alloc(i32, if (compact_input) active_rows else ids.len);
         defer a.free(map);
+        var output_row: usize = 0;
         var wrapper_index: usize = 0;
         var media_offset: usize = 0;
         for (rows, lengths, 0..) |row, count, item| {
             var found: usize = 0;
             for (0..sequence) |pos| {
-                const destination = item * sequence + pos;
-                if (ids[destination] == marker) {
+                const original = item * sequence + pos;
+                if (compact_input and mask[original] == 0) continue;
+                const destination = if (compact_input) output_row else original;
+                output_row += 1;
+                if (ids[original] == marker) {
                     if (pos >= row.ids.len or row.mask[pos] == 0 or found >= count) return error.InvalidEmbeddingGroup;
                     map[destination] = -@as(i32, @intCast(media_offset + found + 1));
                     found += 1;
@@ -2655,7 +2754,12 @@ fn packResidentMediaRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: 
             if (found != count or count == 0) return error.InvalidEmbeddingGroup;
             media_offset += count;
         }
-        if (try compose(cb.ptr, scaled, projected, map, 512)) |input| return .{ .embeddings = input, .mask = mask, .sequence = sequence };
+        if (try compose(cb.ptr, scaled, projected, map, 512)) |input| return .{ .embeddings = input, .mask = mask, .sequence = sequence, .compact_input = compact_input };
+        if (compact_input) {
+            const fallback = try packResidentMediaRowsPolicy(a, cb, rows, projected, lengths, marker, max_sequence, false);
+            a.free(mask);
+            return fallback;
+        }
     };
     // Resident media supplies every marker row; retain original lookup values
     // for all other positions, including masked padding, with exact rounding.
@@ -2799,6 +2903,14 @@ fn packPreparedGroups(a: std.mem.Allocator, rows: []const PreparedGroup) !Packed
 }
 
 fn runPreparedBatchTimed(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encoder.Config, rows: []const PreparedGroup, options: Options, permit: *RunPermit) ![][]f32 {
+    if (encoder.compactRowsEnabled(cb.kind() == .metal)) {
+        const packed_rows = try packCompactPreparedRows(a, cb, rows);
+        defer packed_rows.deinit(a, cb);
+        try retainPackedPhase(permit, rows.len, packed_rows);
+        const output = try encoder.forwardPackedPooledEmbeddingsCT(cb, a, cfg, packed_rows.embeddings, packed_rows.mask, rows.len, packed_rows.sequence, options.dimensions, true);
+        defer cb.free(output);
+        return readPooledBatch(a, cb, output, rows.len, options.dimensions);
+    }
     const started = mediaNow();
     const batch_inputs = try packPreparedGroups(a, rows);
     defer batch_inputs.deinit(a);
@@ -2962,15 +3074,33 @@ pub fn preparedText(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: encode
 pub fn preparedTexts(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: encoder.Config, ids: []const i64, mask: []const i64, batch: usize, sequence: usize, dimensions: usize) ![][]f32 {
     if (!encoder.validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
     const rows = std.math.mul(usize, batch, sequence) catch return error.InvalidEmbeddingInputLength;
-    if (batch == 0 or sequence == 0 or sequence > 8192 or rows > 8192 or ids.len != rows or mask.len != rows) return error.InvalidEmbeddingInputLength;
+    var compact_input = encoder.compactRowsEnabled(cb.kind() == .metal);
+    if (batch == 0 or (compact_input and batch > 64) or sequence == 0 or sequence > 8192 or (!compact_input and rows > 8192) or ids.len != rows or mask.len != rows) return error.InvalidEmbeddingInputLength;
+    var active: usize = 0;
+    for (mask) |value| {
+        if (value != 0 and value != 1) return error.InvalidAttentionMask;
+        active += @intFromBool(value != 0);
+    }
+    if (active == 0) return error.EmptyEmbeddingInput;
+    if (compact_input and active > 8192) return error.InvalidEmbeddingInputLength;
+    if (batch == 1 and active == rows) compact_input = false;
+    const selected = if (compact_input) try a.alloc(i64, active) else null;
+    defer if (selected) |values| a.free(values);
+    if (selected) |values| {
+        var at: usize = 0;
+        for (ids, mask) |id, valid| if (valid != 0) {
+            values[at] = id;
+            at += 1;
+        };
+    }
     for (ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidTokenId;
     const ew = try cb.getWeight("language_model.embed_tokens.weight");
     defer cb.free(ew);
-    const raw = try cb.embeddingLookup(ew, ids, rows, 512);
+    const raw = try cb.embeddingLookup(ew, selected orelse ids, if (compact_input) active else rows, 512);
     defer cb.free(raw);
     const input = (try cb.multiplyScalar(raw, @sqrt(@as(f32, 512)))) orelse return error.EmbeddingGemma2OperationUnavailable;
     defer cb.free(input);
-    const output = try encoder.forwardPooledEmbeddingsCT(cb, a, cfg, input, mask, batch, sequence, dimensions);
+    const output = try encoder.forwardPackedPooledEmbeddingsCT(cb, a, cfg, input, mask, batch, sequence, dimensions, compact_input);
     defer cb.free(output);
     return readPooledBatch(a, cb, output, batch, dimensions);
 }
@@ -3810,7 +3940,7 @@ test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and
     }
 }
 
-test "embeddinggemma2 Metal media composition looks up wrappers and padding without soft tokens" {
+test "embeddinggemma2 Metal media composition writes compact rows and preserves rectangular fallback" {
     const Case = struct {
         fn populate(store: *@import("../ops/native_compute.zig").WeightStore) !void {
             // Marker 258880 is deliberately outside this vocabulary. The
@@ -3836,7 +3966,14 @@ test "embeddinggemma2 Metal media composition looks up wrappers and padding with
             const values = try cb.toFloat32(result.embeddings, a);
             defer a.free(values);
             const expected = [_]f32{ 0.125 * @sqrt(@as(f32, 512)), 0.5, 0.6, 0.125 * @sqrt(@as(f32, 512)), 0.125 * @sqrt(@as(f32, 512)), 0.7, 0.125 * @sqrt(@as(f32, 512)), 0.125 * @sqrt(@as(f32, 512)) };
-            for (expected, 0..) |value, row| for (values[row * 512 ..][0..512]) |actual| try std.testing.expectApproxEqAbs(value, actual, 1e-6);
+            try std.testing.expect(result.compact_input);
+            try std.testing.expectEqual(@as(usize, 7 * 512), values.len);
+            for (expected[0..7], 0..) |value, row| for (values[row * 512 ..][0..512]) |actual| try std.testing.expectApproxEqAbs(value, actual, 1e-6);
+            const legacy = try packResidentMediaRowsPolicy(a, &cb, &rows, source, &.{ 2, 1 }, 258880, 32, false);
+            defer legacy.deinit(a, &cb);
+            const legacy_values = try cb.toFloat32(legacy.embeddings, a);
+            defer a.free(legacy_values);
+            for (expected, 0..) |value, row| for (legacy_values[row * 512 ..][0..512]) |actual| try std.testing.expectApproxEqAbs(value, actual, 1e-6);
             try std.testing.expectEqualSlices(i64, &.{ 1, 1, 1, 1, 1, 1, 1, 0 }, result.mask);
             var marker = [_]i64{258880};
             var active = [_]i64{1};
@@ -3863,4 +4000,42 @@ test "embeddinggemma2 media templates require immutable tokenizer generations" {
     try std.testing.expect(key != mediaTemplateKey(tokenizer, 4, 32, true).?);
     tokenizer.cache_identity = 43;
     try std.testing.expect(key != mediaTemplateKey(tokenizer, 4, 32, false).?);
+}
+
+test "embeddinggemma2 compact cohort policy uses active rows while portable policy bounds padding" {
+    try std.testing.expectEqual(@as(usize, 2), preparedCohortCountForBackend(&.{ 1024, 7168 }, 4, true));
+    try std.testing.expectEqual(@as(usize, 1), preparedCohortCountForBackend(&.{ 1024, 7168 }, 4, false));
+    try std.testing.expectEqual(@as(usize, 3), preparedCohortCountForBackend(&.{ 32, 1024, 4096, 4096 }, 4, true));
+    try std.testing.expectEqual(@as(usize, 1), preparedCohortCountForBackend(&.{ 8192, 1 }, 4, true));
+}
+
+test "embeddinggemma2 Metal direct packed rows exclude NaN padding and preserve original positions" {
+    const Case = struct {
+        fn run(cb: ComputeBackend, _: ComputeBackend) !void {
+            const a = std.testing.allocator;
+            var data: [5 * 512]f32 = undefined;
+            for (&data, 0..) |*value, i| value.* = @floatFromInt(i / 512 + 1);
+            @memset(data[512..1024], std.math.nan(f32));
+            @memset(data[1536..2048], std.math.nan(f32));
+            const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&data, &.{ 5, 512 }));
+            defer cb.free(input);
+            const first = try cb.sliceRows2D(a, input, 0, 3, 512);
+            defer cb.free(first);
+            const second = try cb.sliceRows2D(a, input, 3, 2, 512);
+            defer cb.free(second);
+            var ids_a = [_]i64{ 1, 2, 3 };
+            var mask_a = [_]i64{ 1, 0, 1 };
+            var ids_b = [_]i64{ 4, 5 };
+            var mask_b = [_]i64{ 0, 1 };
+            const rows = [_]PreparedGroup{ .{ .ids = &ids_a, .mask = &mask_a, .embeddings = null, .tensor = first }, .{ .ids = &ids_b, .mask = &mask_b, .embeddings = null, .tensor = second } };
+            const packed_rows = try packCompactPreparedRows(a, &cb, &rows);
+            defer packed_rows.deinit(a, &cb);
+            const values = try cb.toFloat32(packed_rows.embeddings, a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(i64, &.{ 1, 0, 1, 0, 1, 0 }, packed_rows.mask);
+            try std.testing.expectEqual(@as(usize, 3 * 512), values.len);
+            for ([_]f32{ 1, 3, 5 }, 0..) |expected, row| for (values[row * 512 ..][0..512]) |value| try std.testing.expectEqual(expected, value);
+        }
+    };
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, Case.run);
 }

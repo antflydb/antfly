@@ -634,7 +634,6 @@ preparation wave. Finished groups release projected tokens promptly; public
 result order, per-group failures, cancellation and shared admission remain
 unchanged. GPU tower and backbone work stay ordered on one leased backend.
 
-
 Metal grouped attention folds query heads sharing a KV head into matrix rows,
 then batches distinct KV heads for dense key envelopes. Partial envelopes
 encode one QK/PV pair per KV head, avoiding padded RHS batch strides and K/V
@@ -674,7 +673,6 @@ zig-out/bin/antfly-embeddinggemma2-attention-check /path/to/model \
   /path/to/attention-timings.json --benchmark
 ```
 
-
 Audio relative-position inputs, query scales, normalization ones and completed
 per-layer relative-key projections are cached as immutable model constants.
 Prepared constants have an 8 MiB/128-entry ceiling within the audio class and
@@ -708,7 +706,6 @@ devices; other Metal devices blit that same generated staging buffer directly
 to private storage, avoiding a second shared upload allocation.
 Publication remains atomic: failed preparation preserves any previous slot,
 and the existing class/admission limits charge the final allocation.
-
 
 Embedding-only calls apply the final token RMSNorm, masked-mean pool hidden
 rows, then project once per item. Token-output callers retain the original
@@ -802,7 +799,6 @@ remain separately reported boundaries. Images, PDF pages and GIF frames share
 the vision path, but source decoding/extraction must also be measured for each
 complete service workload. Passing isolated model cases does not certify those
 wrapper costs or universal PyTorch performance parity.
-
 
 ### Earlier local measurements
 
@@ -1028,7 +1024,6 @@ preserve GLiNER's model-stage HTTP error and metric classification, release
 admission, and allow a subsequent request to recover. The comparison report
 records the initial diagnostic failure and its final passing regression.
 
-
 ## Video groups
 
 Submit MP4, MOV or WebM as a `media` part in an ordered group, for example:
@@ -1061,7 +1056,6 @@ Model FPS sampling currently requires progressive one-picture-per-sample AVC
 transport remain library capabilities; the model adapter rejects them until a
 logical-picture index qualifies their frame-count/FPS semantics.
 
-
 WebM model sampling uses visible decoder outputs rather than packet count. Hidden
 reference frames remain dependencies, and VP9 superframe outputs have individual
 logical IDs. Indexing stores metadata, then replay decodes once up to the last
@@ -1069,7 +1063,6 @@ selected picture and reuses the existing CPU/Metal projection batching. Each
 pass allows at most 8192 coded packets and 65536 visible picture entries; the
 model selects at most 32 pictures. This bounds memory without retaining a whole
 decoded clip. Equal PTS retain output order; no per-picture timestamps are invented.
-
 
 [Pretrained WebM qualification](../../zig/lib/video/testdata/webm-validation/README.md)
 compares eight vectors and three retrieval rankings against pinned PyTorch.
@@ -1124,7 +1117,6 @@ It changes `model_identity` and remains opt-in pending NVIDIA qualification.
 The BF16 native vision implementation also versions its existing opt-in identity;
 reload and qualify models before using the resulting pin.
 
-
 CUDA `PACKED_PROJECTIONS`, `GRAPH_REPLAY` and `EXTENDED_FLASH` opt-in profiles
 carry updated identities for bounded grouped PLE, cohort replay and portable
 WMMA tail padding. Reload and qualify the new pins before use. Graph replay is
@@ -1177,7 +1169,6 @@ pins with `batched-patches-v2`; reload and run NVIDIA qualification before use.
 The comparison harness can require `audio_constants` and `patch_into` execution.
 Vision scratch now fits four 480×480 frames with packed BF16 preparation into the
 existing 128 MiB graph arena, without raising the cache ceiling.
-
 
 Audio acceleration also batches compatible subsampling lengths and keeps window,
 magnitude, log/mask, channel normalization and flatten preparation on device.
@@ -1455,37 +1446,56 @@ Diagnostic controls are `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_WORKSPACE`,
 `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES`. Packed-QKV policy also
 participates in audio schedule identity. Controls are restored after qualification.
 
-On an M4 Max, completed ReleaseFast median latencies measured:
+On an M4 Max, completed ReleaseFast checkpoint measurements gave these median
+latencies in the first qualification run. Full encoder measurements include all 24 layers, pooling,
+normalization and output readback; the vision comparison uses the public raster
+embedding API with two real image fixtures.
 
 | Fixture | Reference | Optimized |
 |---|---:|---:|
-| Audio singleton, all execution changes | 23.271 ms | 22.952 ms |
-| Two-clip cohort, all execution changes | 24.834 ms | 24.174 ms |
-| Masked backbone, 512 rectangular / 448 active rows | 34.498 ms | 31.757 ms |
-| 3000-row FFN projection/GELU | 7.616 ms | 7.105 ms |
-| Public audio singleton, template/composition only | 22.901 ms | 22.811 ms |
-| Public two-clip audio, template/composition only | 23.944 ms | 23.946 ms |
+| Full encoder, 2560 rows | 267.742 ms | 214.426 ms |
+| Full encoder, 3000 rows, partial final tile | 305.461 ms | 259.392 ms |
+| Full encoder, 4096 rows | 459.970 ms | 380.611 ms |
+| Public raster embeddings, synchronous / overlapping vision | 560.638 ms | 544.330 ms |
+| Masked backbone, 512 rectangular / 448 active rows | 33.276 ms | 31.405 ms |
+| Masked backbone, 512 rectangular / 511 active rows | 33.781 ms | 34.316 ms |
 
-Audio comparisons use 12 samples per route after warmup with paired AB/BA order;
-compact and FFN comparisons use seven samples after two warmups. All include GPU
-completion, readback and parity checks. The compact backbone removes 12.5% of rows
-and reduces this fixture's latency about 8%. The FFN replaces a 46.9-MiB packed
-projection with an 8-MiB tile. Public-audio counters establish 120 template hits
-and 80 compositor dispatches during the dedicated comparison. Individual
-component timings vary, and general composition alone slightly increased latency
-in this run; these results do not establish broad workload speedups or PyTorch
-parity. Qualification includes 271 passing Metal checks (51 skipped), 37 portable
-checks from a CUDA-enabled Linux build, and the pretrained ordered-media oracle.
-Linux CUDA device execution was not exercised.
+The full encoder compares dense FFNs, product-only tiling and streamed down
+projection, rotating route order with two warmups and five measured samples.
+Product-only medians were 225.384, 267.617 and 396.398 ms respectively; streamed
+down projection remains the default for eligible long layouts, avoiding the
+full intermediate product as well as the full packed projection. A separate
+active-frame cancellation/retry run measured dense/product-only/streamed medians
+of 278.705/246.027/241.570 ms at 2560 rows, 369.557/304.552/301.633 ms at 3000
+rows, and 500.061/444.959/453.036 ms at 4096 rows. Across both runs streaming
+reduced full encoder latency by 9–20% versus dense execution; its difference
+versus product-only tiling ranged from about 2% slower to 5% faster. The bounded
+memory reduction is consistent; the latency advantage over product-only tiling
+is workload-dependent. The compact and vision comparisons use seven samples after
+two warmups, with alternating route order. Vision overlap reduced the measured
+public-path latency about 3%, within the existing two-layer scratch envelope.
+Removing only one masked row was slightly slower; compact execution does not
+promise a latency gain for almost-full masks. All comparisons complete GPU work
+and check output parity. These fixtures do not establish broad workload speedups
+or parity with PyTorch.
+
+Qualification includes 312 passing optimized Metal checks (51 skipped), 39
+portable checks from a CUDA-enabled Linux build, and the pretrained ordered-media
+oracle. The full encoder checks 2560, 3000 and 4096 rows, output parity and
+active-frame cancellation, cleanup and retry. Debug reference checks also cover audio replay and
+public audio waves. Linux CUDA device execution was not exercised.
 
 Metal pooled inference compacts masked rows before backbone execution. Explicit
 original positions preserve RoPE and sliding windows across holes; per-item
 ranges isolate attention, and segmented pooling restores output order without
 reintroducing padded activations. Token-level outputs retain rectangular layout.
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_ROWS=1` selects the rectangular reference.
-Long-context FFNs project into a reusable 512-row tile and immediately consume
-its GELU product into final product rows, avoiding the full packed gate/up
-activation. Ordinary MPS projections remain the capability fallback.
+Long-context FFNs can project into a reusable 512-row tile, apply GELU into a
+second tile and immediately run the down projection into final hidden rows.
+This avoids both full gate/up and full intermediate product activations. The
+product-only tiled route and ordinary MPS projections remain qualified fallbacks.
+Long layouts add one admitted product descriptor (13 total); layouts remain
+bounded at 96 MiB, including this tile.
 
 General mixed-media and video composition also uses compact wrapper lookups and
 indexed composition. A single resident media tensor is consumed directly;
@@ -1494,16 +1504,40 @@ of repeatedly concatenating a growing table. Original tokenizer IDs are committe
 to video IDs only after successful composition.
 
 `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_COMPACT_FFN=1` adds checkpoint comparisons for
-compact masked execution (including non-finite padding) and a 3000-row tiled
-FFN. `ANTFLY_EMBEDDINGGEMMA2_BENCH_FFN_PRECISION=1` enables the separate
+compact masked execution (including holes and non-finite padding) and a 3000-row
+tiled FFN. `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_STREAMED_ENCODER=1` adds the three-way
+full encoder comparison and cancellation/retry checks.
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_PIPELINED_VISION=1` adds the completed public
+raster comparison. `ANTFLY_EMBEDDINGGEMMA2_BENCH_FFN_PRECISION=1` enables the separate
 `BF16 storage candidate completed projection comparison` test. Its exactly
 BF16-representable synthetic weights compare F32 MPS against native BF16 weight
 storage with F32 activations/accumulation at 1, 128 and 512 rows. Both comparisons
 complete GPU work and read back results; serving precision remains unchanged.
-
 
 The BF16 storage candidate measured 0.391 versus 0.561 ms for F32 MPS at one
 row, but 1.247 versus 1.159 ms at 128 rows and 4.226 versus 3.498 ms at 512 rows.
 Although BF16 halves the tested weight payload, it was slower for the measured
 media-sized GEMMs. F32 MPS therefore remains the serving policy. This synthetic
 projection comparison does not qualify a new checkpoint precision recipe.
+
+Compact Metal cohorts are selected by summed token counts, capped at 8192 active
+rows and four items. Portable/CUDA policies retain rectangular padding limits.
+Encoder phase admission uses the compact physical shape and explicit output
+bytes; preprocessing and retained source allocations keep their separate host
+and device reservations. Text, prepared groups and resident media compose or
+look up active rows directly, preserving the original rectangular mask solely
+as layout metadata. Capability declines retain the rectangular composition route.
+
+Two model-owned compact-layout entries cache exact masks, original positions,
+per-item offsets, source rows and uploaded attention tables. Retention is admitted,
+evicted by LRU and released under model pressure; position tensors carry no
+request-owner pointer. Denied retention uses request-owned layout construction.
+
+Vision can encode a successor while its predecessor is submitted, using two
+one-layer groups within the existing two-layer scratch envelope. Images that
+admit only one layer and external frame owners keep synchronous execution.
+Cancellation drains or cancels both owned frame slots before freeing views.
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION=1` selects synchronous vision;
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_FFN=1` selects the product-only FFN path,
+and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN=1` also disables that candidate.
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_CACHE=1` bypasses retained mask metadata.

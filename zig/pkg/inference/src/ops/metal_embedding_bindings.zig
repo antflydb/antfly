@@ -29,6 +29,9 @@ pub const State = struct {
     geometry_retry: u64 = 0,
     geometry_hits: u64 = 0,
     geometries: [2]?*Geometry = @splat(null),
+    compact_geometries: [2]?*CompactGeometry = @splat(null),
+    compact_hits: u64 = 0,
+    compact_retry: u64 = 0,
     workspaces: [2]?*Workspace = @splat(null),
     workspace_retry: u64 = 0,
     workspace_hits: u64 = 0,
@@ -37,6 +40,10 @@ pub const State = struct {
     template_hits: u64 = 0,
     compose_dispatches: u64 = 0,
     pub fn deinit(self: *State) void {
+        for (self.compact_geometries) |entry| if (entry) |geometry| {
+            geometry.deinit();
+            std.heap.c_allocator.destroy(geometry);
+        };
         for (self.workspaces) |entry| if (entry) |workspace| {
             workspace.owner.deinit();
             std.heap.c_allocator.destroy(workspace);
@@ -82,7 +89,7 @@ pub const Workspace = struct {
     spec: ops.EmbeddingWorkspaceSpec,
     projection_rows: usize,
     stamp: u64,
-    views: [12]?ops.CT = @splat(null),
+    views: [13]?ops.CT = @splat(null),
     pub fn projection(kind: ops.EmbeddingModelProjection) ?usize {
         return switch (kind) {
             .packed_qkv => 0,
@@ -112,5 +119,23 @@ pub const Template = struct {
     pub fn deinit(self: *Template) void {
         std.heap.c_allocator.free(self.view.ids);
         std.heap.c_allocator.free(self.view.mask);
+    }
+};
+
+/// Exact masks and positions are immutable while an encoder borrows this entry.
+/// One host allocation and one device allocation own the cached layout.
+pub const CompactGeometry = struct {
+    owner: tape.Plan = .{ .host_bytes = @sizeOf(CompactGeometry), .metadata_bytes = @sizeOf(CompactGeometry) },
+    batch: usize,
+    sequence: usize,
+    window: u32,
+    stamp: u64,
+    storage: []u64 = &.{},
+    mask: []i64 = &.{},
+    tensors: [3]?ops.CT = @splat(null),
+    view: ops.EmbeddingCompactVisibility = undefined,
+    pub fn deinit(self: *CompactGeometry) void {
+        self.owner.deinit();
+        std.heap.c_allocator.free(self.storage);
     }
 };

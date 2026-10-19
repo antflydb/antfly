@@ -2060,6 +2060,7 @@ pub const ComputeBackend = struct {
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
         rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
         clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
+        embeddingCompactVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingCompactVisibility = null,
         embeddingModelVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingModelVisibility = null,
         embeddingWorkspacePrepare: ?*const fn (ctx: *anyopaque, spec: EmbeddingWorkspaceSpec) anyerror!void = null,
         embeddingWorkspaceNorm: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelWeight, input: CT, residual: ?CT, dim: usize, eps: f32, scale: f32) anyerror!?CT = null,
@@ -2102,6 +2103,7 @@ pub const ComputeBackend = struct {
         /// Backends may fuse the common gated-FFN activation/multiply pair.
         /// Consume row-packed [gelu gate; up] without materializing either half.
         /// Optional bounded projection/GELU pipeline; avoids full packed FFN output.
+        embeddingStreamedFFN: ?*const fn (ctx: *anyopaque, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize) anyerror!?CT = null,
         embeddingGatedFFN: ?*const fn (ctx: *anyopaque, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize) anyerror!?CT = null,
         packedGeluMultiply: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
         activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
@@ -4825,6 +4827,22 @@ pub const ComputeBackend = struct {
         try self.checkExecutionControl();
         return out;
     }
+    /// Cooperatively cancel between FFN row tiles and restore nested controls.
+    pub fn embeddingFFN(self: *const ComputeBackend, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize, streamed: bool) !?CT {
+        const run = (if (streamed) self.vtable.embeddingStreamedFFN else self.vtable.embeddingGatedFFN) orelse return null;
+        try self.checkExecutionControl();
+        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.audioSetControl) |set| {
+            _ = set(self.ptr, previous);
+        };
+        const output = try run(self.ptr, layer, input, rows, hidden, intermediate);
+        self.checkExecutionControl() catch |err| {
+            if (output) |tensor| self.free(tensor);
+            return err;
+        };
+        return output;
+    }
+
     pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
         const op = self.vtable.audioExecution orelse return null;
         const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
@@ -6516,6 +6534,14 @@ pub const EmbeddingModelVisibility = struct {
     window_metadata: CT,
 };
 
+pub const EmbeddingCompactVisibility = struct {
+    visibility: EmbeddingModelVisibility,
+    source_rows: []i64,
+    offsets: []usize,
+    ones: []i64,
+    device_positions: CT,
+};
+
 pub const EmbeddingWorkspaceSpec = struct {
     rows: usize,
     hidden: usize,
@@ -6524,3 +6550,57 @@ pub const EmbeddingWorkspaceSpec = struct {
     widths: [6]usize,
 };
 pub const EmbeddingMediaTemplate = struct { ids: []i64, mask: []i64 };
+
+test "embeddinggemma2 streamed FFN restores controls and releases post-cancel outputs" {
+    const Probe = struct {
+        cancelled: bool = false,
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+    };
+    const Fixture = struct {
+        active: ?InferenceExecutionControl = null,
+        probe: *Probe,
+        cancel_during: bool,
+        calls: usize = 0,
+        frees: usize = 0,
+        token: u8 = 0,
+        fn set(raw: *anyopaque, value: ?InferenceExecutionControl) ?InferenceExecutionControl {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.active;
+            self.active = value;
+            return previous;
+        }
+        fn run(raw: *anyopaque, _: usize, _: CT, _: usize, _: usize, _: usize) anyerror!?CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(?*anyopaque, self.probe), self.active.?.ptr);
+            try self.active.?.check();
+            if (self.cancel_during) self.probe.cancelled = true;
+            return @ptrCast(&self.token);
+        }
+        fn free(raw: *anyopaque, _: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frees += 1;
+        }
+    };
+    for ([_]u8{ 0, 1, 2 }) |case| {
+        var probe = Probe{ .cancelled = case == 1 };
+        var old_probe = Probe{};
+        const old = InferenceExecutionControl{ .ptr = &old_probe, .check_fn = Probe.check };
+        var fixture = Fixture{ .probe = &probe, .cancel_during = case == 2, .active = old };
+        var table: ComputeBackend.VTable = undefined;
+        table.embeddingStreamedFFN = Fixture.run;
+        table.audioSetControl = Fixture.set;
+        table.freeTensor = Fixture.free;
+        const cb = ComputeBackend{ .ptr = &fixture, .vtable = &table, .execution_control = .{ .ptr = &probe, .check_fn = Probe.check } };
+        if (case == 0) {
+            const output = (try cb.embeddingFFN(0, @ptrCast(&fixture.token), 4, 4, 8, true)).?;
+            cb.free(output);
+        } else try std.testing.expectError(error.Cancelled, cb.embeddingFFN(0, @ptrCast(&fixture.token), 4, 4, 8, true));
+        try std.testing.expectEqual(@as(?*anyopaque, &old_probe), fixture.active.?.ptr);
+        try std.testing.expectEqual(@as(usize, if (case == 1) 0 else 1), fixture.calls);
+        try std.testing.expectEqual(@as(usize, if (case == 1) 0 else 1), fixture.frees);
+    }
+}
