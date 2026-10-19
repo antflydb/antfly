@@ -5979,7 +5979,7 @@ class CliTests(unittest.TestCase):
                 paths[17].write_text(f"updated {iteration}\n")
                 ready = request("refresh")[0]
                 self.assertEqual(ready["sources_opened"], 1)
-                self.assertEqual(ready["refresh_entries_visited"], 1)
+                self.assertEqual(ready["refresh_entries_visited"], 1, ready)
                 self.assertTrue(ready["discovery_reused"])
                 revision = ready["revision"]
                 forced = request("refresh", force_rescan=True)[0]
@@ -5987,7 +5987,7 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(forced["refresh_entries_visited"], len(paths))
             self.write("src/new.txt", "membership change\n")
             changed = request("refresh")[0]
-            self.assertFalse(changed["discovery_reused"])
+            self.assertTrue(changed["discovery_reused"])
             self.assertEqual(changed["files"], len(paths) + 1)
 
     def test_workspace_watched_refresh_scales_and_mutates_every_file(self):
@@ -6306,6 +6306,95 @@ class CliTests(unittest.TestCase):
                     for r in partial
                 )
             )
+
+    def test_workspace_membership_updates_match_forced_rebuilds(self):
+        for i in range(32):
+            self.write(f"src/dir-{i}/a.txt", "needle original\n")
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            for i in range(6):
+                self.write(f"src/dir-{i}/added.txt", "needle added\n")
+                self.write(f"src/dir-{31 - i}/a.txt", f"needle changed {i}\n")
+                if i:
+                    (self.root / f"src/dir-{i - 1}/added.txt").rename(
+                        self.root / f"src/dir-{i - 1}/renamed.txt"
+                    )
+                changed = request("refresh")[0]
+                self.assertTrue(changed["discovery_reused"], changed)
+                self.assertLessEqual(changed["refresh_entries_visited"], 8, changed)
+                rows = request(
+                    "search",
+                    revision=changed["revision"],
+                    args=["--threads=1", "needle"],
+                )
+                forced = request("refresh", force_rescan=True)[0]
+                self.assertEqual(changed["revision"], forced["revision"])
+                rebuilt = request(
+                    "search",
+                    revision=forced["revision"],
+                    args=["--threads=1", "needle"],
+                )
+
+                def matches(values):
+                    return [
+                        (r["data"]["path"], r["data"]["lines"])
+                        for r in values
+                        if r["type"] == "match"
+                    ]
+
+                self.assertEqual(matches(rows), matches(rebuilt))
+
+    def test_workspace_membership_handles_empty_and_trailing_slash_roots(self):
+        path = self.write("src/a.txt", "hit\n")
+        with self.workspace("--workspace-watch", "src/") as (ready, request):
+            path.unlink()
+            empty = request("refresh")[0]
+            self.assertEqual(empty["files"], 0, empty)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(empty["revision"], forced["revision"])
+            self.write("src/b.txt", "hit\n")
+            changed = request("refresh")[0]
+            self.assertEqual(changed["files"], 1, changed)
+            self.assertTrue(changed["discovery_reused"], changed)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(changed["revision"], forced["revision"])
+
+    def test_workspace_new_excluded_file_is_watched_for_size_eligibility(self):
+        self.write("src/a.txt", "hit\n")
+        with self.workspace("--workspace-watch", "--max-filesize=4", "src") as (
+            ready,
+            request,
+        ):
+            excluded = self.write("src/new.txt", "initially too large\n")
+            first = request("refresh")[0]
+            self.assertEqual(first["files"], 1)
+            excluded.write_text("hit\n")
+            changed = request("refresh")[0]
+            self.assertEqual(changed["files"], 2, changed)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(changed["revision"], forced["revision"])
+
+    def test_workspace_membership_preserves_ignore_depth_and_symlink_policies(self):
+        self.write("src/.ignore", "ignored*\n")
+        self.write("src/sub/a.txt", "hit\n")
+        self.write("src/sub/deep/outside.txt", "hit\n")
+        with self.workspace(
+            "--workspace-watch", "--no-ignore-parent", "--max-depth=2", "src"
+        ) as (ready, request):
+            self.write("src/sub/ignored-new.txt", "hit\n")
+            self.write("src/sub/allowed.txt", "hit\n")
+            (self.root / "src/sub/link.txt").symlink_to(self.root / "src/sub/a.txt")
+            # Symlink topology requires conservative rediscovery on macOS;
+            # Linux's named queue must preserve no-follow eligibility as well.
+            changed = request("refresh")[0]
+            self.assertEqual(changed["files"], 2, changed)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(changed["revision"], forced["revision"])
+            self.write("src/sub/another.txt", "hit\n")
+            changed = request("refresh")[0]
+            self.assertTrue(changed["discovery_reused"], changed)
+            self.assertEqual(changed["files"], 3)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(changed["revision"], forced["revision"])
 
     def test_workspace_journal_detects_symlink_target_ancestor_replacement(self):
         external = self.write("external/deep/a.txt", "old target\n")

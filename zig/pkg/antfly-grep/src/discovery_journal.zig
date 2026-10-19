@@ -38,11 +38,21 @@ pub const Journal = struct {
     approved_sequences: [4096]u64 = @splat(std.math.maxInt(u64)),
     approved_generations: [4096]u64 = @splat(0),
     tokens: std.StringHashMapUnmanaged(Token) = .empty,
+    // Borrowed paths route ancestor invalidations to dependent descendants.
+    routes: [4096]std.ArrayList([]const u8) = @splat(.empty),
+    dependency_routes: [4096]std.ArrayList([]const u8) = @splat(.empty),
+    roots: std.ArrayList(Root) = .empty,
+    membership_dirs: std.ArrayList(Membership) = .empty,
+    allow_membership: bool = false,
+    path_checks: usize = 0,
+    directory_checks: usize = 0,
     coverage: bool = true,
     sources_covered: bool = false,
     source_epoch: u64 = 0,
     dependency_epoch: u64 = 0,
     sealed: bool = false,
+    pub const Root = struct { path: []const u8, display: []const u8 };
+    pub const Membership = struct { path: []const u8, display: []const u8, stamp: @import("directory_stamp.zig").Stamp, native_names: bool = false };
     pub fn init(a: std.mem.Allocator, io: std.Io) Journal {
         return .{ .io = io, .budget = .{ .backing = a, .limit = 1024 * 1024 }, .watch = Watch.init(), .native = .init(a, io) };
     }
@@ -52,6 +62,18 @@ pub const Journal = struct {
         self.clearMetadata();
     }
     fn clearMetadata(self: *Journal) void {
+        for (self.roots.items) |root| {
+            self.budget.allocator().free(root.path);
+            self.budget.allocator().free(root.display);
+        }
+        self.roots.deinit(self.budget.allocator());
+        self.roots = .empty;
+        self.membership_dirs.deinit(self.budget.allocator());
+        self.membership_dirs = .empty;
+        for (&self.routes) |*route| route.deinit(self.budget.allocator());
+        self.routes = @splat(.empty);
+        for (&self.dependency_routes) |*route| route.deinit(self.budget.allocator());
+        self.dependency_routes = @splat(.empty);
         self.freeDisplays();
         var inventories = self.inventories.keyIterator();
         while (inventories.next()) |key| self.budget.allocator().free(key.*);
@@ -125,28 +147,48 @@ pub const Journal = struct {
         };
     }
     pub fn rearmDirectories(self: *Journal) void {
-        var witnesses = self.tokens.iterator();
-        while (witnesses.next()) |witness| {
-            if (self.watch.intact(witness.value_ptr.*)) continue;
-            var dir = std.Io.Dir.cwd().openDir(self.io, witness.key_ptr.*, .{}) catch continue;
+        const count = self.watch.event_count;
+        for (self.watch.events[0..count]) |slot| for (self.routes[slot].items) |path| {
+            const prior = self.tokens.getPtr(path) orelse continue;
+            if (self.watch.intact(prior.*)) continue;
+            var dir = std.Io.Dir.cwd().openDir(self.io, path, .{}) catch continue;
             defer dir.close(self.io);
             const token = self.watch.armDirectory(dir) orelse continue;
-            if (token.generation != witness.value_ptr.generation or token.generation != self.approved_generations[token.slot] or token.sequence != self.approved_sequences[token.slot]) {
+            if (token.generation != prior.generation or token.generation != self.approved_generations[token.slot] or token.sequence != self.approved_sequences[token.slot]) {
                 self.watch.release(token);
                 continue;
             }
             self.watch.certify(token);
-            self.watch.release(witness.value_ptr.*);
-            witness.value_ptr.* = token;
-        }
+            self.watch.release(prior.*);
+            prior.* = token;
+        };
         self.watch.poll();
-        var tokens = self.tokens.valueIterator();
-        while (tokens.next()) |token| if (!self.watch.intact(token.*)) return;
+        for (self.watch.events[0..self.watch.event_count]) |slot| for (self.routes[slot].items) |path| {
+            if (!self.watch.intact(self.tokens.get(path).?)) return;
+        };
         self.dependency_epoch = self.watch.epoch;
+        self.watch.clearEvents();
+    }
+    pub fn registerRoot(self: *Journal, path: []const u8, display: []const u8) void {
+        for (self.roots.items) |existing| if (std.mem.eql(u8, existing.path, path) and std.mem.eql(u8, existing.display, display)) return;
+        const a = self.budget.allocator();
+        const key = a.dupe(u8, path) catch {
+            self.failMetadata();
+            return;
+        };
+        const shown = a.dupe(u8, display) catch {
+            a.free(key);
+            self.failMetadata();
+            return;
+        };
+        self.roots.append(a, .{ .path = key, .display = shown }) catch {
+            a.free(key);
+            a.free(shown);
+            self.failMetadata();
+        };
     }
     pub fn displayDirectory(self: *Journal, path: []const u8, display: []const u8) void {
         self.directory(path);
-        if (@import("builtin").os.tag != .linux) return;
         const a = self.budget.allocator();
         const canonical = std.Io.Dir.cwd().realPathFileAlloc(self.io, path, a) catch {
             self.failMetadata();
@@ -213,7 +255,24 @@ pub const Journal = struct {
         self.dependencies.put(a, absolute, present) catch {
             a.free(absolute);
             self.failMetadata();
+            return;
         };
+        var parent = std.fs.path.dirname(absolute);
+        while (parent) |path_name| {
+            var dir = std.Io.Dir.cwd().openDir(self.io, path_name, .{}) catch {
+                const next = std.fs.path.dirname(path_name);
+                if (next != null and std.mem.eql(u8, next.?, path_name)) break;
+                parent = next;
+                continue;
+            };
+            dir.close(self.io);
+            self.directoryWitness(path_name);
+            if (self.tokens.get(path_name)) |token| {
+                self.dependency_routes[token.slot].append(a, absolute) catch self.failMetadata();
+            } else self.failMetadata();
+            return;
+        }
+        self.failMetadata();
     }
     fn reject(self: *Journal, reason: []const u8) bool {
         self.rejection = reason;
@@ -230,38 +289,79 @@ pub const Journal = struct {
         // Revalidate every tracked pathname and absent configuration target,
         // while scanning names only in affected source directories.
         const namespace_dirty = self.dependency_epoch != self.watch.epoch;
-        var witnesses = self.tokens.iterator();
-        while (namespace_dirty) {
-            const witness = witnesses.next() orelse break;
-            if (!self.watch.identityMatchesPath(witness.value_ptr.*, witness.key_ptr.*)) return self.reject("changed-path-identity");
-            if (self.watch.intact(witness.value_ptr.*)) continue;
-            var checked_dir = std.Io.Dir.cwd().openDir(self.io, witness.key_ptr.*, .{}) catch return self.reject("changed-configuration");
-            checked_dir.close(self.io);
-            const canonical = std.Io.Dir.cwd().realPathFileAlloc(self.io, witness.key_ptr.*, self.budget.allocator()) catch return self.reject("missing-ancestor-or-dependency");
-            defer self.budget.allocator().free(canonical);
-            if (self.inventories.get(canonical)) |optional_baseline| {
-                const baseline = optional_baseline orelse return self.reject("uncertified-directory");
-                const current = @import("directory_stamp.zig").Stamp.capture(self.io, canonical) catch return self.reject("unstable-directory");
-                if (!baseline.same(current)) return self.reject("directory-membership-changed");
+        const count = self.watch.event_count;
+        for (self.watch.events[0..count]) |slot| {
+            if (!namespace_dirty) break;
+            for (self.routes[slot].items) |path| {
+                const witness = self.tokens.get(path) orelse return self.reject("lost-path-route");
+                self.path_checks += 1;
+                if (!self.watch.identityMatchesPath(witness, path)) return self.reject("changed-path-identity");
+                if (self.watch.intact(witness)) continue;
+                var checked_dir = std.Io.Dir.cwd().openDir(self.io, path, .{}) catch return self.reject("changed-configuration");
+                checked_dir.close(self.io);
+                const canonical = std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.budget.allocator()) catch return self.reject("missing-ancestor-or-dependency");
+                defer self.budget.allocator().free(canonical);
+                var named = false;
+                if (self.allow_membership and @import("builtin").os.tag == .linux and self.native_covered and !self.native.failed and self.inventories.contains(canonical)) {
+                    var paths = self.native.paths.keyIterator();
+                    while (paths.next()) |event_path| if (std.mem.eql(u8, std.fs.path.dirname(event_path.*) orelse "/", canonical)) {
+                        named = true;
+                        break;
+                    };
+                }
+                if (named) {
+                    var recorded = false;
+                    for (self.membership_dirs.items) |pending| if (std.mem.eql(u8, pending.path, canonical)) {
+                        recorded = true;
+                        break;
+                    };
+                    if (!recorded) self.membership_dirs.append(self.budget.allocator(), .{ .path = self.inventories.getKey(canonical).?, .display = self.displays.get(canonical) orelse return self.reject("unrouted-membership"), .stamp = .{}, .native_names = true }) catch return self.reject("membership-budget");
+                } else if (self.inventories.get(canonical)) |optional_baseline| {
+                    const baseline = optional_baseline orelse return self.reject("uncertified-directory");
+                    self.directory_checks += 1;
+                    const current = @import("directory_stamp.zig").Stamp.capture(self.io, canonical) catch return self.reject("unstable-directory");
+                    if (!baseline.same(current)) {
+                        if (!self.allow_membership or baseline.inode != current.inode or baseline.permissions != current.permissions or !std.mem.eql(u8, &baseline.topology, &current.topology)) return self.reject("directory-membership-changed");
+                        const display = self.displays.get(canonical) orelse return self.reject("unrouted-membership");
+                        var recorded = false;
+                        for (self.membership_dirs.items) |pending| if (std.mem.eql(u8, pending.path, canonical)) {
+                            if (!pending.stamp.same(current)) return self.reject("racing-membership");
+                            recorded = true;
+                            break;
+                        };
+                        if (!recorded) {
+                            const stable = self.inventories.getKey(canonical).?;
+                            self.membership_dirs.append(self.budget.allocator(), .{ .path = stable, .display = display, .stamp = current }) catch return self.reject("membership-budget");
+                        }
+                    }
+                }
+                const checkpoint = self.watch.observed(witness) orelse return self.reject("lost-directory-witness");
+                self.approved_sequences[checkpoint.slot] = checkpoint.sequence;
+                self.approved_generations[checkpoint.slot] = checkpoint.generation;
             }
-            const checkpoint = self.watch.observed(witness.value_ptr.*) orelse return self.reject("lost-directory-witness");
-            self.approved_sequences[checkpoint.slot] = checkpoint.sequence;
-            self.approved_generations[checkpoint.slot] = checkpoint.generation;
-        }
-        if (namespace_dirty) {
-            var dependencies = self.dependencies.iterator();
-            while (dependencies.next()) |dep| {
-                const present = if (std.Io.Dir.cwd().statFile(self.io, dep.key_ptr.*, .{})) |_| true else |err| blk: {
+            for (self.dependency_routes[slot].items) |path| {
+                self.path_checks += 1;
+                const present = if (std.Io.Dir.cwd().statFile(self.io, path, .{})) |_| true else |err| blk: {
                     if (err != error.FileNotFound and err != error.NotDir) return self.reject("unreadable-configuration");
                     break :blk false;
                 };
-                if (present != dep.value_ptr.*) return self.reject("configuration-membership-changed");
+                if (present != self.dependencies.get(path).?) return self.reject("configuration-membership-changed");
             }
         }
         var it = self.native.paths.iterator();
         while (it.next()) |event| {
             if (event.value_ptr.*) return self.reject("directory-topology-or-metadata");
+            const name = std.fs.path.basename(event.key_ptr.*);
+            if (self.allow_membership and (std.mem.eql(u8, name, ".gitignore") or std.mem.eql(u8, name, ".ignore") or std.mem.eql(u8, name, ".rgignore") or std.mem.eql(u8, name, ".git"))) return self.reject("configuration-membership");
             if (self.dependencies.contains(event.key_ptr.*)) return self.reject("configuration");
+            if (self.allow_membership) {
+                var covered = false;
+                for (self.membership_dirs.items) |pending| if (std.mem.eql(u8, pending.path, std.fs.path.dirname(event.key_ptr.*) orelse "/")) {
+                    covered = true;
+                    break;
+                };
+                if (covered) continue;
+            }
             if (self.sourceIndex(event.key_ptr.*) != null) {
                 const stat = std.Io.Dir.cwd().statFile(self.io, event.key_ptr.*, .{}) catch return self.reject("removed-source");
                 if (stat.kind != .file) return self.reject("source-kind-changed");
@@ -297,7 +397,19 @@ pub const Journal = struct {
             self.coverage = false;
             a.free(key);
             self.watch.release(value);
+            return;
         };
+        self.routes[value.slot].append(a, key) catch self.failMetadata();
+        var parent = std.fs.path.dirname(key);
+        if (parent == null and !std.mem.eql(u8, key, ".")) parent = ".";
+        while (parent) |path_name| {
+            if (self.tokens.get(path_name)) |ancestor| if (ancestor.slot != value.slot) {
+                self.routes[ancestor.slot].append(a, key) catch self.failMetadata();
+            };
+            const next = std.fs.path.dirname(path_name);
+            if (next != null and std.mem.eql(u8, next.?, path_name)) break;
+            parent = next;
+        }
     }
     pub fn directory(self: *Journal, path: []const u8) void {
         self.native.track(path);
@@ -402,6 +514,7 @@ pub const Journal = struct {
         self.source_epoch = sources.epoch;
         self.dependency_epoch = self.watch.epoch;
         self.sealed = true;
+        if (self.coverage) self.watch.clearEvents();
     }
 };
 

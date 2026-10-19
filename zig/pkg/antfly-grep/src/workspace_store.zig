@@ -22,6 +22,7 @@ const source = @import("source_cache.zig");
 const Watch = @import("source_watch.zig").Watch;
 const Token = @import("source_watch.zig").Token;
 const Budget = @import("antfly_regex").Budget;
+const inventory = @import("inventory.zig");
 pub const Entry = struct {
     blob: *Blob,
     path: []const u8,
@@ -29,6 +30,12 @@ pub const Entry = struct {
     revision: [64]u8,
     explicit_file: bool = false,
     witness_reused: bool = false,
+    watch_next: usize = std.math.maxInt(usize),
+    watch_prev: usize = std.math.maxInt(usize),
+    watch_slot: usize = std.math.maxInt(usize),
+    touched: u64 = 0,
+    directory_next: usize = std.math.maxInt(usize),
+    directory_prev: usize = std.math.maxInt(usize),
     prepared: ?source.Prepared = null,
     preparation: ?*PreparedOwner = null,
     fn retain(self: Entry) void {
@@ -62,14 +69,13 @@ pub const Generation = struct {
     parent_revision: ?[64]u8 = null,
     changes: std.ArrayList([]const u8) = .empty,
     blob_bytes: usize = 0,
-    merkle: [][32]u8 = &.{},
-    merkle_base: usize = 0,
+    tree: ?*inventory.Node = null,
     watch_heads: []usize = &.{},
-    watch_next: []usize = &.{},
-    watch_slots: []usize = &.{},
-    touched: []u64 = &.{},
+    directory_heads: std.StringHashMapUnmanaged(usize) = .empty,
     touch_epoch: u64 = 0,
     refresh_entries_visited: usize = 0,
+    namespace_paths_checked: usize = 0,
+    namespace_directories_scanned: usize = 0,
     preparation_mutex: std.Io.Mutex = .init,
     preparation_count: usize = 0,
     pub fn capture(a: A, io: std.Io, o: *const Options, previous: ?*const Generation) !*Generation {
@@ -90,6 +96,18 @@ pub const Generation = struct {
         };
     }
     pub fn captureJournal(a: A, io: std.Io, o: *const Options, previous: ?*Generation, watcher: ?*Watch, journal: ?*@import("discovery_journal.zig").Journal) !*Generation {
+        if (journal) |j| {
+            j.path_checks = 0;
+            j.directory_checks = 0;
+        }
+        const next = try captureJournalInner(a, io, o, previous, watcher, journal);
+        if (journal) |j| {
+            next.namespace_paths_checked = j.path_checks;
+            next.namespace_directories_scanned = j.directory_checks;
+        }
+        return next;
+    }
+    fn captureJournalInner(a: A, io: std.Io, o: *const Options, previous: ?*Generation, watcher: ?*Watch, journal: ?*@import("discovery_journal.zig").Journal) !*Generation {
         const w = watcher orelse return captureWatched(a, io, o, previous, null);
         const j = journal orelse return captureWatched(a, io, o, previous, w);
         if (o.trace) {
@@ -126,6 +144,9 @@ pub const Generation = struct {
                 if (!j.clean() or w.failed) break;
             }
         }
+        if (previous) |old| if (!clean and old.refs == 1 and j.sources_covered and !w.failed) {
+            if (captureMembership(a, io, o, old, w, j) catch null) |updated| return updated;
+        };
         return captureFallback(a, io, o, previous, w, j, clean);
     }
     fn captureFallback(a: A, io: std.Io, o: *const Options, previous: ?*Generation, w: *Watch, j: *@import("discovery_journal.zig").Journal, was_clean: bool) !*Generation {
@@ -177,49 +198,41 @@ pub const Generation = struct {
                 return std.mem.order(u8, x.path, y.path) == .lt;
             }
         }.less);
-        self.merkle_base = std.math.ceilPowerOfTwo(usize, @max(1, self.entries.items.len)) catch return error.OutOfMemory;
-        self.merkle = try self.arena.allocator().alloc([32]u8, 2 * self.merkle_base);
-        @memset(self.merkle, @as([32]u8, @splat(0)));
         for (self.entries.items, 0..) |entry, i| {
             if (i > 0 and std.mem.eql(u8, self.entries.items[i - 1].path, entry.path)) return error.DuplicateWorkspacePath;
-            self.merkle[self.merkle_base + i] = leafHash(entry);
         }
-        var branch = self.merkle_base;
-        while (branch > 1) {
-            branch -= 1;
-            self.merkle[branch] = branchHash(self.merkle[branch * 2], self.merkle[branch * 2 + 1]);
-        }
-        self.revision = rootRevision(self.entries.items.len, self.merkle[1]);
+        self.tree = try inventory.build(self.budget.allocator(), self.entries.items, leafHash);
+        self.revision = inventoryRevision(self.tree);
         if (watcher != null and journal != null) {
             const allocator = self.arena.allocator();
             self.watch_heads = try allocator.alloc(usize, watcher.?.limit);
             @memset(self.watch_heads, std.math.maxInt(usize));
-            self.watch_next = try allocator.alloc(usize, self.entries.items.len);
-            self.watch_slots = try allocator.alloc(usize, self.entries.items.len);
-            self.touched = try allocator.alloc(u64, self.entries.items.len);
-            @memset(self.touched, 0);
             for (self.entries.items, 0..) |entry, i| {
-                self.watch_next[i] = std.math.maxInt(usize);
-                self.watch_slots[i] = std.math.maxInt(usize);
                 if (entry.blob.token) |token| self.linkWatch(i, token.slot);
             }
+        }
+        for (self.entries.items, 0..) |entry, i| {
+            try self.ensureDirectory(std.fs.path.dirname(entry.path) orelse "");
+            self.linkDirectory(i);
         }
         self.refresh_entries_visited = self.entries.items.len;
         if (previous) |old| {
             self.parent_revision = old.revision;
             if (std.mem.eql(u8, &self.revision, &old.revision)) {
                 self.parent_revision = old.parent_revision;
-                for (old.changes.items) |path| try self.changes.append(self.arena.allocator(), try self.arena.allocator().dupe(u8, path));
+                for (old.changes.items) |path| try self.addChange(path);
             }
-            var left: usize = 0;
-            var right: usize = 0;
-            while (left < old.entries.items.len or right < self.entries.items.len) {
-                const order: std.math.Order = if (left == old.entries.items.len) .gt else if (right == self.entries.items.len) .lt else std.mem.order(u8, old.entries.items[left].path, self.entries.items[right].path);
-                const path = if (order == .lt) old.entries.items[left].path else self.entries.items[right].path;
-                if (order != .eq or !std.mem.eql(u8, &old.entries.items[left].revision, &self.entries.items[right].revision) or old.entries.items[left].explicit_file != self.entries.items[right].explicit_file)
-                    try self.changes.append(self.arena.allocator(), try self.arena.allocator().dupe(u8, path));
-                if (order != .gt) left += 1;
-                if (order != .lt) right += 1;
+            var left_it = old.iterator();
+            var right_it = self.iterator();
+            var left = left_it.next();
+            var right = right_it.next();
+            while (left != null or right != null) {
+                const order: std.math.Order = if (left == null) .gt else if (right == null) .lt else std.mem.order(u8, left.?.path, right.?.path);
+                const path = if (order == .lt) left.?.path else right.?.path;
+                if (order != .eq or !std.mem.eql(u8, &left.?.revision, &right.?.revision) or left.?.explicit_file != right.?.explicit_file)
+                    try self.addChange(path);
+                if (order != .gt) left = left_it.next();
+                if (order != .lt) right = right_it.next();
             }
         }
         self.captured_at = std.Io.Clock.real.now(io).toSeconds();
@@ -238,18 +251,9 @@ pub const Generation = struct {
         h.final(&digest);
         return digest;
     }
-    fn branchHash(left: [32]u8, right: [32]u8) [32]u8 {
-        var h = std.crypto.hash.sha2.Sha256.init(.{});
-        h.update("antfly-workspace-branch-v2");
-        h.update(&left);
-        h.update(&right);
-        var digest: [32]u8 = undefined;
-        h.final(&digest);
-        return digest;
-    }
     fn rootRevision(count: usize, root: [32]u8) [64]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
-        h.update("antfly-workspace-root-v2");
+        h.update("antfly-workspace-root-v3");
         var length: [8]u8 = undefined;
         std.mem.writeInt(u64, &length, count, .little);
         h.update(&length);
@@ -258,29 +262,48 @@ pub const Generation = struct {
         h.final(&digest);
         return std.fmt.bytesToHex(digest, .lower);
     }
+    fn inventoryRevision(root: ?*inventory.Node) [64]u8 {
+        return rootRevision(if (root) |n| n.count else 0, if (root) |n| n.hash else @splat(0));
+    }
+    fn ensureDirectory(self: *Generation, path: []const u8) !void {
+        if (self.directory_heads.contains(path)) return;
+        const key = try self.arena.allocator().dupe(u8, path);
+        try self.directory_heads.put(self.budget.allocator(), key, std.math.maxInt(usize));
+    }
+    fn linkDirectory(self: *Generation, i: usize) void {
+        const entry = &self.entries.items[i];
+        const head = self.directory_heads.getPtr(std.fs.path.dirname(entry.path) orelse "").?;
+        entry.directory_prev = std.math.maxInt(usize);
+        entry.directory_next = head.*;
+        if (head.* != std.math.maxInt(usize)) self.entries.items[head.*].directory_prev = i;
+        head.* = i;
+    }
+    fn unlinkDirectory(self: *Generation, i: usize) void {
+        const entry = self.entries.items[i];
+        if (entry.directory_prev == std.math.maxInt(usize)) self.directory_heads.getPtr(std.fs.path.dirname(entry.path) orelse "").?.* = entry.directory_next else self.entries.items[entry.directory_prev].directory_next = entry.directory_next;
+        if (entry.directory_next != std.math.maxInt(usize)) self.entries.items[entry.directory_next].directory_prev = entry.directory_prev;
+    }
     fn linkWatch(self: *Generation, i: usize, slot: usize) void {
-        self.watch_next[i] = self.watch_heads[slot];
+        const prior = self.watch_heads[slot];
+        self.entries.items[i].watch_next = prior;
+        self.entries.items[i].watch_prev = std.math.maxInt(usize);
+        if (prior != std.math.maxInt(usize)) self.entries.items[prior].watch_prev = i;
         self.watch_heads[slot] = i;
-        self.watch_slots[i] = slot;
+        self.entries.items[i].watch_slot = slot;
     }
     fn unlinkWatch(self: *Generation, i: usize) void {
-        const slot = self.watch_slots[i];
-        if (slot == std.math.maxInt(usize)) return;
-        var link = &self.watch_heads[slot];
-        while (link.* != std.math.maxInt(usize)) {
-            if (link.* == i) {
-                link.* = self.watch_next[i];
-                break;
-            }
-            link = &self.watch_next[link.*];
-        }
+        const entry = &self.entries.items[i];
+        if (entry.watch_slot == std.math.maxInt(usize)) return;
+        if (entry.watch_prev == std.math.maxInt(usize)) self.watch_heads[entry.watch_slot] = entry.watch_next else self.entries.items[entry.watch_prev].watch_next = entry.watch_next;
+        if (entry.watch_next != std.math.maxInt(usize)) self.entries.items[entry.watch_next].watch_prev = entry.watch_prev;
+        entry.watch_slot = std.math.maxInt(usize);
     }
     /// Query workers have joined and the namespace certificate is unchanged.
     /// Stage dirty contents and Merkle paths before touching the published tree.
     /// Exclusive ownership permits transactional replacement without retaining
     /// a chain of prior generations or copying the unchanged inventory.
     fn captureDirty(a: A, io: std.Io, o: *const Options, old: *Generation, w: *Watch, journal: *@import("discovery_journal.zig").Journal) !?*Generation {
-        if (old.watch_heads.len == 0 or old.watch_next.len != old.entries.items.len or old.touch_epoch == std.math.maxInt(u64)) return null;
+        if (old.watch_heads.len == 0 or old.touch_epoch == std.math.maxInt(u64)) return null;
         const epoch = w.epoch;
         const native_epoch = journal.native.checkpoint();
         const native_refresh = journal.native_refresh;
@@ -293,20 +316,25 @@ pub const Generation = struct {
         var stage: Generation = .{ .backing = a, .budget = .{ .backing = a, .limit = o.workspace_memory_limit - @sizeOf(Generation) }, .arena = undefined };
         stage.arena = .init(stage.budget.allocator());
         defer {
-            for (stage.entries.items) |entry| entry.release();
+            for (stage.entries.items) |entry| {
+                entry.release();
+                stage.budget.allocator().free(entry.path);
+            }
+            stage.entries.deinit(stage.budget.allocator());
             stage.arena.deinit();
         }
         var indices: std.ArrayList(usize) = .empty;
-        var updates: std.AutoHashMapUnmanaged(usize, [32]u8) = .empty;
+        var tree = inventory.retain(old.tree);
+        defer inventory.release(old.budget.allocator(), tree);
         const scratch = stage.arena.allocator();
         // Freeze the event suffix; any new event during capture abandons the
         // optimization before publication and uses conservative capture.
         const event_count = w.event_count;
         for (w.events[0..event_count]) |slot| {
             var i = old.watch_heads[slot];
-            while (i != std.math.maxInt(usize)) : (i = old.watch_next[i]) {
-                if (old.touched[i] == old.touch_epoch) continue;
-                old.touched[i] = old.touch_epoch;
+            while (i != std.math.maxInt(usize)) : (i = old.entries.items[i].watch_next) {
+                if (old.entries.items[i].touched == old.touch_epoch) continue;
+                old.entries.items[i].touched = old.touch_epoch;
                 try indices.append(scratch, i);
             }
         }
@@ -320,8 +348,8 @@ pub const Generation = struct {
                 // A strict intact inode witness proves its payload is current.
                 // The final source epoch barrier catches racing new writes.
                 if (entry.blob.token) |token| if (w.intact(token)) continue;
-                if (old.touched[i] == old.touch_epoch) continue;
-                old.touched[i] = old.touch_epoch;
+                if (old.entries.items[i].touched == old.touch_epoch) continue;
+                old.entries.items[i].touched = old.touch_epoch;
                 try indices.append(scratch, i);
             };
         }
@@ -329,7 +357,8 @@ pub const Generation = struct {
         var collector: Collector = .{ .generation = &stage, .io = io, .options = o, .previous = old, .watcher = w };
         var retained = old.blob_bytes;
         var source_bytes = old.source_bytes;
-        var changed: usize = 0;
+        var changes: std.ArrayList([]const u8) = .empty;
+        defer freeChanges(old.budget.allocator(), &changes);
         for (indices.items) |i| {
             const entry = old.entries.items[i];
             const before = stage.entries.items.len;
@@ -339,27 +368,13 @@ pub const Generation = struct {
             const next = stage.entries.items[before];
             source_bytes = source_bytes - entry.bytes.len + next.bytes.len;
             retained = retained - entry.charge() + next.charge();
-            if (!std.mem.eql(u8, &entry.revision, &next.revision)) changed += 1;
-            var node = old.merkle_base + i;
-            try updates.put(scratch, node, leafHash(next));
-            while (node > 1) {
-                node /= 2;
-                const left = updates.get(node * 2) orelse old.merkle[node * 2];
-                const right = updates.get(node * 2 + 1) orelse old.merkle[node * 2 + 1];
-                try updates.put(scratch, node, branchHash(left, right));
-            }
+            if (!std.mem.eql(u8, &entry.revision, &next.revision)) try appendChange(old.budget.allocator(), &changes, entry.path);
+            const updated = try inventory.put(old.budget.allocator(), tree, entry.path, i, leafHash(next));
+            inventory.release(old.budget.allocator(), tree);
+            tree = updated;
         }
         if (retained + old.budget.live + @sizeOf(Generation) > o.workspace_memory_limit) return null;
-        const revision = rootRevision(old.entries.items.len, updates.get(1) orelse old.merkle[1]);
-        if (!std.mem.eql(u8, &revision, &old.revision)) {
-            // Restore the old blob allowance only for bounded metadata growth.
-            const prior_limit = old.budget.limit;
-            old.budget.limit = @min(original_limit, o.workspace_memory_limit - @sizeOf(Generation) - retained);
-            old.changes.ensureTotalCapacity(old.arena.allocator(), changed) catch |err| {
-                old.budget.limit = prior_limit;
-                return err;
-            };
-        }
+        const revision = inventoryRevision(tree);
         w.poll();
         if (!journal.clean() or w.failed or w.epoch != epoch) {
             if (o.trace) std.debug.print("antfly-grep: dirty refresh retry source_epoch={d}/{d} reason={s}\n", .{ w.epoch, epoch, journal.rejection });
@@ -386,23 +401,27 @@ pub const Generation = struct {
         const content_changed = !std.mem.eql(u8, &revision, &old.revision);
         if (content_changed) {
             old.parent_revision = old.revision;
-            old.changes.clearRetainingCapacity();
+            freeChanges(old.budget.allocator(), &old.changes);
+            old.changes = changes;
+            changes = .empty;
         }
         old.preparations_built = 0;
         old.preparations_reused = old.preparation_count;
         for (indices.items, stage.entries.items) |i, next| {
             const prior = old.entries.items[i];
-            if (content_changed and !std.mem.eql(u8, &prior.revision, &next.revision)) old.changes.appendAssumeCapacity(prior.path);
             old.unlinkWatch(i);
+            old.unlinkDirectory(i);
             old.entries.items[i] = next;
             old.entries.items[i].path = prior.path;
             next.retain();
             old.preparation_count = old.preparation_count - @intFromBool(prior.prepared != null) + @intFromBool(next.prepared != null);
             prior.release();
             if (next.blob.token) |token| old.linkWatch(i, token.slot);
+            old.linkDirectory(i);
         }
-        var it = updates.iterator();
-        while (it.next()) |item| old.merkle[item.key_ptr.*] = item.value_ptr.*;
+        inventory.release(old.budget.allocator(), old.tree);
+        old.tree = tree;
+        tree = null;
         old.preparations_reused = old.preparation_count;
         old.blob_bytes = retained;
         old.budget.limit = o.workspace_memory_limit - @sizeOf(Generation) - retained;
@@ -427,6 +446,303 @@ pub const Generation = struct {
             journal.native.retire(native_epoch);
             journal.native_epoch = native_epoch;
         }
+        return old;
+    }
+    /// Reconcile only file membership in certified existing directories. A
+    /// topology/configuration change, lost witness, or race uses full discovery.
+    /// All fallible work precedes publication, including slot moves and hashes.
+    fn captureMembership(a: A, io: std.Io, o: *const Options, old: *Generation, w: *Watch, j: *@import("discovery_journal.zig").Journal) !?*Generation {
+        if (!j.sealed or !j.coverage or old.watch_heads.len == 0) return null;
+        j.membership_dirs.clearRetainingCapacity();
+        j.allow_membership = true;
+        defer j.allow_membership = false;
+        if (!j.namespaceClean() or j.membership_dirs.items.len == 0) return null;
+        w.poll();
+        const epoch = w.epoch;
+        const namespace_epoch = j.watch.epoch;
+        const native_epoch = j.native.checkpoint();
+        var stage: Generation = .{ .backing = a, .budget = .{ .backing = a, .limit = o.workspace_memory_limit - @sizeOf(Generation) }, .arena = undefined };
+        stage.arena = .init(stage.budget.allocator());
+        defer {
+            for (stage.entries.items) |entry| {
+                entry.release();
+                stage.budget.allocator().free(entry.path);
+            }
+            stage.entries.deinit(stage.budget.allocator());
+            stage.arena.deinit();
+        }
+        const scratch = stage.arena.allocator();
+        var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        var eligibility: std.ArrayList([]const u8) = .empty;
+        var collector: Collector = .{ .generation = &stage, .io = io, .options = o, .previous = old, .watcher = w, .membership_seen = &seen, .eligibility = &eligibility };
+        var considered: std.ArrayList([]const u8) = .empty;
+        for (j.membership_dirs.items) |directory| {
+            var root: ?@import("discovery_journal.zig").Journal.Root = null;
+            for (j.roots.items) |candidate| {
+                if (std.mem.eql(u8, candidate.path, directory.path) or (std.mem.startsWith(u8, directory.path, candidate.path) and directory.path.len > candidate.path.len and (std.mem.endsWith(u8, candidate.path, "/") or directory.path[candidate.path.len] == '/'))) {
+                    if (root == null or candidate.path.len > root.?.path.len) root = candidate;
+                }
+            }
+            const scope = root orelse return null;
+            // Overlapping roots already produce duplicate paths in cold capture.
+            // Match the original display prefix before using this policy chain.
+            const suffix = directory.path[scope.path.len..];
+            const expected = if (scope.display.len == 0) std.mem.trimStart(u8, suffix, "/") else try std.mem.concat(scratch, u8, &.{ scope.display, suffix });
+            if (!std.mem.eql(u8, expected, directory.display)) return null;
+            var discovery = @import("discovery.zig").Discovery{ .a = scratch, .io = io, .options = o, .shallow = true };
+            defer discovery.deinit();
+            try discovery.prepareWithin(scope.path, directory.path);
+            if (directory.native_names) {
+                try discovery.prepareDirectoryRules(directory.path);
+                var paths: std.ArrayList([]const u8) = .empty;
+                j.native.lock();
+                var events_at = j.native.paths.keyIterator();
+                while (events_at.next()) |name| if (std.mem.eql(u8, std.fs.path.dirname(name.*) orelse "/", directory.path)) {
+                    const owned = scratch.dupe(u8, name.*) catch {
+                        j.native.unlock();
+                        return null;
+                    };
+                    paths.append(scratch, owned) catch {
+                        j.native.unlock();
+                        return null;
+                    };
+                };
+                j.native.unlock();
+                for (paths.items) |full| {
+                    const shown = if (directory.display.len == 0) try scratch.dupe(u8, std.fs.path.basename(full)) else try std.fs.path.join(scratch, &.{ directory.display, std.fs.path.basename(full) });
+                    try considered.append(scratch, shown);
+                    const stat = std.Io.Dir.cwd().statFile(io, full, .{ .follow_symlinks = false }) catch |err| {
+                        if (err == error.FileNotFound or err == error.NotDir) continue;
+                        return null;
+                    };
+                    if (stat.kind == .file and try discovery.fileAllowed(full, shown)) try collector.addFile(full, shown, false);
+                }
+            } else try discovery.walk(directory.path, directory.display, &collector);
+        }
+        var staged: std.StringHashMapUnmanaged(void) = .empty;
+        for (stage.entries.items) |entry| try staged.put(scratch, entry.path, {});
+        var removed: std.ArrayList([]const u8) = .empty;
+        for (j.membership_dirs.items) |directory| {
+            if (directory.native_names) {
+                for (considered.items) |path| if (std.mem.eql(u8, std.fs.path.dirname(path) orelse "", directory.display)) {
+                    if (old.find(path)) |entry| {
+                        const slot = (@intFromPtr(entry) - @intFromPtr(old.entries.items.ptr)) / @sizeOf(Entry);
+                        if (!seen.contains(slot)) try removed.append(scratch, entry.path);
+                    }
+                };
+                continue;
+            }
+            var slot = old.directory_heads.get(directory.display) orelse std.math.maxInt(usize);
+            while (slot != std.math.maxInt(usize)) {
+                const entry = old.entries.items[slot];
+                if (!seen.contains(slot)) try removed.append(scratch, entry.path);
+                slot = entry.directory_next;
+            }
+        }
+        // Include writes outside the directories whose names changed. A single
+        // refresh may combine an add/delete with arbitrary source edits.
+        const event_count = w.event_count;
+        for (w.events[0..event_count]) |watch_slot| {
+            var slot = old.watch_heads[watch_slot];
+            while (slot != std.math.maxInt(usize)) : (slot = old.entries.items[slot].watch_next) {
+                const entry = old.entries.items[slot];
+                var scanned = false;
+                for (j.membership_dirs.items) |directory| if (std.mem.eql(u8, std.fs.path.dirname(entry.path) orelse "", directory.display)) {
+                    scanned = true;
+                    break;
+                };
+                if (!scanned and !staged.contains(entry.path)) {
+                    const before = stage.entries.items.len;
+                    try collector.addFile(entry.path, entry.path, entry.explicit_file);
+                    if (stage.entries.items.len != before + 1 and !seen.contains(slot)) return null;
+                    try staged.put(scratch, entry.path, {});
+                }
+            }
+        }
+        // Linux directory-only witnesses can describe source writes outside the
+        // changed membership directories as well.
+        j.native.lock();
+        const native_stable = j.native.epoch == native_epoch;
+        var native_paths: std.ArrayList([]const u8) = .empty;
+        var events = j.native.paths.keyIterator();
+        while (events.next()) |path| if (j.sourceIndex(path.*)) |slot| {
+            const entry = old.entries.items[slot];
+            var scanned = false;
+            for (j.membership_dirs.items) |directory| if (std.mem.eql(u8, std.fs.path.dirname(entry.path) orelse "", directory.display)) {
+                scanned = true;
+                break;
+            };
+            if (!scanned and !staged.contains(entry.path)) {
+                native_paths.append(scratch, entry.path) catch {
+                    j.native.unlock();
+                    return null;
+                };
+                staged.put(scratch, entry.path, {}) catch {
+                    j.native.unlock();
+                    return null;
+                };
+            }
+        };
+        j.native.unlock();
+        if (!native_stable) return null;
+        for (native_paths.items) |path| {
+            const before = stage.entries.items.len;
+            try collector.addFile(path, path, old.find(path).?.explicit_file);
+            if (stage.entries.items.len != before + 1 and !seen.contains(@as(usize, (@intFromPtr(old.find(path).?) - @intFromPtr(old.entries.items.ptr)) / @sizeOf(Entry)))) return null;
+        }
+        var tree = inventory.retain(old.tree);
+        defer inventory.release(old.budget.allocator(), tree);
+        var changes: std.ArrayList([]const u8) = .empty;
+        defer freeChanges(old.budget.allocator(), &changes);
+        const Remove = struct { slot: usize, last: usize };
+        var removes: std.ArrayList(Remove) = .empty;
+        var moved: std.AutoHashMapUnmanaged(usize, Entry) = .empty;
+        var count = old.entries.items.len;
+        var retained = old.blob_bytes;
+        var bytes = old.source_bytes;
+        var preparations = old.preparation_count;
+        for (removed.items) |path| {
+            const slot = inventory.find(tree, path) orelse return null;
+            const entry = moved.get(slot) orelse old.entries.items[slot];
+            const next = try inventory.remove(old.budget.allocator(), tree, path);
+            inventory.release(old.budget.allocator(), tree);
+            tree = next;
+            try appendChange(old.budget.allocator(), &changes, path);
+            retained -= entry.charge();
+            bytes -= entry.bytes.len;
+            preparations -= @intFromBool(entry.prepared != null);
+            count -= 1;
+            if (slot != count) {
+                const last = moved.get(count) orelse old.entries.items[count];
+                const updated = try inventory.put(old.budget.allocator(), tree, last.path, slot, leafHash(last));
+                inventory.release(old.budget.allocator(), tree);
+                tree = updated;
+                try moved.put(scratch, slot, last);
+            }
+            _ = moved.remove(count);
+            try removes.append(scratch, .{ .slot = slot, .last = count });
+        }
+        const Upsert = struct { slot: usize, added: bool, path: ?[]const u8 = null, skip: bool = false };
+        var upserts: std.ArrayList(Upsert) = .empty;
+        defer for (upserts.items) |op| if (op.path) |path| old.budget.allocator().free(path);
+        for (stage.entries.items) |entry| {
+            const prior_slot = inventory.find(tree, entry.path);
+            const slot = prior_slot orelse count;
+            if (prior_slot) |_| {
+                const prior = moved.get(slot) orelse old.entries.items[slot];
+                if (prior.blob == entry.blob and prior.preparation == entry.preparation and prior.explicit_file == entry.explicit_file and prior.watch_slot == (if (entry.blob.token) |token| token.slot else std.math.maxInt(usize))) {
+                    try upserts.append(scratch, .{ .slot = slot, .added = false, .skip = true });
+                    continue;
+                }
+                retained -= prior.charge();
+                bytes -= prior.bytes.len;
+                preparations -= @intFromBool(prior.prepared != null);
+                if (!std.mem.eql(u8, &prior.revision, &entry.revision) or prior.explicit_file != entry.explicit_file) try appendChange(old.budget.allocator(), &changes, entry.path);
+            } else {
+                if (count >= o.workspace_max_files) return null;
+                count += 1;
+                try appendChange(old.budget.allocator(), &changes, entry.path);
+            }
+            retained += entry.charge();
+            bytes += entry.bytes.len;
+            preparations += @intFromBool(entry.prepared != null);
+            const next = try inventory.put(old.budget.allocator(), tree, entry.path, slot, leafHash(entry));
+            inventory.release(old.budget.allocator(), tree);
+            tree = next;
+            try upserts.append(scratch, .{ .slot = slot, .added = prior_slot == null });
+            if (prior_slot == null) upserts.items[upserts.items.len - 1].path = try old.budget.allocator().dupe(u8, entry.path);
+            try old.ensureDirectory(std.fs.path.dirname(entry.path) orelse "");
+        }
+        // New size-excluded files still affect future eligibility. Arm their
+        // dependency before confirming the exclusion; do not certify an event
+        // which raced subscription/validation.
+        for (eligibility.items) |path| {
+            j.dependency(path);
+            if (!j.coverage) return null;
+            const token = j.tokens.get(path) orelse return null;
+            const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+            if (stat.size <= o.max_file_bytes) return null;
+            j.watch.certify(token);
+            if (!j.watch.intact(token)) return null;
+        }
+        try old.entries.ensureTotalCapacity(old.budget.allocator(), count);
+        if (retained + old.budget.live + @sizeOf(Generation) > o.workspace_memory_limit) return null;
+        w.poll();
+        j.watch.poll();
+        if (w.failed or w.epoch != epoch or j.watch.epoch != namespace_epoch or !j.namespaceClean()) return null;
+        if (j.native.checkpoint() != native_epoch) return null;
+        for (stage.entries.items) |entry| if (entry.witness_reused and (entry.blob.token == null or !w.intact(entry.blob.token.?))) return null;
+        const revision = inventoryRevision(tree);
+        const changed = !std.mem.eql(u8, &revision, &old.revision);
+        // Publication below cannot allocate, fail, or invoke external code.
+        if (changed) {
+            old.parent_revision = old.revision;
+            freeChanges(old.budget.allocator(), &old.changes);
+            old.changes = changes;
+            changes = .empty;
+        }
+        for (removes.items) |op| {
+            old.unlinkWatch(op.slot);
+            old.unlinkDirectory(op.slot);
+            if (op.slot != op.last) {
+                old.unlinkWatch(op.last);
+                old.unlinkDirectory(op.last);
+            }
+            const entry = old.entries.swapRemove(op.slot);
+            entry.release();
+            old.budget.allocator().free(entry.path);
+            if (op.slot != op.last) {
+                old.linkDirectory(op.slot);
+                if (old.entries.items[op.slot].blob.token) |token| old.linkWatch(op.slot, token.slot);
+            }
+        }
+        for (stage.entries.items, upserts.items) |entry, *op| {
+            if (op.skip) continue;
+            var next = entry;
+            if (op.added) {
+                next.path = op.path.?;
+                op.path = null;
+                old.entries.appendAssumeCapacity(next);
+            } else {
+                const prior = old.entries.items[op.slot];
+                old.unlinkWatch(op.slot);
+                old.unlinkDirectory(op.slot);
+                next.path = prior.path;
+                old.entries.items[op.slot] = next;
+                prior.release();
+            }
+            next.retain();
+            old.linkDirectory(op.slot);
+            if (next.blob.token) |token| old.linkWatch(op.slot, token.slot);
+        }
+        inventory.release(old.budget.allocator(), old.tree);
+        old.tree = tree;
+        tree = null;
+        old.revision = revision;
+        old.blob_bytes = retained;
+        old.budget.limit = o.workspace_memory_limit - @sizeOf(Generation) - retained;
+        old.source_bytes = bytes;
+        old.preparation_count = preparations;
+        old.preparations_reused = preparations;
+        old.preparations_built = 0;
+        old.sources_opened = stage.sources_opened;
+        old.source_bytes_read = stage.source_bytes_read;
+        old.source_bytes_reused = bytes -| stage.source_bytes_read;
+        old.refresh_entries_visited = collector.membership_visited + removed.items.len;
+        old.captured_at = std.Io.Clock.real.now(io).toSeconds();
+        old.discovery_reused = true;
+        for (j.membership_dirs.items) |directory| j.inventories.getPtr(directory.path).?.* = if (directory.native_names) null else directory.stamp;
+        for (stage.entries.items) |entry| if (entry.blob.token == null or !w.intact(entry.blob.token.?)) {
+            if (@import("builtin").os.tag != .linux or entry.explicit_file or (entry.blob.stamp != null and entry.blob.stamp.?.nlink > 1) or !j.native_covered or !j.allow_native_sources) j.sources_covered = false;
+            j.native_active = true;
+        };
+        j.source_epoch = w.epoch;
+        w.clearEvents();
+        j.rearmDirectories();
+        j.native.retire(native_epoch);
+        j.native_epoch = native_epoch;
+        old.watch_fallback = !j.sources_covered or !j.coverage;
+        old.refs += 1;
         return old;
     }
     /// Immutable content has an optional, independently owned derived memo.
@@ -472,23 +788,44 @@ pub const Generation = struct {
         self.refs -= 1;
         if (self.refs != 0) return;
         const a = self.backing;
-        for (self.entries.items) |entry| entry.release();
+        for (self.entries.items) |entry| {
+            entry.release();
+            self.budget.allocator().free(entry.path);
+        }
+        self.entries.deinit(self.budget.allocator());
+        self.directory_heads.deinit(self.budget.allocator());
+        freeChanges(self.budget.allocator(), &self.changes);
+        inventory.release(self.budget.allocator(), self.tree);
         self.arena.deinit();
         a.destroy(self);
     }
+    fn appendChange(a: A, list: *std.ArrayList([]const u8), path: []const u8) !void {
+        const owned = try a.dupe(u8, path);
+        errdefer a.free(owned);
+        try list.append(a, owned);
+    }
+    fn addChange(self: *Generation, path: []const u8) !void {
+        try appendChange(self.budget.allocator(), &self.changes, path);
+    }
+    fn freeChanges(a: A, list: *std.ArrayList([]const u8)) void {
+        for (list.items) |path| a.free(path);
+        list.deinit(a);
+        list.* = .empty;
+    }
     pub fn find(self: *const Generation, path_name: []const u8) ?*const Entry {
-        var begin: usize = 0;
-        var end = self.entries.items.len;
-        while (begin < end) {
-            const mid = begin + (end - begin) / 2;
-            const entry = &self.entries.items[mid];
-            switch (std.mem.order(u8, entry.path, path_name)) {
-                .eq => return entry,
-                .lt => begin = mid + 1,
-                .gt => end = mid,
-            }
+        const slot = inventory.find(self.tree, path_name) orelse return null;
+        return &self.entries.items[slot];
+    }
+    pub const Iterator = struct {
+        generation: *const Generation,
+        tree: inventory.Iterator,
+        pub fn next(self: *Iterator) ?*const Entry {
+            const slot = self.tree.next() orelse return null;
+            return &self.generation.entries.items[slot];
         }
-        return null;
+    };
+    pub fn iterator(self: *const Generation) Iterator {
+        return .{ .generation = self, .tree = .init(self.tree, null) };
     }
 };
 /// Independent allocations never borrow a generation allocator. Refresh can
@@ -576,6 +913,15 @@ const Collector = struct {
     watcher: ?*Watch = null,
     journal: ?*@import("discovery_journal.zig").Journal = null,
     trusted_membership: bool = false,
+    membership_seen: ?*std.AutoHashMapUnmanaged(usize, void) = null,
+    membership_visited: usize = 0,
+    eligibility: ?*std.ArrayList([]const u8) = null,
+    fn markSeen(self: *Collector, path_name: []const u8) !void {
+        if (self.membership_seen) |seen| if (self.previous.?.find(path_name)) |entry| {
+            const slot = (@intFromPtr(entry) - @intFromPtr(self.previous.?.entries.items.ptr)) / @sizeOf(Entry);
+            try seen.put(self.generation.arena.allocator(), slot, {});
+        };
+    }
     fn path(self: *Collector, name: []const u8) !void {
         if (std.mem.eql(u8, name, "-")) return error.WorkspaceStdinUnsupported;
         var scratch = std.heap.ArenaAllocator.init(self.generation.budget.allocator());
@@ -588,7 +934,9 @@ const Collector = struct {
             var discovery = @import("discovery.zig").Discovery{ .a = a, .io = self.io, .options = self.options, .journal = self.journal };
             defer discovery.deinit();
             try discovery.prepare(full);
-            try discovery.walk(full, if (std.mem.eql(u8, name, ".") and self.options.paths.items.len == 0) "" else name, self);
+            const display = if (std.mem.eql(u8, name, ".") and self.options.paths.items.len == 0) "" else if (name.len > 1) std.mem.trimEnd(u8, name, "/") else name;
+            if (self.journal) |journal| journal.registerRoot(full, display);
+            try discovery.walk(full, display, self);
         } else if (info.kind == .file) try self.addFile(name, name, true) else return error.NotRegularFile;
     }
     pub fn stopped(_: *Collector) bool {
@@ -603,12 +951,17 @@ const Collector = struct {
     }
     fn addFile(self: *Collector, path_name: []const u8, display: []const u8, explicit_file: bool) !void {
         const generation = self.generation;
+        self.membership_visited += 1;
         if (generation.entries.items.len >= self.options.workspace_max_files) return error.WorkspaceFileLimit;
         if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
             if (old.blob.watcher == watcher and old.blob.token != null and
                 watcher.intact(old.blob.token.?) and
                 (self.trusted_membership or watcher.identityMatchesPath(old.blob.token.?, path_name)))
             {
+                if (self.membership_seen != null) {
+                    try self.markSeen(display);
+                    return;
+                }
                 const available = generation.budget.limit -| generation.budget.live;
                 old.blob.refs += 1;
                 errdefer old.blob.release();
@@ -625,7 +978,12 @@ const Collector = struct {
         if (before.size > self.options.max_file_bytes and self.options.skip_oversize) {
             // Size affects discovery eligibility without changing directory
             // membership. Observe excluded inputs as discovery dependencies.
-            if (self.journal) |journal| journal.dependency(path_name);
+            if (self.journal) |journal| {
+                journal.dependency(path_name);
+                const latest = try std.Io.Dir.cwd().statFile(self.io, path_name, .{});
+                if (!sameStamp(before, latest)) return error.WorkspaceChangedDuringCapture;
+            }
+            if (self.eligibility) |list| try list.append(generation.arena.allocator(), try generation.arena.allocator().dupe(u8, path_name));
             return;
         }
         const available = generation.budget.limit -| generation.budget.live;
@@ -680,7 +1038,7 @@ const Collector = struct {
     }
     fn append(self: *Collector, blob: *Blob, display: []const u8, explicit_file: bool, revision: [64]u8, witness_reused: bool, available: usize) !void {
         const generation = self.generation;
-        const a = generation.arena.allocator();
+        try self.markSeen(display);
         const previous = if (self.previous) |old| old.find(display) else null;
         const preparation = if (previous != null and std.mem.eql(u8, &previous.?.revision, &revision)) previous.?.preparation else null;
         const charge = blob.budget.live + @sizeOf(Blob) + (if (preparation) |owner| owner.bytes() else @as(usize, 0));
@@ -691,7 +1049,9 @@ const Collector = struct {
             generation.budget.limit += charge;
             generation.blob_bytes -= charge;
         }
-        try generation.entries.append(a, .{ .blob = blob, .path = try a.dupe(u8, display), .bytes = blob.bytes, .revision = revision, .explicit_file = explicit_file, .witness_reused = witness_reused, .prepared = if (preparation) |owner| owner.value else null, .preparation = preparation });
+        const owned_path = try generation.budget.allocator().dupe(u8, display);
+        errdefer generation.budget.allocator().free(owned_path);
+        try generation.entries.append(generation.budget.allocator(), .{ .blob = blob, .path = owned_path, .bytes = blob.bytes, .revision = revision, .explicit_file = explicit_file, .witness_reused = witness_reused, .prepared = if (preparation) |owner| owner.value else null, .preparation = preparation });
         generation.source_bytes += blob.bytes.len;
         if (preparation) |owner| {
             owner.refs += 1;
@@ -901,4 +1261,58 @@ test "size-excluded inputs invalidate discovery when they become eligible" {
     defer next.deinit();
     try std.testing.expectEqual(@as(usize, 1), next.entries.items.len);
     try std.testing.expectEqualStrings("hit", next.entries.items[0].bytes);
+}
+
+test "membership updates retain canonical identities and visit only affected directories" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [128]u8 = undefined;
+    for (0..32) |i| {
+        const dir = try std.fmt.bufPrint(&buffer, "dir-{d}", .{i});
+        try tmp.dir.createDir(io, dir, .default_dir);
+        const name = try std.fmt.bufPrint(&buffer, "dir-{d}/original.txt", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "original\n" });
+    }
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var o: Options = .{ .no_ignore = true };
+    defer o.deinit(a);
+    try o.paths.append(a, path);
+    var watch = Watch.init();
+    defer watch.deinit();
+    var journal = @import("discovery_journal.zig").Journal.init(a, io);
+    defer journal.deinit();
+    var current = try Generation.captureJournal(a, io, &o, null, &watch, &journal);
+    defer current.deinit();
+    if (!journal.sources_covered or !journal.coverage) return error.SkipZigTest;
+    const initial_bytes = current.retainedBytes();
+    for (0..24) |iteration| {
+        const added = try std.fmt.bufPrint(&buffer, "dir-{d}/new.txt", .{iteration % 32});
+        try tmp.dir.writeFile(io, .{ .sub_path = added, .data = "new\n" });
+        if (iteration > 0) {
+            const removed = try std.fmt.bufPrint(&buffer, "dir-{d}/new.txt", .{(iteration - 1) % 32});
+            try tmp.dir.deleteFile(io, removed);
+        }
+        const next = try Generation.captureJournal(a, io, &o, current, &watch, &journal);
+        current.deinit();
+        current = next;
+        try std.testing.expect(current.discovery_reused);
+        try std.testing.expect(current.refresh_entries_visited <= 5);
+        try std.testing.expect(current.namespace_paths_checked < 24);
+        const rebuilt = try Generation.capture(a, io, &o, null);
+        defer rebuilt.deinit();
+        try std.testing.expectEqualSlices(u8, &rebuilt.revision, &current.revision);
+        var ordered = current.iterator();
+        var expected = rebuilt.iterator();
+        while (ordered.next()) |entry| {
+            const reference = expected.next().?;
+            try std.testing.expectEqualStrings(reference.path, entry.path);
+            try std.testing.expectEqualStrings(reference.bytes, entry.bytes);
+        }
+        try std.testing.expect(expected.next() == null);
+    }
+    // Repeated updates retire paths/tree nodes and reuse bounded dense capacity.
+    try std.testing.expect(current.retainedBytes() < initial_bytes + 96 * 1024);
 }

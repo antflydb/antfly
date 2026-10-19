@@ -29,6 +29,7 @@ pub const Summary = struct {
     index_requests: usize = 0,
     incremental_cache_hits: usize = 0,
     incremental_files_evaluated: usize = 0,
+    incremental_results_materialized: usize = 0,
     query_cache_hits: usize = 0,
     file_evaluation_cache_hits: usize = 0,
     source_cache_hits: usize = 0,
@@ -67,6 +68,7 @@ const EvidenceView = struct {
 };
 const RenderRow = struct { raw: []const u8, length: usize, line: usize, offset: usize, matched: bool, probability: f64, independent: bool, gap: bool };
 const Candidate = struct {
+    materialized: bool = true,
     a: Allocator,
     budget: @import("antfly_regex").Budget,
     arena: std.heap.ArenaAllocator,
@@ -92,6 +94,7 @@ const Candidate = struct {
     }
 };
 const SavedCandidate = struct {
+    materialized: bool = true,
     payload: ?*CachedPayload = null,
     path: []const u8,
     score: f64,
@@ -144,6 +147,7 @@ const CachedPayload = struct {
     }
 };
 const SavedQuery = struct {
+    complete_payloads: bool = true,
     summary: Summary,
     considered: usize,
     items: []const *const SavedCandidate,
@@ -158,6 +162,7 @@ const SavedQuery = struct {
         var logical: usize = result.items.len * @sizeOf(*const SavedCandidate) + result.by_path.capacity() * (@sizeOf([]const u8) + @sizeOf(*const SavedCandidate) + 1);
         errdefer for (result.items[0..done]) |item| item.payload.?.release();
         for (value.items, items) |item, *dest| {
+            result.complete_payloads = result.complete_payloads and item.materialized;
             const payload = if (item.payload) |existing| blk: {
                 _ = existing.refs.fetchAdd(1, .monotonic);
                 break :blk existing;
@@ -396,6 +401,7 @@ pub const Search = struct {
         search.summary.file_evaluation_cache_hits = 0;
         search.summary.incremental_cache_hits = 0;
         search.summary.incremental_files_evaluated = 0;
+        search.summary.incremental_results_materialized = 0;
         search.summary.source_parses = 0;
         search.summary.source_cache_hits = 0;
         if (!search.limits.cancel.load(.acquire)) try search.protocolJson(.{ .type = "workspace_unchanged", .result_token = expected, .revision = generation.revision, .observed_at = generation.captured_at }, false);
@@ -489,13 +495,16 @@ pub const Search = struct {
             !self.options.files and !self.options.files_with_matches and !self.options.files_without_match and
             !self.options.inventory and !self.options.multiline);
         const query_key = self.queryReuseKey();
-        if (self.incremental == null or (self.incremental.?.revision != null and std.mem.eql(u8, &self.incremental.?.revision.?, &self.workspace_generation.?.revision))) if (query_key) |key| if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| {
+        if (self.incremental == null or (self.incremental.?.revision != null and std.mem.eql(u8, &self.incremental.?.revision.?, &self.workspace_generation.?.revision))) if (query_key) |key| if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| cached: {
             defer pinned.release();
+            const cached_token = std.fmt.bytesToHex(pinned.token, .lower);
+            if (!pinned.value.complete_payloads and (self.if_result_token == null or !std.mem.eql(u8, self.if_result_token.?, &cached_token))) break :cached;
             self.summary = pinned.value.summary;
             self.summary.query_cache_hits = 1;
             self.summary.file_evaluation_cache_hits = 0;
             self.summary.incremental_cache_hits = 0;
             self.summary.incremental_files_evaluated = 0;
+            self.summary.incremental_results_materialized = 0;
             self.summary.source_parses = 0;
             self.summary.source_cache_hits = 0;
             self.decider.evidence_times.merge(pinned.times);
@@ -570,7 +579,8 @@ pub const Search = struct {
         };
 
         if (self.workspace_generation) |generation| {
-            for (generation.entries.items) |*entry| {
+            var entries = generation.iterator();
+            while (entries.next()) |entry| {
                 if (self.stopped()) break;
                 self.workspace_entry = entry;
                 self.explicit_file = entry.explicit_file;
@@ -2405,6 +2415,7 @@ pub const Search = struct {
         const delta = try self.beginDelta(items);
         for (items) |c| {
             if (delta and !self.deltaChanged(c.path)) continue;
+            if (comptime cached) if (!c.materialized) return error.IncompleteCachedPayload;
             if (self.limits.cancel.load(.acquire)) return;
             try self.rankedBoundary(c.filename);
             const render_started = std.Io.Clock.awake.now(self.io);
@@ -2803,7 +2814,9 @@ pub const Search = struct {
             var borrowed: ?*const SavedCandidate = null;
             if (self.prior_delivery) |base| if (base.by_path.get(record.path)) |tag| {
                 if (std.mem.eql(u8, &tag, &record.tag)) if (previous) |lease| {
-                    borrowed = lease.value.by_path.get(record.path);
+                    if (lease.value.by_path.get(record.path)) |candidate| if (candidate.materialized) {
+                        borrowed = candidate;
+                    };
                 };
             };
             if (borrowed) |candidate| {
@@ -2811,9 +2824,22 @@ pub const Search = struct {
                 count += 1;
                 continue;
             }
+            // A delivery lease proves which immutable file outcomes the client
+            // already owns, independently of the optional excerpt cache. Keep
+            // only a descriptor for unchanged delta members after eviction.
+            if (self.delta_base != null and index.valid(self.options.cache_ttl_seconds) and
+                std.mem.eql(u8, &index.revision.?, &generation.revision) and !self.deltaChanged(record.path))
+            {
+                const saved = try fresh.allocator().create(SavedCandidate);
+                saved.* = .{ .materialized = false, .path = record.path, .score = record.score, .ordinal = count, .provenance = .{}, .rows = &.{}, .view = null, .before = .{}, .summary = record.summary, .filename = true, .color = false };
+                try items.append(self.a, saved);
+                count += 1;
+                continue;
+            }
             var arena = std.heap.ArenaAllocator.init(self.a);
             defer arena.deinit();
             const a = arena.allocator();
+            self.summary.incremental_results_materialized += 1;
             const prepared = entry.prepared.?;
             const selected = try a.alloc(bool, prepared.lines.len);
             const probabilities = try a.alloc(f64, selected.len);
@@ -3950,6 +3976,69 @@ test "cancelled cached empty results are incomplete and do not acknowledge token
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "result_token") == null);
 }
 const ReuseForTest = WorkspaceReuse;
+
+test "delta descriptors survive excerpt eviction and full replay reconstructs missing payloads" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "STOP\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "STOP\n" });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var o: Options = .{ .ask = "q", .cache_dir = "unused", .cached_only = true, .max_result_files = 2, .json = true, .json_compact = true, .suppress_progress = true, .no_ignore = true };
+    defer o.deinit(a);
+    try o.paths.append(a, path);
+    const generation = try @import("workspace_store.zig").Generation.capture(a, io, &o, null);
+    defer generation.deinit();
+    var index = Search.IncrementalIndex.init(a, io);
+    defer index.deinit();
+    var times: @import("reuse_cache.zig").Times = .{};
+    times.add(std.Io.Clock.real.now(io).toSeconds());
+    var members: [2]@import("incremental.zig").Member = undefined;
+    var by_path: std.StringHashMapUnmanaged([32]u8) = .empty;
+    defer by_path.deinit(a);
+    for (generation.entries.items, &members) |*entry, *member| {
+        try std.testing.expect(generation.prepareEntry(io, entry));
+        var runs = [_]EvaluationRun{.{ .end = entry.prepared.?.lines.len, .probability = 1, .line_score = 1, .selected = true }};
+        index.commit(index.capture(entry.path, entry.revision, .{ .line_count = entry.prepared.?.lines.len, .runs = &runs, .dense = null, .regions = &.{}, .file_score = 1, .best = 1, .considered = 1, .evaluated = 1, .preview_rejected = false }, times), .{ .files = 1, .files_with_matches = 1, .matches = 1 }, 1);
+        member.* = .{ .path = entry.path, .tag = index.files.get(entry.path).?.tag };
+        try by_path.put(a, member.path, member.tag);
+    }
+    index.revision = generation.revision;
+    var delivery: Search.Delivery = .{ .token = @splat('a'), .revision = generation.revision, .members = &members, .by_path = by_path };
+    var reuse = ReuseForTest.init(a, io);
+    defer reuse.deinit();
+    var token: ?[64]u8 = null;
+    for (0..3) |step| {
+        var search = try Search.init(a, io, &o);
+        defer search.deinit();
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        search.sink = &output.writer;
+        search.workspace_generation = generation;
+        search.reuse = &reuse;
+        search.reuse_identity = @splat(1);
+        search.incremental = &index;
+        search.prior_delivery = &delivery;
+        if (step == 0) search.delta_base = &delivery;
+        if (step == 1) search.if_result_token = &token.?;
+        try std.testing.expectEqual(@as(u8, 0), try search.run());
+        if (step == 0) {
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "workspace_delta") != null);
+            try std.testing.expectEqual(@as(usize, 0), search.summary.incremental_results_materialized);
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"type\":\"match\"") == null);
+            token = search.last_result_token.?;
+        } else if (step == 1) {
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "workspace_unchanged") != null);
+            try std.testing.expectEqual(@as(usize, 1), search.summary.query_cache_hits);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), search.summary.query_cache_hits);
+            try std.testing.expectEqual(@as(usize, 2), search.summary.incremental_results_materialized);
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"type\":\"match\"") != null);
+        }
+    }
+}
 
 test "query revisions share immutable payloads and retain physical charges through leases" {
     const a = std.testing.allocator;

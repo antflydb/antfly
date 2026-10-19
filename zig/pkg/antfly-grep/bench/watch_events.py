@@ -35,7 +35,13 @@ def main():
     parser.add_argument("current", type=Path)
     parser.add_argument("baseline", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--files", type=int, nargs="+", default=[64, 512])
+    parser.add_argument("--directories", type=int, default=1)
+    parser.add_argument("--iterations", type=int, default=11)
+    parser.add_argument("--workspace-memory-limit", default="1G")
     args = parser.parse_args()
+    if min(*args.files, args.directories, args.iterations) < 1:
+        parser.error("sizes and iterations must be positive")
     bins = {"current": args.current.resolve(), "baseline": args.baseline.resolve()}
     report = {
         "host": platform.platform(),
@@ -48,12 +54,21 @@ def main():
         },
         "cases": [],
     }
-    for count in [64, 512]:
+    for count in args.files:
         with tempfile.TemporaryDirectory(prefix="grep-watch-pair-") as tmp:
             root = Path(tmp)
             (root / "src").mkdir()
+            paths = []
             for i in range(count):
-                (root / "src" / f"f{i:04}.txt").write_text("STOP original\n")
+                parent = (
+                    root / "src"
+                    if args.directories == 1
+                    else root / "src" / f"d{i % args.directories:04}"
+                )
+                parent.mkdir(exist_ok=True)
+                path = parent / f"f{i:04}.txt"
+                path.write_text("STOP original\n")
+                paths.append(path)
             env = {
                 k: v
                 for k, v in os.environ.items()
@@ -62,23 +77,32 @@ def main():
             env.update(HOME=tmp, XDG_CONFIG_HOME=tmp)
             clients = {
                 k: Client(
-                    v, root, "src", ["STOP"], env, start_args=["--workspace-watch"]
+                    v,
+                    root,
+                    "src",
+                    ["STOP"],
+                    env,
+                    start_args=[
+                        "--workspace-watch",
+                        "--workspace-max-files=200000",
+                        f"--workspace-memory-limit={args.workspace_memory_limit}",
+                    ],
                 )
                 for k, v in bins.items()
             }
             try:
                 for mode in ["unchanged", "inplace", "atomic", "add_delete"]:
                     trials = []
-                    for n in range(11):
-                        path = root / "src" / f"f{count - 1:04}.txt"
+                    for n in range(args.iterations):
+                        path = paths[-1]
                         if mode == "inplace":
                             path.write_text(f"STOP inplace {n}\n")
                         elif mode == "atomic":
-                            replacement = root / "src" / ".save-temp"
+                            replacement = path.parent / ".save-temp"
                             replacement.write_text(f"STOP atomic {n}\n")
                             os.replace(replacement, path)
                         elif mode == "add_delete":
-                            path = root / "src" / "new.txt"
+                            path = path.parent / "new.txt"
                             if n % 2 == 0:
                                 path.write_text(f"STOP addition {n}\n")
                             elif path.exists():
@@ -101,6 +125,7 @@ def main():
                     report["cases"].append(
                         {
                             "files": count,
+                            "directories": args.directories,
                             "mode": mode,
                             "trials": trials,
                             "median": {
@@ -118,6 +143,12 @@ def main():
                                         t[k]["ready"]["refresh_entries_visited"]
                                         for t in trials
                                     ),
+                                    "namespace_paths_checked": statistics.median(
+                                        t[k]["ready"].get("namespace_paths_checked", 0)
+                                        for t in trials
+                                    )
+                                    if k == "current"
+                                    else None,
                                     "source_bytes_read": statistics.median(
                                         t[k]["ready"]["source_bytes_read"]
                                         for t in trials

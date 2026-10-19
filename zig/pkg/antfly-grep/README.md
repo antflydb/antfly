@@ -2326,15 +2326,16 @@ refreshes and remain owned independently of the generation that first built them
 
 Opt-in certified refresh routes dirty watch slots to source entries (including
 hard-link aliases) and stages only those files. With an exclusively owned generation,
-publication replaces staged blobs and updates a binary Merkle tree in O(D log N)
+publication replaces staged blobs and updates a canonical path-keyed Merkle tree in O(D log N)
 work, without rebuilding/sorting the full inventory. No fallible operation follows
 publication. Retained readers, uncertain witnesses, new events during capture,
-membership/configuration changes or insufficient admission use ordinary capture.
-Opaque workspace revisions now use the canonical version-2 Merkle root; forced
+configuration/topology changes or insufficient admission use ordinary capture.
+Opaque workspace revisions now use the canonical version-3 inventory root; forced
 rescans and incremental refresh produce identical revisions for identical captures.
 The protocol version remains 1. `refresh_entries_visited` distinguishes inventory
 work from source opens; cached retained-byte totals keep unchanged ready responses
-independent of corpus size. Membership-changing capture still performs discovery.
+independent of corpus size. Certified file-membership updates use affected-directory
+reconciliation; uncertain membership still performs ordinary discovery.
 
 Complete-result entries now share immutable file payloads. Metadata and all shared
 payload allocations, construction, growth and evicted active leases participate in
@@ -2414,8 +2415,9 @@ uses validated sequence numbers, preserving events arriving after validation.
 Healthy directory-event subscriptions survive rediscovery; namespace/configuration
 certificates are rebuilt, and events racing that rebuild remain pending. Directory
 loss, overflow, alias uncertainty and admission failure use conservative
-discovery and reads. File additions/deletions still rebuild the flat inventory
-and canonical Merkle metadata; they are not logarithmic membership updates.
+discovery and reads. The original follow-up rebuilt inventory metadata on additions/deletions;
+the subsequent membership implementation below removes that rebuild when
+source and directory coverage remain complete.
 
 Linux uses synchronous named inotify directory events beyond the individual-file
 watch budget. macOS uses bounded strict kqueue inode and directory witnesses without
@@ -2471,3 +2473,52 @@ Evidence: [refresh controls](bench/results/directory-events-macos.json),
 [differential replay](bench/results/directory-differential.json),
 [validation/source identities](bench/results/directory-validation.json), and
 [release archives](bench/results/directory-archives.json).
+
+### Incremental membership and payload-free delta reuse
+
+Workspace inventory uses a canonical, path-keyed Cartesian Merkle tree whose
+priorities derive from SHA-256 of paths. Cold sorted discovery builds it in linear
+time; updates copy only affected tree paths and share the other nodes. Dense entry
+slots and intrusive directory/watch lists permit constant-time removal/relocation;
+slot positions do not affect revision identities. Opaque revisions use a new v3
+hash domain. Old process-local tokens are not portable across processes/builds;
+the stdio protocol version remains 1. Forced rebuilds use the same v3 identity.
+Tree depth is capped at 128, allocations participate in the workspace budget,
+and failed staging preserves published contents. Entry paths and retired tree
+nodes are reclaimed rather than accumulating across membership changes.
+
+Certified file additions, deletions and renames stage a complete transaction before
+publication, including simultaneous edits elsewhere. Directory topology, ignore or
+configuration changes, lost events, incomplete source coverage, retained readers,
+and failed admission retain conservative discovery. New size-excluded inputs
+receive eligibility witnesses before their exclusion is accepted. Policy reloads
+preserve the original root, ancestor-ignore controls, depth and filesystem rules.
+Linux uses complete named inotify events to reconcile changed paths without
+walking the directory's other files. macOS kqueue has no child names, so it checks
+the affected directory's membership; it does not rebuild the repository inventory.
+Unwitnessed macOS source contents still require conservative reads. Namespace
+invalidations route to affected paths and dependencies, including descendants of
+invalidated ancestors; an ancestor replacement cannot hide pathname changes.
+
+Delta delivery checks result tags before allocating line masks, score arrays or
+excerpts. If the prior excerpt cache was evicted, unchanged members retain small
+metadata-only descriptors. Such entries can acknowledge matching conditional
+tokens but cannot satisfy full-payload replay; full delivery reconstructs missing
+payloads from immutable sources/evidence. Partial searches never gain complete
+result status through this mechanism. All payloads, descriptors and active leases
+remain under the existing physical query-cache cap.
+
+`namespace_paths_checked` and `namespace_directories_scanned` report refresh
+validation work. `incremental_results_materialized` counts file payloads rebuilt
+by incremental search. Idle service blocks on stdin; valid conditional queries
+avoid scanning, parsing, inference and payload delivery. Freshness checks and
+changed content still require resources. Ordinary one-shot search remains
+independent of workspace inventories and event subscriptions.
+
+Possible future work: benchmark broader directory churn and consider extending
+incremental discovery to directory topology and ignore-policy changes only if
+measurements justify that complexity. Include 1K/10K/100K-file cases, rename bursts,
+retained memory, first-result latency and forced-rebuild equivalence. macOS cannot
+infer child names from kqueue notifications, and kernel-invisible writers still
+require forced capture. The earlier warm shared-host reports above describe their
+original binaries, not performance guarantees for later revisions.

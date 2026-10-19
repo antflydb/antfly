@@ -19,6 +19,7 @@ const std = @import("std");
 pub const Stamp = struct {
     count: usize = 0,
     digest: [32]u8 = @splat(0),
+    topology: [32]u8 = @splat(0),
     inode: std.Io.File.INode = 0,
     permissions: std.Io.File.Permissions = @fromBackingInt(@intCast(0)),
     pub fn same(self: Stamp, other: Stamp) bool {
@@ -34,6 +35,8 @@ pub const Stamp = struct {
         // makes this optional proof unavailable, never a clean certificate.
         var budget: @import("antfly_regex").Budget = .{ .backing = std.heap.page_allocator, .limit = 2 * 1024 * 1024 };
         var members: std.ArrayList([32]u8) = .empty;
+        var topology: std.ArrayList([32]u8) = .empty;
+        defer topology.deinit(budget.allocator());
         defer members.deinit(budget.allocator());
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
@@ -44,6 +47,7 @@ pub const Stamp = struct {
             var leaf: [32]u8 = undefined;
             hash.final(&leaf);
             try members.append(budget.allocator(), leaf);
+            if (entry.kind == .directory or entry.kind == .sym_link or std.mem.eql(u8, entry.name, ".gitignore") or std.mem.eql(u8, entry.name, ".ignore") or std.mem.eql(u8, entry.name, ".rgignore") or std.mem.eql(u8, entry.name, ".git")) try topology.append(budget.allocator(), leaf);
         }
         const after = try dir.stat(io);
         if (before.inode != after.inode or before.permissions != after.permissions or before.mtime.nanoseconds != after.mtime.nanoseconds or before.ctime.nanoseconds != after.ctime.nanoseconds) return error.WorkspaceChangedDuringCapture;
@@ -52,6 +56,12 @@ pub const Stamp = struct {
                 return std.mem.order(u8, &a, &b) == .lt;
             }
         }.less);
+        std.mem.sort([32]u8, topology.items, {}, struct {
+            fn less(_: void, a: [32]u8, b: [32]u8) bool {
+                return std.mem.order(u8, &a, &b) == .lt;
+            }
+        }.less);
+        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(topology.items), &result.topology, .{});
         result.count = members.items.len;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly-directory-inventory-v2");

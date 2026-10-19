@@ -127,6 +127,7 @@ const Dispatcher = struct {
 const Override = struct { pattern: regex.PreparedPattern, basename: bool, include: bool, directory: bool = false, insensitive: bool = false };
 pub const Discovery = struct {
     journal: ?*@import("discovery_journal.zig").Journal = null,
+    shallow: bool = false,
     a: Allocator,
     io: std.Io,
     options: *const Options,
@@ -331,6 +332,31 @@ pub const Discovery = struct {
             try self.loadDirectory(ancestors.items[i]);
         }
     }
+    /// Reload the same root policy and only the rule chain leading to this
+    /// directory. Topology/configuration changes use full discovery instead.
+    pub fn prepareWithin(self: *Discovery, root: []const u8, directory: []const u8) !void {
+        try self.prepare(root);
+        if (std.mem.eql(u8, root, directory)) return;
+        if (!std.mem.startsWith(u8, directory, root) or directory.len <= root.len or (!std.mem.endsWith(u8, root, "/") and directory[root.len] != '/')) return error.OutsideDiscoveryRoot;
+        const relative = std.mem.trimStart(u8, directory[root.len..], "/");
+        self.depth = 1 + std.mem.count(u8, relative, "/");
+        if (self.options.no_ignore) return;
+        try self.loadDirectory(root);
+        var offset = root.len + @intFromBool(!std.mem.endsWith(u8, root, "/"));
+        while (std.mem.indexOfScalarPos(u8, directory, offset, '/')) |end| {
+            try self.loadDirectory(directory[0..end]);
+            offset = end + 1;
+        }
+    }
+    pub fn prepareDirectoryRules(self: *Discovery, directory: []const u8) !void {
+        if (!self.options.no_ignore) try self.loadDirectory(directory);
+    }
+    pub fn fileAllowed(self: *Discovery, path_name: []const u8, display: []const u8) !bool {
+        self.depth += 1;
+        defer self.depth -= 1;
+        if (self.options.one_file_system and (try @import("filesystem.zig").info(self.a, self.io, path_name)).device != self.root_device.?) return false;
+        return self.allowed(path_name, display, false);
+    }
     /// Directory parallelism is independent of file scanning. The queue is
     /// bounded; a producer traverses inline when it is full, so workers never
     /// deadlock waiting for space that only another producer could release.
@@ -464,6 +490,7 @@ pub const Discovery = struct {
                 continue;
             }
             if (is_dir) {
+                if (self.shallow) continue;
                 const queued = if (self.dispatcher) |dispatcher| dispatcher.submit(dispatcher.ptr, self, full, shown) catch |err| {
                     try context.reportError(shown, err);
                     continue;
