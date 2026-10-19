@@ -1148,6 +1148,15 @@ class RuntimeCacheTest(unittest.TestCase):
         )
         failure = self.build("cache-finetune-registry", succeeds=False)
         self.assertIn("received undeclared import undeclared-test-import", failure)
+        common.write_text(
+            contents.replace(
+                '            module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);',
+                "",
+                1,
+            )
+        )
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn("command lost its shared runtime ABI identity", failure)
 
     def test_finetune_shared_test_ownership(self):
         shutil.copyfile(
@@ -1210,6 +1219,53 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assertIn(
             "standalone gate must reach shared finetuning owner once", failure
         )
+
+    def test_finetune_isolated_test_ownership(self):
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/finetune_commands.zig",
+            self.root / "zig/build.zig",
+        )
+        tests = self.own("zig/pkg/inference/build/finetune/tests.zig")
+        contents = tests.read_text()
+        attachment = "aggregate.dependOn(isolated);"
+        self.assertIn(attachment, contents)
+        for replacement in (
+            "",
+            attachment + "\n            aggregate.dependOn(common.addTest(ctx, spec));",
+        ):
+            with self.subTest(root_attachment=replacement):
+                tests.write_text(contents.replace(attachment, replacement))
+                try:
+                    failure = self.build("cache-finetune-registry", succeeds=False)
+                    self.assertIn(
+                        "isolated finetune root must execute exactly once", failure
+                    )
+                finally:
+                    tests.write_text(contents)
+
+        self.use_standalone()
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/finetune_standalone.zig",
+            self.build_directory / "build.zig",
+        )
+        self.build("cache-finetune-standalone")
+        attachment = "unit_step.dependOn(isolated);"
+        self.assertIn(attachment, contents)
+        for replacement, expected in (
+            ("", "standalone gate must reach isolated finetuning owner once"),
+            (
+                attachment
+                + '\n            unit_step.dependOn(&ctx.b.addRunArtifact(isolated.dependencies.items[0].cast(@import("std").Build.Step.Run).?.argv.items[0].artifact.artifact).step);',
+                "standalone gate repeats a finetuning executable",
+            ),
+        ):
+            with self.subTest(standalone_attachment=replacement):
+                tests.write_text(contents.replace(attachment, replacement))
+                try:
+                    failure = self.build("cache-finetune-standalone", succeeds=False)
+                    self.assertIn(expected, failure)
+                finally:
+                    tests.write_text(contents)
 
     def test_vopr_workflow_memory_admission(self):
         shutil.copyfile(

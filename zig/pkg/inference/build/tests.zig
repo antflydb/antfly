@@ -99,6 +99,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("prometheus", ctx.graph.prometheus_mod);
     tests.root_module.addImport("structlog", ctx.graph.structlog_mod);
     tests.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
+    tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     tests.root_module.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
     tests.root_module.addImport("inference_internal", tests.root_module);
     if (ctx.graph.inference_client_mod) |mod| {
@@ -293,6 +294,7 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
         }),
         .filters = &.{"GLiNER25 fuzz"},
     });
+    tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     tests.root_module.addImport("build_options", ctx.graph.build_options_mod);
     tests.root_module.addImport("antfly_platform", platform);
     tests.root_module.addImport("antfly_image", ctx.graph.image_mod);

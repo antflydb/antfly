@@ -359,6 +359,8 @@ pub const EmbeddingPipeline = struct {
     /// parallel; only device/session execution is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
     execution_gate_held: bool = false,
+    execution_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
+    execution_lane_held: bool = false,
     trace: ?*embedding_trace.Trace = null,
     /// Request lifetime propagated from ingress through model execution.
     execution_control: ?InferenceExecutionControl = null,
@@ -406,6 +408,8 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of texts, returning [batch_size][hidden_dim] embeddings.
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         self.last_input_tokens = 0;
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null and texts.len != 0) {
             // Request arenas retain logical frees. Encoder temporaries need a
@@ -537,9 +541,7 @@ pub const EmbeddingPipeline = struct {
     /// One result per ordered content group; text parts concatenate without
     /// inserted spaces. Media soft tokens join the same bidirectional encoder.
     pub fn embedContent(self: *EmbeddingPipeline, inputs: []const EmbeddingContentInput) ![][]f32 {
-        self.last_input_tokens = 0;
         if (!self.config.resident_embedding_gemma2) return error.OrderedEmbeddingContentNotSupported;
-        if (inputs.len == 0) return self.allocator.alloc([]f32, 0);
         var text_only = true;
         for (inputs) |item| {
             if (item.content.len == 0) return error.EmptyEmbeddingInput;
@@ -550,6 +552,10 @@ pub const EmbeddingPipeline = struct {
                 text_only = false;
             };
         }
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
+        self.last_input_tokens = 0;
+        if (inputs.len == 0) return self.allocator.alloc([]f32, 0);
         if (text_only) {
             const texts = try self.allocator.alloc([]const u8, inputs.len);
             defer self.allocator.free(texts);
@@ -977,6 +983,15 @@ pub const EmbeddingPipeline = struct {
         const admitted_tokens = std.math.mul(usize, batch, effective_len) catch
             return error.ResourceLimitExceeded;
         if (self.execution_control) |control| try control.check();
+        // Workspace belongs to the running batch, not to waiters behind the
+        // serialized backend. Admission stays inside this execution gate.
+        const owns_gate = !self.execution_gate_held;
+        if (owns_gate) try self.lockExecution();
+        self.execution_gate_held = true;
+        defer if (owns_gate) {
+            self.execution_gate_held = false;
+            self.unlockExecution();
+        };
         var run_permit = try text_session.admit(.{
             .batch = batch,
             .sequence = effective_len,
@@ -1043,6 +1058,8 @@ pub const EmbeddingPipeline = struct {
         batch: usize,
         seq_len: usize,
     ) ![][]f32 {
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         if (batch == 0 or seq_len == 0) return error.InvalidInputShape;
         if (self.config.strict_max_length and seq_len > self.config.max_length)
             return error.EmbeddingSequenceTooLong;
@@ -1074,6 +1091,15 @@ pub const EmbeddingPipeline = struct {
             active_rows += @intFromBool(value != 0);
         }
         if (compact_policy and (active_rows == 0 or active_rows > 8192)) return error.EmbeddingInputTooLong;
+        // Workspace belongs to the running batch, not to waiters behind the
+        // serialized backend. Admission stays inside this execution gate.
+        const owns_gate = !self.execution_gate_held;
+        if (owns_gate) try self.lockExecution();
+        self.execution_gate_held = true;
+        defer if (owns_gate) {
+            self.execution_gate_held = false;
+            self.unlockExecution();
+        };
         var run_permit = try text_session.admit(.{
             .batch = if (compact_policy) 1 else batch,
             .sequence = if (compact_policy) active_rows else seq_len,
@@ -1419,6 +1445,9 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of images (raw JPEG/PNG bytes), returning [batch][projection_dim] embeddings.
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
+        if (images.len > 0 and !self.config.allow_image) return error.UnsupportedInput;
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         return (try self.embedImagesReported(images)).vectors;
     }
 
@@ -1429,6 +1458,8 @@ pub const EmbeddingPipeline = struct {
 
     pub fn embedImagesReported(self: *EmbeddingPipeline, images: []const []const u8) anyerror!ImageBatchResult {
         if (images.len > 0 and !self.config.allow_image) return error.UnsupportedInput;
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
             const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control, null);
             return .{ .vectors = result.vectors, .execution = result.execution };
@@ -1461,6 +1492,8 @@ pub const EmbeddingPipeline = struct {
     /// and never enters the encoder. Healthy rows retain their original order.
     pub fn embedImagesIndexed(self: *EmbeddingPipeline, images: []const []const u8, errors: []?anyerror) !ImageBatchResult {
         if (images.len > 0 and !self.config.allow_image) return error.UnsupportedInput;
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         if (errors.len != images.len) return error.InvalidInputShape;
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
             const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control, errors);
@@ -1691,10 +1724,14 @@ pub const EmbeddingPipeline = struct {
         self: *EmbeddingPipeline,
         rasters: []const antfly_image.BorrowedRasterAttachment,
     ) anyerror![][]f32 {
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         return (try self.embedBorrowedRastersReported(rasters)).vectors;
     }
 
     pub fn embedBorrowedRastersReported(self: *EmbeddingPipeline, rasters: []const antfly_image.BorrowedRasterAttachment) anyerror!ImageBatchResult {
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         if (rasters.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
             const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control);
@@ -1887,6 +1924,8 @@ pub const EmbeddingPipeline = struct {
     /// Requires an audio_session (CLAP model).
     pub fn embedAudio(self: *EmbeddingPipeline, audio_clips: []const []const u8) ![][]f32 {
         if (audio_clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
             const clips = try self.allocator.alloc(EncodedAudioClip, audio_clips.len);
             defer self.allocator.free(clips);
@@ -1914,6 +1953,8 @@ pub const EmbeddingPipeline = struct {
         audio_clips: []const EncodedAudioClip,
     ) ![][]f32 {
         if (audio_clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
             if (self.config.gemma4_audio_batching) {
                 const grouped = @import("embedding_gemma2.zig");
@@ -1980,6 +2021,8 @@ pub const EmbeddingPipeline = struct {
     /// next clip when it does not fit, without retrying a failed model forward.
     pub fn embedEncodedAudioIndexed(self: *EmbeddingPipeline, clips: []const EncodedAudioClip, errors: []?anyerror) !ImageBatchResult {
         if (clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         if (errors.len != clips.len) return error.InvalidInputShape;
         if (self.config.resident_embedding_gemma2) {
             const parts = try self.allocator.alloc(EmbeddingContentPart, clips.len);
@@ -2229,6 +2272,8 @@ pub const EmbeddingPipeline = struct {
         audio_clips: []const audio.PcmAudioInterleaved,
     ) ![][]f32 {
         if (audio_clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) return self.embedGemma2Pcm(audio_clips);
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
 
@@ -2278,11 +2323,16 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of PCM audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
     pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
+        if (audio_clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         return (try self.embedAudioPcmReported(audio_clips)).vectors;
     }
 
     pub fn embedAudioPcmReported(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror!ImageBatchResult {
         if (audio_clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) return self.embedGemma2PcmReported(audio_clips);
         if (audio_clips.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         const prepared_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
@@ -2373,6 +2423,21 @@ pub const EmbeddingPipeline = struct {
             initialized += 1;
         }
         return .{ .vectors = output, .execution = .serial };
+    }
+
+    fn enterExecutionLane(self: *EmbeddingPipeline) !?@import("../execution_control.zig").ExecutionLane.Lease {
+        if (self.execution_lane_held) return null;
+        const lane = self.execution_lane orelse return null;
+        const lease = try lane.acquire(self.execution_control orelse .{});
+        self.execution_lane_held = true;
+        return lease;
+    }
+
+    fn leaveExecutionLane(self: *EmbeddingPipeline, lease: ?@import("../execution_control.zig").ExecutionLane.Lease) void {
+        if (lease) |owned| {
+            self.execution_lane_held = false;
+            owned.release();
+        }
     }
 
     fn lockExecution(self: *EmbeddingPipeline) !void {
@@ -4511,11 +4576,29 @@ test "audio microbatch isolates corrupt clips and bounds decoded windows" {
 }
 
 test "text-only embedding capability rejects media before decoder or backend access" {
-    var pipeline: EmbeddingPipeline = undefined;
-    pipeline.allocator = std.testing.allocator;
-    pipeline.config = .{ .allow_image = false, .allow_audio = false, .resident_embedding_gemma2 = true };
+    const AdmissionProbe = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return error.Cancelled;
+        }
+    };
+    var admission: AdmissionProbe = .{};
+    var lane: @import("../execution_control.zig").ExecutionLane = .{};
+    var pipeline: EmbeddingPipeline = .{
+        .allocator = std.testing.allocator,
+        // Unsupported media must not inspect either backend or tokenizer.
+        .session = undefined,
+        .tok = undefined,
+        .config = .{ .allow_image = false, .allow_audio = false, .resident_embedding_gemma2 = true },
+        .execution_lane = &lane,
+        .execution_control = .{ .ptr = &admission, .check_fn = AdmissionProbe.check },
+        .last_input_tokens = 7,
+    };
     const malformed = [_][]const u8{"this must never reach a decoder"};
     var errors = [_]?anyerror{null};
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedImages(&malformed));
     try std.testing.expectError(error.UnsupportedInput, pipeline.embedImagesReported(&malformed));
     try std.testing.expectError(error.UnsupportedInput, pipeline.embedImagesIndexed(&malformed, &errors));
     try std.testing.expectError(error.UnsupportedInput, pipeline.embedAudio(&malformed));
@@ -4523,6 +4606,20 @@ test "text-only embedding capability rejects media before decoder or backend acc
     try std.testing.expectError(error.UnsupportedInput, pipeline.embedEncodedAudioIndexed(&.{.{ .bytes = malformed[0] }}, &errors));
     try std.testing.expectError(error.UnsupportedInput, pipeline.embedContent(&.{.{ .content = &.{.{ .image = malformed[0] }} }}));
     try std.testing.expectError(error.UnsupportedInput, pipeline.embedContent(&.{.{ .content = &.{.{ .audio = .{ .bytes = malformed[0] } }} }}));
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedAudioPcm(&.{.{ .samples = &.{0}, .sample_rate = 16000 }}));
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedAudioPcmReported(&.{.{ .samples = &.{0}, .sample_rate = 16000 }}));
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedAudioInterleavedPcm(&.{.{ .samples = &.{0}, .sample_rate = 16000, .channels = 1 }}));
+    try std.testing.expectEqual(@as(usize, 0), admission.calls);
+    try std.testing.expectEqual(@as(usize, 7), pipeline.last_input_tokens);
+    try std.testing.expect(!lane.owned);
+    // A supported request must still honor cancellation at admission.
+    pipeline.config.allow_image = true;
+    try std.testing.expectError(error.Cancelled, pipeline.embedImagesReported(&malformed));
+    try std.testing.expectEqual(@as(usize, 1), admission.calls);
+    try std.testing.expectError(error.Cancelled, pipeline.embedContent(&.{.{ .content = &.{.{ .text = "supported" }} }}));
+    try std.testing.expectEqual(@as(usize, 2), admission.calls);
+    try std.testing.expectEqual(@as(usize, 7), pipeline.last_input_tokens);
+    try std.testing.expect(!lane.owned);
 }
 
 test "selectProjectedOutput skips collapsed pooled output for image batch" {
@@ -4782,4 +4879,33 @@ test "CLAP prepared accelerator waves preserve indexed errors and collapsed-batc
     try std.testing.expect(fake.collapsed_batch_attempts > 1);
     // Two attempted batch forwards plus nine valid singleton fallbacks.
     try std.testing.expectEqual(@as(usize, 11), fake.run_count);
+}
+
+test "embedding workspace admission happens only after execution ownership" {
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        called: bool = false,
+        gate_owned: bool = false,
+        fn reserve(raw: *anyopaque, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+            self.gate_owned = !self.gate.tryLock();
+            if (!self.gate_owned) self.gate.unlock();
+            return error.ResourceTemporarilyUnavailable;
+        }
+        fn retain(_: *anyopaque, _: usize, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+    };
+    var gate: std.atomic.Mutex = .unlocked;
+    var probe = Probe{ .gate = &gate };
+    var controller = memory_admission.AdmissionController{};
+    try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    defer controller.configureResourceBudget(null) catch unreachable;
+    var session = fakeTextSession(.wasm, &.{ -1, -1 });
+    session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    var pipeline = EmbeddingPipeline{ .allocator = std.testing.allocator, .session = session, .tok = undefined, .config = .{}, .execution_lock = &gate };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pipeline.embedTokenized(&.{ 1, 2 }, &.{ 1, 1 }, 1, 2));
+    try std.testing.expect(probe.called and probe.gate_owned);
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
 }

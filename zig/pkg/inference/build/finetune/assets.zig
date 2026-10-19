@@ -27,6 +27,7 @@ pub fn create(options: struct {
     onnx_data: *std.Build.Module,
     jinja: *std.Build.Module,
     platform: *std.Build.Module,
+    runtime_abi: *std.Build.Module,
 }) *std.Build.Module {
     const b = options.b;
     const module = b.createModule(.{
@@ -48,5 +49,6 @@ pub fn create(options: struct {
         },
     }
     module.addImport("antfly_platform", options.platform);
+    module.addImport("antfly_runtime_abi", options.runtime_abi);
     return module;
 }

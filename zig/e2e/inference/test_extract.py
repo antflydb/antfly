@@ -136,6 +136,7 @@ def test_extract_from_images_via_reader(api):
         images=[test_image],
         schema={"person": ["name::str", "company::str"]},
         model=GLINER_MODEL,
+        max_tokens=64,
     )
     results = resp["data"]
     assert len(results) == 1

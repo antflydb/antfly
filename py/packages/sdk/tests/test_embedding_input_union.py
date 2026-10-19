@@ -2,14 +2,13 @@ import pytest
 
 from antfly.client_generated.api.default.create_embedding import _get_kwargs
 from antfly.client_generated.models import (
-    InferenceEmbedRequest,
     InferenceEmbeddingContentInput,
+    InferenceEmbedRequest,
     MediaContentPart,
     MediaContentPartType,
     TextContentPart,
     TextContentPartType,
 )
-
 
 TEXT = TextContentPart(type_=TextContentPartType.TEXT, text="ants")
 AUDIO = MediaContentPart(type_=MediaContentPartType.MEDIA, data="AA==", mime_type="audio/wav")

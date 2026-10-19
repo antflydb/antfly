@@ -13091,6 +13091,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn integerBinary(self: *MetalCompute, a: CT, b: CT, kind: u32) !CT {
+        // Imported attention masks mix boolean controls, integer sentinels,
+        // and floating-point activations. Normalize their physical types
+        // before selecting an integer or floating-point arithmetic kernel.
+        if (kind != 3) {
+            const cb = self.computeBackend();
+            const a_type = try cb.tensorDType(a);
+            const b_type = try cb.tensorDType(b);
+            if (!toBuf(a).integer_storage or !toBuf(b).integer_storage) {
+                const typed = if (toBuf(a).integer_storage) a else b;
+                const converted = (try cb.tryConvertDType(typed, .f32)) orelse return error.UnsupportedTensorType;
+                defer cb.free(converted);
+                const lhs = if (toBuf(a).integer_storage) converted else a;
+                const rhs = if (toBuf(b).integer_storage) converted else b;
+                return switch (kind) {
+                    0 => cb.add(lhs, rhs),
+                    1 => cb.primSubtract(lhs, rhs),
+                    2 => cb.multiply(lhs, rhs),
+                    else => error.UnsupportedTensorType,
+                };
+            }
+            if (a_type != b_type and (a_type == .bool_ or b_type == .bool_)) {
+                const target = if (a_type == .bool_) b_type else a_type;
+                const dtype = std.meta.stringToEnum(ops.GraphDType, @tagName(target)) orelse return error.UnsupportedTensorType;
+                const converted = (try cb.tryConvertDType(if (a_type == .bool_) a else b, dtype)) orelse return error.UnsupportedTensorType;
+                defer cb.free(converted);
+                return self.integerBinary(if (a_type == .bool_) converted else a, if (b_type == .bool_) converted else b, kind);
+            }
+        }
         var lhs = if (toBuf(a).integer_storage) try toBuf(a).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(a);
         defer lhs.deinit();
         var rhs = if (toBuf(b).integer_storage) try toBuf(b).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(b);
@@ -13104,8 +13132,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const range: ?@TypeOf(left) = checked: {
                     const minimum: i64, const maximum: i64 = switch (kind) {
                         0 => .{ std.math.add(i64, left.minimum, right.minimum) catch break :checked null, std.math.add(i64, left.maximum, right.maximum) catch break :checked null },
-                        2 => .{ std.math.sub(i64, left.minimum, right.maximum) catch break :checked null, std.math.sub(i64, left.maximum, right.minimum) catch break :checked null },
-                        1 => products: {
+                        1 => .{ std.math.sub(i64, left.minimum, right.maximum) catch break :checked null, std.math.sub(i64, left.maximum, right.minimum) catch break :checked null },
+                        2 => products: {
                             const products = [_]i64{
                                 std.math.mul(i64, left.minimum, right.minimum) catch break :checked null,
                                 std.math.mul(i64, left.minimum, right.maximum) catch break :checked null,
@@ -14412,7 +14440,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn concatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return error.UnsupportedResidentTrainingPrimitive;
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return self.integerConcatPrim(a, b, axis);
         if (getenvBool("TERMITE_METAL_TRACE_CONCAT_PRIM")) {
             const a_buf = toBuf(a);
             const b_buf = toBuf(b);
@@ -14445,6 +14473,55 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (getenvBool("TERMITE_METAL_TRACE_CONCAT_PRIM")) std.debug.print("metal_concat_prim: path=host_fallback\n", .{});
         return self.hostFallbackConcatPrim(a, b, axis, a_shape, b_shape);
+    }
+
+    /// ONNX GatherND builds coordinate tuples by concatenating i64 tensors.
+    /// Copy their bytes exactly rather than rejecting them or widening via f32.
+    fn integerConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8) !CT {
+        const cb = self.computeBackend();
+        // Legacy ArgMax produces floating-point indices even when the ONNX
+        // value is i64. Restore the peer's integer type before joining tuples.
+        if (toBuf(a).integer_storage != toBuf(b).integer_storage) {
+            const typed = if (toBuf(a).integer_storage) a else b;
+            const untyped = if (toBuf(a).integer_storage) b else a;
+            const dtype = std.meta.stringToEnum(ops.GraphDType, @tagName(try cb.tensorDType(typed))) orelse return error.UnsupportedTensorType;
+            const converted = (try cb.tryConvertDType(untyped, dtype)) orelse return error.UnsupportedTensorType;
+            defer cb.free(converted);
+            return self.integerConcatPrim(if (toBuf(a).integer_storage) a else converted, if (toBuf(b).integer_storage) b else converted, axis);
+        }
+        const a_dims = try cb.tensorShape(a, self.allocator);
+        defer self.allocator.free(a_dims);
+        const b_dims = try cb.tensorShape(b, self.allocator);
+        defer self.allocator.free(b_dims);
+        if (a_dims.len != b_dims.len or axis >= a_dims.len or a_dims.len > metal_tensor_mod.max_dims) return error.InvalidTensorShape;
+        var shape: [metal_tensor_mod.max_dims]i64 = undefined;
+        var outer: usize = 1;
+        var inner: usize = 1;
+        for (a_dims, b_dims, 0..) |ad, bd, d| {
+            if (ad < 0 or bd < 0) return error.InvalidTensorShape;
+            if (d != axis and ad != bd) return error.ShapeMismatch;
+            shape[d] = if (d == axis) try std.math.add(i64, ad, bd) else ad;
+            if (d < axis) outer = try std.math.mul(usize, outer, @intCast(ad));
+            if (d > axis) inner = try std.math.mul(usize, inner, @intCast(ad));
+        }
+        const lhs = (try cb.exportTensorData(a, self.allocator)) orelse return error.UnsupportedTensorType;
+        defer self.allocator.free(lhs.payload.bytes);
+        const rhs = (try cb.exportTensorData(b, self.allocator)) orelse return error.UnsupportedTensorType;
+        defer self.allocator.free(rhs.payload.bytes);
+        if (lhs.dtype != rhs.dtype) return error.UnsupportedTensorType;
+        const width = lhs.dtype.byteSize();
+        const a_chunk = try std.math.mul(usize, try std.math.mul(usize, @intCast(a_dims[axis]), inner), width);
+        const b_chunk = try std.math.mul(usize, try std.math.mul(usize, @intCast(b_dims[axis]), inner), width);
+        if (lhs.payload.bytes.len != try std.math.mul(usize, outer, a_chunk) or rhs.payload.bytes.len != try std.math.mul(usize, outer, b_chunk)) return error.ShapeMismatch;
+        const chunk = try std.math.add(usize, a_chunk, b_chunk);
+        const output = try self.allocator.alloc(u8, try std.math.mul(usize, outer, chunk));
+        defer self.allocator.free(output);
+        for (0..outer) |i| {
+            @memcpy(output[i * chunk ..][0..a_chunk], lhs.payload.bytes[i * a_chunk ..][0..a_chunk]);
+            @memcpy(output[i * chunk + a_chunk ..][0..b_chunk], rhs.payload.bytes[i * b_chunk ..][0..b_chunk]);
+        }
+        const dtype = std.meta.stringToEnum(ops.GraphDType, @tagName(lhs.dtype)) orelse return error.UnsupportedTensorType;
+        return (try cb.fromConstantBytes(output, dtype, shape[0..a_dims.len])) orelse error.UnsupportedTensorType;
     }
 
     fn quantizedConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !?CT {
@@ -26920,6 +26997,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const a_buf = toBuf(a);
         const b_buf = toBuf(b);
         if (bufHasAnyQuantizedStorage(a_buf) or bufHasAnyQuantizedStorage(b_buf)) return error.UnsupportedTensorType;
+        // Chained attention masks can consume a deferred product. Materialize
+        // a separate handle so other consumers retain the original lazy pair.
+        if (a_buf.lazy_multiply != null or b_buf.lazy_multiply != null) {
+            const materialized_a = if (a_buf.lazy_multiply != null) try self.ctFromOwnedMetalTensor(try self.ownedDeviceMetalTensorFromCt(a)) else null;
+            defer if (materialized_a) |value| freeOp(self, value);
+            const materialized_b = if (b_buf.lazy_multiply != null) try self.ctFromOwnedMetalTensor(try self.ownedDeviceMetalTensorFromCt(b)) else null;
+            defer if (materialized_b) |value| freeOp(self, value);
+            return multiplyOp(ctx, materialized_a orelse a, materialized_b orelse b);
+        }
         if (!disableRuntimeElementwise()) {
             const a_len = bufElemCount(a_buf);
             const b_len = bufElemCount(b_buf);
@@ -47519,4 +47605,102 @@ test "embeddinggemma2 Metal stage handoff preserves independent tensors across p
     const changed = try cb.toFloat32(original, a);
     defer a.free(changed);
     for (changed) |value| try std.testing.expectEqual(@as(f32, 0), value);
+}
+
+test "metal_compute: GatherND coordinate concat preserves exact i64 bytes" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(a);
+    defer weights.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const lhs_values = [_]i64{ 9007199254740993, -9007199254740993 };
+    const rhs_values = [_]i64{ 0, 1 };
+    const dims = [_]i64{ 1, 1, 1, 2, 1 };
+    const lhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&lhs_values), .i64, &dims)).?;
+    defer cb.free(lhs);
+    const rhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&rhs_values), .i64, &dims)).?;
+    defer cb.free(rhs);
+    const out = try cb.primConcatPrim(lhs, rhs, 4, &dims, &dims);
+    defer cb.free(out);
+    const actual = (try cb.exportTensorData(out, a)).?;
+    defer a.free(actual.payload.bytes);
+    try std.testing.expectEqual(.i64, actual.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ lhs_values[0], 0, lhs_values[1], 1 }), actual.payload.bytes);
+    const shape = try cb.tensorShape(out, a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 1, 1, 2, 2 }, shape);
+    const legacy = try cb.fromFloat32Shape(&.{ 0, 1 }, &.{ 1, 1, 1, 2, 1 });
+    defer cb.free(legacy);
+    const mixed = try cb.primConcatPrim(lhs, legacy, 4, &dims, &dims);
+    defer cb.free(mixed);
+    const mixed_bytes = (try cb.exportTensorData(mixed, a)).?;
+    defer a.free(mixed_bytes.payload.bytes);
+    try std.testing.expectEqual(.i64, mixed_bytes.dtype);
+    try std.testing.expectEqualSlices(u8, actual.payload.bytes, mixed_bytes.payload.bytes);
+}
+
+test "metal_compute: ClipClap attention masks promote boolean integer and float arithmetic" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(a);
+    defer weights.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const mask = (try cb.fromConstantBytes(&.{ 0, 1 }, .bool_, &.{ 1, 2 })).?;
+    defer cb.free(mask);
+    const sentinel = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{-9007199254740993}), .i64, &.{})).?;
+    defer cb.free(sentinel);
+    const masked = try cb.multiply(mask, sentinel);
+    defer cb.free(masked);
+    const exact = (try cb.exportTensorData(masked, a)).?;
+    defer a.free(exact.payload.bytes);
+    try std.testing.expectEqual(.i64, exact.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 0, -9007199254740993 }), exact.payload.bytes);
+    const floats = try cb.fromFloat32Shape(&.{ 2, 3 }, &.{ 1, 2 });
+    defer cb.free(floats);
+    const product = try cb.multiply(mask, floats);
+    defer cb.free(product);
+    const values = try cb.toFloat32(product, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 3 }, values);
+    const sum = try cb.add(masked, floats);
+    defer cb.free(sum);
+    const sums = try cb.toFloat32(sum, a);
+    defer a.free(sums);
+    try std.testing.expectEqual(@as(f32, 2), sums[0]);
+    try std.testing.expect(sums[1] < -9e15);
+}
+
+test "metal_compute: ClipClap chained masks materialize pending lazy products" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(a);
+    defer weights.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const values: [77 * 77]f32 = @splat(2);
+    const host = try cb.fromFloat32Shape(&values, &.{ 1, 1, 77, 77 });
+    defer cb.free(host);
+    const input = try compute.ctFromOwnedMetalTensor(try compute.ownedDeviceMetalTensorFromCt(host));
+    defer cb.free(input);
+    const product = try cb.multiply(input, input);
+    defer cb.free(product);
+    try std.testing.expect(MetalCompute.toBuf(product).lazy_multiply != null);
+    const mask_values: [77 * 77]u8 = @splat(1);
+    const mask = (try cb.fromConstantBytes(&mask_values, .bool_, &.{ 1, 1, 77, 77 })).?;
+    defer cb.free(mask);
+    const chained = try cb.multiply(product, mask);
+    defer cb.free(chained);
+    const actual = try cb.toFloat32(chained, a);
+    defer a.free(actual);
+    try std.testing.expectEqual(@as(usize, 77 * 77), actual.len);
+    for (actual) |value| try std.testing.expectEqual(@as(f32, 4), value);
+    try std.testing.expect(MetalCompute.toBuf(product).lazy_multiply != null);
 }

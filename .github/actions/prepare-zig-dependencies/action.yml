@@ -1,0 +1,26 @@
+name: Prepare verified Zig source dependencies
+description: Read pinned sources using bucket-scoped keyless CI credentials
+inputs:
+  mirror-only:
+    description: Fail instead of falling back to upstream
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+      id: mirror
+      with:
+        workload_identity_provider: projects/281947489474/locations/global/workloadIdentityPools/github-actions/providers/github
+        service_account: zig-dependency-reader@antfly-image-artifacts.iam.gserviceaccount.com
+        token_format: access_token
+        access_token_scopes: https://www.googleapis.com/auth/devstorage.read_only
+        create_credentials_file: false
+        export_environment_variables: false
+    - shell: bash
+      env:
+        MIRROR_ONLY: ${{ inputs.mirror-only }}
+        ANTFLY_ZIG_MIRROR_TOKEN: ${{ steps.mirror.outputs.access_token }}
+      run: |
+        args=()
+        if [[ "$MIRROR_ONLY" == 'true' ]]; then args+=(--mirror-only); fi
+        python3 scripts/ci/prepare_zig_dependencies.py "${args[@]}"

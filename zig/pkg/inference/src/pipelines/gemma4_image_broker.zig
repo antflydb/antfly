@@ -258,8 +258,7 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
     control.deadline_ns = null;
     control.cancellation = null;
     control.cancellation_grace_ns = null;
-    control.ptr = &cohort;
-    control.check_fn = micro.ExecutionControl.check;
+    control = control.withCheckpoint(&cohort, micro.ExecutionControl.check);
     control.io = items[0].control.io;
     const shared = std.heap.smp_allocator;
     var errors: [4]?anyerror = @splat(null);

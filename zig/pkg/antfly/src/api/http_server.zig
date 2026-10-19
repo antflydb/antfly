@@ -3945,6 +3945,8 @@ pub const ApiHttpServer = struct {
     lake_gc_last_schedule_ns: std.atomic.Value(u64) = .init(0),
     lake_gc_after: ?u64 = null,
     native_query_gc_after: ?[]u8 = null,
+    native_query_gc_collection: ?*@import("native_query_repository.zig").Repository.CollectionState = null,
+    native_query_gc_pending: std.atomic.Value(bool) = .init(false),
     lake_gc_store_index: usize = 0,
     lake_gc_token: ?[16]u8 = null,
     lake_gc_token_table: u64 = 0,
@@ -4758,6 +4760,10 @@ pub const ApiHttpServer = struct {
         self.lake_native_runtimes.deinit();
         self.lake_text_corpora.deinit();
         if (self.native_query_gc_after) |value| self.alloc.free(value);
+        if (self.native_query_gc_collection) |state| {
+            state.deinit();
+            self.alloc.destroy(state);
+        }
         self.lake_search_metadata.deinit();
         self.lake_reader_leases.deinit(self.embedding_provider_runtime.io);
         self.lake_read_cache.deinit();
@@ -5984,7 +5990,8 @@ pub const ApiHttpServer = struct {
         if (runtime.threaded_jobs == null or self.lake_gc_owner_id == 0) return;
         const now = platform_time.monotonicNs();
         const previous = self.lake_gc_last_schedule_ns.load(.acquire);
-        if (previous != 0 and now -| previous < config.lake_indexes.artifact_gc.interval_ms * std.time.ns_per_ms) return;
+        const interval_ms = if (self.native_query_gc_pending.load(.acquire)) @min(@as(u64, 50), config.lake_indexes.artifact_gc.interval_ms) else config.lake_indexes.artifact_gc.interval_ms;
+        if (previous != 0 and now -| previous < interval_ms * std.time.ns_per_ms) return;
         if (self.lake_gc_last_schedule_ns.cmpxchgStrong(previous, now, .acq_rel, .acquire) != null) return;
         if (self.lake_gc_in_flight.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         const work = self.alloc.create(LakeArtifactCollectionWork) catch |err| {
@@ -6003,7 +6010,11 @@ pub const ApiHttpServer = struct {
     /// tombstones remain enumerable; collection never depends on live tables.
     /// The scheduling owner serializes this cursor and drains it on shutdown.
     fn runLakeArtifactCollectionOnce(self: *ApiHttpServer) !void {
-        if (!self.mutationBackgroundExecutionPermitted()) return;
+        if (!self.mutationBackgroundExecutionPermitted()) {
+            if (self.native_query_gc_collection) |state| state.deinit();
+            self.native_query_gc_pending.store(false, .release);
+            return;
+        }
         const config = self.cfg.node_config orelse return;
         const cancel: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = LakeArtifactCollectionWork.canceled };
         const request: api_operation.RequestContext = .{ .setting_admin = true, .deadline_ns = platform_time.monotonicNs() +| 120 * std.time.ns_per_s, .cancellation = cancel };
@@ -6011,11 +6022,23 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        if (!config.lake_indexes.artifact_gc.dry_run) {
+        if (config.lake_indexes.artifact_gc.dry_run) {
+            if (self.native_query_gc_collection) |state| state.deinit();
+            self.native_query_gc_pending.store(false, .release);
+        } else {
             var repository = try @import("native_query_repository.zig").Repository.init(a, config, self.cfg.secret_store, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
             defer repository.deinit();
             const control: @import("antfly_local_sources").storage_db_native_query_cut.Control = .{ .parent = cancel, .deadline_ns = request.deadline_ns.? };
-            const next = try repository.collectNext(self.alloc, self.native_query_gc_after, platform_time.realtimeNs() / std.time.ns_per_ms, @min(128, config.lake_indexes.artifact_gc.max_deleted), control.token());
+            if (self.native_query_gc_collection == null) {
+                const runtime = self.cfg.backend_runtime orelse return;
+                const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+                const state = try self.alloc.create(@import("native_query_repository.zig").Repository.CollectionState);
+                state.* = .init(self.alloc, io);
+                self.native_query_gc_collection = state;
+            }
+            const state = self.native_query_gc_collection.?;
+            defer self.native_query_gc_pending.store(state.hasPending(), .release);
+            const next = try repository.collectNextWithState(self.alloc, state, self.native_query_gc_after, platform_time.realtimeNs() / std.time.ns_per_ms, @min(128, config.lake_indexes.artifact_gc.max_deleted), control.token());
             if (self.native_query_gc_after) |value| self.alloc.free(value);
             self.native_query_gc_after = next;
         }
@@ -16176,6 +16199,15 @@ pub const ApiHttpServer = struct {
         prepared: *PreparedIndexInstallation,
         enqueue_if_absent: bool,
     ) bool {
+        return self.activatePreparedIndexInstallationWithReplacement(prepared, enqueue_if_absent, true);
+    }
+
+    fn activatePreparedIndexInstallationWithReplacement(
+        self: *ApiHttpServer,
+        prepared: *PreparedIndexInstallation,
+        enqueue_if_absent: bool,
+        replace_existing: bool,
+    ) bool {
         const runtime = self.cfg.backend_runtime orelse return false;
         if (!prepared.reservation_active or !prepared.owns_payload) return false;
 
@@ -16192,6 +16224,7 @@ pub const ApiHttpServer = struct {
             }
         }
         if (existing == null and !enqueue_if_absent) return false;
+        if (existing != null and !replace_existing) return true;
 
         const generation = self.index_installation_next_generation;
         self.index_installation_next_generation +%= 1;
@@ -16278,6 +16311,15 @@ pub const ApiHttpServer = struct {
         var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
         defer prepared.deinit(self);
         self.activateLakeCommit(&prepared);
+    }
+
+    /// Read-side freshness checks can observe an external commit before the
+    /// periodic inventory sweep. Coalesce that hint without resetting an active
+    /// build's generation, failure count, or retry deadline on every poll.
+    pub fn requestLakePublication(self: *ApiHttpServer, table_name: []const u8) !void {
+        var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
+        defer prepared.deinit(self);
+        _ = self.activatePreparedIndexInstallationWithReplacement(&prepared, true, false);
     }
 
     fn resumeNativeLakeIndexPublication(self: *ApiHttpServer) !void {
@@ -20984,7 +21026,7 @@ pub const ApiHttpServer = struct {
             }
         }.less);
         try context.ensureActive();
-        const encoded = try std.json.Stringify.valueAlloc(arena, listed, .{});
+        const encoded = try std.json.Stringify.valueAlloc(arena, listed, .{ .emit_null_optional_fields = false });
         return .{ .body = try self.projectForeignKeyNames(self.alloc, context, encoded), .cursor = next_cursor };
     }
 
@@ -57932,4 +57974,112 @@ test "api http server serves status using control metadata without diagnostic tr
     defer denied.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), fake.control_reads);
     try std.testing.expectEqual(@as(usize, 0), fake.diagnostic_reads);
+}
+
+test "external lake native server resumes bounded collection across maintenance passes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Repository = @import("native_query_repository.zig").Repository;
+    const cut = @import("antfly_local_sources").storage_db_native_query_cut;
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            return alloc.dupe(u8, "{\"item\":null,\"after\":null}");
+        }
+        fn read(_: *anyopaque, _: std.mem.Allocator, _: u64, _: api_operation.RequestContext) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn mutate(_: *anyopaque, _: u64, _: u64, _: @import("../metadata/lake_index_lifecycle.zig").Mutation, _: api_operation.RequestContext) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var directory = try TestDirectory.init("server-native-gc-pages");
+    defer directory.cleanup();
+    var config = try common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    config.lake_indexes.artifact_gc.max_deleted = 1;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    const source = try std.fs.path.join(a, &.{ directory.path(), "source" });
+    defer a.free(source);
+    try fs_paths.createDirPathPortable(io, source);
+    const payload = try std.fs.path.join(a, &.{ source, "file" });
+    defer a.free(payload);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = payload, .data = "immutable" });
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const id: [64]u8 = @splat('a');
+    const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true };
+    try cut.finish(a, io, source, request, namespace, 1, .none);
+    {
+        var repository = try Repository.init(a, &config, null, .standalone, directory.path());
+        defer repository.deinit();
+        try repository.capability().publish(io, source, request, namespace, .none);
+    }
+    var server = ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .node_config = &config, .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path(), .lake_artifact_gc_enabled = false }, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog, .get_lake_index_lifecycle = Fake.read, .mutate_lake_index_lifecycle = Fake.mutate } }, null, null);
+    defer server.deinit();
+    try server.runLakeArtifactCollectionOnce();
+    const state = server.native_query_gc_collection.?;
+    try std.testing.expect(server.native_query_gc_pending.load(.acquire));
+    const expired = try std.fs.path.join(a, &.{ state.collector.?.root, "00000000000000000001", "query" });
+    defer a.free(expired);
+    try fs_paths.createDirPathPortable(io, expired);
+    for (0..30) |i| {
+        const path = try std.fmt.allocPrint(a, "{s}/file-{d}", .{ expired, i });
+        defer a.free(path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "obsolete" });
+    }
+    config.lake_indexes.artifact_gc.dry_run = true;
+    try server.runLakeArtifactCollectionOnce();
+    try std.testing.expect(!server.native_query_gc_pending.load(.acquire));
+    try std.testing.expect(state.collector == null);
+    config.lake_indexes.artifact_gc.dry_run = false;
+    try server.runLakeArtifactCollectionOnce();
+    try std.testing.expect(server.native_query_gc_pending.load(.acquire));
+    var turns: usize = 0;
+    while (server.native_query_gc_pending.load(.acquire)) : (turns += 1) {
+        try std.testing.expect(turns < 1000);
+        try server.runLakeArtifactCollectionOnce();
+        try std.testing.expectEqual(state, server.native_query_gc_collection.?);
+    }
+    try std.testing.expect(turns > 30);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, expired, .{}));
+    try cut.validate(a, io, source, request, namespace, .none);
+}
+
+test "external lake read refresh hints coalesce without superseding active publication work" {
+    const a = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var raw: u8 = 0;
+    var server = ApiHttpServer.init(a, .{ .backend_runtime = &runtime }, .{ .ptr = &raw, .vtable = &.{ .status = Source.status } }, null, null);
+    defer server.deinit();
+    // Hold execution so the test can inspect the authoritative keyed wakeup
+    // and its retry state independently of worker scheduling.
+    server.index_installation_worker_in_flight.store(true, .release);
+    defer server.index_installation_worker_in_flight.store(false, .release);
+    try server.requestLakePublication("docs");
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    const generation = server.index_installation_queue.items[0].generation;
+    server.index_installation_queue.items[0].failures = 3;
+    server.index_installation_queue.items[0].retry_after_ns = 987654321;
+    for (0..20) |_| try server.requestLakePublication("docs");
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    try std.testing.expectEqual(generation, server.index_installation_queue.items[0].generation);
+    try std.testing.expectEqual(@as(u8, 3), server.index_installation_queue.items[0].failures);
+    try std.testing.expectEqual(@as(u64, 987654321), server.index_installation_queue.items[0].retry_after_ns);
+    try std.testing.expectEqual(@as(usize, 0), server.index_installation_reserved_slots);
+    // An actual commit still supersedes the hint so work that raced the commit
+    // cannot complete and discard the new generation's wakeup.
+    try server.notifyLakeCommit("docs");
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    try std.testing.expect(server.index_installation_queue.items[0].generation != generation);
+    try std.testing.expectEqual(@as(u8, 0), server.index_installation_queue.items[0].failures);
+    try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
 }

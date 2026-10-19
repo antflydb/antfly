@@ -1833,7 +1833,7 @@ fn directExecutorDeadline(io: std.Io, deadline_ns: ?u64) !?std.Io.Clock.Timestam
 }
 
 fn isRecoverableEmbeddingRuntimeIntegrityError(err: anyerror) bool {
-    return err == error.MissingWeight or err == error.WeightNotFound;
+    return err == error.MissingWeight or err == error.WeightNotFound or err == error.ModelArtifactsChanging;
 }
 
 fn shouldAbortDensePartialFallback(err: anyerror) bool {
@@ -1969,7 +1969,7 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
 
 test "embedding runtime recovery retries once and retires every corrupt runtime" {
     const Probe = struct {
-        const FailureMode = enum { first_missing, persistent_missing, capacity, timeout };
+        const FailureMode = enum { first_missing, persistent_missing, changed_publication, capacity, timeout };
         const Handle = struct { active: bool = true };
 
         mode: FailureMode,
@@ -1989,6 +1989,7 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
             switch (self.mode) {
                 .first_missing => if (self.execute_count == 1) return error.MissingWeight,
                 .persistent_missing => return error.MissingWeight,
+                .changed_publication => if (self.execute_count == 1) return error.ModelArtifactsChanging,
                 .capacity => return error.ResourceTemporarilyUnavailable,
                 .timeout => return error.Timeout,
             }
@@ -2019,6 +2020,11 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
     try std.testing.expectEqual(@as(usize, 1), recovered.release_count);
     try std.testing.expectEqual(@as(usize, 1), recovered.succeed_count);
 
+    var changed = Probe{ .mode = .changed_publication };
+    try runEmbeddingRuntimeRecoveryLoop(&changed);
+    try std.testing.expectEqual(@as(usize, 2), changed.acquire_count);
+    try std.testing.expectEqual(@as(usize, 1), changed.retire_count);
+
     var persistent = Probe{ .mode = .persistent_missing };
     try std.testing.expectError(error.MissingWeight, runEmbeddingRuntimeRecoveryLoop(&persistent));
     try std.testing.expectEqual(@as(usize, 2), persistent.acquire_count);
@@ -2038,7 +2044,7 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
     try std.testing.expectEqual(@as(usize, 1), timeout.release_count);
 }
 
-test "embedding runtime recovery is limited to weight integrity failures" {
+test "embedding runtime recovery is limited to weight and publication integrity failures" {
     try std.testing.expect(isRecoverableEmbeddingRuntimeIntegrityError(error.MissingWeight));
     try std.testing.expect(isRecoverableEmbeddingRuntimeIntegrityError(error.WeightNotFound));
     try std.testing.expect(!isRecoverableEmbeddingRuntimeIntegrityError(error.ResourceLimitExceeded));
@@ -4724,7 +4730,7 @@ pub const Node = struct {
         trace: ?*embedding_trace.Trace,
         observation: ?*@import("../pipelines/batch_execution.zig").Observation,
     ) ![][]f32 {
-        try model.verifyEmbeddingIdentity();
+        try model.verifyEmbeddingIdentityWithControl(control);
         const asset_started = if (trace != null) embedding_trace.now() else 0;
         var pipeline = blk: {
             try model.lockEmbeddingAssetsWithControl(control);
@@ -4753,7 +4759,7 @@ pub const Node = struct {
             for (vectors) |vector| allocator.free(vector);
             allocator.free(vectors);
         }
-        try model.verifyEmbeddingIdentity();
+        try model.verifyEmbeddingIdentityWithControl(control);
         return vectors;
     }
 
@@ -6331,7 +6337,7 @@ pub const Node = struct {
         errdefer handle.release();
         const actual = if (handle.get().embedding_identity) |*identity| identity else return error.InvalidEmbeddingIdentity;
         if (!std.mem.eql(u8, expected, actual)) return error.EmbeddingIdentityMismatch;
-        try handle.get().verifyEmbeddingIdentity();
+        try handle.get().verifyEmbeddingIdentityWithControl(self.bindExecutionControl(io, control));
         return handle;
     }
 
@@ -6605,7 +6611,7 @@ pub const Node = struct {
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 const active = attempt.control;
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(active);
                 if (try attempt.node.tryEmbedImagesViaBroker(attempt.allocator, attempt.io, model, &.{}, attempt.rasters, active, .RETRIEVAL_DOCUMENT, null)) |vectors| {
                     attempt.vectors = vectors;
                     return;
@@ -6623,7 +6629,7 @@ pub const Node = struct {
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
                 try active.check();
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(active);
                 attempt.vectors = vectors;
             }
         };
@@ -7376,7 +7382,7 @@ pub const Node = struct {
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(attempt.control);
                 const resident_embedding_gemma2 = model.manifest.embedding_style == .embedding_gemma2 and model.session.backend() == .cuda;
                 const request_prefix = try denseEmbeddingTextPrefix(attempt.allocator, model, attempt.task_type, attempt.instruction);
                 defer if (request_prefix.owned) |owned| attempt.allocator.free(owned);
@@ -7431,7 +7437,7 @@ pub const Node = struct {
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
                 try attempt.control.check();
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(attempt.control);
                 attempt.vectors = vectors;
             }
         };
@@ -11407,7 +11413,7 @@ pub const Node = struct {
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
                 attempt.model_identity = model.embedding_identity;
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
                 if (attempt.request.model_identity) |expected| {
                     const actual = if (model.embedding_identity) |*identity| identity else return error.InvalidEmbeddingIdentity;
                     if (!std.mem.eql(u8, expected, actual)) return error.EmbeddingIdentityMismatch;
@@ -11423,7 +11429,7 @@ pub const Node = struct {
                         defer if (prefix.owned) |owned| attempt.allocator.free(owned);
                         if (try attempt.node.tryEmbedParsedViaBroker(attempt.allocator, io, model, attempt.inputs, attempt.execution_control, attempt.request.task_type orelse .RETRIEVAL_DOCUMENT, attempt.request.instruction, attempt.audio_decode_working_bytes)) |vectors| {
                             errdefer freeDirectDenseVectors(attempt.allocator, vectors);
-                            try model.verifyEmbeddingIdentity();
+                            try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
                             attempt.prompt_tokens = countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs, prefix.prefix);
                             attempt.result = .{ .fail_fast = vectors };
                             return;
@@ -11506,7 +11512,7 @@ pub const Node = struct {
                     .per_item => |*partial| partial.deinit(attempt.allocator),
                 };
                 asset_lease.release();
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
                 attempt.result = result;
             }
         };
@@ -11701,7 +11707,7 @@ pub const Node = struct {
         defer if (planning_assets) |*assets| assets.deinit();
         const manifest = if (loaded) |model| &model.manifest else &planning_assets.?.manifest;
         if (manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-        if (loaded) |model| try model.verifyEmbeddingIdentity();
+        if (loaded) |model| try model.verifyEmbeddingIdentityWithControl(control);
         const contract = try resolvedInferenceExecutorContract(self, "embed", manifest);
         const capacity = @min(manifest.maxTextSequenceLength(), contract.batch.max_input_tokens_per_item orelse std.math.maxInt(usize));
         if (capacity == 0) return error.InvalidChunkModel;
@@ -11714,7 +11720,7 @@ pub const Node = struct {
         var embedding_config: embedding_mod.EmbeddingConfig = .{ .text_prefix = manifest.embedding_profile.document.prefix, .ensure_trailing_eos_id = if (manifest.isLastTokenDecoderEmbedder() and manifest.embedding_style != .embedding_gemma2 and tokenizer.specialTokens().sep_id >= 0) tokenizer.specialTokens().sep_id else null };
         const owned_prefix = try applyDenseEmbeddingConfigRequestOptions(a, &embedding_config, manifest, .{ .model = target.model, .input = .null, .encoding_format = null, .dimensions = if (target.dimensions) |d| @intCast(d) else null, .task_type = task });
         defer if (owned_prefix) |prefix| a.free(prefix);
-        const planning_digest = std.fmt.bytesToHex(if (loaded) |model| try model.chunkPlanningIdentity() else planning_assets.?.planning.digest, .lower);
+        const planning_digest = std.fmt.bytesToHex(if (loaded) |model| try model.chunkPlanningIdentityWithControl(control) else planning_assets.?.planning.digest, .lower);
         const planning_identity = try std.fmt.allocPrint(a, "antfly-media-chunk-model-v1:{s}:{s}:{s}:{?d}", .{ planning_digest, @tagName(manifest.embedding_style), embedding_config.text_prefix, embedding_config.ensure_trailing_eos_id });
         defer a.free(planning_identity);
         const dimensions = target.dimensions orelse if (manifest.embedding_style == .embedding_gemma2) @as(usize, 768) else manifest.hidden_size;
@@ -11832,7 +11838,7 @@ pub const Node = struct {
                 // The public mode describes arbitrary mixed groups; this route
                 // is separately qualified for independent video windows only.
                 if (payloads.len > adapter.contract.batch.max_items) return error.BatchIncompatible;
-                try adapter.model.?.verifyEmbeddingIdentity();
+                try adapter.model.?.verifyEmbeddingIdentityWithControl(adapter.control);
                 var movies: [4]grouped.VideoBatchItem = undefined;
                 for (payloads, movies[0..payloads.len]) |payload, *movie| {
                     if (payload != .video) return error.InvalidInputShape;
@@ -11849,7 +11855,7 @@ pub const Node = struct {
                 defer out.free(result.vectors);
                 defer out.free(result.input_tokens);
                 errdefer for (result.vectors) |vector| out.free(vector);
-                try adapter.model.?.verifyEmbeddingIdentity();
+                try adapter.model.?.verifyEmbeddingIdentityWithControl(adapter.control);
                 try adapter.control.check();
                 const values = try out.alloc(chunks.Output, payloads.len);
                 for (values, result.vectors, result.input_tokens) |*value, vector, tokens| value.* = .{ .vector = vector, .input_tokens = tokens };
@@ -11858,7 +11864,7 @@ pub const Node = struct {
             fn embed(raw: *anyopaque, out: std.mem.Allocator, payload: chunks.Payload) !chunks.Output {
                 const adapter: *@This() = @ptrCast(@alignCast(raw));
                 try adapter.control.check();
-                try adapter.model.?.verifyEmbeddingIdentity();
+                try adapter.model.?.verifyEmbeddingIdentityWithControl(adapter.control);
                 const options = grouped.Options{ .task_type = @tagName(adapter.task), .dimensions = adapter.dimensions, .video_ahead = if (payload == .video) payload.video.ahead else null, .video_prepared = if (payload == .video) payload.video.prepared else null };
                 var vector: []f32 = undefined;
                 var input_tokens: usize = 0;
@@ -11924,7 +11930,7 @@ pub const Node = struct {
                 errdefer out.free(vector);
                 if (adapter.requested_dimensions) |expected| if (vector.len != expected) return error.InvalidEmbeddingDimensions;
                 adapter.dimensions = vector.len;
-                try adapter.model.?.verifyEmbeddingIdentity();
+                try adapter.model.?.verifyEmbeddingIdentityWithControl(adapter.control);
                 try adapter.control.check();
                 return .{ .vector = vector, .input_tokens = input_tokens };
             }
@@ -11950,7 +11956,7 @@ pub const Node = struct {
             failure = if (err == error.OutOfMemory and bounded_source.denied) error.ChunkWorkingBudgetExceeded else if (err == error.OutOfMemory) admitted_source.admission_error orelse err else err;
             break :blk runner.summary;
         };
-        if (loaded) |model| _ = try model.chunkPlanningIdentity() else try planning_assets.?.verify();
+        if (loaded) |model| _ = try model.chunkPlanningIdentityWithControl(control) else try planning_assets.?.verify();
         return .{ .summary = summary, .model_identity = identity, .model_revision = std.fmt.bytesToHex(revision, .lower), .dimensions = adapter.dimensions, .failure = failure };
     }
 
@@ -20247,7 +20253,7 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const contract = try resolvedInferenceExecutorContract(self, "decide", &loaded.manifest);
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(effective);
         if (request.model_identity) |expected| if (!std.mem.eql(u8, expected, &loaded.embedding_identity.?)) return error.EmbeddingIdentityMismatch;
         var max_labels: usize = 0;
         for (request.questions) |question| max_labels = @max(max_labels, question.labels.len);
@@ -20321,7 +20327,7 @@ pub const Node = struct {
         try root.put(a, "usage", .{ .object = usage });
         try root.put(a, "renderer_version", .{ .string = scoring.renderer_version });
         if (loaded.embedding_identity) |*identity| try root.put(a, "model_identity", .{ .string = identity });
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(effective);
         try effective.check();
         return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = root }, .{});
     }
@@ -20454,7 +20460,7 @@ pub const Node = struct {
         const loaded = handle.get();
         var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
         defer frame_cache.deinit();
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, options);
         for (groups) |group| try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control);
@@ -20476,7 +20482,7 @@ pub const Node = struct {
                     .item_error => |failure| return failure.cause,
                 }
             }
-            try loaded.verifyEmbeddingIdentity();
+            try loaded.verifyEmbeddingIdentityWithControl(control);
             return vectors;
         }
         for (groups, vectors) |group, *vector| {
@@ -20484,7 +20490,7 @@ pub const Node = struct {
             vector.* = result.vector;
             count += 1;
         }
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(control);
         return vectors;
     }
 
@@ -20548,7 +20554,7 @@ pub const Node = struct {
             const actual = loaded.embedding_identity orelse return error.EmbeddingIdentityMismatch;
             if (!std.mem.eql(u8, expected, &actual)) return error.EmbeddingIdentityMismatch;
         }
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, .{
             .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT),
@@ -20589,7 +20595,7 @@ pub const Node = struct {
                 input_tokens += result.input_tokens;
             }
         }
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(control);
         if (request.error_policy == .per_item) {
             const partial = DenseEmbedPartialResult{ .embeddings = vectors, .errors = errors.items };
             var response = try buildEmbedDensePartialResponse(a, request.model, &partial, if (request.dimensions) |dim| @intCast(dim) else null, true, input_tokens);

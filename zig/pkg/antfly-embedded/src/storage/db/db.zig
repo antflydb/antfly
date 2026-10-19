@@ -3042,12 +3042,9 @@ const DocumentPrimaryReadWindow = struct {
         if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         self.retire();
         self.scope = try txn.openReadScope(self.arena.allocator());
-        try readMany(&self.scope.?, physical, output);
-        for (output) |value| if (value) |raw| {
-            self.bytes +|= raw.len;
-        };
+        self.bytes = try readMany(&self.scope.?, physical, output);
     }
-    fn readMany(scope: *@import("../backend_erased.zig").ReadScope, physical: []const []const u8, output: []?[]const u8) !void {
+    fn readMany(scope: *@import("../backend_erased.zig").ReadScope, physical: []const []const u8, output: []?[]const u8) !usize {
         if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         const Entry = struct {
             key: []const u8,
@@ -3072,6 +3069,13 @@ const DocumentPrimaryReadWindow = struct {
         }
         try scope.getManySorted(keys[0..count], values[0..count]);
         for (entries[0..physical.len]) |entry| output[entry.row] = values[entry.value_index];
+        // Duplicate keys borrow the same retained value. Account actual scope
+        // payload once, independently of caller order or repeated rows.
+        var bytes: usize = 0;
+        for (values[0..count]) |value| if (value) |raw| {
+            bytes +|= raw.len;
+        };
+        return bytes;
     }
 
     fn finishRow(self: *@This(), uncached: bool) void {
@@ -19936,6 +19940,7 @@ pub const DB = struct {
             break :validated true;
         } else false;
         if (!local_usable) if (self.backend_runtime.query_cut_repository) |repository| {
+            // The read lease retains the caller's token beyond this stack frame.
             if (try repository.openRead(io, path, request, origin, cancellation)) |opened| {
                 var lease = opened;
                 errdefer lease.deinit();
@@ -19956,9 +19961,10 @@ pub const DB = struct {
                 readonly.retained_remote_query_lease = lease;
                 return readonly;
             }
-            // Legacy repositories may materialize missing generations, but
-            // must not overwrite an invalid cache with active local readers.
-            if (local_exists) return error.CatalogGenerationChanged;
+            // Retained files are authority; local files are a disposable cache.
+            // Admission alone cannot detect a missing sealed file behind a valid
+            // manifest. Protect active readers before replacing any invalid root.
+            if (local_exists) try cut.discardInvalidCache(self.alloc, io, std.fs.path.dirname(path).?, cache_id, path);
             try self.admitQueryCut(io, cache_id, control.token());
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
@@ -20170,7 +20176,7 @@ pub const DB = struct {
                 .{},
                 cancellation,
                 maintenance_deadline_ns orelse std.math.maxInt(u64),
-                if (query_cut != null) .settled_requests else .successful_requests,
+                if (query_cut != null) .published_requests else .successful_requests,
             ) catch |err| switch (err) {
                 error.Cancelled => return error.Canceled,
                 else => return err,
@@ -31087,7 +31093,7 @@ pub const DB = struct {
         return self.runMaintenanceUntilWithEnrichmentCompletion(sequence, sync_targets, cancellation, deadline_ns, .successful_requests);
     }
 
-    const EnrichmentCompletion = enum { successful_requests, settled_requests };
+    const EnrichmentCompletion = enum { successful_requests, published_requests };
 
     fn runMaintenanceUntilWithEnrichmentCompletion(
         self: *DB,
@@ -31104,14 +31110,16 @@ pub const DB = struct {
         };
         var stable_target = sequence;
         while (true) {
-            const outcome = self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
-            outcome catch |err| {
-                if (completion != .settled_requests or err != error.EnrichmentWorkerFailed) return err;
-            };
-            // A completed watermark alone does not prove owner health. This
-            // also runs when the visibility wait took its already-applied path.
-            if (completion == .settled_requests) if (self.enrichment_runtime) |runtime|
-                try runtime.requireSettledForQueryCapture(stable_target);
+            if (completion == .successful_requests) {
+                try self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            } else if (self.enrichment_runtime) |runtime| {
+                // A retained read captures committed primary and generated
+                // publications. It must not run providers or wait for future
+                // request retries before reading already-visible documents.
+                // Replay/apply fences below exclude publication while pinning;
+                // derived indexes still catch up to this exact primary cut.
+                try runtime.requireHealthyForQueryCapture();
+            }
             try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
             const next_target = self.core.nextDerivedSequence();
@@ -31819,7 +31827,9 @@ pub const DB = struct {
                 var ordered = (try @import("artifact_inventory.zig").load(scratch, &read)) orelse return error.ArtifactCatalogDrift;
                 defer ordered.deinit();
                 if (ordered.value.command.binding.effect_protocol >= 15) return error.ArtifactCatalogCorrupt;
-                return false;
+                const pending = try @import("artifact_producer_readiness.zig").pending(scratch, self.core.store, self.root_incarnation);
+                self.artifact_producer_scheduler.completeReadinessPage(self.alloc, pending, readiness_progress, self.independentMaintenanceNowNs());
+                return readiness_progress;
             };
             try state.requireAuthority(authority);
             if (state.sealed_attempt != null) return false;
@@ -31907,12 +31917,8 @@ pub const DB = struct {
             processed += 1;
         }
         const readiness_pending = try @import("artifact_producer_readiness.zig").pending(scratch, self.core.store, self.root_incarnation);
-        more_dispatch = more_dispatch or readiness_pending;
-        self.artifact_producer_scheduler.completePage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, self.independentMaintenanceNowNs());
-        if (readiness_pending and !readiness_progress and processed == page.items.len and page.at_end) {
-            self.artifact_producer_scheduler.retry_after_ns.store(self.independentMaintenanceNowNs() +| @import("artifact_producer_scheduler.zig").Scheduler.poll_interval_ns, .release);
-        }
-        return processed != 0;
+        self.artifact_producer_scheduler.completeWorkPage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, .{ .pending = readiness_pending, .progressed = readiness_progress }, self.independentMaintenanceNowNs());
+        return processed != 0 or readiness_progress;
     }
 
     /// Persist scoped jobs and their document wakeup atomically. The thin
@@ -40383,7 +40389,7 @@ pub const DB = struct {
                 // one-row byte limit must not re-read all remaining directories.
                 errdefer self.retireDirectories();
                 if (self.directory_scope == null) self.directory_scope = try self.read.openReadScope(self.directory_arena.allocator());
-                try DocumentPrimaryReadWindow.readMany(&self.directory_scope.?, keys[0..pending_count], fetched[0..pending_count]);
+                _ = try DocumentPrimaryReadWindow.readMany(&self.directory_scope.?, keys[0..pending_count], fetched[0..pending_count]);
                 for (pending[0..pending_count], fetched[0..pending_count]) |index, raw| {
                     self.directories[index] = raw;
                     self.directories_loaded[index] = true;
@@ -71103,7 +71109,9 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
 
 test "db query capture retains settled terminal repair debt without acknowledging visibility" {
     const Fixture = struct {
-        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+        fn produce(raw: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const calls: *u8 = @ptrCast(@alignCast(raw));
+            calls.* += 1;
             return error.InvalidExtractorResponse;
         }
     };
@@ -71121,6 +71129,7 @@ test "db query capture retains settled terminal repair debt without acknowledgin
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
     var fixture: u8 = 0;
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
@@ -71147,12 +71156,25 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     runtime.worker_failed = false;
     runtime.retrying = true;
     runtime.next_retry_at_ms = runtime.clock.nowRealtimeMs() + 60_000;
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.captureQueryCut(request, .none));
+    try db.batch(.{ .writes = &.{.{ .key = "pending", .value = "{\"body\":\"awaiting extraction\"}" }}, .sync_level = .write });
+    try std.testing.expect(runtime.stats().applied_sequence < db.core.nextDerivedSequence());
+    const calls_before_capture = fixture;
+    try db.captureQueryCut(request, .none);
+    try std.testing.expectEqual(calls_before_capture, fixture);
+    try std.testing.expect(runtime.stats().retrying);
     runtime.retrying = false;
     runtime.next_retry_at_ms = 0;
 
     var retained = try db.openQueryCut(request, .none);
     defer retained.close();
+    var sorted = try retained.search(alloc, .{ .index_name = "text", .full_text = .{ .match_all = {} }, .order_by = &.{.{ .field = "_id" }}, .limit = 10 });
+    defer sorted.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
+    try std.testing.expectEqualStrings("doc", sorted.hits[0].id);
+    try std.testing.expectEqualStrings("pending", sorted.hits[1].id);
+    const pending = (try retained.get(alloc, "pending")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(pending);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "awaiting extraction") != null);
     var document = (try retained.getDocument(alloc, "doc", .{})) orelse return error.TestUnexpectedResult;
     defer document.deinit(alloc);
     try ant_json.testing.expectSubsetJsonText(alloc, "{\"body\":\"broken input\"}", document.json);
@@ -134284,6 +134306,53 @@ test "db ordered artifact inventory chunk replacement rolls back and reopens as 
     try std.testing.expectError(error.EnrichmentSourceChanged, prepared.requireCurrent(&read));
 }
 
+test "db ordered artifact inventory producer coverage pages do not idle between productive turns" {
+    const alloc = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    var tmp = try TestDirectory.init("producer-coverage-cadence");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
+    for (0..140) |i| {
+        const name = try std.fmt.allocPrint(alloc, "doc-{d:0>4}", .{i});
+        defer alloc.free(name);
+        const key = try internal_keys.documentKeyAlloc(alloc, name);
+        defer alloc.free(key);
+        try db.core.store.put(key, "{\"body\":\"one\"}");
+    }
+    var ordered = try db.artifactInventoryCommand(alloc);
+    defer ordered.catalogs.deinit(alloc);
+    ordered.binding.effect_protocol = 14;
+    var namespace: publication.Namespace = undefined;
+    doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        const catalogs = try @import("artifact_inventory.zig").catalogs(&txn);
+        try @import("artifact_inventory.zig").stageOrdered(alloc, &txn, ordered, 1);
+        try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = catalogs.digest(), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try txn.commit();
+    }
+    // No protocol-15 work registry and no clock advancement. Both pages must
+    // run immediately; otherwise a large census advances at 64 rows / 5 s.
+    try std.testing.expect(try db.advanceArtifactProducerWorkPage());
+    try std.testing.expectEqual(@as(u64, 0), db.artifact_producer_scheduler.retry_after_ns.load(.acquire));
+    try std.testing.expect(try db.advanceArtifactProducerWorkPage());
+    try std.testing.expectEqual(@as(u64, 0), db.artifact_producer_scheduler.retry_after_ns.load(.acquire));
+    var turns: usize = 0;
+    while (db.artifact_producer_scheduler.retry_after_ns.load(.acquire) == 0 and turns < 1000) : (turns += 1) {
+        _ = try db.advanceArtifactProducerWorkPage();
+    }
+    // Protocol-14 rows cannot fabricate protocol-15 receipts. The census can
+    // finish, but an unresolved witness sweep must remain pending and back off.
+    try std.testing.expect(turns < 1000);
+    try std.testing.expect(db.artifact_producer_scheduler.pending.load(.acquire));
+    try std.testing.expect(db.artifact_producer_scheduler.retry_after_ns.load(.acquire) > db.independentMaintenanceNowNs());
+    try std.testing.expect(!try db.advanceArtifactProducerWorkPage());
+}
+
 test "db ordered artifact inventory producer dispatch is durable and never completes work" {
     const alloc = std.testing.allocator;
     const publication = @import("artifact_publication.zig");
@@ -137840,6 +137909,49 @@ test "lite bounded reader integration scans native relational dirty rows" {
     try std.testing.expect(std.mem.indexOf(u8, result.documents[1].json, "updated") != null);
     // Both maintenance and dirty-row scan scopes must release their native pins.
     try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).retained_readers);
+}
+
+test "lite full text status follows writes after adding a sibling index (#1207)" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/status.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptions(&opts);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const empty = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, empty);
+    try std.testing.expectEqual(@as(u64, 0), empty.indexes[0].doc_count);
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"orchard alpha\"}" }} });
+    try db.runUntilIdle();
+    try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"body\":\"orchard beta\"}" }} });
+    try db.runUntilIdle();
+    const stats = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, stats);
+    try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].doc_count);
+    try std.testing.expect(stats.indexes[0].term_count > 0);
+    db.close();
+    db = try DB.open(a, path, opts);
+    const reopened_stats = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, reopened_stats);
+    try std.testing.expectEqual(@as(u64, 2), reopened_stats.indexes[0].doc_count);
+    try std.testing.expectEqual(@import("publication.zig").Stamp.Order.newer, reopened_stats.indexes[0].serving_publication.?.order(stats.indexes[0].serving_publication.?));
+    try db.batch(.{ .deletes = &.{"a"} });
+    try db.runUntilIdle();
+    const deleted_stats = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, deleted_stats);
+    try std.testing.expectEqual(@as(u64, 1), deleted_stats.indexes[0].doc_count);
+    var result = try db.search(a, .{ .index_name = "text", .query = .{ .match = .{ .field = "body", .text = "orchard" } }, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
 test "lite bounded reader integration publishes full text mappings through db" {

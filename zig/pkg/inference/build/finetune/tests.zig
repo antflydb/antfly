@@ -15,19 +15,41 @@
 
 const common = @import("common.zig");
 
-// These CLI test bodies are also reachable from inference.zig. The shared
-// finetuning executable owns them; inference's default run excludes them.
-pub const inference_overlap_filters: []const []const u8 = &.{
+const embedding_gemma2_graph_filters = [_][]const u8{
+    "finetune.embedding_gemma2_training.test.",
+    "finetune.embedding_gemma2_graph.test.",
+    "finetune.embedding_gemma2_adapter_state.test.",
+    "finetune.embedding_gemma2_cuda.test.",
+    "finetune.embedding_gemma2_cuda_tape.test.",
+    "finetune.embedding_gemma2_checkpoint.test.",
+};
+const embedding_gemma2_job_filters = [_][]const u8{
+    "finetune.embedding_gemma2_job.test.",
+    "finetune.embedding_gemma2_data.test.",
+    "finetune.embedding_gemma2_batch.test.",
+    "finetune.embedding_gemma2_loss.test.",
+    "finetune.embedding_gemma2_export.test.",
+};
+const embedding_gemma2_model_training_filters = [_][]const u8{
+    "finetune.tools.export_embedding_gemma2_lora.test.",
+    "finetune.tools.eval_embedding_gemma2_retrieval.test.",
+};
+
+// Shared CLI and isolated family owners run these tests. Inference retains
+// their general dependencies (tensor, execution control, registries, etc.).
+// Use the same selectors on both sides so ownership cannot drift.
+pub const inference_overlap_filters: []const []const u8 = &([_][]const u8{
     "finetune.train.train_gliner2_autodiff.test.",
     "finetune.tools.eval_gliner2_autodiff_adapter.test.",
     "finetune.tools.eval_gliner2_autodiff_adapter_dataset.test.",
-};
+} ++ embedding_gemma2_graph_filters ++ embedding_gemma2_job_filters ++ embedding_gemma2_model_training_filters);
 
 pub const specs = [_]common.TestSpec{
     .{
         .step_name = "test-embedding-gemma2-graph",
         .isolated = true,
         .root_source_file = "src/test_embedding_gemma2_graph.zig",
+        .filters = &embedding_gemma2_graph_filters,
         .description = "Run exact EmbeddingGemma 2 differentiable graph and adapter-layout unit tests",
         .imports = &.{ .antfly_platform, .ml },
         .native_link = .default,
@@ -36,6 +58,7 @@ pub const specs = [_]common.TestSpec{
         .step_name = "test-embedding-gemma2-job",
         .isolated = true,
         .root_source_file = "src/test_embedding_gemma2_job.zig",
+        .filters = &embedding_gemma2_job_filters,
         .description = "Run EmbeddingGemma 2 data, job, contrastive oracle and export tests",
         .imports = &.{.antfly_platform},
         .native_link = .default,
@@ -44,6 +67,7 @@ pub const specs = [_]common.TestSpec{
         .step_name = "test-embedding-gemma2-model-training",
         .isolated = true,
         .root_source_file = "src/test_embedding_gemma2_training.zig",
+        .filters = &embedding_gemma2_model_training_filters,
         .description = "Run EmbeddingGemma2 differentiable model and LoRA tests",
         .imports = &.{ .antfly_platform, .build_options, .ml, .inference_internal },
         .native_link = .default,

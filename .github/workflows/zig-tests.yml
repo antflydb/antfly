@@ -384,6 +384,12 @@ jobs:
         run: scripts/test-backup-s3-integration.sh
 
   arm64-codec:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -447,6 +453,9 @@ jobs:
             --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
+      - name: Prepare verified Zig source dependencies
+        uses: ./.github/actions/prepare-zig-dependencies
+
       - name: Verify Zig version
         env:
           ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
@@ -469,6 +478,12 @@ jobs:
           zig test zig/lib/hash/src/mod.zig -O safe -mcpu=baseline -lc
 
   zig-base-tests:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -511,7 +526,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -529,6 +544,9 @@ jobs:
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -565,9 +583,14 @@ jobs:
           grep -q 'run python3 success' "$RUNNER_TEMP/platform-musl.log"
 
       - name: Set up Node for generated source checks
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
+
+      - name: Verify Zig source cache round trip
+        env:
+          ANTFLY_TEST_ZIG: zig
+        run: python3 -m unittest discover -s scripts/ci -p test_zig_dependencies.py
 
       - name: Check generated sources
         run: make zig-generated-check
@@ -717,7 +740,7 @@ jobs:
 
       - name: Retain unit test progress
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
           path: |
@@ -729,7 +752,7 @@ jobs:
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -743,7 +766,7 @@ jobs:
 
       - name: Retain TLA trace evidence
         if: always() && !cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/antfly-tla-traces/
@@ -753,6 +776,12 @@ jobs:
   # Independent target matrices own their clocks and disposable compiler caches;
   # they do not consume the native unit gate's watchdog allowance.
   zig-base-wasm:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -790,7 +819,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -810,11 +839,14 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      - name: Prepare verified Zig source dependencies
+        uses: ./.github/actions/prepare-zig-dependencies
+
       - name: Verify Zig version
         run: zig version
 
       - name: Set up Node for WASM tests
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
 
@@ -839,6 +871,12 @@ jobs:
         run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
 
   zig-base-lite-models:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -877,7 +915,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -896,6 +934,9 @@ jobs:
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -952,7 +993,7 @@ jobs:
 
       - name: Upload real-model extraction evaluation
         if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lite-extraction-evaluation
           path: ${{ runner.temp }}/lite-extraction-eval.json
@@ -963,6 +1004,12 @@ jobs:
         run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
 
   zig-full-tests:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -1002,10 +1049,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1031,8 +1078,16 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      - name: Prepare verified Zig source dependencies
+        uses: ./.github/actions/prepare-zig-dependencies
+
       - name: Verify Zig version
         run: zig version
+
+      - name: Verify Zig source cache round trip
+        env:
+          ANTFLY_TEST_ZIG: zig
+        run: python3 -m unittest discover -s scripts/ci -p test_zig_dependencies.py
 
       - name: Check generated sources
         run: make zig-generated-check
@@ -1154,7 +1209,7 @@ jobs:
 
       - name: Upload real-model extraction evaluation
         if: always() && !cancelled() && steps.lite_extraction_report.outputs.exists == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lite-extraction-evaluation
           path: ${{ runner.temp }}/lite-extraction-eval.json
@@ -1171,7 +1226,7 @@ jobs:
 
       - name: Retain unit test progress
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
           path: |
@@ -1203,7 +1258,7 @@ jobs:
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Set up Java for TLA+
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -1216,7 +1271,7 @@ jobs:
 
       - name: Retain TLA trace evidence
         if: always() && !cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/antfly-tla-traces/
@@ -1255,7 +1310,7 @@ jobs:
       - name: Retain VOPR qualification diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-qualification-diagnostics
           path: |
@@ -1308,6 +1363,12 @@ jobs:
           rm -rf -- "$ZIG_LOCAL_CACHE_DIR"
 
   zig-build-cache-tests:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -1354,10 +1415,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1383,6 +1444,9 @@ jobs:
       # Each shard gets its own runner and PVC. Physical storage ownership has
       # several production rebuilds, so give it the full job budget separately
       # from the cold host-generator and linked-cache contract fixtures.
+      - name: Prepare verified Zig source dependencies
+        uses: ./.github/actions/prepare-zig-dependencies
+
       - name: Test runtime compilation and cache contracts
         if: startsWith(matrix.shard, 'runtime-')
         working-directory: zig
@@ -1402,7 +1466,7 @@ jobs:
 
       - name: Upload storage compilation measurements
         if: ${{ always() && matrix.shard == 'storage-ownership' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: storage-compilation
           path: zig/storage-compilation.json
@@ -1484,6 +1548,12 @@ jobs:
           test "$ARM64_CODEC_RESULT" = "success"
 
   e2e-base-build:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -1541,10 +1611,15 @@ jobs:
           mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
           cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
           mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
-          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
-          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
-          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
+          {
+            echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root"
+            echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local"
+            echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global"
+            echo "TMPDIR=$cache_root/tmp"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -1553,7 +1628,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base.tar.gz
@@ -1565,7 +1640,7 @@ jobs:
         run: tar -C zig/zig-out -czf "${RUNNER_TEMP}/libantfly-e2e-base.tar.gz" lib include
 
       - name: Upload native SDK library installation
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: libantfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-base.tar.gz
@@ -1605,7 +1680,7 @@ jobs:
       - name: Install native test tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
       - name: Download native SDK library installation
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: libantfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/native-sdk-artifact
@@ -1631,10 +1706,10 @@ jobs:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
         if: matrix.sdk == 'python'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Set up Node
         if: matrix.sdk == 'typescript'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
       - name: Set up pnpm
@@ -1669,7 +1744,7 @@ jobs:
       - name: Install driver build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
       - name: Download candidate E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/pgwire-driver-artifact
@@ -1681,7 +1756,7 @@ jobs:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: false
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
       - name: Set up Rust
@@ -1693,7 +1768,7 @@ jobs:
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Test standard PostgreSQL drivers against candidate runtime
         run: >-
           uv run --no-project --with requests --with pytest
@@ -1720,7 +1795,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
       - name: Restore common E2E duration history
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -1740,7 +1815,7 @@ jobs:
           uv run --project e2e/antfly pytest --collect-only -q -p zig_e2e_shard \
             --antfly-ci-plan-output "${RUNNER_TEMP}/e2e-plan/plan.json" \
             -m "$(python3 ../scripts/ci/zig_e2e_shard.py base-marker)" e2e/antfly
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/e2e-plan
@@ -1839,7 +1914,7 @@ jobs:
           ln -s "$cache_root/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -1849,7 +1924,7 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Download E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
@@ -1858,7 +1933,7 @@ jobs:
         run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-base/antfly-e2e-base.tar.gz" -C zig
 
       - name: Download common E2E plan and timing baseline
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/e2e-plan
@@ -1924,7 +1999,7 @@ jobs:
           >> "$GITHUB_STEP_SUMMARY"
       - name: Retain E2E timings and per-test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-e2e-timings-${{ matrix.suite }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/e2e-reports
@@ -1933,7 +2008,7 @@ jobs:
 
       - name: Retain failed E2E server logs and cluster diagnostics
         if: failure() && startsWith(matrix.suite, 'antfly')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: |
@@ -2019,7 +2094,7 @@ jobs:
           ln -s "$cache_root/home-antfly-low-fd" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2029,7 +2104,7 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Download E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
@@ -2059,7 +2134,7 @@ jobs:
 
       - name: Retain low-FD regression results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-low-fd-results-${{ github.run_attempt }}
           path: ${{ runner.temp }}/low-fd-reports
@@ -2068,7 +2143,7 @@ jobs:
 
       - name: Retain failed low-FD server logs and cluster diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-low-fd-server-logs-${{ github.run_attempt }}
           path: |
@@ -2117,11 +2192,11 @@ jobs:
           test "$NATIVE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/e2e-plan
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: antfly-e2e-timings-*
           path: ${{ runner.temp }}/e2e-observations
@@ -2137,6 +2212,12 @@ jobs:
           key: antfly-e2e-durations-v2-${{ github.run_id }}-${{ github.run_attempt }}
 
   e2e-full-build:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -2193,10 +2274,15 @@ jobs:
           mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
           cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
           mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
-          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
-          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
-          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
+          {
+            echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root"
+            echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local"
+            echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global"
+            echo "TMPDIR=$cache_root/tmp"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2205,7 +2291,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full.tar.gz
@@ -2217,7 +2303,7 @@ jobs:
         run: tar -C zig/zig-out -czf "${RUNNER_TEMP}/libantfly-e2e-full.tar.gz" lib include
 
       - name: Upload native SDK library installation
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: libantfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-full.tar.gz
@@ -2251,12 +2337,13 @@ jobs:
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full / ${{ matrix.suite }}
     needs: [admission, changes, e2e-base-build, e2e-full-build]
-    runs-on: ${{ matrix.suite != 'inference' && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
+    runs-on: ${{ !startsWith(matrix.suite, 'inference-') && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly"]') }}
+        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference-generation","inference-speech","inference-embedding"]' || '["inference-generation","inference-speech","inference-embedding","antfly"]') }}
     env:
       # Full Antfly E2E has the same multi-process groups as the base shards.
       # Keep one process-owning worker per runner while lightweight tests may
@@ -2306,7 +2393,7 @@ jobs:
           ln -s "$home_cache_root/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2327,7 +2414,7 @@ jobs:
         run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
 
       - name: Download E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full
@@ -2339,7 +2426,7 @@ jobs:
       # C ABI artifact produced by the same build as the server under test.
       - name: Download ingestion native library
         if: matrix.suite == 'antfly'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-full
@@ -2352,7 +2439,7 @@ jobs:
           echo "ANTFLY_LIBRARY=${GITHUB_WORKSPACE}/zig/zig-out/lib/libantfly.so" >> "$GITHUB_ENV"
 
       - name: Report inference memory baseline
-        if: matrix.suite == 'inference'
+        if: startsWith(matrix.suite, 'inference-')
         run: |
           echo "memory.current=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo unavailable)"
           echo "memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unavailable)"
@@ -2383,10 +2470,11 @@ jobs:
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Run Antfly inference full E2E
-        if: matrix.suite == 'inference'
+        if: startsWith(matrix.suite, 'inference-')
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_REPORT_DIR: ${{ runner.temp }}/inference-reports
           ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           # Gemma 4 covers ordinary, tool-calling, and multimodal generation;
@@ -2399,9 +2487,8 @@ jobs:
           # explicitly covering first-use paths opt into this hard bound.
           ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
-          # This Burstable pod has a 15000Mi request but no finite memory.max.
-          # Bound leaf-cgroup working set at 14000Mi so admission retains its
-          # emergency reserve and leaves another 1000Mi of pod-request margin.
+          # Keep the model process inside its existing 14GiB admission budget.
+          # Shards remain serial and use the existing heavy runner envelope.
           ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"
           # Bound the native hot set while allowing the measured 11173MiB 2B
           # decoder working set plus its scoped projector to complete. Keep
@@ -2413,10 +2500,11 @@ jobs:
           RUN_CLIPCLAP_CONTRACT_TESTS: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+          shard="${{ matrix.suite }}"
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference python ../scripts/ci/inference_e2e_shards.py "${shard#inference-}"
 
       - name: Validate standalone inference resource composition
-        if: matrix.suite == 'inference'
+        if: matrix.suite == 'inference-generation'
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
@@ -2446,17 +2534,17 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
 
       - name: Retain full inference server logs
-        if: always() && matrix.suite == 'inference'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && startsWith(matrix.suite, 'inference-')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: antfly-inference-full-server-logs-${{ github.run_attempt }}
+          name: antfly-inference-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/inference-server-logs/*.log
           if-no-files-found: ignore
           retention-days: 7
 
       - name: Retain failed full E2E server logs and cluster diagnostics
         if: failure() && matrix.suite == 'antfly'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: |
@@ -2469,6 +2557,15 @@ jobs:
             ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/native-stacks.txt
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Retain inference timings
+        if: always() && startsWith(matrix.suite, 'inference-')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: inference-timings-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/inference-reports
+          if-no-files-found: warn
+          retention-days: 14
 
   e2e-full:
     if: >-
