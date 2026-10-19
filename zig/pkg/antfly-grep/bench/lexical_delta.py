@@ -19,9 +19,12 @@
 Warm filesystem/process data. Forced refresh is excluded from query timings.
 The client applies each patch transactionally, binds compact file IDs to source
 identities, and compares its materialized result with the baseline full delivery.
+GC is collected before each pair. Both requests finish before either O(N) oracle
+view is updated, avoiding verification work between paired request timings.
 """
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -140,8 +143,13 @@ def main():
                 path.write_text(f"STOP edit {iteration}\n")
                 for service in services.values():
                     service.exchange("refresh", force_rescan=True)
-                trial = {"load_average": os.getloadavg()}
-                for name in binaries if iteration % 2 else reversed(binaries):
+                # Do not let full-view oracle allocation/GC from the first
+                # query perturb the second query's decoder or scheduling.
+                gc.collect()
+                order = list(binaries) if iteration % 2 else list(reversed(binaries))
+                trial = {"load_average": os.getloadavg(), "query_order": order}
+                responses = {}
+                for name in order:
                     service = services[name]
                     counters = (
                         Path(f"/proc/{service.process.pid}/schedstat")
@@ -168,12 +176,17 @@ def main():
                         value["main_thread_runqueue_seconds"] = (
                             after_cpu[1] - before_cpu[1]
                         ) / 1e9
+                    trial[name] = value
+                    responses[name] = rows
+                # All verification is outside both timed requests.
+                for name, rows in responses.items():
                     tokens[name] = next(
                         r["result_token"] for r in rows if r["type"] == "result_token"
                     )
                     views[name] = apply(views[name], rows)
-                    trial[name] = value
                     if name == "current":
+                        service = services[name]
+                        value = trial[name]
                         patch = next(
                             r for r in rows if r["type"] == "workspace_lexical_delta"
                         )
