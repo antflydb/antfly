@@ -575,16 +575,29 @@ pub const ModelRegistry = struct {
         // even creating a hard link changes the live artifact's ctime and
         // needlessly invalidates a loaded model's coherency signature.
         if (tasks_csv == null and capabilities_csv == null) {
-            const cached = if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, &bundle.artifacts(), hub_config, progress_sink)
-            else if (qwen3vl_catalog.findGenerationSafetensorsBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, &bundle.artifacts(), hub_config, progress_sink)
+            const cached = if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| blk: {
+                const descriptor = try qwen3vl_catalog.generationBundleManifestAlloc(self.allocator, bundle);
+                defer self.allocator.free(descriptor);
+                break :blk try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = &bundle.artifacts(),
+                    .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = descriptor }},
+                }, hub_config, progress_sink);
+            } else if (qwen3vl_catalog.findGenerationSafetensorsBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = &bundle.artifacts(),
+                    .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = qwen3vl_catalog.generation_safetensors_bundle_manifest }},
+                }, hub_config, progress_sink)
+            else if (qwen3vl_catalog.isRerankerBundleRef(ref.owner, ref.name, ref.variant))
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = &qwen3vl_catalog.rerankerArtifacts(),
+                    .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = qwen3vl_catalog.reranker_bundle_manifest }},
+                }, hub_config, progress_sink)
             else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), hub_config, progress_sink)
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
             else if (embedding_gemma2_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), hub_config, progress_sink)
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
             else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), hub_config, progress_sink)
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
             else
                 false;
             if (cached) {

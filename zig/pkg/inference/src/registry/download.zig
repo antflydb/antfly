@@ -1289,6 +1289,27 @@ pub fn validateManagedDownloadLimits(allocator: std.mem.Allocator, io: std.Io, d
     try validateArtifactLimits(plan.artifacts, 0, config);
 }
 
+pub const bundle_descriptor_filename = "antfly_inference_bundle.json";
+
+/// Generated descriptors are executable artifacts too. Their expected bytes
+/// come from the catalog, so even legacy receipts without a digest can be
+/// verified without changing the published installation.
+pub const GeneratedArtifact = struct {
+    path: []const u8,
+    bytes: []const u8,
+
+    fn sha256(self: GeneratedArtifact) [64]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(self.bytes, &digest, .{});
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+};
+
+pub const PinnedBundleContract = struct {
+    artifacts: []const qwen3vl_catalog.Artifact,
+    generated: []const GeneratedArtifact = &.{},
+};
+
 /// Reuse only a fully verified, immutable catalog bundle. Mutable Hub refs
 /// still resolve metadata and go through the publication transaction.
 /// Checking hashes here also repairs same-size local corruption on re-pull.
@@ -1296,7 +1317,7 @@ pub fn installedPinnedBundleMatches(
     allocator: std.mem.Allocator,
     io: std.Io,
     directory: []const u8,
-    artifacts: []const qwen3vl_catalog.Artifact,
+    contract: PinnedBundleContract,
     config: HubConfig,
     progress: ProgressSink,
 ) !bool {
@@ -1305,13 +1326,25 @@ pub fn installedPinnedBundleMatches(
         else => return false,
     } orelse return false;
     defer receipt.deinit();
-    if (receipt.artifacts.len != artifacts.len + 1 or receipt.find("model_manifest.json") == null) return false;
+    // The task/capability manifest is receipt-verified separately because it
+    // may contain caller overrides. Every catalog descriptor is pinned below.
+    if (receipt.artifacts.len != contract.artifacts.len + contract.generated.len + 1 or receipt.find("model_manifest.json") == null) return false;
     try validateArtifactLimits(receipt.artifacts, 0, config);
-    for (artifacts) |expected| {
+    for (contract.artifacts) |expected| {
         const actual = receipt.find(expected.path) orelse return false;
         if (actual.size != expected.size) return false;
         try progress.checkCancelled();
         managed_receipt.verifyValidatedArtifactSha256(io, actual, expected.sha256) catch |err| switch (err) {
+            error.Canceled => return err,
+            else => return false,
+        };
+    }
+    for (contract.generated) |expected| {
+        const actual = receipt.find(expected.path) orelse return false;
+        if (actual.size != expected.bytes.len) return false;
+        const digest = expected.sha256();
+        try progress.checkCancelled();
+        managed_receipt.verifyValidatedArtifactSha256(io, actual, &digest) catch |err| switch (err) {
             error.Canceled => return err,
             else => return false,
         };
@@ -1369,6 +1402,21 @@ fn seedManagedArtifactsWithHardLinks(
     }
 }
 
+fn sameDownloadSource(left: ?managed_receipt.DownloadSource, right: ?managed_receipt.DownloadSource) bool {
+    const a = left orelse return right == null;
+    const b = right orelse return false;
+    inline for (@typeInfo(managed_receipt.DownloadSource).@"struct".field_names) |name| {
+        const x = @field(a, name);
+        const y = @field(b, name);
+        if (@TypeOf(x) == ?[]const u8) {
+            if (x) |value| {
+                if (!std.mem.eql(u8, value, y orelse return false)) return false;
+            } else if (y != null) return false;
+        } else if (!std.mem.eql(u8, x, y)) return false;
+    }
+    return true;
+}
+
 fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, staging: []const u8) !bool {
     var published = managed_receipt.loadValidated(allocator, io, destination) catch |err| switch (err) {
         error.OutOfMemory, error.Canceled => return err,
@@ -1377,19 +1425,21 @@ fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destinati
     defer published.deinit();
     var candidate = try managed_receipt.loadValidated(allocator, io, staging) orelse return false;
     defer candidate.deinit();
-    const a_path = try managedPath(allocator, destination, managed_download_complete_filename);
-    defer allocator.free(a_path);
-    const b_path = try managedPath(allocator, staging, managed_download_complete_filename);
-    defer allocator.free(b_path);
+    // Receipt formatting, artifact order, and adding a previously absent
+    // checksum do not change executable bytes. Preserve source provenance and
+    // the exact artifact set, then prove byte identity for replaced inodes.
+    if (published.parsed.value.version != candidate.parsed.value.version or
+        !sameDownloadSource(published.parsed.value.source, candidate.parsed.value.source) or
+        published.artifacts.len != candidate.artifacts.len) return false;
     const cwd = std.Io.Dir.cwd();
-    const a = try cwd.readFileAlloc(io, a_path, allocator, .limited(managed_receipt.max_receipt_bytes));
-    defer allocator.free(a);
-    const b = try cwd.readFileAlloc(io, b_path, allocator, .limited(managed_receipt.max_receipt_bytes));
-    defer allocator.free(b);
-    // Include source revision and manifest digests, not just weight identity.
-    if (!std.mem.eql(u8, a, b)) return false;
     for (candidate.artifacts) |artifact| {
         const old = published.find(artifact.path) orelse return false;
+        if (old.size != artifact.size) return false;
+        // An absent legacy digest can be proven below. Conflicting declared
+        // digests require publication so a re-pull repairs a bad old receipt.
+        if (old.sha256) |old_digest| if (artifact.sha256) |new_digest| {
+            if (!std.mem.eql(u8, old_digest, new_digest)) return false;
+        };
         const old_stat = try cwd.statFile(io, old.canonical_path, .{});
         const new_stat = try cwd.statFile(io, artifact.canonical_path, .{});
         // Download validation already verified shared immutable inodes.
@@ -1757,6 +1807,7 @@ fn downloadPinnedQwenBundleArtifacts(
     defer receipts.deinit(allocator);
     var remaining_model_bytes = config.max_model_bytes;
 
+    var generated_digest: [64]u8 = undefined;
     for (artifacts, 0..) |artifact, i| {
         if (artifact.size > config.max_artifact_bytes or artifact.size > remaining_model_bytes) {
             return error.DownloadSizeLimitExceeded;
@@ -1799,12 +1850,13 @@ fn downloadPinnedQwenBundleArtifacts(
         if (manifest.len > remaining_model_bytes or manifest.len > config.max_artifact_bytes) {
             return error.DownloadSizeLimitExceeded;
         }
-        const relative_path = "antfly_inference_bundle.json";
+        const relative_path = bundle_descriptor_filename;
         const manifest_path = try managedPath(allocator, dest_dir, relative_path);
         defer allocator.free(manifest_path);
         try writeFileAtomically(allocator, io, manifest_path, manifest);
         remaining_model_bytes = try consumeModelBudget(remaining_model_bytes, manifest.len);
-        try receipts.append(allocator, .{ .path = relative_path, .size = manifest.len });
+        generated_digest = (GeneratedArtifact{ .path = relative_path, .bytes = manifest }).sha256();
+        try receipts.append(allocator, .{ .path = relative_path, .size = manifest.len, .sha256 = &generated_digest });
     }
 
     const receipt_json = try std.json.Stringify.valueAlloc(
@@ -5479,17 +5531,17 @@ test "pinned bundle re-pull verifies bytes without mutating the live installatio
     // Limits apply to the full selected set, including the generated manifest,
     // on both the staged and cached paths. Rejection must not hash or mutate.
     const exact = HubConfig{ .max_model_bytes = 9, .max_artifact_bytes = 7 };
-    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, &artifacts, exact, .{}));
-    try std.testing.expectError(error.ModelSizeLimitExceeded, installedPinnedBundleMatches(a, io, directory, &artifacts, .{ .max_model_bytes = 8 }, .{}));
-    try std.testing.expectError(error.DownloadSizeLimitExceeded, installedPinnedBundleMatches(a, io, directory, &artifacts, .{ .max_artifact_bytes = 6 }, .{}));
-    try std.testing.expectError(error.InvalidDownloadSizeLimit, installedPinnedBundleMatches(a, io, directory, &artifacts, .{ .max_model_bytes = 0 }, .{}));
+    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, .{ .artifacts = &artifacts }, exact, .{}));
+    try std.testing.expectError(error.ModelSizeLimitExceeded, installedPinnedBundleMatches(a, io, directory, .{ .artifacts = &artifacts }, .{ .max_model_bytes = 8 }, .{}));
+    try std.testing.expectError(error.DownloadSizeLimitExceeded, installedPinnedBundleMatches(a, io, directory, .{ .artifacts = &artifacts }, .{ .max_artifact_bytes = 6 }, .{}));
+    try std.testing.expectError(error.InvalidDownloadSizeLimit, installedPinnedBundleMatches(a, io, directory, .{ .artifacts = &artifacts }, .{ .max_model_bytes = 0 }, .{}));
     const before = try std.Io.Dir.cwd().statFile(io, path, .{});
-    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, &artifacts, .{}, .{}));
+    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, .{ .artifacts = &artifacts }, .{}, .{}));
     const after = try std.Io.Dir.cwd().statFile(io, path, .{});
     try std.testing.expectEqual(before.inode, after.inode);
     try std.testing.expectEqual(before.ctime.toNanoseconds(), after.ctime.toNanoseconds());
     var cancelled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Canceled, installedPinnedBundleMatches(a, io, directory, &artifacts, .{}, .{ .cancelled = &cancelled }));
+    try std.testing.expectError(error.Canceled, installedPinnedBundleMatches(a, io, directory, .{ .artifacts = &artifacts }, .{}, .{ .cancelled = &cancelled }));
     const interrupted = try managedSiblingPath(a, directory, managed_download_staging_suffix);
     defer a.free(interrupted);
     const backup = try managedSiblingPath(a, directory, managed_download_backup_suffix);
@@ -5501,7 +5553,7 @@ test "pinned bundle re-pull verifies bytes without mutating the live installatio
     try std.testing.expect(!try pathExists(std.Io.Dir.cwd(), io, backup));
     // A same-size local mutation must repair instead of trusting the receipt.
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "corrupt" });
-    try std.testing.expect(!try installedPinnedBundleMatches(a, io, directory, &artifacts, .{}, .{}));
+    try std.testing.expect(!try installedPinnedBundleMatches(a, io, directory, .{ .artifacts = &artifacts }, .{}, .{}));
 }
 
 test "managed model transaction preserves unchanged publication and replaces changed content" {
@@ -5577,4 +5629,123 @@ test "managed pull limits include generated artifacts on staged and cached paths
     try std.testing.expectError(error.DownloadSizeLimitExceeded, validateManagedDownloadLimits(a, io, directory, .{ .max_artifact_bytes = 7 }));
     const sizes = [_]struct { size: u64 }{ .{ .size = std.math.maxInt(u64) }, .{ .size = 1 } };
     try std.testing.expectError(error.ModelSizeLimitExceeded, validateArtifactLimits(&sizes, 0, .{ .max_model_bytes = std.math.maxInt(u64), .max_artifact_bytes = std.math.maxInt(u64) }));
+}
+
+/// Exercise the real pinned downloader and publication transaction with tiny,
+/// already-cached payloads and the production-generated descriptor bytes.
+/// An unreachable Hub endpoint makes any accidental download fail this test.
+fn testGeneratedBundlePublication(descriptor: []const u8, payload_name: []const u8) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try testTmpPath(a, tmp, "generated");
+    defer a.free(directory);
+    const artifacts = [_]qwen3vl_catalog.Artifact{.{ .repo = "fixture/bundle", .revision = "pinned", .path = payload_name, .size = 7, .sha256 = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5" }};
+    const generated = [_]GeneratedArtifact{.{ .path = bundle_descriptor_filename, .bytes = descriptor }};
+    const contract = PinnedBundleContract{ .artifacts = &artifacts, .generated = &generated };
+    const config = HubConfig{ .base_url = "http://127.0.0.1:1", .artifact_timeout_ms = 1000 };
+    try beginManagedDownload(a, io, directory);
+    const weights = try managedPath(a, directory, payload_name);
+    defer a.free(weights);
+    try writeFileAtomically(a, io, weights, "payload");
+    try downloadPinnedQwenBundleArtifacts(a, io, "fixture", "bundle", "pinned", &artifacts, descriptor, directory, config, .{});
+    try writeManagedArtifactAndUpdatePlan(a, io, directory, "model_manifest.json", "{}");
+    try completeManagedDownload(a, io, directory);
+    var receipt = (try managed_receipt.loadValidated(a, io, directory)).?;
+    const digest = generated[0].sha256();
+    try std.testing.expectEqualStrings(&digest, receipt.find(bundle_descriptor_filename).?.sha256.?);
+    receipt.deinit();
+
+    // Old releases omitted the descriptor checksum. Reformatting this receipt
+    // also ensures staged equality is semantic rather than raw JSON equality.
+    const complete = try managedPath(a, directory, managed_download_complete_filename);
+    defer a.free(complete);
+    const raw = try cwd.readFileAlloc(io, complete, a, .limited(4096));
+    defer a.free(raw);
+    var parsed = try std.json.parseFromSlice(ManagedDownloadReceipt, a, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    for (@constCast(parsed.value.artifacts)) |*artifact| {
+        if (std.mem.eql(u8, artifact.path, bundle_descriptor_filename)) artifact.sha256 = null;
+    }
+    const legacy = try std.json.Stringify.valueAlloc(a, parsed.value, .{ .whitespace = .indent_2, .emit_null_optional_fields = false });
+    defer a.free(legacy);
+    try writeFileAtomically(a, io, complete, legacy);
+    const marker = try managedPath(a, directory, bundle_descriptor_filename);
+    defer a.free(marker);
+    const manifest = try managedPath(a, directory, "model_manifest.json");
+    defer a.free(manifest);
+    const watched = [_][]const u8{ directory, weights, marker, manifest, complete };
+    var before: [watched.len]std.Io.File.Stat = undefined;
+    for (watched, &before) |path, *stat| stat.* = try cwd.statFile(io, path, .{});
+    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, contract, config, .{}));
+    for (watched, before) |path, stat| {
+        const after = try cwd.statFile(io, path, .{});
+        try std.testing.expectEqual(stat.inode, after.inode);
+        try std.testing.expectEqual(stat.mtime.toNanoseconds(), after.mtime.toNanoseconds());
+        try std.testing.expectEqual(stat.ctime.toNanoseconds(), after.ctime.toNanoseconds());
+    }
+    // Both aggregate and individual limits include generated descriptors.
+    try std.testing.expectError(error.ModelSizeLimitExceeded, installedPinnedBundleMatches(a, io, directory, contract, .{ .max_model_bytes = 8 + descriptor.len }, .{}));
+    try std.testing.expectError(error.DownloadSizeLimitExceeded, installedPinnedBundleMatches(a, io, directory, contract, .{ .max_artifact_bytes = descriptor.len - 1 }, .{}));
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, installedPinnedBundleMatches(a, io, directory, contract, config, .{ .cancelled = &cancelled }));
+
+    // Content must match the catalog even when the legacy receipt has no hash.
+    const changed = try a.dupe(u8, descriptor);
+    defer a.free(changed);
+    changed[2] = if (changed[2] == 'f') 'F' else 'f';
+    try writeFileAtomically(a, io, marker, changed);
+    try std.testing.expect(!try installedPinnedBundleMatches(a, io, directory, contract, config, .{}));
+    try writeFileAtomically(a, io, marker, descriptor);
+
+    // Explicit overrides still stage. Adding the descriptor hash must not
+    // publish a new directory, even on repeated pulls of an old installation.
+    for (0..2) |_| {
+        var transaction = try ManagedModelTransaction.begin(a, io, directory);
+        defer transaction.deinit(io);
+        try downloadPinnedQwenBundleArtifacts(a, io, "fixture", "bundle", "pinned", &artifacts, descriptor, transaction.staging, config, .{});
+        try writeManagedArtifactAndUpdatePlan(a, io, transaction.staging, "model_manifest.json", "{}");
+        try completeManagedDownload(a, io, transaction.staging);
+        try transaction.commit(io);
+        try std.testing.expectEqual(before[0].inode, (try cwd.statFile(io, directory, .{})).inode);
+        try std.testing.expect(!try pathExists(cwd, io, transaction.staging));
+        try std.testing.expect(!try pathExists(cwd, io, transaction.backup));
+    }
+    // A changed descriptor is a changed executable contract, regardless of size.
+    var update = try ManagedModelTransaction.begin(a, io, directory);
+    defer update.deinit(io);
+    try downloadPinnedQwenBundleArtifacts(a, io, "fixture", "bundle", "pinned", &artifacts, changed, update.staging, config, .{});
+    try writeManagedArtifactAndUpdatePlan(a, io, update.staging, "model_manifest.json", "{}");
+    try completeManagedDownload(a, io, update.staging);
+    try update.commit(io);
+    const updated_inode = (try cwd.statFile(io, directory, .{})).inode;
+    try std.testing.expect(updated_inode != before[0].inode);
+    try std.testing.expect(!try installedPinnedBundleMatches(a, io, directory, contract, config, .{}));
+    const changed_contract = PinnedBundleContract{ .artifacts = &artifacts, .generated = &.{.{ .path = bundle_descriptor_filename, .bytes = changed }} };
+    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, changed_contract, config, .{}));
+    // Identical bytes under different source provenance still publish anew.
+    var source_update = try ManagedModelTransaction.begin(a, io, directory);
+    defer source_update.deinit(io);
+    try downloadPinnedQwenBundleArtifacts(a, io, "different-owner", "bundle", "pinned", &artifacts, changed, source_update.staging, config, .{});
+    try writeManagedArtifactAndUpdatePlan(a, io, source_update.staging, "model_manifest.json", "{}");
+    try completeManagedDownload(a, io, source_update.staging);
+    try source_update.commit(io);
+    try std.testing.expect(updated_inode != (try cwd.statFile(io, directory, .{})).inode);
+}
+
+test "Qwen3-VL GGUF generated descriptor preserves legacy and staged re-pulls" {
+    const bundle = &qwen3vl_catalog.generation_bundles[0];
+    const descriptor = try qwen3vl_catalog.generationBundleManifestAlloc(std.testing.allocator, bundle);
+    defer std.testing.allocator.free(descriptor);
+    try testGeneratedBundlePublication(descriptor, bundle.decoder.path);
+}
+
+test "Qwen3-VL safetensors generated descriptor preserves legacy and staged re-pulls" {
+    try testGeneratedBundlePublication(qwen3vl_catalog.generation_safetensors_bundle_manifest, "model.safetensors");
+}
+
+test "Qwen3-VL reranker generated descriptor preserves legacy and staged re-pulls" {
+    try testGeneratedBundlePublication(qwen3vl_catalog.reranker_bundle_manifest, "model.safetensors");
 }
