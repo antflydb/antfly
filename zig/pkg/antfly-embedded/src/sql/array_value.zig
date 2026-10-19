@@ -664,12 +664,20 @@ pub fn validateShape(dimensions: []const Dimension, count_: usize, limits: Limit
 }
 
 pub fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
+    _ = try validateElementHash(kind, element, budget);
+}
+
+/// JSONB semantic hashing is part of validation (including numeric tokens).
+/// Return that hash to immediate lookup callers rather than traversing the
+/// same probe again. Other types retain their existing validation/hash paths.
+/// Only immediate callers receive it, after full validation succeeds.
+fn validateElementHash(kind: ElementType, element: Element, budget: *Budget) !?u64 {
     try budget.consume(1);
     if (element.patterns != null or element.array != null) return error.SqlTypeMismatch;
     if (element.numeric != null and (kind != .numeric or element.sql_null or element.value != .null)) return error.SqlTypeMismatch;
     if (element.sql_null) {
         if (element.value != .null) return error.InvalidSqlArrayShape;
-        return;
+        return null;
     }
     const value = element.value;
     switch (kind) {
@@ -706,9 +714,10 @@ pub fn validateElement(kind: ElementType, element: Element, budget: *Budget) !vo
         .boolean => if (value != .bool) return error.SqlTypeMismatch,
         .jsonb => {
             try json_order.validateTextDomain(value, budget, 0);
-            _ = try json_order.hash(value, budget, 0);
+            return try json_order.hash(value, budget, 0);
         },
     }
+    return null;
 }
 
 /// PostgreSQL's shape tie-break follows equal row-major elements. Reuse it
@@ -1372,7 +1381,7 @@ pub const Membership = struct {
     /// Hashed equality ANY preserves SQL NULL provenance. The caller excludes
     /// mixed/exact numeric comparisons that require a different hash domain.
     pub fn equalAny(self: *const Membership, element: Element, work: *Budget) !?bool {
-        try validateElement(switch (self.value.element_type) {
+        const validated_hash = try validateElementHash(switch (self.value.element_type) {
             .int16, .int32 => .int64,
             .float32 => .float64,
             else => self.value.element_type,
@@ -1380,15 +1389,15 @@ pub const Membership = struct {
         try work.consume(1);
         if (self.value.cardinality() == 0) return false;
         if (element.sql_null) return null;
-        if (try self.find(element, try hashElement(self.value.element_type, element, work), work) != null) return true;
+        if (try self.find(element, validated_hash orelse try hashElement(self.value.element_type, element, work), work) != null) return true;
         return if (self.first_null != null) null else false;
     }
 
     pub fn firstPosition(self: *const Membership, element: Element, work: *Budget) !?i32 {
-        try validateElement(self.value.element_type, element, work);
+        const validated_hash = try validateElementHash(self.value.element_type, element, work);
         if (self.value.dimensions.len > 1) return error.UnsupportedSqlShape;
         if (self.value.dimensions.len == 0) return null;
-        const ordinal = if (element.sql_null) self.first_null else try self.find(element, try hashElement(self.value.element_type, element, work), work);
+        const ordinal = if (element.sql_null) self.first_null else try self.find(element, validated_hash orelse try hashElement(self.value.element_type, element, work), work);
         return if (ordinal) |at| @intCast(@as(i64, self.value.dimensions[0].lower) + @as(i64, @intCast(at))) else null;
     }
 };
@@ -2216,4 +2225,93 @@ test "SQL membership construction adapts hash prefixes to tight headroom" {
     defer tight.deinit();
     try std.testing.expectEqual(@as(usize, 15360), tight.budget.peak);
     try std.testing.expectEqual(@as(usize, n), tight.count);
+}
+
+test "SQL JSONB lookup reuses validation hashes with exact bounded work" {
+    const a = std.testing.allocator;
+    const source = try Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "source" })}, .{});
+    var index = try Membership.init(a, source, .{});
+    defer index.deinit();
+    const payload: [4096]u8 = @splat('x');
+    const probe: Element = .json(.{ .string = &payload });
+    const allowance = 1024 * 1024;
+    // Reproduce the old validation-plus-rehash lookup with the same bucket
+    // checks so the saved work is isolated from table and collision behavior.
+    var legacy: Budget = .{ .remaining = allowance };
+    try validateElement(.jsonb, probe, &legacy);
+    try legacy.consume(1);
+    try std.testing.expect((try index.find(probe, try hashElement(.jsonb, probe, &legacy), &legacy)) == null);
+    var current: Budget = .{ .remaining = allowance };
+    try std.testing.expectEqual(@as(?bool, false), try index.equalAny(probe, &current));
+    const before = allowance - legacy.remaining;
+    const after = allowance - current.remaining;
+    try std.testing.expectEqual(@as(usize, payload.len + 2), before - after);
+    var exact: Budget = .{ .remaining = after };
+    try std.testing.expectEqual(@as(?bool, false), try index.equalAny(probe, &exact));
+    try std.testing.expectEqual(@as(usize, 0), exact.remaining);
+    var short: Budget = .{ .remaining = after - 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, index.equalAny(probe, &short));
+    var position: Budget = .{ .remaining = allowance };
+    try std.testing.expectEqual(@as(?i32, null), try index.firstPosition(probe, &position));
+    const position_work = allowance - position.remaining;
+    try std.testing.expectEqual(after - 1, position_work);
+    var exact_position: Budget = .{ .remaining = position_work };
+    try std.testing.expectEqual(@as(?i32, null), try index.firstPosition(probe, &exact_position));
+    try std.testing.expectEqual(@as(usize, 0), exact_position.remaining);
+    var short_position: Budget = .{ .remaining = position_work - 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, index.firstPosition(probe, &short_position));
+    // Request exhaustion and cancellation must remain sticky even when the
+    // validation hash is available before the lookup starts.
+    var exhausted: @import("numeric_value.zig").Context = .{ .alloc = std.testing.failing_allocator, .remaining = after - 1 };
+    var shared: Budget = .{ .shared = &exhausted };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, index.equalAny(probe, &shared));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, shared.consume(0));
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var canceled: @import("numeric_value.zig").Context = .{ .alloc = std.testing.failing_allocator, .checkpoint = Cancel.check };
+    var interrupted: Budget = .{ .shared = &canceled };
+    try std.testing.expectError(error.Canceled, index.firstPosition(probe, &interrupted));
+    try std.testing.expectError(error.Canceled, interrupted.consume(0));
+    std.debug.print("SQL_JSONB_PROBE_HASH bytes={} old_lookup_work={} reused_lookup_work={} reused_position_work={} retained_probe_bytes=0\n", .{ payload.len, before, after, position_work });
+}
+
+test "SQL JSONB lookup hash reuse preserves semantic equality nulls and validation errors" {
+    const a = std.testing.allocator;
+    var object = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":1,\"b\":[true,null]}", .{});
+    defer object.deinit();
+    var reordered = try std.json.parseFromSlice(std.json.Value, a, "{\"b\":[true,null],\"a\":1.0}", .{});
+    defer reordered.deinit();
+    var array = try std.json.parseFromSlice(std.json.Value, a, "[1,\"alpha\",null]", .{});
+    defer array.deinit();
+    const source = try Value.init(.jsonb, &.{.{ .length = 7, .lower = -7 }}, &.{ .json(.{ .string = "alpha" }), .json(.{ .number_string = "1" }), .json(.{ .bool = true }), .json(.null), .json(object.value), .{}, .json(array.value) }, .{});
+    var index = try Membership.init(a, source, .{});
+    defer index.deinit();
+    for ([_]Element{ .json(.{ .string = "alpha" }), .json(.{ .number_string = "1.000" }), .json(.{ .integer = 1 }), .json(.{ .float = 1 }), .json(.{ .bool = true }), .json(.null), .json(reordered.value), .json(array.value), .{}, .json(.{ .string = "missing" }) }) |probe| {
+        var work: Budget = .{};
+        try std.testing.expectEqual(try source.quantified(probe, .eq, .any, &work), try index.equalAny(probe, &work));
+        try std.testing.expectEqual(try source.position(probe, null, &work), try index.firstPosition(probe, &work));
+    }
+    // Invalid probes still fail before any reusable hash can escape, including
+    // invalid numeric tokens that text-domain validation alone cannot reject.
+    var invalid_object = try std.json.parseFromSlice(std.json.Value, a, "{\"bad\\u0000key\":1}", .{});
+    defer invalid_object.deinit();
+    var nested: [132]u8 = undefined;
+    @memset(nested[0..66], '[');
+    @memset(nested[66..], ']');
+    var deep = try std.json.parseFromSlice(std.json.Value, a, &nested, .{});
+    defer deep.deinit();
+    for ([_]Element{ .json(.{ .string = "bad\x00text" }), .json(.{ .string = "\xff" }), .json(.{ .number_string = "invalid" }), .json(invalid_object.value), .json(deep.value), .{ .value = .{ .string = "not SQL NULL" } }, .typedArray(&source) }) |probe| {
+        var work: Budget = .{};
+        validateElement(.jsonb, probe, &work) catch |expected| {
+            var any_work: Budget = .{};
+            try std.testing.expectError(expected, index.equalAny(probe, &any_work));
+            var position_work: Budget = .{};
+            try std.testing.expectError(expected, index.firstPosition(probe, &position_work));
+            continue;
+        };
+        return error.TestExpectedError;
+    }
 }
