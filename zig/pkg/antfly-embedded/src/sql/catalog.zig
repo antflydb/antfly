@@ -762,6 +762,12 @@ pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed,
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
 pub const AggregatePartialCursor = struct {
+    /// Providers may prove a unique complete cohort before the first pull.
+    /// Slots refer to the requested recipe, independent of physical order.
+    final_group_proof: ?struct { count: u64, slots: []const u16 } = null,
+    /// Transfer the cursor's ownership into an empty result operator. False
+    /// preserves the ordinary partial path; a successful transfer is streamed.
+    adopt_final_groups: ?*const fn (*anyopaque, *@import("operators.zig").Grouped, usize) anyerror!bool = null,
     /// Optional ownership transfer before the first pull. The provider proves
     /// one state per final recipe key, with the exact recipe slots and limits.
     /// A successful transfer leaves close responsible only for cursor resources.

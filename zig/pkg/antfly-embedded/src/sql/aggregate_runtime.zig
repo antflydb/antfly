@@ -238,13 +238,14 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner
     defer cursor.close(cursor.ptr);
     if (bound.input.predicate == null and for (bound.filters) |filter| {
         if (filter != null) break false;
-    } else true) if (cursor.take_final_groups) |take| {
-        if (try take(cursor.ptr)) |final| {
+    } else true) {
+        if (cursor.adopt_final_groups) |adopt| if (try adopt(cursor.ptr, grouped_owner.*, context.limits.scan_pages)) return true;
+        if (cursor.take_final_groups) |take| if (try take(cursor.ptr)) |final| {
             grouped_owner.*.deinit();
             grouped_owner.* = final;
             return true;
-        }
-    };
+        };
+    }
     const grouped = grouped_owner.*;
     var pages: usize = 0;
     var groups: usize = 0;

@@ -255,11 +255,15 @@ pub const Plan = struct {
     }
     pub fn initPaged(a: A, out: A, provider: *Provider, previous: []const File, directory: ?@import("../serverless/graph_segment/page_tree.zig").Ref, has_seed: bool, delta_compatible: bool) !Plan {
         if (provider.resume_work) |work| if (work.file) |ordinal| {
-            if (ordinal + 1 != provider.source.inventory.files.len or previous.len != 0 or (if (directory) |root| root.records else 0) != ordinal) return error.InvalidNativeLakeFileState;
+            const end = work.end orelse ordinal + 1;
+            if (end <= ordinal or end != provider.source.inventory.files.len or previous.len != 0 or (if (directory) |root| root.records else 0) != ordinal) return error.InvalidNativeLakeFileState;
             const input = provider.source.inventory.files[ordinal];
-            var self: Plan = .{ .a = a, .append_provider = provider, .by_id = work.positions orelse return error.InvalidNativeLakeFileState, .borrowed_positions = true, .append_file = .{ .ordinal = ordinal, .file = .{ .id = input.file_id, .digest = try identity(a, provider, input) } }, .append_count = ordinal + 1, .prior_directory = directory };
+            var self: Plan = .{ .a = a, .append_provider = provider, .by_id = work.positions orelse return error.InvalidNativeLakeFileState, .borrowed_positions = true, .append_file = .{ .ordinal = ordinal, .file = .{ .id = input.file_id, .digest = try identity(a, provider, input) } }, .append_count = end, .prior_directory = directory };
             errdefer self.deinit();
             if (self.by_id.get(input.file_id) != ordinal) return error.InvalidNativeLakeFileState;
+            for (provider.source.inventory.files[ordinal..end], ordinal..) |entry, index| {
+                try self.updates.put(a, index, if (index == ordinal) self.append_file.?.file else .{ .id = entry.file_id, .digest = try identity(a, provider, entry) });
+            }
             return self;
         };
         if (!has_seed or delta_compatible or previous.len == 0 and directory == null) if (provider.native_delta) |delta| if (delta.selection) |selection| {
@@ -327,7 +331,7 @@ pub const Plan = struct {
         return slot.value_ptr;
     }
     pub fn isChanged(self: *const Plan, index: usize) bool {
-        if (self.append_file) |item| return index == item.ordinal;
+        if (self.append_file) |item| return index >= item.ordinal and index < self.append_count;
         return self.force_all or if (self.selection) |selection| selection.changed(index) else self.changed[index];
     }
     pub const Iterator = struct {
@@ -337,9 +341,10 @@ pub const Plan = struct {
         sparse: ?Selection.Iterator = null,
         pub fn next(self: *Iterator) !?Selection.Item {
             if (self.plan.append_file) |item| {
-                if (self.position != 0) return null;
-                self.position = 1;
-                return .{ .ordinal = item.ordinal, .file = try self.plan.stateAt(item.ordinal) };
+                const ordinal = item.ordinal + self.position;
+                if (ordinal == self.plan.append_count) return null;
+                self.position += 1;
+                return .{ .ordinal = ordinal, .file = try self.plan.stateAt(ordinal) };
             }
             if (self.sparse) |*iterator_| {
                 const item = (try iterator_.next()) orelse return null;
@@ -427,7 +432,7 @@ pub const Plan = struct {
         return std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ std.fmt.bytesToHex(&(try self.stateAt(file)).digest, .lower), row.row_group_ordinal, row.row_ordinal });
     }
     pub fn unchanged(self: *const Plan, file: File) bool {
-        if (self.append_file) |item| return !std.mem.eql(u8, file.id, item.file.id) and (self.by_id.get(file.id) orelse return false) < self.append_count;
+        if (self.append_file) |item| return (self.by_id.get(file.id) orelse return false) < item.ordinal;
         const ordinal = self.by_id.get(file.id) orelse return false;
         return !self.isChanged(ordinal) and std.mem.eql(u8, &file.digest, &(self.stateAt(ordinal) catch return false).digest);
     }

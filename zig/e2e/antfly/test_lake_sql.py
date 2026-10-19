@@ -6417,9 +6417,9 @@ def test_compact_parquet_encodings_attach_query_and_restart(
         server.stop(test_failed=failed)
 
 
-@pytest.mark.parametrize("text_copies", [7, 33])
+@pytest.mark.parametrize("text_copies,parts", [(7, 3), (33, 3), (33, 9)])
 def test_native_configuration_cohorts_and_group_directories_survive_restart(
-    tmp_path, text_copies
+    tmp_path, text_copies, parts
 ):
     """Resident and file-major builds retain exact results through source loss/restart."""
     pa = pytest.importorskip("pyarrow")
@@ -6435,7 +6435,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
     base = 9007199254740993
     expected = {k: [0, 0] for k in range(17)}
     originals = []
-    for part in range(3):
+    for part in range(parts):
         ids = list(range(part * 512, (part + 1) * 512))
         path = tmp_path / "part.parquet"
         pq.write_table(
@@ -6588,7 +6588,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         assert call("POST", "/sql", {"statement": statement})["rows"] == rows
         assert call(
             "POST", "/sql", {"statement": "SELECT COUNT(*) FROM native_cohorts"}
-        )["rows"] == [["1536"]]
+        )["rows"] == [[str(parts * 512)]]
         failed = False
     finally:
         server.stop(test_failed=failed)

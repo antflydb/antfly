@@ -40,6 +40,18 @@ pub fn read(a: A, group: operators.GroupResult, index: usize, spec: operators.Ag
     return state;
 }
 
+/// Finalization of a borrowed immutable state must not mutate its NUMERIC
+/// result memo or allocate through a shared cache owner's allocator.
+pub fn finishBorrowed(a: A, state: operators.Aggregate) !Datum {
+    if (state.numeric) |numeric| {
+        var owned = try numeric.clone(a);
+        defer owned.deinit();
+        const value = (try owned.finish(state.kind == .avg)) orelse return .{};
+        return operators.cloneDatum(a, Datum.typedNumeric(value));
+    }
+    return operators.cloneDatum(a, try state.finish());
+}
+
 fn elementId(identity: ?@import("array_value.zig").ElementType) u8 {
     return if (identity) |kind| switch (kind) {
         .text => 0,
@@ -728,5 +740,24 @@ test "SQL exact NUMERIC checkpoint lanes validate full signatures and truncated 
         var context: @import("numeric_value.zig").Context = .{ .alloc = a };
         try std.testing.expect(try lane.numeric.?.equivalent(&context, state.numeric.?.state));
         for (0..encoded.value.string.len) |end| try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(a, Datum.json(.{ .string = encoded.value.string[0..end] }), spec));
+    }
+}
+
+test "SQL borrowed numeric aggregate finalization leaves shared memo immutable" {
+    const a = std.testing.allocator;
+    var source = try operators.Aggregate.initTyped(a, .sum, .number, .numeric);
+    defer source.deinit();
+    const numeric = @import("numeric_value.zig");
+    var context: numeric.Context = .{ .alloc = a };
+    var value = try numeric.parse(&context, "9007199254740993.1200");
+    defer value.deinit();
+    try source.update(Datum.typedNumeric(&value.value));
+    for (0..2) |_| {
+        var page = std.heap.ArenaAllocator.init(a);
+        defer page.deinit();
+        const result = try finishBorrowed(page.allocator(), source);
+        try std.testing.expect(result.numeric != null);
+        try std.testing.expectEqual(std.math.Order.eq, try numeric.order(&context, result.numeric.?.*, value.value));
+        try std.testing.expect(source.numeric.?.result == null);
     }
 }

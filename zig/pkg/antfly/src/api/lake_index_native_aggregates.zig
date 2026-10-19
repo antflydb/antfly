@@ -756,9 +756,19 @@ const Reduction = struct {
         const work = provider.resume_work orelse return null;
         const file = work.file orelse return null;
         const index = self.index orelse return error.InvalidLakeIndexCatalog;
-        if (file + 1 != provider.source.inventory.files.len) return error.InvalidLakeIndexCatalog;
-        const incoming = try self.resolver.?.resolve(.{ .key = fileIdentity(provider.source, provider.source.inventory.files[file]), .index = file });
-        if (file == 0) return incoming;
+        const end = work.end orelse file + 1;
+        if (end <= file or end != provider.source.inventory.files.len) return error.InvalidLakeIndexCatalog;
+        const changes = try self.out.alloc(Mutation, end - file);
+        for (changes, file..) |*change, ordinal| {
+            const incoming = try self.resolver.?.resolve(.{ .key = fileIdentity(provider.source, provider.source.inventory.files[ordinal]), .index = ordinal });
+            change.* = .{ .key = incoming.key, .replacement = incoming };
+        }
+        std.mem.sort(Mutation, changes, {}, struct {
+            fn less(_: void, l: Mutation, r: Mutation) bool {
+                return std.mem.lessThan(u8, &l.key, &r.key);
+            }
+        }.less);
+        if (file == 0) return try self.editBatch(null, changes, 0);
         var prior: ?[32]u8 = null;
         for (self.names, 0..) |name, slot| {
             const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
@@ -767,8 +777,8 @@ const Reduction = struct {
             prior = record.file;
         }
         const previous = try self.loadNode(prior.?);
-        const root = (try self.editBatch(previous, &.{.{ .key = incoming.key, .replacement = incoming }}, 0)) orelse return error.InvalidLakeIndexCatalog;
-        if (root.range.?.files != file + 1) return error.InvalidLakeIndexCatalog;
+        const root = (try self.editBatch(previous, changes, 0)) orelse return error.InvalidLakeIndexCatalog;
+        if (root.range.?.files != end) return error.InvalidLakeIndexCatalog;
         try index.recordDeltaReduction();
         return root;
     }
@@ -1337,7 +1347,9 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
     defer fs.deinit();
     var client = fs.client();
     try client.makeBucket("antfly");
-    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 1, 2, 7 }, .field_id = 1 }});
+    var amounts: [300]i64 = undefined;
+    for (&amounts, 1..) |*value, ordinal| value.* = @intCast(ordinal);
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &amounts, .field_id = 1 }});
     defer a.free(data);
     for (0..16) |index| {
         const key = try std.fmt.allocPrint(a, "part-{d}.parquet", .{index});
@@ -1495,7 +1507,7 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
                 }), result.aggregates[0].value.integer);
                 count += 1;
             }
-            try std.testing.expectEqual(@as(usize, 3), count);
+            try std.testing.expectEqual(@as(usize, 300), count);
         }
         previous = built;
     }

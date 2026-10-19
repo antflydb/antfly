@@ -50,6 +50,12 @@ pub const Composition = struct {
     pub fn cursor(self: *Composition) Cursor {
         return .{ .ptr = self, .next = next, .close = close };
     }
+    /// Preflight the first complete cohort without consuming any partials.
+    pub fn prime(self: *Composition) !Cursor {
+        if (self.slot != 0) return error.InvalidSqlBackendResponse;
+        if (self.child == null) self.child = try self.factory.open(self.factory.ptr, 0);
+        return self.child.?;
+    }
     fn next(raw: *anyopaque, a: A, maximum: u32) !?[]const GroupResult {
         const self: *Composition = @ptrCast(@alignCast(raw));
         if (maximum == 0) return error.InvalidSqlLimit;

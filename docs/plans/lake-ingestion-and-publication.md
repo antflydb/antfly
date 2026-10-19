@@ -2675,10 +2675,10 @@ archive-scale throughput or RSS benchmark.
 ### Paged append frontiers, physical work accounting and adaptive packs (protocol 60)
 
 Cold publications beyond retained-cohort admission advance an attempt-private
-append frontier. The source snapshot and upload fence remain fixed; only one new
-file enters each configuration's checkpoint. Shared source positions are built
+append frontier. The source snapshot and upload fence remain fixed; a bounded window of new
+files enters each configuration's checkpoint. Shared source positions are built
 once (or borrowed from the source catalog), and the reached public navigation
-tree path-copies one name per file. Prefix views never become serving authority.
+tree path-copies one name per reached file. Prefix views never become serving authority.
 Only complete final roots enter progress/recovery and atomic publication, and
 only the final ordered root carries the complete source-cut commitment.
 
@@ -2745,3 +2745,42 @@ source-unavailable grouped reads after restart. The corruption fixture locates
 both standalone blocks and embedded packs and requires integrity rejection
 before restoring the objects. The 33-index case completes in 29.8 seconds on
 the local stripped Debug server; archive-scale throughput/RSS is unmeasured.
+
+### Bounded build windows and finalized aggregate streams
+
+Cold file-major publication advances up to four files per private checkpoint.
+Native dense/sparse builders keep one handle open across that window; ordered,
+text and aggregate builders likewise checkpoint the reached prefix once per
+window. This amortizes reopen/manifest work without retaining every index's
+mutable state for the entire archive. The coordinator retains at most two
+windows and overlaps the next capture with current consumers only when shared
+scheduler and statement admission cover a second scan workspace. The windows
+share the existing replay memory and disk allowances. Each window shrinks to its
+admitted prefix; an oversized first file uses ordinary serial streaming. Capture
+futures drain before source/replay owners retire, including cancellation/error
+paths. Only the complete final roots become serving or recovery authority.
+
+Aggregate output block sizes are bounded by encoded bytes as well as row count.
+A small resident result whose keys exceed the flat pack ceiling falls back to
+ordinary immutable blocks; each block repeatedly halves its candidate row span
+until it fits the 4 MiB limit. Single oversized rows, block-count limits and total
+output limits remain errors. A 128-group regression with 34,004-byte keys covers
+this case without requiring a grouping spill.
+
+A complete authenticated materialized aggregate cohort can transfer a finalized
+group stream into SQL execution. The reader proves unique final groups and full
+requested-slot coverage, and the executor retains only its current result page.
+It skips rebuilding a hash table and spilling already reduced groups. Queries
+with an upper predicate or aggregate FILTER, or recipes spanning independent
+cohorts, retain partial-state merging. Group counts, scan pages, current table
+and reader authority, cancellation and final response limits still apply.
+NUMERIC finalization clones borrowed reducer state before populating its result
+memo, preserving shared cache immutability. Stream ownership transfers only on
+successful adoption and closes once with the consuming grouping operator.
+
+Qualification includes a nine-file, five-family native fixture crossing three
+windows and public Parquet restart/source-loss cases with 33 text indexes over
+three and nine files. The shared SQL regression streams 10,000 final groups with
+a 16 KiB grouping budget and verifies zero hash probes. These fixtures establish
+bounded execution and correctness; archive-scale throughput and RSS remain to be
+measured.

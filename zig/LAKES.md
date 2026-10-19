@@ -1305,3 +1305,19 @@ Native logical generation size and cumulative newly published output have
 separate limits, so unchanged chunk references do not exhaust output work.
 Replay capture forwards prepared native scalar/dictionary vectors directly to
 the physical spill codec while preserving established conversion/fallback paths.
+
+
+Cold file-major checkpoints now cover up to four files, with one native builder
+session per configuration/window. At most two windows share the existing replay
+memory/disk allowance; admitted read-ahead overlaps capture with consumption.
+Quota pressure shortens a window, and an unretainable file keeps serial streaming
+fallback. Only complete final roots enter serving/recovery publication.
+
+Wide aggregate groups fall back from flat packs to byte-bounded immutable blocks
+without requiring a grouping spill. Complete authenticated aggregate cohorts can
+stream final groups directly to SQL result execution, avoiding a second hash
+reducer and spill pass. Full slot coverage and absence of an upper predicate or
+aggregate FILTER are required. Group/page/response limits, current authority and
+reader lifetime checks remain active. Exact NUMERIC finalization leaves shared
+cached states immutable. No durable format, attachment or query syntax changes
+are required.

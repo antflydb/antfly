@@ -192,7 +192,8 @@ pub fn buildAppend(a: A, out: A, provider: *Provider, store: *stores.ArtifactSto
     const ordinal = work.file orelse return null;
     if (ordinal == 0) return null;
     const navigation = work.navigation orelse return error.InvalidNativeLakeFileState;
-    if (ordinal + 1 != provider.source.inventory.files.len or navigation.count != ordinal + 1) return error.InvalidNativeLakeFileState;
+    const end = work.end orelse ordinal + 1;
+    if (end <= ordinal or end != provider.source.inventory.files.len or navigation.count != end) return error.InvalidNativeLakeFileState;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
@@ -228,16 +229,20 @@ pub fn buildAppend(a: A, out: A, provider: *Provider, store: *stores.ArtifactSto
         var keys = columns.keyIterator();
         for (names) |*column| column.* = keys.next().?.*;
         projected.column_bindings = names;
-        var input = provider.*;
-        input.only_file = ordinal;
-        input.only_files = null;
-        input.only_plan = null;
-        const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, projected, token);
-        defer rows.deinit(a);
-        var row_ordinal: u64 = 0;
-        const file = provider.source.inventory.files[ordinal];
-        while (try rows.next(a)) |batch| try parent.consumeBatch(a, &entry, batch, file.file_id, @intCast(ordinal), &row_ordinal, provider.context, token);
-        const ref = try ordered.publishIncremental(a, ca, store, &entry.sort, name, digest, provider.source.inventory, cover, token, .{ .previous = previous, .sparse_slots = true, .retired_slots = &.{}, .dictionary_edits = &.{.{ .slot = @intCast(ordinal), .file = file.file_id, .fingerprint = try state.identity(a, provider, file) }}, .public_navigation = navigation, .source_cut = work.source_cut });
+        const edits = try ca.alloc(dictionaries.Edit, end - ordinal);
+        for (edits, ordinal..) |*edit, file_ordinal| {
+            var input = provider.*;
+            input.only_file = file_ordinal;
+            input.only_files = null;
+            input.only_plan = null;
+            const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, projected, token);
+            defer rows.deinit(a);
+            var row_ordinal: u64 = 0;
+            const file = provider.source.inventory.files[file_ordinal];
+            while (try rows.next(a)) |batch| try parent.consumeBatch(a, &entry, batch, file.file_id, @intCast(file_ordinal), &row_ordinal, provider.context, token);
+            edit.* = .{ .slot = @intCast(file_ordinal), .file = file.file_id, .fingerprint = try state.identity(a, provider, file) };
+        }
+        const ref = try ordered.publishIncremental(a, ca, store, &entry.sort, name, digest, provider.source.inventory, cover, token, .{ .previous = previous, .sparse_slots = true, .retired_slots = &.{}, .dictionary_edits = edits, .public_navigation = navigation, .source_cut = work.source_cut });
         declaration.* = .{ .name = name, .binding = binding, .artifact = ref };
     }
     // Public declarations have bounded metadata; no archive-sized dictionary is owned.

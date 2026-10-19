@@ -258,6 +258,8 @@ pub const Replay = struct {
     streamed_batches: usize = 0,
     retained_batches: usize = 0,
     pipeline: ?*@import("lake_index_build_pipeline.zig") = null,
+    /// A bounded cold-build window owns each sibling independently.
+    sibling: ?*Replay = null,
     /// A speculative lane pins only the first borrowed source batch. Joining
     /// transfers its cursor and this batch together; no replay spool is built.
     primed: ?rows.ColumnBatch = null,
@@ -518,6 +520,12 @@ pub const Replay = struct {
         }
         const file_index = only_file orelse return null;
         if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
+        if (consumer == null and self.captured_file != file_index) {
+            var sibling = self.sibling;
+            while (sibling) |candidate| : (sibling = candidate.sibling) {
+                if (candidate.ready and candidate.captured_file == file_index) return candidate.openFor(a, binding, only_file, cancellation, null);
+            }
+        }
         if (consumer) |slot| if (self.pipeline) |pipeline| {
             const chosen = (try pipeline.request(slot, file_index, cancellation)) orelse return null;
             return try chosen.openPrepared(a, binding, file_index, cancellation, slot);

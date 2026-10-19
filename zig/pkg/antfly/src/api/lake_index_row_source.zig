@@ -53,6 +53,7 @@ pub const Provider = struct {
         /// Coordinator-owned append frontier; only the current immutable file
         /// changes. These private roots never serve an incomplete snapshot.
         file: ?usize = null,
+        end: ?usize = null,
         positions: ?local.serverless_query_lake_inventory_catalog.Positions = null,
         navigation: ?@import("lake_index_ordered_files.zig").Public = null,
         source_cut: ?[32]u8 = null,

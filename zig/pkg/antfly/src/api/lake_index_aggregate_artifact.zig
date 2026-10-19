@@ -348,16 +348,32 @@ fn publishPartialStream(a: A, result_alloc: A, store: *stores.ArtifactStore, nam
         const rows = try input.next(pa);
         if (rows.len == 0) break;
         for (rows) |row| if (row.keys.len != recipe.keys.len or row.values.len != recipe.inputs.len) return error.InvalidSqlBackendResponse;
-        if (blocks.items.len == max_blocks) return error.NativeAggregateArtifactTooLarge;
-        const encoded = try spill.encodeColumnarBlockAlloc(pa, rows, max_block_bytes);
-        var upload = store.*;
-        upload.allocator = ca;
-        output_bytes = std.math.add(u64, output_bytes, encoded.len) catch return error.NativeAggregateArtifactTooLarge;
-        if (output_bytes > 512 * 1024 * 1024) return error.NativeAggregateArtifactTooLarge;
-        const artifact = try upload.putWithCancellation(encoded, cancellation);
-        defer if (artifact.provider_version) |version| upload.allocator.free(version);
-        try blocks.append(ca, .{ .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, .rows = @intCast(rows.len) });
-        groups = std.math.add(u64, groups, rows.len) catch return error.NativeAggregateArtifactTooLarge;
+        var begin: usize = 0;
+        while (begin < rows.len) {
+            try cancellation.check();
+            if (blocks.items.len == max_blocks) return error.NativeAggregateArtifactTooLarge;
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            var count = rows.len - begin;
+            const encoded = encode: while (true) {
+                const bytes = spill.encodeColumnarBlockAlloc(scratch.allocator(), rows[begin..][0..count], max_block_bytes) catch |err| {
+                    if (err != error.SqlProgramLimitExceeded or count == 1) return err;
+                    _ = scratch.reset(.free_all);
+                    count = (count + 1) / 2;
+                    continue;
+                };
+                break :encode bytes;
+            };
+            var upload = store.*;
+            upload.allocator = ca;
+            output_bytes = std.math.add(u64, output_bytes, encoded.len) catch return error.NativeAggregateArtifactTooLarge;
+            if (output_bytes > 512 * 1024 * 1024) return error.NativeAggregateArtifactTooLarge;
+            const artifact = try upload.putWithCancellation(encoded, cancellation);
+            defer if (artifact.provider_version) |version| upload.allocator.free(version);
+            try blocks.append(ca, .{ .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, .rows = @intCast(count) });
+            groups = std.math.add(u64, groups, count) catch return error.NativeAggregateArtifactTooLarge;
+            begin += count;
+        }
     }
     input.finish();
     const references = try result_alloc.alloc(Ref, names.len);
@@ -480,7 +496,11 @@ fn publishPackedRows(a: A, out: A, store: *stores.ArtifactStore, names: []const 
     defer arena.deinit();
     const pa = arena.allocator();
     try token.check();
-    const block = try spill.encodeColumnarBlockAlloc(pa, rows, max_block_bytes);
+    const block = spill.encodeColumnarBlockAlloc(pa, rows, max_block_bytes) catch |err| {
+        if (err != error.SqlProgramLimitExceeded or rows.len <= 1) return err;
+        var input: PartialStream = .{ .rows = rows };
+        return publishPartialStream(a, out, store, names, &input, recipe, token, proofs);
+    };
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(block, &digest, .{});
     const checksum = try pa.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
@@ -736,7 +756,7 @@ pub const Reader = struct {
         return self.root.groups;
     }
     pub fn cursor(self: *Reader) local.sql_catalog.AggregatePartialCursor {
-        return .{ .ptr = self, .next = next, .close = close };
+        return .{ .ptr = self, .next = next, .close = close, .final_group_proof = .{ .count = self.root.groups, .slots = self.output_slots orelse &.{0} } };
     }
     fn next(raw: *anyopaque, a: A, maximum: u32) !?[]const operators.GroupResult {
         const self: *Reader = @ptrCast(@alignCast(raw));
@@ -1902,4 +1922,42 @@ test "external lake packed leaves bound writes and build directories share authe
     bad.name = "missing";
     try std.testing.expectError(error.InvalidNativeAggregateArtifact, Reader.open(a, store, bad, single, .none));
     try std.testing.expectError(error.InvalidNativeAggregateArtifact, descendantsAlloc(out, store, bad, .none));
+}
+
+test "external lake adaptive packs split wide resident groups by encoded bytes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("wide-aggregate-pages");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false };
+    defer manager.deinit();
+    const specs = [_]operators.AggregateSpec{.{ .kind = .count }};
+    const recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "k", .type = .string, .nullable = false }}, .inputs = &.{.{ .spec = specs[0], .column = null }} };
+    const group = try operators.Grouped.create(a, &specs, .{ .bytes = 8 * 1024 * 1024 });
+    defer group.deinit();
+    const key = try a.alloc(u8, 34004);
+    defer a.free(key);
+    @memset(key, 'x');
+    for (0..128) |i| {
+        std.mem.writeInt(u32, key[0..4], @intCast(i), .little);
+        try group.add(&.{local.sql_scalar.Datum.json(.{ .string = key })}, &.{local.sql_scalar.Datum.json(.{ .integer = 1 })});
+    }
+    const refs = try publishPartitioned(a, out, &store, &.{"stats.count"}, group, recipe, &manager, .none);
+    try std.testing.expectEqual(metadata_version, refs[0].metadata_version);
+    const reader = try Reader.open(a, store, refs[0], recipe, .none);
+    defer reader.cursor().close(reader);
+    try std.testing.expect(reader.root.blocks.len > 1);
+    for (reader.root.blocks) |block| try std.testing.expect(block.artifact.byte_len <= max_block_bytes);
+    var count: usize = 0;
+    while (try reader.cursor().next(reader, out, 256)) |rows| count += rows.len;
+    try std.testing.expectEqual(@as(usize, 128), count);
 }

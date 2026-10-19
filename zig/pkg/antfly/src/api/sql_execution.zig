@@ -951,6 +951,9 @@ pub const Adapter = struct {
         read_context: @import("antfly_local_sources").serverless_query_lake_read_context.Context,
         child: catalog.AggregatePartialCursor,
         fused: [256]bool = @splat(false),
+        composition: ?*@import("lake_index_aggregate_composition.zig").Composition = null,
+        transferred: bool = false,
+        started: bool = false,
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             self.adapter.context.ensureActive() catch return true;
@@ -958,6 +961,7 @@ pub const Adapter = struct {
         }
         fn next(raw: *anyopaque, a: std.mem.Allocator, maximum: u32) !?[]const @import("antfly_local_sources").sql_operators.GroupResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.started = true;
             try self.adapter.verify(a, self.table);
             const cursor = self.child;
             const result = cursor.next(cursor.ptr, a, maximum) catch |err| {
@@ -966,6 +970,54 @@ pub const Adapter = struct {
             };
             try self.adapter.context.ensureActive();
             return result;
+        }
+        fn closeCursor(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.transferred) close(raw);
+        }
+        fn adoptFinal(raw: *anyopaque, grouped: *@import("antfly_local_sources").sql_operators.Grouped, page_limit: usize) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.started or self.transferred) return error.InvalidSqlBackendResponse;
+            const first = if (self.composition) |composition| try composition.prime() else self.child;
+            const proof = first.final_group_proof orelse return false;
+            if (proof.slots.len != self.recipe.inputs.len or grouped.specs.len != self.recipe.inputs.len) return false;
+            var covered: [256]bool = @splat(false);
+            for (proof.slots) |slot| {
+                if (slot >= self.recipe.inputs.len or covered[slot]) return error.InvalidSqlBackendResponse;
+                covered[slot] = true;
+            }
+            for (grouped.specs, self.recipe.inputs) |spec, input| if (!std.meta.eql(spec, input.spec)) return error.InvalidSqlBackendResponse;
+            try self.adapter.verify(self.a, self.table);
+            try grouped.adoptFinalized(.{ .ptr = self, .count = std.math.cast(usize, proof.count) orelse return error.SqlProgramLimitExceeded, .next = nextFinal, .close = close }, page_limit);
+            self.transferred = true;
+            return true;
+        }
+        fn nextFinal(raw: *anyopaque, a: std.mem.Allocator, maximum: usize, exact: bool) anyerror!?@import("antfly_local_sources").sql_operators.GroupBatch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const local = @import("antfly_local_sources");
+            const rows = (try next(raw, a, std.math.cast(u32, maximum) orelse return error.InvalidSqlLimit)) orelse return null;
+            const keys = try a.alloc([]const local.sql_scalar.Datum, rows.len);
+            const values = try a.alloc([]const local.sql_scalar.Datum, rows.len);
+            const ordinals = try a.alloc(u64, rows.len);
+            for (rows, keys, values, ordinals) |row, *key, *value, *ordinal| {
+                if (row.keys.len != self.recipe.keys.len or try local.sql_aggregate_partial.partialCount(row) != self.recipe.inputs.len) return error.InvalidSqlBackendResponse;
+                const slots = row.aggregate_slots;
+                const cells = try a.alloc(local.sql_scalar.Datum, self.recipe.inputs.len);
+                var populated: [256]bool = @splat(false);
+                for (0..cells.len) |logical| {
+                    const slot = if (slots) |map| map[logical] else logical;
+                    if (slot >= cells.len or populated[slot]) return error.InvalidSqlBackendResponse;
+                    populated[slot] = true;
+                    const state = try local.sql_aggregate_partial.read(a, row, logical, self.recipe.inputs[slot].spec);
+                    cells[slot] = if (exact) try local.sql_aggregate_partial.cell(a, state) else try local.sql_aggregate_partial.finishBorrowed(a, state);
+                }
+                const key_cells = try a.alloc(local.sql_scalar.Datum, row.keys.len);
+                for (key_cells, row.keys) |*cell, input| cell.* = try local.sql_operators.cloneDatum(a, input);
+                key.* = key_cells;
+                value.* = cells;
+                ordinal.* = row.ordinal;
+            }
+            return .{ .keys = .{ .rows = keys }, .aggregates = .{ .rows = values }, .ordinals = ordinals };
         }
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1069,6 +1121,9 @@ pub const Adapter = struct {
         // From this point errors propagate: selected immutable state cannot be
         // replaced with a fresh scan halfway through consumption.
         owner.fused = @splat(false);
+        owner.composition = null;
+        owner.transferred = false;
+        owner.started = false;
         owner.a = a;
         owner.adapter = self;
         owner.table = table;
@@ -1077,6 +1132,7 @@ pub const Adapter = struct {
         owner.read_context = context;
         owner.child = (if (recipe.inputs.len == 1) AggregateArtifactCursor.openMember(owner, 0) else composed: {
             const composition = try @import("lake_index_aggregate_composition.zig").Composition.create(a, recipe, .{ .ptr = owner, .open = AggregateArtifactCursor.openMember });
+            owner.composition = composition;
             break :composed composition.cursor();
         }) catch |err| {
             try self.context.ensureActive();
@@ -1084,7 +1140,7 @@ pub const Adapter = struct {
         };
         keep_store = true;
         keep_owner = true;
-        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.close };
+        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.closeCursor, .adopt_final_groups = AggregateArtifactCursor.adoptFinal };
     }
 
     pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {

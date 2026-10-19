@@ -282,9 +282,9 @@ const FileJob = struct {
 };
 
 /// Cold publications whose configurations cannot reside together advance
-/// private immutable checkpoints one file at a time. Each family reopens its
-/// last checkpoint, consumes the new file, and releases its working state.
-/// Only one file's projected run is retained, with the existing spill quota.
+/// private immutable checkpoints over bounded four-file windows. Each family
+/// reopens once per window and releases its working state after checkpointing.
+/// At most two projected windows share the existing replay memory/disk quota.
 /// No prefix checkpoint is exposed to recovery or serving as a complete root.
 fn buildFileMajor(args: Args, units: []const Unit) !?Result {
     if (args.reusable.len != 0 or args.candidates.len != 0 or args.contributions.len != 0 or args.index.root != null) return null;
@@ -310,8 +310,11 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
     if (worker_bytes < 1024 * 1024) return null;
     const replay = args.provider.replay.?;
     const replay_bytes = @min(replay.budget.limit, 16 * 1024 * 1024);
-    const fixed = args.provider.limits.max_input_bytes +| args.provider.limits.max_decoded_bytes *| 2 +| replay_bytes;
-    const retained = scheduler.reservePullUpTo(lanes, fixed +| maximum, @min(available, fixed +| all)) orelse return null;
+    const scan_workspace = args.provider.limits.max_input_bytes +| args.provider.limits.max_decoded_bytes *| 2;
+    const required_fixed = scan_workspace +| replay_bytes;
+    const retained = scheduler.reservePullUpTo(lanes, required_fixed +| maximum, @min(available, required_fixed +| all +| scan_workspace)) orelse return null;
+    const ahead = retained - required_fixed - maximum >= scan_workspace;
+    const fixed = required_fixed + if (ahead) scan_workspace else 0;
     defer scheduler.releasePull(lanes, retained);
     var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = args.a };
     const a = allocations.allocator();
@@ -365,24 +368,49 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
         .index_config_hash = "file-major-replay",
         .column_bindings = replay.columns,
     };
-    // Prefixes use the exact authorized source snapshot and stable file
-    // coordinates. The selected view changes only which files a private build
-    // has reached; intermediate roots stay inside this attempt.
-    for (0..parent.inventory.files.len) |file| {
+    const Window = @import("lake_index_build_window.zig");
+    var windows: [2]Window = undefined;
+    var window_count: usize = 0;
+    defer for (windows[0..window_count]) |*window| window.deinit(replay);
+    for (0..@as(usize, if (ahead) 2 else 1)) |index| {
+        try windows[index].init(a, args.provider, capture, replay_bytes / (if (ahead) @as(usize, 2) else 1), replay.max_spill_bytes / (if (ahead) @as(u64, 2) else 1));
+        window_count += 1;
+    }
+    var read_ahead: ?local.sql_parallel_scheduler.Task(anyerror!bool) = null;
+    defer if (read_ahead) |*task| {
+        _ = task.cancel(io) catch false;
+    };
+    var file: usize = 0;
+    var turn: usize = 0;
+    while (file < parent.inventory.files.len) {
         try args.token.check();
         try args.provider.context.ensureActive();
-        // Freeze the file before workers borrow it or the parent's versions.
-        // A declined oversized replay uses independent ordinary scan views.
-        const prepared = if (replay.columns.len == 0) false else try replay.prepare(a, capture, file, args.token);
+        const requested_end = @min(file + Window.width, parent.inventory.files.len);
+        const window = &windows[turn % window_count];
+        const prepared = if (read_ahead) |*task| loaded: {
+            const result = task.await(io);
+            read_ahead = null;
+            replay.read_ahead_hits += 1;
+            break :loaded try result;
+        } else try window.capture(file, requested_end, args.token);
+        window.report(replay);
+        const end = window.end;
+        if (ahead and end < parent.inventory.files.len) {
+            const next = &windows[(turn + 1) % window_count];
+            read_ahead = scheduler.submitIoTransient(io, 8 * 1024 * 1024, Window.capture, .{ next, end, @min(end + Window.width, parent.inventory.files.len), args.token });
+        }
         private_index.roots.clearRetainingCapacity();
         var nav_arena = std.heap.ArenaAllocator.init(a);
         defer nav_arena.deinit();
-        const key = local.storage_rowsource_identity.navigationDigest(public.identity_version, public.source, public.snapshot, parent.inventory.files[file].file_id);
-        public.root = try @import("../serverless/graph_segment/page_tree.zig").apply(nav_arena.allocator(), navigation_pages.store(), public.root, &.{.{ .key = &key, .value = parent.inventory.files[file].file_id }});
-        public.count += 1;
+        for (parent.inventory.files[file..end]) |input| {
+            _ = nav_arena.reset(.retain_capacity);
+            const key = local.storage_rowsource_identity.navigationDigest(public.identity_version, public.source, public.snapshot, input.file_id);
+            public.root = try @import("../serverless/graph_segment/page_tree.zig").apply(nav_arena.allocator(), navigation_pages.store(), public.root, &.{.{ .key = &key, .value = input.file_id }});
+            public.count += 1;
+        }
         var view = try parent.parallelView(a);
         defer view.closeParallelView(parent);
-        view.inventory.files = parent.inventory.files[0 .. file + 1];
+        view.inventory.files = parent.inventory.files[0..end];
         view.scanner.inventory = view.inventory;
         view.selected_catalog_view = true;
         view.local_plan = null;
@@ -422,11 +450,12 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
                 provider.only_file = null;
                 provider.progress = null;
                 states[index].work.file = file;
+                states[index].work.end = end;
                 states[index].work.positions = positions;
                 states[index].work.navigation = public;
-                states[index].work.source_cut = if (file + 1 == parent.inventory.files.len) (if (args.provider.native_delta) |delta| delta.source_cut else null) else null;
+                states[index].work.source_cut = if (end == parent.inventory.files.len) (if (args.provider.native_delta) |delta| delta.source_cut else null) else null;
                 provider.resume_work = &states[index].work;
-                if (!prepared) provider.replay = null;
+                provider.replay = if (prepared) window.replay() else null;
                 var job_args = args;
                 job_args.a = a;
                 job_args.index = &private_index;
@@ -460,7 +489,9 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
         private_index.reduction_seeds.clearRetainingCapacity();
         _ = private_index.seed_arena.reset(.free_all);
         private_index.seeds_loaded = false;
-        try replay.reset();
+        for (&window.buffers) |*buffer| try buffer.reset();
+        file = end;
+        turn += 1;
     }
     var result: Result = .{ .contribution_root = private_index.root, .contribution_roots = try args.out.dupe([32]u8, prior_roots) };
     for (states) |state| {
@@ -976,4 +1007,54 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(usize, 0), replay.budget.live);
     try std.testing.expectEqual(@as(usize, 0), file_major.pull_bytes);
     try std.testing.expectEqual(@as(usize, 0), file_major.workers);
+
+    // Three windows cross two durable append frontiers in every family. The
+    // next window is captured on the scheduler while current consumers run.
+    provider.context.additional_checkpoint = null;
+    provider.progress = null;
+    for (3..9) |ordinal| {
+        const name = try std.fmt.allocPrint(a, "part-{d}.parquet", .{ordinal});
+        defer a.free(name);
+        var put = try client.putObject("antfly", name, bytes, .{});
+        put.deinit(a);
+    }
+    var expanded = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer expanded.deinit();
+    provider.source = &expanded;
+    defer provider.source = &source;
+    provider.native_delta = null;
+    var expanded_navigation = try navigation_api.build(a, out, &store, &provider, null, .none);
+    defer expanded_navigation.deinit();
+    provider.native_delta = expanded_navigation.delta;
+    defer provider.native_delta = navigation.delta;
+    const expanded_inventory = try navigation_api.encodeInventory(out, &provider, expanded_navigation.root);
+    var expanded_ref = try store.putWithCancellation(expanded_inventory, .none);
+    defer expanded_ref.deinit(a);
+    args.base = try binding.binding.toManifestBaseSource(expanded.inventory.snapshot_id, expanded_ref.artifact_id);
+    const before_windows = replay.captures;
+    const ahead_before_windows = replay.read_ahead_hits;
+    const windows_result = (try build(args)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 9), replay.captures - before_windows);
+    try std.testing.expect(replay.read_ahead_hits > ahead_before_windows);
+    const window_ordered = try @import("lake_index_ordered_rows.zig").loadRootLazy(out, store, windows_result.ordered[0].artifact, .none, null);
+    try std.testing.expectEqual(@as(u64, 36), window_ordered.page.?.records);
+    try std.testing.expectEqual(@as(u32, 0), window_ordered.pending_files);
+    const window_dense = try @import("lake_index_native_dense.zig").loadRoot(out, store, windows_result.dense[0].artifact, .none, null);
+    const window_sparse = try @import("lake_index_native_sparse.zig").loadRoot(out, store, windows_result.sparse[0].artifact, .none, null);
+    try std.testing.expectEqual(@as(u64, 9), window_dense.file_directory.?.records);
+    try std.testing.expectEqual(@as(u64, 9), window_sparse.file_directory.?.records);
+    var windows_rows: u64 = 0;
+    for (try @import("lake_index_native_state.zig").directoryFiles(out, store, window_sparse.file_directory.?, window_sparse.generation.domain, .none)) |file| windows_rows += file.count;
+    try std.testing.expectEqual(@as(u64, 36), windows_rows);
+    try std.testing.expectEqual(@as(usize, 0), file_major.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), file_major.workers);
+    // Interrupt current consumers after scheduling the next capture. Both
+    // windows and all reservations must retire before the failed build returns.
+    interrupt.after = replay.captures + 4;
+    provider.context.additional_checkpoint = .{ .ptr = &interrupt, .check = Interrupt.check };
+    try std.testing.expectError(error.Canceled, build(args));
+    try std.testing.expectEqual(@as(usize, 0), file_major.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), file_major.pull_workers);
+    try std.testing.expectEqual(@as(usize, 0), file_major.workers);
+    try std.testing.expectEqual(@as(usize, 0), file_major.io_workers);
 }
