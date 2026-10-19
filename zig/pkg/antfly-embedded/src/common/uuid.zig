@@ -53,6 +53,18 @@ pub fn format(bytes: [16]u8) [36]u8 {
     return result;
 }
 
+/// Validate the normalized spelling without decoding or formatting it.
+/// This also allows evaluators to borrow canonical inputs with no heap work.
+pub fn isCanonical(input: []const u8) bool {
+    if (input.len != 36) return false;
+    for (input, 0..) |byte, index| {
+        if (index == 8 or index == 13 or index == 18 or index == 23) {
+            if (byte != '-') return false;
+        } else if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
 pub fn canonicalAlloc(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     const value = format(try parse(input));
     return alloc.dupe(u8, &value);
@@ -68,8 +80,11 @@ test "UUID input variants share one canonical value" {
     }) |input| {
         const value = format(try parse(input));
         try std.testing.expectEqualStrings(canonical, &value);
+        try std.testing.expect(isCanonical(&value));
+        try std.testing.expectEqual(std.mem.eql(u8, canonical, input), isCanonical(input));
     }
     for ([_][]const u8{ "", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1z", "a0eebc99--9c0b-4ef8-bb6d-6bb9bd380a11", "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" }) |input| {
         try std.testing.expectError(error.InvalidUuid, parse(input));
+        try std.testing.expect(!isCanonical(input));
     }
 }
