@@ -186,6 +186,20 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft, pr
         timeout_s=30,
         interval_s=0.1,
     ), api.get(resolver)
+
+    def all_reviews():
+        items = []
+        path = resolver + "/reviews"
+        while True:
+            page = api.get(path)
+            items.extend(page["reviews"])
+            cursor = page.get("next_cursor")
+            if cursor is None:
+                return items
+            # Pages bound physical scan work and may contain no reviews while
+            # retaining a cursor, particularly after prior reviews settle.
+            path = resolver + "/reviews?cursor=" + quote(cursor, safe="")
+
     last_sequence = 0
     # Reuse the same owner after each publication: initial startup can resolve
     # before ordered producer authority is active and conceal output-read bugs.
@@ -208,7 +222,7 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft, pr
         reviews = []
 
         def pending_review():
-            reviews[:] = api.get(resolver + "/reviews")["reviews"]
+            reviews[:] = all_reviews()
             return bool(reviews)
 
         assert wait_until(pending_review, timeout_s=30, interval_s=0.1), (
@@ -223,9 +237,9 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft, pr
         assert accepted["replay_sequence"] > last_sequence, accepted
         last_sequence = accepted["replay_sequence"]
         assert accepted["applied"], accepted
-        assert api.get(resolver + "/reviews")["reviews"] == []
+        assert all_reviews() == []
     api.restart_server()
-    assert api.get(resolver + "/reviews")["reviews"] == []
+    assert all_reviews() == []
 
 
 @pytest.mark.parametrize("raft", [False, True], ids=["standalone", "raft"])
