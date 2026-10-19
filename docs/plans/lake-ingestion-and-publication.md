@@ -2632,8 +2632,8 @@ rather than eight); a repeated pass adds no provider reads.
 When an initial publication has too many configurations for one retained cohort,
 file-major execution advances private immutable checkpoints under shared retained
 state and CPU admission. It exposes only the reached file prefix to a builder,
-keeps one projected file replay under the existing disk quota, and runs bounded
-parallel waves of configurations against that replay before advancing the source.
+keeps projected file windows under the existing replay quota, and runs bounded
+parallel waves of configurations against each window before advancing the source.
 CPU permits are held only while workers execute; file capture runs outside their
 execution leases. Ordered/text checkpoints and native vector/sparse generations
 reopen their completed work; exact aggregate trees reuse per-file contributions.
@@ -2784,3 +2784,15 @@ three and nine files. The shared SQL regression streams 10,000 final groups with
 a 16 KiB grouping budget and verifies zero hash probes. These fixtures establish
 bounded execution and correctness; archive-scale throughput and RSS remain to be
 measured.
+
+All 18 selected HTTP/pgwire Parquet/Iceberg E2Es pass on the branch merged with
+main `a8e47ce4cc`. The 33-index/three-file case completes in 13.2 seconds locally
+and the nine-file case in 65.0 seconds; these include publication, queries and
+source-unavailable reads after restart. They ran alongside native regressions,
+so these timings are qualification observations rather than a controlled
+throughput comparison. The 12 focused regressions after merging main also pass,
+including active read-ahead cancellation and main's encoded grouping fallback.
+
+The broad affected lake/native selection passes 361 native and 255 shared
+regressions with zero failures or leaks. The large-directory and spilled
+pack-proof stress cases are included in that selection.

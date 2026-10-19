@@ -1282,9 +1282,9 @@ as one object. Existing flat and partitioned formats remain readable. Aggregate
 builds share bounded verified/decoded metadata caches, including physical pack
 controls, and copy retained directory descriptors without JSON round trips.
 
-Cold publications exceeding resident cohort admission advance private per-file
-checkpoints across configurations, retaining one bounded disk replay instead of
-rereading the archive for each cohort. Native vector/sparse generations, ordered
+Cold publications exceeding resident cohort admission advance private bounded-window
+checkpoints across configurations, retaining projected replays within the shared
+disk quota instead of rereading the archive for each cohort. Native vector/sparse generations, ordered
 and text checkpoints, and exact aggregate contributions reopen completed work.
 Only final roots become serving/recovery publications. Warm delta publications
 and non-incremental aggregate recipes retain their existing paths. Oversized
