@@ -27,6 +27,7 @@ pub const Events = struct {
     directories: std.StringHashMapUnmanaged(c_int) = .empty,
     handles: std.AutoHashMapUnmanaged(c_int, []const u8) = .empty,
     paths: std.StringHashMapUnmanaged(bool) = .empty,
+    by_directory: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty,
     fd: c_int = -1,
     failed: bool = !supported,
     epoch: u64 = 0,
@@ -58,7 +59,21 @@ pub const Events = struct {
         self.paths.put(a, key, directory) catch {
             a.free(key);
             self.failed = true;
+            return;
         };
+        const parent = std.fs.path.dirname(key) orelse "/";
+        const group = self.by_directory.getOrPut(a, parent) catch {
+            self.failed = true;
+            return;
+        };
+        if (!group.found_existing) group.value_ptr.* = .empty;
+        group.value_ptr.append(a, key) catch {
+            self.failed = true;
+        };
+    }
+    /// Borrowed event paths; the caller holds the event lock until done.
+    pub fn pathsInDirectory(self: *Events, directory: []const u8) []const []const u8 {
+        return if (self.by_directory.get(directory)) |group| group.items else &.{};
     }
     pub fn fail(self: *Events) void {
         self.lock();
@@ -83,6 +98,9 @@ pub const Events = struct {
         self.clearLocked();
     }
     fn clearLocked(self: *Events) void {
+        var groups = self.by_directory.valueIterator();
+        while (groups.next()) |group| group.deinit(self.budget.allocator());
+        self.by_directory.clearRetainingCapacity();
         var it = self.paths.keyIterator();
         while (it.next()) |key| self.budget.allocator().free(key.*);
         self.paths.clearRetainingCapacity();
@@ -99,11 +117,13 @@ pub const Events = struct {
         self.clear();
         const a = self.budget.allocator();
         self.paths.deinit(a);
+        self.by_directory.deinit(a);
         self.handles.deinit(a);
         var it = self.directories.keyIterator();
         while (it.next()) |key| a.free(key.*);
         self.directories.deinit(a);
         self.paths = .empty;
+        self.by_directory = .empty;
         self.directories = .empty;
         self.handles = .empty;
         self.fd = -1;
@@ -212,10 +232,12 @@ test "event retirement preserves callbacks racing publication and stays bounded"
     events.record("/source/a", false);
     const checkpoint = events.checkpoint();
     events.record("/source/b", false);
+    try std.testing.expectEqual(@as(usize, 2), events.pathsInDirectory("/source").len);
     events.retire(checkpoint);
     try std.testing.expectEqual(@as(usize, 2), events.paths.count());
     events.retire(events.checkpoint());
     try std.testing.expectEqual(@as(usize, 0), events.paths.count());
+    try std.testing.expectEqual(@as(usize, 0), events.pathsInDirectory("/source").len);
     events.budget.limit = events.budget.live;
     events.record("/source/c", false);
     try std.testing.expect(events.isFailed());

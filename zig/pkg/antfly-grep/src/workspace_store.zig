@@ -476,7 +476,9 @@ pub const Generation = struct {
         var eligibility: std.ArrayList([]const u8) = .empty;
         var collector: Collector = .{ .generation = &stage, .io = io, .options = o, .previous = old, .watcher = w, .membership_seen = &seen, .eligibility = &eligibility };
         var considered: std.ArrayList([]const u8) = .empty;
+        var scanned_dirs: std.StringHashMapUnmanaged(void) = .empty;
         for (j.membership_dirs.items) |directory| {
+            try scanned_dirs.put(scratch, directory.display, {});
             var root: ?@import("discovery_journal.zig").Journal.Root = null;
             for (j.roots.items) |candidate| {
                 if (std.mem.eql(u8, candidate.path, directory.path) or (std.mem.startsWith(u8, directory.path, candidate.path) and directory.path.len > candidate.path.len and (std.mem.endsWith(u8, candidate.path, "/") or directory.path[candidate.path.len] == '/'))) {
@@ -496,9 +498,8 @@ pub const Generation = struct {
                 try discovery.prepareDirectoryRules(directory.path);
                 var paths: std.ArrayList([]const u8) = .empty;
                 j.native.lock();
-                var events_at = j.native.paths.keyIterator();
-                while (events_at.next()) |name| if (std.mem.eql(u8, std.fs.path.dirname(name.*) orelse "/", directory.path)) {
-                    const owned = scratch.dupe(u8, name.*) catch {
+                for (j.native.pathsInDirectory(directory.path)) |name| {
+                    const owned = scratch.dupe(u8, name) catch {
                         j.native.unlock();
                         return null;
                     };
@@ -506,7 +507,7 @@ pub const Generation = struct {
                         j.native.unlock();
                         return null;
                     };
-                };
+                }
                 j.native.unlock();
                 for (paths.items) |full| {
                     const shown = if (directory.display.len == 0) try scratch.dupe(u8, std.fs.path.basename(full)) else try std.fs.path.join(scratch, &.{ directory.display, std.fs.path.basename(full) });
@@ -522,16 +523,12 @@ pub const Generation = struct {
         var staged: std.StringHashMapUnmanaged(void) = .empty;
         for (stage.entries.items) |entry| try staged.put(scratch, entry.path, {});
         var removed: std.ArrayList([]const u8) = .empty;
+        for (considered.items) |path| if (old.find(path)) |entry| {
+            const slot = (@intFromPtr(entry) - @intFromPtr(old.entries.items.ptr)) / @sizeOf(Entry);
+            if (!seen.contains(slot)) try removed.append(scratch, entry.path);
+        };
         for (j.membership_dirs.items) |directory| {
-            if (directory.native_names) {
-                for (considered.items) |path| if (std.mem.eql(u8, std.fs.path.dirname(path) orelse "", directory.display)) {
-                    if (old.find(path)) |entry| {
-                        const slot = (@intFromPtr(entry) - @intFromPtr(old.entries.items.ptr)) / @sizeOf(Entry);
-                        if (!seen.contains(slot)) try removed.append(scratch, entry.path);
-                    }
-                };
-                continue;
-            }
+            if (directory.native_names) continue;
             var slot = old.directory_heads.get(directory.display) orelse std.math.maxInt(usize);
             while (slot != std.math.maxInt(usize)) {
                 const entry = old.entries.items[slot];
@@ -546,11 +543,7 @@ pub const Generation = struct {
             var slot = old.watch_heads[watch_slot];
             while (slot != std.math.maxInt(usize)) : (slot = old.entries.items[slot].watch_next) {
                 const entry = old.entries.items[slot];
-                var scanned = false;
-                for (j.membership_dirs.items) |directory| if (std.mem.eql(u8, std.fs.path.dirname(entry.path) orelse "", directory.display)) {
-                    scanned = true;
-                    break;
-                };
+                const scanned = scanned_dirs.contains(std.fs.path.dirname(entry.path) orelse "");
                 if (!scanned and !staged.contains(entry.path)) {
                     const before = stage.entries.items.len;
                     try collector.addFile(entry.path, entry.path, entry.explicit_file);
@@ -567,11 +560,7 @@ pub const Generation = struct {
         var events = j.native.paths.keyIterator();
         while (events.next()) |path| if (j.sourceIndex(path.*)) |slot| {
             const entry = old.entries.items[slot];
-            var scanned = false;
-            for (j.membership_dirs.items) |directory| if (std.mem.eql(u8, std.fs.path.dirname(entry.path) orelse "", directory.display)) {
-                scanned = true;
-                break;
-            };
+            const scanned = scanned_dirs.contains(std.fs.path.dirname(entry.path) orelse "");
             if (!scanned and !staged.contains(entry.path)) {
                 native_paths.append(scratch, entry.path) catch {
                     j.native.unlock();

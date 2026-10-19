@@ -6343,6 +6343,23 @@ class CliTests(unittest.TestCase):
 
                 self.assertEqual(matches(rows), matches(rebuilt))
 
+    def test_workspace_membership_rename_burst_matches_rebuild(self):
+        for i in range(32):
+            self.write(f"src/dir-{i}/a.txt", f"hit {i}\n")
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            for i in range(32):
+                (self.root / f"src/dir-{i}/a.txt").rename(
+                    self.root / f"src/dir-{i}/b.txt"
+                )
+            changed = request("refresh")[0]
+            self.assertTrue(changed["discovery_reused"], changed)
+            self.assertEqual(changed["files"], 32)
+            self.assertLessEqual(changed["refresh_entries_visited"], 64, changed)
+            if sys.platform.startswith("linux"):
+                self.assertEqual(changed["namespace_directories_scanned"], 0, changed)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(changed["revision"], forced["revision"])
+
     def test_workspace_membership_handles_empty_and_trailing_slash_roots(self):
         path = self.write("src/a.txt", "hit\n")
         with self.workspace("--workspace-watch", "src/") as (ready, request):

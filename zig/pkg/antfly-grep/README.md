@@ -2456,9 +2456,9 @@ baseline SHA-256 to the original frozen artifact):
 | 512 files / add_delete | 14.882 ms | 3.471 ms | 513 → 1 |
 
 Eleven alternating pairs per case, warm shared host; every mode ends with a
-forced-rescan revision comparison. File additions/deletions still visit the
-inventory: the measured gain removes repeated polling and source opens, not
-the linear metadata rebuild. At 64 files, unchanged/in-place controls are
+forced-rescan revision comparison. In that binary, file additions/deletions still
+visited the inventory: those measurements removed repeated polling and source
+opens, before the subsequent incremental membership implementation. At 64 files, unchanged/in-place controls are
 essentially unchanged; atomic saves improve and add/delete rediscovery improves.
 
 Nineteen-pair native-inference controls show selected-file refresh + search
@@ -2494,7 +2494,9 @@ and failed admission retain conservative discovery. New size-excluded inputs
 receive eligibility witnesses before their exclusion is accepted. Policy reloads
 preserve the original root, ancestor-ignore controls, depth and filesystem rules.
 Linux uses complete named inotify events to reconcile changed paths without
-walking the directory's other files. macOS kqueue has no child names, so it checks
+walking the directory's other files. A bounded event index groups paths by directory
+and direct membership lookups avoid scanning the full event set per changed
+directory during rename bursts. macOS kqueue has no child names, so it checks
 the affected directory's membership; it does not rebuild the repository inventory.
 Unwitnessed macOS source contents still require conservative reads. Namespace
 invalidations route to affected paths and dependencies, including descendants of
@@ -2522,3 +2524,39 @@ retained memory, first-result latency and forced-rebuild equivalence. macOS cann
 infer child names from kqueue notifications, and kernel-invisible writers still
 require forced capture. The earlier warm shared-host reports above describe their
 original binaries, not performance guarantees for later revisions.
+
+Final paired warm add/delete controls against the preceding PR binary:
+
+| Host / corpus | Before | After | Entries visited before → after | Retained workspace MiB before → after |
+|---|---:|---:|---:|---:|
+| macOS / 2,048 files, 32 directories | 12.750 ms | 0.937 ms | 2,049 → 65 | 3.50 → 2.14 |
+| Linux VM / 100,000 files, 64 directories | 1,864.748 ms | 8.867 ms | 100,001 → 1 | 203.06 → 95.93 |
+| Linux VM / 100,000 files, one directory | 1,523.255 ms | 2.305 ms | 100,001 → 1 | 203.05 → 94.78 |
+
+macOS uses eleven alternating pairs per case; the Linux VM uses five pairs and a
+two-CPU quota. Each mode ends with a forced-rebuild revision comparison. Linux
+named-event cases perform no directory membership enumerations, including the
+100,000-name directory whose optional bounded certificate cannot hold all names.
+Accounted retained workspace bytes are distinct from process RSS: sampled RSS
+improves on several workloads but is roughly unchanged at 100K Linux files.
+Initial capture still does full discovery and builds the inventory. Its single
+bootstrap samples were slower on large Linux corpora (for example 3.47 s versus
+2.29 s at 100K/64 directories); these are not paired cold-start qualifications.
+The results do not establish a universal startup, throughput, or RSS win.
+
+Final validation covers 227 CLI tests on each of macOS and Linux (two skips each),
+86/87 package tests on each (one platform skip), 328 grammar cases, all six Linux
+hardening tests/four fuzz targets, 1,000 generated comparisons with zero
+mismatches/timeouts, and Windows cross-compilation. Linux package tests run on the
+VM's native filesystem so bind-mount limitations cannot silently skip membership
+coverage. Put the pinned GNU ripgrep 15.2 / PCRE2 10.45 oracle on `PATH` when
+running Linux CLI qualification; two skips are expected here, and a higher skip
+count can indicate missing oracle coverage. Run package unit executables from
+local VM storage rather than a host bind mount. Native fixtures establish
+orchestration, not real model quality or cost.
+
+Evidence: [macOS controls](bench/results/membership-refresh-macos.json),
+[Linux controls](bench/results/membership-refresh-linux.json),
+[wide-directory controls](bench/results/membership-wide-linux.json),
+[differential replay](bench/results/membership-differential.json), and
+[source/binary/archive identities](bench/results/membership-validation.json).

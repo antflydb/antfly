@@ -301,21 +301,29 @@ pub const Journal = struct {
                 checked_dir.close(self.io);
                 const canonical = std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.budget.allocator()) catch return self.reject("missing-ancestor-or-dependency");
                 defer self.budget.allocator().free(canonical);
-                var named = false;
-                if (self.allow_membership and @import("builtin").os.tag == .linux and self.native_covered and !self.native.failed and self.inventories.contains(canonical)) {
-                    var paths = self.native.paths.keyIterator();
-                    while (paths.next()) |event_path| if (std.mem.eql(u8, std.fs.path.dirname(event_path.*) orelse "/", canonical)) {
-                        named = true;
-                        break;
-                    };
-                }
+                const named_paths = self.native.pathsInDirectory(canonical);
+                const named = @import("builtin").os.tag == .linux and self.native_covered and !self.native.failed and self.inventories.contains(canonical) and named_paths.len != 0;
                 if (named) {
+                    if (!self.allow_membership) {
+                        // A vanished temporary name or atomic save need no
+                        // enumeration. Names of eligible files must still exist
+                        // as regular files; actual membership changes stage.
+                        for (named_paths) |event_path| {
+                            if (self.native.paths.get(event_path).?) return self.reject("directory-topology-or-metadata");
+                            const known = self.sourceIndex(event_path) != null;
+                            const stat = std.Io.Dir.cwd().statFile(self.io, event_path, .{ .follow_symlinks = false }) catch |err| {
+                                if ((err == error.FileNotFound or err == error.NotDir) and !known) continue;
+                                return self.reject("named-directory-invalidation");
+                            };
+                            if (!known or stat.kind != .file) return self.reject("named-directory-invalidation");
+                        }
+                    }
                     var recorded = false;
                     for (self.membership_dirs.items) |pending| if (std.mem.eql(u8, pending.path, canonical)) {
                         recorded = true;
                         break;
                     };
-                    if (!recorded) self.membership_dirs.append(self.budget.allocator(), .{ .path = self.inventories.getKey(canonical).?, .display = self.displays.get(canonical) orelse return self.reject("unrouted-membership"), .stamp = .{}, .native_names = true }) catch return self.reject("membership-budget");
+                    if (self.allow_membership and !recorded) self.membership_dirs.append(self.budget.allocator(), .{ .path = self.inventories.getKey(canonical).?, .display = self.displays.get(canonical) orelse return self.reject("unrouted-membership"), .stamp = .{}, .native_names = true }) catch return self.reject("membership-budget");
                 } else if (self.inventories.get(canonical)) |optional_baseline| {
                     const baseline = optional_baseline orelse return self.reject("uncertified-directory");
                     self.directory_checks += 1;

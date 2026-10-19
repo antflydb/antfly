@@ -26,8 +26,9 @@ import json
 import hashlib
 import platform
 import statistics
+import subprocess
 from pathlib import Path
-from registered import Client
+from registered import Client, rss_kib
 
 
 def main():
@@ -46,10 +47,21 @@ def main():
     report = {
         "host": platform.platform(),
         "cpu_count": os.cpu_count(),
+        "affinity_cpus": len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else None,
+        "cgroup_cpu_max": Path("/sys/fs/cgroup/cpu.max").read_text().strip()
+        if Path("/sys/fs/cgroup/cpu.max").exists()
+        else None,
         "load_average_start": os.getloadavg(),
         "measurement": "Alternating paired warm filesystem workspace refresh; no provider; forced rescan revision equality outside timing. Other host builds may contend for CPU.",
         "binaries": {
-            k: {"sha256": hashlib.sha256(v.read_bytes()).hexdigest()}
+            k: {
+                "sha256": hashlib.sha256(v.read_bytes()).hexdigest(),
+                "version": subprocess.check_output(
+                    [str(v), "--version"], text=True
+                ).strip(),
+            }
             for k, v in bins.items()
         },
         "cases": [],
@@ -110,6 +122,17 @@ def main():
                         pair = {"load_average": os.getloadavg()}
                         for key in list(bins) if n % 2 else list(reversed(bins)):
                             value, rows = clients[key].exchange("refresh")
+                            if platform.system() == "Linux":
+                                status = Path(
+                                    f"/proc/{clients[key].process.pid}/status"
+                                ).read_text()
+                                value["rss_kib"] = next(
+                                    int(line.split()[1])
+                                    for line in status.splitlines()
+                                    if line.startswith("VmRSS:")
+                                )
+                            else:
+                                value["rss_kib"] = rss_kib(clients[key])
                             pair[key] = value
                         trials.append(pair)
                     for key, client in clients.items():
@@ -126,10 +149,19 @@ def main():
                         {
                             "files": count,
                             "directories": args.directories,
+                            "capture_seconds": {
+                                k: c.capture_seconds for k, c in clients.items()
+                            },
                             "mode": mode,
                             "trials": trials,
                             "median": {
                                 k: {
+                                    "retained_bytes": statistics.median(
+                                        t[k]["ready"]["retained_bytes"] for t in trials
+                                    ),
+                                    "rss_kib": statistics.median(
+                                        t[k]["rss_kib"] for t in trials
+                                    ),
                                     "seconds": statistics.median(
                                         t[k]["seconds"] for t in trials
                                     ),
