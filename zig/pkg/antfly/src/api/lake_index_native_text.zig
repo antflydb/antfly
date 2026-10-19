@@ -797,12 +797,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
             const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0 or directory_root.checkpoint_files != null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (root.source_layout_version == 1 and root.source_routes_version == 1 and root.serving != null and root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
-                try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
+                try validateBuildReuse(a, store.*, root, declaration.artifact, provider, cancellation);
                 try declarations.append(out, declaration);
                 continue;
             }
             if (root.seekable and root.statistics_version >= 1 and std.mem.eql(u8, &root.recipe, &recipe) and std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) {
-                try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
+                try validateBuildReuse(a, store.*, root, declaration.artifact, provider, cancellation);
                 seed_artifact = declaration.artifact.artifact_id;
                 seed_ref = .{ .artifact_id = declaration.artifact.artifact_id, .checksum = declaration.artifact.checksum, .byte_len = declaration.artifact.byte_len };
                 exact_seed = root;
@@ -816,7 +816,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
             const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0 or directory_root.checkpoint_files != null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (!root.seekable or root.statistics_version < 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
-            try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
+            try validateBuildReuse(a, store.*, root, declaration.artifact, provider, cancellation);
             seed_artifact = declaration.artifact.artifact_id;
             seed_ref = .{ .artifact_id = declaration.artifact.artifact_id, .checksum = declaration.artifact.checksum, .byte_len = declaration.artifact.byte_len };
             break root;
@@ -1226,6 +1226,12 @@ fn changedInventoryRecords(a: A, out: A, store: stores.ArtifactStore, baseline: 
 // bound memory and avoid downloading the archive; normal serving continues to
 // authenticate posting ranges. Metadata trees are read and authenticated in
 // bounded pages, including descendants not touched by incremental updates.
+fn validateBuildReuse(a: A, store: stores.ArtifactStore, root: Root, ref: local.serverless_manifest_artifact_ref.ArtifactRef, provider: *@import("lake_index_row_source.zig").Provider, token: Cancellation) !void {
+    try provider.context.ensureActive();
+    try token.check();
+    if (provider.resume_work) |work| if (work.trusts(store, ref)) return;
+    return validateReuse(a, store, root, ref.artifact_id, provider.context, token);
+}
 fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_id: []const u8, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) anyerror!void {
     var retained_backend = backend;
     const certified = retained_backend.retainedClosure(root_id, cancellation) catch false;

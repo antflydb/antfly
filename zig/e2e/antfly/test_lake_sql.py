@@ -248,7 +248,7 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 continue
             original = artifact_path.read_bytes()
             marker = original.find(b'"format":"native-sql-aggregate-v')
-            if marker >= 0:
+            if marker >= 0 and b"AGPK\x01" not in original[:marker]:
                 candidate = json.loads(original[marker - 1 :])
                 inputs = candidate["recipe"]["inputs"]
                 if (
@@ -6400,14 +6400,21 @@ def test_compact_parquet_encodings_attach_query_and_restart(
         server.stop(test_failed=failed)
 
 
-def test_native_configuration_cohorts_and_group_directories_survive_restart(tmp_path):
-    """Nine native consumers share real delta pages and survive source loss/restart."""
+@pytest.mark.parametrize("text_copies", [7, 33])
+def test_native_configuration_cohorts_and_group_directories_survive_restart(
+    tmp_path, text_copies
+):
+    """Resident and file-major builds retain exact results through source loss/restart."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / "lake"
     objects = root / "buckets" / "antfly" / "objects"
     objects.mkdir(parents=True)
-    text_names = ("words", "words_again", *(f"words_{i}" for i in range(5)))
+    text_names = (
+        "words",
+        "words_again",
+        *(f"words_{i}" for i in range(text_copies - 2)),
+    )
     base = 9007199254740993
     expected = {k: [0, 0] for k in range(17)}
     originals = []

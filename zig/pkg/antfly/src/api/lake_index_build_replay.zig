@@ -341,6 +341,7 @@ pub const Replay = struct {
         }
         _ = self.arena.reset(.free_all);
         self.ready = false;
+        self.budget.exhausted = false;
         self.captured_file = file_index;
         const io = self.provider.context.io orelse return error.UnsupportedSqlExecution;
         if (self.run != null) return error.InvalidSqlSpill;
@@ -472,8 +473,8 @@ pub const Replay = struct {
     fn captureAdmitted(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation) !bool {
         // Oversized individual files retain the ordinary streaming path. The
         // replay optimization must never make an otherwise valid scan fail.
-        self.capture(a, binding, file_index, cancellation) catch |err| switch (err) {
-            error.SqlProgramLimitExceeded => {
+        self.capture(a, binding, file_index, cancellation) catch |err| {
+            if (err == error.SqlProgramLimitExceeded or err == error.UnsupportedExternalLakeIndex or (err == error.OutOfMemory and self.budget.isLocallyExhausted())) {
                 if (self.run) |*run| {
                     run.close();
                     self.manager.deinit();
@@ -482,8 +483,8 @@ pub const Replay = struct {
                 _ = self.arena.reset(.free_all);
                 self.ready = false;
                 return false;
-            },
-            else => return err,
+            }
+            return err;
         };
         return true;
     }
@@ -656,6 +657,20 @@ test "external lake bounded replay releases files and falls back for oversized s
     try std.testing.expect((try replay.open(a, binding, 0, .none)) == null);
     try std.testing.expect(replay.run == null);
     try std.testing.expectEqual(@as(usize, 0), replay.readers);
+    replay.max_spill_bytes = 160 * 1024;
+    replay.budget.limit = 1;
+    try std.testing.expect((try replay.open(a, binding, 0, .none)) == null);
+    try std.testing.expectEqual(@as(usize, 0), replay.budget.live);
+    try std.testing.expectEqual(@as(usize, 0), replay.manager.files);
+    replay.budget.limit = 2 * 1024 * 1024;
+    const recovered = (try replay.open(a, binding, 0, .none)).?;
+    recovered.deinit(a);
+    try replay.reset();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var failed = Replay.init(failing.allocator(), &provider, &.{"body"});
+    defer failed.deinit();
+    try std.testing.expectError(error.OutOfMemory, failed.open(a, binding, 0, .none));
+    try std.testing.expect(!failed.budget.isLocallyExhausted());
 }
 
 test "external lake replay sparse union borrows authenticated deltas without opening file catalogs" {
@@ -703,4 +718,38 @@ test "external lake replay sparse union borrows authenticated deltas without ope
     // Snapshot mismatch cannot turn a partial predecessor into a delta proof.
     try std.testing.expect(!deltaMatches(&provider, "s", "schema", "older"));
     try std.testing.expect(!deltaMatches(&provider, "other", "schema", "before"));
+}
+
+test "external lake replay capture keeps IEEE values and null dictionary identities through disk" {
+    const a = std.testing.allocator;
+    const floating = [_]f64{ std.math.nan(f64), 0, -0.0, std.math.inf(f64), -std.math.inf(f64) };
+    const dictionary = [_]f64{ -0.0, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) };
+    const vectors = [_]rows.ColumnVector{
+        .{ .name = "f", .values = .{ .f64 = &floating }, .nulls = .{ .bytes = &.{ 0, 1, 0, 0, 0 } } },
+        .{ .name = "f", .values = .{ .dictionary_f64 = .{ .values = &dictionary, .indices = &.{ 3, 999999, 0, 1, 2 } } }, .nulls = .{ .bytes = &.{ 0, 1, 0, 0, 0 } } },
+    };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for (vectors) |vector| {
+        var capture: Replay.CaptureBatch = .{ .vectors = &.{vector} };
+        const input: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture, .read = Replay.CaptureBatch.cell, .read_identity = Replay.CaptureBatch.identity, .count = 5, .width = 1 } };
+        var marker: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check, .async_writes = false };
+        defer manager.deinit();
+        var file = try spill.Sequential.init(&manager, 256);
+        defer file.close();
+        const keys: [5][]const local.sql_scalar.Datum = @splat(&.{});
+        try file.appendBatch(input, .{ .rows = &keys }, &.{ 0, 1, 2, 3, 4 });
+        var offset: u64 = 0;
+        while (offset < 5) {
+            const batch = try file.readBatchBorrowed(offset, 2);
+            for (batch.rows) |row| {
+                const index: usize = @intCast(row.ordinal);
+                try std.testing.expectEqual(index == 1, row.values[0].sql_null);
+                if (index != 1) try std.testing.expectEqual(@as(u64, @bitCast(floating[index])), @as(u64, @bitCast(row.values[0].value.float)));
+            }
+            offset = batch.following;
+        }
+    }
 }

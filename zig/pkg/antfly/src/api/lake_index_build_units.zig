@@ -79,7 +79,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, io: 
             count += 1;
             if (count == 64) break;
         }
-        var unit: builds.Unit = .{ .kind = .aggregate, .table = table };
+        var unit: builds.Unit = .{ .kind = .aggregate, .table = table, .incremental = aggregates.incrementalRecipe(request.recipe) };
         unit.table.indexes_json = try text(out, selected);
         try units.append(out, unit);
     }

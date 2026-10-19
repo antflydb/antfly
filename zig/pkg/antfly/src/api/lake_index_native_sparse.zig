@@ -160,7 +160,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
         const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
         defer rows.deinit(a);
-        var input: u64 = 512 * 1024 * 1024;
+        var input_remaining: u64 = 512 * 1024 * 1024;
+        const input = if (provider.resume_work) |work| &work.native_input_left else &input_remaining;
         while (try rows.next(a)) |batch| {
             var page_arena = std.heap.ArenaAllocator.init(a);
             defer page_arena.deinit();
@@ -176,7 +177,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const parent_key = try plan.privateKey(pa, ref);
                 for (try producer.units(pa, row)) |unit| {
                     const vector = (try producer.sparseUnit(pa, unit)) orelse continue;
-                    try stores.chargeReadBudget(&input, @as(u64, @intCast(vector.indices.len)) * 8 + 128);
+                    try stores.chargeReadBudget(input, @as(u64, @intCast(vector.indices.len)) * 8 + 128);
                     const key = try @import("lake_enrichment_units.zig").identity(pa, parent_key, unit);
                     try tracker.append(ref, key);
                     if (unit.chunked) {
@@ -200,8 +201,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         finished = true;
         var checkpoint = try index.pinNativeCheckpoint();
         defer checkpoint.deinit();
-        var output_bytes: u64 = 1024 * 1024 * 1024;
-        const generation = try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, &output_bytes, if (seed) |root| .{ .root = root.generation } else null);
+        var output_remaining: u64 = 1024 * 1024 * 1024;
+        const output_bytes = if (provider.resume_work) |work| &work.native_output_left else &output_remaining;
+        const generation = try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation } else null);
         const root: Root = .{ .binding = binding, .config_json = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{}), .generation = generation, .recipe = recipe, .file_states = if (plan.selection == null) plan.files else &.{}, .file_directory = if (plan.selection != null) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > files.max_root_bytes) return error.NativeLakeFilesTooLarge;

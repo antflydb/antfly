@@ -2596,3 +2596,78 @@ and exact NUMERIC AVG after restart with source payloads unavailable. The stripp
 Debug server, CLI, formatting, license/Apache boundary, source/control catalog,
 engine-error catalog and quickstart documentation checks passed with Zig 0.17.0.
 A fresh fetch confirmed `origin/main` through `f173b597ee` is already merged.
+
+
+### Packed aggregate leaves and file-major cold publication (protocol 59)
+
+Small completed aggregate leaves store the shared column block and every logical
+slot's root in one bounded immutable `AGPK` object (aggregate metadata version 6).
+The object contains a length-framed JSON control directory followed by the native
+column block. The shared recipe and block directory occur once, alongside the
+logical name/slot map, without JSON encoding the binary payload. Whole-object SHA-256,
+block identity/length/checksum, complete state recipe, unique logical names and
+slot mappings are checked before any state is exposed. All logical references
+point to the same physical object. Readers select their own name and recipe;
+cohort fusion still checks the physical state identity. Packs remain bounded to
+4 MiB; oversized leaves retain ordinary block/root publication. Both resident
+leaves and small leaves reached through recursive spill routing use the pack.
+
+GC treats a packed leaf as one physical object. Its virtual block digest is a
+cache identity, never a separately stored child. Collector scratch releases the
+verified pack body before advancing to the next object. Parent v5 directories and their
+cohort certificates remain unchanged, and old aggregate metadata versions remain
+readable. Protocol 59 fences older readers/collectors from the packed-leaf graph.
+This avoids a manifest-reference or object-store routing extension. A 32-group,
+four-slot fixture now publishes 28 objects rather than 120.
+
+Each aggregate reduction uses a build-local immutable cache: 2 MiB of verified
+bytes and 4 MiB of decoded directories, cohort certificates and selected state.
+The required reducer allowance includes this cache memory. Logical root/name,
+recipe, physical slot, source scope and current request authority are checked on
+hits. Packed control is decoded once for all its slots. Directory ownership
+transfers copy descriptors directly, without a JSON round trip. Four logical
+partition directories fetch their common certificate once (five reads total,
+rather than eight); a repeated pass adds no provider reads.
+
+When an initial publication has too many configurations for one retained cohort,
+file-major execution advances private immutable checkpoints under shared retained
+state and CPU admission. It exposes only the reached file prefix to a builder,
+keeps one projected file replay under the existing disk quota, and runs bounded
+parallel waves of configurations against that replay before advancing the source.
+CPU permits are held only while workers execute; file capture runs outside their
+execution leases. Ordered/text checkpoints and native vector/sparse generations
+reopen their completed work; exact aggregate trees reuse per-file contributions.
+Working state is released between waves. Aggregate row/input work and
+vector/sparse input/output budgets remain cumulative across checkpoints.
+Prior and replacement metadata overlap only within admitted worker waves, and
+superseded prefix metadata is freed instead of accumulating every prefix.
+Each successfully produced text checkpoint carries an attempt-local closure
+proof bound to its exact artifact interpretation, store implementation and upload
+scope. Reopening it validates the root checksum and recipe and checks the current
+lease; it does not re-audit every immutable descendant just produced by that
+session. The proof is never persisted, never grants serving authority, and is
+not accepted across stores, attempts or altered references.
+Intermediate roots are private to the current attempt and are never checkpointed
+as complete serving publications. Only final roots enter progress/recovery and
+the normal atomic publication. Cancellation releases scheduler permits and the
+current file; failed attempts use the existing fenced upload journal and GC.
+
+This path applies to cold builds whose aggregate recipes and delete plans
+support exact incremental reuse. Warm/delta builds retain the existing source-cut pipeline;
+binary floating and DISTINCT rebuild semantics remain unchanged. A single file
+that exceeds replay disk or local memory admission uses ordinary streaming for
+that file, with one scanner at a time under the reserved decode workspace.
+The fallback therefore preserves the existing resource ceilings;
+it never creates an archive-sized spool. A constrained five-family regression
+requires three captures for three files under a 500 MiB shared allowance and
+checks final ordered rows, vector/sparse coverage, exact reducers and cancellation.
+Public attachment options and SQL/search syntax do not change.
+
+Qualification includes 37 selected native/shared regressions with zero failures
+or leaks, plus forced per-file replay decline under constrained admission.
+Seventeen public HTTP/pgwire E2Es cover resident and 33-index cold builds,
+independent compact Parquet fixtures, exact numeric aggregates, real Iceberg
+evolution/deletes and source-unavailable reads after restart. The 33-index case
+completed in 28–33 seconds locally; the earlier serial checkpoint implementation
+exceeded its 90-second readiness deadline. These are bounded fixtures, not an
+archive-scale throughput or RSS benchmark.

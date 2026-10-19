@@ -25,8 +25,11 @@ const stream_api = local.serverless_query_lake_stream;
 const Context = local.serverless_query_lake_read_context.Context;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+const stores = @import("../serverless/artifacts/store.zig");
 pub const Provider = struct {
     ordered_delta_plans: usize = 0,
+    /// Total work belongs to a configuration, across private file checkpoints.
+    resume_work: ?*ResumeWork = null,
     source: *serving.ServingSource,
     /// Borrowed authenticated prior inventory, shared by all native builders.
     previous_inventory: ?local.serverless_external_source_types.Inventory = null,
@@ -46,6 +49,29 @@ pub const Provider = struct {
     replay_consumer: ?usize = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
     statistics: ?Statistics = null,
+    pub const ResumeWork = struct {
+        aggregate: @import("../serverless/build/lake_build_limits.zig").Budget = .{ .limits = .{} },
+        native_input_left: u64 = 512 * 1024 * 1024,
+        native_output_left: u64 = 1024 * 1024 * 1024,
+        private: ?struct {
+            ref: local.serverless_manifest_artifact_ref.ArtifactRef,
+            scope: stores.UploadScope,
+            store_ptr: *anyopaque,
+            store_vtable: *const stores.ArtifactStore.VTable,
+        } = null,
+        /// A successful producer owns this exact immutable closure in its
+        /// still-fenced upload attempt. This hint grants no serving authority.
+        pub fn trusts(self: *const ResumeWork, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef) bool {
+            const proof = self.private orelse return false;
+            const scope = store.upload_scope orelse return false;
+            if (store.ptr != proof.store_ptr or store.vtable != proof.store_vtable or !std.meta.eql(scope, proof.scope) or !std.mem.eql(u8, ref.name, proof.ref.name) or !std.mem.eql(u8, ref.artifact_id, proof.ref.artifact_id) or !std.mem.eql(u8, ref.checksum, proof.ref.checksum)) return false;
+            var normalized = ref;
+            normalized.name = proof.ref.name;
+            normalized.artifact_id = proof.ref.artifact_id;
+            normalized.checksum = proof.ref.checksum;
+            return std.meta.eql(normalized, proof.ref);
+        }
+    };
     pub const Statistics = struct {
         ptr: *anyopaque,
         columns: []const []const u8,

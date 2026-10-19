@@ -195,6 +195,17 @@ pub fn acquireColumnBlock(cached: artifacts.CachedRead, store: stores.ArtifactSt
     return acquire(local.sql_spill.ColumnarBlock, cached, store, .{ .kind = .ordered_row_index, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, Loader.load);
 }
 
+/// A verified pack already owns the immutable block bytes. Cache admission
+/// still binds the exact content identity and copies into the cache lease.
+pub fn acquireColumnBlockBytes(cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: artifacts.ChunkRef, cancellation: @import("antfly_cancellation").CancellationToken, bytes: []const u8) !Owned(local.sql_spill.ColumnarBlock) {
+    const Loader = struct {
+        fn load(a: std.mem.Allocator, _: stores.ArtifactStore, _: local.serverless_manifest_artifact_ref.ArtifactRef, _: @import("antfly_cancellation").CancellationToken, _: ?artifacts.CachedRead, data: []const u8) !local.sql_spill.ColumnarBlock {
+            return local.sql_spill.decodeColumnarBlockInArena(a, try a.dupe(u8, data), artifacts.max_block_bytes);
+        }
+    };
+    return acquireInterpreted(local.sql_spill.ColumnarBlock, cached, store, .{ .kind = .ordered_row_index, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, "", bytes, Loader.load);
+}
+
 test "external lake decoded covering blocks share exact dictionaries and fence current readers" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("cover-decoded-cache");

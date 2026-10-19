@@ -231,11 +231,16 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             const group = try operators.Grouped.create(a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = &spill });
             defer group.deinit();
             if (recipe.keys.len == 0) try group.ensureGlobalGroup();
-            var budget = try @import("../serverless/build/lake_build_limits.zig").Budget.init(.{});
+            var local_budget = try @import("../serverless/build/lake_build_limits.zig").Budget.init(.{});
+            const budget = if (provider.resume_work) |work| &work.aggregate else &local_budget;
             const incremental = incrementalRecipe(recipe) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
             if (incremental and source.inventory.files.len != 0) {
-                var resolver: LeafResolver = .{ .a = a, .out = out, .provider = &native_provider, .source = source, .binding = binding, .recipe = recipe, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .metadata_count = metadata_count, .store = store, .spill = &spill, .budget = &budget, .cancellation = cancellation, .contributions = &contributions };
-                var reduction: Reduction = .{ .a = a, .out = out, .store = store, .recipe = recipe, .specs = specs, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .contributions = &contributions, .spill = &spill, .cancellation = cancellation, .resolver = &resolver };
+                var resolver: LeafResolver = .{ .a = a, .out = out, .provider = &native_provider, .source = source, .binding = binding, .recipe = recipe, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .metadata_count = metadata_count, .store = store, .spill = &spill, .budget = budget, .cancellation = cancellation, .contributions = &contributions };
+                var metadata_cache = local.serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(a, 2 * 1024 * 1024);
+                defer metadata_cache.deinit();
+                metadata_cache.decoded.max_bytes = 4 * 1024 * 1024;
+                const cached: artifacts.CachedRead = .{ .cache = &metadata_cache, .scope = if (store.upload_scope) |scope| scope.domain else @splat(0), .context = provider.context };
+                var reduction: Reduction = .{ .cached = cached, .a = a, .out = out, .store = store, .recipe = recipe, .specs = specs, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .contributions = &contributions, .spill = &spill, .cancellation = cancellation, .resolver = &resolver };
                 defer reduction.shape_keys.deinit(a);
                 defer reduction.proof_memo.deinit(a);
                 native_provider.only_file = null;
@@ -290,8 +295,8 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                     defer scan.deinit();
                     native_provider.only_plan = &scan;
                     defer native_provider.only_plan = null;
-                    try consumeCohort(a, &native_provider, binding, recipe, group, &budget, cancellation);
-                } else try consumeCohort(a, &native_provider, binding, recipe, group, &budget, cancellation);
+                    try consumeCohort(a, &native_provider, binding, recipe, group, budget, cancellation);
+                } else try consumeCohort(a, &native_provider, binding, recipe, group, budget, cancellation);
             }
             const published = try artifacts.publishCohort(a, out, store, names, group, recipe, cancellation);
             for (published, names, cohort.items) |artifact, name, index| {
@@ -552,6 +557,7 @@ const Reduction = struct {
     resolver: ?*LeafResolver = null,
     shape_keys: std.AutoHashMapUnmanaged([2][32]u8, [32]u8) = .empty,
     proof_memo: artifacts.ProofMemo = .{},
+    cached: ?artifacts.CachedRead = null,
     fn shapeKey(self: *@This(), leaves: []const Leaf) anyerror![32]u8 {
         if (leaves.len == 1) return leaves[0].key;
         const range = [2][32]u8{ leaves[0].key, leaves[leaves.len - 1].key };
@@ -649,8 +655,8 @@ const Reduction = struct {
             const group = try operators.Grouped.create(self.a, self.specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
             defer group.deinit();
             if (self.recipe.keys.len == 0) try group.ensureGlobalGroup();
-            try importContributions(self.a, self.store, left.refs, self.recipe, group, self.cancellation);
-            try importContributions(self.a, self.store, right.refs, self.recipe, group, self.cancellation);
+            try importContributionsCached(self.a, self.store, left.refs, self.recipe, group, self.cancellation, self.cached);
+            try importContributionsCached(self.a, self.store, right.refs, self.recipe, group, self.cancellation, self.cached);
             const published = try artifacts.publishCohort(self.a, self.out, self.store, self.names, group, self.recipe, self.cancellation);
             @memcpy(refs, published);
             self.out.free(published);
@@ -797,7 +803,7 @@ const Reduction = struct {
         if (artifacts.isPartitioned(refs[0].metadata_version)) return refs;
         const group = try operators.Grouped.create(self.a, self.specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
         defer group.deinit();
-        try importContributions(self.a, self.store, refs, self.recipe, group, self.cancellation);
+        try importContributionsCached(self.a, self.store, refs, self.recipe, group, self.cancellation, self.cached);
         return artifacts.publishPartitionedAt(self.a, self.out, self.store, self.names, group, self.recipe, self.spill, self.cancellation, depth);
     }
     fn mergePartitions(self: *@This(), left: Leaf, right: Leaf, known: ?[]const local.serverless_manifest_artifact_ref.ArtifactRef, ownership: []std.ArrayList([32]u8), depth: u8, output_proofs: ?[]artifacts.StateProof) anyerror![]local.serverless_manifest_artifact_ref.ArtifactRef {
@@ -812,12 +818,12 @@ const Reduction = struct {
         const current = try a.alloc([]const Part, self.names.len);
         for (self.names, 0..) |_, slot| {
             const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
-            const ldir = try artifacts.loadPartitionDirectory(a, self.store.*, left.refs[slot], single, self.cancellation);
-            const rdir = try artifacts.loadPartitionDirectory(a, self.store.*, right.refs[slot], single, self.cancellation);
+            const ldir = try artifacts.loadPartitionDirectoryWithCache(a, self.store.*, left.refs[slot], single, self.cancellation, self.cached);
+            const rdir = try artifacts.loadPartitionDirectoryWithCache(a, self.store.*, right.refs[slot], single, self.cancellation, self.cached);
             if (ldir.depth != depth or rdir.depth != depth) return error.InvalidNativeAggregateArtifact;
             lparts[slot] = ldir.parts;
             rparts[slot] = rdir.parts;
-            if (known) |roots| current[slot] = try artifacts.loadPartitions(a, self.store.*, roots[slot], single, self.cancellation);
+            if (known) |roots| current[slot] = (try artifacts.loadPartitionDirectoryWithCache(a, self.store.*, roots[slot], single, self.cancellation, self.cached)).parts;
         }
         for (0..artifacts.partitionFanout(depth)) |bucket| {
             const occupied_left = for (lparts[0]) |part| {
@@ -904,8 +910,8 @@ const Reduction = struct {
                 } else if (!complete) {
                     const group = try operators.Grouped.create(self.a, self.specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
                     defer group.deinit();
-                    try importContributions(self.a, self.store, lrefs, self.recipe, group, self.cancellation);
-                    try importContributions(self.a, self.store, rrefs, self.recipe, group, self.cancellation);
+                    try importContributionsCached(self.a, self.store, lrefs, self.recipe, group, self.cancellation, self.cached);
+                    try importContributionsCached(self.a, self.store, rrefs, self.recipe, group, self.cancellation, self.cached);
                     const published = if (depth < artifacts.max_partition_depth and count > artifacts.partition_leaf_groups)
                         try artifacts.publishPartitionedAtProven(self.a, pa, self.store, self.names, group, self.recipe, self.spill, self.cancellation, depth + 1, fresh_proofs)
                     else
@@ -958,6 +964,9 @@ const Reduction = struct {
 };
 
 fn importContributions(a: A, store: *stores.ArtifactStore, refs: []const local.serverless_manifest_artifact_ref.ArtifactRef, recipe: recipes.Recipe, group: *operators.Grouped, cancellation: @import("antfly_cancellation").CancellationToken) !void {
+    return importContributionsCached(a, store, refs, recipe, group, cancellation, null);
+}
+fn importContributionsCached(a: A, store: *stores.ArtifactStore, refs: []const local.serverless_manifest_artifact_ref.ArtifactRef, recipe: recipes.Recipe, group: *operators.Grouped, cancellation: @import("antfly_cancellation").CancellationToken, cached: ?artifacts.CachedRead) !void {
     var readers: std.ArrayList(*artifacts.Reader) = .empty;
     defer {
         for (readers.items) |reader| reader.cursor().close(reader);
@@ -965,7 +974,7 @@ fn importContributions(a: A, store: *stores.ArtifactStore, refs: []const local.s
     }
     for (refs, 0..) |ref, slot| {
         const single: recipes.Recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[slot..][0..1] };
-        const reader = try artifacts.Reader.open(a, store.*, ref, single, cancellation);
+        const reader = try artifacts.Reader.openWithCache(a, store.*, ref, single, cancellation, cached);
         var retained = false;
         defer if (!retained) reader.cursor().close(reader);
         try reader.setOutputSlot(@intCast(slot));
@@ -1630,6 +1639,7 @@ test "external lake exact numeric radix updates reuse unchanged Parquet through 
             return local.sql_scalar.numericTextLeaky(alloc, text, &work);
         }
     };
+    var cumulative: @import("lake_index_row_source.zig").Provider.ResumeWork = .{};
     var previous: BuildResult = .{ .declarations = &.{}, .contributions = &.{} };
     for (0..3) |phase| {
         if (phase == 1) {
@@ -1643,7 +1653,7 @@ test "external lake exact numeric radix updates reuse unchanged Parquet through 
         Denied.append = phase == 1;
         denied.get_object = Denied.get;
         if (phase != 0) source.scanner.object_reader.client.vtable = &denied;
-        var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+        var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .resume_work = &cumulative };
         var replay = @import("lake_index_build_replay.zig").Replay.init(a, &provider, &.{ "k", "amount" });
         defer replay.deinit();
         provider.replay = &replay;
@@ -1702,4 +1712,5 @@ test "external lake exact numeric radix updates reuse unchanged Parquet through 
         }
         previous = built;
     }
+    try std.testing.expectEqual(@as(u64, 25), cumulative.aggregate.rows);
 }

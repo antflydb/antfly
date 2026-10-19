@@ -46,6 +46,7 @@ pub const Args = struct {
     index: *@import("lake_index_contributions.zig").Index,
     token: Token,
     scheduler: ?*local.sql_parallel_scheduler.Scheduler = null,
+    unindexed_aggregates: bool = false,
 };
 const Job = struct {
     args: Args,
@@ -90,7 +91,7 @@ fn executeFamily(args: Args, kind: Kind, provider: *Provider, store: *stores.Art
     const source = provider.source;
     switch (kind) {
         .aggregate => {
-            result.native = try aggregates.buildIndexed(args.a, args.out, args.table, source, store, provider, args.token, args.reusable, args.contributions, args.index);
+            result.native = try aggregates.buildIndexed(args.a, args.out, args.table, source, store, provider, args.token, args.reusable, args.contributions, if (args.unindexed_aggregates) null else args.index);
             try provider.checkpointBatch(result.native.declarations);
         },
         .ordered => {
@@ -106,10 +107,11 @@ fn executeFamily(args: Args, kind: Kind, provider: *Provider, store: *stores.Art
     }
     return result;
 }
-pub const Unit = struct { kind: Kind, table: local.common_topology_records.TableRecord };
+pub const Unit = struct { kind: Kind, table: local.common_topology_records.TableRecord, incremental: bool = true };
 fn allowance(kind: Kind) usize {
     return switch (kind) {
-        .aggregate, .ordered => 8 * 1024 * 1024,
+        .aggregate => 14 * 1024 * 1024,
+        .ordered => 8 * 1024 * 1024,
         .text => 64 * 1024 * 1024,
         .sparse, .dense => 256 * 1024 * 1024,
     };
@@ -153,6 +155,13 @@ pub fn build(args: Args) !?Result {
     defer arena.deinit();
     const units = try @import("lake_index_build_units.zig").plan(args.a, arena.allocator(), args.table, args.provider.context.io.?);
     if (units.len < 2) return null;
+    const scheduler = args.scheduler orelse local.sql_parallel_scheduler.global();
+    const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(args.a) orelse return null;
+    var desired = args.provider.limits.max_input_bytes +| args.provider.limits.max_decoded_bytes *| 2;
+    for (units) |unit| desired +|= allowance(unit.kind);
+    if (units.len > Pipeline.width or desired +| (1024 * 1024) > @min(available, scheduler.max_pull_bytes)) {
+        if (try buildFileMajor(args, units)) |result| return result;
+    }
     const pending = try arena.allocator().alloc(bool, units.len);
     @memset(pending, true);
     var remaining = units.len;
@@ -203,6 +212,236 @@ pub fn build(args: Args) !?Result {
     };
     return result;
 }
+const FileCheckpoint = struct { arena: ?std.heap.ArenaAllocator = null, result: Result = .{}, work: Provider.ResumeWork = .{} };
+const FileJob = struct {
+    args: Args,
+    unit: Unit,
+    state: *FileCheckpoint,
+    failure: *std.atomic.Value(u16),
+    provider: Provider,
+    source: local.serverless_query_lake_serving.ServingSource,
+    store: stores.ArtifactStore,
+    execution: local.sql_parallel_scheduler.Execution,
+    fn check(raw: *anyopaque) !void {
+        const self: *FileJob = @ptrCast(@alignCast(raw));
+        const code = self.failure.load(.acquire);
+        if (code != 0) return @errorFromInt(code);
+        try self.args.token.check();
+        try self.args.provider.context.ensureActive();
+    }
+    fn run(self: *FileJob, io: std.Io) anyerror!void {
+        return self.execute(io) catch |err| {
+            _ = self.failure.cmpxchgStrong(0, @intFromError(err), .release, .monotonic);
+            return err;
+        };
+    }
+    fn execute(self: *FileJob, io: std.Io) anyerror!void {
+        self.provider.context.additional_checkpoint = .{ .ptr = self, .check = check };
+        self.execution.checkpoint = .{ .ptr = self, .check = check };
+        defer self.execution.pause();
+        try self.execution.enter(io);
+        var next = std.heap.ArenaAllocator.init(self.args.a);
+        defer next.deinit();
+        var stage = self.args;
+        stage.out = next.allocator();
+        stage.table = self.unit.table;
+        stage.reusable = &.{};
+        stage.contributions = self.state.result.native.contributions;
+        stage.candidates = switch (self.unit.kind) {
+            .aggregate => &.{},
+            .ordered => self.state.result.ordered,
+            .text => self.state.result.text,
+            .sparse => self.state.result.sparse,
+            .dense => self.state.result.dense,
+        };
+        const borrowed = try executeFamily(stage, self.unit.kind, &self.provider, &self.store);
+        // Reused refs can borrow the old checkpoint. Own them before either
+        // producer arena retires, without retaining every historical prefix.
+        var owned = std.heap.ArenaAllocator.init(self.args.a);
+        errdefer owned.deinit();
+        const bytes = try std.json.Stringify.valueAlloc(next.allocator(), borrowed, .{});
+        const result = try std.json.parseFromSliceLeaky(Result, owned.allocator(), bytes, .{ .allocate = .alloc_always });
+        if (self.state.arena) |*previous| previous.deinit();
+        self.state.arena = owned;
+        self.state.result = result;
+        if (self.unit.kind == .text and result.text.len == 1) if (self.store.upload_scope) |scope| {
+            self.state.work.private = .{ .ref = result.text[0].artifact, .scope = scope, .store_ptr = self.store.ptr, .store_vtable = self.store.vtable };
+        };
+    }
+};
+
+/// Cold publications whose configurations cannot reside together advance
+/// private immutable checkpoints one file at a time. Each family reopens its
+/// last checkpoint, consumes the new file, and releases its working state.
+/// Only one file's projected run is retained, with the existing spill quota.
+/// No prefix checkpoint is exposed to recovery or serving as a complete root.
+fn buildFileMajor(args: Args, units: []const Unit) !?Result {
+    if (args.reusable.len != 0 or args.candidates.len != 0 or args.contributions.len != 0 or args.index.root != null) return null;
+    for (units) |unit| if (!unit.incremental) return null;
+    const parent = args.provider.source;
+    try parent.ensureInventory(args.provider.context);
+    for (units) |unit| if (unit.kind == .aggregate) {
+        if (parent.inventory.deleted_row_groups.len != 0 or (if (parent.scanner.iceberg_delete_plan) |plan| plan.files.len != 0 else false)) return null;
+    };
+    if (parent.inventory.files.len < 2) return null;
+    const scheduler = args.scheduler orelse local.sql_parallel_scheduler.global();
+    const io = args.provider.context.io.?;
+    const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(args.a) orelse return null;
+    var maximum: usize = 0;
+    var all: usize = 0;
+    for (units) |unit| {
+        maximum = @max(maximum, allowance(unit.kind));
+        all +|= allowance(unit.kind);
+    }
+    const lanes: usize = @min(8, units.len, scheduler.max_workers, scheduler.max_pull_workers);
+    if (lanes == 0) return null;
+    const worker_bytes = scheduler.cpuWorkspaceBudget(lanes * 8 * 1024 * 1024) / lanes;
+    if (worker_bytes < 1024 * 1024) return null;
+    const replay = args.provider.replay.?;
+    const replay_bytes = @min(replay.budget.limit, 16 * 1024 * 1024);
+    const fixed = args.provider.limits.max_input_bytes +| args.provider.limits.max_decoded_bytes *| 2 +| replay_bytes;
+    const retained = scheduler.reservePullUpTo(lanes, fixed +| maximum, @min(available, fixed +| all)) orelse return null;
+    defer scheduler.releasePull(lanes, retained);
+    var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = args.a };
+    const a = allocations.allocator();
+    try replay.reset();
+    const original_columns = replay.columns;
+    const original_budget = replay.budget.limit;
+    const original_backing = replay.budget.backing;
+    const original_arena = replay.arena.child_allocator;
+    replay.budget.backing = a;
+    replay.arena.child_allocator = a;
+    const index_io = args.index.io;
+    const index_a = args.index.a;
+    const index_seed = args.index.seed_arena.child_allocator;
+    const index_store = args.index.store.allocator;
+    args.index.io = io;
+    args.index.a = a;
+    args.index.seed_arena.child_allocator = a;
+    args.index.store.allocator = a;
+    defer {
+        replay.reset() catch unreachable;
+        replay.columns = original_columns;
+        replay.budget.limit = original_budget;
+        replay.budget.backing = original_backing;
+        replay.arena.child_allocator = original_arena;
+        args.index.io = index_io;
+        args.index.a = index_a;
+        args.index.seed_arena.child_allocator = index_seed;
+        args.index.store.allocator = index_store;
+    }
+    var control = std.heap.ArenaAllocator.init(a);
+    defer control.deinit();
+    replay.columns = try projectionForUnits(args, control.allocator(), units);
+    replay.budget.limit = replay_bytes;
+    const states = try a.alloc(FileCheckpoint, units.len);
+    defer a.free(states);
+    @memset(states, .{});
+    defer for (states) |*state| if (state.arena) |*arena| arena.deinit();
+    const capture: local.serverless_segment_source_binding.Binding = .{
+        .source_kind = switch (parent.inventory.format) {
+            .parquet => .external_parquet,
+            .iceberg => .external_iceberg,
+            .lance => return null,
+        },
+        .row_ref_kind = .external,
+        .source_id = parent.inventory.source_id,
+        .snapshot_id = parent.inventory.snapshot_id,
+        .schema_fingerprint = parent.inventory.schema_fingerprint,
+        .sidecar_kind = .text,
+        .index_config_hash = "file-major-replay",
+        .column_bindings = replay.columns,
+    };
+    // Prefixes use the exact authorized source snapshot and stable file
+    // coordinates. The selected view changes only which files a private build
+    // has reached; intermediate roots stay inside this attempt.
+    for (0..parent.inventory.files.len) |file| {
+        try args.token.check();
+        try args.provider.context.ensureActive();
+        // Freeze the file before workers borrow it or the parent's versions.
+        // A declined oversized replay uses independent ordinary scan views.
+        const prepared = if (replay.columns.len == 0) false else try replay.prepare(a, capture, file, args.token);
+        var view = try parent.parallelView(a);
+        defer view.closeParallelView(parent);
+        view.inventory.files = parent.inventory.files[0 .. file + 1];
+        view.scanner.inventory = view.inventory;
+        view.selected_catalog_view = true;
+        view.local_plan = null;
+        view.plan_identity = null;
+        // Without a replay each worker owns its own scanner. The retained
+        // reservation covers one decode workspace, so stream them serially.
+        const wave_lanes: usize = if (prepared) lanes else 1;
+        var begin: usize = 0;
+        while (begin < units.len) {
+            const headroom = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse return error.LakeSidecarBuildBudgetExceeded;
+            const capacity = @min(retained - fixed, headroom -| fixed);
+            var count: usize = 0;
+            var bytes: usize = 0;
+            while (begin + count < units.len and count < wave_lanes) {
+                const wanted = allowance(units[begin + count].kind);
+                if (wanted > capacity -| bytes) break;
+                bytes += wanted;
+                count += 1;
+            }
+            if (count == 0) return error.LakeSidecarBuildBudgetExceeded;
+            var jobs: [8]FileJob = undefined;
+            var failure = std.atomic.Value(u16).init(0);
+            var initialized: usize = 0;
+            defer for (jobs[0..initialized]) |*job| job.source.closeParallelView(&view);
+            var tasks: [8]?std.Io.Future(anyerror!void) = @splat(null);
+            defer for (&tasks) |*task| if (task.*) |*pending| {
+                pending.cancel(io) catch {};
+            };
+            for (0..count) |slot| {
+                const index = begin + slot;
+                var provider = args.provider.*;
+                provider.native_delta = null;
+                provider.previous_inventory = null;
+                provider.replay_consumer = null;
+                provider.only_plan = null;
+                provider.only_files = null;
+                provider.only_file = null;
+                provider.progress = null;
+                provider.resume_work = &states[index].work;
+                if (!prepared) provider.replay = null;
+                var job_args = args;
+                job_args.a = a;
+                job_args.unindexed_aggregates = file + 1 != parent.inventory.files.len;
+                var store = args.store.*;
+                store.allocator = a;
+                jobs[slot] = .{ .args = job_args, .unit = units[index], .state = &states[index], .failure = &failure, .provider = provider, .source = try view.parallelView(a), .store = store, .execution = .{ .scheduler = scheduler, .bytes = worker_bytes } };
+                initialized += 1;
+                jobs[slot].provider.source = &jobs[slot].source;
+                tasks[slot] = io.concurrent(FileJob.run, .{ &jobs[slot], io }) catch fallback: {
+                    try jobs[slot].run(io);
+                    break :fallback null;
+                };
+            }
+            for (&tasks) |*task| if (task.*) |*pending| {
+                const finished = pending.await(io);
+                task.* = null;
+                try finished;
+            };
+            begin += count;
+        }
+        try replay.reset();
+    }
+    var result: Result = .{};
+    for (states) |state| {
+        // Transfer only the final immutable metadata to the publication owner.
+        // Old/new metadata overlaps only within the admitted worker wave.
+        var page = std.heap.ArenaAllocator.init(args.a);
+        defer page.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(page.allocator(), state.result, .{});
+        const owned_result = try std.json.parseFromSliceLeaky(Result, args.out, encoded, .{ .allocate = .alloc_always });
+        try merge(args.out, &result, owned_result);
+    }
+    try args.provider.checkpointBatch(result.native.declarations);
+    for (result.ordered) |declaration| try args.provider.checkpoint(declaration);
+    for (result.text) |declaration| try args.provider.checkpoint(declaration);
+    return result;
+}
+
 fn buildCohort(args_: Args, units: []const Unit) !?Result {
     const replay = args_.provider.replay.?;
     const io = args_.provider.context.io.?;
@@ -493,9 +732,9 @@ test "external lake file-first publication shares one decode across five native 
         try std.testing.expect(limited_replay.captures < 21);
     }
     try std.testing.expectEqual(@as(usize, 0), modest.live_bytes);
-    // At 224 MiB these three light consumers admit the second source cursor
+    // At 240 MiB these three light consumers admit the second source cursor
     // while retaining borrowed single-batch backpressure (no two-frame queue).
-    var borrowed_budget = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 224 * 1024 * 1024 });
+    var borrowed_budget = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 240 * 1024 * 1024 });
     {
         var borrowed_provider = provider;
         var borrowed_replay = replay_api.Replay.init(borrowed_budget.allocator(), &borrowed_provider, columns);
@@ -582,4 +821,117 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(usize, 3), replay.captures - captures_before_constrained);
     try std.testing.expectEqual(@as(usize, 0), constrained.pull_bytes);
     try std.testing.expectEqual(@as(usize, 0), constrained.pull_workers);
+    var file_major: local.sql_parallel_scheduler.Scheduler = .{ .max_pull_bytes = 500 * 1024 * 1024 };
+    args.scheduler = &file_major;
+    const captures_before_major = replay.captures;
+    const Progress = struct {
+        replay: *replay_api.Replay,
+        complete_at: usize,
+        calls: usize = 0,
+        fn save(raw: *anyopaque, _: Declared) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.complete_at, self.replay.captures);
+            self.calls += 1;
+        }
+    };
+    var progress: Progress = .{ .replay = &replay, .complete_at = captures_before_major + 3 };
+    provider.progress = .{ .ptr = &progress, .save = Progress.save };
+    defer provider.progress = null;
+    const major = (try build(args)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 4), major.text.len);
+    try std.testing.expectEqual(@as(usize, 1), major.dense.len);
+    try std.testing.expectEqual(@as(usize, 1), major.sparse.len);
+    try std.testing.expectEqual(@as(usize, 1), major.ordered.len);
+    try std.testing.expectEqual(@as(usize, 3), major.native.declarations.len);
+    try std.testing.expectEqual(@as(usize, 3), replay.captures - captures_before_major);
+    try std.testing.expectEqual(@as(usize, 8), progress.calls);
+    const held_ref = major.text[0].artifact;
+    const private_work: Provider.ResumeWork = .{ .private = .{ .ref = held_ref, .scope = store.upload_scope.?, .store_ptr = store.ptr, .store_vtable = store.vtable } };
+    try std.testing.expect(private_work.trusts(store, held_ref));
+    var changed_ref = held_ref;
+    changed_ref.metadata_version += 1;
+    try std.testing.expect(!private_work.trusts(store, changed_ref));
+    changed_ref = held_ref;
+    changed_ref.byte_len += 1;
+    try std.testing.expect(!private_work.trusts(store, changed_ref));
+    changed_ref = held_ref;
+    changed_ref.name = "another-index";
+    try std.testing.expect(!private_work.trusts(store, changed_ref));
+    var changed_store = store;
+    changed_store.upload_scope.?.attempt[15] ^= 1;
+    try std.testing.expect(!private_work.trusts(changed_store, held_ref));
+    changed_store = store;
+    var other_backend: u8 = 0;
+    changed_store.ptr = &other_backend;
+    try std.testing.expect(!private_work.trusts(changed_store, held_ref));
+    const another_vtable = store.vtable.*;
+    changed_store = store;
+    changed_store.vtable = &another_vtable;
+    try std.testing.expect(!private_work.trusts(changed_store, held_ref));
+    try std.testing.expectEqual(@as(usize, 0), file_major.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), file_major.pull_workers);
+    const major_ordered = try @import("lake_index_ordered_rows.zig").loadRootLazy(out, store, major.ordered[0].artifact, .none, null);
+    try std.testing.expect(!major_ordered.building);
+    try std.testing.expectEqual(@as(u64, 12), major_ordered.page.?.records);
+    const dense = try @import("lake_index_native_dense.zig").loadRoot(out, store, major.dense[0].artifact, .none, null);
+    var dense_rows: u64 = 0;
+    for (dense.file_states) |file| dense_rows += file.count;
+    try std.testing.expectEqual(@as(u64, 12), dense_rows);
+    const sparse = try @import("lake_index_native_sparse.zig").loadRoot(out, store, major.sparse[0].artifact, .none, null);
+    var sparse_rows: u64 = 0;
+    for (sparse.file_states) |file| sparse_rows += file.count;
+    try std.testing.expectEqual(@as(u64, 12), sparse_rows);
+    const artifact_api = @import("lake_index_aggregate_artifact.zig");
+    for (major.native.declarations) |declaration| {
+        const recipe = try artifact_api.loadRecipe(out, store, declaration.artifact, .none);
+        const reader = try artifact_api.Reader.open(a, store, declaration.artifact, recipe, .none);
+        defer reader.cursor().close(reader);
+        const group = try local.sql_operators.Grouped.create(a, &.{recipe.inputs[0].spec}, .{});
+        defer group.deinit();
+        while (try reader.cursor().next(reader, out, 8)) |rows| try group.importPartialBatch(rows);
+        var total: i64 = 0;
+        while (try group.nextResult(out)) |row| total += row.aggregates[0].value.integer;
+        try std.testing.expectEqual(@as(i64, if (recipe.inputs[0].spec.kind == .sum) 30 else 12), total);
+    }
+    // A declined per-file replay preserves the ordinary streaming path and
+    // keeps a single scan workspace under the same constrained reservation.
+    provider.progress = null;
+    const spill_limit = replay.max_spill_bytes;
+    replay.max_spill_bytes = 1;
+    const streamed = (try build(args)) orelse return error.TestUnexpectedResult;
+    replay.max_spill_bytes = spill_limit;
+    provider.progress = .{ .ptr = &progress, .save = Progress.save };
+    try std.testing.expectEqual(major.text.len, streamed.text.len);
+    try std.testing.expectEqual(major.native.declarations.len, streamed.native.declarations.len);
+    const streamed_rows = try @import("lake_index_ordered_rows.zig").loadRootLazy(out, store, streamed.ordered[0].artifact, .none, null);
+    try std.testing.expectEqual(@as(u64, 12), streamed_rows.page.?.records);
+    try std.testing.expectEqual(@as(usize, 0), file_major.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), file_major.workers);
+    var canceled = std.atomic.Value(bool).init(true);
+    args.token = Token.fromAtomic(&canceled);
+    const captures_before_cancel = replay.captures;
+    try std.testing.expectError(error.Canceled, build(args));
+    try std.testing.expectEqual(captures_before_cancel, replay.captures);
+    try std.testing.expectEqual(@as(usize, 0), file_major.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), file_major.pull_workers);
+    const Interrupt = struct {
+        replay: *replay_api.Replay,
+        after: usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.replay.captures >= self.after) return error.Canceled;
+        }
+    };
+    var interrupt: Interrupt = .{ .replay = &replay, .after = replay.captures + 2 };
+    args.token = .none;
+    progress.calls = 0;
+    provider.context.additional_checkpoint = .{ .ptr = &interrupt, .check = Interrupt.check };
+    defer provider.context.additional_checkpoint = null;
+    try std.testing.expectError(error.Canceled, build(args));
+    try std.testing.expectEqual(@as(usize, 0), progress.calls);
+    try std.testing.expect(replay.run == null);
+    try std.testing.expectEqual(@as(usize, 0), replay.readers);
+    try std.testing.expectEqual(@as(usize, 0), replay.budget.live);
+    try std.testing.expectEqual(@as(usize, 0), file_major.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), file_major.workers);
 }

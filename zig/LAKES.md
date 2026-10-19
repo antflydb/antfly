@@ -1273,3 +1273,20 @@ publish without spill I/O. Output pages coalesce at most 256 rows. Ordered index
 gather 64 keys at a time and pass covering scalar/JSON columns to native batch
 sorting, retaining payload ownership before advancing source pages. The durable
 metadata and attachment/query UX remain unchanged.
+
+
+Protocol 59 adds immutable packed aggregate leaves (metadata 6), combining a
+bounded native column block and all logical roots into one object. Readers
+validate the complete pack and each selected recipe/slot; GC retains the pack
+as one object. Existing flat and partitioned formats remain readable. Aggregate
+builds share bounded verified/decoded metadata caches, including physical pack
+controls, and copy retained directory descriptors without JSON round trips.
+
+Cold publications exceeding resident cohort admission advance private per-file
+checkpoints across configurations, retaining one bounded disk replay instead of
+rereading the archive for each cohort. Native vector/sparse generations, ordered
+and text checkpoints, and exact aggregate contributions reopen completed work.
+Only final roots become serving/recovery publications. Warm delta publications
+and non-incremental aggregate recipes retain their existing paths. Oversized
+individual files preserve ordinary streaming fallback and existing disk/memory
+limits. Attachment, SQL and search UX are unchanged.

@@ -185,7 +185,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
         const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
         defer rows.deinit(a);
-        var input: u64 = 512 * 1024 * 1024;
+        var input_remaining: u64 = 512 * 1024 * 1024;
+        const input = if (provider.resume_work) |work| &work.native_input_left else &input_remaining;
         while (try rows.next(a)) |batch| {
             var page_arena = std.heap.ArenaAllocator.init(a);
             defer page_arena.deinit();
@@ -213,7 +214,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         defer index.alloc.free(existing);
                         return error.NativeLakeVectorIdentityCollision;
                     };
-                    try stores.chargeReadBudget(&input, @as(u64, dims) * 4 + 128);
+                    try stores.chargeReadBudget(input, @as(u64, dims) * 4 + 128);
                     try writes.append(pa, .{ .vector_id = id, .vector = vector, .metadata = key });
                 }
             }
@@ -246,11 +247,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         try index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = flatten, .make_authoritative = true });
         var checkpoint = (try index.nativeBackupGeneration(a, 0)) orelse return error.InvalidNativeLakeDenseRoot;
         defer checkpoint.deinit();
-        var output_bytes: u64 = 1024 * 1024 * 1024;
-        const posting_generation = try publishGeneration(a, ca, &checkpoint, store, cancellation, &output_bytes, if (seed) |root| .{ .root = root.generation } else null);
+        var output_remaining: u64 = 1024 * 1024 * 1024;
+        const output_bytes = if (provider.resume_work) |work| &work.native_output_left else &output_remaining;
+        const posting_generation = try publishGeneration(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation } else null);
         var vector_checkpoint = try vectors.pinNativeCheckpoint();
         defer vector_checkpoint.deinit();
-        const vector_generation = try files.publishCheckpoint(a, ca, &vector_checkpoint, store, cancellation, &output_bytes, if (seed) |root| .{ .root = root.generation, .prefix = "vectors/" } else null);
+        const vector_generation = try files.publishCheckpoint(a, ca, &vector_checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .prefix = "vectors/" } else null);
         const generation = try combineVectors(ca, posting_generation, vector_generation);
         const root: Root = .{ .binding = binding, .config_json = config.config_json, .dims = dims, .metric = metric, .generation = generation, .recipe = recipe, .file_states = if (plan.selection == null) plan.files else &.{}, .file_directory = if (plan.selection != null) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
