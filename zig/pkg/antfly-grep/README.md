@@ -3189,7 +3189,7 @@ therefore not eliminated, and no universal delta speedup is claimed. A bounded
 transport-coalescing experiment also regressed complete-request latency and was
 reverted; its negative controls identify the experimental binary separately.
 
-Final product sources pass the 243-case CLI suites on macOS/Linux (two expected
+The `3c25321f51` source snapshot passed the 243-case CLI suites on macOS/Linux (two expected
 skips each), 100/101 package tests each (one expected skip), ReleaseSafe native
 conformance/hardening, 1,000 generated oracle comparisons without failures or
 timeouts, Windows cross-compilation, and release/license/toolchain/compatibility
@@ -3261,3 +3261,64 @@ timing ends. Main-thread CPU excludes workers; wall time includes backpressure.
 Clock calls perturb short phases, so uninstrumented paired trials determine
 performance gains. Normal builds compile out both timers and profiling storage.
 No new JIT path is justified by these output/capture measurements.
+
+
+Qualification of `5b7a05d424` compares uninstrumented binaries against the prior
+PR head `3c25321f51`. Delta controls use 51 alternating pairs, exclude refresh,
+and finish both requests before updating either complete oracle view. Consumer
+controls rotate decoded, frozen-list and buffered modes across nine trials,
+using one exact binary. The dense fixture contains one file with 20,000 matching
+lines and a 6.02 MB retained payload. Allocation tracing is a separate untimed
+probe. Capture uses seven alternating pairs on warm filesystem data. Linux is
+an ARM64 VM constrained to two CPUs; macOS and Linux share the host with other
+work. These results do not establish cold-storage or hardware-independent wins.
+
+| Control | macOS before → after | Linux VM before → after |
+|---|---:|---:|
+| Dense file, list → buffered traced peak | 14.51 → 6.77 MB | 14.49 → 6.77 MB |
+| Same delivery, elapsed | 53.67 → 54.48 ms | 53.60 → 53.57 ms |
+| One-file delta, client elapsed | 129.96 → 129.17 µs | 452.04 → 296.67 µs |
+| Same delta, main-thread CPU | Not sampled | 156.38 → 146.58 µs |
+| Default 10K-file capture, process CPU | 0.22 → 0.20 s | 0.06 → 0.06 s |
+| Opt-in parallel 10K capture, elapsed | 260.42 → 236.46 ms | 69.84 → 77.45 ms |
+| Same opt-in capture, process CPU | 0.21 → 0.44 s | 0.06 → 0.07 s |
+
+Dense staging reduces traced peak allocation by about 53%; it does not establish
+a latency improvement over the previous list collector. Many-small-file consumer
+controls remain approximately flat. Delta CPU falls about 6% in the Linux control;
+the larger elapsed-time difference is sensitive to shared-host scheduling, and
+macOS latency is flat. Default Linux 100K capture is similarly flat (709.9 →
+718.3 ms, 0.70 s CPU for both). Capture CPU counters have 10 ms precision.
+
+An earlier unconditional-parallel-open prototype regressed the loaded macOS
+100K-file control (13.43 → 14.53 s, 4.14 → 9.66 s CPU). Its negative report and
+binary identity remain available, separate from the distributed binary. Final
+opt-in Linux 100K capture also costs more CPU (0.69 → 0.82 s) without improving
+elapsed time. Consequently parallel opens remain explicit opt-in, intended for
+storage where a measured latency benefit justifies the CPU cost. Automatic
+metadata concurrency and independent storage/hardware qualification remain future
+work. The default preserves serial opens, and retained source accounting differs
+by only one eight-byte generation counter on these 64-bit targets.
+
+The final sources pass both 243-case CLI suites (two expected skips each),
+102/103 package tests on each host (one expected skip), ReleaseSafe conformance
+and hardening, 1,000 generated oracle comparisons without failures/timeouts,
+Windows cross-compilation, six consumer regressions and release/license/toolchain
+checks. Packaged completions and the man page include the new flag. Profiling
+builds are separate from all distributed/tested performance binaries. Pinned
+retained reads still omit requests; freshness checks, changed output and retained
+RAM retain their inherent costs. Provider checks remain local fixtures.
+
+Evidence: [source/binary/report/archive qualification](bench/results/bounded-validation.json),
+[dense macOS consumer](bench/results/bounded-consumer-dense-macos.json),
+[dense Linux consumer](bench/results/bounded-consumer-dense-linux.json),
+[macOS deltas](bench/results/bounded-delta-macos.json),
+[Linux deltas and CPU](bench/results/bounded-delta-linux.json),
+[default macOS capture](bench/results/bounded-capture-macos.json),
+[default Linux capture](bench/results/bounded-capture-linux.json),
+[opt-in macOS metadata capture](bench/results/bounded-parallel-macos.json),
+[opt-in Linux metadata capture](bench/results/bounded-parallel-linux.json),
+[rejected automatic prototype](bench/results/bounded-parallel-prototype-macos.json),
+[pre-optimization macOS phases](bench/results/bounded-phases-preopt-macos.json),
+[final diagnostic Linux phases](bench/results/bounded-phases-linux.json), and
+[generated oracle results](bench/results/bounded-differential.json).
