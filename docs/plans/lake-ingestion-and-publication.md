@@ -2838,3 +2838,20 @@ Explicit unordered LIMIT/OFFSET stops finalized result consumption after enough
 rows pass HAVING. Ordered aggregates, ORDER BY and external decision evaluation
 keep their established paths. Authority, cancellation, grouping and response
 limits remain active. Attachment, index configuration and SQL syntax are unchanged.
+
+
+Protocol-61 qualification passes 365 native and 256 shared lake/SQL regressions
+with zero failures or leaks. After merging main `fc9bea9f20`, the focused native
+and shared selection also passes (8 native, 3 shared). Main's newly introduced
+private inference error names are regenerated with pinned Zig 0.17.0, and both
+identity round-trip tests pass. The native prefix, NULL/integer radix routing,
+mixed AVG/shared-scan, GC and result-delivery regressions are included. These
+checks establish bounded work and correctness; archive-scale latency/RSS gains
+remain unmeasured.
+
+The final server merged with main `fc9bea9f20` also passes all 21 selected
+HTTP/pgwire E2Es: compact V1/V2 Parquet, real Iceberg evolution/deletes, exact
+numeric aggregates, 33-index cold publication over nine files, 521-key routing,
+dense/sparse search, incremental artifact reuse and source-loss restart reads.
+The stripped Debug build, CLI smoke test, generated catalogs, source/control
+boundary, licensing, formatting and quickstart documentation checks pass.
