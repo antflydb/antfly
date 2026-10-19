@@ -76,9 +76,16 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--files", type=int, default=10000)
     parser.add_argument("--iterations", type=int, default=9)
+    parser.add_argument(
+        "--cpu-schedstat",
+        action="store_true",
+        help="Linux single-thread CPU/runqueue counters outside request timing",
+    )
     args = parser.parse_args()
     if min(args.files, args.iterations) < 1:
         parser.error("sizes must be positive")
+    if args.cpu_schedstat and platform.system() != "Linux":
+        parser.error("--cpu-schedstat requires Linux /proc counters")
     binaries = {"current": args.current.resolve(), "baseline": args.baseline.resolve()}
     report = {
         "measurement": __doc__.strip(),
@@ -93,6 +100,9 @@ def main():
             for name, binary in binaries.items()
         },
         "trials": [],
+        "cpu_counter_source": "/proc/PID/schedstat (main thread; sampled outside request timing)"
+        if args.cpu_schedstat
+        else None,
     }
     with tempfile.TemporaryDirectory(prefix="grep-delta-") as tmp:
         root = Path(tmp)
@@ -133,6 +143,16 @@ def main():
                 trial = {"load_average": os.getloadavg()}
                 for name in binaries if iteration % 2 else reversed(binaries):
                     service = services[name]
+                    counters = (
+                        Path(f"/proc/{service.process.pid}/schedstat")
+                        if args.cpu_schedstat
+                        else None
+                    )
+                    before_cpu = (
+                        [int(v) for v in counters.read_text().split()]
+                        if args.cpu_schedstat
+                        else None
+                    )
                     value, rows = service.exchange(
                         "search",
                         revision=service.ready["revision"],
@@ -140,6 +160,14 @@ def main():
                         delta=True,
                         if_result_token=tokens[name],
                     )
+                    if before_cpu is not None:
+                        after_cpu = [int(v) for v in counters.read_text().split()]
+                        value["main_thread_cpu_seconds"] = (
+                            after_cpu[0] - before_cpu[0]
+                        ) / 1e9
+                        value["main_thread_runqueue_seconds"] = (
+                            after_cpu[1] - before_cpu[1]
+                        ) / 1e9
                     tokens[name] = next(
                         r["result_token"] for r in rows if r["type"] == "result_token"
                     )
@@ -178,6 +206,11 @@ def main():
                 "producer_seconds",
                 "first_event_seconds",
                 "response_bytes",
+                *(
+                    ["main_thread_cpu_seconds", "main_thread_runqueue_seconds"]
+                    if args.cpu_schedstat
+                    else []
+                ),
             )
         }
         for name in binaries
