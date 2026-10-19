@@ -71,6 +71,7 @@ pub const Generation = struct {
     source_bytes_read: usize = 0,
     capture_workers: usize = 0,
     parallel_sources_read: usize = 0,
+    parallel_sources_opened: usize = 0,
     sources_opened: usize = 0,
     discovery_reused: bool = false,
     source_bytes_reused: usize = 0,
@@ -114,6 +115,7 @@ pub const Generation = struct {
         if (previous != null) {
             next.capture_workers = 0;
             next.parallel_sources_read = 0;
+            next.parallel_sources_opened = 0;
         }
         if (journal) |j| {
             next.namespace_paths_checked = j.path_checks;
@@ -199,12 +201,21 @@ pub const Generation = struct {
         var collector = Collector{ .generation = self, .io = io, .options = o, .previous = previous, .watcher = watcher, .journal = journal, .trusted_membership = trusted };
         var queue: CaptureQueue = .{ .collector = &collector, .pool = .{ .io = io }, .workers = @min(8, if (o.jobs_auto) @min(4, o.jobs) else o.jobs), .capacity = CaptureQueue.descriptorCapacity() };
         defer queue.deinit();
-        if (previous == null and queue.workers > 1) collector.queue = &queue;
+        var opens: OpenQueue = .{ .collector = &collector, .pool = &queue.pool, .workers = queue.workers, .capacity = @max(1, queue.capacity / 2) };
+        defer opens.deinit();
+        if (previous == null and queue.workers > 1) {
+            collector.queue = &queue;
+            if (o.workspace_parallel_open and queue.capacity >= 2) {
+                collector.opens = &opens;
+                queue.capacity -= opens.capacity;
+            }
+        }
         self.discovery_reused = trusted;
         if (watcher) |w| w.poll();
         if (trusted) {
             for (previous.?.entries.items) |entry| try collector.addFile(entry.path, entry.path, entry.explicit_file);
         } else if (o.paths.items.len == 0) try collector.path(".") else for (o.paths.items) |path| try collector.path(path);
+        try opens.flush();
         try queue.flush();
         if (watcher) |w| {
             w.poll();
@@ -977,6 +988,110 @@ test "direct snapshot reads reject growth and shrinkage and preserve empty file 
     try std.testing.expectEqualSlices(u8, &expected, &hash);
 }
 
+// Cold opens overlap filesystem metadata latency. Workers own disjoint job
+// slots; only the coordinator allocates source blobs, arms subscriptions and
+// publishes entries. Both queues share the descriptor allowance. Paths are
+// owned because discovery reuses its scratch buffer between callbacks.
+const OpenQueue = struct {
+    const Job = struct {
+        path: []u8,
+        display: []const u8,
+        file: ?std.Io.File = null,
+        stamp: std.Io.File.Stat = undefined,
+        explicit_file: bool,
+        failure: ?anyerror = null,
+    };
+    collector: *Collector,
+    pool: *@import("worker_pool.zig").Pool,
+    workers: usize,
+    capacity: usize,
+    jobs: [16]Job = undefined,
+    count: usize = 0,
+    cursor: std.atomic.Value(usize) = .init(0),
+    fn push(self: *OpenQueue, path: []const u8, display: []const u8, explicit_file: bool) !void {
+        const a = self.collector.generation.budget.allocator();
+        const same = std.mem.eql(u8, path, display);
+        const storage = try a.alloc(u8, path.len + if (same) @as(usize, 0) else display.len);
+        @memcpy(storage[0..path.len], path);
+        if (!same) @memcpy(storage[path.len..], display);
+        self.jobs[self.count] = .{ .path = storage, .display = if (same) storage else storage[path.len..], .explicit_file = explicit_file };
+        // Keep path length separate from the shared allocation through a slice.
+        self.jobs[self.count].path = storage[0..path.len];
+        self.count += 1;
+    }
+    fn clear(self: *OpenQueue) void {
+        for (self.jobs[0..self.count]) |job| {
+            if (job.file) |file| file.close(self.collector.io);
+            const len = job.path.len + if (job.display.ptr == job.path.ptr) @as(usize, 0) else job.display.len;
+            self.collector.generation.budget.allocator().free(job.path.ptr[0..len]);
+        }
+        self.count = 0;
+    }
+    fn run(self: *OpenQueue) void {
+        while (true) {
+            const index = self.cursor.fetchAdd(1, .monotonic);
+            if (index >= self.count) return;
+            const job = &self.jobs[index];
+            const file = std.Io.Dir.cwd().openFile(self.collector.io, job.path, .{}) catch |err| {
+                job.failure = err;
+                continue;
+            };
+            job.file = file;
+            job.stamp = file.stat(self.collector.io) catch |err| {
+                job.failure = err;
+                continue;
+            };
+        }
+    }
+    fn flush(self: *OpenQueue) !void {
+        if (self.count == 0) return;
+        defer self.clear();
+        self.cursor.store(0, .monotonic);
+        var handles: [8]@import("worker_pool.zig").Handle = undefined;
+        var launched: usize = 0;
+        if (self.count > 1) for (0..@min(self.workers, self.count) - 1) |_| {
+            handles[launched] = self.pool.launch(run, self) catch break;
+            launched += 1;
+        };
+        self.run();
+        for (handles[0..launched]) |handle| handle.join();
+        if (launched > 0) {
+            self.collector.generation.capture_workers = @max(self.collector.generation.capture_workers, launched + 1);
+            self.collector.generation.parallel_sources_opened += self.count;
+        }
+        const serial_retry = for (self.jobs[0..self.count]) |job| {
+            if (job.failure != null and job.file == null) break true;
+        } else false;
+        if (serial_retry) {
+            // An optional parallel open must not make capture fail solely
+            // because other successful opens hold scarce descriptors. Retire
+            // the entire open batch, then admit one file at a time.
+            for (self.jobs[0..self.count]) |*job| if (job.file) |file| {
+                file.close(self.collector.io);
+                job.file = null;
+            };
+            if (self.collector.queue) |queue| try queue.flush();
+        }
+        for (self.jobs[0..self.count]) |*job| {
+            if (serial_retry) {
+                job.file = std.Io.Dir.cwd().openFile(self.collector.io, job.path, .{}) catch |err| blk: {
+                    const queue = self.collector.queue orelse return err;
+                    if (queue.count == 0) return err;
+                    try queue.flush();
+                    break :blk try std.Io.Dir.cwd().openFile(self.collector.io, job.path, .{});
+                };
+                job.stamp = try job.file.?.stat(self.collector.io);
+            } else if (job.failure) |err| return err;
+            const file = job.file.?;
+            job.file = null;
+            try self.collector.addOpened(file, job.stamp, job.path, job.display, job.explicit_file);
+        }
+    }
+    fn deinit(self: *OpenQueue) void {
+        self.clear();
+    }
+};
+
 // Cold capture batches own a fixed number of descriptors and at most 8 MiB
 // of source payloads. Allocation, subscriptions and publication stay serial;
 // workers only read, validate and hash disjoint preallocated immutable blobs.
@@ -1084,6 +1199,7 @@ const Collector = struct {
     membership_visited: usize = 0,
     eligibility: ?*std.ArrayList([]const u8) = null,
     queue: ?*CaptureQueue = null,
+    opens: ?*OpenQueue = null,
     fn markSeen(self: *Collector, path_name: []const u8) !void {
         if (self.membership_seen) |seen| if (self.previous.?.find(path_name)) |entry| {
             const slot = (@intFromPtr(entry) - @intFromPtr(self.previous.?.entries.items.ptr)) / @sizeOf(Entry);
@@ -1120,6 +1236,7 @@ const Collector = struct {
     fn addFile(self: *Collector, path_name: []const u8, display: []const u8, explicit_file: bool) !void {
         const generation = self.generation;
         self.membership_visited += 1;
+        if (self.opens) |opens| if (generation.entries.items.len +| (if (self.queue) |queue| queue.count else 0) +| opens.count >= self.options.workspace_max_files) try opens.flush();
         if (generation.entries.items.len +| (if (self.queue) |queue| queue.count else 0) >= self.options.workspace_max_files) return error.WorkspaceFileLimit;
         if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
             if (old.blob.watcher == watcher and old.blob.token != null and
@@ -1138,9 +1255,16 @@ const Collector = struct {
                 return;
             }
         };
-        if (self.queue) |queue| if (queue.count == queue.capacity) try queue.flush();
         generation.sources_opened += 1;
-        var file_handle = std.Io.Dir.cwd().openFile(self.io, path_name, .{}) catch |err| blk: {
+        if (self.opens) |opens| {
+            // Flush before enqueueing so max-file accounting includes both
+            // pending queues and the already-published generation exactly once.
+            if (opens.count == opens.capacity) try opens.flush();
+            try opens.push(path_name, display, explicit_file);
+            return;
+        }
+        if (self.queue) |queue| if (queue.count == queue.capacity) try queue.flush();
+        const file_handle = std.Io.Dir.cwd().openFile(self.io, path_name, .{}) catch |err| blk: {
             // Optional pending reads must not consume the last descriptors and
             // turn a source which fits serially into a capture failure.
             const queue = self.queue orelse return err;
@@ -1148,9 +1272,18 @@ const Collector = struct {
             try queue.flush();
             break :blk try std.Io.Dir.cwd().openFile(self.io, path_name, .{});
         };
+        const before = file_handle.stat(self.io) catch |err| {
+            file_handle.close(self.io);
+            return err;
+        };
+        return self.addOpened(file_handle, before, path_name, display, explicit_file);
+    }
+    // Consumes the descriptor on both success and failure.
+    fn addOpened(self: *Collector, file_handle: std.Io.File, before: std.Io.File.Stat, path_name: []const u8, display: []const u8, explicit_file: bool) !void {
         var close_file = true;
         defer if (close_file) file_handle.close(self.io);
-        const before = try file_handle.stat(self.io);
+        const generation = self.generation;
+        if (self.queue) |queue| if (queue.count == queue.capacity) try queue.flush();
         if (before.kind != .file) return error.NotRegularFile;
         if (before.size > self.options.max_file_bytes and self.options.skip_oversize) {
             // Size affects discovery eligibility without changing directory
@@ -1526,7 +1659,7 @@ test "parallel cold capture equals serial capture and bounds failed admission" {
         var name: [32]u8 = undefined;
         try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name, "f{d}.txt", .{i}), .data = payload });
     }
-    var options: Options = .{ .no_ignore = true, .jobs = 1, .workspace_memory_limit = 16 * 1024 * 1024 };
+    var options: Options = .{ .no_ignore = true, .jobs = 1, .workspace_parallel_open = true, .workspace_memory_limit = 16 * 1024 * 1024 };
     defer options.deinit(a);
     try options.paths.append(a, path);
     const serial = try Generation.capture(a, io, &options, null);
@@ -1572,7 +1705,7 @@ test "parallel reader failure retires pending reservations without publication" 
 }
 
 fn coldFailureCase(a: A, path: []const u8) !void {
-    var options: Options = .{ .no_ignore = true, .jobs = 4 };
+    var options: Options = .{ .no_ignore = true, .jobs = 4, .workspace_parallel_open = true };
     defer options.deinit(a);
     try options.paths.append(a, path);
     const generation = try Generation.capture(a, std.testing.io, &options, null);
@@ -1598,4 +1731,44 @@ test "source blob stamp validity shares existing header padding" {
     const blob = try Blob.create(std.testing.allocator, 0);
     defer blob.release();
     try std.testing.expect(!blob.stamp.valid);
+}
+
+test "parallel open failures release descriptors and owned discovery paths" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "STOP" });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/a", .{tmp.sub_path});
+    defer a.free(path);
+    const missing = try std.fmt.allocPrint(a, "{s}-missing", .{path});
+    defer a.free(missing);
+    var generation: Generation = .{ .backing = a, .budget = .{ .backing = a, .limit = 1024 * 1024 }, .arena = undefined };
+    var collector: Collector = .{ .generation = &generation, .io = io, .options = &.{}, .previous = null };
+    var pool: @import("worker_pool.zig").Pool = .{ .io = io };
+    defer pool.deinit();
+    var opens: OpenQueue = .{ .collector = &collector, .pool = &pool, .workers = 2, .capacity = 2 };
+    defer opens.deinit();
+    try opens.push(missing, "missing", false);
+    try opens.push(path, path, false);
+    try std.testing.expectError(error.FileNotFound, opens.flush());
+    try std.testing.expectEqual(@as(usize, 0), generation.budget.live);
+    try std.testing.expectEqual(@as(usize, 0), opens.count);
+}
+
+test "pending oversized opens do not consume the eligible file limit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "large", .data = "too large" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "small", .data = "hit" });
+    var options: Options = .{ .no_ignore = true, .jobs = 4, .workspace_parallel_open = true, .max_file_bytes = 3, .skip_oversize = true, .workspace_max_files = 1 };
+    defer options.deinit(a);
+    for ([_][]const u8{ "large", "small" }) |name| try options.paths.append(a, try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name }));
+    defer for (options.paths.items) |path| a.free(path);
+    const generation = try Generation.capture(a, io, &options, null);
+    defer generation.deinit();
+    try std.testing.expectEqual(@as(usize, 1), generation.entries.items.len);
+    try std.testing.expectEqualStrings("hit", generation.entries.items[0].bytes());
 }

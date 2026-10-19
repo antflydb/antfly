@@ -614,6 +614,8 @@ pub const Search = struct {
         if (!self.options.no_messages) std.debug.print("antfly-grep: {s}: {s}\n", .{ path, @errorName(err) });
     }
     pub fn run(self: *Search) !u8 {
+        var phases = @import("workspace_profile.zig").Phases.init(self.io, "run");
+        defer phases.finish();
         errdefer self.flushOutput() catch {};
         const started = std.Io.Clock.awake.now(self.io);
         if (self.options.debug or self.options.trace) std.debug.print("antfly-grep: engine={s} threads={d} encoding={s} multiline={}\n", .{ @tagName(self.options.engine), if (self.options.files) self.options.jobs else self.fileJobs(), self.options.encoding, self.options.multiline });
@@ -715,6 +717,7 @@ pub const Search = struct {
             self.pipeline = null;
         };
 
+        phases.mark("setup");
         if (self.workspace_generation) |generation| {
             if (self.lexical_paths) |paths| {
                 for (paths) |path| {
@@ -771,7 +774,9 @@ pub const Search = struct {
             try self.renderInventory();
             return if (self.summary.complete) 0 else 2;
         }
+        phases.mark("discover");
         try self.flushTasks();
+        phases.mark("files");
         if (self.ranking != null) try self.emitRanked();
         if (self.spill != null) try self.emitSpilled();
         if (self.limits.cancel.load(.acquire) and self.summary.complete and !self.options.quiet) {
@@ -788,7 +793,9 @@ pub const Search = struct {
             self.decider.request_inputs += client.request_inputs;
             self.decider.peak_request_bytes = @max(self.decider.peak_request_bytes, client.peak_request_bytes);
         }
+        phases.mark("postprocess");
         const code = try self.finish(started);
+        phases.mark("summary");
         if (query_key) |key| if (code <= 1 and self.summary.complete and !self.limits.cancel.load(.monotonic)) {
             self.saveQuery(key);
             if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| {
@@ -838,8 +845,8 @@ pub const Search = struct {
         }
         const elapsed = started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
         const seconds = @as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0;
-        const human = try std.fmt.allocPrint(self.a, "{d:.6}s", .{seconds});
-        defer self.a.free(human);
+        var human_buffer: [64]u8 = undefined;
+        const human = try std.fmt.bufPrint(&human_buffer, "{d:.6}s", .{seconds});
         if (self.options.json and !self.options.quiet) try self.json(.{ .type = "summary", .data = .{ .elapsed_total = .{ .secs = @as(u64, @intCast(@divFloor(elapsed, 1_000_000_000))), .nanos = @as(u32, @intCast(@mod(elapsed, 1_000_000_000))), .human = human }, .stats = self.jsonStats(.{}) }, .stats = self.summary, .requests = self.decider.requests, .input_tokens = self.decider.input_tokens, .output_tokens = self.decider.output_tokens, .request_bytes = self.decider.request_bytes, .request_inputs = self.decider.request_inputs, .peak_request_bytes = self.decider.peak_request_bytes, .cache_hits = self.decider.cache_hits });
         if (self.options.stats and !self.options.json) std.debug.print("{d} matches\n{d} matched lines\n{d} files contained matches\n{d} files searched\n{d} bytes searched\n{s} total\n", .{ self.summary.occurrences, self.summary.matches, self.summary.files_with_matches, self.summary.files, self.summary.bytes, human });
         if (self.options.ask != null and !self.options.quiet and !self.options.suppress_progress) std.debug.print("antfly-grep: {d} files, {d}/{d} regions evaluated, {d} matches, {d} requests, {d} input tokens, {s}\n", .{ self.summary.files, self.summary.regions_evaluated, self.summary.regions_considered, self.summary.matches, self.decider.requests, self.decider.input_tokens, if (self.summary.complete) "complete" else "partial" });
@@ -3589,7 +3596,7 @@ pub const Search = struct {
             const utf8 = self.options.json_compact or std.unicode.utf8ValidateSlice(text);
             const encoded = if (utf8) null else try base64(a, text);
             var captured_spans: std.ArrayList(@import("matcher.zig").Span) = .empty;
-            const subs = JsonSubmatches{ .bulk_fields = self.output_bytes >= 128 * 1024, .capture = if (self.lexical_capture and !self.lexical_overflow) .{ .a = self.lexical_staging.?.arena.allocator(), .spans = &captured_spans, .failed = &self.lexical_overflow } else null, .spans = if (self.lexical_replay_row) |row| row.spans else null, .matcher = &self.matcher, .text = text, .terminated = terminated, .runs = if (self.replay_spans and matched) self.cachedRuns() else null, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
+            const subs = JsonSubmatches{ .bulk_fields = self.output_bytes >= 128 * 1024 or self.lexical_patch != null, .capture = if (self.lexical_capture and !self.lexical_overflow) .{ .a = self.lexical_staging.?.arena.allocator(), .spans = &captured_spans, .failed = &self.lexical_overflow } else null, .spans = if (self.lexical_replay_row) |row| row.spans else null, .matcher = &self.matcher, .text = text, .terminated = terminated, .runs = if (self.replay_spans and matched) self.cachedRuns() else null, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
             const raw_valid = std.unicode.utf8ValidateSlice(raw);
             if (self.options.json_compact) {
                 try self.json(.{ .type = if (matched) "match" else "context", .data = .{ .lines = JsonText{ .text = if (raw_valid) raw else null, .bytes = if (raw_valid) null else try base64(a, raw) }, .line_number = line, .absolute_offset = byte_offset, .submatches = subs }, .probability = p, .scope = if (p != null and !independent) "region" else "line" });
@@ -4090,7 +4097,7 @@ pub const Search = struct {
                 try json_writer.endObject();
             }
         };
-        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .bulk_fields = self.output_bytes >= 128 * 1024, .file_id = if (self.options.json_compact and ((std.mem.eql(u8, eventKind(value), "begin") or (self.json_started and !std.mem.eql(u8, eventKind(value), "summary") and !std.mem.eql(u8, eventKind(value), "inventory") and !std.mem.eql(u8, eventKind(value), "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
+        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .bulk_fields = self.output_bytes >= 128 * 1024 or self.lexical_patch != null, .file_id = if (self.options.json_compact and ((std.mem.eql(u8, eventKind(value), "begin") or (self.json_started and !std.mem.eql(u8, eventKind(value), "summary") and !std.mem.eql(u8, eventKind(value), "inventory") and !std.mem.eql(u8, eventKind(value), "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
         try writer.writeByte('\n');
     }
     fn json(self: *Search, value: anytype) !void {
@@ -4151,14 +4158,19 @@ test "bulk JSON envelopes and submatches preserve small record bytes" {
         defer small.deinit();
         var bulk = std.Io.Writer.Allocating.init(a);
         defer bulk.deinit();
-        for ([_]bool{ false, true }) |large| {
+        var patch = std.Io.Writer.Allocating.init(a);
+        defer patch.deinit();
+        for (0..3) |mode| {
+            const large = mode == 1;
             search.output_bytes = if (large) 128 * 1024 else 0;
+            search.lexical_patch = if (mode == 2) .{ .base_token = @splat('b'), .base_revision = @splat('c'), .removed = &.{} } else null;
             const text = "é hit\n";
             const spans = [_]@import("matcher.zig").Span{.{ .start = 3, .end = 6 }};
-            const value = .{ .type = kind, .data = .{ .lines = Search.JsonText{ .text = text, .bytes = null }, .submatches = Search.JsonSubmatches{ .bulk_fields = large, .matcher = &search.matcher, .text = text, .terminated = true, .hits = null, .spans = &spans }, .stats = Summary{ .files = 1, .matches = 1 } }, .probability = @as(?f64, 0.5) };
-            try search.encodeJson(value, if (large) &bulk.writer else &small.writer);
+            const value = .{ .type = kind, .data = .{ .lines = Search.JsonText{ .text = text, .bytes = null }, .submatches = Search.JsonSubmatches{ .bulk_fields = large or mode == 2, .matcher = &search.matcher, .text = text, .terminated = true, .hits = null, .spans = &spans }, .stats = Summary{ .files = 1, .matches = 1 } }, .probability = @as(?f64, 0.5) };
+            try search.encodeJson(value, if (mode == 2) &patch.writer else if (large) &bulk.writer else &small.writer);
         }
         try std.testing.expectEqualStrings(small.written(), bulk.written());
+        try std.testing.expectEqualStrings(small.written(), patch.written());
     }
 }
 

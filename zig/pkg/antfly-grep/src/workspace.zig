@@ -18,6 +18,7 @@
 //! or implicit freshness claim. EOF tears down all retained source memory.
 const std = @import("std");
 const A = std.mem.Allocator;
+const Phases = @import("workspace_profile.zig").Phases;
 const Options = @import("options.zig").Options;
 const Generation = @import("workspace_store.zig").Generation;
 fn emit(a: A, io: std.Io, value: anytype) !void {
@@ -76,6 +77,8 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     while (try reader.interface.takeDelimiter('\n')) |line| {
+        var phases = Phases.init(io, "request");
+        defer phases.finish();
         // One serial request arena, with bounded reuse across small frames.
         // Registrations and generations copy every value they retain.
         defer _ = arena.reset(.{ .retain_with_limit = 16 * 1024 });
@@ -85,6 +88,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
             try emit(a, io, .{ .type = "workspace_error", .id = @as(?u64, null), .message = "InvalidWorkspaceRequest" });
             continue;
         };
+        phases.mark("parse");
         if (request.version != 1) {
             try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnsupportedWorkspaceVersion" });
             continue;
@@ -176,11 +180,14 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                     }
                 };
             };
+            phases.mark("validate");
             try emit(a, io, .{ .type = "workspace_begin", .id = request.id, .revision = generation.revision });
+            phases.mark("begin");
             const code = (if (plan) |prepared| registered(Search, a, io, generation, &session, &reuse, prepared, request.if_result_token, request.delta) else search(Search, a, io, base, generation, &session, &reuse, request.args, request.if_result_token)) catch |err| blk: {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 break :blk @as(u8, 2);
             };
+            phases.mark("search");
             try emit(a, io, .{ .type = "workspace_end", .id = request.id, .revision = generation.revision, .exit_code = code });
         } else if (std.mem.eql(u8, request.op, "close")) {
             try emit(a, io, .{ .type = "workspace_closed", .id = request.id });
@@ -190,7 +197,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     return 0;
 }
 fn ready(a: A, io: std.Io, generation: *const Generation, id: ?u64) !void {
-    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .observed_at = generation.captured_at, .files = generation.entries.items.len, .entry_bytes = @sizeOf(@import("workspace_store.zig").Entry), .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .capture_workers = generation.capture_workers, .parallel_sources_read = generation.parallel_sources_read, .sources_opened = generation.sources_opened, .refresh_entries_visited = generation.refresh_entries_visited, .namespace_paths_checked = generation.namespace_paths_checked, .namespace_directories_scanned = generation.namespace_directories_scanned, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
+    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .observed_at = generation.captured_at, .files = generation.entries.items.len, .entry_bytes = @sizeOf(@import("workspace_store.zig").Entry), .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .capture_workers = generation.capture_workers, .parallel_sources_read = generation.parallel_sources_read, .parallel_sources_opened = generation.parallel_sources_opened, .sources_opened = generation.sources_opened, .refresh_entries_visited = generation.refresh_entries_visited, .namespace_paths_checked = generation.namespace_paths_checked, .namespace_directories_scanned = generation.namespace_directories_scanned, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
 }
 fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, args: []const []const u8, if_result_token: ?[]const u8) !u8 {
     var option_arena = std.heap.ArenaAllocator.init(a);
@@ -219,6 +226,8 @@ fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generat
 }
 
 fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, plan: *@import("prepared_query.zig").Registry(Search).Plan, token: ?[]const u8, delta: bool) !u8 {
+    var phases = Phases.init(io, "registered");
+    defer phases.finish();
     // Any staging/allocation/output failure invalidates partly updated metadata.
     // The client applies patches only after a complete successful transaction.
     errdefer plan.lexical.clear();
@@ -227,8 +236,13 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
             if (try Search.completedConditional(a, io, &plan.options, generation, certificate.summary, certificate.token)) |code| return code;
     };
     if (token) |value| if (try Search.conditional(a, io, &plan.options, generation, reuse, plan.identity, value)) |code| return code;
+    phases.mark("conditional");
     var searcher = try Search.initCompiled(a, io, &plan.options, &plan.matcher, plan.cwd);
-    defer searcher.deinit();
+    defer {
+        searcher.deinit();
+        phases.mark("teardown");
+    }
+    phases.mark("init");
     if (plan.options.ask != null) try session.configure(&plan.options);
     searcher.workspace_generation = generation;
     searcher.reuse = reuse;
@@ -297,9 +311,12 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
             }
         }
     }
+    phases.mark("admission");
     const guard = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);
     defer guard.deinit();
+    phases.mark("guard");
     const code = try searcher.run();
+    phases.mark("run");
     if (searcher.lexical_index != null) {
         if (code <= 1 and searcher.summary.complete and plan.lexical.healthy and plan.lexical.files.count() == generation.entries.items.len and !searcher.limits.cancel.load(.acquire)) {
             plan.lexical.revision = generation.revision;
@@ -327,5 +344,6 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
         plan.incremental_disabled_revision = generation.revision;
         plan.index.clear();
     }
+    phases.mark("commit");
     return code;
 }

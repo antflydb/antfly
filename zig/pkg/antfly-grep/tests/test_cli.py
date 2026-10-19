@@ -7332,6 +7332,7 @@ class CliTests(unittest.TestCase):
                 "workspace",
                 "serve",
                 "--threads=8",
+                "--workspace-parallel-open",
                 "src",
             ],
             cwd=self.root,
@@ -7346,7 +7347,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             ready["revision"], json.loads(serial.stdout.splitlines()[0])["revision"]
         )
-        self.assertEqual(ready["capture_workers"], 8)
+        # The shared eight-descriptor allowance is split between open/stat
+        # and read/hash batches; each stage can run four workers.
+        self.assertEqual(ready["capture_workers"], 4)
+        self.assertEqual(ready["parallel_sources_opened"], 100)
         self.assertEqual(ready["parallel_sources_read"], 100)
 
     def test_workspace_loads_preparations_across_restarts_and_respects_no_cache(self):

@@ -36,7 +36,17 @@ from workspace import signature
 
 
 class Service:
-    def __init__(self, binary, cwd, source, query, env, start_args=()):
+    def __init__(
+        self,
+        binary,
+        cwd,
+        source,
+        query,
+        env,
+        start_args=(),
+        *,
+        stderr=subprocess.DEVNULL,
+    ):
         self.query = query
         self.pending = bytearray()
         self.cursor = 0
@@ -47,7 +57,7 @@ class Service:
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr,
             bufsize=0,
         )
         started = time.monotonic()

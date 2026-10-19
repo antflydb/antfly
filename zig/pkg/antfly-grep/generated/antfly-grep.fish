@@ -187,5 +187,6 @@ complete -c antfly-grep -l with-filename
 complete -c antfly-grep -l word-regexp
 complete -c antfly-grep -l workspace-max-files -r
 complete -c antfly-grep -l workspace-memory-limit -r
+complete -c antfly-grep -l workspace-parallel-open
 complete -c antfly-grep -l workspace-watch
 complete -c antfly-grep -l yes

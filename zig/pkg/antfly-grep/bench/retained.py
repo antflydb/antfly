@@ -25,6 +25,7 @@ The payload allowance bounds retained serialized bytes, not Python object RSS.
 """
 
 import base64
+import io
 import json
 import time
 from collections import OrderedDict
@@ -55,14 +56,20 @@ class Payloads:
             if identity in self.identities or path in self.files or path in self.open:
                 raise RuntimeError("duplicate file identity")
             self.identities[identity] = path
-            self.open[path] = [encoded]
+            buffer = self.open[path] = io.BytesIO()
+            buffer.write(b"[")
+            buffer.write(encoded)
         elif kind in ("match", "context", "end"):
             path = self.identities.get(row["file_id"])
             if path not in self.open:
                 raise RuntimeError("unbound file identity")
-            self.open[path].append(encoded)
+            buffer = self.open[path]
+            buffer.write(b",")
+            buffer.write(encoded)
             if kind == "end":
-                self.files[path] = b"[" + b",".join(self.open.pop(path)) + b"]"
+                buffer.write(b"]")
+                self.files[path] = buffer.getvalue()
+                del self.open[path]
         else:
             return False
         return True

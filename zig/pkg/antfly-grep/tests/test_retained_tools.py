@@ -56,6 +56,36 @@ class StreamingViewTests(unittest.TestCase):
         self.assertEqual(actual[1], frames[1])
         self.assertEqual(actual[0]["source"], {"snapshot": "new", "observed_at": 42})
 
+    def test_interleaved_dense_files_own_immutable_payloads(self):
+        payloads = Payloads()
+        expected = {b"a": [], b"b": []}
+
+        def consume(row):
+            raw = json.dumps(row, ensure_ascii=False).encode()
+            payloads.consume(row, raw)
+            expected[row["file_id"].encode()].append(raw)
+
+        for name in ("a", "b"):
+            consume(
+                {"type": "begin", "file_id": name, "data": {"path": {"text": name}}}
+            )
+        for number in range(2000):
+            for name in ("a", "b"):
+                consume(
+                    {
+                        "type": "match",
+                        "file_id": name,
+                        "data": {"text": "é" * 64, "line": number},
+                    }
+                )
+        for name in ("a", "b"):
+            consume({"type": "end", "file_id": name})
+        actual = payloads.finish()
+        self.assertFalse(payloads.open)
+        for name, frames in expected.items():
+            self.assertIsInstance(actual[name], bytes)
+            self.assertEqual(actual[name], b"[" + b",".join(frames) + b"]")
+
     def test_missing_end_and_duplicate_identity_are_rejected(self):
         p = Payloads()
         row = {"type": "begin", "file_id": "a", "data": {"path": {"text": "p"}}}

@@ -75,6 +75,7 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     parser_hash.final(&parser_digest);
     const cache_options = b.addOptions();
     cache_options.addOption([32]u8, "parser_digest", parser_digest);
+    cache_options.addOption(bool, "workspace_profile", b.option(bool, "grep-workspace-profile", "Emit bounded per-request workspace phase timings to stderr (diagnostic build)") orelse false);
     lib.addImport("grep_cache_options", cache_options.createModule());
     lib.addImport("antfly_syntax", syntax);
     lib.addImport("antfly_regex", regex);

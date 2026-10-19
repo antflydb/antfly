@@ -2625,8 +2625,9 @@ or requiring segment compaction. Captures retain immutable owned bytes, includin
 when original paths disappear. Inventory v3 revisions remain unchanged.
 
 Initial capture can read, validate and hash a bounded batch in parallel. The
-coordinator alone opens files, arms witnesses, allocates buffers, updates budgets
-and publishes entries; workers touch disjoint preallocated buffers. File sizes and
+coordinator alone arms witnesses, allocates buffers, updates budgets
+and publishes entries; read workers touch disjoint preallocated buffers. The later
+opt-in metadata stage described below also batches opens and stats. File sizes and
 stamps are checked before and after reading, including EOF/growth checks. Failed
 batches join every worker and release their descriptors, blobs and reservations
 before returning; no partial generation is published. Discovery remains serial.
@@ -2634,10 +2635,10 @@ before returning; no partial generation is published. Discovery remains serial.
 The queue holds at most 32 descriptors and 8 MiB of source payloads. POSIX descriptor
 quotas lower its capacity; pending reads drain before an open is retried. Capture
 uses at most eight workers for explicit `--threads`, or four in automatic mode,
-subject to the existing automatic job budget. Automatic mode leaves files below 64 KiB and
+subject to the existing automatic job budget. Automatic mode leaves reads of files below 64 KiB and
 files exceeding the queue byte bound on the serial path. `--threads=1` disables
 capture concurrency. `workspace_ready.capture_workers` reports the largest launched
-reader team, including the coordinator (zero when no helper is launched);
+capture stage, including the coordinator (zero when no helper is launched);
 `parallel_sources_read` counts files in batches
 which used workers. Incremental refresh remains selective and reports zero capture
 workers. The existing separate search/provider worker policies are unchanged.
@@ -3037,7 +3038,7 @@ most 64 KiB of scratch between rows, releases exceptional larger records, and
 borrows pinned workspace paths for queued tasks; live discovery retains explicit
 string ownership. Per-file elapsed labels use stack storage, and compact end
 records avoid unused path encoding. After 128 KiB of output, typed JSON envelopes pre-quote static ASCII
-schema keys; small records keep the standard encoder to bound fixed work. Both
+schema keys; small non-delta records keep the standard encoder to bound fixed work. Both
 paths produce identical envelopes and submatches; dynamic keys, value escaping, numeric formatting and custom
 serializers remain with `std.json`, with byte-equivalence tests. Cold captures
 read directly into their
@@ -3207,3 +3208,56 @@ Evidence: [qualification and source/binary/archive identities](bench/results/rec
 [older-reference Linux deltas](bench/results/recovery-reference-delta-linux.json),
 [oracle results](bench/results/recovery-differential.json), and
 [pre-optimization diagnostic stacks and driver](bench/results/recovery-profile.json).
+
+### Bounded capture metadata and dense consumer staging
+
+`--workspace-parallel-open` opts cold capture into batching open/stat work
+separately from read/hash work. The default keeps serial opens. Each open
+batch owns at most 16 source descriptors and copies transient discovery names
+into quota-accounted storage. The two stages share a persistent worker pool and
+a total allowance of at most 32 source descriptors, reduced by the process's
+open-file limit. A one-descriptor allowance keeps serial opens. Allocation,
+source subscriptions, quota reservations and publication remain on the
+coordinator. Read workers still verify full stamps after reading; capture still
+performs its final namespace/event barriers. Failed parallel opens retire the
+batch and retry serially after draining pending reads. `--threads=1` retains
+serial capture. Metadata concurrency trades CPU for latency and is intended for
+measured latency-bound storage. Refresh continues to use the existing changed-path path.
+
+`workspace_ready.parallel_sources_opened` counts paths in concurrent
+open/stat batches; `parallel_sources_read` continues to count concurrent reads.
+`capture_workers` reports the largest actual stage width, which may be smaller
+than `--threads` under descriptor pressure. Pending oversized sources are resolved
+before applying the eligible-file limit. Regressions cover that boundary, failed
+opens, allocation failures and descriptor headroom.
+
+The reference consumer now writes each file's original frames into one growable
+byte buffer and publishes immutable bytes at its end frame. It avoids retaining
+one allocation per match followed by a join and whole-file concatenations.
+Identity checks and transactional publication are unchanged. The consumer benchmark
+retains the old list collector as an explicit `listed` baseline, rotates three
+consumer modes, and accepts `--matches-per-file` to qualify dense individual files.
+The traced probe measures Python allocations separately from request timings and
+is not an RSS measurement.
+
+Workspace deltas also use the existing byte-verified static JSON field encoder
+for small records, and summary elapsed formatting uses stack storage. Dynamic
+keys, values and custom serializers keep their existing escaping and formatting.
+Output flushing and cancellation behavior are unchanged.
+
+Per-request profiling is a compile-time diagnostic option:
+
+```sh
+zig build --build-file zig/build.zig -Dgrep-only=true -Doptimize=ReleaseFast \
+  -Dgrep-workspace-profile=true grep
+python3 zig/pkg/antfly-grep/bench/workspace_phases.py \
+  zig/zig-out/bin/antfly-grep phases.json --files=1000 --iterations=101
+```
+
+It records parse/validation, conditional checks, initialization, admission,
+cancellation setup, search phases, completion and teardown. Each request stages a
+fixed number of samples and writes one bounded diagnostic record to stderr after
+timing ends. Main-thread CPU excludes workers; wall time includes backpressure.
+Clock calls perturb short phases, so uninstrumented paired trials determine
+performance gains. Normal builds compile out both timers and profiling storage.
+No new JIT path is justified by these output/capture measurements.

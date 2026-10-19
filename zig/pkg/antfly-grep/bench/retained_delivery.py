@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Paired full-view consumption: decoded trees versus staged original frames.
+"""Paired full-view consumption: decoded trees, raw-frame lists, and buffered original frames.
 
 One exact binary, warm pinned generation. Includes request, response decoding and
 transaction publication; refresh excluded. Python CPU measures the consumer.
@@ -34,11 +34,37 @@ import tracemalloc
 from pathlib import Path
 from lexical_reuse import signature
 from registered import Client
-from retained import Payloads, View
+from retained import Payloads, View, path_bytes
 
 
-def deliver(client, handle, streaming):
-    payloads = Payloads() if streaming else None
+class ListPayloads(Payloads):
+    """Frozen pre-buffering baseline; only used to qualify consumer allocation."""
+
+    def consume(self, row, encoded):
+        kind = row["type"]
+        if kind == "begin":
+            path = path_bytes(row["data"]["path"])
+            identity = row["file_id"]
+            if identity in self.identities or path in self.files or path in self.open:
+                raise RuntimeError("duplicate file identity")
+            self.identities[identity] = path
+            self.open[path] = [encoded]
+        elif kind in ("match", "context", "end"):
+            path = self.identities.get(row["file_id"])
+            if path not in self.open:
+                raise RuntimeError("unbound file identity")
+            self.open[path].append(encoded)
+            if kind == "end":
+                self.files[path] = b"[" + b",".join(self.open.pop(path)) + b"]"
+        else:
+            return False
+        return True
+
+
+def deliver(client, handle, mode):
+    payloads = {"decoded": lambda: None, "listed": ListPayloads, "streaming": Payloads}[
+        mode
+    ]()
     _, rows = client.exchange(
         "search",
         revision=client.ready["revision"],
@@ -59,17 +85,27 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--files", type=int, default=1000)
+    parser.add_argument("--matches-per-file", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=32)
     parser.add_argument("--trials", type=int, default=9)
     args = parser.parse_args()
-    if min(args.files, args.rounds, args.trials) < 1:
+    if min(args.files, args.matches_per_file, args.rounds, args.trials) < 1:
         parser.error("positive sizes required")
     binary = args.binary.resolve()
     report = {
         "measurement": __doc__.strip(),
         "host": platform.platform(),
+        "python": {
+            "implementation": platform.python_implementation(),
+            "version": platform.python_version(),
+        },
+        "cpu_count": os.cpu_count(),
+        "cgroup_cpu_max": Path("/sys/fs/cgroup/cpu.max").read_text().strip()
+        if Path("/sys/fs/cgroup/cpu.max").exists()
+        else None,
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "files": args.files,
+        "matches_per_file": args.matches_per_file,
         "rounds": args.rounds,
         "trials": [],
     }
@@ -82,25 +118,32 @@ def main():
         root = Path(tmp)
         (root / "src").mkdir()
         for n in range(args.files):
-            (root / "src" / f"f{n:06}.txt").write_text("STOP original\n")
+            (root / "src" / f"f{n:06}.txt").write_text(
+                "STOP original\n" * args.matches_per_file
+            )
         env.update(HOME=tmp, XDG_CONFIG_HOME=tmp)
         client = Client(binary, root, "src", [], env)
         try:
             _, rows = client.exchange("register", args=["STOP", "--threads=2"])
             handle = rows[0]["query_handle"]
-            expected = signature(deliver(client, handle, False).materialize())
-            assert signature(deliver(client, handle, True).materialize()) == expected
+            expected = signature(deliver(client, handle, "decoded").materialize())
+            assert (
+                signature(deliver(client, handle, "streaming").materialize())
+                == expected
+            )
             for trial in range(args.trials):
                 result = {"load_average": os.getloadavg()}
-                modes = (False, True) if trial % 2 else (True, False)
-                for streaming in modes:
+                names = ("decoded", "listed", "streaming")
+                modes = names[trial % 3 :] + names[: trial % 3]
+                result["order"] = modes
+                for mode in modes:
                     before = client.wire_bytes
                     cpu, started = time.process_time(), time.monotonic()
                     for _ in range(args.rounds):
-                        view = deliver(client, handle, streaming)
+                        view = deliver(client, handle, mode)
                     elapsed, cpu = time.monotonic() - started, time.process_time() - cpu
                     assert signature(view.materialize()) == expected
-                    result["streaming" if streaming else "decoded"] = {
+                    result[mode] = {
                         "seconds_per_request": elapsed / args.rounds,
                         "client_cpu_seconds_per_request": cpu / args.rounds,
                         "bytes_per_request": (client.wire_bytes - before) / args.rounds,
@@ -109,13 +152,13 @@ def main():
                 report["trials"].append(result)
             report["allocation_probe"] = {}
             del view
-            for streaming in (False, True):
+            for mode in ("decoded", "listed", "streaming"):
                 gc.collect()
                 tracemalloc.start()
-                view = deliver(client, handle, streaming)
+                view = deliver(client, handle, mode)
                 live, peak = tracemalloc.get_traced_memory()
                 tracemalloc.stop()
-                report["allocation_probe"]["streaming" if streaming else "decoded"] = {
+                report["allocation_probe"][mode] = {
                     "live_bytes": live,
                     "peak_bytes": peak,
                 }
@@ -128,7 +171,7 @@ def main():
             key: statistics.median(t[name][key] for t in report["trials"])
             for key in report["trials"][0][name]
         }
-        for name in ("decoded", "streaming")
+        for name in ("decoded", "listed", "streaming")
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")

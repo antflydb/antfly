@@ -187,6 +187,7 @@ _arguments -s \
  '--word-regexp[word-regexp]' \
  '--workspace-max-files[workspace-max-files]:value:' \
  '--workspace-memory-limit[workspace-memory-limit]:value:' \
+ '--workspace-parallel-open[workspace-parallel-open]' \
  '--workspace-watch[workspace-watch]' \
  '--yes[yes]' \
  '1:command or pattern:(ask files auth doctor skill cache workspace)' '*:path:_files'

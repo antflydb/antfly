@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 from registered import Client, rss_kib
+from session_compare import cpu_seconds
 
 
 def main():
@@ -43,6 +44,7 @@ def main():
     parser.add_argument("--directories", type=int, default=64)
     parser.add_argument("--iterations", type=int, default=7)
     parser.add_argument("--bytes-per-file", type=int, default=14)
+    parser.add_argument("--current-parallel-open", action="store_true")
     parser.add_argument("--current-threads", type=int)
     parser.add_argument("--baseline-threads", type=int)
     args = parser.parse_args()
@@ -61,7 +63,9 @@ def main():
         if Path("/sys/fs/cgroup/cpu.max").exists()
         else None,
         "measurement": __doc__.strip(),
+        "cpu_measurement": "Process user+system CPU through readiness, including workers; platform counter precision is 10 ms. Sampled after elapsed timing.",
         "bytes_per_file": args.bytes_per_file,
+        "current_parallel_open": args.current_parallel_open,
         "threads": {"current": args.current_threads, "baseline": args.baseline_threads},
         "binaries": {
             key: {
@@ -105,6 +109,11 @@ def main():
                         env,
                         start_args=[
                             "--workspace-watch",
+                            *(
+                                ["--workspace-parallel-open"]
+                                if key == "current" and args.current_parallel_open
+                                else []
+                            ),
                             "--workspace-max-files=200000",
                             "--workspace-memory-limit=1G",
                             *(
@@ -127,6 +136,7 @@ def main():
                             revision = client.ready["revision"]
                         if revision != client.ready["revision"]:
                             raise RuntimeError("capture revision mismatch")
+                        cpu = cpu_seconds(client.process.pid)
                         if platform.system() == "Linux":
                             status = Path(
                                 f"/proc/{client.process.pid}/status"
@@ -140,6 +150,7 @@ def main():
                             rss = rss_kib(client)
                         trial[key] = {
                             "seconds": elapsed,
+                            "cpu_seconds": cpu,
                             "rss_kib": rss,
                             "ready": client.ready,
                         }
@@ -156,6 +167,9 @@ def main():
                         key: {
                             "seconds": statistics.median(
                                 t[key]["seconds"] for t in trials
+                            ),
+                            "cpu_seconds": statistics.median(
+                                t[key]["cpu_seconds"] for t in trials
                             ),
                             "rss_kib": statistics.median(
                                 t[key]["rss_kib"] for t in trials
