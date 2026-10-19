@@ -729,6 +729,13 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .sentencepiece_proto = sentencepiece_proto_mod,
     });
 
+    const runtime_abi_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    runtime_abi_mod.addImport("httpx", httpx_mod);
+    runtime_abi_mod.addImport("antfly_platform", platform_mod);
     const inference_api_source = inference_runtime_build.addInferenceApiOverride(b, openapi_build, b.path("../scripts"), openapi_codegen);
     const inference_config: inference_runtime_build.Config = .{
         .b = b,
@@ -760,6 +767,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .fixed_tokenizer_data_mod = tokenizer.fixed_data,
             .json = json_mod,
             .httpx = httpx_mod,
+            .runtime_abi = runtime_abi_mod,
             .platform = platform_mod,
             .fst = fst_mod,
             .scraping = scraping_mod,
@@ -873,6 +881,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    cancellation_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     credentials_mod.addImport("httpx", httpx_mod);
     credentials_mod.addImport("antfly_cancellation", cancellation_mod);
     credentials_mod.addImport("antfly_platform", platform_mod);
@@ -895,13 +904,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     cache_budget_mod.addImport("antfly_platform", platform_mod);
-    const runtime_abi_mod = b.createModule(.{
-        .root_source_file = b.path("lib/runtime/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    runtime_abi_mod.addImport("httpx", httpx_mod);
-    runtime_abi_mod.addImport("antfly_platform", platform_mod);
     const runtime_fs_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/fs.zig"),
         .target = target,

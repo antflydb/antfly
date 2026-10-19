@@ -242,7 +242,11 @@ zig_build_options=(
   -Dsystem-blas="$system_blas"
 )
 if [ "$product" = server ]; then
-  zig_build_options+=(-Dantfly-bin-name=antfly -Dapple-providers="$apple_providers")
+  # Vision OCR needs no Swift sidecar and is available in the pinned macOS
+  # cross SDK. Ship it even when newer Apple generation/speech are disabled.
+  apple_ocr=false
+  case "$target" in *macos*) apple_ocr=true ;; esac
+  zig_build_options+=(-Dantfly-bin-name=antfly -Dapple-providers="$apple_providers" -Dapple-ocr="$apple_ocr")
 fi
 
 zig_install_args=(

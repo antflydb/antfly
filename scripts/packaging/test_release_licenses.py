@@ -224,6 +224,15 @@ pub fn build(b: *std.Build) void {
                     self.assertEqual(
                         product == "server", "-Dapple-providers=false" in args
                     )
+                    if product == "server":
+                        self.assertIn(
+                            "-Dapple-ocr=" + ("true" if "macos" in target else "false"),
+                            args,
+                        )
+                    else:
+                        self.assertFalse(
+                            any(arg.startswith("-Dapple-ocr=") for arg in args)
+                        )
                     self.assertNotIn("--max-rss-cap", args)
                     project_cache = Path(args[args.index("--cache-dir") + 1])
                     self.assertEqual(project_cache, root / ".zig-cache/release")

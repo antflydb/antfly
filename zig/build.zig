@@ -165,8 +165,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple OCR, generation, and transcription (macOS 27 SDK and Swift required)") orelse false;
     if (apple_reader_enabled and (target.result.os.tag != .macos or !link_libc))
         @panic("-Dapple-providers=true requires macOS and libc");
+    // Vision OCR is Objective-C and supports cross compilation with the
+    // release SDK. Generation/transcription additionally need the Swift sidecar.
+    const apple_ocr_enabled = b.option(bool, "apple-ocr", "Enable Apple Vision OCR (macOS and libc required)") orelse apple_reader_enabled;
+    if (apple_ocr_enabled and (target.result.os.tag != .macos or !link_libc))
+        @panic("-Dapple-ocr=true requires macOS and libc");
     const apple_reader_options = b.addOptions();
-    apple_reader_options.addOption(bool, "enabled", apple_reader_enabled);
+    apple_reader_options.addOption(bool, "enabled", apple_ocr_enabled);
     const apple_options_module = apple_reader_options.createModule();
     readers_mod.addImport("apple_reader_options", apple_options_module);
     readers_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
@@ -176,7 +181,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    apple_native_mod.addImport("apple_native_options", apple_options_module);
+    const apple_native_options = b.addOptions();
+    apple_native_options.addOption(bool, "enabled", apple_reader_enabled);
+    apple_native_mod.addImport("apple_native_options", if (apple_ocr_enabled == apple_reader_enabled) apple_options_module else apple_native_options.createModule());
     apple_native_mod.addImport("antfly_platform", platform_mod);
     apple_native_mod.addImport("httpx", httpx_mod);
     generating_mod.addImport("antfly_apple_native", apple_native_mod);
@@ -208,7 +215,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
         });
     }
-    if (apple_reader_enabled) {
+    if (apple_ocr_enabled) {
         addMacosSdkPaths(b, readers_mod, target);
         readers_mod.linkFramework("Foundation", .{});
         readers_mod.linkFramework("CoreGraphics", .{});
