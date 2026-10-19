@@ -240,23 +240,35 @@ pub const Coordinator = struct {
         self.finished = true;
         if (self.count != 0) self.sealed_ns = self.tail_ns;
     }
-    pub fn prepare(self: *Coordinator) !?Prepared {
+    /// Metadata-only readiness: idle polls neither allocate nor reserve a window.
+    pub fn ready(self: *const Coordinator) !bool {
         try self.options.window.stream.control.check();
-        const start = self.start_ns orelse return null;
-        const sealed = self.sealed_ns orelse return null;
-        if (start >= sealed) return null;
+        const start = self.start_ns orelse return false;
+        const sealed = self.sealed_ns orelse return false;
+        if (start >= sealed) return false;
         const requested = try std.math.add(i64, start, self.options.duration_ns);
-        if (sealed < requested and !self.finished) return null;
+        if (sealed < requested and !self.finished) return false;
         if (self.ordinal >= self.options.max_windows) return error.ResourceLimitExceeded;
-        const end = @min(requested, sealed);
-        var window = try self.joined("live-model-window", self.count);
+        return true;
+    }
+    pub fn prepare(self: *Coordinator) !?Prepared {
+        return self.prepareAlloc(self.allocator);
+    }
+    /// All snapshot allocations belong to this allocator, independently of the
+    /// coordinator's retained ingestion state. It outlives the returned owner.
+    pub fn prepareAlloc(self: *Coordinator, a: std.mem.Allocator) !?Prepared {
+        if (!try self.ready()) return null;
+        const start = self.start_ns.?;
+        const end = @min(try std.math.add(i64, start, self.options.duration_ns), self.sealed_ns.?);
+        var window = try windows.join(a, "live-model-window", self.units[0..self.count], self.options.window);
         errdefer window.deinit();
+        try windows.prefixParameters(&window, self.parameters.bytes, self.options.window);
         var eligible = false;
         var logical: ?pictures.Index = null;
         errdefer if (logical) |*index| index.deinit();
         if (window.reader.track.codec == .avc) {
             const validated = self.logical orelse return error.InvalidLivePictureIndex;
-            logical = try validated.cloneRebased(self.allocator, self.logical_base, window.reader.packets.len, self.options.window.stream.admission_pool, self.options.window.stream.control);
+            logical = try validated.cloneRebased(a, self.logical_base, window.reader.packets.len, self.options.window.stream.admission_pool, self.options.window.stream.control);
             if (logical.?.pending_pts) |pts| if (@as(i128, pts) * std.time.ns_per_s < @as(i128, end) * window.reader.track.timescale) return error.InvalidLiveWatermark;
             for (logical.?.pictures) |picture| {
                 const time = @as(i128, picture.pts) * std.time.ns_per_s;
@@ -396,20 +408,23 @@ pub const Coordinator = struct {
     /// Consume currently published units. A null result means reload is needed
     /// unless reader.ended(); no polling sleep or speculative preload is hidden.
     pub fn pull(self: *Coordinator, reader: anytype) !?Prepared {
-        if (try self.prepare()) |prepared| return prepared;
+        return self.pullAlloc(reader, self.allocator);
+    }
+    pub fn pullAlloc(self: *Coordinator, reader: anytype, a: std.mem.Allocator) !?Prepared {
+        if (try self.prepareAlloc(a)) |prepared| return prepared;
         while (true) {
             if (self.pending == null) self.pending = try reader.next();
             if (self.pending == null) {
                 if (reader.ended()) try self.finish();
-                return self.prepare();
+                return self.prepareAlloc(a);
             }
             if (!self.sameEpoch(self.pending.?)) {
                 try self.finish();
-                if (try self.prepare()) |prepared| return prepared;
+                if (try self.prepareAlloc(a)) |prepared| return prepared;
                 self.resetEpoch();
             }
             try self.append(&self.pending);
-            if (try self.prepare()) |prepared| return prepared;
+            if (try self.prepareAlloc(a)) |prepared| return prepared;
         }
     }
 };
@@ -1089,4 +1104,34 @@ test "streamed live compatible DASH period bounds do not reset decoded reference
     defer prepared.deinit();
     try std.testing.expect(prepared.has_pictures);
     try std.testing.expectEqual(@as(i64, 1200 * std.time.ns_per_ms), prepared.source_end_ns);
+}
+
+test "live coordinator readiness is allocation free and snapshot allocator failures preserve retry" {
+    const a = std.testing.allocator;
+    var ingest = try media.live_mp4.Ingest.init(a, "window-allocator", fixture[0..797], .{});
+    defer ingest.deinit();
+    var coordinator = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s });
+    defer coordinator.deinit();
+    try std.testing.expect(!try coordinator.ready());
+    var unit = try part(&ingest, 797, 20811);
+    defer if (unit) |*owner| owner.deinit();
+    try coordinator.append(&unit);
+    try std.testing.expect(try coordinator.ready());
+    var failures: usize = 0;
+    while (failures < 32) : (failures += 1) {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = failures });
+        if (coordinator.prepareAlloc(failing.allocator())) |value| {
+            var prepared = value.?;
+            prepared.deinit();
+            break;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(@as(usize, 0), coordinator.ordinal);
+        try std.testing.expect(try coordinator.ready());
+    }
+    try std.testing.expect(failures > 0 and failures < 32);
+    var prepared = (try coordinator.prepareAlloc(a)).?;
+    defer prepared.deinit();
+    try std.testing.expect(prepared.has_pictures);
+    try coordinator.commit(&prepared);
+    try std.testing.expect(!try coordinator.ready());
 }
