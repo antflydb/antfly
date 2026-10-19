@@ -150,3 +150,12 @@ pub const VisionWorkspace = struct {
     views: [107]?ops.CT = @splat(null),
     slots: [16][3]?usize = @splat(@splat(null)),
 };
+
+/// Immutable precise-Metal sin/cos table. Cache creation completes on an owned
+/// command before publication, so cancellation cannot publish uninitialized data.
+pub const Rotary = struct {
+    owner: tape.Plan = .{ .host_bytes = @sizeOf(Rotary), .metadata_bytes = @sizeOf(Rotary) },
+    spec: ops.EmbeddingRotarySpec,
+    stamp: u64,
+    views: [1]?ops.CT = @splat(null),
+};

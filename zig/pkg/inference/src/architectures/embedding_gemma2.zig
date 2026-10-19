@@ -1142,6 +1142,9 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
     if (mask.len != rows) return error.InvalidEmbeddingInputLength;
+    if (cb.vtable.embeddingRotaryPrepare) |prepare| {
+        for ([_]usize{ 0, 5 }) |layer| try prepare(cb.ptr, .{ .dim = @intCast(cfg.headDim(layer)), .x = max_tokens, .theta = cfg.theta(layer) });
+    }
     if (cb.vtable.embeddingModelPrepare) |prepare| try prepare(cb.ptr, cfg.num_hidden_layers);
     if (cb.vtable.embeddingWorkspacePrepare) |prepare| try prepare(cb.ptr, .{
         .rows = rows,

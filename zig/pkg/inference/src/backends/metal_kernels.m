@@ -1040,6 +1040,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> mrope_pipeline;
     id<MTLComputePipelineState> vision_norm_rope_pipeline;
     id<MTLComputePipelineState> embedding_head_prepare_pipeline;
+    id<MTLComputePipelineState> rotary_table_pipeline;
     id<MTLComputePipelineState> packed_gelu_pipeline;
     id<MTLComputePipelineState> rope_pair_pipeline;
     id<MTLComputePipelineState> head_rms_rope_pipeline;
@@ -13785,8 +13786,16 @@ static NSString *termite_metal_shader_source(void) {
            "    else output[gid] = input[gid];\n"
            "}\n"
            "kernel void termite_packed_gelu(device const float *x [[buffer(0)]], device float *y [[buffer(1)]], constant uint2 &p [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i >= p.x * p.y) return; uint row = i / p.y, col = i % p.y; y[i] = termite_gated_activation_product(x[row * p.y * 2u + col], x[row * p.y * 2u + p.y + col], 0u); }\n"
-           "struct termite_embedding_head_params { uint source_rows, rows, source_heads, heads, dim, sequence, stride, start, rotate, gather, weighted; float eps, theta, scale; };\n"
-           "kernel void termite_embedding_head_prepare(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]], device const int *ids [[buffer(2)]], device float *y [[buffer(3)]], constant termite_embedding_head_params &p [[buffer(4)]], uint head [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {\n"
+           "struct antfly_rotary_params { uint dim, x, y, vision; float theta; };\n"
+           "kernel void antfly_rotary_table(device float2 *out [[buffer(0)]], constant antfly_rotary_params &p [[buffer(1)]], uint i [[thread_position_in_grid]]) {\n"
+           "    uint pairs = p.dim / (p.vision ? 4u : 2u); if (i >= (p.x+p.y)*pairs) return; uint pos = i/pairs, j = i%pairs;\n"
+           "    float position = float(p.vision && pos >= p.x ? pos-p.x : pos); float angle;\n"
+           "    if (p.vision) angle = position / pow(p.theta, float(2u*j)/float(p.dim/2u));\n"
+           "    else { float frequency = 1.0f / pow(p.theta, float(2u*j)/float(p.dim)); angle = position * frequency; }\n"
+           "    out[i] = float2(cos(angle), sin(angle));\n"
+           "}\n"
+           "struct termite_embedding_head_params { uint source_rows, rows, source_heads, heads, dim, sequence, stride, start, rotate, gather, weighted; float eps, theta, scale; uint cached_rotary; };\n"
+           "kernel void termite_embedding_head_prepare(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]], device const int *ids [[buffer(2)]], device float *y [[buffer(3)]], constant termite_embedding_head_params &p [[buffer(4)]], device const float2 *rotary [[buffer(5)]], uint head [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {\n"
            "    uint row = head / p.heads, h = head % p.heads;\n"
            "    uint src_row = p.gather == 1u ? uint(ids[row]) : row;\n"
            "    uint base = src_row * p.stride + p.start + (h / (p.heads / p.source_heads)) * p.dim;\n"
@@ -13798,16 +13807,18 @@ static NSString *termite_metal_shader_source(void) {
            "        float value = x[base + d] * inv * (p.weighted ? w[d] : 1.0f);\n"
            "        if (p.rotate) {\n"
            "            uint left = d % half_dim, right = left + half_dim;\n"
-           "            float frequency = 1.0f / pow(p.theta, float(2u * left) / float(p.dim)); float angle = float(p.gather == 2u ? uint(ids[row]) : src_row % p.sequence) * frequency;\n"
+           "            uint position = p.gather == 2u ? uint(ids[row]) : src_row % p.sequence; float c, s;\n"
+           "            if (p.cached_rotary) { float2 value = rotary[position * half_dim + left]; c = value.x; s = value.y; }\n"
+           "            else { float frequency = 1.0f / pow(p.theta, float(2u * left) / float(p.dim)); float angle = float(position) * frequency; c = cos(angle); s = sin(angle); }\n"
            "            float a = x[base + left] * inv * (p.weighted ? w[left] : 1.0f);\n"
            "            float b = x[base + right] * inv * (p.weighted ? w[right] : 1.0f);\n"
-           "            value = d < half_dim ? a * cos(angle) - b * sin(angle) : a * sin(angle) + b * cos(angle);\n"
+           "            value = d < half_dim ? a * c - b * s : a * s + b * c;\n"
            "        }\n"
            "        y[head * p.dim + d] = value * p.scale;\n"
            "    }\n"
            "}\n"
-           "struct termite_vision_norm_rope_params { uint rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint stride, start, rotate, weighted; };\n"
-           "kernel void termite_vision_norm_rope(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_vision_norm_rope_params &p [[buffer(3)]], uint head [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {\n"
+           "struct termite_vision_norm_rope_params { uint rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint stride, start, rotate, weighted, cached_rotary; };\n"
+           "kernel void termite_vision_norm_rope(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_vision_norm_rope_params &p [[buffer(3)]], device const float2 *rotary [[buffer(4)]], uint head [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {\n"
            "    uint heads = p.hidden / p.head_dim; uint row = head / heads; uint out_base = head * p.head_dim; uint base = row * (p.stride ? p.stride : p.hidden) + p.start + (head % heads) * p.head_dim;\n"
            "    float sum = 0.0f;\n"
            "    for (uint d = lane; d < p.head_dim; d += 32u) { float x = input[base + d]; sum += x*x; }\n"
@@ -13817,10 +13828,12 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint pair = lane; pair < p.head_dim / 2u; pair += 32u) {\n"
            "        uint axis = pair / quarter; uint j = pair % quarter; uint a = axis * 2u * quarter + j; uint b = a + quarter;\n"
            "        float position = axis == 0u ? float(row % p.grid_x) : float((row / p.grid_x) % p.grid_y);\n"
-           "        float angle = position / pow(p.theta, float(2u*j)/float(p.head_dim/2u));\n"
+           "        float c, s;\n"
+           "        if (p.cached_rotary) { uint index = (axis == 0u ? uint(position) : p.grid_x + uint(position)) * quarter + j; float2 value = rotary[index]; c = value.x; s = value.y; }\n"
+           "        else { float angle = position / pow(p.theta, float(2u*j)/float(p.head_dim/2u)); c = cos(angle); s = sin(angle); }\n"
            "        float x = input[base+a] * inv * (p.weighted ? weight[a] : 1.0f); float y = input[base+b] * inv * (p.weighted ? weight[b] : 1.0f);\n"
-           "        output[out_base+a] = (x*cos(angle)-y*sin(angle))*p.scale;\n"
-           "        output[out_base+b] = (y*cos(angle)+x*sin(angle))*p.scale;\n"
+           "        output[out_base+a] = (x*c-y*s)*p.scale;\n"
+           "        output[out_base+b] = (y*c+x*s)*p.scale;\n"
            "    }\n"
            "}\n"
            "kernel void termite_apply_mrope(device const float *input [[buffer(0)]], device const uint *positions [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_mrope_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -28753,6 +28766,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->mrope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_mrope");
         runtime->packed_gelu_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_packed_gelu");
         runtime->embedding_head_prepare_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_embedding_head_prepare");
+        runtime->rotary_table_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_rotary_table");
         runtime->vision_norm_rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_vision_norm_rope");
         runtime->rope_pair_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_rope_pair");
         runtime->head_rms_rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_head_rms_rope");
@@ -29830,6 +29844,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->mrope_pipeline = nil;
     runtime->packed_gelu_pipeline = nil;
     runtime->embedding_head_prepare_pipeline = nil;
+    runtime->rotary_table_pipeline = nil;
     runtime->vision_norm_rope_pipeline = nil;
     runtime->rope_pair_pipeline = nil;
     runtime->head_rms_rope_pipeline = nil;
@@ -32752,38 +32767,43 @@ int termite_metal_decode_runtime_packed_gelu(termite_metal_decode_runtime *runti
     }
 }
 
-typedef struct { uint32_t source_rows, rows, source_heads, heads, dim, sequence, stride, start, rotate, gather, weighted; float eps, theta, scale; } termite_embedding_head_params;
-int termite_metal_decode_runtime_embedding_head_prepare(termite_metal_decode_runtime *runtime, void *input, size_t input_offset, void *weight, size_t weight_offset, void *gather, size_t gather_offset, void *output, size_t output_offset, const termite_embedding_head_params *p) {
+typedef struct { uint32_t source_rows, rows, source_heads, heads, dim, sequence, stride, start, rotate, gather, weighted; float eps, theta, scale; uint32_t cached_rotary; } termite_embedding_head_params;
+int termite_metal_decode_runtime_embedding_head_prepare(termite_metal_decode_runtime *runtime, void *input, size_t input_offset, void *weight, size_t weight_offset, void *gather, size_t gather_offset, void *output, size_t output_offset, void *rotary, size_t rotary_offset, const termite_embedding_head_params *p) {
     if (!runtime || !input || !weight || !gather || !output || !p || !runtime->embedding_head_prepare_pipeline) return -1;
     if (!p->dim || p->dim > 512 || p->dim % 2 || !p->sequence || !p->source_heads || !p->heads || p->heads % p->source_heads || p->start + p->source_heads * p->dim > p->stride) return -2;
     size_t input_bytes = (size_t)p->source_rows * p->stride * sizeof(float), output_bytes = (size_t)p->rows * p->heads * p->dim * sizeof(float);
     @autoreleasepool {
         id<MTLBuffer> x = (__bridge id<MTLBuffer>)input, w = (__bridge id<MTLBuffer>)weight, g = (__bridge id<MTLBuffer>)gather, y = (__bridge id<MTLBuffer>)output;
         if (!termite_metal_buffer_range_valid(x, input_offset, input_bytes) || !termite_metal_buffer_range_valid(y, output_offset, output_bytes) || (p->weighted && !termite_metal_buffer_range_valid(w, weight_offset, p->dim * sizeof(float))) || (p->gather && !termite_metal_buffer_range_valid(g, gather_offset, p->rows * sizeof(int32_t)))) return -3;
+        id<MTLBuffer> table = rotary ? (__bridge id<MTLBuffer>)rotary : x;
+        size_t table_bytes = (size_t)p->sequence * (p->dim/2) * 2 * sizeof(float);
+        if (p->cached_rotary > 1 || (p->cached_rotary && (!rotary || !termite_metal_buffer_range_valid(table, rotary_offset, table_bytes)))) return -3;
         bool owned = runtime->active_frame_cb == nil;
         id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &owned);
         if (!cb) return -4;
-        termite_metal_planned_encoder_range accesses[4];
+        termite_metal_planned_encoder_range accesses[5];
         size_t n = 0;
         if (termite_metal_planned_range_make(x, input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[n++], -5) || termite_metal_planned_range_make(y, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[n++], -5)) return -5;
         if (p->weighted && termite_metal_planned_range_make(w, weight_offset, p->dim * sizeof(float), TERMITE_METAL_PLANNED_RANGE_READ, &accesses[n++], -5)) return -5;
         if (p->gather && termite_metal_planned_range_make(g, gather_offset, p->rows * sizeof(int32_t), TERMITE_METAL_PLANNED_RANGE_READ, &accesses[n++], -5)) return -5;
+        if (p->cached_rotary && termite_metal_planned_range_make(table, rotary_offset, table_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[n++], -5)) return -5;
         if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, n, -5)) return -5;
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_HEAD_ROPE, &encoder_owned);
         if (!encoder) return -6;
         [encoder setComputePipelineState:runtime->embedding_head_prepare_pipeline];
         [encoder setBuffer:x offset:input_offset atIndex:0]; [encoder setBuffer:w offset:weight_offset atIndex:1]; [encoder setBuffer:g offset:gather_offset atIndex:2]; [encoder setBuffer:y offset:output_offset atIndex:3]; [encoder setBytes:p length:sizeof(*p) atIndex:4];
+        [encoder setBuffer:table offset:p->cached_rotary ? rotary_offset : input_offset atIndex:5];
         [encoder dispatchThreadgroups:MTLSizeMake((size_t)p->rows * p->heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -7);
     }
 }
 
-typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted; } termite_vision_norm_rope_params;
+typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;
 int termite_metal_decode_runtime_vision_norm_rope(termite_metal_decode_runtime *runtime,
     void *input, size_t input_offset, void *weight, size_t weight_offset,
-    void *output, size_t output_offset, const termite_vision_norm_rope_params *p) {
+    void *output, size_t output_offset, void *rotary, size_t rotary_offset, const termite_vision_norm_rope_params *p) {
     if (!runtime || !input || !weight || !output || !p || !runtime->vision_norm_rope_pipeline) return -1;
     if (!p->rows || !p->head_dim || p->head_dim % 4u || p->hidden % p->head_dim || !p->grid_x || !p->grid_y || !(p->theta > 0)) return -2;
     size_t count, bytes, weight_bytes, source_count, source_bytes;
@@ -32798,19 +32818,27 @@ int termite_metal_decode_runtime_vision_norm_rope(termite_metal_decode_runtime *
         id<MTLBuffer> w = (__bridge id<MTLBuffer>)weight;
         id<MTLBuffer> y = (__bridge id<MTLBuffer>)output;
         if (!termite_metal_buffer_range_valid(x, input_offset, source_bytes) || !termite_metal_buffer_range_valid(w, weight_offset, weight_bytes) || !termite_metal_buffer_range_valid(y, output_offset, bytes)) return -4;
+        id<MTLBuffer> table = rotary ? (__bridge id<MTLBuffer>)rotary : x;
+        size_t table_bytes = ((size_t)p->grid_x + p->grid_y) * (p->head_dim/4) * 2 * sizeof(float);
+        if (p->cached_rotary > 1 || (p->cached_rotary && (!rotary || !termite_metal_buffer_range_valid(table, rotary_offset, table_bytes)))) return -4;
         bool owned = runtime->active_frame_cb == nil;
         id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &owned);
         if (!cb) return -5;
+        termite_metal_planned_encoder_range accesses[4]; size_t n = 0;
+        if (termite_metal_planned_range_make(x, input_offset, source_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[n++], -7) ||
+            termite_metal_planned_range_make(w, weight_offset, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[n++], -7) ||
+            termite_metal_planned_range_make(y, output_offset, bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[n++], -7)) return -7;
+        if (p->cached_rotary && termite_metal_planned_range_make(table, rotary_offset, table_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[n++], -7)) return -7;
+        if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, n, -7)) return -7;
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_HEAD_ROPE, &encoder_owned);
         if (!encoder) return -6;
-        int rc = termite_metal_decode_runtime_prepare_planned_compute_binary_accesses(runtime, x, input_offset, source_bytes, w, weight_offset, weight_bytes, y, output_offset, bytes, -7);
-        if (rc) { termite_metal_end_scoped_compute_encoder(encoder, encoder_owned); return rc; }
         [encoder setComputePipelineState:runtime->vision_norm_rope_pipeline];
         [encoder setBuffer:x offset:input_offset atIndex:0];
         [encoder setBuffer:w offset:weight_offset atIndex:1];
         [encoder setBuffer:y offset:output_offset atIndex:2];
         [encoder setBytes:p length:sizeof(*p) atIndex:3];
+        [encoder setBuffer:table offset:p->cached_rotary ? rotary_offset : input_offset atIndex:4];
         [encoder dispatchThreadgroups:MTLSizeMake(count / p->head_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -8);
@@ -70303,4 +70331,24 @@ int antfly_metal_audio_replay_scope(termite_metal_decode_runtime *r,int enabled)
     const int previous=r->audio_replay_scope;
     r->audio_replay_scope=(enabled!=0);
     return previous;
+}
+
+int antfly_metal_rotary_table(termite_metal_decode_runtime *runtime, void *output, size_t offset, uint32_t dim, uint32_t x, uint32_t y, float theta, uint32_t vision) {
+    if (!runtime || !output || !runtime->rotary_table_pipeline || runtime->active_frame_cb || runtime->submitted_frame_cb || !dim || dim>512 || dim%(vision?4:2) || !x || x>8192 || y>8192 || vision>1 || (vision && !y) || (!vision && y) || !(theta>0) || !isfinite(theta)) return -1;
+    const uint32_t pairs = dim/(vision?4:2), count = (x+y)*pairs;
+    @autoreleasepool {
+        id<MTLBuffer> out = (__bridge id<MTLBuffer>)output;
+        if (!termite_metal_buffer_range_valid(out, offset, (size_t)count*2*sizeof(float))) return -2;
+        bool owned = true;
+        id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &owned);
+        if (!cb) return -3;
+        id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+        if (!encoder) return -4;
+        struct { uint32_t dim,x,y,vision; float theta; } params = {dim,x,y,vision,theta};
+        [encoder setComputePipelineState:runtime->rotary_table_pipeline];
+        [encoder setBuffer:out offset:offset atIndex:0]; [encoder setBytes:&params length:sizeof(params) atIndex:1];
+        [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+        [encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -5);
+    }
 }

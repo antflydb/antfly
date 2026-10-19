@@ -94,6 +94,7 @@ const Config = struct {
     head_count: usize,
     direct_unified: bool = false,
     embedding_gemma2_f32_attention: bool = false,
+    require_prepared_vision: bool = false,
     image_size: usize,
     patch_size: usize,
     layer_norm_eps: f32,
@@ -704,7 +705,8 @@ pub fn embeddingGemma2VideoBatchCapacityForBackend(width: u32, height: u32, budg
     // intermediates. Its cohort ceiling must not pay Metal's two-layer cost.
     const scratch = if (metal) try imageScratchBytes(embeddingGemma2ImageConfig(), patches) else try imageLayerScratchBytes(embeddingGemma2ImageConfig(), patches);
     if (scratch > budget) return error.ImageBatchBudgetExceeded;
-    return @min(@as(usize, 8), budget / @max(@as(usize, 1), scratch));
+    const count = @min(@as(usize, 8), budget / @max(@as(usize, 1), scratch));
+    return if (metal) @import("../ops/embedding_vision_plan.zig").capacity(patches, count) else count;
 }
 
 pub fn encodeEmbeddingGemma2VideoBatchTensorResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize) !EncodedDeviceImage {
@@ -2526,6 +2528,7 @@ pub fn prepareEmbeddingGemma2RasterForBackend(a: std.mem.Allocator, raster: antf
 pub const ImageBatchOptions = struct {
     max_batch: usize = 4,
     max_patch_tokens: usize = 10080,
+    require_prepared_vision: bool = false,
     max_scratch_bytes: usize = 768 * 1024 * 1024,
     pub fn validate(self: ImageBatchOptions) !void {
         if (self.max_batch == 0 or self.max_batch > 8 or self.max_patch_tokens == 0 or self.max_scratch_bytes == 0) return error.InvalidImageBatch;
@@ -2580,6 +2583,24 @@ pub fn embeddingGemma2PreparedScratch(images: []const PreparedImage, limit: usiz
     return @min(sum, limit);
 }
 
+pub fn embeddingGemma2PreparedPlanScratch(images: []const PreparedImage) !usize {
+    var peak: usize = 0;
+    var output: usize = 0;
+    var first: usize = 0;
+    while (first < images.len) {
+        const g = images[first].geometry;
+        const patches = g.grid_x * g.grid_y;
+        const capacity = @import("../ops/embedding_vision_plan.zig").capacity(patches, 4);
+        if (capacity == 0) return error.PreparedVisionUnavailable;
+        var count: usize = 0;
+        while (first + count < images.len and count < capacity and std.meta.eql(g, images[first + count].geometry)) : (count += 1) {}
+        peak = @max(peak, try @import("../ops/embedding_vision_plan.zig").transientBytes(count * patches));
+        output = try std.math.add(usize, output, count * g.tokenCount() * 512 * 4);
+        first += count;
+    }
+    return try std.math.add(usize, peak, output);
+}
+
 pub fn embeddingGemma2RasterScratch(rasters: []const antfly_image.BorrowedRasterAttachment, limit: usize) !usize {
     const cfg = embeddingGemma2ImageConfig();
     var sum: usize = 0;
@@ -2594,7 +2615,7 @@ pub fn embeddingGemma2RasterScratch(rasters: []const antfly_image.BorrowedRaster
     return @min(sum, limit);
 }
 
-fn imageBatchCount(cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !usize {
+fn imageBatchCount(cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions, metal: bool) !usize {
     try options.validate();
     if (prepared.len == 0) return 0;
     for (prepared) |item| try validatePreparedImage(cfg, item);
@@ -2603,8 +2624,12 @@ fn imageBatchCount(cfg: Config, prepared: []const PreparedImage, options: ImageB
     if (patches == 0) return error.InvalidImageBatch;
     // Conservative dense-attention and activation estimate; providers may use
     // less scratch, but a larger batch must fit this bound before execution.
-    const scratch = try imageScratchBytes(cfg, patches);
-    const capacity = @min(options.max_batch, @min(options.max_patch_tokens / patches, options.max_scratch_bytes / @max(scratch, 1)));
+    const scratch = if (options.require_prepared_vision) try @import("../ops/embedding_vision_plan.zig").transientBytes(patches) else try imageScratchBytes(cfg, patches);
+    const model_capacity = if (metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN") and cfg.embedding_gemma2_f32_attention and cfg.vision_hidden == 768 and cfg.intermediate_size == 3072) @import("../ops/embedding_vision_plan.zig").capacity(patches, options.max_batch) else options.max_batch;
+    var capacity = @min(model_capacity, options.max_patch_tokens / patches);
+    if (options.require_prepared_vision) {
+        while (capacity > 0 and try @import("../ops/embedding_vision_plan.zig").transientBytes(capacity * patches) > options.max_scratch_bytes) capacity -= 1;
+    } else capacity = @min(capacity, options.max_scratch_bytes / @max(scratch, 1));
     if (capacity == 0) return error.ImageBatchBudgetExceeded;
     var count: usize = 0;
     for (prepared[0..@min(prepared.len, capacity)]) |item| {
@@ -2616,6 +2641,8 @@ fn imageBatchCount(cfg: Config, prepared: []const PreparedImage, options: ImageB
 
 fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !ProjectedImages {
     try options.validate();
+    var execution_cfg = cfg;
+    execution_cfg.require_prepared_vision = options.require_prepared_vision;
     var embeddings = std.ArrayList(f32).empty;
     errdefer embeddings.deinit(allocator);
     const lengths = try allocator.alloc(usize, prepared.len);
@@ -2625,8 +2652,8 @@ fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem
     var maximum: usize = 0;
     while (offset < prepared.len) {
         try cb.checkExecutionControl();
-        const count = try imageBatchCount(cfg, prepared[offset..], options);
-        const result = try encodePreparedImageBatch(cb, allocator, store, cfg, prepared[offset..][0..count]);
+        const count = try imageBatchCount(cfg, prepared[offset..], options, cb.kind() == .metal);
+        const result = try encodePreparedImageBatch(cb, allocator, store, execution_cfg, prepared[offset..][0..count]);
         defer allocator.free(result.embeddings);
         try embeddings.appendSlice(allocator, result.embeddings);
         @memset(lengths[offset..][0..count], result.tokens);
@@ -2639,6 +2666,8 @@ fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem
 
 fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem.Allocator, weights: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {
     try options.validate();
+    var execution_cfg = cfg;
+    execution_cfg.require_prepared_vision = options.require_prepared_vision;
     if (prepared.len == 0 or prepared.len > 8) return error.InvalidImageBatch;
     // Joining heterogeneous cohorts must never invoke the download fallback.
     if (!cb.supportsCopyRows2D()) return error.ResidentImageOperationUnavailable;
@@ -2658,8 +2687,8 @@ fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem
     var maximum: usize = 0;
     while (offset < prepared.len) {
         try cb.checkExecutionControl();
-        const count = try imageBatchCount(cfg, prepared[offset..], options);
-        const result = try encodePreparedImageBatchResident(cb, a, weights, cfg, prepared[offset..][0..count]);
+        const count = try imageBatchCount(cfg, prepared[offset..], options, cb.kind() == .metal);
+        const result = try encodePreparedImageBatchResident(cb, a, weights, execution_cfg, prepared[offset..][0..count]);
         const added = count * result.tokens;
         defer cb.free(result.embeddings);
         if (!try cb.copyRows2D(a, tensor, rows, result.embeddings, 0, added, cfg.text_hidden)) return error.ResidentImageOperationUnavailable;
@@ -2743,6 +2772,10 @@ fn encodePreparedImageBatchResident(cb: *const ComputeBackend, allocator: std.me
     if (cfg.direct_unified) return encodePreparedUnifiedBatchResident(cb, allocator, store, cfg, prepared);
     const batch = prepared.len;
     const geometry = prepared[0].geometry;
+    if (cfg.require_prepared_vision) {
+        const ready = try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingVisionPlan(cb, .{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
+        if (!ready) return error.PreparedVisionUnavailable;
+    }
     var deferred = false;
     for (prepared) |item| {
         if (!std.meta.eql(geometry, item.geometry)) return error.IncompatibleImageBatch;
@@ -2862,6 +2895,9 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
     var hidden = positioned;
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
+    if (cfg.embedding_gemma2_f32_attention) if (cb.vtable.embeddingRotaryPrepare) |prepare| try prepare(cb.ptr, .{ .vision = true, .dim = @intCast(cfg.vision_hidden / cfg.head_count), .x = @intCast(geometry.grid_x), .y = @intCast(geometry.grid_y), .theta = cfg.rope_theta });
+    const previous = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, cfg.require_prepared_vision);
+    defer _ = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, previous);
 
     if (visionFollowup(cb, store, cfg)) if (cb.vtable.embeddingVisionWorkspace) |prepare|
         try prepare(cb.ptr, .{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
@@ -5115,6 +5151,7 @@ fn visionNorm(cb: *const ComputeBackend, cfg: Config, store: *ProjectorWeights, 
     if (visionFollowup(cb, store, cfg)) {
         if (cb.vtable.embeddingVisionNorm) |run| if (try run(cb.ptr, input, residual, cfg.layer_norm_eps, index)) |out| return out;
     }
+    if (cfg.require_prepared_vision) return error.PreparedVisionUnavailable;
     var name: [128]u8 = undefined;
     const suffix = switch (index % 4) {
         0 => "ln1",
@@ -5208,6 +5245,7 @@ fn selfAttentionBatch(
         const params = visionNormRopeParams(total, cfg.vision_hidden, head_dim, geometry, cfg.layer_norm_eps, cfg.rope_theta, true) orelse break :blk null;
         break :blk try cb.vtable.embeddingVisionQKV.?(cb.ptr, input, layer, params);
     } else null;
+    if (cfg.require_prepared_vision and direct_heads == null) return error.PreparedVisionUnavailable;
     var packed_qkv: ?@import("../ops/ops.zig").LinearTripleResult = if (direct_heads) |heads| .{ .first = heads.first, .second = heads.second, .third = heads.third } else null;
     if (direct_heads == null and cfg.embedding_gemma2_f32_attention and store.gguf == null) {
         var names: [3][128]u8 = undefined;
@@ -5418,6 +5456,7 @@ fn feedForward(
     buf: *[128]u8,
 ) !CT {
     if (visionFollowup(cb, store, cfg)) if (try cb.runEmbeddingVisionFFN(input, layer)) |out| return out;
+    if (cfg.require_prepared_vision) return error.PreparedVisionUnavailable;
     if (cfg.embedding_gemma2_f32_attention and store.gguf == null) {
         var names: [2][128]u8 = undefined;
         if (try cb.linearPackedNamed(input, &.{
@@ -6962,13 +7001,13 @@ fn checkGemma4ImageBatch(cb: ComputeBackend, reference: ComputeBackend) !void {
         defer a.free(expected.embeddings);
         for (mixed.embeddings[b * stride ..][0..stride], expected.embeddings) |v, e| try std.testing.expectApproxEqAbs(e, v, 2e-4);
     }
-    try std.testing.expectEqual(@as(usize, 1), try imageBatchCount(cfg, prepared[0..2], .{ .max_patch_tokens = 24 }));
-    try std.testing.expectError(error.ImageBatchBudgetExceeded, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_scratch_bytes = 1 }));
-    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_batch = 0 }));
+    try std.testing.expectEqual(@as(usize, 1), try imageBatchCount(cfg, prepared[0..2], .{ .max_patch_tokens = 24 }, false));
+    try std.testing.expectError(error.ImageBatchBudgetExceeded, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_scratch_bytes = 1 }, false));
+    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_batch = 0 }, false));
     try std.testing.expectError(error.IncompatibleImageBatch, encodePreparedImageBatch(&cb, a, &weights, cfg, prepared[1..3]));
     var invalid = prepared[0];
     invalid.geometry.grid_x = std.math.maxInt(usize);
-    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{invalid}, .{}));
+    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{invalid}, .{}, false));
 }
 
 test "gemma4 image batching native parity and isolation" {

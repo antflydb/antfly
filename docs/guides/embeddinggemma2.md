@@ -1612,3 +1612,52 @@ execution policy. Individual diagnostics are
 `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP=1` adds an alternating completed
 public-raster comparison to the ordered-media checkpoint oracle, plus active
 vision-frame cancellation and retry parity.
+
+Metal vision cohort selection and request admission share one execution plan:
+8192 patch rows and a 256 MiB activation-layout ceiling, including 512-row FFN
+tiles. Four full-size 2304-patch images therefore execute as three images plus
+one; 2520-patch geometries fit two per cohort. The request reserves bounded
+transient execution and all retained projected outputs; model-owned layouts and
+coefficients retain independent cache leases. Prepared execution is required
+under this estimate. If a capability or cache admission declines, partial work
+is drained and a separate conservative fallback supplement is admitted before
+retry. Failure to admit the supplement returns a resource error.
+
+Retained host source bytes remain charged to host residency. Backend workspace
+uses physical model inputs instead of multiplying encoded files or borrowed
+raster bytes by the generic staging factor. Projection and encoder phase
+reductions preserve the source lease and release only retired workspace.
+
+Four admitted model-owned rotary tables reuse precise Metal sine/cosine
+coefficients across heads and layers. Vision keys include grid, dimension and
+theta; backbone tables cover original positions through 8191, including holes.
+LRU replacement occurs outside active/submitted frames; vision/language pressure
+and unload release the corresponding tables. Denied optional retention keeps
+the original precise kernel math. Set
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_ROTARY_CACHE=1` to qualify that fallback.
+
+EmbeddingGemma 2 sessions share a FIFO of ready execution cohorts. Text and
+media callers use the same model gate; image preparation runs outside it and
+long media requests requeue after each ready wave. Each request retains at most
+one current and one future preparation wave, with host admission shared across
+requests. Waiting cancellation unlinks its queue node and releases owned work.
+The scheduler preserves one backend owner and does not preempt an active
+cohort. It guarantees FIFO handoff among ready participants, without a latency
+SLO or unlimited queued preparation memory.
+
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN=1` selects the previous cohort and
+conservative workspace policy for comparison.
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_PLAN=1` adds an alternating completed
+four-image comparison to the ordered-media checkpoint oracle. It checks vector
+parity, verifies no optimized plan fallback, exercises dedicated raster/image
+routes, and forces a workspace decline to qualify separately admitted fallback.
+
+A completed ReleaseFast four-full-size-image comparison on the shared M4 Max
+host measured 947.551 ms with the previous cohort/admission policy versus
+737.255 ms with the bounded plan (seven samples per route after two warmups,
+alternating order). Both routes retained precise rotary caching and device image
+preparation. Every vector passed parity, and the optimized route reported zero
+plan fallbacks. This roughly 22% improvement qualifies these fixtures, without
+establishing broad PyTorch parity or a clean-host throughput result. Forced
+workspace decline passed separately admitted fallback parity; active-frame
+cancellation completed 32 checks and a successful retry.

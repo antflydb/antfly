@@ -37531,14 +37531,15 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         defer freeDirectDenseVectors(a, single.vectors);
         for (vector, single.vectors[0]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, @as(f32, if (metal) 1e-3 else 1e-4));
     }
-    if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_PIPELINED_VISION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_IMAGE_PREPARATION"))) {
+    if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_PIPELINED_VISION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_IMAGE_PREPARATION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_PLAN"))) {
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
             extern "c" fn unsetenv([*:0]const u8) c_int;
         };
         const followup = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP");
         const image_preparation = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_IMAGE_PREPARATION");
-        const flag = if (image_preparation) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION" else if (followup) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP" else "ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION";
+        const vision_plan = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_PLAN");
+        const flag = if (vision_plan) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN" else if (image_preparation) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION" else if (followup) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP" else "ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION";
         const saved = if (platform.env.getenv(flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
         defer if (saved) |old| a.free(old);
         defer {
@@ -37548,6 +37549,8 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                 _ = Env.unsetenv(flag);
             }
         }
+        const plan_rasters: [4]readers_api.RasterImage = @splat(rasters[0]);
+        const benchmark_rasters = if (vision_plan) plan_rasters[0..] else rasters[0..2];
         var samples: [2][7]u64 = undefined;
         var reference: ?[][]f32 = null;
         defer if (reference) |vectors| freeDirectDenseVectors(a, vectors);
@@ -37555,7 +37558,12 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
             const route = phase ^ (iteration & 1);
             try std.testing.expect(Env.setenv(flag, if (route == 0) "1" else "0", 1) == 0);
             const started = platform.time.monotonicNs();
-            const result = try grouped.embedRasters(a, loaded.session, loaded.getTokenizer(), rasters[0..2], .{ .dimensions = 128 }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+            var timings = grouped.MediaTimings{};
+            const result = try grouped.embedRasters(a, loaded.session, loaded.getTokenizer(), benchmark_rasters, .{ .dimensions = 128, .timings = &timings }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+            if (vision_plan and route == 1) {
+                try std.testing.expect(timings.prepared_vision_attempts > 0);
+                try std.testing.expectEqual(@as(usize, 0), timings.vision_plan_fallbacks);
+            }
             if (iteration >= 2) samples[route][iteration - 2] = platform.time.monotonicNs() -| started;
             if (reference) |vectors| {
                 defer freeDirectDenseVectors(a, result.vectors);
@@ -37563,7 +37571,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
             } else reference = result.vectors;
         };
         for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
-        std.debug.print("embeddinggemma2 vision_{s} reference_ns={d} optimized_ns={d} samples=7 parity=true\n", .{ if (image_preparation) "image_preparation" else if (followup) "followup" else "pipeline", samples[0][3], samples[1][3] });
+        std.debug.print("embeddinggemma2 vision_{s} reference_ns={d} optimized_ns={d} samples=7 parity=true\n", .{ if (vision_plan) "bounded_plan" else if (image_preparation) "image_preparation" else if (followup) "followup" else "pipeline", samples[0][3], samples[1][3] });
     }
     if (comptime @import("build_options").enable_metal) {
         if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP")) {
@@ -37577,6 +37585,37 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
             defer managed.deinit();
             try @import("../architectures/gemma4_projector.zig").qualifyEmbeddingGemma2VisionCancellation(&managed.backend, a, rasters[0]);
         }
+    }
+    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_PLAN")) {
+        const pages: [4]readers_api.RasterImage = @splat(rasters[0]);
+        {
+            const Env = struct {
+                extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+                extern "c" fn unsetenv([*:0]const u8) c_int;
+            };
+            const flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_WORKSPACE";
+            const saved = if (platform.env.getenv(flag)) |v| try a.dupeSentinel(u8, v, 0) else null;
+            defer if (saved) |v| a.free(v);
+            defer {
+                if (saved) |v| {
+                    _ = Env.setenv(flag, v, 1);
+                } else {
+                    _ = Env.unsetenv(flag);
+                }
+            }
+            try std.testing.expectEqual(@as(c_int, 0), Env.setenv(flag, "1", 1));
+            var timings = grouped.MediaTimings{};
+            const fallback = try grouped.embedRasters(a, loaded.session, loaded.getTokenizer(), pages[0..1], .{ .prepare_ahead = false, .timings = &timings }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+            defer freeDirectDenseVectors(a, fallback.vectors);
+            try std.testing.expectEqual(@as(usize, 1), timings.vision_plan_fallbacks);
+            for (fallback.vectors[0], batched.vectors[0]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+        }
+        const direct = try grouped.embedRasters(a, loaded.session, loaded.getTokenizer(), &pages, .{ .prepare_ahead = false }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+        defer freeDirectDenseVectors(a, direct.vectors);
+        for (direct.vectors) |vector| for (vector, batched.vectors[0]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+        const encoded = try grouped.embedImages(a, loaded.session, loaded.getTokenizer(), pngs[0..2], .{ .prepare_ahead = false }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+        defer freeDirectDenseVectors(a, encoded.vectors);
+        for (encoded.vectors, batched.vectors[0..2]) |vector, original| for (vector, original) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
     }
     const equal_pages: [5]readers_api.RasterImage = @splat(rasters[0]);
     const native_batch = try pipeline.embedBorrowedRastersReported(&equal_pages);

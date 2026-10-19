@@ -178,7 +178,7 @@ pub const RunAdmission = struct {
         };
         const output_bytes = request.output_bytes orelse try estimatedOutputBytes(&reference_shape, output_info);
         if (request.output_kv_bytes > output_bytes) return error.ResourceLimitExceeded;
-        const dynamic_base = try addBytes(input_bytes, output_bytes);
+        const dynamic_base = try addBytes(request.backend_input_bytes orelse input_bytes, output_bytes);
         const dynamic_workspace = try mulBytes(dynamic_base, 6);
         const workspace = @max(
             @max(self.static_workspace_bytes, request.workspace_bytes),
@@ -237,7 +237,7 @@ pub const RunAdmission = struct {
             // scratch. No [B,H,S,S] score tensor is materialized.
             const arena = try mulBytes(try mulBytes(tokens, 4 * 2048), @sizeOf(u16));
             const states = try mulBytes(try mulBytes(tokens, 2 * 512), @sizeOf(u16));
-            const staging = try addBytes(request.input_bytes, try mulBytes(tokens, 2 * @sizeOf(i64)));
+            const staging = try addBytes(request.backend_input_bytes orelse request.input_bytes, try mulBytes(tokens, 2 * @sizeOf(i64)));
             const attention = try mulBytes(workspace_sequence, 4 * 256 * (@sizeOf(f32) + @sizeOf(u16)));
             // Media runs before the text encoder but its BF16 tower keeps a
             // ~60 MiB reusable layer arena live alongside the bounded
@@ -320,6 +320,9 @@ pub const RunRequest = struct {
     batch: usize = 1,
     sequence: usize = 1,
     input_bytes: usize = 0,
+    /// Physical backend inputs, independent of retained host source bytes.
+    /// Null preserves conservative legacy admission for other callers.
+    backend_input_bytes: ?usize = null,
     /// Resolved physical stage geometry; null retains graph metadata inference.
     output_bytes: ?usize = null,
     output_kv_bytes: usize = 0,
@@ -646,6 +649,18 @@ pub const Session = struct {
     broadcast_inputs: []const []const u8 = &.{},
     /// Borrowed from the model/runtime owner; stable for every session copy.
     execution_gate: ?*std.atomic.Mutex = null,
+    cohort_scheduler: ?*@import("../runtime/embedding_scheduler.zig").Scheduler = null,
+
+    /// Queue only ready work; callers own admitted preparation outside this
+    /// scope. Keep the original raw gate for native/backend interoperability.
+    pub fn enterExecutionCohort(self: Session, gate: ?*std.atomic.Mutex, control: InferenceExecutionControl, waiter: *@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter) !void {
+        const lock = gate orelse return;
+        if (self.cohort_scheduler) |scheduler| if (self.execution_gate == lock) return scheduler.enter(waiter, lock, control);
+        try control.lock(lock);
+    }
+    pub fn leaveExecutionCohort(_: Session, gate: ?*std.atomic.Mutex, waiter: *@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter) void {
+        if (waiter.owner != null) @import("../runtime/embedding_scheduler.zig").Scheduler.leave(waiter) else if (gate) |lock| lock.unlock();
+    }
 
     /// Stable planning capacity, shared by all copies of this session. Live
     /// contention is resolved by workspace acquisition after chunk selection.
@@ -2048,4 +2063,16 @@ test "embeddinggemma2 CUDA phased admission retires media peak without borrowing
     try std.testing.expectEqual(after, controller.snapshot());
     try std.testing.expectError(error.InvalidAdmissionLeaseReduction, lease.retain(before));
     try std.testing.expectEqual(after, controller.snapshot());
+}
+
+test "embeddinggemma2 physical backend inputs do not charge retained host rasters as device staging" {
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const admission = RunAdmission{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const before = try admission.estimateRequest(.{ .input_bytes = 128 * 1024 * 1024, .pre_admitted_host_bytes = 128 * 1024 * 1024, .workspace_bytes = 64 * 1024 * 1024, .output_bytes = 768 * 4 }, &.{});
+    const after = try admission.estimateRequest(.{ .input_bytes = 128 * 1024 * 1024, .backend_input_bytes = 512 * 260 * 4, .pre_admitted_host_bytes = 128 * 1024 * 1024, .workspace_bytes = 64 * 1024 * 1024, .output_bytes = 768 * 4 }, &.{});
+    try std.testing.expectEqual(before.host_scratch_bytes, after.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), after.backend_scratch_bytes);
+    try std.testing.expect(before.backend_scratch_bytes > after.backend_scratch_bytes + 600 * 1024 * 1024);
+    try std.testing.expectError(error.ResourceLimitExceeded, admission.estimateRequest(.{ .input_bytes = 128, .backend_input_bytes = 0, .pre_admitted_host_bytes = 129 }, &.{}));
 }

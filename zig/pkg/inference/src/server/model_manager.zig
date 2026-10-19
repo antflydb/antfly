@@ -2558,6 +2558,7 @@ pub const LoadedModel = struct {
     /// state within a loaded model. Keep one model-local lane while allowing
     /// independent models to overlap.
     target_inference_run_lock: std.atomic.Mutex = .unlocked,
+    embedding_cohort_scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{},
     /// CUDA boundary requests execute serially on this session. Queue before
     /// reserving their full device scratch ceiling, without holding a provider
     /// lock during admission/eviction. Every waiter retains a ModelHandle.
@@ -8024,6 +8025,7 @@ pub const ModelManager = struct {
             .resource_lease = loaded_session.resource_lease,
         };
         model.session.execution_gate = &model.target_inference_run_lock;
+        if (session_factory.getEmbeddingGemma2Config(model.session) != null) model.session.cohort_scheduler = &model.embedding_cohort_scheduler;
 
         // Keep publication behind the same cooperative boundary as expensive
         // construction. An abandoned manager task should release its fully

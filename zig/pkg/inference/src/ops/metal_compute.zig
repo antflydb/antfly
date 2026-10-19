@@ -1151,6 +1151,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     allocator: std.mem.Allocator,
     require_f32_linears: bool = false,
+    require_prepared_vision: bool = false,
     audio_execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     audio_capture: ?*audio_tape.Capture = null,
     embedding_bindings_enabled: bool = false,
@@ -1858,6 +1859,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (cb.kind() != .metal) return error.UnsupportedVideoBackend;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         return metal_runtime.termite_metal_decode_runtime_device(self.provider_impl.raw_decode_runtime) orelse error.MetalRuntimeUnavailable;
+    }
+
+    pub fn requireEmbeddingVisionPlan(cb: *const ops.ComputeBackend, require: bool) bool {
+        if (cb.kind() != .metal) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const old = self.require_prepared_vision;
+        self.require_prepared_vision = require;
+        return old;
+    }
+    pub fn prepareEmbeddingVisionPlan(cb: *const ops.ComputeBackend, spec: ops.EmbeddingVisionSpec) !bool {
+        if (cb.kind() != .metal) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        try embeddingVisionWorkspaceOp(self, spec);
+        return self.embedding_vision_workspace != null;
     }
 
     /// Shared provider ownership amortizes shader setup and exact torchvision
@@ -13875,6 +13890,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn scaledDotProductAttentionEmbeddingGemma2VisionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (try self.tryScaledDotProductAttentionResident(q, k, v, null, null, batch, seq_len, num_heads, head_dim, .embedding_gemma2)) |output| return output;
+        if (self.require_prepared_vision) return error.PreparedVisionUnavailable;
         return self.hostFallbackSdpa(q, k, v, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
@@ -16342,6 +16358,82 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         p.embeddinggemma2_cache_admission = cache;
         p.embedding_bindings = state;
     }
+    fn rotaryLookup(self: *MetalCompute, spec: ops.EmbeddingRotarySpec) ?MetalTensor {
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_ROTARY_CACHE")) return null;
+        const p = self.provider_impl;
+        for (p.embedding_rotary) |slot| if (slot) |entry| if (entry.spec.vision == spec.vision and entry.spec.dim == spec.dim and entry.spec.theta == spec.theta and (if (spec.vision) entry.spec.x == spec.x and entry.spec.y == spec.y else entry.spec.x >= spec.x)) {
+            p.embedding_rotary_clock += 1;
+            entry.stamp = p.embedding_rotary_clock;
+            p.embedding_rotary_hits += 1;
+            return denseDeviceF32(entry.views[0].?);
+        };
+        return null;
+    }
+    fn dropRotary(self: *MetalCompute, entry: *@import("metal_embedding_bindings.zig").Rotary) void {
+        entry.owner.deinit();
+        self.data.prefetch.lock();
+        if (self.provider_impl.embeddinggemma2_cache_admission) |cache| {
+            cache.noteRelease(.host, entry.owner.host_bytes);
+            cache.noteRelease(.backend, entry.owner.backend_bytes);
+        }
+        self.data.prefetch.unlock();
+        std.heap.c_allocator.destroy(entry);
+    }
+    fn embeddingRotaryPrepareOp(ctx: *anyopaque, spec: ops.EmbeddingRotarySpec) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const values = try spec.values();
+        if (self.rotaryLookup(spec) != null or self.decoderWorkspaceBusy() or @import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_ROTARY_CACHE")) return;
+        const cache = if (self.data.tier_cache) |*v| v else return;
+        const p = self.provider_impl;
+        if (p.embeddinggemma2_cache_admission) |bound| if (bound != cache) return;
+        const Entry = @import("metal_embedding_bindings.zig").Rotary;
+        var victim: usize = 0;
+        for (p.embedding_rotary, 0..) |entry, i| if (entry == null or (p.embedding_rotary[victim] != null and entry.?.stamp < p.embedding_rotary[victim].?.stamp)) {
+            victim = i;
+        };
+        // Replacement is pre-frame and may reclaim the victim before growth.
+        if (p.embedding_rotary[victim]) |entry| {
+            self.dropRotary(entry);
+            p.embedding_rotary[victim] = null;
+        }
+        self.data.prefetch.lock();
+        cache.reserve(.host, @sizeOf(Entry)) catch {
+            self.data.prefetch.unlock();
+            return;
+        };
+        self.data.prefetch.unlock();
+        const entry = std.heap.c_allocator.create(Entry) catch {
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, @sizeOf(Entry));
+            self.data.prefetch.unlock();
+            return;
+        };
+        p.embeddinggemma2_cache_admission = cache;
+        p.embedding_rotary_clock += 1;
+        entry.* = .{ .spec = spec, .stamp = p.embedding_rotary_clock };
+        entry.owner.outputs = &entry.views;
+        var committed = false;
+        defer if (!committed) self.dropRotary(entry);
+        var buffer = (self.audioPlanBuffer(&entry.owner, values * 4, false) catch |err| switch (err) {
+            error.OutOfMemory, error.MetalBufferAllocFailed => return,
+            else => return err,
+        }) orelse return;
+        defer buffer.deinit();
+        const runtime = p.raw_decode_runtime orelse return;
+        if (metal_runtime.antfly_metal_rotary_table(runtime, buffer.deviceHandle(), buffer.deviceByteOffset(), spec.dim, spec.x, spec.y, spec.theta, @intFromBool(spec.vision)) != 0) return error.MetalKernelDispatchFailed;
+        const view = try buffer.retainedView(0, values * 4, &.{@intCast(values)});
+        const tensor = self.audioPersistentCt(&entry.owner, view) catch |err| {
+            var owned = view;
+            owned.deinit();
+            return err;
+        };
+        toBuf(tensor).persistent_model = true;
+        entry.views[0] = tensor;
+        p.embedding_rotary[victim] = entry;
+        p.embedding_rotary_builds += 1;
+        committed = true;
+    }
+
     fn dropVisionWorkspace(self: *MetalCompute, old: *@import("metal_embedding_bindings.zig").VisionWorkspace) void {
         old.owner.deinit();
         if (self.data.tier_cache) |*cache| {
@@ -16402,8 +16494,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const tile: usize = @min(spec.rows, 512);
         // Four hidden regions, packed QKV, three prepared heads and FFN down.
         // Each range has an explicit last-use; private writes follow queue order.
-        const bytes = std.mem.alignForward(usize, (11 * spec.rows * spec.hidden + 3 * tile * spec.intermediate) * 4, 4096);
-        if (bytes > 256 * 1024 * 1024) return error.AudioScheduleAdmission;
+        const bytes = @import("embedding_vision_plan.zig").arenaBytes(spec.rows, spec.hidden, spec.intermediate) catch return error.AudioScheduleAdmission;
         const cache = if (self.data.tier_cache) |*v| v else return error.AudioScheduleAdmission;
         self.data.prefetch.lock();
         cache.reserve(.host, @sizeOf(Workspace)) catch |err| {
@@ -16548,7 +16639,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             p.rotate = @intFromBool(i < 2);
             p.weighted = @intFromBool(i < 2);
             p.scale = if (i == 0) @sqrt(@as(f32, @floatFromInt(p.head_dim))) else 1;
-            if (metal_runtime.termite_metal_decode_runtime_vision_norm_rope(runtime, projection.deviceHandle(), projection.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), out.deviceHandle(), out.deviceByteOffset(), &p) != 0) return error.MetalKernelDispatchFailed;
+            const rotary = if (p.rotate != 0) self.rotaryLookup(.{ .vision = true, .dim = p.head_dim, .x = p.grid_x, .y = p.grid_y, .theta = p.theta }) else null;
+            p.cached_rotary = @intFromBool(rotary != null);
+            if (metal_runtime.termite_metal_decode_runtime_vision_norm_rope(runtime, projection.deviceHandle(), projection.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), out.deviceHandle(), out.deviceByteOffset(), if (rotary) |table| table.deviceHandle() else null, if (rotary) |table| table.deviceByteOffset() else 0, &p) != 0) return error.MetalKernelDispatchFailed;
         }
         return .{ .first = workspace.views[5].?, .second = workspace.views[6].?, .third = workspace.views[7].? };
     }
@@ -19550,7 +19643,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const bounds = toBuf(tensor).resident_index_bounds orelse return error.InvalidTensorShape;
             if (bounds.minimum < 0 or bounds.maximum >= (if (p.gather == 2) p.sequence else p.source_rows) or g.elemCount() != p.rows) return error.InvalidTensorShape;
         }
-        const result = try metal_runtime.decoderRuntimeEmbeddingHeadPrepare(self.provider_impl, x, w, g, p);
+        const rotary = if (p.rotate != 0) self.rotaryLookup(.{ .dim = p.dim, .x = p.sequence, .theta = p.theta }) else null;
+        var params = p;
+        params.cached_rotary = @intFromBool(rotary != null);
+        const result = try metal_runtime.decoderRuntimeEmbeddingHeadPrepare(self.provider_impl, x, w, g, params, rotary);
         return self.ctFromOwnedMetalTensor(result);
     }
 
@@ -19560,7 +19656,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer x.deinit();
         var w = try self.ownedDeviceMetalTensorFromCt(weight);
         defer w.deinit();
-        const output = (try metal_runtime.decoderRuntimeVisionNormRope(self.provider_impl, x, w, params)) orelse return null;
+        const rotary = if (params.rotate != 0) self.rotaryLookup(.{ .vision = true, .dim = params.head_dim, .x = params.grid_x, .y = params.grid_y, .theta = params.theta }) else null;
+        var p = params;
+        p.cached_rotary = @intFromBool(rotary != null);
+        const output = (try metal_runtime.decoderRuntimeVisionNormRope(self.provider_impl, x, w, p, rotary)) orelse return null;
         return self.ctFromOwnedMetalTensor(output);
     }
 
@@ -35582,6 +35681,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.rmsNormClamped = audioTapeRmsNormClamped;
         vt.audioPreparedLinear = audioPreparedLinearOp;
         vt.audioNodeInto = audioNodeIntoOp;
+        vt.embeddingRotaryPrepare = embeddingRotaryPrepareOp;
         vt.embeddingVisionWorkspace = embeddingVisionWorkspaceOp;
         vt.embeddingVisionNorm = embeddingVisionNormOp;
         vt.embeddingVisionQKV = embeddingVisionQKVOp;
@@ -35785,6 +35885,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     pub fn reserveHiddenStatePair(_: *const ops.ComputeBackend, _: usize, _: usize) !?ReservedHiddenStatePair {
         return null;
+    }
+
+    pub fn requireEmbeddingVisionPlan(_: *const ops.ComputeBackend, _: bool) bool {
+        return false;
+    }
+    pub fn prepareEmbeddingVisionPlan(_: *const ops.ComputeBackend, _: ops.EmbeddingVisionSpec) !bool {
+        return false;
     }
 
     pub fn prepareEmbeddingImagePatches(_: *const ops.ComputeBackend, _: @import("antfly_image").processing.ImageU8, _: u32, _: u32) !?CT {
@@ -47095,4 +47202,91 @@ test "embeddinggemma2 Metal image preparation declines denied persistent admissi
     try std.testing.expect(compute.provider_impl.embedding_image_preparer == null);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
+}
+
+test "embeddinggemma2 Metal rotary tables preserve precise heads warm reuse bounded eviction and pressure cleanup" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{});
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    // Vision across both axes and repeated batches, strided packed projections.
+    const rows = 24;
+    const hidden = 128;
+    const dim = 64;
+    var data: [rows * hidden * 3]f32 = undefined;
+    for (&data, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.17);
+    const input = try cb.fromFloat32Shape(&data, &.{ rows, hidden * 3 });
+    defer cb.free(input);
+    const weights: [dim]f32 = @splat(0.75);
+    const weight = try cb.fromFloat32Shape(&weights, &.{dim});
+    defer cb.free(weight);
+    const params = ops.VisionNormRopeParams{ .rows = rows, .hidden = hidden, .head_dim = dim, .grid_x = 3, .grid_y = 2, .theta = 10000, .eps = 1e-6, .scale = 8, .stride = hidden * 3, .start = hidden };
+    const reference = (try cb.visionNormRope(input, weight, params)).?;
+    defer cb.free(reference);
+    const expected = try cb.toFloat32(reference, a);
+    defer a.free(expected);
+    const key = ops.EmbeddingRotarySpec{ .vision = true, .dim = dim, .x = 3, .y = 2, .theta = 10000 };
+    try cb.vtable.embeddingRotaryPrepare.?(cb.ptr, key);
+    const builds = compute.provider_impl.embedding_rotary_builds;
+    try cb.vtable.embeddingRotaryPrepare.?(cb.ptr, key);
+    try std.testing.expectEqual(builds, compute.provider_impl.embedding_rotary_builds);
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    const output = (try cb.visionNormRope(input, weight, params)).?;
+    defer cb.free(output);
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    const actual = try cb.toFloat32(output, a);
+    defer a.free(actual);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    // Backbone: explicit original positions and two qualified head dimensions.
+    for ([_]u32{ 128, 256 }) |d| {
+        const values = try a.alloc(f32, 4 * d);
+        defer a.free(values);
+        const gamma = try a.alloc(f32, d);
+        defer a.free(gamma);
+        for (values, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.11);
+        @memset(gamma, 0.9);
+        const x = try cb.fromFloat32Shape(values, &.{ 4, @intCast(d) });
+        defer cb.free(x);
+        const w = try cb.fromFloat32Shape(gamma, &.{@intCast(d)});
+        defer cb.free(w);
+        const ids = (try cb.fromInt32Shape(&.{ 0, 9, 511, 8191 }, &.{4})).?;
+        defer cb.free(ids);
+        const p = ops.EmbeddingHeadParams{ .source_rows = 4, .rows = 4, .source_heads = 1, .heads = 1, .dim = d, .sequence = 8192, .stride = d, .start = 0, .rotate = 1, .gather = 2, .weighted = 1, .eps = 1e-6, .theta = if (d == 128) 10000 else 1000000, .scale = 1 };
+        const baseline = try cb.vtable.embeddingHeadPrepare.?(cb.ptr, x, w, ids, p);
+        defer cb.free(baseline);
+        const want = try cb.toFloat32(baseline, a);
+        defer a.free(want);
+        try cb.vtable.embeddingRotaryPrepare.?(cb.ptr, .{ .dim = d, .x = 8192, .theta = p.theta });
+        const cached = try cb.vtable.embeddingHeadPrepare.?(cb.ptr, x, w, ids, p);
+        defer cb.free(cached);
+        const got = try cb.toFloat32(cached, a);
+        defer a.free(got);
+        for (want, got) |u, v| try std.testing.expectApproxEqAbs(u, v, 1e-6);
+    }
+    try std.testing.expect(compute.provider_impl.embedding_rotary_hits > 0);
+    // No cache mutation/publication while an active frame could borrow it.
+    const count = compute.provider_impl.embedding_rotary_builds;
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    try cb.vtable.embeddingRotaryPrepare.?(cb.ptr, .{ .dim = 64, .x = 17, .theta = 1234 });
+    try cb.decoderRuntimeCancelFrame();
+    try std.testing.expectEqual(count, compute.provider_impl.embedding_rotary_builds);
+    for (1..9) |n| try cb.vtable.embeddingRotaryPrepare.?(cb.ptr, .{ .dim = 64, .x = @intCast(n * 7), .theta = 1234 });
+    var retained: usize = 0;
+    for (compute.provider_impl.embedding_rotary) |entry| {
+        retained += @intFromBool(entry != null);
+    }
+    try std.testing.expect(retained <= 4);
+    _ = try compute.provider_impl.reclaimEmbeddingGemma2Weights(.vision);
+    _ = try compute.provider_impl.reclaimEmbeddingGemma2Weights(.language);
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
 }

@@ -1110,13 +1110,9 @@ pub const EmbeddingPipeline = struct {
         const alloc = self.allocator;
         const lock_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.execution_control) |control| try control.update(.executing, 0, 0);
-        if (!self.execution_gate_held) if (self.execution_lock) |lock| {
-            if (self.execution_control) |control|
-                try control.lock(lock)
-            else
-                platform.sync.lockYielding(lock);
-        };
-        defer if (!self.execution_gate_held) if (self.execution_lock) |lock| lock.unlock();
+        var cohort_waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+        if (!self.execution_gate_held) try self.session.enterExecutionCohort(self.execution_lock, self.execution_control orelse .{}, &cohort_waiter);
+        defer if (!self.execution_gate_held) self.session.leaveExecutionCohort(self.execution_lock, &cohort_waiter);
         const execute_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.trace) |trace| trace.execution_lock_ns += execute_started -| lock_started;
         defer if (self.trace) |trace| {

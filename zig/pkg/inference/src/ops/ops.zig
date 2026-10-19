@@ -794,6 +794,7 @@ pub const EmbeddingHeadParams = extern struct {
     eps: f32,
     theta: f32,
     scale: f32,
+    cached_rotary: u32 = 0,
     pub fn validate(self: EmbeddingHeadParams) !void {
         if (self.source_rows == 0 or self.rows == 0 or self.source_heads == 0 or self.heads == 0 or self.heads % self.source_heads != 0 or self.dim == 0 or self.dim > 512 or self.dim % 2 != 0 or self.sequence == 0 or self.rotate > 1 or self.gather > 2 or self.weighted > 1 or !std.math.isFinite(self.scale) or !std.math.isFinite(self.theta) or self.theta <= 0 or !std.math.isFinite(self.eps) or self.eps <= 0 or @as(usize, self.start) + @as(usize, self.source_heads) * self.dim > self.stride or (self.gather != 1 and self.rows > self.source_rows)) return error.InvalidTensorShape;
     }
@@ -812,6 +813,18 @@ pub const VisionNormRopeParams = extern struct {
     start: u32 = 0,
     rotate: u32 = 1,
     weighted: u32 = 1,
+    cached_rotary: u32 = 0,
+};
+pub const EmbeddingRotarySpec = struct {
+    vision: bool = false,
+    dim: u32,
+    x: u32,
+    y: u32 = 0,
+    theta: f32,
+    pub fn values(self: EmbeddingRotarySpec) !usize {
+        if (self.dim == 0 or self.dim > 512 or self.dim % (if (self.vision) @as(u32, 4) else 2) != 0 or self.x == 0 or self.x > 8192 or self.y > 8192 or (self.vision and self.y == 0) or (!self.vision and self.y != 0) or !std.math.isFinite(self.theta) or self.theta <= 0) return error.InvalidTensorShape;
+        return try std.math.mul(usize, try std.math.add(usize, self.x, self.y), self.dim / (if (self.vision) @as(u32, 4) else 2) * 2);
+    }
 };
 pub const EmbeddingVisionSpec = struct { rows: usize, hidden: usize, intermediate: usize };
 pub const Gemma4AudioLocalAttentionParams = struct {
@@ -2065,6 +2078,7 @@ pub const ComputeBackend = struct {
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
         rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
         clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
+        embeddingRotaryPrepare: ?*const fn (ctx: *anyopaque, spec: EmbeddingRotarySpec) anyerror!void = null,
         embeddingVisionWorkspace: ?*const fn (ctx: *anyopaque, spec: ?EmbeddingVisionSpec) anyerror!void = null,
         embeddingVisionNorm: ?*const fn (ctx: *anyopaque, input: CT, residual: ?CT, eps: f32, slot: usize) anyerror!?CT = null,
         embeddingVisionQKV: ?*const fn (ctx: *anyopaque, input: CT, layer: usize, params: VisionNormRopeParams) anyerror!?SplitLastDim3Result = null,
@@ -6627,4 +6641,8 @@ test "embeddinggemma2 streamed FFN restores controls and releases post-cancel ou
         try std.testing.expectEqual(@as(usize, if (case == 1) 0 else 1), fixture.calls);
         try std.testing.expectEqual(@as(usize, if (case == 1) 0 else 1), fixture.frees);
     }
+}
+
+test {
+    _ = @import("embedding_vision_plan.zig");
 }
