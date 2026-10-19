@@ -1272,6 +1272,56 @@ fn removeTreeIfExists(dir: std.Io.Dir, io: std.Io, path: []const u8) !void {
     try dir.deleteTree(io, path);
 }
 
+/// Reuse only a fully verified, immutable catalog bundle. Mutable Hub refs
+/// still resolve metadata and go through the publication transaction.
+/// Checking hashes here also repairs same-size local corruption on re-pull.
+pub fn installedPinnedBundleMatches(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    directory: []const u8,
+    artifacts: []const qwen3vl_catalog.Artifact,
+    progress: ProgressSink,
+) !bool {
+    var receipt = managed_receipt.loadValidated(allocator, io, directory) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => return err,
+        else => return false,
+    } orelse return false;
+    defer receipt.deinit();
+    if (receipt.artifacts.len != artifacts.len + 1 or receipt.find("model_manifest.json") == null) return false;
+    for (artifacts) |expected| {
+        const actual = receipt.find(expected.path) orelse return false;
+        if (actual.size != expected.size) return false;
+        try progress.checkCancelled();
+        managed_receipt.verifyValidatedArtifactSha256(io, actual, expected.sha256) catch |err| switch (err) {
+            error.Canceled => return err,
+            else => return false,
+        };
+    }
+    const manifest = receipt.find("model_manifest.json").?;
+    const digest = manifest.sha256 orelse return false;
+    try progress.checkCancelled();
+    managed_receipt.verifyValidatedArtifactSha256(io, manifest, digest) catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return false,
+    };
+    return true;
+}
+
+/// Finish recovery after the locked caller verified the published bundle.
+/// An idempotent pull must not strand backups or interrupted private staging.
+pub fn finishVerifiedManagedInstall(allocator: std.mem.Allocator, io: std.Io, destination: []const u8) !void {
+    var removed = false;
+    for ([_][]const u8{ managed_download_staging_suffix, managed_download_backup_suffix }) |suffix| {
+        const path = try managedSiblingPath(allocator, destination, suffix);
+        defer allocator.free(path);
+        if (try pathExists(std.Io.Dir.cwd(), io, path)) {
+            try removeTreeIfExists(std.Io.Dir.cwd(), io, path);
+            removed = true;
+        }
+    }
+    if (removed) try syncManagedDirectory(io, std.fs.path.dirname(destination) orelse ".");
+}
+
 fn seedManagedArtifactsWithHardLinks(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1298,6 +1348,40 @@ fn seedManagedArtifactsWithHardLinks(
         // changing the staged file can never mutate the published inode.
         std.Io.Dir.hardLink(cwd, artifact.canonical_path, cwd, staging_path, io, .{ .follow_symlinks = false }) catch continue;
     }
+}
+
+fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, staging: []const u8) !bool {
+    var published = managed_receipt.loadValidated(allocator, io, destination) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => return err,
+        else => return false,
+    } orelse return false;
+    defer published.deinit();
+    var candidate = try managed_receipt.loadValidated(allocator, io, staging) orelse return false;
+    defer candidate.deinit();
+    const a_path = try managedPath(allocator, destination, managed_download_complete_filename);
+    defer allocator.free(a_path);
+    const b_path = try managedPath(allocator, staging, managed_download_complete_filename);
+    defer allocator.free(b_path);
+    const cwd = std.Io.Dir.cwd();
+    const a = try cwd.readFileAlloc(io, a_path, allocator, .limited(managed_receipt.max_receipt_bytes));
+    defer allocator.free(a);
+    const b = try cwd.readFileAlloc(io, b_path, allocator, .limited(managed_receipt.max_receipt_bytes));
+    defer allocator.free(b);
+    // Include source revision and manifest digests, not just weight identity.
+    if (!std.mem.eql(u8, a, b)) return false;
+    for (candidate.artifacts) |artifact| {
+        const old = published.find(artifact.path) orelse return false;
+        const old_stat = try cwd.statFile(io, old.canonical_path, .{});
+        const new_stat = try cwd.statFile(io, artifact.canonical_path, .{});
+        // Download validation already verified shared immutable inodes.
+        if (old_stat.inode == new_stat.inode) continue;
+        const digest = artifact.sha256 orelse return false;
+        managed_receipt.verifyValidatedArtifactSha256(io, old, digest) catch |err| switch (err) {
+            error.Canceled => return err,
+            else => return false,
+        };
+    }
+    return true;
 }
 
 /// A pull transaction built beside the published model directory.
@@ -1365,6 +1449,14 @@ pub const ManagedModelTransaction = struct {
         }
 
         const cwd = std.Io.Dir.cwd();
+        // Mutable refs still fetch and verify their selected revision. If its
+        // complete executable contract is unchanged, preserve the published
+        // directory and every hot runtime instead of swapping identical files.
+        if (try unchangedPublishedInstall(self.allocator, io, self.destination, self.staging)) {
+            try removeTreeIfExists(cwd, io, self.staging);
+            self.committed = true;
+            return;
+        }
         try removeTreeIfExists(cwd, io, self.backup);
         const had_destination = try pathExists(cwd, io, self.destination);
         if (had_destination) {
@@ -5352,4 +5444,94 @@ test "declared GLiNER default preserves explicit nondefault quantization" {
     const declared = try appendDeclaredGlinerBundle(a, &selected, &files, descriptor, "Q4_K");
     const found = declared orelse try appendBestRequestedGgufPayload(a, &selected, &files, "Q4_K", .auto);
     try std.testing.expect(found);
+}
+
+test "pinned bundle re-pull verifies bytes without mutating the live installation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try testTmpPath(a, tmp, "pinned");
+    defer a.free(directory);
+    try beginManagedDownload(a, io, directory);
+    const initial_weights = try managedPath(a, directory, "model.gguf");
+    defer a.free(initial_weights);
+    try writeFileAtomically(a, io, initial_weights, "payload");
+    const initial_plan = try managedPath(a, directory, managed_download_plan_filename);
+    defer a.free(initial_plan);
+    try writeFileAtomically(a, io, initial_plan,
+        \\{"version":1,"artifacts":[{"path":"model.gguf","size":7,"sha256":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}]}
+    );
+    try writeManagedArtifactAndUpdatePlan(a, io, directory, "model_manifest.json", "{}");
+    try completeManagedDownload(a, io, directory);
+    const path = try managedPath(a, directory, "model.gguf");
+    defer a.free(path);
+    const artifacts = [_]qwen3vl_catalog.Artifact{.{ .repo = "owner/model", .revision = "pinned", .path = "model.gguf", .size = 7, .sha256 = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5" }};
+    const before = try std.Io.Dir.cwd().statFile(io, path, .{});
+    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, &artifacts, .{}));
+    const after = try std.Io.Dir.cwd().statFile(io, path, .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.ctime.toNanoseconds(), after.ctime.toNanoseconds());
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, installedPinnedBundleMatches(a, io, directory, &artifacts, .{ .cancelled = &cancelled }));
+    const interrupted = try managedSiblingPath(a, directory, managed_download_staging_suffix);
+    defer a.free(interrupted);
+    const backup = try managedSiblingPath(a, directory, managed_download_backup_suffix);
+    defer a.free(backup);
+    try std.Io.Dir.cwd().createDirPath(io, interrupted);
+    try std.Io.Dir.cwd().createDirPath(io, backup);
+    try finishVerifiedManagedInstall(a, io, directory);
+    try std.testing.expect(!try pathExists(std.Io.Dir.cwd(), io, interrupted));
+    try std.testing.expect(!try pathExists(std.Io.Dir.cwd(), io, backup));
+    // A same-size local mutation must repair instead of trusting the receipt.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "corrupt" });
+    try std.testing.expect(!try installedPinnedBundleMatches(a, io, directory, &artifacts, .{}));
+}
+
+test "managed model transaction preserves unchanged publication and replaces changed content" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try testTmpPath(a, tmp, "unchanged");
+    defer a.free(directory);
+    try beginManagedDownload(a, io, directory);
+    const initial_weights = try managedPath(a, directory, "model.gguf");
+    defer a.free(initial_weights);
+    try writeFileAtomically(a, io, initial_weights, "payload");
+    const initial_plan = try managedPath(a, directory, managed_download_plan_filename);
+    defer a.free(initial_plan);
+    try writeFileAtomically(a, io, initial_plan,
+        \\{"version":1,"artifacts":[{"path":"model.gguf","size":7,"sha256":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}]}
+    );
+    try writeManagedArtifactAndUpdatePlan(a, io, directory, "model_manifest.json", "{}");
+    try completeManagedDownload(a, io, directory);
+    const receipt_path = try managedPath(a, directory, managed_download_complete_filename);
+    defer a.free(receipt_path);
+    const receipt = try std.Io.Dir.cwd().readFileAlloc(io, receipt_path, a, .limited(4096));
+    defer a.free(receipt);
+    const before = try std.Io.Dir.cwd().statFile(io, directory, .{});
+    var transaction = try ManagedModelTransaction.begin(a, io, directory);
+    defer transaction.deinit(io);
+    const plan = try managedPath(a, transaction.staging, managed_download_plan_filename);
+    defer a.free(plan);
+    try writeFileAtomically(a, io, plan, receipt);
+    try completeManagedDownload(a, io, transaction.staging);
+    try transaction.commit(io);
+    try std.testing.expectEqual(before.inode, (try std.Io.Dir.cwd().statFile(io, directory, .{})).inode);
+
+    var changed = try ManagedModelTransaction.begin(a, io, directory);
+    defer changed.deinit(io);
+    const changed_plan = try managedPath(a, changed.staging, managed_download_plan_filename);
+    defer a.free(changed_plan);
+    try writeFileAtomically(a, io, changed_plan, receipt);
+    try writeManagedArtifactAndUpdatePlan(a, io, changed.staging, "model.gguf", "updated");
+    try completeManagedDownload(a, io, changed.staging);
+    try changed.commit(io);
+    try std.testing.expect(before.inode != (try std.Io.Dir.cwd().statFile(io, directory, .{})).inode);
+    const weights = try managedPath(a, directory, "model.gguf");
+    defer a.free(weights);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(io, weights, a, .limited(64));
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("updated", actual);
 }

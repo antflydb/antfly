@@ -571,6 +571,28 @@ pub const ModelRegistry = struct {
         });
         defer download_lock.close(io);
 
+        // Immutable catalog pulls are idempotent. Do this before staging:
+        // even creating a hard link changes the live artifact's ctime and
+        // needlessly invalidates a loaded model's coherency signature.
+        if (tasks_csv == null and capabilities_csv == null) {
+            const cached = if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, &bundle.artifacts(), progress_sink)
+            else if (qwen3vl_catalog.findGenerationSafetensorsBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, &bundle.artifacts(), progress_sink)
+            else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), progress_sink)
+            else if (embedding_gemma2_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), progress_sink)
+            else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), progress_sink)
+            else
+                false;
+            if (cached) {
+                try download.finishVerifiedManagedInstall(self.allocator, io, dest);
+                return;
+            }
+        }
+
         var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
         defer transaction.deinit(io);
 

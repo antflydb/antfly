@@ -19,13 +19,14 @@
     "thumbnail": {
       "name": "thumbnail",
       "type": "embeddings",
-      "template": "{{media url=thumbnail_url}}",
+      "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
       "embedder": {
         "provider": "antfly",
         "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
       },
       "dimension": 768,
-      "distance_metric": "cosine"
+      "distance_metric": "cosine",
+      "coverage_policy": "partial"
     }
   }
 }

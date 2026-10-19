@@ -1449,10 +1449,12 @@ class StandaloneAntflyServer:
         *,
         pgwire: bool = False,
         storage_engine: str | None = None,
+        inference_host_budget_mb: int | None = None,
     ):
         self.binary = binary
         self.host = host
         self.storage_engine = storage_engine
+        self.inference_host_budget_mb = inference_host_budget_mb
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(host)
             setup.callback(self.port_reservations.close)
@@ -1490,6 +1492,10 @@ class StandaloneAntflyServer:
             root=self.root,
             pgwire_port=self.pgwire_port,
         )
+        if self.inference_host_budget_mb is not None:
+            command.extend(
+                ["--inference-host-budget-mb", str(self.inference_host_budget_mb)]
+            )
         if self.storage_engine is not None:
             command.extend(["--storage-engine", self.storage_engine])
             if self.storage_engine == "lite":
@@ -3669,8 +3675,15 @@ def _reusable_backup_runtime():
 
 @pytest.fixture(scope="function")
 def backup_api(request: pytest.FixtureRequest):
+    # A parametrized budget needs its own process; it must not silently reuse
+    # the module server's more generous default inference envelope.
+    inference_host_budget_mb = getattr(request, "param", None)
+    if inference_host_budget_mb is not None:
+        assert (
+            isinstance(inference_host_budget_mb, int) and inference_host_budget_mb > 0
+        )
     reusable_runtime: ReusableAntflyRuntime | None = None
-    if _uses_reusable_antfly_process(request):
+    if inference_host_budget_mb is None and _uses_reusable_antfly_process(request):
         reusable_runtime = request.getfixturevalue("_reusable_backup_runtime")
         server = reusable_runtime.server
         binary = server.binary
@@ -3681,8 +3694,18 @@ def backup_api(request: pytest.FixtureRequest):
         if not Path(binary).exists():
             pytest.skip(f"Public API binary not found: {binary}")
         if Path(binary).name == "antfly":
-            server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port())
+            if inference_host_budget_mb is None:
+                server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port())
+            else:
+                server = StandaloneAntflyServer(
+                    binary,
+                    "127.0.0.1",
+                    find_free_port(),
+                    inference_host_budget_mb=inference_host_budget_mb,
+                )
         else:
+            if inference_host_budget_mb is not None:
+                pytest.skip("an inference budget requires the native standalone binary")
             server = PublicAntflyServer(binary, "127.0.0.1", find_free_port())
 
     base = antfly_public_api_url(server.url, binary=binary)

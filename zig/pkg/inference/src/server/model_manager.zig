@@ -2517,6 +2517,8 @@ pub const LoadedModel = struct {
     resolution_revision: ?[32]u8 = null,
     embedding_identity: ?[64]u8 = null,
     embedding_asset_signature: ?[32]u8 = null,
+    embedding_identity_mutex: std.atomic.Mutex = .unlocked,
+    embedding_execution_lane: execution_control_mod.ExecutionLane = .{},
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,
@@ -2601,17 +2603,73 @@ pub const LoadedModel = struct {
     retired: bool = false,
 
     pub fn chunkPlanningIdentity(self: *LoadedModel) ![32]u8 {
-        const snapshot = self.chunk_planning orelse return self.resolution_revision orelse error.InvalidEmbeddingIdentity;
+        platform.sync.lockYielding(&self.embedding_identity_mutex);
+        const previous = self.chunk_planning;
+        self.embedding_identity_mutex.unlock();
+        const snapshot = previous orelse return self.resolution_revision orelse error.InvalidEmbeddingIdentity;
+        const io = self.executor_io orelse std.Options.debug_io;
         var paths: [9][]const u8 = undefined;
-        const signature = try componentDependencySignature(self.executor_io orelse std.Options.debug_io, chunkPlanningPaths(self.manifest, &paths));
-        if (!std.mem.eql(u8, &signature, &snapshot.signature)) return error.ModelArtifactsChanging;
-        return snapshot.digest;
+        const signature = try componentDependencySignature(io, chunkPlanningPaths(self.manifest, &paths));
+        if (std.mem.eql(u8, &signature, &snapshot.signature)) return snapshot.digest;
+        const current = chunkPlanningSnapshot(self.allocator, io, self.manifest, self.resolution_revision orelse snapshot.digest) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir, error.ModelArtifactsChanging => return error.ResourceTemporarilyUnavailable,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, &current.digest, &snapshot.digest)) {
+            self.model_manager.retireLoadedModel(self);
+            return error.ModelArtifactsChanging;
+        }
+        platform.sync.lockYielding(&self.embedding_identity_mutex);
+        self.chunk_planning = current;
+        self.embedding_identity_mutex.unlock();
+        return current.digest;
     }
 
     pub fn verifyEmbeddingIdentity(self: *const LoadedModel) !void {
-        const expected = self.embedding_asset_signature orelse return;
-        const actual = try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?);
-        if (!std.mem.eql(u8, &expected, &actual)) return error.ModelArtifactsChanging;
+        return self.verifyEmbeddingIdentityWithControl(.{});
+    }
+
+    pub fn verifyEmbeddingIdentityWithControl(self: *const LoadedModel, control: InferenceExecutionControl) !void {
+        const mutable = @constCast(self);
+        try control.lock(&mutable.embedding_identity_mutex);
+        const expected = self.embedding_asset_signature;
+        mutable.embedding_identity_mutex.unlock();
+        const before = expected orelse return;
+        const identity = @import("../models/embedding_gemma2_identity.zig");
+        const actual = identity.signature(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?) catch |err| switch (err) {
+            // A directory publication can briefly replace path components.
+            // Keep that race retryable instead of failing a document forever.
+            error.FileNotFound, error.NotDir => return error.ResourceTemporarilyUnavailable,
+            else => return err,
+        };
+        if (std.mem.eql(u8, &before, &actual)) return;
+        // Hard links and atomic publication can change metadata without
+        // changing executable bytes. Revalidate content for the new signature,
+        // then restore the cheap warm check without weakening mutation guards.
+        const snapshot = identity.snapshotCached(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?, control) catch |err| {
+            // An unstable filesystem snapshot does not prove this loaded
+            // runtime is stale. Preserve it and retry publication instead of
+            // forcing a second resident session under backfill memory pressure.
+            switch (err) {
+                error.ModelArtifactsChanging, error.FileNotFound, error.NotDir => return error.ResourceTemporarilyUnavailable,
+                error.Cancelled, error.Canceled, error.Timeout => return err,
+                else => {
+                    self.model_manager.retireLoadedModel(mutable);
+                    return err;
+                },
+            }
+        };
+        const digest = identity.forBackend(snapshot.digest, self.session.backend());
+        if (self.embedding_identity) |loaded| if (std.mem.eql(u8, &loaded, &digest)) {
+            try control.lock(&mutable.embedding_identity_mutex);
+            mutable.embedding_asset_signature = snapshot.signature;
+            mutable.embedding_identity_mutex.unlock();
+            return;
+        };
+        // Active handles retain rejected assets until they unwind; later
+        // calls reload instead of reusing a permanently stale generation.
+        self.model_manager.retireLoadedModel(mutable);
+        return error.ModelArtifactsChanging;
     }
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
@@ -3093,6 +3151,7 @@ pub const LoadedModel = struct {
         self.bindEmbeddingPipelineAssetsLocked(&pipeline);
         pipeline.resident_projection_stats = &self.resident_projection_stats;
         pipeline.execution_lock = self.embeddingExecutionLock();
+        pipeline.execution_lane = if (self.manifest.embedding_style == .embedding_gemma2) &self.embedding_execution_lane else null;
         return pipeline;
     }
 
@@ -14038,4 +14097,48 @@ test "embeddinggemma2 planning precision follows required backend before prefere
     try std.testing.expectEqual(backends.BackendType.metal, embeddingPlanningBackend(manager));
     manager.required_backend = .native;
     try std.testing.expectEqual(backends.BackendType.native, embeddingPlanningBackend(manager));
+}
+
+test "chunk planning survives metadata-only re-pulls and rejects changed tokenizer bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "original" });
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "tokenizer.json" });
+    defer a.free(path);
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .tokenizer_json_path = path };
+    const snapshot = try chunkPlanningSnapshot(a, io, manifest, @splat(0));
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    // Only planning metadata is exercised; no tokenizer/backend is loaded.
+    var model: LoadedModel = undefined;
+    model.allocator = a;
+    model.model_dir = root;
+    model.manifest = manifest;
+    model.executor_io = io;
+    model.chunk_planning = snapshot;
+    model.resolution_revision = @splat(0);
+    model.embedding_identity_mutex = .unlocked;
+    model.model_manager = &manager;
+    model.retired = false;
+    try std.Io.Dir.hardLink(tmp.dir, "tokenizer.json", tmp.dir, "linked.json", io, .{});
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    try tmp.dir.deleteFile(io, "linked.json");
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "changed!" });
+    try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
+}
+
+test "embedding identity validation without asset signatures remains cancellable and performs no discovery" {
+    var model: LoadedModel = undefined;
+    model.embedding_identity_mutex = .unlocked;
+    model.embedding_asset_signature = null;
+    // Other fields deliberately have no valid allocator, paths or session:
+    // models without an asset signature must stay on the metadata-free path.
+    try model.verifyEmbeddingIdentityWithControl(.{});
+    try std.testing.expectError(error.Timeout, model.verifyEmbeddingIdentityWithControl(.{ .deadline_ns = 0 }));
+    try model.verifyEmbeddingIdentityWithControl(.{});
 }

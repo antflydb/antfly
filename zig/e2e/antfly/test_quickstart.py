@@ -1050,6 +1050,16 @@ def test_public_managed_chunked_semantic_full_index_pipeline(
         until="complete",
     )
 
+    # Check the actual public table response without requiring model weights.
+    # Nullable struct defaults used to leak into this nonnullable chunker wire
+    # contract on list, even though the single-table encoder omitted them.
+    for tables in (backup_api.get("/tables"), [backup_api.get_table(table_name)]):
+        listed = next(table for table in tables if table["name"] == table_name)
+        chunker = listed["indexes"]["semantic_chunked_idx"]["chunker"]
+        assert chunker["text"]["target_tokens"] == 4
+        for absent in ("audio", "embedding", "policy"):
+            assert absent not in chunker, chunker
+
     batch = backup_api.batch_write(
         table_name,
         inserts={
@@ -2407,3 +2417,166 @@ def test_public_managed_antfly_embeddinggemma2_chunked_full_index_pipeline(
     assert len(chunks) >= 2
     assert chunks[0]["body"].startswith("alpha")
     assert any(chunk["body"].startswith("beta") for chunk in chunks)
+
+
+@pytest.mark.real_model
+@pytest.mark.parametrize("backup_api", [8192], indirect=True, ids=["host-budget-8gib"])
+def test_embeddinggemma2_quickstart_foreground_and_repull_during_backfill(
+    embeddinggemma2_model_available, backup_api
+):
+    api = backup_api
+    server = api._server
+    assert server is not None
+    assert server.inference_host_budget_mb == 8192
+    table = f"quickstart_gemma_runtime_{time.time_ns()}"
+    index = "title_body"
+    sample = json.loads(
+        (Path(__file__).resolve().parents[3] / "wikipedia-config.json").read_text()
+    )["indexes"]
+    config = sample[index]
+    api.create_table(table, num_shards=1)
+    api.create_index(table, index, config)
+
+    env = os.environ.copy()
+    env["ANTFLY_URL"] = server.url
+    env.pop("ANTFLY_TOKEN", None)
+
+    def cli(*args):
+        result = subprocess.run(
+            [server.binary, *args], env=env, text=True, capture_output=True, timeout=120
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return result.stdout
+
+    # Exercise the typed native client too: requests.json() accepts nulls that
+    # violate the response schema and previously hid this table-list failure.
+    listed = json.loads(cli("table", "list", "--output", "json"))
+    assert table in {entry["name"] for entry in listed}
+    detail = json.loads(cli("table", "get", "--table", table))
+    assert detail["indexes"][index]["chunker"]["text"]["target_tokens"] == 200
+    for entry in api.get("/tables"):
+        for cfg in entry.get("indexes", {}).values():
+            chunker = cfg.get("chunker") or {}
+            assert all(value is not None for value in chunker.values()), chunker
+
+    # Many distinct chunks keep native inference active throughout the probes;
+    # repeated bodies would be served by the enrichment cache instead.
+    docs = {
+        f"doc:{i:04d}": {
+            "title": f"Anatomy and physiology reference {i}",
+            "body": " ".join(
+                f"Anatomy study {i} section {j} describes physiology medicine organs "
+                f"and clinical research findings for patient group {i * 1000 + j}."
+                for j in range(48)
+            ),
+        }
+        for i in range(512)
+    }
+    # A valid local 32x32 red PNG keeps the shared-model image path hermetic.
+    image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg=="
+    for document in list(docs.values())[:8]:
+        document["thumbnail_url"] = image
+    assert api.batch_write(table, inserts=docs, sync_level="write")["inserted"] == len(
+        docs
+    )
+
+    last_status = None
+
+    def active_status():
+        nonlocal last_status
+        status = api.get_index(table, index)["status"]
+        last_status = status
+        coverage = status.get("source_coverage") or {}
+        assert int(coverage.get("failed") or 0) == 0, status
+        if (
+            int(coverage.get("covered") or 0) > 0
+            and int(coverage.get("pending") or 0) > 0
+        ):
+            return status
+        return None
+
+    assert wait_until(active_status, timeout_s=120, interval_s=0.1), api.get_index(
+        table, index
+    )
+
+    def foreground_query(sequence):
+        # No caller retries, and a new query defeats the query-embedding cache.
+        response = api.query_table(
+            table,
+            {
+                "semantic_search": f"anatomy and physiology research {sequence}",
+                "indexes": [index],
+                "fields": ["title"],
+                "limit": 3,
+            },
+        )
+        assert response["responses"][0]["hits"]["hits"], response
+
+    def require_active():
+        # Coverage observations can be temporarily unavailable while a live
+        # checkpoint changes. Wait for a confirmed pending observation rather
+        # than treating unknown counters as completed backfill.
+        assert wait_until(active_status, timeout_s=15, interval_s=0.05), json.dumps(
+            {"status": last_status, "logs": api.debug_logs()[-12000:]}, indent=2
+        )
+
+    for sequence in range(3):
+        require_active()
+        foreground_query(sequence)
+
+    model_dir = embeddinggemma2_model_available
+    watched = [model_dir / "model.safetensors", model_dir / "model_manifest.json"]
+    before = [
+        (p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in watched
+    ]
+    # The normal pinned re-pull must preserve the live installation, even its
+    # metadata: an otherwise harmless hard link used to poison every next call.
+    pull = subprocess.Popen(
+        [server.binary, "inference", "pull", f"hf:{EMBEDDINGGEMMA2_MODEL}"],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        foreground_query("during-pull")
+        output, _ = pull.communicate(timeout=120)
+        assert pull.returncode == 0, output
+    finally:
+        if pull.poll() is None:
+            pull.kill()
+            pull.wait()
+    after = [
+        (p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in watched
+    ]
+    assert after == before, "unchanged pull mutated live artifacts"
+
+    # Explicit overrides traverse staged publication. Preserve the installed
+    # tasks while exercising the formerly persistent ctime/cache failure too.
+    manifest = json.loads((model_dir / "model_manifest.json").read_text())
+    cli(
+        "inference",
+        "pull",
+        f"hf:{EMBEDDINGGEMMA2_MODEL}",
+        "--tasks",
+        ",".join(manifest["tasks"]),
+    )
+    require_active()
+    foreground_query("after-staged-pull")
+    # Omitting dimension forces the live validation probe through the same
+    # supervised native worker while the original index is still backfilling.
+    image_config = dict(sample["thumbnail"])
+    image_config.pop("name", None)
+    image_config.pop("dimension", None)
+    api.create_index(table, "live_image", image_config)
+    foreground_query("after-live-ddl")
+    for name, covered in ((index, len(docs)), ("live_image", 8)):
+        complete = api.wait_index_ready(table, name, until="complete", timeout_s=600)
+        assert complete["source_coverage"]["covered"] == covered, complete
+        assert (complete["source_coverage"].get("failed") or 0) == 0, complete
+    image_query = api.query_table(
+        table,
+        {"semantic_search": "a red picture", "indexes": ["live_image"], "limit": 3},
+    )
+    assert image_query["responses"][0]["hits"]["hits"], image_query
+    cli("table", "list", "--output", "json")
