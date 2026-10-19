@@ -6806,6 +6806,18 @@ class CliTests(unittest.TestCase):
                     client.search_view(handle)
             finally:
                 client.close()
+            legacy = RetainedClient(
+                Path(BINARY), self.root, "src", [], self.env, max_response_bytes=8192
+            )
+            try:
+                _, registration = legacy.exchange("register", args=["STOP"])
+                legacy.search_view(registration[0]["query_handle"])
+                # Legacy unregistered searches share the same bounded reader;
+                # prior control/results must not consume this response's budget.
+                result, _ = legacy.search(query=["STOP"])
+                self.assertTrue(result["summary"]["stats"]["complete"])
+            finally:
+                legacy.close()
             bounded = RetainedClient(
                 Path(BINARY), self.root, "src", [], self.env, max_response_bytes=1024
             )

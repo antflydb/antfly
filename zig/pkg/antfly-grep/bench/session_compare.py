@@ -112,6 +112,7 @@ class Service:
             request["if_result_token"] = token
         started = time.monotonic()
         before_bytes = self.wire_bytes
+        self.response_start = before_bytes
         self.process.stdin.write(json.dumps(request).encode() + b"\n")
         self.process.stdin.flush()
         rows = []
