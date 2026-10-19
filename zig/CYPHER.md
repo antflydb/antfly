@@ -1642,6 +1642,35 @@ passes may share bags with MIN/MAX and Boolean reducers; duplicate-insensitive
 states and partial merges track presence rather than overflowing a cardinality
 counter. Physical contribution ordinals remain independent of exact logical bag
 cardinality, including when wide summary bins are followed by unit rows.
+Summary negotiation includes dependencies of SQL grouping keys, WHERE and
+aggregate FILTER predicates. Providers certify that these fields are constant
+within the physical endpoint bag; a length-dependent key or predicate declines
+that certificate and retains the exact histogram. Endpoint integer fields are
+rejected as summary candidates before allocating a reduction plan, avoiding
+duplicate geometry retention for long fixed-hop patterns. The same dependencies follow
+typed renames and transparent CTE projections, so a filter cannot regain a
+certificate merely by moving into a subquery.
+
+Native and SQL scalar programs share checked integer affine lineage for unary
+signs, addition, subtraction and multiplication by constants. Every intermediate
+must remain affine in one marginal. Representative bags include both extrema,
+so the ordinary scalar evaluators still detect intermediate BIGINT overflow,
+including when a later operation cancels it. Native SUM also requires a
+one-sign argument to preserve its contribution-order overflow semantics; mixed
+signs retain the ordinary executor. Nonlinear and cross-marginal expressions
+remain distribution-sensitive.
+
+Fixed UNWIND repetitions retain scalar lineage and exact weights. Path/list
+aliases in a fixed list carry their private summaries; full values are removed
+only after consumer liveness proves that the alias itself is unobserved.
+Local reducers consume affine moments directly through the ordinary row
+pipeline; escaping bags retain integer representatives. Every intermediate
+arithmetic bound is checked, and current fold weights account for repetitions
+coalesced by CALL memoization, so repeated elements multiply every contribution
+correctly.
+Empty lists, observable full paths, heterogeneous marginal inputs and
+length-dependent filters retain their normal semantics.
+
 Length predicates, length grouping keys, non-extremum DISTINCT arguments
 and other distribution-dependent expressions retain exact hop states. Cyclic
 trail histories retain ordinary enumeration when uniqueness cannot be proved;

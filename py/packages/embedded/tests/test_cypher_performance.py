@@ -20,6 +20,7 @@ from contextlib import closing
 import pytest
 
 import antfly_embedded as af
+from antfly_embedded._sql import SQLStateError
 
 
 @pytest.fixture(params=[af.Storage.LITE, af.Storage.DIRECTORY])
@@ -3215,7 +3216,95 @@ def test_sql_graph_statistics_use_consumer_certificates(graph_db):
         if len(result[0]) > 1:
             assert result[0][1] == str(layers)
             assert float(result[0][2]) == pytest.approx(average, rel=1e-13)
+    grouped = relation.replace("length(p) AS hops", "length(p) AS hops,b.score AS depth")
+    assert db.sql(f"SELECT min(hops+1),max(hops+1),avg(hops+1) FROM {grouped} WHERE depth>0")["rows"][0] == [
+        "2",
+        str(layers + 1),
+        pytest.approx(average + 1, rel=1e-13),
+    ]
+    query = f"WITH t AS (SELECT hops+1 AS n,depth FROM {grouped} WHERE depth>0) SELECT depth,min(n),max(n),avg(n) FROM t WHERE depth%4=0 GROUP BY depth ORDER BY depth"
+    result = db.sql(query)["rows"]
+    assert result == [
+        [
+            str(depth),
+            str((depth + 1) // 2 + 1),
+            str(depth + 1),
+            pytest.approx(sums[depth] / counts[depth] + 1, rel=1e-13),
+        ]
+        for depth in range(4, layers + 1, 4)
+    ]
+    # A separate finite component gives a small observable length
+    # distribution without relying on a SQL graph range-quantifier spelling.
+    documents = {"short": {"id": "short", "score": 0}}
+    documents.update({f"s{i}_{j}": {"id": f"s{i}_{j}", "score": i + 1} for i in range(4) for j in range(2)})
+    pairs = [("short", f"s{i}_{j}") for i in range(2) for j in range(2)]
+    pairs += [
+        (f"s{i}_{j}", f"s{i + step}_{k}")
+        for step in (1, 2)
+        for i in range(4 - step)
+        for j in range(2)
+        for k in range(2)
+    ]
+    with db.open_table("docs") as table:
+        table.batch_json(
+            {
+                "inserts": documents,
+                "graph_writes": [
+                    {"index_name": "links", "source": a, "target": b, "edge_type": "link"} for a, b in pairs
+                ],
+                "sync_level": "full_index",
+            }
+        )
+    short = grouped.replace("s.id='start'", "s.id='short'")
+    bounded = short
+    paths = [4, 16, 32, 16]
+    assert db.sql(f"SELECT hops,count(*),sum(hops+1) FROM {bounded} GROUP BY hops ORDER BY hops")["rows"] == [
+        [str(n), str(count), str((n + 1) * count)] for n, count in enumerate(paths, 1)
+    ]
+    filtered = db.sql(f"SELECT avg(hops+1) FROM {bounded} WHERE hops%2=0")["rows"][0][0]
+    assert filtered == pytest.approx((3 * 16 + 5 * 16) / (16 + 16))
+    nonlinear = db.sql(f"SELECT avg(hops*hops) FROM {bounded}")["rows"][0][0]
+    assert nonlinear == pytest.approx(sum(n * n * count for n, count in enumerate(paths, 1)) / sum(paths))
+    with pytest.raises(SQLStateError, match="22003"):
+        db.sql(f"SELECT avg((hops+9223372036854775807)-9223372036854775807) FROM {bounded}")
     small = "GRAPH_TABLE(g MATCH p=(s IS D)-[rs IS R*3]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS hops,size(rs) AS segment)) q"
     assert db.sql(
         f"SELECT count(hops),sum(hops),avg(segment),min(hops),max(segment),count(DISTINCT hops) FROM {small}"
     )["rows"] == [["64", "192", 3.0, "3", "3", "1"]]
+
+
+def test_affine_and_fixed_unwind_keep_length_statistics_compressed(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 20000}
+    control = db.cypher_json(
+        "g", {"query": base + "RETURN min(length(p)),max(length(p)),avg(length(p))", "limits": limits}
+    )
+    minimum, maximum, average = [cell["value"] for cell in control["rows"][0]]
+    for expression, scale, offset in (("length(p)+1", 1, 1), ("3-2*length(p)", -2, 3)):
+        result = db.cypher_json(
+            "g", {"query": base + f"RETURN min({expression}),max({expression}),avg({expression})", "limits": limits}
+        )
+        low, high = sorted((scale * int(minimum) + offset, scale * int(maximum) + offset))
+        assert [cell["value"] for cell in result["rows"][0]] == [
+            str(low),
+            str(high),
+            pytest.approx(scale * average + offset, rel=1e-13),
+        ]
+    for tail in (
+        "WITH length(p) AS n UNWIND [n] AS x RETURN min(x),max(x),avg(x)",
+        "WITH length(p) AS n UNWIND [n,n] AS x RETURN min(x),max(x),avg(x)",
+        "UNWIND [p] AS q RETURN min(length(q)),max(length(q)),avg(length(q))",
+        "UNWIND [p,p] AS q RETURN min(length(q)),max(length(q)),avg(length(q))",
+        "WITH length(p)+1 AS n CALL { WITH n RETURN 2*n AS k } RETURN min(k)-2,max(k)-2,avg(k)-2",
+    ):
+        # CALL transports at most four integer bins per endpoint so cached
+        # scalar values retain their original lazy error boundaries.
+        budget = limits if "CALL" not in tail else {**limits, "intermediate_states": 30000}
+        result = db.cypher_json("g", {"query": base + tail, "limits": budget})
+        expected = [minimum, maximum, pytest.approx(average, rel=1e-13)]
+        if "CALL" in tail:
+            expected = [str(2 * int(minimum)), str(2 * int(maximum)), pytest.approx(2 * average, rel=1e-13)]
+        assert [cell["value"] for cell in result["rows"][0]] == expected

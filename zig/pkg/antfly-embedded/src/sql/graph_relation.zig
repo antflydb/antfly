@@ -364,7 +364,7 @@ pub const Cursor = struct {
         for (requests, 0..) |request, i| {
             const multiplicity = request.multiplicity;
             if (request.summary) |field| {
-                if (try stream.planSummaryFields(request.fields, multiplicity, field)) |plan| {
+                if (try stream.planSummaryFields(request.fields, multiplicity, field, request.invariants)) |plan| {
                     var selected: ?usize = null;
                     for (candidates.items, 0..) |candidate, position| {
                         if (candidate.plan.summary == null or !std.mem.eql(u8, candidate.plan.summary.?, plan.summary.?) or

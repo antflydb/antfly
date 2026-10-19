@@ -2868,3 +2868,59 @@ test "escaping vector summary bags unwind allocation failures through CALL memoi
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }
+
+test "affine moment consumers retain checked arithmetic and alias lineage" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH b,length(p) AS n WHERE b.rank<0 WITH n+9223372036854775807 AS k RETURN avg(k)", "[[null]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN min(length(p)+1),max(length(p)+1),sum(length(p)+1),avg(length(p)+1)>1.66 AND avg(length(p)+1)<1.67", "[[1,2,5,true]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH 2*length(p)+1 AS n WITH -n AS k RETURN min(k),max(k),sum(k)", "[[-3,-1,-7]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN sum(length(p)-1),avg(length(p)-length(p))", "[[-1,0]]");
+    try check("CALL { MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN length(p)+1 AS n } RETURN sum(n)", "[[5]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN avg((length(p)+9223372036854775807)-9223372036854775807)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}
+
+test "fixed UNWIND repetitions preserve weighted scalar and path summary lineage" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n CALL { WITH n UNWIND [n,n] AS x RETURN x } RETURN count(*),sum(x)", "[[6,4]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n UNWIND [n,n] AS x RETURN count(*),sum(x),min(x),max(x)", "[[6,4,0,1]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND [p,p] AS q RETURN count(*),sum(length(q)),min(length(q)),max(length(q))", "[[6,4,0,1]]");
+    try check("CALL { MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN length(p) AS n } UNWIND [n,n] AS x RETURN count(*),sum(x)", "[[6,4]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n UNWIND [n,n+1] AS x RETURN count(*),sum(x),min(x),max(x)", "[[6,7,0,2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n UNWIND [] AS x RETURN count(*),sum(n)", "[[0,0]]");
+}
+
+test "affine and repeated summary bags release every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var fixed: FixedAllocation = .{ .backing = backing };
+            const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND [p,p] AS q WITH length(q)+1 AS n RETURN sum(n),avg(n)", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 10), result.rows[0][0].integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "endpoint certificates decline before allocating summary geometry" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES*0..3]->(b:Document) RETURN b.rank AS r", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    const cursor = (try runtime.NodeCursor.open(std.testing.allocator, fixture.backend(), graph, compiled.query, &.{}, .{})).?;
+    defer cursor.close();
+    const peak = cursor.budget.peak;
+    for (0..64) |_| try std.testing.expect(try cursor.planSummaryFields(&.{"r"}, .presence, "r", &.{}) == null);
+    try std.testing.expectEqual(peak, cursor.budget.peak);
+    var scalar = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[:CITES*0..3]->(b:Document) RETURN length(p) AS hops", .{}, &diagnostic);
+    defer scalar.deinit();
+    const scalar_cursor = (try runtime.NodeCursor.open(std.testing.allocator, fixture.backend(), graph, scalar.query, &.{}, .{})).?;
+    defer scalar_cursor.close();
+    try std.testing.expect(try scalar_cursor.planSummaryFields(&.{"hops"}, .exact, "hops", &.{}) != null);
+}

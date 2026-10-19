@@ -163,7 +163,23 @@ pub const NodeCursor = struct {
     }
     /// Certify a marginal-statistic consumer. Other columns, predicates and
     /// path dimensions must not observe the selected length distribution.
-    pub fn planSummaryFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity, field: []const u8) !?WeightPlan {
+    pub fn planSummaryFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity, field: []const u8, invariants: []const []const u8) !?WeightPlan {
+        // Endpoint integer columns also receive affine certificates. Reject
+        // them before constructing a reduction plan: long fixed-hop patterns
+        // otherwise pay for (and retain) the same geometry twice per reducer.
+        const observed = for (self.query.clauses[1].operation.project.value.items) |item| {
+            const name = item.alias orelse try self.engine.expressionName(item.expression);
+            if (!std.mem.eql(u8, name, field)) continue;
+            const reads_summary = reads: {
+                for (self.original_match.paths) |path| {
+                    if (path.execution_summary.length) |slot| if (path_summaries.references(item.expression, slot)) break :reads true;
+                    for (path.edges) |edge| if (edge.execution_length) |slot| if (path_summaries.references(item.expression, slot)) break :reads true;
+                }
+                break :reads false;
+            };
+            if (reads_summary) break true;
+        } else false;
+        if (!observed) return null;
         var plan = (try self.planWeightFields(fields, multiplicity)) orelse return null;
         const targets = try self.engine.summaryTargets(plan.path);
         if (targets.len != 1) return null;
@@ -172,9 +188,13 @@ pub const NodeCursor = struct {
         for (plan.projection.items) |item| {
             const name = item.alias orelse try self.engine.expressionName(item.expression);
             if (std.mem.eql(u8, name, field)) {
-                if (item.expression.value != .variable or !std.mem.eql(u8, item.expression.value.variable, target)) return null;
+                var names: Engine.MomentNames = .empty;
+                try names.put(self.engine.a, target, Engine.Affine.column(0));
+                const form = Engine.momentArgument(item.expression, names) orelse return null;
+                if (form.field == null) return null;
                 found = true;
             } else if (path_summaries.references(item.expression, target)) return null;
+            for (invariants) |invariant| if (std.mem.eql(u8, invariant, name) and path_summaries.references(item.expression, target)) return null;
         }
         if (!found or path_summaries.references(.{ plan.projection.predicate, self.original_match.predicate }, target)) return null;
         plan.summary = target;
@@ -987,6 +1007,8 @@ const Engine = struct {
     moment_targets: []const SummaryTarget = &.{},
     external_summary: ?[]const u8 = null,
     moment_calls: ?[]const ?DirectMoment = null,
+    moment_checks: std.AutoHashMapUnmanaged(*const ast.Expr, Affine) = .empty,
+    active_moments: ?struct { values: PathMoments, checks: std.AutoHashMapUnmanaged(*const ast.Expr, Affine) } = null,
     route_pruner: ?*RoutePruner = null,
     route_probe: ?struct { rejected: *usize, fold: *StreamFold } = null,
     numeric_consolidation: bool = false,
@@ -1207,21 +1229,29 @@ const Engine = struct {
                 self.best = try value.clone(self.arena.allocator());
             }
         }
-        fn addMoments(self: *StreamingAggregate, engine: *Engine, kind: MomentCall, stats: MomentStats, count_value: Count, weight: Count, factor: Count) !void {
+        fn addMoments(self: *StreamingAggregate, engine: *Engine, kind: MomentCall, form: Affine, stats: MomentStats, count_value: Count, weight: Count) !void {
             if (kind == .sum) {
-                // Lengths are nonnegative: the exact moment certifies both
-                // final and intermediate signed overflow without regrouping.
-                const prior = self.sum.integer;
-                const contribution = try stats.sum.multiply(engine.a, factor);
+                // One-sign affine arguments preserve contribution-order
+                // overflow while retaining arbitrary-precision multiplicity.
+                const scale: u64 = @intCast(if (form.scale < 0) -@as(i128, form.scale) else form.scale);
+                const offset: u64 = @intCast(if (form.offset < 0) -@as(i128, form.offset) else form.offset);
+                const magnitude = try (try stats.sum.multiply(engine.a, Count.init(scale))).add(engine.a, try count_value.multiply(engine.a, Count.init(offset)));
+                // Row-local CALL memoization can coalesce repeated rows into
+                // one weighted contribution. Derive its repetition factor
+                // from the current fold weight rather than the producer's.
+                const repetitions = try weight.divRem(engine.a, count_value);
+                std.debug.assert(repetitions.remainder.cap(1) == 0);
+                const contribution = try magnitude.multiply(engine.a, repetitions.quotient);
                 const value = contribution.exact() orelse return error.CypherNumericOverflow;
-                self.sum = .{ .integer = std.math.cast(i64, @as(i128, prior) + value) orelse return error.CypherNumericOverflow };
+                const signed: i128 = if (form.scale < 0 or form.offset < 0) -@as(i128, value) else value;
+                self.sum = .{ .integer = std.math.cast(i64, @as(i128, self.sum.integer) + signed) orelse return error.CypherNumericOverflow };
                 return;
             }
             const value: v.Value = switch (kind) {
-                .min => .{ .integer = @intCast(stats.min) },
-                .max => .{ .integer = @intCast(stats.max) },
+                .min => .{ .integer = try affineValue(form, if (form.scale < 0) stats.max else stats.min) },
+                .max => .{ .integer = try affineValue(form, if (form.scale < 0) stats.min else stats.max) },
                 .count => .{ .integer = 0 },
-                .avg => .{ .number = if (stats.sum.cap(1) == 0) 0 else @floatCast(stats.sum.scaled().ratio(count_value.scaled())) },
+                .avg => .{ .number = @floatCast(@as(f128, @floatFromInt(form.scale)) * (if (stats.sum.cap(1) == 0) @as(f128, 0) else stats.sum.scaled().ratio(count_value.scaled())) + @as(f128, @floatFromInt(form.offset))) },
                 .sum => unreachable,
             };
             const literal: ast.Expr = .{ .span = .{}, .value = .{ .literal = switch (value) {
@@ -1360,7 +1390,7 @@ const Engine = struct {
         probe_tail: bool = true,
         weight: Count = Count.one,
         active_calls: ?[]const bool = null,
-        moment_direct: ?struct { calls: []const ?DirectMoment, values: PathMoments, factor: Count } = null,
+        moment_direct: ?struct { calls: []const ?DirectMoment, values: PathMoments } = null,
         record_rows: bool = true,
         continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null, returned: ?*bool = null, capture: ?*StreamCapture = null, admission: bool = false } = null,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
@@ -1538,7 +1568,8 @@ const Engine = struct {
             for (fold.groups.items[found.?].states, 0..) |*accumulator, i| {
                 if (fold.active_calls) |active| if (!active[i]) continue;
                 if (fold.moment_direct) |direct| if (direct.calls[i]) |input| {
-                    try accumulator.addMoments(engine, input.kind, direct.values.part(input.target), direct.values.count, fold.weight, direct.factor);
+                    try engine.validateMomentInput(input.expression);
+                    try accumulator.addMoments(engine, input.kind, input.form, direct.values.part(input.form.field.?), direct.values.count, fold.weight);
                     continue;
                 };
                 try accumulator.addWeighted(engine, row, fold.weight);
@@ -4257,6 +4288,9 @@ const Engine = struct {
         const saved_calls = self.moment_calls;
         self.moment_calls = null;
         defer self.moment_calls = saved_calls;
+        const saved_checks = self.moment_checks;
+        self.moment_checks = .empty;
+        defer self.moment_checks = saved_checks;
         if (try self.momentTargets(path)) |targets| {
             const saved = self.moment_targets;
             self.moment_targets = targets;
@@ -4281,8 +4315,9 @@ const Engine = struct {
         return false;
     }
     const MomentCall = enum { count, sum, avg, min, max };
-    const DirectMoment = struct { kind: MomentCall, target: usize };
-    const MomentNames = std.StringHashMapUnmanaged(usize);
+    const DirectMoment = struct { kind: MomentCall, form: Affine, expression: *const ast.Expr };
+    const Affine = @import("integer_affine.zig").Form;
+    const MomentNames = std.StringHashMapUnmanaged(Affine);
     const SummaryTarget = struct { name: []const u8, edge: ?usize = null };
     const MomentStats = struct { sum: Count = Count.init(0), min: usize = 0, max: usize = 0 };
     /// The fields are independent marginals. Their joint distribution is never
@@ -4335,8 +4370,95 @@ const Engine = struct {
         while (keys.next()) |key| if (path_summaries.references(value, key.*)) return true;
         return false;
     }
+    fn momentArgument(expression: *const ast.Expr, names: MomentNames) ?Affine {
+        return switch (expression.value) {
+            .variable => |name| names.get(name),
+            .literal => |value| if (value == .integer) Affine.literal(value.integer) else null,
+            .unary => |u| blk: {
+                const operand = momentArgument(u.operand, names) orelse return null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => operand.negative(),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const left = momentArgument(b.left, names) orelse return null;
+                const right = momentArgument(b.right, names) orelse return null;
+                break :blk switch (b.op) {
+                    .add => Affine.combine(left, right, .add),
+                    .subtract => Affine.combine(left, right, .subtract),
+                    .multiply => Affine.combine(left, right, .multiply),
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    }
+    fn retainMomentChecks(self: *Engine, expression: *const ast.Expr, names: MomentNames) anyerror!void {
+        switch (expression.value) {
+            .unary => |u| try self.retainMomentChecks(u.operand, names),
+            .binary => |b| {
+                try self.retainMomentChecks(b.left, names);
+                try self.retainMomentChecks(b.right, names);
+            },
+            else => return,
+        }
+        const form = momentArgument(expression, names) orelse return;
+        if (form.field != null) try self.moment_checks.put(self.a, expression, form);
+    }
+    fn validateMomentNode(self: *Engine, expression: *const ast.Expr) !void {
+        const active = self.active_moments orelse return;
+        const form = active.checks.get(expression) orelse return;
+        const stats = active.values.part(form.field.?);
+        _ = try affineValue(form, stats.min);
+        _ = try affineValue(form, stats.max);
+    }
+    fn validateMomentInput(self: *Engine, expression: *const ast.Expr) anyerror!void {
+        try self.validateMomentNode(expression);
+        switch (expression.value) {
+            .unary => |u| try self.validateMomentInput(u.operand),
+            .binary => |b| {
+                try self.validateMomentInput(b.left);
+                try self.validateMomentInput(b.right);
+            },
+            else => {},
+        }
+    }
+    fn hasMomentCheck(value: anytype, checks: std.AutoHashMapUnmanaged(*const ast.Expr, Affine)) bool {
+        const T = @TypeOf(value);
+        if (T == *const ast.Expr) if (checks.contains(value)) return true;
+        switch (@typeInfo(T)) {
+            .pointer => |pointer| {
+                if (pointer.size == .one and pointer.child == ast.Expr) return hasMomentCheck(value.*, checks);
+                if (pointer.size == .slice and pointer.child != u8) for (value) |child| if (hasMomentCheck(child, checks)) return true;
+            },
+            .@"struct" => |info| inline for (info.field_names) |field| {
+                if (hasMomentCheck(@field(value, field), checks)) return true;
+            },
+            .@"union" => switch (value) {
+                inline else => |child| return hasMomentCheck(child, checks),
+            },
+            .optional => if (value) |child| return hasMomentCheck(child, checks),
+            else => {},
+        }
+        return false;
+    }
+    fn momentLocal(self: *Engine, clauses: []const ast.Clause) bool {
+        // Alias-only CALLs have no interval-dependent failures. A CALL that
+        // computes affine values uses representative bags so memo keys retain
+        // every actual extremum and its original lazy error boundary.
+        for (clauses) |clause| if (clause.operation == .subquery and hasMomentCheck(clause.operation.subquery, self.moment_checks)) return false;
+        return true;
+    }
+    fn affineValue(form: Affine, input: usize) !i64 {
+        return std.math.cast(i64, @as(i128, form.scale) * @as(i128, input) + form.offset) orelse error.CypherNumericOverflow;
+    }
     fn momentKind(aggregate_function: ast.Function, names: MomentNames) ?MomentCall {
-        if (aggregate_function.args.len != 1 or aggregate_function.args[0].value != .variable or !names.contains(aggregate_function.args[0].value.variable)) return null;
+        if (aggregate_function.args.len != 1) return null;
+        const form = momentArgument(aggregate_function.args[0], names) orelse return null;
+        if (form.field == null) return null;
+        if (std.ascii.eqlIgnoreCase(aggregate_function.name, "sum") and !form.oneSign()) return null;
         inline for (@typeInfo(MomentCall).@"enum".field_names) |name| {
             if (std.ascii.eqlIgnoreCase(aggregate_function.name, name) and (!aggregate_function.distinct or std.mem.eql(u8, name, "min") or std.mem.eql(u8, name, "max"))) return @field(MomentCall, name);
         }
@@ -4375,12 +4497,11 @@ const Engine = struct {
         if (projection.distinct or projection.skip != null or projection.limit != null or projection.order.len != 0) return null;
         var next: MomentNames = if (projection.wildcard) try names.clone(self.a) else .empty;
         for (projection.items) |item| {
-            if (item.expression.value == .variable) {
-                if (names.get(item.expression.value.variable)) |target| {
-                    try next.put(self.a, item.alias orelse item.expression.value.variable, target);
-                    continue;
-                }
-            }
+            if (momentArgument(item.expression, names)) |form| if (form.field != null) {
+                try self.retainMomentChecks(item.expression, names);
+                try next.put(self.a, item.alias orelse try self.expressionName(item.expression), form);
+                continue;
+            };
             if (referencesAny(item.expression, names)) return null;
         }
         if (referencesAny(projection.predicate, names) or referencesAny(projection.predicate, next)) return null;
@@ -4390,6 +4511,23 @@ const Engine = struct {
         var names = initial;
         for (middle) |clause| switch (clause.operation) {
             .project => |p| names = (try self.momentProjection(p.value, names)) orelse return null,
+            .unwind => |u| {
+                var form: ?Affine = null;
+                if (referencesAny(u.expression, names)) {
+                    const items = if (u.expression.value == .list) u.expression.value.list else &.{u.expression};
+                    for (items) |item| {
+                        const candidate = momentArgument(item, names) orelse return null;
+                        if (candidate.field == null) return null;
+                        try self.retainMomentChecks(item, names);
+                        if (form) |prior| {
+                            if (prior.field != candidate.field or prior.scale != candidate.scale or prior.offset != candidate.offset) return null;
+                        } else form = candidate;
+                    }
+                }
+                names = try names.clone(self.a);
+                _ = names.remove(u.alias);
+                if (form) |value| try names.put(self.a, u.alias, value);
+            },
             .subquery => |inner| {
                 if (inner.len == 0 or inner[inner.len - 1].operation != .project or !inner[inner.len - 1].operation.project.final) return null;
                 // Row-local CALLs preserve one row per input. Their returned
@@ -4417,7 +4555,7 @@ const Engine = struct {
                     } else false;
                     if (reduction) return momentSafe(projection, names);
                     names = (try self.momentProjection(projection, names)) orelse return false;
-                } else if (clause.operation == .subquery) {
+                } else if (clause.operation == .subquery or clause.operation == .unwind) {
                     names = (try self.momentMiddle(&.{clause}, names)) orelse return false;
                 } else return false;
             }
@@ -4435,7 +4573,7 @@ const Engine = struct {
         const targets = try self.summaryTargets(path);
         if (targets.len == 0) return null;
         var names: MomentNames = .empty;
-        for (targets, 0..) |target, i| try names.put(self.a, target.name, i);
+        for (targets, 0..) |target, i| try names.put(self.a, target.name, Affine.column(i));
         if (referencesAny(self.stream_predicate, names)) return null;
         if (self.weighted_sink) |_| {
             // External consumers negotiate this certificate before advancing.
@@ -4457,11 +4595,12 @@ const Engine = struct {
             } else {
                 if (fold.calls.len != 0) {
                     if (!momentSafe(fold.projection, names)) return null;
-                    if (fold == self.stream_fold.?) {
+                    if (fold == self.stream_fold.? and self.momentLocal(fold.middle)) {
                         const calls = try self.a.alloc(?DirectMoment, fold.calls.len);
                         for (fold.calls, calls) |expression, *call_input| {
                             const invocation = expression.value.call;
-                            call_input.* = if (momentKind(invocation, names)) |kind| .{ .kind = kind, .target = names.get(invocation.args[0].value.variable).? } else null;
+                            call_input.* = if (momentKind(invocation, names)) |kind| .{ .kind = kind, .form = momentArgument(invocation.args[0], names).?, .expression = invocation.args[0] } else null;
+                            if (call_input.* != null) try self.retainMomentChecks(invocation.args[0], names);
                         }
                         self.moment_calls = calls;
                     }
@@ -4795,10 +4934,13 @@ const Engine = struct {
         // Local reducers consume the algebra directly. Only escaping bags need
         // integer representatives for CALL memoization or SQL cursor transport.
         if (self.moment_calls) |calls| {
+            const active = self.active_moments;
+            self.active_moments = .{ .values = moments, .checks = self.moment_checks };
+            defer self.active_moments = active;
             const fold = self.stream_fold.?;
             const prior = fold.weight;
             const direct = fold.moment_direct;
-            fold.moment_direct = .{ .calls = calls, .values = moments, .factor = prior };
+            fold.moment_direct = .{ .calls = calls, .values = moments };
             fold.weight = try prior.multiply(fold.retained, moments.count);
             defer {
                 fold.weight = prior;
@@ -6641,6 +6783,9 @@ const Engine = struct {
         return self.eval(expression, row, null);
     }
     fn eval(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) anyerror!v.Value {
+        // Validate only reached affine stages. Hoisting this check to the bag
+        // producer would incorrectly evaluate errors behind an earlier filter.
+        try self.validateMomentNode(expression);
         const memoizable = self.read_only and self.projection_overrides == null and self.aggregate_overrides == null and (expression.value == .pattern_comprehension or expression.value == .exists or (expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "size") and expression.value.call.args.len == 1 and expression.value.call.args[0].value == .pattern_comprehension)) and weightedExpression(expression);
         var key: Row = &.{};
         if (memoizable) {

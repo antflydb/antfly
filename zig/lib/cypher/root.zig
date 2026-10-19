@@ -22,6 +22,7 @@ pub const value = @import("value.zig");
 pub const catalog = @import("catalog.zig");
 pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
+pub const integer_affine = @import("integer_affine.zig");
 pub const multiplicity = @import("multiplicity.zig");
 pub const runtime = @import("runtime.zig");
 pub const request = @import("request.zig");
@@ -34,6 +35,7 @@ pub const regex = @import("regex.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const mutations = @import("mutations.zig");
 test {
+    _ = integer_affine;
     _ = @import("compiler_test.zig");
     _ = @import("catalog_test.zig");
     _ = @import("runtime_test.zig");

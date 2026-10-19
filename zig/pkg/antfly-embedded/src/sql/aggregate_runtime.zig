@@ -348,6 +348,14 @@ fn multiplicity(bound: *const binding.Bound) catalog.Multiplicity {
 
 fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: catalog.Table, conditions: []const catalog.Condition) ![]const catalog.AggregateWeight {
     const requests = try a.alloc(catalog.AggregateWeight, bound.specs.len);
+    var stable: std.StringHashMapUnmanaged(void) = .empty;
+    for (conditions) |condition| try stable.put(a, condition.column, {});
+    for (bound.input.projections[0..bound.group_count]) |optional| if (optional) |program| for (program.required_columns) |ordinal| {
+        try stable.put(a, (try table.column(bound.input.columns[ordinal].name)).path, {});
+    };
+    if (bound.input.predicate) |program| for (program.required_columns) |ordinal| {
+        try stable.put(a, (try table.column(bound.input.columns[ordinal].name)).path, {});
+    };
     for (bound.specs, bound.inputs, bound.filters, requests) |spec, input, filter, *request| {
         var fields: std.StringHashMapUnmanaged(void) = .empty;
         for (conditions) |condition| try fields.put(a, condition.column, {});
@@ -363,17 +371,26 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
         var keys = fields.keyIterator();
         while (keys.next()) |key| try names.append(a, key.*);
         const presence = spec.distinct or spec.kind == .min or spec.kind == .max or spec.kind == .bool_and or spec.kind == .bool_or;
+        var invariant = try stable.clone(a);
+        if (filter) |slot| if (bound.input.projections[slot]) |program| for (program.required_columns) |ordinal| {
+            try invariant.put(a, (try table.column(bound.input.columns[ordinal].name)).path, {});
+        };
         var summary: ?[]const u8 = null;
-        if (!spec.distinct and filter == null and bound.input.predicate == null and conditions.len == 0 and
+        if (!spec.distinct and
             (spec.kind == .count or spec.kind == .sum or spec.kind == .avg or spec.kind == .min or spec.kind == .max))
         {
             if (input) |slot| if (bound.input.projections[slot]) |program| {
-                const root = program.instructions[program.root];
-                if (!root.input_function and root.operation == .column and program.output_type.kind == .integer)
-                    summary = (try table.column(bound.input.columns[root.operation.column].name)).path;
+                if (program.affineColumn()) |column|
+                    summary = (try table.column(bound.input.columns[column].name)).path;
             };
         }
-        request.* = .{ .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary };
+        var invariants: std.ArrayList([]const u8) = .empty;
+        var stable_keys = invariant.keyIterator();
+        while (stable_keys.next()) |key| {
+            try invariants.append(a, key.*);
+            if (!fields.contains(key.*)) try names.append(a, key.*);
+        }
+        request.* = .{ .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary, .invariants = invariants.items };
     }
     return requests;
 }
@@ -426,7 +443,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             aggregate_loaded = true;
         };
         const can_weight = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound);
-        const partitioned = can_weight and bound.group_count == 0 and bound.specs.len > 0 and
+        const partitioned = can_weight and bound.specs.len > 0 and
             try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, try aggregateRequests(context.arena, bound, table, predicates.terms.items));
         const weighted = partitioned or (can_weight and try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound)));
         const parallel = !weighted and bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });

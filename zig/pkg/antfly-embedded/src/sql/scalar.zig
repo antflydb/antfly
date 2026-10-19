@@ -285,6 +285,43 @@ pub const Program = struct {
     constant_pool: ?*ConstantPool = null,
     constant_inputs: std.AutoHashMapUnmanaged(u32, Datum) = .empty,
 
+    /// Only integer affine instruction trees may consume synthetic marginal
+    /// bins. Every intermediate remains affine, so the original evaluator at
+    /// the emitted extrema preserves checked arithmetic failures as well.
+    pub fn affineColumn(self: Program) ?u32 {
+        if (self.output_type.kind != .integer) return null;
+        const form = self.affineInstruction(self.root, 0) orelse return null;
+        return if (form.field) |field| @intCast(field) else null;
+    }
+    fn affineInstruction(self: Program, index: u32, depth: usize) ?@import("cypher").integer_affine.Form {
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const form = @import("cypher").integer_affine.Form;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or instruction.type.kind != .integer) return null;
+        return switch (instruction.operation) {
+            .column => |column| form.column(column),
+            .literal => |value| if (value == .integer) form.literal(value.integer) else null,
+            .unary => |u| blk: {
+                const operand = self.affineInstruction(u.operand, depth + 1) orelse return null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => operand.negative(),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const left = self.affineInstruction(b.left, depth + 1) orelse return null;
+                const right = self.affineInstruction(b.right, depth + 1) orelse return null;
+                break :blk switch (b.op) {
+                    .add => form.combine(left, right, .add),
+                    .subtract => form.combine(left, right, .subtract),
+                    .multiply => form.combine(left, right, .multiply),
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    }
     /// Re-evaluating this program for the same input row has the same value
     /// and no observable effects within one statement. CASE/Boolean laziness
     /// stays in the ordinary evaluator; compression only changes multiplicity.

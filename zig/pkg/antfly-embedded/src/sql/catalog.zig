@@ -577,10 +577,12 @@ pub const ColumnPage = struct {
 
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
-/// A summary field is read only by a direct, non-DISTINCT COUNT/SUM/AVG/MIN/MAX.
+/// A summary field is read only by an integer affine, non-DISTINCT COUNT/SUM/AVG/MIN/MAX.
+/// Invariants name dependencies of grouping, filtering and other observations;
+/// their values must be constant within each compressed bag.
 /// Adapters must clear it whenever a filter, expression or barrier observes its
 /// distribution. Exact integer representative bags may preserve its statistics.
-pub const AggregateWeight = struct { fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null };
+pub const AggregateWeight = struct { fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null, invariants: []const []const u8 = &.{} };
 /// Borrowed snapshot-local costing evidence. Providers never perform I/O for
 /// optimizer statistics; absent fields remain unknown. Frequencies and hashes
 /// describe semantic equality keys, and are advisory rather than pruning proof.

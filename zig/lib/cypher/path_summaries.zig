@@ -36,6 +36,7 @@ const Lower = struct {
     changed: bool = false,
     used: std.StringHashMapUnmanaged(void) = .empty,
     carries: std.ArrayList(Carry) = .empty,
+    unwinds: std.ArrayList(struct { clause: *ast.Clause, tail: []const ast.Clause }) = .empty,
     scopes: std.ArrayList(struct { clauses: []const ast.Clause, caller: ?[]const ast.Clause = null }) = .empty,
     fn privateName(self: *@This()) ![]const u8 {
         while (true) {
@@ -275,8 +276,20 @@ const Lower = struct {
                 if (matching.predicate) |predicate| matching.predicate = try self.expression(predicate, scope.items);
             },
             .unwind => |*u| {
+                // Fixed repetitions of one path/list alias preserve its
+                // lineage. The post-liveness pass can then remove full values
+                // when only their private scalar summaries escape.
+                var source: ?*Source = null;
+                if (u.expression.value == .list and u.expression.value.list.len != 0) {
+                    source = reference(scope.items, u.expression.value.list[0]);
+                    for (u.expression.value.list) |item| if (reference(scope.items, item) != source) {
+                        source = null;
+                        break;
+                    };
+                }
                 u.expression = try self.expression(u.expression, scope.items);
-                try self.bind(&scope, u.alias, null);
+                try self.bind(&scope, u.alias, source);
+                if (source != null) try self.unwinds.append(self.a, .{ .clause = clause, .tail = out[clause_index + 1 ..] });
             },
             .subquery => |inner| {
                 const child = try self.clauses(inner, scope.items, false);
@@ -427,6 +440,17 @@ pub fn lower(a: A, query: ast.Query) !ast.Query {
                 projection.items = items.items;
             }
         }
+    }
+    for (plan.unwinds.items) |entry| {
+        const u = &entry.clause.operation.unwind;
+        if (references(entry.tail, u.alias)) continue;
+        const items = try a.alloc(*const ast.Expr, u.expression.value.list.len);
+        const one = try a.create(ast.Expr);
+        one.* = .{ .span = u.expression.span, .value = .{ .literal = .{ .integer = 1 } } };
+        @memset(items, one);
+        const list = try a.create(ast.Expr);
+        list.* = .{ .span = u.expression.span, .value = .{ .list = items } };
+        u.expression = list;
     }
     return result;
 }
