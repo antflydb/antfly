@@ -1859,7 +1859,15 @@ fn readerGatherScenario(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(i64, 3), (try outputs[0].?.cell(alloc, 1, 0)).value.integer);
     var bad = page;
     bad.selection = &.{1};
-    try std.testing.expectError(error.SqlNumericOutOfRange, evaluateColumnsEncodedMany(alloc, &.{&program}, bad, &definitions, &.{}, null));
+    if (evaluateColumnsEncodedMany(alloc, &.{&program}, bad, &definitions, &.{}, null)) |unexpected| {
+        freeEncodedMany(alloc, unexpected);
+        return error.TestExpectedError;
+    } else |err| {
+        // Fault injection can exhaust setup before arithmetic is reached.
+        // Propagate it so the harness still enumerates every allocation.
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(@as(anyerror, error.SqlNumericOutOfRange), err);
+    }
 }
 test "SQL physical readers gather selected dictionary lanes without scalar reads" {
     try readerGatherScenario(std.testing.allocator);
