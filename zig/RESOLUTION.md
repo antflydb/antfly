@@ -1692,9 +1692,13 @@ returns HTTP 202 with the accepted commit receipt, `applied:false`, and
 Resolver GET
 reports per-group revision, freshness, durable backfill and resolution/promotion
 watermarks. An idle watermark alone does not prove the new revision is applied.
-If cached/heartbeat status omits resolver diagnostics or lags an accepted revision,
+If cached/heartbeat status omits resolver diagnostics, lags an accepted revision,
+or has not reached an accepted review journal sequence,
 status obtains compact observations from the current mutation owners, with at
-most 16 concurrent shard requests. Polling never drains replay on a request
+most 16 concurrent shard requests. Probe selection and completion share the
+same revision and resolution/promotion sequence requirements, so an idle
+heartbeat below the accepted sequence cannot suppress a current-owner probe.
+Polling never drains replay on a request
 worker. A shard with no runtime completes only with a durable proof of no
 primary records and no derived replay sequence; absent observations alone never
 prove completion. Native `pending_work_stats` includes these per-resolver revisions under

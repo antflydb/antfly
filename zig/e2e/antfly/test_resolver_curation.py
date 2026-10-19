@@ -363,6 +363,11 @@ def test_entity_merge_adopts_matching_local_policy(request, monkeypatch, raft, p
             {"text": "A", "label": "concept"},
         )
         assert rendered["key"] == "concept/b", rendered
+    resolved = api.post(
+        f"/tables/{second}/resolvers/concepts:resolve",
+        {"extraction": {"entities": []}},
+    )
+    assert resolved["resolution"]["entities"] == [], resolved
     # Once authority is published, retries do not create another revision.
     retried = api.post(entity, {"into": "concept/b", "wait": wait})
     assert not retried["changed"] and retried["applied"], retried

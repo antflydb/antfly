@@ -137,25 +137,52 @@ const ObservationTarget = struct {
     }
 };
 pub const Progress = struct { applied: bool, shards: []const GroupProgress, observation_error: []const u8 = "" };
+const ReplayRequirement = struct {
+    target: ObservationTarget,
+    revision: u64,
+    floor: ?ReplayFloor,
+    fn applied(self: ReplayRequirement, row: GroupProgress) bool {
+        if (!row.available or !row.fresh or row.curation_revision < self.revision or
+            row.config_generation < self.target.config_generation or row.backfill_pending or
+            !curation.stageApplied(row.resolution, row.empty) or
+            (self.target.promote and !curation.stageApplied(row.promotion, row.empty))) return false;
+        if (self.floor) |floor| if (row.group_id == floor.group) {
+            return row.resolution.applied_sequence >= floor.sequence and
+                (!self.target.promote or row.promotion.applied_sequence >= floor.sequence);
+        };
+        return true;
+    }
+};
 const Sample = struct {
     groups: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
     observations: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(u64, GroupProgress)) = .empty,
 
     fn progress(self: Sample, a: std.mem.Allocator, cfg: ObservationTarget, revision: u64) !Progress {
+        return self.progressForReplay(a, .{ .target = cfg, .revision = revision, .floor = null });
+    }
+    fn progressForReplay(self: Sample, a: std.mem.Allocator, required: ReplayRequirement) !Progress {
         const rows = try a.alloc(GroupProgress, self.groups.count());
         var applied = rows.len > 0;
+        var floor_observed = required.floor == null;
         for (self.groups.keys(), rows) |id, *row| {
-            row.* = if (self.observations.get(cfg.name)) |by_group| by_group.get(id) orelse .{ .group_id = id } else .{ .group_id = id };
-            applied = applied and row.available and row.fresh and row.curation_revision >= revision and
-                row.config_generation >= cfg.config_generation and !row.backfill_pending and
-                curation.stageApplied(row.resolution, row.empty) and
-                (!cfg.promote or curation.stageApplied(row.promotion, row.empty));
+            row.* = if (self.observations.get(required.target.name)) |by_group| by_group.get(id) orelse .{ .group_id = id } else .{ .group_id = id };
+            applied = applied and required.applied(row.*);
+            if (required.floor) |floor| if (id == floor.group) {
+                floor_observed = true;
+            };
         }
-        return .{ .applied = applied, .shards = rows };
+        return .{ .applied = applied and floor_observed, .shards = rows };
+    }
+    fn needsReplayProbe(self: Sample, group: u64, required: ReplayRequirement) bool {
+        const by_group = self.observations.get(required.target.name) orelse return true;
+        return !required.applied(by_group.get(group) orelse return true);
     }
 };
 
 fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool) !Sample {
+    return sampleForReplay(server, a, snapshot, table, request, probe_owners, null);
+}
+fn sampleForReplay(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool, required: ?ReplayRequirement) !Sample {
     var result: Sample = .{};
     for (snapshot.ranges) |range| if (range.table_id == table.table_id) try result.groups.put(a, range.group_id, {});
     var statuses = try server.localTableRuntimeStatusesWithSnapshot(table.name, snapshot);
@@ -214,7 +241,8 @@ fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anyty
                 row.resolution.applied_sequence < row.resolution.target_sequence or
                 (cfg.promote and (!row.promotion.enabled or row.promotion.blocked or row.promotion.catch_up_required or row.promotion.applied_sequence < row.promotion.target_sequence))) break true;
         } else false;
-        if (needs_probe) try probes.append(a, .{ .group = group });
+        const behind_requested = if (required) |target| result.needsReplayProbe(group, target) else false;
+        if (needs_probe or behind_requested) try probes.append(a, .{ .group = group });
     }
     var offset: usize = 0;
     while (offset < probes.items.len) {
@@ -778,22 +806,14 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
             if (!scoped) server.source.freeAdminSnapshot(&snapshot);
             return err;
         };
-        const observation = sample(server, scratch, &snapshot, table, observation_request, wait != null) catch |err| {
+        const observation = sampleForReplay(server, scratch, &snapshot, table, observation_request, wait != null, .{ .target = cfg, .revision = revision, .floor = floor }) catch |err| {
             if (!scoped) server.source.freeAdminSnapshot(&snapshot);
             try request.ensureActive();
             if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
             return err;
         };
         if (!scoped) server.source.freeAdminSnapshot(&snapshot);
-        var progress = try observation.progress(scratch, cfg, revision);
-        if (floor) |target| {
-            var observed = false;
-            for (progress.shards) |row| if (row.group_id == target.group) {
-                observed = row.resolution.applied_sequence >= target.sequence and (!cfg.promote or row.promotion.applied_sequence >= target.sequence);
-                break;
-            };
-            progress.applied = progress.applied and observed;
-        }
+        const progress = try observation.progressForReplay(scratch, .{ .target = cfg, .revision = revision, .floor = floor });
         const borrow = request.fanout_io orelse request.deadline_io;
         if (progress.applied or clock.monotonicNs() >= deadline or borrow == null) {
             const rows = try a.dupe(GroupProgress, progress.shards);
@@ -996,20 +1016,23 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
     defer if (embedding) |*value| value.deinit();
     if (cfg.name_embedding.len > 0) {
         const physical = if (candidates.catalog_binding) |binding| try binding.bindOne(a, cfg.table) else cfg.table;
-        var destinations = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
-        defer server.source.freeAdminSnapshot(&destinations);
-        const destination = try tableByName(&destinations, physical);
-        embedding = try managed.ManagedEmbedder.initFromIndexesJsonWithOptions(a, destination.indexes_json, options);
+        embedding = try managed.ManagedEmbedder.initFromIndexesJsonWithOptions(a, try readResolverIndexes(server, a, physical, request), options);
     }
     var active: std.ArrayListUnmanaged(Config) = .empty;
     for (all) |item| if (!item.retired) try active.append(a, item);
     const result = try local.storage_db_resolution_runtime.resolveQueryExtractionAlloc(a, active.items, &cfg, extraction, candidates.candidateSource(), if (embedding) |*value| value.denseInterface() else null);
     try request.ensureActive();
-    var latest = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
-    defer server.source.freeAdminSnapshot(&latest);
-    const current = try tableByName(&latest, table.name);
-    if (!std.mem.eql(u8, current.indexes_json, table.indexes_json)) return error.Busy;
+    if (!std.mem.eql(u8, try readResolverIndexes(server, a, table.name, request), table.indexes_json)) return error.Busy;
     return response(alloc, 200, .{ .extraction = try std.json.parseFromSliceLeaky(std.json.Value, a, extraction, .{}), .resolution = try std.json.parseFromSliceLeaky(std.json.Value, a, result, .{}) });
+}
+
+/// Query-time embedding configuration and final source validation share the
+/// scoped definition path, including nested reads after candidate execution.
+fn readResolverIndexes(server: anytype, a: std.mem.Allocator, name: []const u8, request: operation.RequestContext) ![]const u8 {
+    if (server.source.vtable.supports_resolver_catalog_read) return (try readResolverCatalog(server, a, .{ .table_name = name }, request)).table.indexes_json;
+    var snapshot = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
+    defer server.source.freeAdminSnapshot(&snapshot);
+    return a.dupe(u8, (try tableByName(&snapshot, name)).indexes_json);
 }
 
 fn response(a: std.mem.Allocator, status: u16, value: anytype) !@import("public_table_http.zig").OwnedResponse {
@@ -1084,4 +1107,58 @@ test "resolver curation progress completes a proven empty owner without invented
     row.resolution.target_sequence = 1;
     try mergeOwnerProgress(a, &observation, 1, .{ .resolvers = &.{row} });
     try std.testing.expect(!(try observation.progress(a, ObservationTarget.fromConfig(cfg), 4)).applied);
+}
+
+test "resolver curation progress probes an idle heartbeat below an accepted journal target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Server = struct {
+        alloc: std.mem.Allocator,
+        probes: usize = 0,
+        local_resolution: u64 = 4,
+        pub fn localTableRuntimeStatusesWithSnapshot(self: *@This(), _: []const u8, _: anytype) !?runtime_status.LocalTableRuntimeStatuses {
+            var row: runtime_status.LocalTableRuntimeStatus = .{ .group_id = 7, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{} };
+            row.stats.resolution = .{ .enabled = true, .target_sequence = self.local_resolution, .applied_sequence = self.local_resolution };
+            row.stats.promotion = .{ .enabled = true, .target_sequence = 4, .applied_sequence = 4 };
+            row.stats.resolver_replay.resolvers = &.{.{ .name = "concepts", .config_generation = 1 }};
+            var rows = [_]runtime_status.LocalTableRuntimeStatus{row};
+            const observed: runtime_status.LocalTableRuntimeStatuses = .{ .items = &rows };
+            return try observed.clone(self.alloc);
+        }
+        pub fn executeResolverOperation(self: *@This(), allocator: std.mem.Allocator, _: []const u8, group: u64, _: []const u8, _: operation.RequestContext) ![]u8 {
+            try std.testing.expectEqual(@as(u64, 7), group);
+            self.probes += 1;
+            return std.json.Stringify.valueAlloc(allocator, curation.ProgressReport{ .resolvers = &.{.{
+                .name = "concepts",
+                .config_generation = 1,
+                .effective_generation = 1,
+                .curation_revision = 0,
+                .backfill_pending = false,
+                .resolution = .{ .enabled = true, .target_sequence = 5, .applied_sequence = 5 },
+                .promotion = .{ .enabled = true, .target_sequence = 5, .applied_sequence = 5 },
+            }} }, .{});
+        }
+    };
+    var server: Server = .{ .alloc = std.testing.allocator };
+    const Range = struct { table_id: u64, group_id: u64 };
+    const snapshot = .{ .ranges = &[_]Range{.{ .table_id = 1, .group_id = 7 }} };
+    const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 1, .name = "source", .indexes_json =
+        \\{"knowledge":{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","config_generation":1,"promote":true}]}}
+    };
+    const target: ObservationTarget = .{ .name = "concepts", .config_generation = 1, .promote = false };
+    const idle = try sample(&server, a, &snapshot, &table, .{}, true);
+    try std.testing.expectEqual(@as(usize, 0), server.probes);
+    try std.testing.expect((try idle.progress(a, target, 0)).applied);
+    const current = try sampleForReplay(&server, a, &snapshot, &table, .{}, true, .{ .target = target, .revision = 0, .floor = .{ .group = 7, .sequence = 5 } });
+    try std.testing.expectEqual(@as(usize, 1), server.probes);
+    try std.testing.expect((try current.progressForReplay(a, .{ .target = target, .revision = 0, .floor = .{ .group = 7, .sequence = 5 } })).applied);
+    try std.testing.expectEqual(@as(u64, 5), current.observations.get("concepts").?.get(7).?.resolution.applied_sequence);
+    // Promotion must independently satisfy the journal floor, even when
+    // resolution has caught up and both cached stages look idle.
+    server.local_resolution = 5;
+    var promoted = target;
+    promoted.promote = true;
+    _ = try sampleForReplay(&server, a, &snapshot, &table, .{}, true, .{ .target = promoted, .revision = 0, .floor = .{ .group = 7, .sequence = 5 } });
+    try std.testing.expectEqual(@as(usize, 2), server.probes);
 }
