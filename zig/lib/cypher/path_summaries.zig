@@ -81,6 +81,10 @@ const Lower = struct {
         for (scope) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.source;
         return null;
     }
+    fn contains(scope: []const Binding, name: []const u8) bool {
+        for (scope) |entry| if (std.mem.eql(u8, entry.name, name)) return true;
+        return false;
+    }
     fn reference(scope: []const Binding, expr: *const ast.Expr) ?*Source {
         return if (expr.value == .variable) find(scope, expr.value.variable) else null;
     }
@@ -238,11 +242,13 @@ const Lower = struct {
                     const edges = try self.a.dupe(ast.Edge, path.edges);
                     path.edges = edges;
                     for (edges) |*edge| if (edge.alias) |alias| {
+                        if (contains(scope.items, alias)) continue;
                         const ref = if (edge.variable_length) try self.a.create(Source) else null;
                         if (ref) |source| source.* = .{ .edge = edge };
                         try self.bind(&scope, alias, ref);
                     };
                     if (path.alias) |alias| {
+                        if (contains(scope.items, alias)) continue;
                         const ref = try self.a.create(Source);
                         ref.* = .{ .path = path, .optional = matching.optional };
                         try self.bind(&scope, alias, ref);

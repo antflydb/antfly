@@ -2674,6 +2674,7 @@ test "path summaries preserve zero hop null scope and observable identities" {
     try check("OPTIONAL MATCH p=(a:Document {id:'absent'})-[:CITES]->(b) RETURN count(p),count(*)", "[[0,1]]");
     try check("OPTIONAL MATCH p=(a:Document {id:'absent'})-[:CITES]->(b) RETURN length(p),head(nodes(p)),last(nodes(p)),size(nodes(p))", "[[null,null,null,null]]");
     try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN count(DISTINCT p),sum(length(p))", "[[2,2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) OPTIONAL MATCH p=(a)-[:CITES*2..2]->(b) RETURN count(p)", "[[2]]");
     try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN [p IN [null] | length(p)],length(p)", "[[[null],1],[[null],1]]");
     try check("CALL { MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN p AS q } RETURN length(q)", "[[1],[1]]");
     try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) WITH p AS q RETURN length(q)", "[[1],[1]]");
