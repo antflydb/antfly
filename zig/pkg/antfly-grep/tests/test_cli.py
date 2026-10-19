@@ -6506,6 +6506,78 @@ class CliTests(unittest.TestCase):
                 "WorkspaceInvalidated",
             )
 
+    @unittest.skipUnless(os.name == "posix", "POSIX descriptor quotas")
+    def test_workspace_parallel_capture_respects_descriptor_headroom(self):
+        for i in range(100):
+            self.write(f"src/f{i}.txt", "STOP original\n")
+        close = b'{"version":1,"id":1,"op":"close"}\n'
+        serial = self.raw_cli("workspace", "serve", "--threads=1", "src", input=close)
+
+        # Exec from a fresh interpreter: preexec_fn is unsafe while the
+        # fixture's HTTP server thread is running in the parent.
+        parallel = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os, resource, sys; resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64)); os.execv(sys.argv[1], sys.argv[1:])",
+                BINARY,
+                "workspace",
+                "serve",
+                "--threads=8",
+                "src",
+            ],
+            cwd=self.root,
+            env=self.env,
+            input=close,
+            capture_output=True,
+            timeout=15,
+        )
+        self.assertEqual(parallel.returncode, 0, parallel.stderr)
+        ready = json.loads(parallel.stdout.splitlines()[0])
+        self.assertEqual(ready["files"], 100)
+        self.assertEqual(
+            ready["revision"], json.loads(serial.stdout.splitlines()[0])["revision"]
+        )
+        self.assertEqual(ready["capture_workers"], 8)
+        self.assertEqual(ready["parallel_sources_read"], 100)
+
+    def test_workspace_loads_preparations_across_restarts_and_respects_no_cache(self):
+        self.write("src/a.py", "def retry():\n    STOP()\n")
+        args = [
+            *self.decision_args(),
+            "--json",
+            "--no-refine",
+            "--no-rank",
+            "--threads=1",
+        ]
+        self.raw_cli(*args, "src/a.py")
+        calls = len(self.server.requests)
+        for _ in range(2):
+            with self.workspace("src") as (ready, request):
+                rows = request(
+                    "search",
+                    revision=ready["revision"],
+                    args=[*args, "--cached-only", "--max-requests=0"],
+                )
+                self.assertEqual(rows[-1]["exit_code"], 0)
+                summary = next(row for row in rows if row["type"] == "summary")
+                self.assertEqual(summary["stats"]["source_parses"], 0)
+                self.assertEqual(summary["stats"]["source_cache_hits"], 1)
+                self.assertEqual(len(self.server.requests), calls)
+        with self.workspace("--no-cache", "src") as (ready, request):
+            rows = request("search", revision=ready["revision"], args=args)
+            self.assertEqual(rows[-1]["exit_code"], 0)
+            summary = next(row for row in rows if row["type"] == "summary")
+            self.assertEqual(summary["stats"]["source_parses"], 1)
+            self.assertEqual(summary["stats"]["source_cache_hits"], 0)
+        self.write("src/a.py", "def another():\n    STOP()\n")
+        with self.workspace("src") as (ready, request):
+            rows = request("search", revision=ready["revision"], args=args)
+            self.assertEqual(rows[-1]["exit_code"], 0)
+            summary = next(row for row in rows if row["type"] == "summary")
+            self.assertEqual(summary["stats"]["source_parses"], 1)
+            self.assertEqual(summary["stats"]["source_cache_hits"], 0)
+
     def test_workspace_reuses_preparations_and_rejects_live_input_options(self):
         self.write("src/a.py", "def retry():\n    STOP()\n")
         with self.workspace("src") as (ready, request):

@@ -36,8 +36,10 @@ pub const Entry = struct {
     touched: u64 = 0,
     directory_next: usize = std.math.maxInt(usize),
     directory_prev: usize = std.math.maxInt(usize),
-    prepared: ?source.Prepared = null,
     preparation: ?*PreparedOwner = null,
+    pub fn prepared(self: Entry) ?source.Prepared {
+        return if (self.preparation) |owner| owner.value else null;
+    }
     fn retain(self: Entry) void {
         self.blob.refs += 1;
         if (self.preparation) |owner| owner.refs += 1;
@@ -47,7 +49,7 @@ pub const Entry = struct {
         if (self.preparation) |owner| owner.release();
     }
     fn charge(self: Entry) usize {
-        return self.blob.budget.live + @sizeOf(Blob) + (if (self.preparation) |owner| owner.bytes() else @as(usize, 0));
+        return self.blob.charge() + (if (self.preparation) |owner| owner.bytes() else @as(usize, 0));
     }
 };
 pub const Generation = struct {
@@ -61,6 +63,8 @@ pub const Generation = struct {
     source_bytes: usize = 0,
     watch_fallback: bool = false,
     source_bytes_read: usize = 0,
+    capture_workers: usize = 0,
+    parallel_sources_read: usize = 0,
     sources_opened: usize = 0,
     discovery_reused: bool = false,
     source_bytes_reused: usize = 0,
@@ -101,6 +105,10 @@ pub const Generation = struct {
             j.directory_checks = 0;
         }
         const next = try captureJournalInner(a, io, o, previous, watcher, journal);
+        if (previous != null) {
+            next.capture_workers = 0;
+            next.parallel_sources_read = 0;
+        }
         if (journal) |j| {
             next.namespace_paths_checked = j.path_checks;
             next.namespace_directories_scanned = j.directory_checks;
@@ -183,11 +191,15 @@ pub const Generation = struct {
         self.arena = .init(self.budget.allocator());
         errdefer self.deinit();
         var collector = Collector{ .generation = self, .io = io, .options = o, .previous = previous, .watcher = watcher, .journal = journal, .trusted_membership = trusted };
+        var queue: CaptureQueue = .{ .collector = &collector, .pool = .{ .io = io }, .workers = @min(8, if (o.jobs_auto) @min(4, o.jobs) else o.jobs), .capacity = CaptureQueue.descriptorCapacity() };
+        defer queue.deinit();
+        if (previous == null and queue.workers > 1) collector.queue = &queue;
         self.discovery_reused = trusted;
         if (watcher) |w| w.poll();
         if (trusted) {
             for (previous.?.entries.items) |entry| try collector.addFile(entry.path, entry.path, entry.explicit_file);
         } else if (o.paths.items.len == 0) try collector.path(".") else for (o.paths.items) |path| try collector.path(path);
+        try queue.flush();
         if (watcher) |w| {
             w.poll();
             for (self.entries.items) |entry| if (entry.witness_reused and
@@ -414,7 +426,7 @@ pub const Generation = struct {
             old.entries.items[i] = next;
             old.entries.items[i].path = prior.path;
             next.retain();
-            old.preparation_count = old.preparation_count - @intFromBool(prior.prepared != null) + @intFromBool(next.prepared != null);
+            old.preparation_count = old.preparation_count - @intFromBool(prior.preparation != null) + @intFromBool(next.preparation != null);
             prior.release();
             if (next.blob.token) |token| old.linkWatch(i, token.slot);
             old.linkDirectory(i);
@@ -599,7 +611,7 @@ pub const Generation = struct {
             try appendChange(old.budget.allocator(), &changes, path);
             retained -= entry.charge();
             bytes -= entry.bytes.len;
-            preparations -= @intFromBool(entry.prepared != null);
+            preparations -= @intFromBool(entry.preparation != null);
             count -= 1;
             if (slot != count) {
                 const last = moved.get(count) orelse old.entries.items[count];
@@ -625,7 +637,7 @@ pub const Generation = struct {
                 }
                 retained -= prior.charge();
                 bytes -= prior.bytes.len;
-                preparations -= @intFromBool(prior.prepared != null);
+                preparations -= @intFromBool(prior.preparation != null);
                 if (!std.mem.eql(u8, &prior.revision, &entry.revision) or prior.explicit_file != entry.explicit_file) try appendChange(old.budget.allocator(), &changes, entry.path);
             } else {
                 if (count >= o.workspace_max_files) return null;
@@ -634,7 +646,7 @@ pub const Generation = struct {
             }
             retained += entry.charge();
             bytes += entry.bytes.len;
-            preparations += @intFromBool(entry.prepared != null);
+            preparations += @intFromBool(entry.preparation != null);
             const next = try inventory.put(old.budget.allocator(), tree, entry.path, slot, leafHash(entry));
             inventory.release(old.budget.allocator(), tree);
             tree = next;
@@ -739,35 +751,40 @@ pub const Generation = struct {
     /// Workers prepare different entries concurrently; metadata admission alone
     /// takes the generation mutex. Failure is an ordinary uncached-query fallback.
     pub fn prepareEntry(generation: *const Generation, io: std.Io, entry: *const Entry) bool {
+        var state: source.State = .{};
+        return generation.prepareEntryCached(io, entry, &.{ .no_cache = true }, null, &state) != .none;
+    }
+    pub const Preparation = enum { none, parsed, cached };
+    pub fn prepareEntryCached(generation: *const Generation, io: std.Io, entry: *const Entry, options: *const Options, scope: ?[32]u8, state: *source.State) Preparation {
         const self = @constCast(generation);
-        if (entry.prepared != null or !std.unicode.utf8ValidateSlice(entry.bytes) or std.mem.indexOfScalar(u8, entry.bytes, 0) != null or @import("antfly_encoding").hasBom(entry.bytes)) return false;
+        if (options.crlf or options.null_data or entry.preparation != null or !std.unicode.utf8ValidateSlice(entry.bytes) or std.mem.indexOfScalar(u8, entry.bytes, 0) != null or @import("antfly_encoding").hasBom(entry.bytes)) return .none;
         self.preparation_mutex.lockUncancelable(io);
         const available = self.budget.limit -| self.budget.live;
         const desired = @max(2 * 1024 * 1024, @min(32 * 1024 * 1024, std.math.mul(usize, entry.bytes.len, 16) catch std.math.maxInt(usize)));
         const reservation = @min(available, desired);
         if (reservation <= @sizeOf(PreparedOwner)) {
             self.preparation_mutex.unlock(io);
-            return false;
+            return .none;
         }
         self.budget.limit -= reservation;
         self.preparation_mutex.unlock(io);
-        const owner = PreparedOwner.create(self.backing, reservation, entry.path, entry.bytes) catch {
+        var hit = false;
+        const owner = PreparedOwner.create(self.backing, reservation, io, entry.path, entry.bytes, options, scope, state, &hit) catch {
             self.preparation_mutex.lockUncancelable(io);
             self.budget.limit += reservation;
             self.preparation_mutex.unlock(io);
-            return false;
+            return .none;
         };
         self.preparation_mutex.lockUncancelable(io);
         defer self.preparation_mutex.unlock(io);
         const size = owner.bytes();
         const mutable = @constCast(entry);
         mutable.preparation = owner;
-        mutable.prepared = owner.value;
         self.budget.limit += reservation - size;
         self.blob_bytes += size;
         self.preparation_count += 1;
         self.preparations_built += 1;
-        return true;
+        return if (hit) .cached else .parsed;
     }
     /// Shared blobs count in full against every generation that retains them.
     pub fn retainedBytes(self: *const Generation) usize {
@@ -819,22 +836,39 @@ pub const Generation = struct {
 };
 /// Independent allocations never borrow a generation allocator. Refresh can
 /// release the old generation immediately, including after arbitrarily many reuses.
+const Stamp = struct {
+    inode: @FieldType(std.Io.File.Stat, "inode"),
+    size: u64,
+    mtime: @FieldType(std.Io.File.Stat, "mtime"),
+    ctime: @FieldType(std.Io.File.Stat, "ctime"),
+    nlink: @FieldType(std.Io.File.Stat, "nlink"),
+    kind: @FieldType(std.Io.File.Stat, "kind"),
+    fn from(value: std.Io.File.Stat) Stamp {
+        return .{ .inode = value.inode, .size = value.size, .mtime = value.mtime, .ctime = value.ctime, .nlink = value.nlink, .kind = value.kind };
+    }
+};
 const Blob = struct {
     backing: A,
     refs: usize = 1, // capture/publication run serially after query workers join
-    budget: Budget,
-    arena: std.heap.ArenaAllocator,
-    bytes: []const u8 = "",
-    stamp: ?std.Io.File.Stat = null,
+    bytes: []u8,
+    stamp: ?Stamp = null,
     watcher: ?*Watch = null,
     token: ?Token = null,
+    fn create(a: A, size: usize) !*Blob {
+        const storage = try a.alignedAlloc(u8, .of(Blob), try std.math.add(usize, @sizeOf(Blob), size));
+        const self: *Blob = @ptrCast(storage.ptr);
+        self.* = .{ .backing = a, .bytes = storage[@sizeOf(Blob)..] };
+        return self;
+    }
+    fn charge(self: *const Blob) usize {
+        return @sizeOf(Blob) + self.bytes.len;
+    }
     fn release(self: *Blob) void {
         self.refs -= 1;
         if (self.refs != 0) return;
-        const a = self.backing;
         if (self.watcher) |watcher| if (self.token) |token| watcher.release(token);
-        self.arena.deinit();
-        a.destroy(self);
+        const storage: [*]align(@alignOf(Blob)) u8 = @ptrCast(self);
+        self.backing.free(storage[0..self.charge()]);
     }
 };
 const PreparedOwner = struct {
@@ -843,7 +877,7 @@ const PreparedOwner = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
     value: source.Prepared,
-    fn create(a: A, maximum: usize, path: []const u8, bytes_value: []const u8) !*PreparedOwner {
+    fn create(a: A, maximum: usize, io: std.Io, path: []const u8, bytes_value: []const u8, options: *const Options, scope: ?[32]u8, state: *source.State, hit: *bool) !*PreparedOwner {
         const self = try a.create(PreparedOwner);
         errdefer a.destroy(self);
         self.* = .{ .backing = a, .budget = .{ .backing = a, .limit = maximum - @sizeOf(PreparedOwner) }, .arena = undefined, .value = undefined };
@@ -852,7 +886,7 @@ const PreparedOwner = struct {
         var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        const value: source.Prepared = .{ .lines = try source.lines(temporary, bytes_value, '\n', false), .index = try @import("source.zig").parse(temporary, path, bytes_value) };
+        const value = try source.get(temporary, io, options, path, bytes_value, scope, hit, state);
         self.value = try clonePrepared(self.arena.allocator(), temporary, bytes_value, value);
         return self;
     }
@@ -894,6 +928,117 @@ fn clonePrepared(a: A, temporary: A, bytes: []const u8, value: source.Prepared) 
     }
     return out;
 }
+fn readBlob(io: std.Io, file: std.Io.File, before: anytype, blob: *Blob) ![64]u8 {
+    var buffer: [65536]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    reader.interface.readSliceAll(blob.bytes) catch |err| {
+        return if (err == error.EndOfStream) error.WorkspaceChangedDuringCapture else err;
+    };
+    if (reader.interface.takeByte()) |_| return error.WorkspaceChangedDuringCapture else |err| {
+        if (err != error.EndOfStream) return err;
+    }
+    const after = try file.stat(io);
+    if (!Collector.sameStamp(before, after)) return error.WorkspaceChangedDuringCapture;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(blob.bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+// Cold capture batches own a fixed number of descriptors and at most 8 MiB
+// of source payloads. Allocation, subscriptions and publication stay serial;
+// workers only read, validate and hash disjoint preallocated immutable blobs.
+// Auto mode keeps tiny files serial, where coordination can cost more than I/O.
+const CaptureQueue = struct {
+    const Job = struct {
+        file: std.Io.File,
+        blob: ?*Blob,
+        display: []u8,
+        explicit_file: bool,
+        reserved: usize,
+        revision: [64]u8 = undefined,
+        failure: ?anyerror = null,
+    };
+    const byte_limit = 8 * 1024 * 1024;
+    collector: *Collector,
+    pool: @import("worker_pool.zig").Pool,
+    workers: usize,
+    capacity: usize = 32,
+    jobs: [32]Job = undefined,
+    count: usize = 0,
+    bytes: usize = 0,
+    cursor: std.atomic.Value(usize) = .init(0),
+    fn descriptorCapacity() usize {
+        if (comptime @import("builtin").link_libc and (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .linux)) {
+            var quota: std.c.rlimit = undefined;
+            if (std.c.getrlimit(.NOFILE, &quota) == 0) return @max(1, @min(32, @as(usize, @intCast(quota.cur / 8))));
+        }
+        return 32;
+    }
+    fn push(self: *CaptureQueue, file: std.Io.File, blob: *Blob, display: []const u8, explicit_file: bool) !void {
+        const generation = self.collector.generation;
+        const a = generation.budget.allocator();
+        const name = try a.dupe(u8, display);
+        errdefer a.free(name);
+        const size = blob.charge();
+        if (size > generation.budget.limit -| generation.budget.live) return error.OutOfMemory;
+        generation.budget.limit -= size;
+        self.jobs[self.count] = .{ .file = file, .blob = blob, .display = name, .explicit_file = explicit_file, .reserved = size };
+        self.count += 1;
+        self.bytes += blob.bytes.len;
+    }
+    fn clear(self: *CaptureQueue) void {
+        const generation = self.collector.generation;
+        for (self.jobs[0..self.count]) |job| {
+            job.file.close(self.collector.io);
+            if (job.blob) |blob| blob.release();
+            generation.budget.limit += job.reserved;
+            generation.budget.allocator().free(job.display);
+        }
+        self.count = 0;
+        self.bytes = 0;
+    }
+    fn run(self: *CaptureQueue) void {
+        while (true) {
+            const i = self.cursor.fetchAdd(1, .monotonic);
+            if (i >= self.count) return;
+            const job = &self.jobs[i];
+            job.revision = readBlob(self.collector.io, job.file, job.blob.?.stamp.?, job.blob.?) catch |err| {
+                job.failure = err;
+                continue;
+            };
+        }
+    }
+    fn flush(self: *CaptureQueue) !void {
+        if (self.count == 0) return;
+        defer self.clear();
+        self.cursor.store(0, .monotonic);
+        var handles: [8]@import("worker_pool.zig").Handle = undefined;
+        var launched: usize = 0;
+        if (self.count > 1) for (0..@min(self.workers, self.count) - 1) |_| {
+            handles[launched] = self.pool.launch(run, self) catch break;
+            launched += 1;
+        };
+        self.run();
+        for (handles[0..launched]) |handle| handle.join();
+        for (self.jobs[0..self.count]) |job| if (job.failure) |err| return err;
+        if (launched > 0) {
+            self.collector.generation.capture_workers = @max(self.collector.generation.capture_workers, launched + 1);
+            self.collector.generation.parallel_sources_read += self.count;
+        }
+        for (self.jobs[0..self.count]) |*job| {
+            self.collector.generation.budget.limit += job.reserved;
+            job.reserved = 0;
+            const blob = job.blob.?;
+            job.blob = null;
+            try self.collector.finishRead(blob, job.display, job.explicit_file, job.revision);
+        }
+    }
+    fn deinit(self: *CaptureQueue) void {
+        self.clear();
+        self.pool.deinit();
+    }
+};
+
 const Collector = struct {
     generation: *Generation,
     io: std.Io,
@@ -905,6 +1050,7 @@ const Collector = struct {
     membership_seen: ?*std.AutoHashMapUnmanaged(usize, void) = null,
     membership_visited: usize = 0,
     eligibility: ?*std.ArrayList([]const u8) = null,
+    queue: ?*CaptureQueue = null,
     fn markSeen(self: *Collector, path_name: []const u8) !void {
         if (self.membership_seen) |seen| if (self.previous.?.find(path_name)) |entry| {
             const slot = (@intFromPtr(entry) - @intFromPtr(self.previous.?.entries.items.ptr)) / @sizeOf(Entry);
@@ -941,7 +1087,7 @@ const Collector = struct {
     fn addFile(self: *Collector, path_name: []const u8, display: []const u8, explicit_file: bool) !void {
         const generation = self.generation;
         self.membership_visited += 1;
-        if (generation.entries.items.len >= self.options.workspace_max_files) return error.WorkspaceFileLimit;
+        if (generation.entries.items.len +| (if (self.queue) |queue| queue.count else 0) >= self.options.workspace_max_files) return error.WorkspaceFileLimit;
         if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
             if (old.blob.watcher == watcher and old.blob.token != null and
                 watcher.intact(old.blob.token.?) and
@@ -959,9 +1105,18 @@ const Collector = struct {
                 return;
             }
         };
+        if (self.queue) |queue| if (queue.count == queue.capacity) try queue.flush();
         generation.sources_opened += 1;
-        var file_handle = try std.Io.Dir.cwd().openFile(self.io, path_name, .{});
-        defer file_handle.close(self.io);
+        var file_handle = std.Io.Dir.cwd().openFile(self.io, path_name, .{}) catch |err| blk: {
+            // Optional pending reads must not consume the last descriptors and
+            // turn a source which fits serially into a capture failure.
+            const queue = self.queue orelse return err;
+            if (queue.count == 0) return err;
+            try queue.flush();
+            break :blk try std.Io.Dir.cwd().openFile(self.io, path_name, .{});
+        };
+        var close_file = true;
+        defer if (close_file) file_handle.close(self.io);
         const before = try file_handle.stat(self.io);
         if (before.kind != .file) return error.NotRegularFile;
         if (before.size > self.options.max_file_bytes and self.options.skip_oversize) {
@@ -975,11 +1130,12 @@ const Collector = struct {
             if (self.eligibility) |list| try list.append(generation.arena.allocator(), try generation.arena.allocator().dupe(u8, path_name));
             return;
         }
+        if (self.queue) |queue| if (queue.count != 0 and (before.size > CaptureQueue.byte_limit -| queue.bytes or before.size +| @sizeOf(Blob) > generation.budget.limit -| generation.budget.live)) try queue.flush();
         const available = generation.budget.limit -| generation.budget.live;
         if (available < @sizeOf(Blob)) return error.OutOfMemory;
         if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
             if (old.blob.token != null and old.blob.watcher == watcher and old.blob.stamp != null and sameStamp(old.blob.stamp.?, before) and watcher.clean(old.blob.token.?, file_handle)) {
-                if (old.blob.budget.live + @sizeOf(Blob) > available) return error.OutOfMemory;
+                if (old.blob.charge() > available) return error.OutOfMemory;
                 old.blob.refs += 1;
                 errdefer old.blob.release();
                 try self.append(old.blob, display, explicit_file, old.revision, true, available);
@@ -987,42 +1143,57 @@ const Collector = struct {
                 return;
             }
         };
-        var token = if (self.watcher) |w| w.arm(file_handle) else null;
-        defer if (token) |value| self.watcher.?.release(value);
-        var blob = try generation.backing.create(Blob);
-        // Use the ordinary search allocator for parser/capture arenas so
-        // bounded parser outcomes remain identical across both entry points.
-        blob.* = .{ .backing = generation.backing, .budget = .{ .backing = generation.backing, .limit = available - @sizeOf(Blob) }, .arena = undefined };
-        blob.arena = .init(blob.budget.allocator());
+        const token = if (self.watcher) |w| w.arm(file_handle) else null;
+        var token_owned = true;
+        defer if (token_owned) if (token) |value| self.watcher.?.release(value);
+        const length = std.math.cast(usize, before.size) orelse return error.StreamTooLong;
+        if (length > self.options.max_file_bytes) return error.StreamTooLong;
+        if (length > available - @sizeOf(Blob)) return error.OutOfMemory;
+        var revision: [64]u8 = undefined;
+        const blob = blk: {
+            const value = try Blob.create(generation.backing, length);
+            errdefer value.release();
+            value.watcher = self.watcher;
+            value.token = token;
+            value.stamp = .from(before);
+            token_owned = false;
+            if (self.queue) |queue| if (length <= CaptureQueue.byte_limit and (!self.options.jobs_auto or length >= 64 * 1024)) {
+                try queue.push(file_handle, value, display, explicit_file);
+                close_file = false;
+                return;
+            };
+            revision = try readBlob(self.io, file_handle, before, value);
+            break :blk value;
+        };
+        try self.finishRead(blob, display, explicit_file, revision);
+    }
+    // Consumes the blob on both success and failure. Only the coordinator
+    // mutates watch state, generation accounting, and prior-reference counts.
+    fn finishRead(self: *Collector, captured: *Blob, display: []const u8, explicit_file: bool, revision: [64]u8) !void {
+        const generation = self.generation;
+        const available = generation.budget.limit -| generation.budget.live;
+        generation.source_bytes_read += captured.bytes.len;
+        if (captured.token) |token| self.watcher.?.certify(token);
+        var blob = captured;
         errdefer blob.release();
-        var buffer: [65536]u8 = undefined;
-        var reader = file_handle.reader(self.io, &buffer);
-        blob.bytes = try reader.interface.allocRemaining(blob.arena.allocator(), .limited(@min(self.options.max_file_bytes, self.options.workspace_memory_limit)));
-        const after = try file_handle.stat(self.io);
-        if (before.inode != after.inode or before.size != after.size or after.size != blob.bytes.len or
-            before.mtime.nanoseconds != after.mtime.nanoseconds or before.ctime.nanoseconds != after.ctime.nanoseconds) return error.WorkspaceChangedDuringCapture;
-        generation.source_bytes_read += blob.bytes.len;
-        if (token) |value| self.watcher.?.certify(value);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(blob.bytes, &digest, .{});
-        const revision = std.fmt.bytesToHex(digest, .lower);
+        const stamp = captured.stamp;
         if (if (self.previous) |old| old.find(display) else null) |old| {
             if (std.mem.eql(u8, &old.revision, &revision)) {
-                const retained = old.blob.budget.live + @sizeOf(Blob);
-                if (retained > available) return error.OutOfMemory;
+                if (old.blob.charge() > available) return error.OutOfMemory;
+                const token = blob.token;
+                blob.token = null;
                 blob.release();
                 blob = old.blob;
                 blob.refs += 1;
+                if (blob.watcher) |w| if (blob.token) |prior| w.release(prior);
+                blob.watcher = self.watcher;
+                blob.token = token;
             }
         }
-        if (blob.watcher) |w| if (blob.token) |old| w.release(old);
-        blob.watcher = self.watcher;
-        blob.token = token;
-        blob.stamp = before;
-        token = null;
+        blob.stamp = stamp;
         try self.append(blob, display, explicit_file, revision, false, available);
     }
-    fn sameStamp(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
+    fn sameStamp(a: anytype, b: std.Io.File.Stat) bool {
         return a.inode == b.inode and a.kind == b.kind and a.size == b.size and a.mtime.nanoseconds == b.mtime.nanoseconds and a.ctime.nanoseconds == b.ctime.nanoseconds;
     }
     fn append(self: *Collector, blob: *Blob, display: []const u8, explicit_file: bool, revision: [64]u8, witness_reused: bool, available: usize) !void {
@@ -1030,7 +1201,7 @@ const Collector = struct {
         try self.markSeen(display);
         const previous = if (self.previous) |old| old.find(display) else null;
         const preparation = if (previous != null and std.mem.eql(u8, &previous.?.revision, &revision)) previous.?.preparation else null;
-        const charge = blob.budget.live + @sizeOf(Blob) + (if (preparation) |owner| owner.bytes() else @as(usize, 0));
+        const charge = blob.charge() + (if (preparation) |owner| owner.bytes() else @as(usize, 0));
         if (charge > available) return error.OutOfMemory;
         generation.budget.limit -= charge;
         generation.blob_bytes += charge;
@@ -1040,7 +1211,7 @@ const Collector = struct {
         }
         const owned_path = try generation.budget.allocator().dupe(u8, display);
         errdefer generation.budget.allocator().free(owned_path);
-        try generation.entries.append(generation.budget.allocator(), .{ .blob = blob, .path = owned_path, .bytes = blob.bytes, .revision = revision, .explicit_file = explicit_file, .witness_reused = witness_reused, .prepared = if (preparation) |owner| owner.value else null, .preparation = preparation });
+        try generation.entries.append(generation.budget.allocator(), .{ .blob = blob, .path = owned_path, .bytes = blob.bytes, .revision = revision, .explicit_file = explicit_file, .witness_reused = witness_reused, .preparation = preparation });
         generation.source_bytes += blob.bytes.len;
         if (preparation) |owner| {
             owner.refs += 1;
@@ -1074,8 +1245,8 @@ test "workspace generations own reused indexes and failed captures release their
     try std.testing.expect(next.retainedBytes() <= o.workspace_memory_limit);
     old.?.deinit();
     old = null;
-    try std.testing.expectEqualStrings("retry", next.entries.items[0].prepared.?.index.declarations[0].name);
-    try std.testing.expectEqualStrings("STOP", next.entries.items[0].prepared.?.index.calls[0].name);
+    try std.testing.expectEqualStrings("retry", next.entries.items[0].prepared().?.index.declarations[0].name);
+    try std.testing.expectEqualStrings("STOP", next.entries.items[0].prepared().?.index.calls[0].name);
     o.workspace_max_files = 0;
     try std.testing.expectError(error.WorkspaceFileLimit, Generation.capture(a, io, &o, next));
     o.workspace_max_files = 10;
@@ -1131,8 +1302,8 @@ test "dirty capture preserves a retained generation and lazy preparations stay b
     try std.testing.expectEqual(@as(usize, 0), next.preparations_built);
     try std.testing.expect(next.prepareEntry(io, &next.entries.items[0]));
     try std.testing.expect(next.retainedBytes() <= o.workspace_memory_limit);
-    try std.testing.expect(old.entries.items[0].prepared == null);
-    try std.testing.expectEqualStrings("changed", next.entries.items[0].prepared.?.index.declarations[0].name);
+    try std.testing.expect(old.entries.items[0].preparation == null);
+    try std.testing.expectEqualStrings("changed", next.entries.items[0].prepared().?.index.declarations[0].name);
 }
 
 test "fallback revalidates an earlier clean namespace certificate before publishing" {
@@ -1304,4 +1475,81 @@ test "membership updates retain canonical identities and visit only affected dir
     }
     // Repeated updates retire paths/tree nodes and reuse bounded dense capacity.
     try std.testing.expect(current.retainedBytes() < initial_bytes + 96 * 1024);
+}
+
+test "parallel cold capture equals serial capture and bounds failed admission" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const payload = try a.alloc(u8, 128 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    for (0..40) |i| {
+        var name: [32]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name, "f{d}.txt", .{i}), .data = payload });
+    }
+    var options: Options = .{ .no_ignore = true, .jobs = 1, .workspace_memory_limit = 16 * 1024 * 1024 };
+    defer options.deinit(a);
+    try options.paths.append(a, path);
+    const serial = try Generation.capture(a, io, &options, null);
+    defer serial.deinit();
+    options.jobs = 4;
+    const parallel = try Generation.capture(a, io, &options, null);
+    defer parallel.deinit();
+    try std.testing.expectEqualSlices(u8, &serial.revision, &parallel.revision);
+    try std.testing.expectEqual(serial.source_bytes, parallel.source_bytes);
+    try std.testing.expectEqual(@as(usize, 0), serial.capture_workers);
+    try std.testing.expectEqual(@as(usize, 4), parallel.capture_workers);
+    try std.testing.expectEqual(@as(usize, 40), parallel.parallel_sources_read);
+    try std.testing.expectEqual(serial.retainedBytes(), parallel.retainedBytes());
+    options.workspace_max_files = 39;
+    try std.testing.expectError(error.WorkspaceFileLimit, Generation.capture(a, io, &options, null));
+    options.workspace_max_files = 40;
+    options.workspace_memory_limit = 128 * 1024;
+    try std.testing.expectError(error.OutOfMemory, Generation.capture(a, io, &options, null));
+}
+
+test "parallel reader failure retires pending reservations without publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "old" });
+    const file = try tmp.dir.openFile(io, "a", .{});
+    const before = try file.stat(io);
+    const blob = try Blob.create(a, 3);
+    blob.stamp = .from(before);
+    var generation: Generation = .{ .backing = a, .budget = .{ .backing = a, .limit = 1024 * 1024 }, .arena = undefined };
+    var collector: Collector = .{ .generation = &generation, .io = io, .options = &.{}, .previous = null };
+    var queue: CaptureQueue = .{ .collector = &collector, .pool = .{ .io = io }, .workers = 2 };
+    defer queue.deinit();
+    const limit = generation.budget.limit;
+    try queue.push(file, blob, "a", false);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "longer" });
+    try std.testing.expectError(error.WorkspaceChangedDuringCapture, queue.flush());
+    try std.testing.expectEqual(@as(usize, 0), generation.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), generation.budget.live);
+    try std.testing.expectEqual(limit, generation.budget.limit);
+}
+
+fn coldFailureCase(a: A, path: []const u8) !void {
+    var options: Options = .{ .no_ignore = true, .jobs = 4 };
+    defer options.deinit(a);
+    try options.paths.append(a, path);
+    const generation = try Generation.capture(a, std.testing.io, &options, null);
+    generation.deinit();
+}
+test "parallel cold capture allocation failures release descriptors and immutable blobs" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "small", .data = "STOP" });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    try std.testing.checkAllAllocationFailures(a, coldFailureCase, .{path});
 }

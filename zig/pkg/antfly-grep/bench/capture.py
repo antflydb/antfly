@@ -42,7 +42,15 @@ def main():
     parser.add_argument("--files", type=int, nargs="+", default=[1000, 10000])
     parser.add_argument("--directories", type=int, default=64)
     parser.add_argument("--iterations", type=int, default=7)
+    parser.add_argument("--bytes-per-file", type=int, default=14)
+    parser.add_argument("--current-threads", type=int)
+    parser.add_argument("--baseline-threads", type=int)
     args = parser.parse_args()
+    if args.bytes_per_file < 14 or any(
+        value is not None and value < 1
+        for value in (args.current_threads, args.baseline_threads)
+    ):
+        parser.error("bytes per file must be at least 14 and threads must be positive")
     if min(*args.files, args.directories, args.iterations) < 1:
         parser.error("sizes and iterations must be positive")
     binaries = {"current": args.current.resolve(), "baseline": args.baseline.resolve()}
@@ -53,6 +61,8 @@ def main():
         if Path("/sys/fs/cgroup/cpu.max").exists()
         else None,
         "measurement": __doc__.strip(),
+        "bytes_per_file": args.bytes_per_file,
+        "threads": {"current": args.current_threads, "baseline": args.baseline_threads},
         "binaries": {
             key: {
                 "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
@@ -70,7 +80,9 @@ def main():
             for i in range(count):
                 parent = root / "src" / f"d{i % args.directories:04}"
                 parent.mkdir(parents=True, exist_ok=True)
-                (parent / f"f{i:06}.txt").write_text("STOP original\n")
+                (parent / f"f{i:06}.txt").write_bytes(
+                    b"STOP original\n" + b"x" * (args.bytes_per_file - 14)
+                )
             env = {
                 key: value
                 for key, value in os.environ.items()
@@ -95,6 +107,18 @@ def main():
                             "--workspace-watch",
                             "--workspace-max-files=200000",
                             "--workspace-memory-limit=1G",
+                            *(
+                                [
+                                    f"--threads={args.current_threads if key == 'current' else args.baseline_threads}"
+                                ]
+                                if (
+                                    args.current_threads
+                                    if key == "current"
+                                    else args.baseline_threads
+                                )
+                                is not None
+                                else []
+                            ),
                         ],
                     )
                     elapsed = time.monotonic() - started

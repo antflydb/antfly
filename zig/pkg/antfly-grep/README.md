@@ -2604,3 +2604,93 @@ Evidence: [paired macOS startup](bench/results/startup-macos.json),
 [Linux refresh controls](bench/results/startup-refresh-linux.json),
 [differential replay](bench/results/startup-differential.json), and
 [qualification identities](bench/results/startup-validation.json).
+
+
+### Compact captures, bounded readers and restart preparation reuse
+
+Workspace decision preparation now consults the same content-addressed, validated
+parser-artifact cache as ordinary decision search before parsing. Parser identity,
+pathname, content, line mode and authorization scope remain part of its identity;
+loaded offsets and ranges are validated against the captured bytes. The retained
+preparation owns its decoded metadata. `--no-cache` bypasses disk artifacts;
+`--cached-only` prohibits provider calls, while still allowing source validation
+and parsing when no preparation artifact exists. Decision evidence TTL is unchanged.
+
+Each raw source blob now occupies one checked, aligned allocation containing its
+header and exact source bytes. A compact stamp retains only the fields needed for
+source certification and alias policy. Entries keep one preparation-owner pointer
+instead of duplicating its descriptor. Blobs remain independently reference counted
+so deletion releases their storage without waiting for unrelated source segments
+or requiring segment compaction. Captures retain immutable owned bytes, including
+when original paths disappear. Inventory v3 revisions remain unchanged.
+
+Initial capture can read, validate and hash a bounded batch in parallel. The
+coordinator alone opens files, arms witnesses, allocates buffers, updates budgets
+and publishes entries; workers touch disjoint preallocated buffers. File sizes and
+stamps are checked before and after reading, including EOF/growth checks. Failed
+batches join every worker and release their descriptors, blobs and reservations
+before returning; no partial generation is published. Discovery remains serial.
+
+The queue holds at most 32 descriptors and 8 MiB of source payloads. POSIX descriptor
+quotas lower its capacity; pending reads drain before an open is retried. Capture
+uses at most eight workers for explicit `--threads`, or four in automatic mode,
+subject to the existing automatic job budget. Automatic mode leaves files below 64 KiB and
+files exceeding the queue byte bound on the serial path. `--threads=1` disables
+capture concurrency. `workspace_ready.capture_workers` reports the largest launched
+reader team, including the coordinator (zero when no helper is launched);
+`parallel_sources_read` counts files in batches
+which used workers. Incremental refresh remains selective and reports zero capture
+workers. The existing separate search/provider worker policies are unchanged.
+
+Final alternating paired measurements against `ea35e73fb8`, using seven pairs on
+the shared macOS host and five in a two-CPU ARM64 Linux Docker VM:
+
+| Workload | Before → after | Retained workspace MiB before → after |
+|---|---:|---:|
+| Linux VM startup, 100K tiny files | 1,328 → 1,268 ms | 96.14 → 53.00 |
+| Linux VM startup, 128 × 1 MiB files | 373.3 → 204.7 ms | 288.17 → 128.12 |
+| macOS startup, 128 × 1 MiB files | 94.3 → 47.1 ms | 288.17 → 128.12 |
+| macOS startup, 10K tiny files | 662.5 → 686.3 ms | 10.41 → 5.89 |
+| Linux VM warm-artifact query after restart | 10.19 → 4.77 ms | Not measured |
+| macOS warm-artifact query after restart | 5.51 → 1.88 ms | Not measured |
+
+At 100K tiny Linux files (1.34 MiB source), sampled ready RSS drops from 105.70 to
+61.31 MiB. Retained accounting includes reserved backing allocations, while RSS
+measures touched resident pages; their reductions differ, particularly on the
+large-file corpus. Isolating worker concurrency within the new binary gives
+376.5 → 197.9 ms for two versus one reader in Linux and 99.5 → 56.3 ms for four
+versus one on macOS. Warm-artifact query trials use 32 synthetic Python files,
+128 call lines each, a native constant-score fixture, and one output match per
+file; capture time is recorded separately. Every recorded query makes zero
+provider calls, returns identical match evidence, and changes 32 source parses
+into zero. These fixtures do not establish live-provider quality or billing.
+
+All timings use warm filesystem data, including fresh-process startup. Small-file
+latency and submillisecond refresh results vary; the macOS 10K case regresses in
+this run. No universal throughput, cold-storage, or independent Linux hardware
+claim is made. Unchanged refresh controls retain zero source reads/entries visited
+and changed cases verify revision equality against forced capture.
+
+Source snapshots, inventory and complete-result memos remain process-local RAM.
+The configured disk cache contains derived parser metadata/names and decision
+scores/timestamps; this change adds no durable source mirror or workspace catalog.
+Ranked output may separately use temporary spill files containing excerpts.
+Persistence cannot make restart validation free, and changed source data still
+requires reading and evaluation. Clients can reuse an existing result locally
+when query, pinned revision and evidence validity permit, eliminating a redundant
+request without claiming freshness for kernel-invisible writes.
+
+Validation: 229 CLI cases per macOS/Linux (two skips each); 89/90 package tests per
+platform (one platform skip), including allocation-failure capture, worker failure,
+serial/parallel revision equivalence and low-descriptor tests. Native package
+checks also pass in ReleaseSafe mode. Windows x86_64 cross-compilation, 1,000 seeded
+differential comparisons without mismatches/timeouts, license boundaries and three
+release archives are qualified. Windows runtime and live-provider testing remain
+outside this qualification.
+
+Evidence: [Linux capture](bench/results/compact-capture-linux.json),
+[Linux I/O](bench/results/compact-io-linux.json),
+[isolated workers](bench/results/compact-workers-linux.json),
+[restart queries](bench/results/compact-restart-linux.json),
+[macOS capture](bench/results/compact-capture-macos.json), and
+[all source/binary/report/archive identities](bench/results/compact-validation.json).

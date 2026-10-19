@@ -1497,8 +1497,9 @@ pub const Search = struct {
                 return error.StreamTooLong;
             }
             self.fresh_workspace_preparation = false;
-            if (self.options.ask != null and !self.options.crlf and !self.options.null_data and entry.prepared == null) {
-                self.fresh_workspace_preparation = self.workspace_generation.?.prepareEntry(self.io, entry);
+            if (self.options.ask != null and !self.options.crlf and !self.options.null_data and entry.preparation == null) {
+                const preparation = self.workspace_generation.?.prepareEntryCached(self.io, entry, self.options, self.decider.cache_scope, &self.source_cache_state);
+                self.fresh_workspace_preparation = preparation == .parsed;
                 if (self.fresh_workspace_preparation) self.summary.source_parses += 1;
             }
             self.replacement_file_context = @import("builtin").os.tag == .linux and (self.options.mmap or (self.options.mmap_auto and self.options.ask == null));
@@ -2165,7 +2166,7 @@ pub const Search = struct {
         if (self.shared_limits) |limits| if (!Limits.reserve(&limits.source_bytes, bytes.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
         self.summary.files += 1;
         self.summary.bytes += bytes.len;
-        const validated_snapshot = if (self.workspace_entry) |entry| entry.prepared != null and entry.bytes.ptr == bytes.ptr and entry.bytes.len == bytes.len else false;
+        const validated_snapshot = if (self.workspace_entry) |entry| entry.preparation != null and entry.bytes.ptr == bytes.ptr and entry.bytes.len == bytes.len else false;
         if (self.options.ask != null and !validated_snapshot and !std.unicode.utf8ValidateSlice(bytes)) {
             self.summary.invalid_utf8_files += 1;
             return;
@@ -2178,9 +2179,9 @@ pub const Search = struct {
         const lines = if (self.options.ask != null) blk: {
             var hit = false;
             prepared = if (self.workspace_entry) |entry| blk2: {
-                if (!self.options.crlf and !self.options.null_data and bytes.ptr == entry.bytes.ptr and bytes.len == entry.bytes.len and entry.prepared != null) {
+                if (!self.options.crlf and !self.options.null_data and bytes.ptr == entry.bytes.ptr and bytes.len == entry.bytes.len and entry.preparation != null) {
                     hit = true;
-                    break :blk2 entry.prepared.?;
+                    break :blk2 entry.prepared().?;
                 }
                 break :blk2 try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit, &self.source_cache_state);
             } else try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit, &self.source_cache_state);
@@ -2679,7 +2680,7 @@ pub const Search = struct {
         // finite-budget evaluation would have produced after another file grew.
         if (self.options.max_regions != std.math.maxInt(usize)) return null;
         const entry = self.workspace_entry orelse return null;
-        if (entry.prepared == null or self.options.crlf or self.options.null_data) return null;
+        if (entry.preparation == null or self.options.crlf or self.options.null_data) return null;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(&self.evaluation_identity.?);
         hash.update(&entry.revision);
@@ -2810,7 +2811,7 @@ pub const Search = struct {
         while (current) |record| : (current = Incremental.next(record)) {
             if (count >= self.options.max_result_files or self.limits.cancel.load(.acquire)) break;
             const entry = generation.find(record.path) orelse continue;
-            if (!std.mem.eql(u8, &entry.revision, &record.revision) or entry.prepared == null) return error.InconsistentIncrementalIndex;
+            if (!std.mem.eql(u8, &entry.revision, &record.revision) or entry.preparation == null) return error.InconsistentIncrementalIndex;
             var borrowed: ?*const SavedCandidate = null;
             if (self.prior_delivery) |base| if (base.by_path.get(record.path)) |tag| {
                 if (std.mem.eql(u8, &tag, &record.tag)) if (previous) |lease| {
@@ -2840,7 +2841,7 @@ pub const Search = struct {
             defer arena.deinit();
             const a = arena.allocator();
             self.summary.incremental_results_materialized += 1;
-            const prepared = entry.prepared.?;
+            const prepared = entry.prepared().?;
             const selected = try a.alloc(bool, prepared.lines.len);
             const probabilities = try a.alloc(f64, selected.len);
             const scores = try a.alloc(f64, selected.len);
@@ -2904,7 +2905,7 @@ pub const Search = struct {
     fn evaluateFile(self: *Search, a: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !bool {
         defer if (self.incremental) |index| {
             if (self.workspace_entry) |entry| {
-                if (entry.prepared == null or bytes.ptr != entry.bytes.ptr or bytes.len != entry.bytes.len) {
+                if (entry.preparation == null or bytes.ptr != entry.bytes.ptr or bytes.len != entry.bytes.len) {
                     index.fail();
                 } else {
                     var scratch: @import("antfly_regex").Budget = .{ .backing = self.a, .limit = 2 * 1024 * 1024 };
@@ -3017,7 +3018,7 @@ pub const Search = struct {
         var regions: std.ArrayList(Region) = .empty;
         if (self.options.semantic_files_only) return;
         const plan = if (self.region_plans) |cache| if (self.workspace_entry) |entry| blk: {
-            if (self.options.crlf or self.options.null_data or bytes.ptr != entry.bytes.ptr or bytes.len != entry.bytes.len or entry.prepared == null) break :blk null;
+            if (self.options.crlf or self.options.null_data or bytes.ptr != entry.bytes.ptr or bytes.len != entry.bytes.len or entry.preparation == null) break :blk null;
             break :blk cache.get(path_name, entry.revision, bytes, lines, self.evidence.?.index, self.options.chunk_lines, self.options.context_lines);
         } else null else null;
         defer if (plan) |value| value.release();
@@ -4000,8 +4001,8 @@ test "delta descriptors survive excerpt eviction and full replay reconstructs mi
     defer by_path.deinit(a);
     for (generation.entries.items, &members) |*entry, *member| {
         try std.testing.expect(generation.prepareEntry(io, entry));
-        var runs = [_]EvaluationRun{.{ .end = entry.prepared.?.lines.len, .probability = 1, .line_score = 1, .selected = true }};
-        index.commit(index.capture(entry.path, entry.revision, .{ .line_count = entry.prepared.?.lines.len, .runs = &runs, .dense = null, .regions = &.{}, .file_score = 1, .best = 1, .considered = 1, .evaluated = 1, .preview_rejected = false }, times), .{ .files = 1, .files_with_matches = 1, .matches = 1 }, 1);
+        var runs = [_]EvaluationRun{.{ .end = entry.prepared().?.lines.len, .probability = 1, .line_score = 1, .selected = true }};
+        index.commit(index.capture(entry.path, entry.revision, .{ .line_count = entry.prepared().?.lines.len, .runs = &runs, .dense = null, .regions = &.{}, .file_score = 1, .best = 1, .considered = 1, .evaluated = 1, .preview_rejected = false }, times), .{ .files = 1, .files_with_matches = 1, .matches = 1 }, 1);
         member.* = .{ .path = entry.path, .tag = index.files.get(entry.path).?.tag };
         try by_path.put(a, member.path, member.tag);
     }
