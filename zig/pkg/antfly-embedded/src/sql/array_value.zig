@@ -1176,7 +1176,38 @@ pub const Membership = struct {
         return .{ .budget = budget, .value = value };
     }
 
+    /// Memoize only an affordable prefix of expensive keys. Source ordinals
+    /// address hashes directly; no map, per-bucket hash, or retained sidecar is
+    /// needed. Require headroom for every table allocation even behind
+    /// a monotonic region, so duplicates and tight quotas keep the small path.
+    fn buildHashes(index: *Membership) ![]u64 {
+        const n = index.value.cardinality();
+        if (n < 32 or (index.value.element_type != .text and index.value.element_type != .jsonb)) return &.{};
+        if (try index.value.retainedBytes() / n < 256) return &.{};
+        const target = std.math.mul(usize, n, 2) catch return &.{};
+        const capacity = std.math.ceilPowerOfTwo(usize, target) catch return &.{};
+        const scratch = MemoryBudget.reclaimingAllocator(index.budget.allocator());
+        const available = MemoryBudget.headroom(scratch).?;
+        // Five bytes per bucket, with the geometric sequence of allocations
+        // totaling less than twice the final capacity in a monotonic region.
+        const table_bytes = std.math.mul(usize, capacity, 10) catch return &.{};
+        const count: usize = @min(n, 8192);
+        const bytes = count * @sizeOf(u64);
+        if (table_bytes > available or bytes > available - table_bytes or bytes > available / 16) return &.{};
+        return scratch.alloc(u64, count) catch |err| return allocationError(index.budget, err);
+    }
+
     fn populate(index: *Membership, work: *Budget) !void {
+        switch (index.value.element_type) {
+            .text, .jsonb => try index.populateWithHashes(work, true),
+            else => try index.populateWithHashes(work, false),
+        }
+    }
+
+    fn populateWithHashes(index: *Membership, work: *Budget, comptime memoize: bool) !void {
+        var hashes: []u64 = &.{};
+        defer if (memoize) MemoryBudget.reclaimingAllocator(index.budget.allocator()).free(hashes);
+        var considered_hashes = false;
         const value = index.value;
         for (0..value.cardinality()) |ordinal| {
             const element = value.flatCell(ordinal);
@@ -1186,22 +1217,35 @@ pub const Membership = struct {
                 continue;
             }
             const hash = try hashElement(value.element_type, element, work);
-            if (try index.findSlot(element, hash, work) != null) continue;
-            // Distinct cardinality determines capacity. In particular, a large
-            // duplicate-heavy source remains cheap under a tight index quota.
-            if (index.count >= index.slots.len / 2) try index.grow(work);
-            var bucket = hash & (index.slots.len - 1);
-            while (index.slots[bucket] != empty) {
-                try work.consume(1);
-                bucket = (bucket + 1) & (index.slots.len - 1);
-            }
+            const found = try index.searchSlot(element, hash, work);
+            if (found.found) continue;
+            // Only growth invalidates the vacant bucket from the equality
+            // search. Distinct cardinality still controls table capacity.
+            const bucket = if (index.count >= index.slots.len / 2) bucket: {
+                var initialized = true;
+                // Wait for distinct keys to require growth: a large source
+                // containing a few repeated values never allocates a memo.
+                if (memoize and !considered_hashes and index.count >= 8) {
+                    considered_hashes = true;
+                    hashes = try index.buildHashes();
+                    initialized = false;
+                }
+                try index.grow(work, hashes, initialized);
+                var at = hash & (index.slots.len - 1);
+                while (index.slots[at] != empty) {
+                    try work.consume(1);
+                    at = (at + 1) & (index.slots.len - 1);
+                }
+                break :bucket at;
+            } else found.bucket;
+            if (ordinal < hashes.len) hashes[ordinal] = hash;
             index.slots[bucket] = @intCast(ordinal);
             index.tags[bucket] = @truncate(hash >> 56);
             index.count += 1;
         }
     }
 
-    fn grow(self: *Membership, work: *Budget) !void {
+    fn grow(self: *Membership, work: *Budget, hashes: []u64, initialized: bool) !void {
         const a = self.budget.allocator();
         const capacity = if (self.slots.len == 0) @as(usize, 16) else std.math.mul(usize, self.slots.len, 2) catch return error.SqlProgramLimitExceeded;
         const words = std.math.add(usize, capacity, capacity / 4) catch return error.SqlProgramLimitExceeded;
@@ -1213,7 +1257,11 @@ pub const Membership = struct {
         for (self.slots) |ordinal| {
             try work.consume(1);
             if (ordinal == empty) continue;
-            const hash = try hashElement(self.value.element_type, self.value.flatCell(ordinal), work);
+            const hash = if (initialized and ordinal < hashes.len) cached: {
+                try work.consume(1);
+                break :cached hashes[ordinal];
+            } else try hashElement(self.value.element_type, self.value.flatCell(ordinal), work);
+            if (ordinal < hashes.len) hashes[ordinal] = hash;
             var bucket = hash & (slots.len - 1);
             while (slots[bucket] != empty) {
                 try work.consume(1);
@@ -1236,17 +1284,23 @@ pub const Membership = struct {
         self.* = undefined;
     }
 
-    fn findSlot(self: *const Membership, element: Element, hash: u64, work: *Budget) !?usize {
-        if (self.slots.len == 0) return null;
+    const Search = struct { bucket: usize = 0, found: bool = false };
+    fn searchSlot(self: *const Membership, element: Element, hash: u64, work: *Budget) !Search {
+        if (self.slots.len == 0) return .{};
         var bucket = hash & (self.slots.len - 1);
         while (self.slots[bucket] != empty) {
             if (self.tags[bucket] == @as(u8, @truncate(hash >> 56))) {
                 // Equality already charges this occupied bucket's visit.
-                if (try compareElement(self.value.element_type, self.value.flatCell(self.slots[bucket]), element, work) == .eq) return bucket;
+                if (try compareElement(self.value.element_type, self.value.flatCell(self.slots[bucket]), element, work) == .eq) return .{ .bucket = bucket, .found = true };
             } else try work.consume(1);
             bucket = (bucket + 1) & (self.slots.len - 1);
         }
-        return null;
+        return .{ .bucket = bucket };
+    }
+
+    fn findSlot(self: *const Membership, element: Element, hash: u64, work: *Budget) !?usize {
+        const result = try self.searchSlot(element, hash, work);
+        return if (result.found) result.bucket else null;
     }
 
     fn find(self: *const Membership, element: Element, hash: u64, work: *Budget) !?usize {
@@ -1938,4 +1992,173 @@ test "SQL borrowed membership keeps source admission independent of index storag
     cells[127] = .json(.{ .integer = 42 });
     var denied: Budget = .{ .remaining = 0 };
     try std.testing.expectError(error.SqlProgramLimitExceeded, Membership.initBorrowedWithBudget(a, source, .{}, 65536, &denied));
+}
+
+test "SQL membership construction hash scratch preserves quotas faults and first ordinals" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var payloads: [128][256]u8 = undefined;
+            var cells: [128]Element = undefined;
+            for (&payloads, &cells, 0..) |*payload, *cell, i| {
+                @memset(payload, 'a');
+                _ = try std.fmt.bufPrint(payload[0..8], "{d:0>8}", .{i % 31});
+                cell.* = if (i % 17 == 0) .{} else .json(.{ .string = payload });
+            }
+            for ([_]ElementType{ .text, .jsonb }) |kind| {
+                const source = try Value.init(kind, &.{.{ .length = cells.len, .lower = -7 }}, &cells, .{});
+                var index = try Membership.init(a, source, .{});
+                defer index.deinit();
+                try std.testing.expectEqual(index.slots.len * 5, index.budget.live);
+                var work: Budget = .{};
+                try std.testing.expectEqual(@as(?i32, -6), try index.firstPosition(cells[1], &work));
+                try std.testing.expectEqual(@as(?i32, -7), try index.firstPosition(.{}, &work));
+                try std.testing.expectEqual(@as(?bool, true), try index.equalAny(cells[1], &work));
+                try std.testing.expectEqual(@as(?bool, null), try index.equalAny(.json(.{ .string = "absent" }), &work));
+            }
+            const source = try Value.init(.text, &.{.{ .length = cells.len }}, &cells, .{});
+            var tight = try Membership.initValidated(a, source, .{ .bytes = 512 });
+            defer tight.deinit();
+            const skipped = try tight.buildHashes();
+            try std.testing.expectEqual(@as(usize, 0), skipped.len);
+            var work: Budget = .{};
+            try tight.populate(&work);
+            try std.testing.expectEqual(@as(usize, 31), tight.count);
+            try std.testing.expect(tight.budget.peak <= 512);
+            const Cancel = struct {
+                calls: usize = 0,
+                fn check(raw: ?*anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    self.calls += 1;
+                    if (self.calls == 24) return error.Canceled;
+                }
+            };
+            var control: Cancel = .{};
+            var canceled: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check, .ptr = &control };
+            var interrupted: Budget = .{ .shared = &canceled };
+            var partial = try Membership.initValidated(a, source, .{});
+            defer partial.deinit();
+            partial.populate(&interrupted) catch |err| {
+                if (err != error.Canceled) return err;
+                return;
+            };
+            return error.ExpectedCancellation;
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL membership construction compares legacy probes and bounded hash reuse" {
+    const Reference = struct {
+        fn populate(index: *Membership, work: *Budget) !void {
+            for (0..index.value.cardinality()) |ordinal| {
+                const element = index.value.flatCell(ordinal);
+                try work.consume(1);
+                if (element.sql_null) {
+                    if (index.first_null == null) index.first_null = ordinal;
+                    continue;
+                }
+                const hash = try hashElement(index.value.element_type, element, work);
+                if (try index.findSlot(element, hash, work) != null) continue;
+                if (index.count >= index.slots.len / 2) try index.grow(work, &.{}, true);
+                var bucket = hash & (index.slots.len - 1);
+                while (index.slots[bucket] != Membership.empty) {
+                    try work.consume(1);
+                    bucket = (bucket + 1) & (index.slots.len - 1);
+                }
+                index.slots[bucket] = @intCast(ordinal);
+                index.tags[bucket] = @truncate(hash >> 56);
+                index.count += 1;
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]ElementType{ .int64, .text, .jsonb }) |kind| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const n: usize = if (kind == .int64) 8192 else 1024;
+        const cells = try arena.allocator().alloc(Element, n);
+        for (cells, 0..) |*cell, i| {
+            if (kind == .int64) {
+                cell.* = .json(.{ .integer = @intCast(i) });
+            } else {
+                const payload = try arena.allocator().alloc(u8, 256);
+                @memset(payload, 'a');
+                _ = try std.fmt.bufPrint(payload[0..8], "{d:0>8}", .{i});
+                cell.* = .json(.{ .string = payload });
+            }
+        }
+        const source = try Value.init(kind, &.{.{ .length = @intCast(n) }}, cells, .{ .work = 64 * 1024 * 1024 });
+        var charged: [3]usize = undefined;
+        for (0..3) |mode| {
+            var elapsed: i96 = 0;
+            var peak: usize = 0;
+            for (0..20) |_| {
+                var work: Budget = .{ .remaining = 64 * 1024 * 1024 };
+                const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+                const admitted = try source.validateWithBudget(.{}, &work);
+                var index = try Membership.initValidated(a, admitted, .{ .bytes = 1024 * 1024 });
+                defer index.deinit();
+                switch (mode) {
+                    0 => try Reference.populate(&index, &work),
+                    1 => try index.populateWithHashes(&work, false),
+                    else => try index.populate(&work),
+                }
+                elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+                charged[mode] = 64 * 1024 * 1024 - work.remaining;
+                peak = @max(peak, index.budget.peak);
+                try std.testing.expectEqual(n, index.count);
+                try std.testing.expectEqual(index.slots.len * 5, index.budget.live);
+                try std.testing.expectEqual(@as(?i32, @intCast(n)), try index.firstPosition(cells[n - 1], &work));
+            }
+            std.debug.print("SQL_MEMBERSHIP_BUILD kind={s} mode={} repetitions=20 cells={} elapsed_ns={} work_per_build={} peak_bytes={}\n", .{ @tagName(kind), mode, n, elapsed, charged[mode], peak });
+        }
+        try std.testing.expect(charged[1] < charged[0]);
+        if (kind != .int64) try std.testing.expect(charged[2] < charged[1]);
+        if (kind == .jsonb) {
+            // Eliminating replay also makes this build fit the execution
+            // cache's unchanged 1 Miwork allowance.
+            try std.testing.expect(charged[0] > (Limits{}).work);
+            var admitted = try Membership.init(a, source, .{});
+            defer admitted.deinit();
+            try std.testing.expectEqual(n, admitted.count);
+        }
+    }
+}
+
+test "SQL membership construction bounds native hash prefixes and region ownership" {
+    const a = std.testing.allocator;
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    const region = source_arena.allocator();
+    const n = 8193;
+    const cells = try region.alloc(Element, n);
+    for (cells, 0..) |*cell, i| {
+        const payload = try region.alloc(u8, 256);
+        @memset(payload, 'a');
+        _ = try std.fmt.bufPrint(payload[0..8], "{d:0>8}", .{i});
+        cell.* = .json(.{ .string = payload });
+    }
+    var creation: Budget = .{ .remaining = 64 * 1024 * 1024 };
+    const raw = try Value.initWithBudget(.text, &.{.{ .length = n, .lower = -11 }}, cells, .{}, &creation);
+    const storage = @import("array_storage.zig");
+    const encoded = try storage.encodeAlloc(region, raw, .{ .values = .{ .work = 64 * 1024 * 1024 } });
+    const native = try storage.borrowLeaky(region, .text, encoded, .{ .values = .{ .work = 64 * 1024 * 1024 } });
+    var parent: MemoryBudget = .{ .backing = a, .limit = 4 * 1024 * 1024, .monotonic = true };
+    {
+        var owner = std.heap.ArenaAllocator.init(parent.allocator());
+        defer owner.deinit();
+        var index = try Membership.initValidated(owner.allocator(), native, .{ .bytes = 2 * 1024 * 1024 });
+        defer index.deinit();
+        var work: Budget = .{ .remaining = 64 * 1024 * 1024 };
+        try index.populate(&work);
+        try std.testing.expectEqual(@as(usize, n), index.count);
+        try std.testing.expectEqual(index.slots.len * 5, index.budget.live);
+        try std.testing.expectEqual(@as(usize, 311296), index.budget.peak);
+        // Last source ordinal lies just outside the 64 KiB memo prefix.
+        try std.testing.expectEqual(@as(?i32, n - 12), try index.firstPosition(cells[n - 1], &work));
+        try std.testing.expectEqual(@as(?bool, false), try index.equalAny(.json(.{ .string = "missing" }), &work));
+        try std.testing.expect(parent.footprint() < parent.limit);
+    }
+    try std.testing.expectEqual(@as(usize, 0), parent.live);
 }
