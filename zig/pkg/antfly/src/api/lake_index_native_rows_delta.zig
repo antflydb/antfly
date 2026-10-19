@@ -144,12 +144,13 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
     // recipes and incomplete/legacy cuts keep the established reconciliation.
     for (definitions) |definition| {
         var tuple = try tuples.TuplePlan.init(a, schema, layout, definition.keys);
-        var predicate: ?predicates.Plan = if (definition.where.len != 0) try predicates.Plan.init(a, schema, layout, definition.where) else null;
+        var predicate: ?predicates.Plan = null;
         var transferred = false;
         defer if (!transferred) {
             if (predicate) |*p| p.deinit();
             tuple.deinit();
         };
+        if (definition.where.len != 0) predicate = try predicates.Plan.init(a, schema, layout, definition.where);
         const cover = try parent.coverColumns(ca, definition);
         const name = try parent.logicalName(ca, definition.name);
         const binding = try parent.bindingFor(ca, provider.source, tuple, predicate, cover);

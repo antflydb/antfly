@@ -169,7 +169,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var replay = @import("lake_index_build_replay.zig").Replay.init(a, &input, shared_columns);
     defer replay.deinit();
     replay.only_files = if (replay_files) |mask| try @import("lake_index_build_replay.zig").Needed.fromMask(a, mask) else null;
-    if (shared_columns.len != 0) input.replay = &replay;
+    if (shared_columns.len != 0 and input.replay == null) input.replay = &replay;
     var files: std.StringHashMapUnmanaged(u32) = .empty;
     defer files.deinit(a);
     for (source.inventory.files, 0..) |file, index| try files.put(a, file.file_id, std.math.cast(u32, index) orelse return error.LakeSidecarBuildLimitExceeded);
@@ -312,8 +312,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var ordinal: u64 = 0;
         // Checkpoint one source file at a time into durable merge levels.
         // Fused sorts and replay never retain archive-sized local runs.
-        for (needed, 0..) |need, file_index| {
-            if (!need) continue;
+        var scan_order = state.ScanOrder.init(&input);
+        while (try scan_order.next()) |file_index| {
+            if (!needed[file_index]) continue;
             input.only_files = null;
             input.only_file = file_index;
             const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation);
@@ -759,6 +760,23 @@ test "external lake ordered sparse publication preserves covering rows across au
         var navigation = try navigation_api.build(a, ca, &store, &provider, previous_navigation, .none);
         defer navigation.deinit();
         provider.native_delta = navigation.delta;
+        if (phase == 1) {
+            var parsed_failure = try local.schema_mod.parseValidatedTableSchema(a, schema_json);
+            defer parsed_failure.deinit(a);
+            const runtime_failure = try local.schema_mod.deriveRuntimeTableSchema(a, parsed_failure);
+            defer local.storage_schema.freeSchema(a, runtime_failure);
+            var layout_failure = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, runtime_failure);
+            defer layout_failure.deinit();
+            const definitions_failure = (try parsed_failure.relationalIndexDefinitions(ca)).?;
+            var partial = definitions_failure[0];
+            partial.where = &.{.{ .field = "amount", .op = .gt, .value_json = "0" }};
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+            var unopened: spill.Manager = undefined;
+            const selected: []const @TypeOf(partial) = &.{partial};
+            // The tuple allocation succeeds; the first predicate allocation
+            // fails before the builder can transfer either owner into Entry.
+            try std.testing.expectError(error.OutOfMemory, @import("lake_index_native_rows_delta.zig").build(failing.allocator(), ca, &provider, &store, runtime_failure, &layout_failure, selected, &.{}, previous, .none, &unopened));
+        }
         const built = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, previous);
         if (phase != 0) try std.testing.expectEqual(@as(usize, 1), provider.ordered_delta_plans);
         if (phase == 3) {

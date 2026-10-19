@@ -43,6 +43,7 @@ pub const Provider = struct {
     only_plan: ?*const @import("lake_index_native_state.zig").Plan = null,
     replay: ?*@import("lake_index_build_replay.zig").Replay = null,
     replay_recommended: bool = false,
+    replay_consumer: ?usize = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
     statistics: ?Statistics = null,
     pub const Statistics = struct {
@@ -99,7 +100,6 @@ pub const Provider = struct {
             cursor.* = .{ .provider = self.*, .binding = binding, .cancellation = cancellation, .planned = if (self.only_plan) |plan| plan.iterator(true) else null };
             return .{ .kind = kind, .ctx = cursor, .next_batch = FileCursor.next, .deinit_fn = FileCursor.deinit };
         }
-        if (!self.enrichment_columns) if (self.replay) |replay| if (try replay.open(a, binding, self.only_file, cancellation)) |source| return source;
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(a);
         if (self.enrichment_columns) {
@@ -115,9 +115,20 @@ pub const Provider = struct {
         };
         const columns = try names.toOwnedSlice(a);
         errdefer a.free(columns);
+        if (self.replay) |replay| {
+            var projected = binding;
+            projected.column_bindings = columns;
+            if (try replay.openFor(a, projected, self.only_file, cancellation, self.replay_consumer)) |source| {
+                a.free(columns);
+                return source;
+            }
+        }
+        const guard = if (self.replay_consumer != null and self.replay != null) self.replay.?.pipeline else null;
+        if (guard) |pipeline| try pipeline.source_mutex.lock(self.context.io.?);
+        errdefer if (guard) |pipeline| pipeline.source_mutex.unlock(self.context.io.?);
         const state = try a.create(Cursor);
         errdefer a.destroy(state);
-        state.* = .{ .stream = try stream_api.Stream.init(a, self.source, columns, &.{}, self.context, self.limits), .source_columns = columns, .expected_delete_objects = self.expected_delete_objects, .scratch = .init(a), .cancellation = cancellation };
+        state.* = .{ .stream = try stream_api.Stream.init(a, self.source, columns, &.{}, self.context, self.limits), .source_columns = columns, .expected_delete_objects = self.expected_delete_objects, .scratch = .init(a), .cancellation = cancellation, .fallback_guard = guard };
         errdefer state.stream.deinit();
         if (self.statistics) |statistics| {
             const needed = if (self.only_file) |file| statistics.needed(statistics.ptr, file) else true;
@@ -253,6 +264,7 @@ const StatisticsCapture = struct {
     }
 };
 const Cursor = struct {
+    fallback_guard: ?*@import("lake_index_build_pipeline.zig") = null,
     statistics: ?*StatisticsCapture = null,
     stream: stream_api.Stream,
     source_columns: []const []const u8,
@@ -309,6 +321,7 @@ const Cursor = struct {
         const self: *Cursor = @ptrCast(@alignCast(raw));
         if (self.statistics) |statistics| a.destroy(statistics);
         self.stream.deinit();
+        if (self.fallback_guard) |pipeline| pipeline.source_mutex.unlock(pipeline.io);
         self.scratch.deinit();
         a.free(self.source_columns);
         a.destroy(self);

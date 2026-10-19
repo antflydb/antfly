@@ -272,7 +272,7 @@ fn decodeExtendedAlloc(comptime T: type, a: Allocator, header: Header, payload: 
     const count = if (definitions) |index| index.present else rows;
     const data = payload[header.data_payload_offset..];
     const codec = @import("lake_parquet_encoded.zig");
-    var delta: ?codec.Delta = null;
+    var delta: ?codec.DeltaStream = null;
     var strings: ?codec.Strings = null;
     const width: usize = switch (physical) {
         .integer, .number, .fixed => |n| n,
@@ -280,8 +280,8 @@ fn decodeExtendedAlloc(comptime T: type, a: Allocator, header: Header, payload: 
     };
     if (encoding == .delta_binary_packed) {
         if (physical != .integer) return error.UnsupportedParquetPage;
-        delta = try codec.Delta.init(work, data, count, @intCast(width * 8));
-        if (delta.?.consumed != data.len or count > (max_uncompressed_page_bytes -| header.data_payload_offset) / width) return error.InvalidParquetPage;
+        delta = try codec.DeltaStream.init(data, count, @intCast(width * 8));
+        if (count > (max_uncompressed_page_bytes -| header.data_payload_offset) / width) return error.InvalidParquetPage;
     } else if (encoding == .byte_stream_split) {
         if (width == 0 or width > 16 or count > (max_uncompressed_page_bytes -| header.data_payload_offset) / width or data.len != count * width) return error.InvalidParquetPage;
     } else {
@@ -297,7 +297,7 @@ fn decodeExtendedAlloc(comptime T: type, a: Allocator, header: Header, payload: 
     const nulls = if (optional) try a.alloc(u8, rows) else @as([]u8, &.{});
     errdefer a.free(nulls);
     if (T == i64) if (!optional and delta != null) {
-        try delta.?.read(0, values);
+        try delta.?.read(values);
         return .{ .values = values, .nulls = nulls };
     };
     var expanded: usize = header.data_payload_offset;
@@ -324,7 +324,7 @@ fn decodeExtendedAlloc(comptime T: type, a: Allocator, header: Header, payload: 
             expanded += bytes.len + overhead;
             value.* = try a.dupe(u8, bytes);
         } else if (T == i64) {
-            if (delta) |*stream| value.* = try stream.at(position.?) else {
+            if (delta) |*stream| value.* = try stream.next() else {
                 var buffer: [8]u8 = undefined;
                 for (0..width) |byte| buffer[byte] = data[byte * count + position.?];
                 value.* = if (width == 4) std.mem.readInt(i32, buffer[0..4], .little) else std.mem.readInt(i64, &buffer, .little);
@@ -336,6 +336,7 @@ fn decodeExtendedAlloc(comptime T: type, a: Allocator, header: Header, payload: 
         } else unreachable;
         initialized += 1;
     }
+    if (delta) |*stream| try stream.finish();
     return .{ .values = values, .nulls = nulls };
 }
 
@@ -4787,7 +4788,7 @@ test "parquet compact full decode admits final typed vector without a plain stag
     for (expected, 0..) |*value, i| value.* = @intCast(i);
     const encoded = try @import("lake_parquet_encoded.zig").testDelta(a, expected);
     defer a.free(encoded);
-    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 96 * 1024 };
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 64 * 1024 };
     const header: Header = .{ .page_type = .data_page, .encoding = .delta_binary_packed, .compressed_page_size = @intCast(encoded.len), .uncompressed_page_size = @intCast(encoded.len), .value_count = @intCast(expected.len) };
     const values = try decodePlainI64Alloc(budget.allocator(), header, encoded);
     defer budget.allocator().free(values);

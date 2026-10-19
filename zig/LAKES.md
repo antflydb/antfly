@@ -1186,3 +1186,11 @@ reduction trees and ordered file-slot dictionaries (reader protocol 55). Unchang
 branches and file slots survive without rebuilding complete per-index catalogs.
 Older/incomplete seeds reconcile conservatively; dense ordered refreshes retain
 bounded compaction. This changes refresh efficiency without adding SQL options.
+
+Native index publication shares one bounded, delete-aware file replay among
+admitted aggregate, ordered, text and vector builders. Matching file requests
+reuse the typed decode; each builder keeps its own durable checkpoint. Saturated
+scheduling, constrained/opaque allocator chains and oversized replay files retain
+the ordinary bounded construction paths. Full delta integer pages stream directly
+into result vectors with one physical block of scratch; selective reads retain
+random-access navigation.

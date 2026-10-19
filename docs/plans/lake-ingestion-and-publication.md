@@ -2144,3 +2144,47 @@ passed on Zig 0.17.0, and the installed CLI reports its version successfully.
 Repository license/boundary, source catalog, generated engine error catalog,
 formatting and whitespace checks passed. Cache cleanup preserved active caches;
 it did not free enough space to satisfy the public E2E storage floor.
+
+### File-first native publication and sequential delta pages
+
+Native publication admits a bounded cohort of aggregate, ordered, text, sparse,
+and dense builders under the shared scheduler. Consumers announce their next
+source file; the producer captures one delete-aware typed run and releases all
+consumers requesting that file. Canonical census order aligns fresh and delta
+scans without an archive-sized permutation or spool. The run remains pinned until
+all current readers drain. Multiple configurations or divergent resumed plans can
+make additional passes; matching requests in an active cohort share the decode.
+Stored-source and enrichment projections include their full declared dependencies,
+and NUMERIC source contracts preserve exact physical values.
+
+Worker admission completes before any builder starts. Insufficient scheduler or
+known allocator headroom selects ordinary serial construction. Opaque allocator
+chains also retain that path. Oversized replay files use serialized ordinary
+streaming. Workers own independent construction state and share synchronized
+allocation; durable checkpoints serialize through one progress owner. Deadline,
+cancellation and builder failures wake waiting consumers and join workers before
+releasing replay or request memory. The existing publication lease and source cut
+remain authoritative throughout construction and final publication.
+
+Outside a publication cohort, native aggregate leaves run in bounded batches of
+up to eight through the shared scheduler. Each job owns its source stream and exact
+partial state; the coordinator publishes artifacts and changes contribution
+ownership after joining. Both full reconciliation and authenticated deltas use this
+boundary. Within publication, the file producer shares each current run across
+families rather than spawning consumers against conflicting files.
+
+Full DELTA_BINARY_PACKED pages now use a sequential physical cursor with a single
+32-value block. It validates framing and signed wrapping while filling final
+vectors, without allocating random-access checkpoints or decoding their values a
+second time. Selective reads continue using checkpoint navigation. Required integer
+full materialization fits a 64 KiB admission budget for a 64 KiB result. Nullable,
+zero-value and terminal-miniblock framing retain the same validation rules.
+
+Sparse ordered-index construction registers tuple ownership before predicate
+initialization. Its allocation-failure regression fails the first predicate
+allocation after tuple creation and requires leak-free cleanup. Publication
+regressions cover real Parquet files shared by aggregate/ordered/text families,
+partial scheduler admission, working-set admission, oversized-file fallback,
+deadline propagation and concurrent checkpoint persistence. Public HTTP E2Es and
+archive-scale latency/RSS measurements remain subject to their existing
+qualification requirements.

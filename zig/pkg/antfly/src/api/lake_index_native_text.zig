@@ -934,7 +934,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const old = try loadRecordedFile(file_arena.allocator(), store.*, record, seed.?.domain, cancellation);
             for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
         };
-        var planned_files = plan.iterator(paged_seed or (baseline != null and reference_seed));
+        var planned_files = plan.scanIterator(paged_seed or (baseline != null and reference_seed));
         // Paged seeds need only changed files; legacy imports stream their full state once.
         while (try planned_files.next()) |planned| {
             const file = planned.file;

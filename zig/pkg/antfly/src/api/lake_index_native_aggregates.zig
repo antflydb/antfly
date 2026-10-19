@@ -108,6 +108,8 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
     } else false;
     if (!has_algebraic) return .{ .declarations = &.{}, .contributions = &.{} };
     const io = provider.context.io orelse return error.UnsupportedSqlExecution;
+    try source.ensureInventory(provider.context);
+    try source.ensureCanonicalPlan(provider.context);
     var schemas = @import("sql_schema_cache.zig").Cache.init(a);
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, ca, table.schema_json, table.table_id, table.name);
@@ -243,6 +245,24 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                     }
                     const leaves = try ca.alloc(Reduction.Leaf, file_keys.?.len);
                     for (file_keys.?, leaves, 0..) |key, *leaf, index| leaf.* = .{ .key = key, .index = index };
+                    var scan_order = @import("lake_index_native_state.zig").ScanOrder.init(&native_provider);
+                    var pending: [8]Reduction.Leaf = undefined;
+                    var count: usize = 0;
+                    while (try scan_order.next()) |ordinal| {
+                        pending[count] = leaves[ordinal];
+                        count += 1;
+                        if (count == pending.len) {
+                            const resolved = try resolver.resolveBatch(pending[0..count]);
+                            for (resolved) |leaf| leaves[leaf.index] = leaf;
+                            out.free(resolved);
+                            count = 0;
+                        }
+                    }
+                    if (count != 0) {
+                        const resolved = try resolver.resolveBatch(pending[0..count]);
+                        for (resolved) |leaf| leaves[leaf.index] = leaf;
+                        out.free(resolved);
+                    }
                     std.mem.sort(Reduction.Leaf, leaves, {}, struct {
                         fn less(_: void, left: Reduction.Leaf, right: Reduction.Leaf) bool {
                             return std.mem.order(u8, &left.key, &right.key) == .lt;
@@ -263,7 +283,15 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                 stream.schema_contract = native_provider.schema_contract;
                 stream.identity_only = true;
                 try group.addGlobalCount((try stream.countAll()) orelse return error.UnsupportedExternalLakeIndex);
-            } else try consumeCohort(a, &native_provider, binding, recipe, group, &budget, cancellation);
+            } else {
+                if (native_provider.replay_consumer != null) {
+                    var scan = try @import("lake_index_native_state.zig").Plan.init(a, ca, &native_provider, &.{});
+                    defer scan.deinit();
+                    native_provider.only_plan = &scan;
+                    defer native_provider.only_plan = null;
+                    try consumeCohort(a, &native_provider, binding, recipe, group, &budget, cancellation);
+                } else try consumeCohort(a, &native_provider, binding, recipe, group, &budget, cancellation);
+            }
             const published = try artifacts.publishCohort(a, out, store, names, group, recipe, cancellation);
             for (published, names, cohort.items) |artifact, name, index| {
                 var slot_binding = binding;
@@ -338,6 +366,7 @@ const LeafResolver = struct {
         a: A,
         spill: local.sql_spill.Manager = undefined,
         group: ?*operators.Grouped = null,
+        source: ?local.serverless_query_lake_serving.ServingSource = null,
         budget: *@import("../serverless/build/lake_build_limits.zig").Budget,
         fn run(self: *@This()) anyerror!void {
             const owner = self.resolver;
@@ -348,6 +377,13 @@ const LeafResolver = struct {
             self.group = try operators.Grouped.create(self.a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = &self.spill });
             if (owner.recipe.keys.len == 0) try self.group.?.ensureGlobalGroup();
             var provider = owner.provider.*;
+            provider.source = &self.source.?;
+            // Parallel file jobs have independent streams. A publication's
+            // file rendezvous instead shares its one pinned run across families.
+            provider.replay = null;
+            provider.replay_consumer = null;
+            provider.only_plan = null;
+            provider.only_files = null;
             provider.only_file = self.leaf.index;
             try consumeCohort(self.a, &provider, owner.binding, owner.recipe, self.group.?, self.budget, owner.cancellation);
         }
@@ -358,6 +394,7 @@ const LeafResolver = struct {
         fn deinit(self: *@This()) void {
             if (self.group) |group| group.deinit();
             self.spill.deinit();
+            if (self.source) |*source| source.closeParallelView(self.resolver.source);
         }
     };
     fn present(self: *@This(), leaf: Reduction.Leaf) !bool {
@@ -376,7 +413,7 @@ const LeafResolver = struct {
     /// artifacts and changing contribution ownership remain coordinator work.
     fn resolveParallel(self: *@This(), leaves: []const Reduction.Leaf) ![]const Reduction.Leaf {
         const io = self.provider.context.io.?;
-        const replay = self.provider.replay orelse return leaves;
+        if (self.provider.replay_consumer != null) return leaves;
         if (leaves.len < 2 or leaves.len > 8 or self.metadata_count) return leaves;
         var needed: [8]bool = @splat(false);
         var count: usize = 0;
@@ -385,9 +422,6 @@ const LeafResolver = struct {
             count += @intFromBool(needed[i]);
         }
         if (count < 2) return leaves;
-        // Freeze the replay before any worker can borrow a per-file reader.
-        const input = (try replay.open(self.a, self.binding, null, self.cancellation)) orelse return leaves;
-        input.deinit(self.a);
         var locked: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = self.a };
         var jobs: [8]Job = undefined;
         var tasks: [8]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
@@ -403,6 +437,7 @@ const LeafResolver = struct {
             // Initialize even when a task is canceled before its first call.
             jobs[i].spill = .{ .alloc = locked.allocator(), .io = io, .context = &self.provider.context, .checkpoint = Job.check, .async_writes = false };
             initialized[i] = true;
+            jobs[i].source = try self.source.parallelView(locked.allocator());
             tasks[i] = local.sql_parallel_scheduler.global().submit(io, 8 * 1024 * 1024, Job.run, .{&jobs[i]});
             if (tasks[i] == null) try jobs[i].run();
         };
@@ -412,6 +447,13 @@ const LeafResolver = struct {
         for (leaves, resolved, 0..) |leaf, *result, i| {
             result.* = if (leaf.refs.len != 0) leaf else try self.resolveWithPartial(leaf, if (needed[i]) jobs[i].group else null);
         }
+        return resolved;
+    }
+    fn resolveBatch(self: *@This(), leaves: []const Reduction.Leaf) ![]const Reduction.Leaf {
+        const prepared = try self.resolveParallel(leaves);
+        if (prepared.ptr != leaves.ptr) return prepared;
+        const resolved = try self.out.alloc(Reduction.Leaf, leaves.len);
+        for (leaves, resolved) |leaf, *target| target.* = if (leaf.refs.len != 0) leaf else try self.resolve(leaf);
         return resolved;
     }
     fn resolve(self: *@This(), leaf: Reduction.Leaf) !Reduction.Leaf {
@@ -681,10 +723,22 @@ const Reduction = struct {
         var plan = try @import("lake_index_native_state.zig").Plan.fromDelta(self.a, self.out, delta);
         defer plan.deinit();
         var iterator = plan.iterator(true);
+        var pending: [8]Leaf = undefined;
+        var count: usize = 0;
         while (try iterator.next()) |item| {
-            const key = fileIdentity(provider.source, provider.source.inventory.files[item.ordinal]);
-            const leaf = try self.resolver.?.resolve(.{ .key = key, .index = item.ordinal });
-            try changes.put(self.a, key, leaf);
+            pending[count] = .{ .key = fileIdentity(provider.source, provider.source.inventory.files[item.ordinal]), .index = item.ordinal };
+            count += 1;
+            if (count == pending.len) {
+                const resolved = try self.resolver.?.resolveBatch(pending[0..count]);
+                for (resolved) |leaf| try changes.put(self.a, leaf.key, leaf);
+                self.out.free(resolved);
+                count = 0;
+            }
+        }
+        if (count != 0) {
+            const resolved = try self.resolver.?.resolveBatch(pending[0..count]);
+            for (resolved) |leaf| try changes.put(self.a, leaf.key, leaf);
+            self.out.free(resolved);
         }
         const batch = try self.out.alloc(Mutation, changes.count());
         var entries = changes.iterator();

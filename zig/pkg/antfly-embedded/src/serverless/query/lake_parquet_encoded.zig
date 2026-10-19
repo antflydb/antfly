@@ -176,6 +176,95 @@ pub const Delta = struct {
         for (keep, matches[0..keep.len]) |*active, matched| active.* = active.* and matched;
     }
 };
+/// Sequential full-page decoder. Holds only one decoded physical block and
+/// borrows miniblock framing; no random-access checkpoints or second decode.
+pub const DeltaStream = struct {
+    reader: Reader,
+    count: usize,
+    bits: u8,
+    first: i64 = 0,
+    block_size: usize = 0,
+    minis: usize = 0,
+    widths: []const u8 = &.{},
+    mini: usize = 0,
+    minimum: i64 = 0,
+    data: []const u8 = &.{},
+    width: u8 = 0,
+    offset: usize = 0,
+    remaining: usize = 0,
+    emitted: usize = 0,
+    predecessor: i64 = 0,
+    buffer: [32]i64 = undefined,
+    position: usize = 0,
+    length: usize = 0,
+    pub fn init(bytes: []const u8, count: usize, bits: u8) !DeltaStream {
+        if (bits != 32 and bits != 64) return error.InvalidParquetPage;
+        var self: DeltaStream = .{ .reader = .{ .bytes = bytes }, .count = count, .bits = bits };
+        if (count == 0 and bytes.len == 0) return self;
+        const block = try self.reader.unsigned();
+        const minis = try self.reader.unsigned();
+        const total = try self.reader.unsigned();
+        if (block == 0 or block > 1024 * 1024 or block % 128 != 0 or minis == 0 or minis > block / 32 or block % minis != 0 or (block / minis) % 32 != 0 or total != count) return error.InvalidParquetPage;
+        self.first = try self.reader.signed();
+        if (bits == 32 and std.math.cast(i32, self.first) == null) return error.InvalidParquetPage;
+        self.block_size = @intCast(block);
+        self.minis = @intCast(minis);
+        self.predecessor = self.first;
+        return self;
+    }
+    fn refill(self: *DeltaStream) !bool {
+        if (self.emitted == self.count) return false;
+        self.position = 0;
+        if (self.emitted == 0) {
+            self.buffer[0] = self.first;
+            self.emitted = 1;
+            self.length = 1;
+            return true;
+        }
+        if (self.remaining == 0) {
+            if (self.mini == self.widths.len) {
+                self.minimum = try self.reader.signed();
+                self.widths = try self.reader.take(self.minis);
+                self.mini = 0;
+            }
+            self.width = self.widths[self.mini];
+            self.mini += 1;
+            if (self.width > self.bits) return error.InvalidParquetPage;
+            const size = self.block_size / self.minis;
+            self.data = try self.reader.take(size * self.width / 8);
+            self.remaining = @min(size, self.count - self.emitted);
+            self.offset = 0;
+        }
+        self.length = @min(32, self.remaining);
+        const decoder: Delta = .{ .bits = self.bits, .first = self.first, .count = self.count, .checkpoints = &.{}, .consumed = 0 };
+        self.buffer = decoder.decode(.{ .base = self.predecessor, .minimum = self.minimum, .bytes = self.data, .offset = self.offset, .width = self.width, .count = self.length });
+        self.predecessor = self.buffer[self.length - 1];
+        self.offset += self.length;
+        self.remaining -= self.length;
+        self.emitted += self.length;
+        return true;
+    }
+    pub fn next(self: *DeltaStream) !i64 {
+        if (self.position == self.length and !try self.refill()) return error.InvalidParquetPage;
+        const value = self.buffer[self.position];
+        self.position += 1;
+        return value;
+    }
+    pub fn finish(self: *const DeltaStream) !void {
+        if (self.emitted != self.count or self.position != self.length or self.reader.offset != self.reader.bytes.len) return error.InvalidParquetPage;
+    }
+    pub fn read(self: *DeltaStream, output: []i64) !void {
+        var position: usize = 0;
+        while (position < output.len) {
+            if (self.position == self.length and !try self.refill()) return error.InvalidParquetPage;
+            const n = @min(output.len - position, self.length - self.position);
+            @memcpy(output[position..][0..n], self.buffer[self.position..][0..n]);
+            position += n;
+            self.position += n;
+        }
+        try self.finish();
+    }
+};
 /// Delta lengths borrow suffix bytes. Prefix compression reconstructs only
 /// demanded strings and reuses previously demanded immutable prefixes.
 /// Metadata and reconstructed values belong to the caller's arena.
@@ -401,9 +490,39 @@ test "parquet compact vector INT32 constant deltas wrap in their physical width"
     var delta = try Delta.init(arena.allocator(), &.{ 128, 1, 4, 36, 254, 255, 255, 255, 15, 2, 0, 0, 0, 0 }, 36, 32);
     var values: [36]i64 = undefined;
     try delta.read(0, &values);
+    var sequential = try DeltaStream.init(&.{ 128, 1, 4, 36, 254, 255, 255, 255, 15, 2, 0, 0, 0, 0 }, 36, 32);
+    var streamed: [36]i64 = undefined;
+    try sequential.read(&streamed);
+    try std.testing.expectEqualSlices(i64, &values, &streamed);
     for (values, 0..) |value, i| {
         const expected: i32 = @bitCast(@as(u32, std.math.maxInt(i32)) +% @as(u32, @intCast(i)));
         try std.testing.expectEqual(@as(i64, expected), value);
         try std.testing.expectEqual(value, try delta.at(i));
     }
+}
+
+test "parquet sequential delta decoding shares kernels without allocating checkpoints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var values: [577]i64 = undefined;
+    values[0] = std.math.maxInt(i64);
+    for (1..values.len) |i| values[i] = values[i - 1] +% @as(i64, @intCast(i % 11)) -% 6;
+    const bytes = try testDelta(a, &values);
+    var stream = try DeltaStream.init(bytes, values.len, 64);
+    var actual: [577]i64 = undefined;
+    try stream.read(&actual);
+    try std.testing.expectEqualSlices(i64, &values, &actual);
+    stream = try DeltaStream.init(bytes, values.len, 64);
+    for (values) |expected| try std.testing.expectEqual(expected, try stream.next());
+    try stream.finish();
+    try std.testing.expectError(error.InvalidParquetPage, stream.next());
+    stream = try DeltaStream.init(bytes[0 .. bytes.len - 1], values.len, 64);
+    try std.testing.expectError(error.InvalidParquetPage, stream.read(&actual));
+    stream = try DeltaStream.init(&.{ 128, 1, 4, 2, 0, 2, 0, 255, 7, 1 }, 2, 64);
+    try std.testing.expectEqual(@as(i64, 0), try stream.next());
+    try std.testing.expectEqual(@as(i64, 1), try stream.next());
+    try stream.finish();
+    stream = try DeltaStream.init(&.{ 128, 1, 4, 0, 0, 1 }, 0, 64);
+    try std.testing.expectError(error.InvalidParquetPage, stream.finish());
 }

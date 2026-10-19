@@ -214,6 +214,27 @@ pub fn canUseDelta(provider: *Provider, snapshot: []const u8) bool {
     if (delta.selection == null) return false;
     return if (delta.prior_snapshot) |prior| std.mem.eql(u8, snapshot, prior) else false;
 }
+pub const ScanOrder = struct {
+    sparse: ?Selection.Iterator = null,
+    count: usize,
+    position: usize = 0,
+    pub fn init(provider: *Provider) ScanOrder {
+        var order: ScanOrder = .{ .count = provider.source.inventory.files.len };
+        if (provider.native_delta) |delta| if (delta.selection) |selected| {
+            var all = selected;
+            all.unchanged = .empty;
+            order.sparse = all.iterator();
+        };
+        return order;
+    }
+    pub fn next(self: *ScanOrder) !?usize {
+        if (self.sparse) |*iterator_| return if (try iterator_.next()) |item| item.ordinal else null;
+        if (self.position == self.count) return null;
+        const ordinal = self.position;
+        self.position += 1;
+        return ordinal;
+    }
+};
 pub const Plan = struct {
     a: A,
     files: []File = &.{},
@@ -309,6 +330,11 @@ pub const Plan = struct {
         var selection = self.selection;
         if (self.force_all and selection != null) selection.?.unchanged = .empty;
         return .{ .plan = self, .changed_only = changed_only, .sparse = if (changed_only and selection != null) selection.?.iterator() else null };
+    }
+    pub fn scanIterator(self: *const Plan, changed_only: bool) Iterator {
+        var selected = self.selection orelse return self.iterator(changed_only);
+        if (!changed_only or self.force_all) selected.unchanged = .empty;
+        return .{ .plan = self, .changed_only = changed_only, .sparse = selected.iterator() };
     }
     pub fn publishDirectory(self: *Plan, a: A, store: *stores.ArtifactStore, domain: [32]u8, token: Cancellation) !?@import("../serverless/graph_segment/page_tree.zig").Ref {
         const tree = @import("../serverless/graph_segment/page_tree.zig");

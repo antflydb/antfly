@@ -41,17 +41,21 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
     const ca = arena.allocator();
     var names: std.StringHashMapUnmanaged(void) = .empty;
     defer names.deinit(a);
+    const configs = try std.json.parseFromSliceLeaky(std.json.Value, ca, table.indexes_json, .{});
     var consumers: usize = 0;
     for (desired.artifacts) |artifact| {
         consumers += 1;
         if (artifact.kind == .text_segment) {
             const config = try std.json.parseFromSliceLeaky(std.json.Value, ca, artifact.build_spec.?.text.config_json, .{});
             const field = config.object.get("field");
-            if (field == null or field.? != .string) {
+            if (field == null or field.? != .string or try @import("lake_index_native_text.zig").storesSource(config)) {
                 for (schema.relational_columns) |column| try names.put(a, column.name, {});
                 continue;
             }
         }
+        if (artifact.kind == .vector_segment or artifact.kind == .sparse_segment) if (configs.object.get(artifact.name)) |config| {
+            if (@import("lake_enrichment_units.zig").configured(config, "template") != null) for (schema.relational_columns) |column| try names.put(a, column.name, {});
+        };
         for (artifact.binding.column_bindings) |column| try names.put(a, column, {});
     }
     if (try parsed.relationalIndexDefinitions(ca)) |indexes| for (indexes) |index| {
@@ -68,7 +72,7 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
     };
     // Contract binds nullable/missing columns across heterogeneous Parquet files.
     const contract = try out.alloc(local.serverless_query_lake_schema.Column, schema.relational_columns.len);
-    for (contract, schema.relational_columns) |*column, definition| column.* = .{ .name = try out.dupe(u8, definition.path), .kind = @tagName(definition.column_type), .required = definition.required and !definition.allows_null };
+    for (contract, schema.relational_columns) |*column, definition| column.* = .{ .name = try out.dupe(u8, definition.path), .kind = if (definition.sql_element_type == .numeric) "numeric" else @tagName(definition.column_type), .required = definition.required and !definition.allows_null };
     provider.schema_contract = contract;
     provider.replay_recommended = consumers >= 2;
     if (consumers == 0 or names.count() == 0) return &.{};
@@ -235,6 +239,8 @@ pub const Replay = struct {
     kinds: []rows.ColumnKind = &.{},
     range: Range = .{ .begin = .{ .row = 0, .byte = 0 }, .end = 0 },
     ready: bool = false,
+    captures: usize = 0,
+    pipeline: ?*@import("lake_index_build_pipeline.zig") = null,
     captured_file: ?usize = null,
     readers: usize = 0,
     mutex: std.Io.Mutex = .init,
@@ -256,6 +262,12 @@ pub const Replay = struct {
     fn check(raw: *anyopaque) !void {
         const self: *Replay = @ptrCast(@alignCast(raw));
         try self.provider.context.ensureActive();
+        if (self.pipeline) |pipeline| try pipeline.check();
+    }
+    fn captureCheckpoint(raw: *anyopaque) !void {
+        const self: *Replay = @ptrCast(@alignCast(raw));
+        if (self.provider.context.additional_checkpoint) |hook| try hook.check(hook.ptr);
+        if (self.pipeline) |pipeline| try pipeline.check();
     }
     fn capture(self: *Replay, a: A, original: Binding, file_index: usize, cancellation: Cancellation) !void {
         if (self.ready and self.captured_file == file_index) return;
@@ -282,6 +294,8 @@ pub const Replay = struct {
         if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
         var input = self.provider.*;
         input.replay = null;
+        input.replay_consumer = null;
+        if (self.pipeline != null) input.context.additional_checkpoint = .{ .ptr = self, .check = captureCheckpoint };
         input.only_file = file_index;
         input.only_files = null;
         input.only_plan = null;
@@ -355,6 +369,7 @@ pub const Replay = struct {
         self.range.end = self.run.?.size;
         try self.run.?.seal();
         self.ready = true;
+        self.captures += 1;
     }
     const CaptureBatch = struct {
         vectors: []const rows.ColumnVector,
@@ -386,22 +401,13 @@ pub const Replay = struct {
             } };
         }
     };
-    pub fn open(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation) !?rows.Source {
-        for (binding.column_bindings) |name| {
-            const present = for (self.columns) |column| {
-                if (std.mem.eql(u8, name, column)) break true;
-            } else false;
-            if (!present) return null;
-        }
-        const file_index = only_file orelse return null;
-        const io = self.provider.context.io orelse return null;
+    pub fn prepare(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation) !bool {
+        const io = self.provider.context.io orelse return false;
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
-        if (self.readers != 0 and self.captured_file != file_index) return null;
-        if (self.only_files) |needed| {
-            if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
-            if (!needed.contains(file_index)) return null;
-        }
+        return self.captureAdmitted(a, binding, file_index, cancellation);
+    }
+    fn captureAdmitted(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation) !bool {
         // Oversized individual files retain the ordinary streaming path. The
         // replay optimization must never make an otherwise valid scan fail.
         self.capture(a, binding, file_index, cancellation) catch |err| switch (err) {
@@ -413,17 +419,45 @@ pub const Replay = struct {
                 }
                 _ = self.arena.reset(.free_all);
                 self.ready = false;
-                return null;
+                return false;
             },
             else => return err,
         };
+        return true;
+    }
+    pub fn open(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation) !?rows.Source {
+        return self.openFor(a, binding, only_file, cancellation, null);
+    }
+    pub fn openFor(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation, consumer: ?usize) !?rows.Source {
+        for (binding.column_bindings) |name| {
+            const present = for (self.columns) |column| {
+                if (std.mem.eql(u8, name, column)) break true;
+            } else false;
+            if (!present) return null;
+        }
+        const file_index = only_file orelse return null;
+        if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
+        if (consumer) |slot| if (self.pipeline) |pipeline| {
+            if (!try pipeline.request(slot, file_index, cancellation)) return null;
+        };
+        const io = self.provider.context.io orelse return null;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (self.readers != 0 and self.captured_file != file_index) return null;
+        if (consumer == null) if (self.only_files) |needed| {
+            if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
+            if (!needed.contains(file_index)) return null;
+        };
+        if (!try self.captureAdmitted(a, binding, file_index, cancellation)) return null;
         const range: Range = if (only_file) |file| blk: {
             if (file != self.captured_file) return error.SidecarSourceBindingMismatch;
             break :blk self.range;
         } else .{ .begin = .{ .row = 0, .byte = 0 }, .end = self.run.?.size };
+        const columns = try a.dupe([]const u8, binding.column_bindings);
+        errdefer a.free(columns);
         const cursor = try a.create(Cursor);
         errdefer a.destroy(cursor);
-        cursor.* = .{ .owner = self, .reader = try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = binding.column_bindings, .cancellation = cancellation };
+        cursor.* = .{ .owner = self, .reader = try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = columns, .cancellation = cancellation };
         self.readers += 1;
         return .{ .kind = binding.source_kind, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
     }
@@ -443,6 +477,7 @@ pub const Replay = struct {
             self.owner.readers -= 1;
             self.owner.mutex.unlock(io);
             self.arena.deinit();
+            a.free(self.columns);
             a.destroy(self);
         }
         fn next(raw: *anyopaque, _: A) !?rows.ColumnBatch {
