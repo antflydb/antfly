@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../specs/openapi/antfly/query.yaml
+//go:generate python3 ../../../../scripts/generate_go_sdk.py --config=cfg.yaml ../../../../specs/openapi/antfly/query.yaml
 //go:generate python3 ../../../../scripts/license_headers.py --group apache query.gen.go
 package query
 

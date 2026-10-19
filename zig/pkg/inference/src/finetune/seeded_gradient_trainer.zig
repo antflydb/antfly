@@ -150,9 +150,7 @@ const CombinedControl = struct {
         // Both full controls remain borrowed until every synchronous binding
         // operation/guard completes. Retain their worker/IO carrier as well as
         // callbacks: process-required primitives must still arm the watchdog.
-        result.ptr = self;
-        result.check_fn = checkBoth;
-        return result;
+        return result.withCheckpoint(self, checkBoth);
     }
 };
 

@@ -71,6 +71,12 @@ jobs:
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
   zig:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'zig') || contains(fromJSON(needs.approve.outputs.suites), 'full')
     uses: ./.github/workflows/zig-tests.yml

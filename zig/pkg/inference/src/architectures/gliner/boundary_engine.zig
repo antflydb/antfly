@@ -367,9 +367,7 @@ const CombinedControl = struct {
         if (result.hard_cancellation == null) if (self.first) |first| {
             result.hard_cancellation = first.hard_cancellation;
         };
-        result.ptr = self;
-        result.check_fn = checkBoth;
-        return result;
+        return result.withCheckpoint(self, checkBoth);
     }
 };
 

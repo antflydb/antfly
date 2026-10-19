@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../specs/openapi/shared/chunking.yaml
+//go:generate python3 ../../../../scripts/generate_go_sdk.py --config=cfg.yaml ../../../../specs/openapi/shared/chunking.yaml
 //go:generate python3 ../../../../scripts/license_headers.py --group apache openapi.gen.go
 package chunking
 

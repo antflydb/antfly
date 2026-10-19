@@ -5,7 +5,9 @@ description: Use macOS native OCR, file transcription, and Apple Intelligence te
 
 Antfly's opt-in `apple` provider uses Vision for OCR, SpeechAnalyzer for file
 transcription, and Foundation Models for on-device text generation. All three
-use one build flag, `-Dapple-providers=true`, and task-specific native APIs.
+use task-specific native APIs. macOS server release archives include Vision OCR.
+For source builds, `-Dapple-ocr=true` enables OCR alone;
+`-Dapple-providers=true` also enables generation and transcription.
 They have independent availability: working OCR or transcription does not imply
 that the Apple Intelligence generation model is ready.
 

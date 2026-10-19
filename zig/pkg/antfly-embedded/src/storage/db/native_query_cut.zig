@@ -141,7 +141,7 @@ pub fn lock(a: A, io: std.Io, db_path: []const u8, cancellation: Cancellation) !
 }
 /// Invalid local generation metadata is disposable, but active local readers
 /// still own their files. Call while holding the parent publication guard.
-fn discardInvalidCache(a: A, io: std.Io, parent: []const u8, id: []const u8, root: []const u8) !void {
+pub fn discardInvalidCache(a: A, io: std.Io, parent: []const u8, id: []const u8, root: []const u8) !void {
     const lease_path = try std.fmt.allocPrint(a, "{s}/{s}.lease", .{ parent, id });
     defer a.free(lease_path);
     const lease = try std.Io.Dir.cwd().createFile(io, lease_path, .{ .truncate = false });

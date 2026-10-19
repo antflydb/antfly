@@ -120,6 +120,7 @@ check_sdk_impl() {
   check_typescript
 
   section "Checking the Go SDK"
+  "$policy_python" -m unittest discover -s "$repo_root/scripts" -p test_generate_go_sdk.py
   (
     cd "$repo_root/go/pkg/sdk"
     GOWORK=off go generate ./...

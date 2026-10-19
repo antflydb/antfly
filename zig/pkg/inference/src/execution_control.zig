@@ -14,6 +14,9 @@
 // limitations under the License.
 
 const std = @import("std");
+const CheckBoundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct {
+    check_fn: *const fn (?*anyopaque) anyerror!void,
+});
 const platform_time = @import("antfly_platform").time;
 
 /// Stable phases shared by API, enrichment, model loading, pipelines, and
@@ -72,12 +75,13 @@ pub const MonitorControl = struct {
     cancellation_grace_ns: ?u64 = null,
     ptr: ?*anyopaque = null,
     check_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    check_dispatch: CheckBoundary.Dispatch = CheckBoundary.local_dispatch,
 
     pub fn check(self: MonitorControl) !void {
         if (self.deadline_ns) |deadline_ns| {
             if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         }
-        if (self.check_fn) |check_fn| try check_fn(self.ptr);
+        if (self.check_fn) |check_fn| try CheckBoundary.call("check_fn", self.check_dispatch, check_fn, .{self.ptr});
         if (self.cancellation) |token| {
             if (token.isCancelled()) return error.Cancelled;
         }
@@ -130,6 +134,7 @@ pub const InferenceExecutionControl = struct {
     progress: ?ProgressSink = null,
     ptr: ?*anyopaque = null,
     check_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    check_dispatch: CheckBoundary.Dispatch = CheckBoundary.local_dispatch,
     /// Present only inside a worker process whose parent owns restart. It is
     /// deliberately request-scoped; a boolean "running out of process" flag
     /// cannot notice that one particular request was cancelled while blocked
@@ -152,8 +157,19 @@ pub const InferenceExecutionControl = struct {
         return .{ .context = self, .check_fn = Adapter.check };
     }
 
+    /// Replace a checkpoint in this compilation unit while retaining the
+    /// request's IO, watchdog, deadline and progress capabilities. A callback
+    /// and its error-domain dispatcher must always change together.
+    pub fn withCheckpoint(self: InferenceExecutionControl, ptr: ?*anyopaque, callback: *const fn (?*anyopaque) anyerror!void) InferenceExecutionControl {
+        var result = self;
+        result.ptr = ptr;
+        result.check_fn = callback;
+        result.check_dispatch = CheckBoundary.local_dispatch;
+        return result;
+    }
+
     pub fn check(self: InferenceExecutionControl) !void {
-        if (self.check_fn) |check_fn| try check_fn(self.ptr);
+        if (self.check_fn) |check_fn| try CheckBoundary.call("check_fn", self.check_dispatch, check_fn, .{self.ptr});
         if (self.cancellation) |token| {
             if (token.isCancelled()) return error.Cancelled;
         }
@@ -220,6 +236,7 @@ pub const InferenceExecutionControl = struct {
                 .cancellation_grace_ns = self.cancellation_grace_ns,
                 .ptr = self.ptr,
                 .check_fn = self.check_fn,
+                .check_dispatch = self.check_dispatch,
             }),
         };
     }
@@ -291,4 +308,24 @@ test "native call policy is scoped to the execution control" {
         }
     }.check };
     try std.testing.expectError(error.Cancelled, cancelled.check());
+}
+
+test "execution control checkpoint replacement preserves carrier and resets foreign dispatch" {
+    const abi = @import("antfly_runtime_abi");
+    const Foreign = struct {
+        fn dispatch(_: *const abi.native_abi.CallContract, _: *const anyopaque, _: *const anyopaque, _: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return abi.error_abi.statusFromError(error.DeadlineExceeded);
+        }
+        fn stop(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    const original: InferenceExecutionControl = .{ .io = std.testing.io, .check_fn = Foreign.stop, .check_dispatch = Foreign.dispatch, .deadline_ns = std.math.maxInt(u64), .native_call_policy = .in_process, .cancellation_grace_ns = 99 };
+    try std.testing.expectError(error.DeadlineExceeded, original.check());
+    const rebound = original.withCheckpoint(null, Foreign.stop);
+    try std.testing.expectError(error.Cancelled, rebound.check());
+    try std.testing.expectEqual(original.io.?.userdata, rebound.io.?.userdata);
+    try std.testing.expectEqual(original.deadline_ns, rebound.deadline_ns);
+    try std.testing.expectEqual(original.native_call_policy, rebound.native_call_policy);
+    try std.testing.expectEqual(original.cancellation_grace_ns, rebound.cancellation_grace_ns);
 }

@@ -98,6 +98,18 @@ pub const Scheduler = struct {
         self.clearCursor(alloc);
         self.cursor = .{ .authority = authority, .document = owned_document };
     }
+    /// Coverage-only owners have no dispatch cursor. Keep productive census
+    /// and witness pages runnable; only an unresolved full sweep needs backoff.
+    pub fn completeReadinessPage(self: *Scheduler, alloc: std.mem.Allocator, pending: bool, progressed: bool, now_ns: u64) void {
+        self.completeWorkPage(alloc, true, false, .{ .pending = pending, .progressed = progressed }, now_ns);
+    }
+    /// Readiness backoff must not suppress runnable dispatch, native verification,
+    /// or an unfinished retry round sharing this maintenance owner.
+    pub fn completeWorkPage(self: *Scheduler, alloc: std.mem.Allocator, at_end: bool, more_dispatch: bool, readiness: struct { pending: bool, progressed: bool }, now_ns: u64) void {
+        self.completePage(alloc, at_end, more_dispatch or readiness.pending, now_ns);
+        if (readiness.pending and !readiness.progressed and at_end and !more_dispatch and self.retry_round == null)
+            self.retry_after_ns.store(now_ns +| poll_interval_ns, .release);
+    }
     pub fn completePage(self: *Scheduler, alloc: std.mem.Allocator, at_end: bool, more_dispatch: bool, now_ns: u64) void {
         if (at_end) {
             self.clearCursor(alloc);
@@ -217,4 +229,25 @@ test "producer scheduler rechecks backoff after admission handoff" {
     fixture.now_ns = deadline;
     try std.testing.expectError(error.Refused, scheduler.advance(fixture.port()));
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "producer scheduler coverage makes progress without spinning on unresolved witnesses" {
+    var scheduler: Scheduler = .{};
+    defer scheduler.deinit(std.testing.allocator);
+    scheduler.completeReadinessPage(std.testing.allocator, true, true, 10);
+    try std.testing.expect(scheduler.active(10));
+    scheduler.completeReadinessPage(std.testing.allocator, true, false, 10);
+    try std.testing.expect(!scheduler.active(10));
+    try std.testing.expect(scheduler.active(10 + Scheduler.poll_interval_ns));
+    scheduler.completeWorkPage(std.testing.allocator, true, true, .{ .pending = true, .progressed = false }, 20);
+    try std.testing.expect(scheduler.active(20));
+    var authority: publication.Authority = undefined;
+    @memset(std.mem.asBytes(&authority), 0);
+    scheduler.startRound(authority, 1);
+    scheduler.noteRetryProgress(false);
+    scheduler.completeWorkPage(std.testing.allocator, true, false, .{ .pending = true, .progressed = false }, 20);
+    try std.testing.expect(scheduler.active(20));
+    scheduler.retry_round = null;
+    scheduler.completeReadinessPage(std.testing.allocator, false, false, 20);
+    try std.testing.expect(!scheduler.active(20 + Scheduler.poll_interval_ns));
 }

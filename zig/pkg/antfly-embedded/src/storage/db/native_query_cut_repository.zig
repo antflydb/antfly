@@ -35,7 +35,8 @@ pub const WarmResult = struct { complete: bool, proof: ?ReuseProof = null };
 pub const VTable = struct {
     publish: *const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation) anyerror!void,
     recover: *const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation) anyerror!void,
-    open_read: ?*const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation) anyerror!StorageLease = null,
+    /// Null selects local recovery for this generation; a lease selects lazy reads.
+    open_read: ?*const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation) anyerror!?StorageLease = null,
     warm: ?*const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation, u64) anyerror!bool = null,
     can_evict: ?*const fn (*anyopaque, Executor, []const u8, Request, Namespace, u64, Cancellation) anyerror!bool = null,
     reference: ?*const fn (*anyopaque, Executor, Request, Namespace, Storage, Cancellation) anyerror!bool = null,

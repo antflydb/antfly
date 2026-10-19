@@ -99,3 +99,36 @@ export fn runtime_io_abi_test_retained_source(output: *retained_io.Storage.Lease
     output.* = reader.lease();
     return .ok;
 }
+
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+var checkpoint_error: u8 = 0;
+fn checkpointFailure(_: *const anyopaque) !void {
+    return switch (checkpoint_error) {
+        0 => error.DeadlineExceeded,
+        1 => error.SessionLeaseLost,
+        2 => error.ConnectionRefused,
+        else => error.Canceled,
+    };
+}
+export fn runtime_io_abi_test_checkpoint(output: *CancellationToken, failure: u8) callconv(.c) void {
+    checkpoint_error = failure;
+    output.* = .{ .ptr = &checkpoint_error, .check_fn = checkpointFailure };
+}
+export fn runtime_io_abi_test_consume_checkpoint(token: *const CancellationToken) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    token.check() catch |err| return @import("antfly_runtime_abi").error_abi.statusFromError(err);
+    return .ok;
+}
+
+const InferenceControl = @import("inference_checkpoint_control").InferenceExecutionControl;
+fn inferenceCheckpoint(_: ?*anyopaque) !void {
+    if (checkpoint_error == 4) return;
+    try checkpointFailure(&checkpoint_error);
+}
+export fn runtime_io_abi_test_inference_control(output: *InferenceControl, failure: u8) callconv(.c) void {
+    checkpoint_error = failure;
+    output.* = .{ .check_fn = inferenceCheckpoint };
+}
+export fn runtime_io_abi_test_consume_inference_control(control: *const InferenceControl) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    control.check() catch |err| return @import("antfly_runtime_abi").error_abi.statusFromError(err);
+    return .ok;
+}
