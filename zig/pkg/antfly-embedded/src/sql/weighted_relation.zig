@@ -48,7 +48,7 @@ pub const Plan = struct {
         for (requests, owned) |request, *out| {
             const fields = try a.alloc([]const u8, request.fields.len);
             for (request.fields, fields) |field, *name| name.* = try a.dupe(u8, field);
-            out.* = .{ .fields = fields, .multiplicity = request.multiplicity };
+            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| try a.dupe(u8, name) else null };
         }
         return initDepth(a, root, owned, cursors, 0);
     }
@@ -100,6 +100,8 @@ pub const Plan = struct {
                     if (columnIndex(node, field) == null) return null;
                     try wanted.put(a, field, {});
                 }
+                var summary: ?[]const u8 = null;
+                var summary_safe = bound.predicate == null;
                 var dependencies: Names = .empty;
                 if (bound.predicate) |p| try programFields(a, &dependencies, p, bound.columns);
                 for (node.columns, query.statement.columns, query.binding.columns, 0..) |column, projection, definition, index| {
@@ -118,6 +120,13 @@ pub const Plan = struct {
                     // A demanded computed output is checked by its assigned
                     // reducer pass. Truly unused computations must still run;
                     // keep their error dependencies in every candidate pass.
+                    if (!direct) summary_safe = false;
+                    if (request.summary) |name| if (std.mem.eql(u8, name, column.internal) and direct) {
+                        if (program) |p| {
+                            const instruction = p.instructions[p.root];
+                            if (instruction.operation == .column) summary = bound.columns[instruction.operation.column].name;
+                        } else summary = projection.field;
+                    };
                     if (!direct and !covered.contains(column.internal)) try wanted.put(a, column.internal, {});
                     if (!wanted.contains(column.internal)) continue;
                     if (program) |p| {
@@ -128,7 +137,7 @@ pub const Plan = struct {
                     }
                 }
                 output.* = try names(a, wanted);
-                input.* = .{ .fields = try names(a, dependencies), .multiplicity = request.multiplicity };
+                input.* = .{ .fields = try names(a, dependencies), .multiplicity = request.multiplicity, .summary = if (summary_safe) summary else null };
             }
             try stages.append(a, .{ .node = node, .fields = outputs });
             width += node.columns.len;
@@ -213,7 +222,7 @@ pub const Plan = struct {
                 const index = columnIndex(node, field) orelse return null;
                 name.* = node.operation.scan.source_columns[index];
             }
-            out.* = .{ .fields = fields, .multiplicity = request.multiplicity };
+            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| node.operation.scan.source_columns[columnIndex(node, name) orelse return null] else null };
         }
         return .{ .source = node, .requests = requests, .stages = stages.items, .physical = physical, .width = width + node.columns.len };
     }
@@ -228,7 +237,7 @@ pub const Plan = struct {
         for (requests, result) |request, *out| {
             const fields = try a.alloc([]const u8, request.fields.len);
             for (request.fields, fields) |field, *name| name.* = nested.columns[columnIndex(parent, field) orelse return error.InvalidSqlBackendResponse].internal;
-            out.* = .{ .fields = fields, .multiplicity = request.multiplicity };
+            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| nested.columns[columnIndex(parent, name) orelse return error.InvalidSqlBackendResponse].internal else null };
         }
         return result;
     }

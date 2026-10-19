@@ -519,6 +519,16 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
         } else for (source.distinct_values.items) |entry| try target.update(entry.row.row.values[0]);
         return;
     }
+    // Extrema and Boolean reducers observe presence, not bag cardinality.
+    // Normalize imported legacy counts before any count-width check; an exact
+    // AVG/SUM pass can legitimately share their arbitrarily large bag weight.
+    if (operators.Aggregate.presenceOnly(target.kind)) {
+        if (source.count == 0) return;
+        if (target.kind == .min or target.kind == .max) {
+            try target.update(source.selected.?.row.values[0]);
+        } else try target.update(Datum.json(.{ .bool = source.boolean }));
+        return;
+    }
     if (target.wide != null or source.wide != null or ((target.kind == .sum or target.kind == .avg) and source.count > std.math.maxInt(i64) - target.count)) {
         if (target.wide == null) {
             target.wide = try @import("wide_aggregate.zig").State.fromPartial(target.alloc, target.*);

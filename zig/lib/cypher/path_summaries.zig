@@ -36,7 +36,7 @@ const Lower = struct {
     changed: bool = false,
     used: std.StringHashMapUnmanaged(void) = .empty,
     carries: std.ArrayList(Carry) = .empty,
-    scopes: std.ArrayList([]const ast.Clause) = .empty,
+    scopes: std.ArrayList(struct { clauses: []const ast.Clause, caller: ?[]const ast.Clause = null }) = .empty,
     fn privateName(self: *@This()) ![]const u8 {
         while (true) {
             self.next += 1;
@@ -244,7 +244,7 @@ const Lower = struct {
         const out = try self.a.dupe(ast.Clause, old);
         var scope: std.ArrayList(Binding) = .empty;
         try scope.appendSlice(self.a, input);
-        for (out) |*clause| switch (clause.operation) {
+        for (out, 0..) |*clause, clause_index| switch (clause.operation) {
             .match => |*matching| {
                 const paths = try self.a.dupe(ast.Path, matching.paths);
                 matching.paths = paths;
@@ -281,6 +281,7 @@ const Lower = struct {
             .subquery => |inner| {
                 const child = try self.clauses(inner, scope.items, false);
                 clause.operation.subquery = child.clauses;
+                self.scopes.items[self.scopes.items.len - 1].caller = out[clause_index + 1 ..];
                 if (inner.len != 0 and inner[inner.len - 1].operation == .project and inner[inner.len - 1].operation.project.final)
                     for (child.scope) |entry| try self.bind(&scope, entry.name, entry.source);
             },
@@ -321,7 +322,7 @@ const Lower = struct {
         };
         // Children are registered first, so their discarded imports disappear
         // before a parent computes its correlated dependencies.
-        try self.scopes.append(self.a, out);
+        try self.scopes.append(self.a, .{ .clauses = out });
         return .{ .clauses = out, .scope = scope.items };
     }
 };
@@ -394,23 +395,37 @@ pub fn lower(a: A, query: ast.Query) !ast.Query {
         };
         carry.projection.items = items.items;
     }
-    for (plan.scopes.items) |clauses| {
-        var i = clauses.len;
-        while (i != 0) {
-            i -= 1;
-            // The arrays are owned by this lowering pass. Public final items,
-            // DISTINCT keys and potentially failing expressions remain intact.
-            const clause = @constCast(&clauses[i]);
-            if (clause.operation != .project or clause.operation.project.final) continue;
-            const projection = &clause.operation.project.value;
-            if (projection.distinct) continue;
-            var items: std.ArrayList(ast.Item) = .empty;
-            for (projection.items) |item| {
-                const name = item.alias orelse try plan.expressionName(item.expression);
-                if (!total(item.expression) or references(.{ projection.predicate, projection.order, clauses[i + 1 ..] }, name))
-                    try items.append(a, item);
+    // Iterate to a fixed point: discarded caller imports can make a private
+    // CALL export dead, which can in turn release a child import. Only total
+    // expressions are removed; aggregate keys, DISTINCT and errors stay live.
+    var pruned = true;
+    while (pruned) {
+        pruned = false;
+        for (plan.scopes.items) |scope| {
+            const clauses = scope.clauses;
+            var i = clauses.len;
+            while (i != 0) {
+                i -= 1;
+                // The arrays are owned by this lowering pass. Public final items,
+                // DISTINCT keys and potentially failing expressions remain intact.
+                const clause = @constCast(&clauses[i]);
+                if (clause.operation != .project) continue;
+                if (clause.operation.project.final and scope.caller == null) continue;
+                const projection = &clause.operation.project.value;
+                if (projection.distinct) continue;
+                const grouped = for (projection.items) |item| {
+                    if (@import("expressions.zig").aggregates(item.expression)) break true;
+                } else false;
+                if (grouped) continue;
+                var items: std.ArrayList(ast.Item) = .empty;
+                for (projection.items) |item| {
+                    const name = item.alias orelse try plan.expressionName(item.expression);
+                    if (!total(item.expression) or references(.{ projection.predicate, projection.order, clauses[i + 1 ..], scope.caller }, name))
+                        try items.append(a, item);
+                }
+                pruned = pruned or items.items.len != projection.items.len;
+                projection.items = items.items;
             }
-            projection.items = items.items;
         }
     }
     return result;

@@ -1613,17 +1613,39 @@ removed before outer dependency analysis. After projection pruning and SQL
 column negotiation, execution recomputes private summary demands; discarded hop
 slots cannot keep a length product alive or disable a topological reduction.
 
-Direct COUNT/SUM/AVG/MIN/MAX of a total path length use a bag algebra of exact
-counts, first moments and extrema. Every edge increments the moment by its bag
-count; union adds counts and moments and merges extrema. Proven DAG tails fold
-in topological order, including bounded ranges whose complete closure fits the
-bound. Native grouped reducers and direct WITH aliases consume these summaries
-without expanding length histograms. Signed SUM overflow remains exact because
-hop lengths are nonnegative, and promoted AVG counts use scaled ratios. Length
-predicates, grouping keys, non-extremum DISTINCT arguments, per-segment length
-observations and other distribution-dependent expressions retain exact hop
-states. Cyclic trail histories retain ordinary enumeration when uniqueness
-cannot be proved; repeatable bounded walks retain the finite hop recurrence.
+Direct COUNT/SUM/AVG/MIN/MAX of total and segment lengths use an exact bag
+algebra of counts, first moments and extrema for each observed marginal. Edge
+transitions increment the appropriate segment and total moments; union merges
+counts, moments and extrema. Proven DAG tails fold in topological order,
+including bounded ranges whose complete closure fits the bound. Local grouped
+reducers consume the algebra directly without expanding length histograms.
+Signed SUM overflow remains exact because hop lengths are nonnegative, and
+promoted AVG counts use scaled ratios.
+
+Returning CALL exports carry caller demands back to private child projections.
+Dead total exports and imports are removed to a fixed point, while every
+aggregate grouping key (including constants and empty-input group boundaries),
+DISTINCT key, window, sort dependency and potentially failing expression remains
+observable. Scalar returning CALL bodies participate in endpoint locality and
+length lineage. Materialized child bags and memo replay carry at most four
+integer bins per marginal, preserving exact counts, sums and extrema. Coupling
+these bins by splitting their arbitrary-precision weights avoids a Cartesian
+product. This representation is admitted only when downstream consumers observe
+individual marginal statistics; it never substitutes for an observable path.
+
+SQL aggregate requests can certify a direct integer COUNT/SUM/AVG/MIN/MAX field.
+Transparent typed renames propagate that certificate; filters, computed
+expressions, windows, replay and joins clear it unless independently certified.
+GRAPH_TABLE negotiates compatible statistic passes with shared geometry and
+emits the same integer bins through its typed weighted cursor. Exact AVG/SUM
+passes may share bags with MIN/MAX and Boolean reducers; duplicate-insensitive
+states and partial merges track presence rather than overflowing a cardinality
+counter. Physical contribution ordinals remain independent of exact logical bag
+cardinality, including when wide summary bins are followed by unit rows.
+Length predicates, length grouping keys, non-extremum DISTINCT arguments
+and other distribution-dependent expressions retain exact hop states. Cyclic
+trail histories retain ordinary enumeration when uniqueness cannot be proved;
+repeatable bounded walks retain the finite hop recurrence.
 
 Intermediate ordered projections negotiate a weighted stage plan. DISTINCT
 collapses bindings before sorting and handing the ordered bag to downstream

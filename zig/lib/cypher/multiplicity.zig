@@ -103,6 +103,58 @@ pub const Count = struct {
         } else |_| {}
         return .{ .small = std.math.maxInt(u64), .big = result };
     }
+    pub fn order(self: Count, other: Count) std.math.Order {
+        if (self.big) |left| {
+            if (other.big) |right| return left.toConst().order(right.toConst());
+            return .gt;
+        }
+        if (other.big != null) return .lt;
+        return std.math.order(self.small, other.small);
+    }
+    fn fromOwned(a: std.mem.Allocator, value: Big) !Count {
+        var result = value;
+        errdefer result.deinit();
+        if (result.toInt(u64)) |small| {
+            result.deinit();
+            return init(small);
+        } else |_| {}
+        const retained = try a.create(Big);
+        retained.* = result;
+        return .{ .small = std.math.maxInt(u64), .big = retained };
+    }
+    pub fn difference(self: Count, a: std.mem.Allocator, other: Count) !Count {
+        if (other.exact()) |small| return self.subtract(a, small);
+        std.debug.assert(self.order(other) != .lt);
+        var result = try Big.initSet(a, 0);
+        result.sub(self.big.?, other.big.?) catch |err| {
+            result.deinit();
+            return err;
+        };
+        return fromOwned(a, result);
+    }
+    pub fn divRem(self: Count, a: std.mem.Allocator, divisor: Count) !struct { quotient: Count, remainder: Count } {
+        std.debug.assert(divisor.cap(1) != 0);
+        if (self.exact()) |left| if (divisor.exact()) |right| return .{ .quotient = init(left / right), .remainder = init(left % right) };
+        var left = if (self.big) |p| p.* else try Big.initSet(a, self.small);
+        defer if (self.big == null) left.deinit();
+        var right = if (divisor.big) |p| p.* else try Big.initSet(a, divisor.small);
+        defer if (divisor.big == null) right.deinit();
+        var quotient = try Big.initSet(a, 0);
+        var remainder = Big.initSet(a, 0) catch |err| {
+            quotient.deinit();
+            return err;
+        };
+        Big.divTrunc(&quotient, &remainder, &left, &right) catch |err| {
+            quotient.deinit();
+            remainder.deinit();
+            return err;
+        };
+        const q = fromOwned(a, quotient) catch |err| {
+            remainder.deinit();
+            return err;
+        };
+        return .{ .quotient = q, .remainder = try fromOwned(a, remainder) };
+    }
     pub const Scaled = struct {
         fraction: f128,
         exponent: i64,
@@ -178,4 +230,23 @@ test "promoted count allocation failures leave arena ownership intact" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "promoted count subtraction and division preserve representative weights" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const denominator = try Count.init(std.math.maxInt(u64)).multiply(a, Count.init(17));
+            const numerator = try (try denominator.multiply(a, Count.init(123))).add(a, Count.init(7));
+            const split = try numerator.divRem(a, denominator);
+            try std.testing.expectEqual(@as(u64, 123), split.quotient.exact().?);
+            try std.testing.expectEqual(@as(u64, 7), split.remainder.exact().?);
+            const remaining = try denominator.difference(a, split.remainder);
+            try std.testing.expectEqual(std.math.Order.eq, denominator.order(try remaining.add(a, Count.init(7))));
+            try std.testing.expectEqual(@as(u64, 0), (try remaining.difference(a, remaining)).exact().?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }

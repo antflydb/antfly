@@ -118,6 +118,7 @@ pub const NodeCursor = struct {
     frames: std.ArrayList(*PathFrame) = .empty,
     weighted: bool = false,
     multiplicity: Multiplicity = .exact,
+    summary: ?[]const u8 = null,
     weighted_seeds: ?Engine.AnchorBatch = null,
     fallback_seed: ?usize = null,
     weighted_arena: std.heap.ArenaAllocator,
@@ -127,7 +128,7 @@ pub const NodeCursor = struct {
     /// Compact prefix counts; exact consumers must read last_counts.
     last_weights: std.ArrayList(u64) = .empty,
     last_counts: std.ArrayList(Count) = .empty,
-    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity };
+    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity, summary: ?[]const u8 = null };
     /// Plan a projected endpoint bag without advancing or rebinding the read
     /// cut. Plans and their AST storage belong to this cursor.
     pub fn planWeightFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity) !?WeightPlan {
@@ -159,6 +160,25 @@ pub const NodeCursor = struct {
         const planned = try self.engine.reductionPath(demanded, &.{}, operation, projection, &.{});
         if (!try self.engine.batchEligible(planned, &.{}, operation, projection, &.{})) return null;
         return .{ .path = planned, .projection = projection, .multiplicity = multiplicity };
+    }
+    /// Certify a marginal-statistic consumer. Other columns, predicates and
+    /// path dimensions must not observe the selected length distribution.
+    pub fn planSummaryFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity, field: []const u8) !?WeightPlan {
+        var plan = (try self.planWeightFields(fields, multiplicity)) orelse return null;
+        const targets = try self.engine.summaryTargets(plan.path);
+        if (targets.len != 1) return null;
+        const target = targets[0].name;
+        var found = false;
+        for (plan.projection.items) |item| {
+            const name = item.alias orelse try self.engine.expressionName(item.expression);
+            if (std.mem.eql(u8, name, field)) {
+                if (item.expression.value != .variable or !std.mem.eql(u8, item.expression.value.variable, target)) return null;
+                found = true;
+            } else if (path_summaries.references(item.expression, target)) return null;
+        }
+        if (!found or path_summaries.references(.{ plan.projection.predicate, self.original_match.predicate }, target)) return null;
+        plan.summary = target;
+        return plan;
     }
     // Ordinary pull fallback traverses the accepted normalized path. Admit
     // only MATCH-wide relationship histories whose depth bound remains valid
@@ -200,6 +220,7 @@ pub const NodeCursor = struct {
         self.columns = columns;
         self.weighted = true;
         self.multiplicity = plan.multiplicity;
+        self.summary = plan.summary;
         const predicates = try self.engine.batchPredicates(plan.path, &.{}, clauses[0].operation.match.predicate);
         self.weighted_seeds = .{ .admission = predicates.admission, .residual = predicates.residual, .path = plan.path, .input = .{ .row = &.{} }, .mode = clauses[0].operation.match.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
     }
@@ -239,9 +260,11 @@ pub const NodeCursor = struct {
         self.pending_position = 0;
         const e = self.engine;
         e.weighted_sink = .{ .ptr = self, .emit = emitWeighted, .multiplicity = self.multiplicity };
+        e.external_summary = self.summary;
         e.stream_predicate = if (self.weighted_seeds != null and input.row.len == 0) self.weighted_seeds.?.residual else self.query.clauses[0].operation.match.predicate;
         defer {
             e.weighted_sink = null;
+            e.external_summary = null;
             e.stream_predicate = null;
         }
         var ignored: std.ArrayList(Engine.MatchState) = .empty;
@@ -961,6 +984,9 @@ const Engine = struct {
     shortest_fast: bool = false,
     stream_fold: ?*StreamFold = null,
     expression_memo: ?CallMemo = null,
+    moment_targets: []const SummaryTarget = &.{},
+    external_summary: ?[]const u8 = null,
+    moment_calls: ?[]const ?DirectMoment = null,
     route_pruner: ?*RoutePruner = null,
     route_probe: ?struct { rejected: *usize, fold: *StreamFold } = null,
     numeric_consolidation: bool = false,
@@ -973,6 +999,7 @@ const Engine = struct {
     retain_windows: bool = false,
     match_weight_demand: ?Multiplicity = null,
     terminal_weight_demand: ?Multiplicity = null,
+    summary_tail: ?*const SummaryTail = null,
     pending_window: ?WeightedRows = null,
     weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, Count) anyerror!void, multiplicity: Multiplicity } = null,
     lower_graph: ?*LowerGraph = null,
@@ -997,6 +1024,7 @@ const Engine = struct {
     postimages: v.EntityMap(v.Value) = .empty,
     values: value_work.Work = undefined,
     strings: @import("string_work.zig").Runtime = undefined,
+    const SummaryTail = struct { clauses: []const ast.Clause, parent: ?*const SummaryTail = null };
     const WeightedRows = struct {
         rows: []const Row,
         weights: []const Count,
@@ -1179,21 +1207,21 @@ const Engine = struct {
                 self.best = try value.clone(self.arena.allocator());
             }
         }
-        fn addMoments(self: *StreamingAggregate, engine: *Engine, kind: MomentCall, moments: PathMoments, weight: Count) !void {
+        fn addMoments(self: *StreamingAggregate, engine: *Engine, kind: MomentCall, stats: MomentStats, count_value: Count, weight: Count, factor: Count) !void {
             if (kind == .sum) {
                 // Lengths are nonnegative: the exact moment certifies both
                 // final and intermediate signed overflow without regrouping.
                 const prior = self.sum.integer;
-                const contribution = try moments.sum.multiply(engine.a, engine.stream_fold.?.moment_factor);
+                const contribution = try stats.sum.multiply(engine.a, factor);
                 const value = contribution.exact() orelse return error.CypherNumericOverflow;
                 self.sum = .{ .integer = std.math.cast(i64, @as(i128, prior) + value) orelse return error.CypherNumericOverflow };
                 return;
             }
             const value: v.Value = switch (kind) {
-                .min => .{ .integer = @intCast(moments.min) },
-                .max => .{ .integer = @intCast(moments.max) },
+                .min => .{ .integer = @intCast(stats.min) },
+                .max => .{ .integer = @intCast(stats.max) },
                 .count => .{ .integer = 0 },
-                .avg => .{ .number = if (moments.sum.cap(1) == 0) 0 else @floatCast(moments.sum.scaled().ratio(moments.count.scaled())) },
+                .avg => .{ .number = if (stats.sum.cap(1) == 0) 0 else @floatCast(stats.sum.scaled().ratio(count_value.scaled())) },
                 .sum => unreachable,
             };
             const literal: ast.Expr = .{ .span = .{}, .value = .{ .literal = switch (value) {
@@ -1332,9 +1360,7 @@ const Engine = struct {
         probe_tail: bool = true,
         weight: Count = Count.one,
         active_calls: ?[]const bool = null,
-        moment_calls: ?[]const ?MomentCall = null,
-        moments: ?PathMoments = null,
-        moment_factor: Count = Count.one,
+        moment_direct: ?struct { calls: []const ?DirectMoment, values: PathMoments, factor: Count } = null,
         record_rows: bool = true,
         continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null, returned: ?*bool = null, capture: ?*StreamCapture = null, admission: bool = false } = null,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
@@ -1511,12 +1537,10 @@ const Engine = struct {
             }
             for (fold.groups.items[found.?].states, 0..) |*accumulator, i| {
                 if (fold.active_calls) |active| if (!active[i]) continue;
-                if (fold.moments) |moments| {
-                    if (fold.moment_calls.?[i]) |kind| {
-                        try accumulator.addMoments(engine, kind, moments, fold.weight);
-                        continue;
-                    }
-                }
+                if (fold.moment_direct) |direct| if (direct.calls[i]) |input| {
+                    try accumulator.addMoments(engine, input.kind, direct.values.part(input.target), direct.values.count, fold.weight, direct.factor);
+                    continue;
+                };
                 try accumulator.addWeighted(engine, row, fold.weight);
             }
             if (fold.distinct_goal) |goal| if (fold.groups.items.len >= goal) return error.CypherStreamComplete;
@@ -2153,6 +2177,19 @@ const Engine = struct {
         for (clauses) |clause| if (clause.operation == .subquery and pureReturningCall(clause.operation.subquery)) return true;
         return false;
     }
+    fn scalarReturningCall(inner: []const ast.Clause) bool {
+        if (inner.len == 0 or inner[inner.len - 1].operation != .project or !inner[inner.len - 1].operation.project.final) return false;
+        for (inner) |clause| switch (clause.operation) {
+            .project => |step| {
+                const p = step.value;
+                if (p.distinct or p.skip != null or p.limit != null or p.order.len != 0) return false;
+                for (p.items) |item| if (aggregates(item.expression)) return false;
+            },
+            .subquery => |child| if (!scalarReturningCall(child)) return false,
+            else => return false,
+        };
+        return true;
+    }
     fn streamableCall(inner: []const ast.Clause) bool {
         if (inner.len == 0 or !weightedExpression(inner)) return false;
         const last = inner[inner.len - 1].operation;
@@ -2196,7 +2233,7 @@ const Engine = struct {
         if (projection.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
         const consumer_goal = if (continuation) |next| next.parent.unorderedGoal(self) else self.windowGoal(projection);
         const has_match = for (middle) |clause| {
-            if (clause.operation == .match or clause.operation == .subquery) break true;
+            if (clause.operation == .match or (clause.operation == .subquery and !scalarReturningCall(clause.operation.subquery))) break true;
         } else false;
         // Global reducers/order remain stage barriers. This continuation path
         // is for finite unordered demand; it never enumerates a large count
@@ -3312,6 +3349,8 @@ const Engine = struct {
                         const children = cached orelse blk: {
                             defer scope.leave(self);
                             self.terminal_weight_demand = if (unit) .presence else demand;
+                            const tail: SummaryTail = .{ .clauses = clauses[clause_index + 1 ..], .parent = scope.summary_tail };
+                            self.summary_tail = if (unit) null else &tail;
                             break :blk try self.runWeightedRows(body, .{ .rows = &.{row}, .weights = &.{Count.one} }, true, true);
                         };
                         // A cache hit does not enter the child's pattern scope.
@@ -4215,11 +4254,13 @@ const Engine = struct {
     }
     fn countAllPaths(self: *Engine, input: MatchState, original_path: ast.Path, mode: ast.PathMode, starts: []const *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
         const path = if (self.stream_fold) |fold| try path_summaries.prune(self.a, original_path, .{ fold.middle, fold.projection, self.stream_predicate }) else original_path;
-        if (try self.momentCalls(path)) |calls| {
-            const fold = self.stream_fold.?;
-            const saved = fold.moment_calls;
-            fold.moment_calls = calls;
-            defer fold.moment_calls = saved;
+        const saved_calls = self.moment_calls;
+        self.moment_calls = null;
+        defer self.moment_calls = saved_calls;
+        if (try self.momentTargets(path)) |targets| {
+            const saved = self.moment_targets;
+            self.moment_targets = targets;
+            defer self.moment_targets = saved;
             return self.countAllPathsTyped(PathMoments, input, path, mode, starts, output);
         }
         // Native and SQL exact consumers keep arbitrary-precision counts.
@@ -4240,47 +4281,77 @@ const Engine = struct {
         return false;
     }
     const MomentCall = enum { count, sum, avg, min, max };
-    /// A path bag's sufficient statistics form an additive/product algebra.
-    /// Advancing an edge adds the count to the first moment. Union merges
-    /// counts/moments and extrema without retaining a length histogram.
+    const DirectMoment = struct { kind: MomentCall, target: usize };
+    const MomentNames = std.StringHashMapUnmanaged(usize);
+    const SummaryTarget = struct { name: []const u8, edge: ?usize = null };
+    const MomentStats = struct { sum: Count = Count.init(0), min: usize = 0, max: usize = 0 };
+    /// The fields are independent marginals. Their joint distribution is never
+    /// synthesized unless every downstream consumer observes only a certified
+    /// count, first moment or extremum of each individual field.
     const PathMoments = struct {
         count: Count,
-        sum: Count = Count.init(0),
-        min: usize = 0,
-        max: usize = 0,
+        parts: []const MomentStats = &.{},
         fn init(amount: Count) @This() {
             return .{ .count = amount };
+        }
+        fn part(self: @This(), i: usize) MomentStats {
+            return if (i < self.parts.len) self.parts[i] else .{};
         }
         fn add(left: @This(), a: A, right: @This()) !@This() {
             if (left.count.cap(1) == 0) return right;
             if (right.count.cap(1) == 0) return left;
-            return .{ .count = try left.count.add(a, right.count), .sum = try left.sum.add(a, right.sum), .min = @min(left.min, right.min), .max = @max(left.max, right.max) };
+            const parts = try a.alloc(MomentStats, @max(left.parts.len, right.parts.len));
+            for (parts, 0..) |*out, i| {
+                const l = left.part(i);
+                const r = right.part(i);
+                out.* = .{ .sum = try l.sum.add(a, r.sum), .min = @min(l.min, r.min), .max = @max(l.max, r.max) };
+            }
+            return .{ .count = try left.count.add(a, right.count), .parts = parts };
         }
         fn multiply(left: @This(), a: A, right: @This()) !@This() {
-            return .{ .count = try left.count.multiply(a, right.count), .sum = try (try left.sum.multiply(a, right.count)).add(a, try right.sum.multiply(a, left.count)), .min = left.min + right.min, .max = left.max + right.max };
+            const parts = try a.alloc(MomentStats, @max(left.parts.len, right.parts.len));
+            for (parts, 0..) |*out, i| {
+                const l = left.part(i);
+                const r = right.part(i);
+                out.* = .{ .sum = try (try l.sum.multiply(a, right.count)).add(a, try r.sum.multiply(a, left.count)), .min = l.min + r.min, .max = l.max + r.max };
+            }
+            return .{ .count = try left.count.multiply(a, right.count), .parts = parts };
         }
-        fn advance(self: @This(), a: A) !@This() {
-            return .{ .count = self.count, .sum = try self.sum.add(a, self.count), .min = self.min + 1, .max = self.max + 1 };
+        fn advance(self: @This(), a: A, targets: []const SummaryTarget, edge: usize) !@This() {
+            const parts = try a.alloc(MomentStats, targets.len);
+            for (parts, targets, 0..) |*out, target, i| {
+                out.* = self.part(i);
+                if (target.edge == null or target.edge.? == edge) {
+                    out.sum = try out.sum.add(a, self.count);
+                    out.min += 1;
+                    out.max += 1;
+                }
+            }
+            return .{ .count = self.count, .parts = parts };
         }
     };
-    fn referencesAny(value: anytype, names: Names) bool {
+    fn referencesAny(value: anytype, names: anytype) bool {
         var keys = names.keyIterator();
         while (keys.next()) |key| if (path_summaries.references(value, key.*)) return true;
         return false;
     }
-    fn momentKind(aggregate_function: ast.Function, names: Names) ?MomentCall {
+    fn momentKind(aggregate_function: ast.Function, names: MomentNames) ?MomentCall {
         if (aggregate_function.args.len != 1 or aggregate_function.args[0].value != .variable or !names.contains(aggregate_function.args[0].value.variable)) return null;
         inline for (@typeInfo(MomentCall).@"enum".field_names) |name| {
             if (std.ascii.eqlIgnoreCase(aggregate_function.name, name) and (!aggregate_function.distinct or std.mem.eql(u8, name, "min") or std.mem.eql(u8, name, "max"))) return @field(MomentCall, name);
         }
         return null;
     }
-    fn momentSafe(value: anytype, names: Names) bool {
+    fn momentSafe(value: anytype, names: MomentNames) bool {
         const T = @TypeOf(value);
         if (T == ast.MapSelector) if (value == .variable) return !names.contains(value.variable);
         if (T == ast.Expr) {
             if (value.value == .variable) return !names.contains(value.value.variable);
-            if (value.value == .call and momentKind(value.value.call, names) != null) return true;
+            if (value.value == .call) {
+                const invocation = value.value.call;
+                if (std.ascii.eqlIgnoreCase(invocation.name, "collect")) return false;
+                if (momentKind(invocation, names) != null) return true;
+            }
         }
         switch (@typeInfo(T)) {
             .pointer => |p| {
@@ -4300,32 +4371,109 @@ const Engine = struct {
         }
         return true;
     }
-    fn momentCalls(self: *Engine, path: ast.Path) !?[]const ?MomentCall {
-        const length = path.execution_summary.length orelse return null;
-        if (self.weighted_sink != null or self.component_leaves.len != 0) return null;
-        const fold = self.stream_fold orelse return null;
-        if (fold.continuation != null or fold.calls.len == 0) return null;
-        for (path.edges) |edge| if (edge.execution_length != null) return null;
-        var names: Names = .empty;
-        try names.put(self.a, length, {});
-        if (referencesAny(self.stream_predicate, names)) return null;
-        for (fold.middle) |clause| {
-            if (clause.operation != .project) return null;
-            const projection = clause.operation.project.value;
-            if (projection.distinct or projection.skip != null or projection.limit != null) return null;
-            var next: Names = if (projection.wildcard) try names.clone(self.a) else .empty;
-            for (projection.items) |item| {
-                if (item.expression.value == .variable and names.contains(item.expression.value.variable)) {
-                    try next.put(self.a, item.alias orelse item.expression.value.variable, {});
-                } else if (referencesAny(item.expression, names)) return null;
+    fn momentProjection(self: *Engine, projection: ast.Projection, names: MomentNames) !?MomentNames {
+        if (projection.distinct or projection.skip != null or projection.limit != null or projection.order.len != 0) return null;
+        var next: MomentNames = if (projection.wildcard) try names.clone(self.a) else .empty;
+        for (projection.items) |item| {
+            if (item.expression.value == .variable) {
+                if (names.get(item.expression.value.variable)) |target| {
+                    try next.put(self.a, item.alias orelse item.expression.value.variable, target);
+                    continue;
+                }
             }
-            if (referencesAny(.{ projection.predicate, projection.order }, names) or referencesAny(.{ projection.predicate, projection.order }, next)) return null;
-            names = next;
+            if (referencesAny(item.expression, names)) return null;
         }
-        if (!momentSafe(fold.projection, names)) return null;
-        const calls = try self.a.alloc(?MomentCall, fold.calls.len);
-        for (fold.calls, calls) |expression, *kind| kind.* = momentKind(expression.value.call, names);
-        return calls;
+        if (referencesAny(projection.predicate, names) or referencesAny(projection.predicate, next)) return null;
+        return next;
+    }
+    fn momentMiddle(self: *Engine, middle: []const ast.Clause, initial: MomentNames) anyerror!?MomentNames {
+        var names = initial;
+        for (middle) |clause| switch (clause.operation) {
+            .project => |p| names = (try self.momentProjection(p.value, names)) orelse return null,
+            .subquery => |inner| {
+                if (inner.len == 0 or inner[inner.len - 1].operation != .project or !inner[inner.len - 1].operation.project.final) return null;
+                // Row-local CALLs preserve one row per input. Their returned
+                // aliases join the caller scope; child-local names do not leak.
+                const exported = (try self.momentMiddle(inner, names)) orelse return null;
+                var keys = exported.iterator();
+                while (keys.next()) |entry| try names.put(self.a, entry.key_ptr.*, entry.value_ptr.*);
+            },
+            else => return null,
+        };
+        return names;
+    }
+    fn momentTail(self: *Engine, initial: MomentNames, first: *const SummaryTail) !bool {
+        var names = initial;
+        var tail: ?*const SummaryTail = first;
+        var depth: usize = 0;
+        while (tail) |current| : (tail = current.parent) {
+            depth += 1;
+            if (depth > self.limits.recursion_depth) return false;
+            for (current.clauses) |clause| {
+                if (clause.operation == .project) {
+                    const projection = clause.operation.project.value;
+                    const reduction = for (projection.items) |item| {
+                        if (aggregates(item.expression)) break true;
+                    } else false;
+                    if (reduction) return momentSafe(projection, names);
+                    names = (try self.momentProjection(projection, names)) orelse return false;
+                } else if (clause.operation == .subquery) {
+                    names = (try self.momentMiddle(&.{clause}, names)) orelse return false;
+                } else return false;
+            }
+        }
+        return false;
+    }
+    fn summaryTargets(self: *Engine, path: ast.Path) ![]const SummaryTarget {
+        var targets: std.ArrayList(SummaryTarget) = .empty;
+        if (path.execution_summary.length) |name| try targets.append(self.a, .{ .name = name });
+        for (path.edges, 0..) |edge, i| if (edge.execution_length) |name| try targets.append(self.a, .{ .name = name, .edge = i });
+        return targets.items;
+    }
+    fn momentTargets(self: *Engine, path: ast.Path) !?[]const SummaryTarget {
+        if (self.component_leaves.len != 0) return null;
+        const targets = try self.summaryTargets(path);
+        if (targets.len == 0) return null;
+        var names: MomentNames = .empty;
+        for (targets, 0..) |target, i| try names.put(self.a, target.name, i);
+        if (referencesAny(self.stream_predicate, names)) return null;
+        if (self.weighted_sink) |_| {
+            // External consumers negotiate this certificate before advancing.
+            if (self.external_summary == null or targets.len != 1 or !std.mem.eql(u8, targets[0].name, self.external_summary.?)) return null;
+            return targets;
+        }
+        var fold = self.stream_fold orelse return null;
+        var start: usize = 0;
+        var depth: usize = 0;
+        while (true) {
+            depth += 1;
+            if (depth > self.limits.recursion_depth) return null;
+            names = (try self.momentMiddle(fold.middle[start..], names)) orelse return null;
+            if (fold.continuation) |next| {
+                if (next.admission) return null;
+                if (next.apply != null) names = (try self.momentProjection(fold.projection, names)) orelse return null;
+                fold = next.parent;
+                start = next.index;
+            } else {
+                if (fold.calls.len != 0) {
+                    if (!momentSafe(fold.projection, names)) return null;
+                    if (fold == self.stream_fold.?) {
+                        const calls = try self.a.alloc(?DirectMoment, fold.calls.len);
+                        for (fold.calls, calls) |expression, *call_input| {
+                            const invocation = expression.value.call;
+                            call_input.* = if (momentKind(invocation, names)) |kind| .{ .kind = kind, .target = names.get(invocation.args[0].value.variable).? } else null;
+                        }
+                        self.moment_calls = calls;
+                    }
+                    return targets;
+                }
+                if (self.summary_tail) |tail| {
+                    names = (try self.momentProjection(fold.projection, names)) orelse return null;
+                    if (try self.momentTail(names, tail)) return targets;
+                }
+                return null;
+            }
+        }
     }
     fn waysCount(value: anytype) Count {
         return if (@TypeOf(value) == PathMoments) value.count else if (@TypeOf(value) == Count) value else Count.init(value);
@@ -4333,8 +4481,8 @@ const Engine = struct {
     fn waysFromCount(comptime W: type, value: Count) W {
         return if (W == PathMoments) PathMoments.init(value) else if (W == Count) value else waysCap(value);
     }
-    fn advanceWays(self: *Engine, value: anytype) !@TypeOf(value) {
-        return if (@TypeOf(value) == PathMoments) value.advance(self.a) else value;
+    fn advanceWays(self: *Engine, graph: *LowerGraph, value: anytype) !@TypeOf(value) {
+        return if (@TypeOf(value) == PathMoments) value.advance(self.a, self.moment_targets, graph.segment) else value;
     }
     fn waysInit(comptime W: type, value: u64) W {
         return waysFromCount(W, Count.init(value));
@@ -4426,6 +4574,7 @@ const Engine = struct {
         }
         var effective_maximum: usize = 0;
         for (path.edges, 0..) |edge, edge_index| {
+            graph.segment = edge_index;
             if (current.count() == 0) return true;
             const domain = edge_domains[edge_index];
             var topological: ?[]const usize = null;
@@ -4524,7 +4673,7 @@ const Engine = struct {
                         try self.state();
                         if (!try self.constantProperties(.{ .relationship = arc.relationship }, edge.properties, input.row)) continue;
                         arc.eligible = true;
-                        reached[arc.target] = try self.waysAdd(reached[arc.target], try self.advanceWays(ways));
+                        reached[arc.target] = try self.waysAdd(reached[arc.target], try self.advanceWays(&graph, ways));
                     };
                 }
                 std.mem.swap(Counts, &current, &endpoints);
@@ -4615,6 +4764,10 @@ const Engine = struct {
                     }
                 }
                 if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
+                if (W == PathMoments) {
+                    try self.emitMomentBag(row, ways);
+                    continue;
+                }
                 if (self.weighted_sink) |sink| {
                     // Finite SQL consumers need only the signed-overflow cap;
                     // exact consumers retain the complete promoted count.
@@ -4629,20 +4782,97 @@ const Engine = struct {
                 const previous_weight = fold.weight;
                 fold.weight = if (self.match_weight_demand == .presence) Count.one else try previous_weight.multiply(fold.retained, waysCount(ways));
                 defer fold.weight = previous_weight;
-                const saved_moments = fold.moments;
-                const saved_factor = fold.moment_factor;
-                if (W == PathMoments) {
-                    fold.moments = ways;
-                    fold.moment_factor = previous_weight;
-                }
-                defer {
-                    fold.moments = saved_moments;
-                    fold.moment_factor = saved_factor;
-                }
                 try fold.add(self, row);
             }
         }
         return true;
+    }
+    /// Construct at most four integer bins for each marginal, preserving its
+    /// exact count, first moment and both extrema. Couple the bins by splitting
+    /// their weights; no Cartesian product or fractional public value is needed.
+    /// These bags can be memoized and replayed through ordinary typed cursors.
+    fn emitMomentBag(self: *Engine, initial: Row, moments: PathMoments) !void {
+        // Local reducers consume the algebra directly. Only escaping bags need
+        // integer representatives for CALL memoization or SQL cursor transport.
+        if (self.moment_calls) |calls| {
+            const fold = self.stream_fold.?;
+            const prior = fold.weight;
+            const direct = fold.moment_direct;
+            fold.moment_direct = .{ .calls = calls, .values = moments, .factor = prior };
+            fold.weight = try prior.multiply(fold.retained, moments.count);
+            defer {
+                fold.weight = prior;
+                fold.moment_direct = direct;
+            }
+            // Transparent projections still evaluate their input bindings.
+            // Supply a valid representative for every private marginal even
+            // when the terminal reducers consume the algebra directly.
+            var row = initial;
+            for (self.moment_targets, 0..) |target, i| row = try self.lengthRow(row, target.name, moments.part(i).min);
+            return fold.add(self, row);
+        }
+        const Bin = struct { value: usize, weight: Count };
+        const Marginal = struct { bins: [4]Bin = undefined, len: usize = 0, position: usize = 0, remaining: Count = Count.init(0) };
+        const marginals = try self.a.alloc(Marginal, self.moment_targets.len);
+        for (marginals, 0..) |*marginal, i| {
+            marginal.* = .{};
+            const part = moments.part(i);
+            if (part.min == part.max) {
+                marginal.bins[0] = .{ .value = part.min, .weight = moments.count };
+                marginal.len = 1;
+            } else {
+                marginal.bins[0] = .{ .value = part.min, .weight = Count.one };
+                marginal.bins[1] = .{ .value = part.max, .weight = Count.one };
+                marginal.len = 2;
+                const count_left = try moments.count.subtract(self.a, 2);
+                if (count_left.cap(1) != 0) {
+                    const sum_left = try (try part.sum.subtract(self.a, part.min)).subtract(self.a, part.max);
+                    const split = try sum_left.divRem(self.a, count_left);
+                    const low = std.math.cast(usize, split.quotient.exact() orelse return error.CypherNumericOverflow) orelse return error.CypherNumericOverflow;
+                    const low_weight = try count_left.difference(self.a, split.remainder);
+                    if (low_weight.cap(1) != 0) {
+                        marginal.bins[marginal.len] = .{ .value = low, .weight = low_weight };
+                        marginal.len += 1;
+                    }
+                    if (split.remainder.cap(1) != 0) {
+                        marginal.bins[marginal.len] = .{ .value = low + 1, .weight = split.remainder };
+                        marginal.len += 1;
+                    }
+                }
+            }
+            marginal.remaining = marginal.bins[0].weight;
+        }
+        var left = moments.count;
+        while (left.cap(1) != 0) {
+            try self.state();
+            var weight = left;
+            var row = initial;
+            for (marginals, self.moment_targets) |marginal, target| {
+                if (marginal.remaining.order(weight) == .lt) weight = marginal.remaining;
+                row = try self.lengthRow(row, target.name, marginal.bins[marginal.position].value);
+            }
+            if (self.weighted_sink) |sink| {
+                try sink.emit(sink.ptr, row, switch (sink.multiplicity) {
+                    .presence => Count.one,
+                    .capped => Count.init(weight.cap(@as(u64, std.math.maxInt(i64)) + 1)),
+                    .exact => weight,
+                });
+            } else {
+                const fold = self.stream_fold.?;
+                const prior = fold.weight;
+                fold.weight = try prior.multiply(fold.retained, weight);
+                defer fold.weight = prior;
+                try fold.add(self, row);
+            }
+            left = try left.difference(self.a, weight);
+            for (marginals) |*marginal| {
+                marginal.remaining = try marginal.remaining.difference(self.a, weight);
+                if (marginal.remaining.cap(1) == 0) {
+                    marginal.position += 1;
+                    if (marginal.position < marginal.len) marginal.remaining = marginal.bins[marginal.position].weight;
+                }
+            }
+        }
     }
     fn lengthRow(self: *Engine, row: Row, alias: ?[]const u8, length: usize) !Row {
         return if (alias) |name| try self.replace(row, name, .{ .integer = @intCast(length) }) else row;
@@ -4824,7 +5054,7 @@ const Engine = struct {
                         !try self.constantProperties(.{ .node = reached }, pattern.properties, graph.input.row)) continue;
                 }
                 const entry = try next.getOrPut(self.a, try graph.movedKey(self, candidate.key_ptr.*, arc.target));
-                const weight = try self.advanceWays(if (source) |pivot| try self.waysMultiply(ways, try self.branchWays(W, graph, index, pivot, relationship, graph.mode)) else ways);
+                const weight = try self.advanceWays(graph, if (source) |pivot| try self.waysMultiply(ways, try self.branchWays(W, graph, index, pivot, relationship, graph.mode)) else ways);
                 entry.value_ptr.* = try self.waysAdd(if (entry.found_existing) entry.value_ptr.* else waysInit(W, 0), weight);
             }
         }
@@ -4949,6 +5179,32 @@ const Engine = struct {
         for (projection.order) |order| if (!rules.rowLocal(order.expression, PipelineScope{ .bindings = visible })) return null;
         return result;
     }
+    fn localCallShape(self: *Engine, initial: Row, inner: []const ast.Clause, depth: usize) anyerror!?Row {
+        if (depth >= self.limits.recursion_depth or inner.len == 0 or inner[inner.len - 1].operation != .project or !inner[inner.len - 1].operation.project.final) return null;
+        const rules = @import("expressions.zig");
+        var shape = initial;
+        for (inner) |clause| switch (clause.operation) {
+            .project => |step| {
+                const p = step.value;
+                if (p.distinct or p.skip != null or p.limit != null or p.order.len != 0) return null;
+                var next: Row = if (p.wildcard) shape else &.{};
+                for (p.items) |item| {
+                    if (aggregates(item.expression) or !rules.rowLocal(item.expression, PipelineScope{ .bindings = shape })) return null;
+                    next = try self.replace(next, item.alias orelse try self.expressionName(item.expression), .{ .boolean = true });
+                }
+                var visible = shape;
+                for (next) |entry| visible = try self.replace(visible, entry.name, entry.value);
+                if (p.predicate) |predicate| if (!rules.rowLocal(predicate, PipelineScope{ .bindings = visible })) return null;
+                shape = next;
+            },
+            .subquery => |child| {
+                const exported = (try self.localCallShape(shape, child, depth + 1)) orelse return null;
+                for (exported) |entry| shape = try self.replace(shape, entry.name, entry.value);
+            },
+            else => return null,
+        };
+        return shape;
+    }
     fn pipelineLocal(self: *Engine, path: ast.Path, row: Row, middle: []const ast.Clause, projection: ast.Projection, include_start: bool) !bool {
         const rules = @import("expressions.zig");
         var shape: Row = &.{};
@@ -4986,6 +5242,10 @@ const Engine = struct {
                 for (next) |entry| predicate_shape = try self.replace(predicate_shape, entry.name, entry.value);
                 if (p.predicate) |predicate| if (!rules.rowLocal(predicate, PipelineScope{ .bindings = predicate_shape })) return false;
                 shape = next;
+            },
+            .subquery => |inner| {
+                const exported = (try self.localCallShape(shape, inner, 0)) orelse return false;
+                for (exported) |entry| shape = try self.replace(shape, entry.name, entry.value);
             },
             else => return false,
         };
@@ -5547,6 +5807,7 @@ const Engine = struct {
         }
     };
     const LowerGraph = struct {
+        segment: usize = 0,
         products: ?*SummaryProducts = null,
         nodes: std.ArrayList(LowerNode) = .empty,
         positions: std.HashMapUnmanaged(v.Identity, usize, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
@@ -7006,9 +7267,10 @@ const Engine = struct {
         retain_windows: bool,
         match_weight_demand: ?Multiplicity,
         terminal_weight_demand: ?Multiplicity,
+        summary_tail: ?*const SummaryTail,
         pending_window: ?WeightedRows,
         fn enter(engine: *Engine) PatternScope {
-            const scope: PatternScope = .{ .columns = engine.columns, .stages = engine.stages, .retain_windows = engine.retain_windows, .match_weight_demand = engine.match_weight_demand, .terminal_weight_demand = engine.terminal_weight_demand, .pending_window = engine.pending_window };
+            const scope: PatternScope = .{ .columns = engine.columns, .stages = engine.stages, .retain_windows = engine.retain_windows, .match_weight_demand = engine.match_weight_demand, .terminal_weight_demand = engine.terminal_weight_demand, .summary_tail = engine.summary_tail, .pending_window = engine.pending_window };
             // A correlated query owns its result/profiling buffers and must
             // produce ordinary expression values. Its caller may itself be
             // retaining a weighted window in a temporary evaluation arena.
@@ -7016,6 +7278,7 @@ const Engine = struct {
             engine.retain_windows = false;
             engine.match_weight_demand = null;
             engine.terminal_weight_demand = null;
+            engine.summary_tail = null;
             engine.pending_window = null;
             return scope;
         }
@@ -7025,6 +7288,7 @@ const Engine = struct {
             engine.retain_windows = scope.retain_windows;
             engine.match_weight_demand = scope.match_weight_demand;
             engine.terminal_weight_demand = scope.terminal_weight_demand;
+            engine.summary_tail = scope.summary_tail;
             engine.pending_window = scope.pending_window;
         }
     };

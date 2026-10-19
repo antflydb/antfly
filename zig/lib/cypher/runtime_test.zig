@@ -2799,3 +2799,72 @@ test "nested summary and moment plans release every failed allocation" {
     };
     inline for (.{ false, true }) |nested| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{nested});
 }
+
+test "summary pruning preserves aggregate grouping and empty grouped inputs" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH b,count(p) AS n RETURN count(*)", "[[2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH b,sum(length(p)) AS n RETURN n ORDER BY n", "[[0],[2]]");
+    try check("MATCH p=(a:Document {id:'absent'})-[:CITES]->(b) WITH b,count(p) AS n RETURN count(*)", "[[0]]");
+    try check("MATCH p=(a:Document {id:'absent'})-[:CITES]->(b) WITH 1 AS k,count(p) AS n RETURN count(*)", "[[0]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) CALL { WITH b,p RETURN b AS k,sum(length(p)) AS n } RETURN count(*)", "[[3]]");
+}
+
+test "summary exports and representative bags preserve CALL scope and memo replay" {
+    try check("MATCH p=(a:Document {id:'a'})-[rs:CITES*0..1]->(b) WITH rs AS xs RETURN sum(size(xs))", "[[2]]");
+    try check("CALL { MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN p } RETURN min(length(p)),max(length(p)),sum(length(p)),avg(length(p))>0.66 AND avg(length(p))<0.67", "[[0,1,2,true]]");
+    try check("CALL { MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN p AS q } RETURN count(q)", "[[3]]");
+    try check("UNWIND [1,1,2] AS i CALL { MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN p } RETURN i,sum(length(p)) ORDER BY i", "[[1,4],[2,2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) CALL { WITH p RETURN length(p) AS n } RETURN min(n),max(n),sum(n)", "[[0,1,2]]");
+    try check("CALL { CALL { MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN p } RETURN p AS q } RETURN sum(length(q))", "[[2]]");
+    try check("CALL { MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN p } RETURN count(DISTINCT p)", "[[2]]");
+    try check("CALL { MATCH p=(a:Document {id:'absent'})-[:CITES]->(b) RETURN p } RETURN count(p),sum(length(p)),min(length(p))", "[[0,0,null]]");
+}
+
+test "multiple segment statistics agree with complete observable route histories" {
+    for ([_][]const u8{ "", "REPEATABLE ELEMENTS " }) |mode| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: Fixture = .{};
+        var diagnostic: c.Diagnostic = .{};
+        const prefix = try std.fmt.allocPrint(a, "MATCH {s}p=(a:Document {{id:'a'}})-[xs:CITES*0..2]->()-[ys:CITES*0..2]->(b) ", .{mode});
+        var reference = try c.compile(a, try std.fmt.allocPrint(a, "{s}RETURN p,size(xs),size(ys)", .{prefix}), .{}, &diagnostic);
+        defer reference.deinit();
+        var rows = try runtime.execute(a, fixture.backend(), graph, &reference, &.{}, .{});
+        defer rows.deinit();
+        var sums: [3]i64 = @splat(0);
+        var minima: [3]i64 = @splat(std.math.maxInt(i64));
+        var maxima: [3]i64 = @splat(0);
+        for (rows.rows) |row| for ([_]i64{ @intCast(row[0].path.relationships.len), row[1].integer, row[2].integer }, 0..) |n, i| {
+            sums[i] += n;
+            minima[i] = @min(minima[i], n);
+            maxima[i] = @max(maxima[i], n);
+        };
+        var compiled = try c.compile(a, try std.fmt.allocPrint(a, "{s}RETURN sum(length(p)),sum(size(xs)),sum(size(ys)),min(length(p)),min(size(xs)),min(size(ys)),max(length(p)),max(size(xs)),max(size(ys)),avg(length(p)),avg(size(xs)),avg(size(ys))", .{prefix}), .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        for (0..3) |i| {
+            try std.testing.expectEqual(sums[i], result.rows[0][i].integer);
+            try std.testing.expectEqual(minima[i], result.rows[0][3 + i].integer);
+            try std.testing.expectEqual(maxima[i], result.rows[0][6 + i].integer);
+            try std.testing.expectApproxEqAbs(@as(f64, @floatFromInt(sums[i])) / @as(f64, @floatFromInt(rows.rows.len)), result.rows[0][9 + i].number, 1e-12);
+        }
+    }
+}
+
+test "escaping vector summary bags unwind allocation failures through CALL memoization" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var fixed: FixedAllocation = .{ .backing = backing };
+            const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "CALL { MATCH REPEATABLE ELEMENTS p=(a:Document {id:'a'})-[xs:CITES*0..2]->()-[ys:CITES*0..1]->(b) RETURN p AS q,size(xs) AS n } RETURN sum(length(q)),avg(n),min(n),max(n)", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}

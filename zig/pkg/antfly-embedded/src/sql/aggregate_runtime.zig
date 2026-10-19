@@ -363,7 +363,17 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
         var keys = fields.keyIterator();
         while (keys.next()) |key| try names.append(a, key.*);
         const presence = spec.distinct or spec.kind == .min or spec.kind == .max or spec.kind == .bool_and or spec.kind == .bool_or;
-        request.* = .{ .fields = names.items, .multiplicity = if (presence) .presence else .exact };
+        var summary: ?[]const u8 = null;
+        if (!spec.distinct and filter == null and bound.input.predicate == null and conditions.len == 0 and
+            (spec.kind == .count or spec.kind == .sum or spec.kind == .avg or spec.kind == .min or spec.kind == .max))
+        {
+            if (input) |slot| if (bound.input.projections[slot]) |program| {
+                const root = program.instructions[program.root];
+                if (!root.input_function and root.operation == .column and program.output_type.kind == .integer)
+                    summary = (try table.column(bound.input.columns[root.operation.column].name)).path;
+            };
+        }
+        request.* = .{ .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary };
     }
     return requests;
 }
@@ -416,7 +426,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             aggregate_loaded = true;
         };
         const can_weight = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound);
-        const partitioned = can_weight and bound.group_count == 0 and bound.specs.len > 1 and
+        const partitioned = can_weight and bound.group_count == 0 and bound.specs.len > 0 and
             try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, try aggregateRequests(context.arena, bound, table, predicates.terms.items));
         const weighted = partitioned or (can_weight and try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound)));
         const parallel = !weighted and bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });

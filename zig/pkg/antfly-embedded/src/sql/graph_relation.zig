@@ -359,26 +359,53 @@ pub const Cursor = struct {
         var fields: [2]std.StringHashMapUnmanaged(void) = .{ .empty, .empty };
         var slots: [2]std.ArrayList(usize) = .{ .empty, .empty };
         var multiplicities: [2]cypher.runtime.Multiplicity = .{ .presence, .presence };
+        const Candidate = struct { plan: cypher.runtime.NodeCursor.WeightPlan, slots: std.ArrayList(usize) = .empty };
+        var candidates: std.ArrayList(Candidate) = .empty;
         for (requests, 0..) |request, i| {
             const multiplicity = request.multiplicity;
+            if (request.summary) |field| {
+                if (try stream.planSummaryFields(request.fields, multiplicity, field)) |plan| {
+                    var selected: ?usize = null;
+                    for (candidates.items, 0..) |candidate, position| {
+                        if (candidate.plan.summary == null or !std.mem.eql(u8, candidate.plan.summary.?, plan.summary.?) or
+                            candidate.plan.path.execution_reversed != plan.path.execution_reversed or candidate.plan.projection.items.len != plan.projection.items.len) continue;
+                        const same_fields = for (plan.projection.items) |item| {
+                            const name = item.alias.?;
+                            const present = for (candidate.plan.projection.items) |other| {
+                                if (std.mem.eql(u8, other.alias.?, name)) break true;
+                            } else false;
+                            if (!present) break false;
+                        } else true;
+                        if (same_fields) {
+                            selected = position;
+                            break;
+                        }
+                    }
+                    if (selected == null) {
+                        selected = candidates.items.len;
+                        try candidates.append(a, .{ .plan = plan });
+                    }
+                    const candidate = &candidates.items[selected.?];
+                    try candidate.slots.append(a, i);
+                    if (multiplicity == .exact or (multiplicity == .capped and candidate.plan.multiplicity == .presence)) candidate.plan.multiplicity = multiplicity;
+                    continue;
+                }
+            }
             const plan = (try stream.planWeightFields(request.fields, multiplicity)) orelse return false;
             const direction: usize = @intFromBool(plan.path.execution_reversed);
             try slots[direction].append(a, i);
             for (request.fields) |field| try fields[direction].put(a, field, {});
             if (multiplicity == .exact or (multiplicity == .capped and multiplicities[direction] == .presence)) multiplicities[direction] = multiplicity;
         }
-        const pass_count: usize = @as(usize, @intFromBool(slots[0].items.len != 0)) + @as(usize, @intFromBool(slots[1].items.len != 0));
-        const passes = try a.alloc(WeightPass, pass_count);
-        var position: usize = 0;
         for (0..2) |i| {
             if (slots[i].items.len == 0) continue;
-            const pass = &passes[position];
-            position += 1;
             var names: std.ArrayList([]const u8) = .empty;
             var keys = fields[i].keyIterator();
             while (keys.next()) |name| try names.append(a, name.*);
-            pass.* = .{ .plan = (try stream.planWeightFields(names.items, multiplicities[i])) orelse return false, .slots = slots[i].items };
+            try candidates.append(a, .{ .plan = (try stream.planWeightFields(names.items, multiplicities[i])) orelse return false, .slots = slots[i] });
         }
+        const passes = try a.alloc(WeightPass, candidates.items.len);
+        for (candidates.items, passes) |candidate, *pass| pass.* = .{ .plan = candidate.plan, .slots = candidate.slots.items };
         try stream.startWeightPlan(passes[0].plan);
         self.weight_passes = passes;
         return true;

@@ -3102,3 +3102,120 @@ def test_length_aggregate_moments_scale_with_dag_geometry(graph_db):
         {"query": base.replace("*1..", "*1..3") + "WITH b,length(p) AS n RETURN sum(b{n}.n)", "limits": limits},
     )
     assert result["rows"] == [[{"type": "integer", "value": "228"}]]
+
+
+def test_summary_pruning_preserves_grouping_and_empty_inputs(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    base = "MATCH p=(s:D {id:'start'})-[:R*1..1]->(b:D) "
+    for query, expected in (
+        (base + "WITH b,count(p) AS n RETURN count(*)", [["2"]]),
+        (base + "WITH b,sum(length(p)) AS n RETURN n ORDER BY n", [["1"], ["1"]]),
+        (base.replace("'start'", "'absent'") + "WITH b,count(p) AS n RETURN count(*)", [["0"]]),
+        (base.replace("'start'", "'absent'") + "WITH 1 AS k,count(p) AS n RETURN count(*)", [["0"]]),
+        ("CALL { " + base + "RETURN b AS k,sum(length(p)) AS n } RETURN count(*)", [["2"]]),
+    ):
+        result = db.cypher_json("g", {"query": query})
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected
+
+
+def test_returning_calls_negotiate_scalar_path_demands(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[rs:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 20000}
+    control = db.cypher_json(
+        "g", {"query": base + "RETURN min(length(p)),max(length(p)),avg(length(p))", "limits": limits}
+    )
+    for query in (
+        "CALL { " + base + "RETURN p } RETURN min(length(p)),max(length(p)),avg(length(p))",
+        "CALL { " + base + "RETURN p AS q } RETURN min(length(q)),max(length(q)),avg(length(q))",
+        base + "CALL { WITH p RETURN length(p) AS n } RETURN min(n),max(n),avg(n)",
+        "CALL { CALL { " + base + "RETURN p } RETURN p AS q } RETURN min(length(q)),max(length(q)),avg(length(q))",
+        base + "RETURN min(size(rs)),max(size(rs)),avg(size(rs))",
+    ):
+        result = db.cypher_json("g", {"query": query, "limits": limits})
+        actual = [cell["value"] for cell in result["rows"][0]]
+        expected = [cell["value"] for cell in control["rows"][0]]
+        assert actual[:2] == expected[:2]
+        assert actual[2] == pytest.approx(expected[2], rel=1e-13)
+
+
+def test_independent_segment_statistics_keep_marginals_compressed(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    frontier = [1] + [0] * 68
+    paths = []
+    for _ in range(68):
+        following = [0] * 69
+        for depth, count in enumerate(frontier):
+            for step in (1, 2):
+                if depth + step <= 68:
+                    following[depth + step] += count * 2
+        frontier = following
+        paths.append(sum(frontier))
+    count = sum(n * (hops - 1) for hops, n in enumerate(paths, 1))
+    total = sum(n * hops * (hops - 1) for hops, n in enumerate(paths, 1))
+    query = "MATCH p=(s:D {id:'start'})-[xs:R*1..]->()-[ys:R*1..]->(b:D) RETURN min(size(xs)),max(size(xs)),avg(size(xs)),min(size(ys)),max(size(ys)),avg(size(ys)),min(length(p)),max(length(p)),avg(length(p))"
+    result = db.cypher_json("g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 30000}})
+    assert [cell["value"] for cell in result["rows"][0]] == [
+        "1",
+        "67",
+        pytest.approx(total / (2 * count), rel=1e-13),
+        "1",
+        "67",
+        pytest.approx(total / (2 * count), rel=1e-13),
+        "2",
+        "68",
+        pytest.approx(total / count, rel=1e-13),
+    ]
+
+
+def test_sql_graph_statistics_use_consumer_certificates(graph_db):
+    db = graph_db
+    layers = 512
+    documents = {"start": {"id": "start", "score": 0}}
+    documents.update({f"v{i}_{j}": {"id": f"v{i}_{j}", "score": i + 1} for i in range(layers) for j in range(2)})
+    pairs = [("start", f"v{i}_{j}") for i in range(2) for j in range(2)]
+    pairs += [
+        (f"v{i}_{j}", f"v{i + step}_{k}")
+        for step in (1, 2)
+        for i in range(layers - step)
+        for j in range(2)
+        for k in range(2)
+    ]
+    with db.open_table("docs") as table:
+        table.batch_json({"inserts": documents, "sync_level": "full_index"})
+        for i in range(0, len(pairs), 256):
+            table.batch_json(
+                {
+                    "graph_writes": [
+                        {"index_name": "links", "source": a, "target": b, "edge_type": "link"}
+                        for a, b in pairs[i : i + 256]
+                    ],
+                    "sync_level": "full_index",
+                }
+            )
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    counts, sums = [1, 2], [0, 2]
+    for _ in range(2, layers + 1):
+        sums.append(2 * (sums[-1] + counts[-1]) + 2 * (sums[-2] + counts[-2]))
+        counts.append(2 * counts[-1] + 2 * counts[-2])
+    average = sum(sums[1:]) / sum(counts[1:])
+    relation = "GRAPH_TABLE(g MATCH p=(s IS D)-[rs IS R*]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS hops)) q"
+    for query in (
+        f"SELECT min(hops),max(hops),avg(hops) FROM {relation}",
+        f"WITH t AS (SELECT hops AS n FROM {relation}) SELECT min(n),max(n),avg(n) FROM t",
+        f"SELECT min(hops) FROM {relation}",
+    ):
+        result = db.sql(query)["rows"]
+        assert result[0][0] == "1"
+        if len(result[0]) > 1:
+            assert result[0][1] == str(layers)
+            assert float(result[0][2]) == pytest.approx(average, rel=1e-13)
+    small = "GRAPH_TABLE(g MATCH p=(s IS D)-[rs IS R*3]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS hops,size(rs) AS segment)) q"
+    assert db.sql(
+        f"SELECT count(hops),sum(hops),avg(segment),min(hops),max(segment),count(DISTINCT hops) FROM {small}"
+    )["rows"] == [["64", "192", 3.0, "3", "3", "1"]]

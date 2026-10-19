@@ -622,6 +622,10 @@ pub const TopK = struct {
 
 pub const Aggregate = struct {
     pub const Kind = enum { count, sum, avg, min, max, bool_and, bool_or, pattern_set };
+    pub fn presenceOnly(kind: Kind) bool {
+        return kind == .min or kind == .max or kind == .bool_and or kind == .bool_or;
+    }
+
     alloc: Allocator,
     kind: Kind,
     input_type: ?ast.ColumnType,
@@ -712,7 +716,7 @@ pub const Aggregate = struct {
             self.distinct_values.appendAssumeCapacity(.{ .row = owned, .next = self.distinct_heads.get(hash) });
             self.distinct_heads.putAssumeCapacity(hash, index);
         }
-        if (self.count == std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+        if (!presenceOnly(self.kind) and self.count == std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
         switch (self.kind) {
             .count => {},
             .sum, .avg => if (self.numeric) |reducer| {
@@ -766,7 +770,7 @@ pub const Aggregate = struct {
                 try self.patterns.?.values.append(self.distinct_values.items[self.distinct_values.items.len - 1].row.row.values[0].value);
             },
         }
-        self.count += 1;
+        self.count = if (presenceOnly(self.kind)) 1 else self.count + 1;
     }
 
     /// PostgreSQL float4 SUM rounds each transition and partial combination.
@@ -1780,7 +1784,7 @@ pub const Grouped = struct {
             initialized += 1;
             state.distinct = spec.distinct;
             try state.update(input);
-            if (spec.distinct or state.count == 0) continue;
+            if (spec.distinct or state.count == 0 or Aggregate.presenceOnly(spec.kind)) continue;
             if (spec.kind == .pattern_set or ((spec.kind == .sum or spec.kind == .avg) and state.numeric == null and spec.input_type != .integer)) return error.InvalidSqlBackendResponse;
             if (state.numeric) |reducer| {
                 reducer.state.count = weight;
@@ -1794,7 +1798,9 @@ pub const Grouped = struct {
             state.count = weight;
         }
         try self.importTypedPartialMapped(keys, states, null, self.source_ordinal orelse self.rows_seen);
-        self.rows_seen +|= weight;
+        // Ordinals count physical contributions. Logical cardinality lives in
+        // each reducer and can exceed u64; later unit bags must remain valid.
+        self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
     }
 
     pub fn addCount(self: *Grouped, keys: []const Datum, inputs: []const Datum, count: @import("catalog.zig").Count) !void {
@@ -1827,7 +1833,7 @@ pub const Grouped = struct {
             state.count = 1; // presence marker; exact cardinality belongs to wide.
         }
         try self.importTypedPartialMapped(keys, states, null, self.source_ordinal orelse self.rows_seen);
-        self.rows_seen +|= 1;
+        self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
     }
 
     /// Resolve a vector of group IDs once, then update state by aggregate
@@ -3787,12 +3793,12 @@ fn mixedExtremaPartialScenario(a: Allocator) !void {
         const partial = (try source.nextResultBatch(arena.allocator(), 1, true)).?;
         try target.importPartial(&.{}, try partial.aggregates.row(arena.allocator(), 0), 0);
         const state = try target.state_columns[0].snapshot(arena.allocator(), 0);
-        try std.testing.expectEqual(@as(u64, 4), state.count);
+        try std.testing.expectEqual(@as(u64, 1), state.count);
         const result = (try target.nextResultBatch(arena.allocator(), 1, false)).?;
         try std.testing.expectEqual(exact, (try result.aggregates.cell(a, 0, 0)).value.integer);
     }
 }
-test "SQL mixed numeric extrema partials promote without narrowing or losing counts" {
+test "SQL mixed numeric extrema partials promote without narrowing and preserve presence" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, mixedExtremaPartialScenario, .{});
 }
 
@@ -5487,4 +5493,36 @@ test "SQL promoted exact bags retain reducer states through partials spill and a
         for ([_]bool{ false, true }) |disk| try Probe.run(std.testing.allocator, disk, promoted);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{ false, promoted });
     }
+}
+
+test "SQL extrema and Boolean partials ignore exact bag count width beside AVG" {
+    const Probe = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: Allocator, disk: bool) !void {
+            var dummy: u8 = 0;
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = checkpoint, .async_writes = false };
+            defer manager.deinit();
+            const group = try Grouped.create(a, &.{ .{ .kind = .min, .input_type = .integer }, .{ .kind = .max, .input_type = .integer }, .{ .kind = .avg, .input_type = .integer }, .{ .kind = .bool_and, .input_type = .boolean }, .{ .kind = .bool_or, .input_type = .boolean } }, .{ .groups = 10, .bytes = 2 << 20, .spill = if (disk) &manager else null });
+            defer group.deinit();
+            if (disk) try group.startSpill();
+            for (0..6) |i| {
+                const n: i64 = if (i % 2 == 0) 2 else 4;
+                try group.addCount(&.{}, &.{ Datum.json(.{ .integer = n }), Datum.json(.{ .integer = n }), Datum.json(.{ .integer = n }), Datum.json(.{ .bool = i % 2 == 0 }), Datum.json(.{ .bool = i % 2 == 0 }) }, @import("catalog.zig").Count.init(1 << 62));
+            }
+            // A summary emits unit-weight extrema between wide mean bins.
+            // Physical ordinals must never inherit their logical cardinality.
+            try group.addCount(&.{}, &.{ Datum.json(.{ .integer = 3 }), Datum.json(.{ .integer = 3 }), Datum.json(.{ .integer = 3 }), Datum.json(.{ .bool = true }), Datum.json(.{ .bool = true }) }, @import("catalog.zig").Count.init(1));
+            try std.testing.expectEqual(@as(u64, 7), group.rows_seen);
+            const result = (try group.nextResult(a)).?;
+            defer a.free(result.aggregates);
+            try std.testing.expectEqual(@as(i64, 2), result.aggregates[0].value.integer);
+            try std.testing.expectEqual(@as(i64, 4), result.aggregates[1].value.integer);
+            try std.testing.expectEqual(@as(f64, 3), result.aggregates[2].value.float);
+            try std.testing.expect(!result.aggregates[3].value.bool);
+            try std.testing.expect(result.aggregates[4].value.bool);
+        }
+    };
+    try Probe.run(std.testing.allocator, false);
+    try Probe.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{false});
 }
