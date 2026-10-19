@@ -1648,6 +1648,13 @@ pub const EmbeddingStageControl = struct {
     pause_fn: *const fn (*anyopaque) anyerror!void,
     resume_fn: *const fn (*anyopaque) anyerror!void,
     cleanup_fn: *const fn (*anyopaque) void,
+    /// Replace the execution supplement at a fenced video boundary. Null
+    /// restores the composition envelope; zero retains only idle resources.
+    workspace_fn: ?*const fn (*anyopaque, ?usize) anyerror!void = null,
+    copy_fn: ?*const fn (*anyopaque, usize, u64) void = null,
+    pub fn workspace(self: *const @This(), bytes: ?usize) !void {
+        if (self.workspace_fn) |run| try run(self.ptr, bytes);
+    }
     pub fn pause(self: *const @This()) !void {
         try self.pause_fn(self.ptr);
     }

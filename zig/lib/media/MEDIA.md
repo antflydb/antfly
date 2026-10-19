@@ -823,3 +823,12 @@ cases plus their HTTP response check. The preceding bounded-plan comparison
 encountered one live-memory admission retry on its legacy route; these results
 are fixture measurements under shared-host conditions, not a production latency
 or sustained-throughput guarantee.
+
+
+For staged Metal video requests, queued preparation owns only source, decode
+buffers and retained-input capacity. A ready model turn obtains the execution
+supplement for its current vision, composition or backbone phase. Phase changes
+occur after commands are fenced; a denied replacement never authorizes work.
+Mixed-image preparation stably groups equal geometries inside the existing
+bounded wave and scatters projections back to original content slots, including
+waves with indexed failures. Neither policy expands producer lookahead.

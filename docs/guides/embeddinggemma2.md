@@ -1715,3 +1715,49 @@ cases plus their HTTP response check. The preceding bounded-plan comparison
 encountered one live-memory admission retry on its legacy route; these results
 are fixture measurements under shared-host conditions, not a production latency
 or sustained-throughput guarantee.
+
+
+Metal video projection uses the image tower's required prepared-plan contract
+when the pipeline owns phase admission. The geometry planner considers the
+bounded arena and transient workspace, rather than a dense attention matrix.
+At 480x480 it permits eight frames with a 250.03 MiB model-owned arena and
+401.5 MiB transient estimate; actual cohorts remain limited by ready frames,
+queue admission and completed-throughput calibration. A capability decline
+fences the required attempt and separately admits legacy subcohorts within
+the conservative 768 MiB transient ceiling before retrying against the retained
+input. Denied fallback admission propagates; it
+cannot execute under the smaller prepared reservation. Generic projector
+callers keep their conservative contract.
+
+Queued Metal video calls retain source/decode/preparation and projected-input
+capacity. Their model execution supplement is acquired only after the model
+queue grants a turn. Decode waits release this supplement. Ready vision,
+composition and backbone phases replace their execution reservations at fenced
+boundaries; the backbone uses its rendered input geometry. This also applies
+to video within mixed cohorts. CPU/CUDA and callers without staged ownership
+retain the established admission policy.
+
+Mixed image waves stably bucket prepared images by geometry within their
+existing four-item window. Projection output is scattered through original
+part indexes, preserving public content order and indexed decode failures.
+No extra preparation window or wait to fill a geometry bucket is introduced.
+
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VIDEO_PLAN=1` extends the pinned video qualifier
+with eight-frame versus singleton tower parity and alternating completed
+legacy/prepared clip timings. `MediaTimings` exposes stage copy bytes/time,
+explicit backend retirement time and provider reacquisition time. Reacquisition
+excludes lazy binding setup during subsequent dispatch; these counters do not
+alone measure all handoff overhead.
+
+
+The prepared-video qualifier passed eight-frame/singleton tower parity and a
+926-token denser-sampling legacy-retry comparison in Debug and ReleaseFast.
+On the shared M4 Max, the completed two-frame ReleaseFast comparison measured
+182.710 ms with legacy planning and 182.284 ms with prepared planning (seven
+samples after two warmups, alternating order, every output checked). This is
+effectively flat; larger eligible cohorts and reduced queued reservations do
+not imply a short-clip latency gain or sustained-throughput qualification.
+One optimized short-clip call recorded 1,077,248 copied bytes in 0.655 ms,
+0.097 ms of explicit backend retirement and 0.110 ms of provider reacquisition.
+These counters preserve independent tensor ownership and exclude lazy binding
+setup during later dispatch.

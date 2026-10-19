@@ -1891,7 +1891,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.embedding_stage_suspended or self.decoderWorkspaceBusy()) return error.EmbeddingStageBusy;
         const source = denseDeviceF32(tensor) orelse return error.InvalidTensorShape;
+        const clock = if (cb.embedding_stage.?.copy_fn != null) @import("antfly_platform").time.monotonicNs() else 0;
         const copy = try source.copiedView(0, source.deviceByteLen(), source.shape());
+        if (cb.embedding_stage.?.copy_fn) |record| record(cb.embedding_stage.?.ptr, source.deviceByteLen(), @import("antfly_platform").time.monotonicNs() - clock);
         return self.ctFromOwnedMetalTensor(copy) catch |err| {
             var owned = copy;
             owned.deinit();
@@ -47478,8 +47480,12 @@ test "embeddinggemma2 Metal stage handoff preserves independent tensors across p
     compute.require_f32_linears = true;
     defer compute.deinit();
     var cb = compute.computeBackend();
-    var hook: ops.EmbeddingStageControl = undefined;
-    cb.embedding_stage = &hook; // Escape only checks that a stage owner exists.
+    const Hook = struct {
+        fn stage(_: *anyopaque) anyerror!void {}
+        fn cleanup(_: *anyopaque) void {}
+    };
+    var hook = ops.EmbeddingStageControl{ .ptr = &compute, .pause_fn = Hook.stage, .resume_fn = Hook.stage, .cleanup_fn = Hook.cleanup };
+    cb.embedding_stage = &hook;
     const original = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 }));
     defer cb.free(original);
     const escaped = try MetalCompute.escapeEmbeddingStage(&cb, original);

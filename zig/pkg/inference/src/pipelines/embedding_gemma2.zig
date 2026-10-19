@@ -48,16 +48,20 @@ const StageLane = struct {
     timings: ?*MediaTimings = null,
     idle_backend: usize,
     extra: ?RunPermit = null,
+    video_phases: bool = false,
+    composition_request: ?@import("../backends/session.zig").RunRequest = null,
     hook: @import("../ops/ops.zig").EmbeddingStageControl = undefined,
     fn attach(self: *StageLane) void {
         if (self.cb.kind() != .metal or self.gate == null or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_STAGE_SCHEDULING")) return;
-        self.hook = .{ .ptr = self, .pause_fn = pause, .resume_fn = acquire, .cleanup_fn = cleanup };
+        self.hook = .{ .ptr = self, .pause_fn = pause, .resume_fn = acquire, .cleanup_fn = cleanup, .workspace_fn = if (self.video_phases) workspace else null, .copy_fn = if (self.timings != null) copied else null };
         self.cb.embedding_stage = &self.hook;
     }
     fn pause(raw: *anyopaque) !void {
         const self: *StageLane = @ptrCast(@alignCast(raw));
         if (!self.active) return;
+        const retired_at = if (self.timings != null) mediaNow() else 0;
         try @import("../ops/metal_compute.zig").MetalCompute.embeddingStageLease(self.cb, false);
+        if (self.timings) |t| t.stage_retire_ns += mediaNow() - retired_at;
         if (self.extra) |*extra| extra.deinit();
         self.extra = null;
         if (self.permit.lease) |*lease| {
@@ -75,16 +79,43 @@ const StageLane = struct {
         if (self.active) return;
         try enterModel(self.session, self.gate, control, self.waiter);
         errdefer leaveModel(self.gate, self.waiter);
-        if (execution) if (self.session.run_admission) |admission| {
-            self.extra = try self.session.admitSupplement(self.permit, try admission.estimateRequest(self.permit.request.?, self.session.outputInfo()));
-        };
+        if (execution) try self.reserve(if (self.video_phases) 0 else null);
         errdefer {
             if (self.extra) |*extra| extra.deinit();
             self.extra = null;
         }
+        const acquired_at = if (self.timings != null) mediaNow() else 0;
         try @import("../ops/metal_compute.zig").MetalCompute.embeddingStageLease(self.cb, true);
+        if (self.timings) |t| t.stage_rebind_ns += mediaNow() - acquired_at;
         self.active = true;
         if (self.timings) |t| t.stage_acquisitions += 1;
+    }
+    fn reserve(self: *StageLane, bytes: ?usize) !void {
+        // Every caller has fenced its previous GPU phase. Releasing an old
+        // supplement before acquiring the replacement never borrows stale credit.
+        if (self.extra) |*extra| extra.deinit();
+        self.extra = null;
+        var request = self.composition_request orelse self.permit.request orelse return error.InvalidAdmissionLeaseReduction;
+        if (bytes) |work| {
+            request.workspace_bytes = try std.math.add(usize, self.idle_backend, work);
+            request.backend_input_bytes = 0;
+            request.batch = 1;
+            request.sequence = 1;
+        }
+        if (self.session.run_admission) |admission| self.extra = try self.session.admitSupplement(self.permit, try admission.estimateRequest(request, self.session.outputInfo()));
+    }
+    fn copied(raw: *anyopaque, bytes: usize, nanos: u64) void {
+        const self: *StageLane = @ptrCast(@alignCast(raw));
+        if (self.timings) |t| {
+            t.stage_copy_ns += nanos;
+            t.stage_copy_bytes += bytes;
+        }
+    }
+    fn workspace(raw: *anyopaque, bytes: ?usize) !void {
+        const self: *StageLane = @ptrCast(@alignCast(raw));
+        if (!self.active or self.cb.decoderRuntimeHasActiveFrame() or self.cb.decoderRuntimeHasSubmittedFrame()) return error.EmbeddingStageBusy;
+        try self.control.check();
+        try self.reserve(bytes);
     }
     fn acquire(raw: *anyopaque) !void {
         const self: *StageLane = @ptrCast(@alignCast(raw));
@@ -107,10 +138,30 @@ const StageLane = struct {
         return if (self.extra) |*extra| extra else null;
     }
     fn retain(self: *StageLane, request: @import("../backends/session.zig").RunRequest) !void {
+        self.composition_request = null;
+        if (self.video_phases) {
+            // The tower is fenced and only independent inputs remain. Admit
+            // the exact backbone phase instead of restoring its tower peak.
+            if (self.extra) |*extra| extra.deinit();
+            self.extra = null;
+            if (self.session.run_admission) |admission| self.extra = try self.session.admitSupplement(self.permit, try admission.estimateRequest(request, self.session.outputInfo()));
+        }
         if (self.extra) |*extra| return self.permit.retainForRunWithSupplement(extra, request);
         try self.permit.retainForRun(request);
     }
 };
+
+fn videoPhaseAdmission(backend: @import("../backends/backends.zig").BackendType, lock: ?*std.atomic.Mutex) bool {
+    return backend == .metal and lock != null and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_STAGE_SCHEDULING");
+}
+fn queuedVideoRequest(request: @import("../backends/session.zig").RunRequest, retained_backend: usize) @import("../backends/session.zig").RunRequest {
+    var queued = request;
+    queued.batch = 1;
+    queued.sequence = 1;
+    queued.backend_input_bytes = 0;
+    queued.workspace_bytes = retained_backend;
+    return queued;
+}
 
 fn visionCacheCanRelieve(pressure: @import("../runtime/tier/memory.zig").AdmissionPressure) bool {
     return switch (pressure) {
@@ -194,6 +245,10 @@ pub const MediaTimings = struct {
     pack_ns: u64 = 0,
     encoder_ns: u64 = 0,
     pool_readback_ns: u64 = 0,
+    stage_retire_ns: u64 = 0,
+    stage_rebind_ns: u64 = 0,
+    stage_copy_ns: u64 = 0,
+    stage_copy_bytes: usize = 0,
     stage_yields: usize = 0,
     stage_acquisitions: usize = 0,
     prepared_vision_attempts: usize = 0,
@@ -557,7 +612,10 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     // A failed speculative call restores the conservative ceiling on retry.
     if (bounded.live > bounds.host) return error.MemoryBudgetExceeded;
     bounded.limit = bounds.host;
-    var permit = admitWithVisionCacheReclaim(session, .{ .batch = 1, .sequence = bounds.sequence, .input_bytes = input_bytes, .host_preprocess_bytes = bounds.host, .workspace_bytes = bounds.workspace, .output_bytes = options.dimensions * @sizeOf(f32) }, effective) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
+    const video_phases = has_video and videoPhaseAdmission(session.backend(), lock);
+    const idle_backend = device_bytes + bounds.sequence * 512 * 4 + 64 * 1024 * 1024;
+    const execution_request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = bounds.sequence, .input_bytes = input_bytes, .host_preprocess_bytes = bounds.host, .workspace_bytes = bounds.workspace, .output_bytes = options.dimensions * @sizeOf(f32) };
+    var permit = admitWithVisionCacheReclaim(session, if (video_phases) queuedVideoRequest(execution_request, idle_backend) else execution_request, effective) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
     defer permit.deinit();
     // Video parts execute sequentially; their transient preparation shares use
     // a maximum, while projected tokens stay in the model workspace.
@@ -591,9 +649,10 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     defer leaveModel(lock, &execution_waiter);
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = device_bytes + bounds.sequence * 512 * 4 + 64 * 1024 * 1024, .cb = &managed.backend, .control = effective };
+    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = idle_backend, .cb = &managed.backend, .control = effective, .video_phases = video_phases, .composition_request = if (video_phases) execution_request else null };
     lane.attach();
     defer lane.deinit();
+    if (video_phases) try lane.reserve(null);
     const cb = &managed.backend;
     if (cb.kind() == .cuda and singleImageGroup(group) and residentImagesEnabled(cb, options)) {
         const before = MediaTransferSnapshot.init(cb);
@@ -714,7 +773,10 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     bounded.limit = 512 * 1024 * 1024;
     if (host > bounded.limit) return error.MemoryBudgetExceeded;
     const workspace = try std.math.add(usize, (if (session.backend() == .metal) @as(usize, 1536) else 512) * 1024 * 1024, if (session.backend() == .metal) device else 0);
-    var permit = try admitWithVisionCacheReclaim(session, .{ .batch = if (compact_policy) 1 else items.len, .sequence = if (compact_policy) total + items.len * 128 else longest, .host_preprocess_bytes = bounded.limit, .workspace_bytes = workspace, .output_bytes = items.len * options.dimensions * 4 }, control);
+    const video_phases = videoPhaseAdmission(session.backend(), lock);
+    const idle_backend = device + total * 512 * 4 + 64 * 1024 * 1024;
+    const execution_request: @import("../backends/session.zig").RunRequest = .{ .batch = if (compact_policy) 1 else items.len, .sequence = if (compact_policy) total + items.len * 128 else longest, .host_preprocess_bytes = bounded.limit, .workspace_bytes = workspace, .output_bytes = items.len * options.dimensions * 4 };
+    var permit = try admitWithVisionCacheReclaim(session, if (video_phases) queuedVideoRequest(execution_request, idle_backend) else execution_request, control);
     defer permit.deinit();
     var pool = media_admission.Pool{ .limits = .{ .host_bytes = host, .device_bytes = if (session.backend() == .metal) device else 0, .commands = if (session.backend() == .metal) commands else 0 } };
     defer std.debug.assert(std.meta.eql(pool.snapshot(), media_admission.Resources{}));
@@ -723,9 +785,10 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer leaveModel(lock, &execution_waiter);
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = device + total * 512 * 4 + 64 * 1024 * 1024, .cb = &managed.backend, .control = control };
+    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = idle_backend, .cb = &managed.backend, .control = control, .video_phases = video_phases, .composition_request = if (video_phases) execution_request else null };
     lane.attach();
     defer lane.deinit();
+    if (video_phases) try lane.reserve(null);
     const cb = &managed.backend;
     var rows: [4]PreparedGroup = undefined;
     var initialized: usize = 0;
@@ -871,7 +934,10 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     const retained = inspected * 8192 * 512 * @sizeOf(f32);
     workspace = try std.math.add(usize, workspace, retained);
     bounded.limit = host;
-    var permit = try admitWithVisionCacheReclaim(session, .{ .batch = 1, .sequence = if (boundedVision(session.backend())) 1 else sequence, .input_bytes = inputs, .backend_input_bytes = if (boundedVision(session.backend())) 0 else null, .host_preprocess_bytes = host, .workspace_bytes = if (boundedVision(session.backend()) and !has_video) 2 * retained + 64 * 1024 * 1024 else workspace, .output_bytes = inspected * options.dimensions * 4 }, control);
+    const video_phases = has_video and videoPhaseAdmission(session.backend(), lock);
+    const idle_backend = device + 2 * retained + 64 * 1024 * 1024;
+    const execution_request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = if (boundedVision(session.backend())) 1 else sequence, .input_bytes = inputs, .backend_input_bytes = if (boundedVision(session.backend())) 0 else null, .host_preprocess_bytes = host, .workspace_bytes = if (boundedVision(session.backend()) and !has_video) 2 * retained + 64 * 1024 * 1024 else workspace, .output_bytes = inspected * options.dimensions * 4 };
+    var permit = try admitWithVisionCacheReclaim(session, if (video_phases) queuedVideoRequest(execution_request, idle_backend) else execution_request, control);
     defer permit.deinit();
     var pool = media_admission.Pool{ .limits = .{ .host_bytes = host, .device_bytes = if (session.backend() == .metal) device else 0, .commands = if (session.backend() == .metal) commands else 0 } };
     defer std.debug.assert(std.meta.eql(pool.snapshot(), media_admission.Resources{}));
@@ -879,7 +945,7 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     defer guard.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = device + retained, .cb = &managed.backend, .control = control };
+    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = if (video_phases) idle_backend else device + retained, .cb = &managed.backend, .control = control, .video_phases = video_phases, .composition_request = if (video_phases) execution_request else null };
     lane.attach();
     defer lane.deinit();
     const cb = &managed.backend;
@@ -1001,6 +1067,7 @@ const CohortReady = struct {
         for (ready[0..ready_count]) |index| {
             try control.check();
             if (errors[index] != null) continue;
+            if (cb.embedding_stage) |stage| try stage.workspace(null);
             rows[prepared] = (if (cb.kind() == .cuda) prepareCudaProjectedGroup(a, cb, tokenizer, groups[index], options, control, parts.parts[index]) else prepareGroupCombined(a, cb, tokenizer, groups[index], options, control, pool, null, cache, parts.parts[index])) catch |err| {
                 if (@import("audio_preparation.zig").abort(err)) return err;
                 errors[index] = err;
@@ -1070,6 +1137,7 @@ const CohortReady = struct {
                 try lease.retain(remaining);
             }
         }
+        if (self.lane.video_phases) try self.lane.reserve(0);
         var supplement = try session.admitSupplementPair(permit, self.lane.credit(), peak);
         defer supplement.deinit();
         for (phases[0..phase_count]) |phase| {
@@ -1159,7 +1227,9 @@ const MixedWave = struct {
     fn run(self: *MixedWave) void {
         self.prepare() catch |err| {
             self.failure = if (err == error.OutOfMemory and self.allocation_exceeded_budget) error.MemoryBudgetExceeded else err;
+            return;
         };
+        self.groupGeometry();
     }
     fn prepare(self: *MixedWave) !void {
         try self.control.check();
@@ -1201,6 +1271,24 @@ const MixedWave = struct {
             }
             self.indexes[self.count] = index;
             self.count += 1;
+        }
+    }
+    fn groupGeometry(self: *MixedWave) void {
+        // Stable in-wave bucketing leaves source/error slots untouched and
+        // never extends the bounded preparation window or waits for more work.
+        if (!self.image) return;
+        var i: usize = 1;
+        while (i < self.count) : (i += 1) {
+            const image = self.images[i];
+            const slot = self.indexes[i];
+            const key = projector.embeddingGemma2GeometryKey(image.geometry);
+            var j = i;
+            while (j > 0 and projector.embeddingGemma2GeometryKey(self.images[j - 1].geometry) > key) : (j -= 1) {
+                self.images[j] = self.images[j - 1];
+                self.indexes[j] = self.indexes[j - 1];
+            }
+            self.images[j] = image;
+            self.indexes[j] = slot;
         }
     }
     fn start(self: *MixedWave) bool {
@@ -4390,4 +4478,77 @@ test "embeddinggemma2 Metal raster preparation borrows strided bytes without hos
     try std.testing.expectEqual(@as(usize, 63), try prepared.source.?.rowStride());
     try std.testing.expectEqual(@as(usize, 0), prepared.retainedBytes());
     try std.testing.expectEqual(@as(usize, 0), try rasterPreparationBytes(.metal, &.{raster}));
+}
+
+test "embeddinggemma2 mixed geometry bucketing preserves sparse source slots and stable order" {
+    const a = std.testing.allocator;
+    var wave = MixedWave{ .session = undefined, .groups = &.{}, .refs = &.{}, .control = .{}, .image = true, .count = 4 };
+    const small = try projector.embeddingGemma2ImageGeometry(48, 96);
+    const large = try projector.embeddingGemma2ImageGeometry(480, 480);
+    for ([_]projector.Geometry{ large, small, large, small }, 0..) |geometry, i| {
+        wave.images[i] = .{ .allocator = a, .pixels = &.{}, .geometry = geometry };
+    }
+    wave.indexes = .{ 0, 2, 3, 1 };
+    wave.groupGeometry();
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0, 3 }, &wave.indexes);
+    try std.testing.expectEqual(small, wave.images[0].geometry);
+    try std.testing.expectEqual(small, wave.images[1].geometry);
+    try std.testing.expectEqual(large, wave.images[2].geometry);
+    try std.testing.expectEqual(large, wave.images[3].geometry);
+    wave.image = false;
+    wave.groupGeometry();
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0, 3 }, &wave.indexes);
+}
+
+test "embeddinggemma2 queued video retains preparation without reserving execution scratch" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const request: @import("../backends/session.zig").RunRequest = .{ .batch = 4, .sequence = 4096, .input_bytes = 32 * 1024 * 1024, .host_preprocess_bytes = 128 * 1024 * 1024, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = 4096 };
+    const queued = queuedVideoRequest(request, 96 * 1024 * 1024);
+    try std.testing.expectEqual(request.input_bytes, queued.input_bytes);
+    try std.testing.expectEqual(request.host_preprocess_bytes, queued.host_preprocess_bytes);
+    try std.testing.expectEqual(@as(?usize, 0), queued.backend_input_bytes);
+    try std.testing.expectEqual(@as(usize, 1), queued.sequence);
+    const tensor = @import("../backends/tensor.zig");
+    const Mock = struct {
+        fn run(_: *anyopaque, _: []const tensor.Tensor, _: std.mem.Allocator) anyerror![]tensor.Tensor {
+            return error.Unused;
+        }
+        fn info(_: *anyopaque) []const tensor.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .metal;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var dummy: u8 = 0;
+    var controller = memory.AdmissionController{};
+    const session = Session{ .ptr = &dummy, .vtable = &.{ .run = Mock.run, .inputInfo = Mock.info, .outputInfo = Mock.info, .backend = Mock.backend, .close = Mock.close }, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 2048 * 1024 * 1024, .host_limit_bytes = 2048 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var first = try session.admit(queued);
+    defer first.deinit();
+    var second = try session.admit(queued);
+    defer second.deinit();
+    var lane = StageLane{ .session = session, .gate = null, .waiter = undefined, .cb = undefined, .control = .{}, .permit = &first, .idle_backend = queued.workspace_bytes, .video_phases = true, .composition_request = request };
+    defer if (lane.extra) |*extra| extra.deinit();
+    try lane.reserve(null);
+    try std.testing.expectEqual(request.workspace_bytes + queued.workspace_bytes, controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, lane.reserve(1860 * 1024 * 1024));
+    // A denied replacement leaves both queued owners intact and grants no work.
+    try std.testing.expect(lane.extra == null);
+    try std.testing.expectEqual(2 * queued.workspace_bytes, controller.snapshot().backend_scratch_bytes);
+    try lane.reserve(256 * 1024 * 1024);
+    try std.testing.expectEqual(2 * queued.workspace_bytes + 256 * 1024 * 1024, controller.snapshot().backend_scratch_bytes);
+    try lane.reserve(0);
+    try std.testing.expectEqual(2 * queued.workspace_bytes, controller.snapshot().backend_scratch_bytes);
+    // A backbone may be larger than the idle lease; it obtains independent
+    // capacity before reducing retained ownership to its exact next phase.
+    var backbone = queued;
+    backbone.workspace_bytes = 512 * 1024 * 1024;
+    try lane.retain(backbone);
+    try std.testing.expectEqual(backbone.workspace_bytes + queued.workspace_bytes, controller.snapshot().backend_scratch_bytes);
+    if (lane.extra) |*extra| extra.deinit();
+    lane.extra = null;
+    first.deinit();
+    second.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }

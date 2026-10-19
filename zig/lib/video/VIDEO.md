@@ -978,3 +978,14 @@ cases plus their HTTP response check. The preceding bounded-plan comparison
 encountered one live-memory admission retry on its legacy route; these results
 are fixture measurements under shared-host conditions, not a production latency
 or sustained-throughput guarantee.
+
+
+Staged Metal inference can admit video tower execution through the same bounded
+prepared-plan contract as images. Admission covers all live frame inputs and
+retained projections beside the current transient phase; model-owned arenas
+have independent cache leases. Required-plan decline must fence partial work
+and acquire each bounded legacy subcohort budget before retry. A generic caller without
+this admission hook retains conservative batch sizing. Decode/preparation
+queues retain their leases while model execution supplements are released at
+waits. Eight-frame tower parity and completed clip comparisons are available
+through `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VIDEO_PLAN=1` in the pretrained suite.

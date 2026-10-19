@@ -709,13 +709,37 @@ pub fn embeddingGemma2VideoBatchCapacityForBackend(width: u32, height: u32, budg
     return if (metal) @import("../ops/embedding_vision_plan.zig").capacity(patches, count) else count;
 }
 
+/// Prepared-video geometry uses the same arena and transient contract as images.
+pub fn embeddingGemma2VideoPreparedScratch(width: u32, height: u32, frames: usize) !usize {
+    if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0 or frames == 0 or frames > 8) return error.InvalidTensorShape;
+    return @import("../ops/embedding_vision_plan.zig").transientBytes(@as(usize, width / 16) * (height / 16) * frames);
+}
+pub fn embeddingGemma2VideoPreparedCapacity(width: u32, height: u32, budget: usize) !usize {
+    var frames: usize = 8;
+    while (frames > 0) : (frames -= 1) {
+        const scratch = embeddingGemma2VideoPreparedScratch(width, height, frames) catch |err| {
+            if (err == error.InvalidVisionPlan) continue;
+            return err;
+        };
+        if (scratch <= budget) return frames;
+    }
+    return error.ImageBatchBudgetExceeded;
+}
+
 pub fn encodeEmbeddingGemma2VideoBatchTensorResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize) !EncodedDeviceImage {
+    return encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, allocator, input, width, height, frames, false);
+}
+pub fn encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize, required: bool) !EncodedDeviceImage {
     var cfg = embeddingGemma2ImageConfig();
     cfg.max_image_tokens = 140;
+    cfg.require_prepared_vision = required;
     if (frames == 0 or frames > 8) return error.InvalidTensorShape;
     if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
     const g = Geometry{ .batches = frames, .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
     if (g.tokenCount() / frames > 140) return error.InvalidTensorShape;
+    if (required) {
+        if (!try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingVisionPlan(cb, .{ .rows = frames * g.grid_x * g.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size })) return error.PreparedVisionUnavailable;
+    }
     var store = ProjectorWeights.initHuggingFace(cb, allocator);
     defer store.deinit();
     const weight = try store.linearCt("v.patch_embd.weight", 768, cfg.vision_hidden);

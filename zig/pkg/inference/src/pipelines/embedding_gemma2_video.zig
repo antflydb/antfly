@@ -1081,7 +1081,10 @@ pub const Prefetch = struct {
         self.join();
         if (self.failure) |err| return err;
         self.releasePreparer();
-        if (cb.embedding_stage) |stage| try stage.acquire();
+        if (cb.embedding_stage) |stage| {
+            try stage.acquire();
+            try stage.workspace(null);
+        }
         try capture.flushNativePending();
         try capture.finishDuplicates();
         if (resident) |tensors| {
@@ -1576,7 +1579,7 @@ const Capture = struct {
             const input = try self.cb.fromFloat32Shape(patches, &.{ @intCast(patches.len / 768), 768 });
             defer self.cb.free(input);
             const started = batch_clock.monotonicNs();
-            const encoded = try projector.encodeEmbeddingGemma2VideoTensorResident(self.cb, self.a, input, options.width, options.height);
+            const encoded = try self.encodeGpu(input, options, 1);
             tensors[slot] = encoded.tensor;
             self.frame_tokens[slot] = encoded.tokens;
             self.storeDevice(slot, encoded.tensor, encoded.tokens);
@@ -1612,6 +1615,53 @@ const Capture = struct {
         }
         return self.projectGpuNow(slot, value, options);
     }
+    fn preparedVision(self: *const Capture) bool {
+        const stage = self.cb.embedding_stage orelse return false;
+        return stage.workspace_fn != null and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN");
+    }
+    fn encodeGpu(self: *Capture, input: CT, options: video.preparation.Options, frames: usize) !projector.EncodedDeviceImage {
+        const stage = self.cb.embedding_stage;
+        const required = self.preparedVision();
+        const scratch = if (required) try projector.embeddingGemma2VideoPreparedScratch(options.width, options.height, frames) else try std.math.mul(usize, try projector.embeddingGemma2VideoScratch(options.width, options.height), frames);
+        if (stage) |lane| try lane.workspace(scratch);
+        return projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, input, options.width, options.height, frames, required) catch |err| {
+            if (err != error.PreparedVisionUnavailable or !required) return err;
+            // The failed required plan has fenced every command. The original
+            // input is still live; no producer job is consumed a second time.
+            if (self.cb.decoderRuntimeHasActiveFrame() or self.cb.decoderRuntimeHasSubmittedFrame()) return error.PreparedVisionFallbackBusy;
+            try self.control.check();
+            return self.encodeLegacyGpu(input, options, frames);
+        };
+    }
+    fn encodeLegacyGpu(self: *Capture, input: CT, options: video.preparation.Options, frames: usize) !projector.EncodedDeviceImage {
+        const capacity = try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024);
+        const per_frame = try projector.embeddingGemma2VideoScratch(options.width, options.height);
+        const stage = self.cb.embedding_stage.?;
+        if (frames <= capacity) {
+            try stage.workspace(per_frame * frames);
+            return projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, input, options.width, options.height, frames, false);
+        }
+        const patches = @as(usize, options.width / 16) * (options.height / 16);
+        const tokens = @as(usize, options.width / 48) * (options.height / 48);
+        // Final projections and the original patch input remain independently
+        // owned throughout retry. Only one legacy subcohort is transiently live.
+        const output = (try self.cb.allocUninitF32Shape(&.{ @intCast(frames * tokens), 512 })) orelse return error.UnsupportedPrimitiveOp;
+        errdefer self.cb.free(output);
+        var first: usize = 0;
+        while (first < frames) {
+            try self.control.check();
+            const take = @min(capacity, frames - first);
+            try stage.workspace(per_frame * take);
+            const slice = try self.cb.sliceRows2D(self.a, input, first * patches, take * patches, 768);
+            defer self.cb.free(slice);
+            const encoded = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, slice, options.width, options.height, take, false);
+            defer self.cb.free(encoded.tensor);
+            if (encoded.tokens != take * tokens) return error.InvalidTensorShape;
+            if (!try self.cb.copyRows2D(self.a, output, first * tokens, encoded.tensor, 0, encoded.tokens, 512)) return error.UnsupportedPrimitiveOp;
+            first += take;
+        }
+        return .{ .tensor = output, .tokens = frames * tokens };
+    }
     /// Consumes every preparation even when imports or projection fail.
     fn projectGpuBatchNow(self: *Capture, jobs: []ProjectionJob) !void {
         var consumed: usize = 0;
@@ -1619,7 +1669,7 @@ const Capture = struct {
         while (consumed < jobs.len) {
             const first = consumed;
             const options = jobs[first].options;
-            const capacity = batch_policy.capacity(true, options.width, options.height, try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024));
+            const capacity = batch_policy.capacity(true, options.width, options.height, if (self.preparedVision()) try projector.embeddingGemma2VideoPreparedCapacity(options.width, options.height, 768 * 1024 * 1024) else try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024));
             var stop = first + 1;
             while (stop < jobs.len and stop - first < capacity and jobs[stop].options.width == options.width and jobs[stop].options.height == options.height) : (stop += 1) {}
             consumed = stop; // Cohort consumes all its leases, including on failure.
@@ -1654,7 +1704,7 @@ const Capture = struct {
             defer self.cb.free(input);
             for (inputs[0..jobs.len], 0..) |part, i| if (!try self.cb.copyRows2D(self.a, input, i * rows, part, 0, rows, 768)) return error.UnsupportedPrimitiveOp;
             const started = batch_clock.monotonicNs();
-            const encoded = try projector.encodeEmbeddingGemma2VideoBatchTensorResident(self.cb, self.a, input, options.width, options.height, jobs.len);
+            const encoded = try self.encodeGpu(input, options, jobs.len);
             defer self.cb.free(encoded.tensor);
             if (encoded.tokens % jobs.len != 0) return error.InvalidTensorShape;
             const per_frame = encoded.tokens / jobs.len;
@@ -3121,4 +3171,37 @@ test "embeddinggemma2 video queue capacity reserves a producer beside queued and
     try std.testing.expectEqual(@as(usize, 2), queueCapacity(&pool, 32));
     pool.limits.commands = 17;
     try std.testing.expectEqual(@as(usize, 8), queueCapacity(&pool, 32));
+}
+
+test "embeddinggemma2 prepared video admits eight full frames without dense score estimates" {
+    const capacity = try projector.embeddingGemma2VideoPreparedCapacity(480, 480, 768 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 8), capacity);
+    try std.testing.expectEqual(@as(usize, 3), try projector.embeddingGemma2VideoBatchCapacity(480, 480, 768 * 1024 * 1024));
+    const scratch = try projector.embeddingGemma2VideoPreparedScratch(480, 480, capacity);
+    try std.testing.expectEqual(@as(usize, 401 * 1024 * 1024 + 512 * 1024), scratch);
+    try std.testing.expectEqual(@as(usize, 1), try projector.embeddingGemma2VideoPreparedCapacity(480, 480, try projector.embeddingGemma2VideoPreparedScratch(480, 480, 1)));
+    try std.testing.expectError(error.ImageBatchBudgetExceeded, projector.embeddingGemma2VideoPreparedCapacity(480, 480, 1));
+    try std.testing.expectError(error.InvalidTensorShape, projector.embeddingGemma2VideoPreparedCapacity(0, 480, 768 * 1024 * 1024));
+}
+
+test "embeddinggemma2 video phase denial precedes projector access" {
+    const Hook = struct {
+        observed: usize = 0,
+        fn reserve(raw: *anyopaque, bytes: ?usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observed = bytes.?;
+            return error.ResourceTemporarilyUnavailable;
+        }
+        fn unused(_: *anyopaque) anyerror!void {
+            return error.UnexpectedStageCall;
+        }
+        fn cleanup(_: *anyopaque) void {}
+    };
+    var hook = Hook{};
+    const stage = @import("../ops/ops.zig").EmbeddingStageControl{ .ptr = &hook, .pause_fn = Hook.unused, .resume_fn = Hook.unused, .cleanup_fn = Hook.cleanup, .workspace_fn = Hook.reserve };
+    const cb = ComputeBackend{ .ptr = undefined, .vtable = undefined, .embedding_stage = &stage };
+    var capture = Capture{ .a = std.testing.allocator, .cb = &cb, .track = undefined, .control = .{}, .output = &.{}, .frame_tokens = &.{}, .selected = &.{} };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, capture.encodeGpu(undefined, .{ .width = 480, .height = 480, .matrix = .bt709 }, 8));
+    const expected = if (capture.preparedVision()) try projector.embeddingGemma2VideoPreparedScratch(480, 480, 8) else 8 * try projector.embeddingGemma2VideoScratch(480, 480);
+    try std.testing.expectEqual(expected, hook.observed);
 }

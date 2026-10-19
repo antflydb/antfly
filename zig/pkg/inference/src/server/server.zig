@@ -37638,7 +37638,33 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
             const expected = parsed.value.object.get("cases").?.array.items[4].object.get("embedding").?.array.items;
             for (vector, expected) |actual, value| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(value.float)), actual, 1e-3);
         }
-        std.debug.print("embeddinggemma2 stage_followup broker_parity=true mixed_parity=true stage_yields={d} stage_acquisitions={d} prepared_attempts={d} fallbacks={d}\n", .{ timings.stage_yields, timings.stage_acquisitions, timings.prepared_vision_attempts, timings.vision_plan_fallbacks });
+        std.debug.print("embeddinggemma2 stage_followup broker_parity=true mixed_parity=true stage_yields={d} stage_acquisitions={d} prepared_attempts={d} fallbacks={d} retire_ns={d} rebind_ns={d} copy_ns={d} copy_bytes={d}\n", .{ timings.stage_yields, timings.stage_acquisitions, timings.prepared_vision_attempts, timings.vision_plan_fallbacks, timings.stage_retire_ns, timings.stage_rebind_ns, timings.stage_copy_ns, timings.stage_copy_bytes });
+        // Alternate aspect ratios in one mixed wave. The prepared order may
+        // change, while each public vector must keep its original group slot.
+        const tall_bytes = try a.alloc(u8, 48 * 96 * 4);
+        defer a.free(tall_bytes);
+        @memset(tall_bytes, 127);
+        const tall: readers_api.RasterImage = .{ .bytes = tall_bytes, .width = 48, .height = 96, .stride_bytes = 48 * 4 };
+        const geometry_groups = [_]grouped.Group{
+            .{ .content = &.{.{ .raster = rasters[0] }} },
+            .{ .content = &.{.{ .raster = tall }} },
+            .{ .content = &.{.{ .raster = rasters[0] }} },
+            .{ .content = &.{.{ .raster = tall }} },
+        };
+        const tall_reference = try grouped.embed(a, loaded.session, loaded.getTokenizer(), geometry_groups[1], .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+        defer a.free(tall_reference.vector);
+        var geometry_errors: [4]?anyerror = @splat(null);
+        const geometry_result = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &geometry_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &geometry_errors);
+        defer {
+            freeDirectDenseVectors(a, geometry_result.vectors);
+            a.free(geometry_result.input_tokens);
+        }
+        for (geometry_result.vectors, geometry_errors, 0..) |vector, failure, index| {
+            try std.testing.expectEqual(@as(?anyerror, null), failure);
+            const expected = if (index % 2 == 0) batched.vectors[0] else tall_reference.vector;
+            for (vector, expected) |actual, value| try std.testing.expectApproxEqAbs(value, actual, 1e-3);
+        }
+        std.debug.print("embeddinggemma2 mixed_geometry alternating_aspects=true scatter_parity=true\n", .{});
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
             extern "c" fn unsetenv([*:0]const u8) c_int;
@@ -37787,6 +37813,102 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
         try rows.append(a, .{ .name = name, .tokens = result.input_tokens, .cosine = cosine, .max_abs = max_abs, .norm = @sqrt(norm) });
         failures += @intFromBool(cosine < @as(f64, if (metal) 0.9999 else 0.99999) or max_abs > @as(f64, if (metal) 1e-3 else 1e-4));
         try std.testing.expectApproxEqAbs(@as(f64, 1), @sqrt(norm), 1e-5);
+
+        if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VIDEO_PLAN") and std.mem.eql(u8, name, "h264_video")) {
+            const Env = struct {
+                extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+                extern "c" fn unsetenv([*:0]const u8) c_int;
+            };
+            {
+                // Exercise a full eight-frame tower independent of decode queue
+                // arrival. A repeated frame must match singleton projection.
+                const projector = @import("../architectures/gemma4_projector.zig");
+                const admission = try loaded.session.admit(.{ .workspace_bytes = 2 * 1024 * 1024 * 1024 });
+                var owned_admission = admission;
+                defer owned_admission.deinit();
+                const gate = loaded.embeddingExecutionLock();
+                if (gate) |mutex| try node.extractionExecutionControl(null).lock(mutex);
+                defer if (gate) |mutex| mutex.unlock();
+                var managed = try session_factory.getManagedComputeBackend(loaded.session, a, null, node.extractionExecutionControl(null));
+                defer managed.deinit();
+                const cb = &managed.backend;
+                const host = try a.alloc(f32, 900 * 768);
+                defer a.free(host);
+                for (host, 0..) |*v, index| v.* = @as(f32, @floatFromInt(index % 251)) / 251 - 0.5;
+                const single_input = try cb.fromFloat32Shape(host, &.{ 900, 768 });
+                defer cb.free(single_input);
+                const single = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, a, single_input, 480, 480, 1, true);
+                defer cb.free(single.tensor);
+                const single_values = try cb.toFloat32(single.tensor, a);
+                defer a.free(single_values);
+                const input = (try cb.allocUninitF32Shape(&.{ 7200, 768 })) orelse return error.UnsupportedPrimitiveOp;
+                defer cb.free(input);
+                for (0..8) |frame| try std.testing.expect(try cb.copyRows2D(a, input, frame * 900, single_input, 0, 900, 768));
+                const projected = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, a, input, 480, 480, 8, true);
+                defer cb.free(projected.tensor);
+                const values = try cb.toFloat32(projected.tensor, a);
+                defer a.free(values);
+                try std.testing.expectEqual(single.tokens * 8, projected.tokens);
+                for (0..8) |frame| for (values[frame * single_values.len ..][0..single_values.len], single_values) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+                std.debug.print("embeddinggemma2 video_plan full_frames=8 singleton_projection_parity=true\n", .{});
+            }
+            const flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN";
+            const saved = if (platform.env.getenv(flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
+            defer if (saved) |old| a.free(old);
+            defer {
+                if (saved) |old| {
+                    _ = Env.setenv(flag, old, 1);
+                } else {
+                    _ = Env.unsetenv(flag);
+                }
+            }
+            const fallback_flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP";
+            const saved_fallback = if (platform.env.getenv(fallback_flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
+            defer if (saved_fallback) |old| a.free(old);
+            {
+                defer {
+                    if (saved_fallback) |old| {
+                        _ = Env.setenv(fallback_flag, old, 1);
+                    } else {
+                        _ = Env.unsetenv(fallback_flag);
+                    }
+                }
+                try std.testing.expect(Env.setenv(flag, "0", 1) == 0);
+                try std.testing.expect(Env.setenv(fallback_flag, "1", 1) == 0);
+                const fallback = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = parts.items }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                defer a.free(fallback.vector);
+                for (fallback.vector, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+                std.debug.print("embeddinggemma2 video_plan required_decline_legacy_retry_parity=true\n", .{});
+                // A denser sampling policy exercises more than one legacy
+                // cohort. Compare the same eight-picture input across routes.
+                const dense_parts = [_]grouped.Part{.{ .sampled_video = .{ .bytes = bytes.items[0], .sampling = .{ .timestamps = .{ .step_ns = 125_000_000, .max_frames = 8 } } } }};
+                const dense_fallback = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &dense_parts }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                defer a.free(dense_fallback.vector);
+                try std.testing.expect(dense_fallback.input_tokens > 3 * 100);
+                try std.testing.expect(Env.setenv(fallback_flag, "0", 1) == 0);
+                const dense_prepared = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &dense_parts }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                defer a.free(dense_prepared.vector);
+                try std.testing.expectEqual(dense_fallback.input_tokens, dense_prepared.input_tokens);
+                for (dense_prepared.vector, dense_fallback.vector) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+                std.debug.print("embeddinggemma2 video_plan dense_sampling_tokens={d} bounded_legacy_retry_parity=true\n", .{dense_prepared.input_tokens});
+            }
+            var samples: [2][7]u64 = undefined;
+            var stage_totals = grouped.MediaTimings{};
+            for (0..9) |iteration| for (0..2) |phase| {
+                const route = phase ^ (iteration & 1);
+                try std.testing.expect(Env.setenv(flag, if (route == 0) "1" else "0", 1) == 0);
+                var timing = grouped.MediaTimings{};
+                const started = platform.time.monotonicNs();
+                const measured = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = parts.items }, .{ .timings = &timing }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                defer a.free(measured.vector);
+                const elapsed = platform.time.monotonicNs() -| started;
+                for (measured.vector, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+                if (iteration >= 2) samples[route][iteration - 2] = elapsed;
+                if (route == 1) stage_totals = timing;
+            };
+            for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
+            std.debug.print("embeddinggemma2 video_plan reference_ns={d} optimized_ns={d} samples=7 parity=true retire_ns={d} rebind_ns={d} copy_ns={d} copy_bytes={d}\n", .{ samples[0][3], samples[1][3], stage_totals.stage_retire_ns, stage_totals.stage_rebind_ns, stage_totals.stage_copy_ns, stage_totals.stage_copy_bytes });
+        }
 
         if (std.mem.eql(u8, name, "text_video")) {
             const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.items[0].len));
