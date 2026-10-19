@@ -3988,14 +3988,20 @@ test "relational contract schema parsing uses bounded stack and unwinds partial 
         }
 
         fn run(self: *@This()) void {
-            parse(std.testing.allocator, self.input) catch |err| {
+            // Measure parser stack, not the DWARF unwinder's additional
+            // recursive stack at every allocation. Leak/ownership checking
+            // stays enabled; failure enumeration below retains full traces
+            // on the normal test thread.
+            var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+            defer std.debug.assert(checked.deinit() == 0);
+            parse(checked.allocator(), self.input) catch |err| {
                 self.failure = err;
             };
         }
     };
     var probe = Probe{ .input = input.items };
     // Keep 32 nested objects within one serving-thread-sized stack, including
-    // allocator tracing and JSON parsing. Scalar scratch must not accumulate
+    // leak checking and JSON parsing. Scalar scratch must not accumulate
     // along the recursive child path.
     const thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Probe.run, .{&probe});
     thread.join();
