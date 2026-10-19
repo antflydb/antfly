@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "qualification_base": "328bca376bf0eb9ae0c49624d4cca1e496107b74",
-  "merged_main": "a37fef34ec82b47ac35e47c5b88f324b109a31a3",
+  "merged_main": "bdd7bc01131c02b4316e23eff61f5a40ed8c813e",
   "compiler": "0.17.0",
   "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
   "build_flags": [
@@ -18,7 +18,7 @@
     "zig/pkg/antfly-grep/src/source_watch.zig": "37b1ee1d90c3466886634173674945442187eaa064574e60023788e266a4f885",
     "zig/pkg/antfly-grep/src/source_cache.zig": "752a6505ece853659c62fd42ef08c384ba0ab6b3f4a0b9287ebb06d689d9bcb8",
     "zig/pkg/antfly-grep/src/prepared_query.zig": "0d260f8611f46698acfde7055e257dd06374c6388da744de8ddee747d9b02532",
-    "zig/pkg/antfly-grep/README.md": "a9ae3a51275868838adc9b2adb65aa9836834215e68ee44f7ecd303f08cf33bd",
+    "zig/pkg/antfly-grep/README.md": "1acf3c72366d67c4665b4085a84b6ee991d76acd8542e7ca2dd34595b1ff8960",
     "zig/pkg/antfly-grep/bench/lexical_reuse.py": "00feba914cd34111ac940397b36a5e13a40c2bd808f67db23df23755928b38ec",
     "zig/pkg/antfly-grep/bench/restart.py": "1012bca7c9387262287ddcfccacdca84d64c8a50be41804f87c5e1b4774f3e3d",
     "zig/pkg/antfly-grep/tests/test_cli.py": "fcedab01ba7335f35b591fd6167abb6de61a8f027d8593245d132ce8d30ee7d8",
@@ -40,12 +40,12 @@
   "archives": {
     "macos": {
       "binary_sha256": "9e06599c2dcd9980f1ad30e74feab777d1d4c44c55bb91e388817f9b17d0edd0",
-      "archive_sha256": "915b7f442cf80405f1ee35199dbc2dfa5f111e1fa81b2d63173494de86862ba8",
+      "archive_sha256": "c968c87ce41e1fd2bc6a2e278075594742961b884abe9af1bf6b4e68071c6a89",
       "binary_bytes": 7580264,
       "runtime_verified": true,
       "verified_members": {
-        "README.md": "a9ae3a51275868838adc9b2adb65aa9836834215e68ee44f7ecd303f08cf33bd",
-        "share/antfly-grep/README.md": "a9ae3a51275868838adc9b2adb65aa9836834215e68ee44f7ecd303f08cf33bd",
+        "README.md": "1acf3c72366d67c4665b4085a84b6ee991d76acd8542e7ca2dd34595b1ff8960",
+        "share/antfly-grep/README.md": "1acf3c72366d67c4665b4085a84b6ee991d76acd8542e7ca2dd34595b1ff8960",
         "share/antfly-grep/COMPATIBILITY.md": "568d1049515a91a876d3e58dbac6113e2789e99680915612230c5dacb1bc98d3",
         "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
         "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
@@ -90,12 +90,12 @@
     },
     "linux": {
       "binary_sha256": "75126e1d8d3c81d25ba5cf05b6dfb6520d9b55452e4031f1d9322d8562f4c62a",
-      "archive_sha256": "279242d0acf32df68b90307361a1c0ebc98c160a7a2cb1b07d0d23c205e05308",
+      "archive_sha256": "6855755c9693ad0dfe910c833c990d05e74439223a8ae2dfd72bdbca0c29f906",
       "binary_bytes": 7601304,
       "runtime_verified": true,
       "verified_members": {
-        "README.md": "a9ae3a51275868838adc9b2adb65aa9836834215e68ee44f7ecd303f08cf33bd",
-        "share/antfly-grep/README.md": "a9ae3a51275868838adc9b2adb65aa9836834215e68ee44f7ecd303f08cf33bd",
+        "README.md": "1acf3c72366d67c4665b4085a84b6ee991d76acd8542e7ca2dd34595b1ff8960",
+        "share/antfly-grep/README.md": "1acf3c72366d67c4665b4085a84b6ee991d76acd8542e7ca2dd34595b1ff8960",
         "share/antfly-grep/COMPATIBILITY.md": "568d1049515a91a876d3e58dbac6113e2789e99680915612230c5dacb1bc98d3",
         "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
         "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
@@ -140,12 +140,12 @@
     },
     "windows": {
       "binary_sha256": "a465a241f54236bb531b253db9d7b44eb93bc06dbd94803733739e6ad379a747",
-      "archive_sha256": "1712f2edb0eec45e3636f0366fe6164055db966747829df8ec4b7ecdfc595cc4",
+      "archive_sha256": "50ebd40b18fd74e13925168aac2a172f1848be184ff529dcb141381b315939ed",
       "binary_bytes": 8504832,
       "runtime_verified": false,
       "verified_members": {
-        "README.md": "a9ae3a51275868838adc9b2adb65aa9836834215e68ee44f7ecd303f08cf33bd",
-        "share/antfly-grep/README.md": "a9ae3a51275868838adc9b2adb65aa9836834215e68ee44f7ecd303f08cf33bd",
+        "README.md": "1acf3c72366d67c4665b4085a84b6ee991d76acd8542e7ca2dd34595b1ff8960",
+        "share/antfly-grep/README.md": "1acf3c72366d67c4665b4085a84b6ee991d76acd8542e7ca2dd34595b1ff8960",
         "share/antfly-grep/COMPATIBILITY.md": "568d1049515a91a876d3e58dbac6113e2789e99680915612230c5dacb1bc98d3",
         "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
         "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
@@ -191,7 +191,7 @@
   },
   "checks": {
     "macos_cli": {
-      "log_sha256": "23e1b22dfec454da595a4ee69cfc7f2e8c8416f13703899fae4aff00d1aa8ed3",
+      "log_sha256": "bcb6cc1c4750864b60f33e016e5da9055e7a80f9b329e9d4280cb556dc231317",
       "assertions": [
         "Ran 234 tests",
         "OK (skipped=2)"
@@ -223,7 +223,7 @@
       ]
     },
     "boundary": {
-      "log_sha256": "38b9c6de73e51220f5264dfe595bd1cfa029706884c085e410f75ef443b677a4",
+      "log_sha256": "4fbf01612a88e643f87a36ffa02f438dcb4301e1664fa3468c46d0eae1911666",
       "assertions": [
         "Apache product boundary verified"
       ]
@@ -247,7 +247,10 @@
     "build-linux.log": "ae7e44f51fef2b0b45db38de26d3c6900efc33f529c04900835dbe28ddbbbea3",
     "build-windows.log": "7268038e2ddf18c3153c578d570379ab4917945db717b0095a5e0c5e3b934555",
     "build-safe-final.log": "bc0ce0d82bed10501d1bbeb089487ed583918bdeb791de925a663229c2395861",
-    "native-test-final.log": "23e1b22dfec454da595a4ee69cfc7f2e8c8416f13703899fae4aff00d1aa8ed3"
+    "native-test-final.log": "bcb6cc1c4750864b60f33e016e5da9055e7a80f9b329e9d4280cb556dc231317",
+    "merge-linux.log": "079baa6a5399b5cd96e3481fe71e0c25742ddc9a17c9cf3f32f71ec3858d355e",
+    "merge-windows.log": "53bd79312c6c82b9dab1953a4420a9f833f4e79c1a3ff2e991149aa8869de463",
+    "restore-after-merge.log": "815f5fc21bebca29e742c08618f39866f95065d72485fde747d64cc2fac9726f"
   },
   "limitations": [
     "Warm filesystem and process query controls; no storage cache eviction",

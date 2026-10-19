@@ -2803,3 +2803,9 @@ Evidence: [Linux lexical reuse](bench/results/certificates-lexical-linux.json),
 Reproduce lexical controls with `python3 bench/lexical_reuse.py CURRENT BASELINE
 OUTPUT`; use `bench/restart.py` with `--prewarm-both --padding-bytes=65536` and a
 local fixture library to isolate preparation work across cache-key versions.
+
+The branch also merges `origin/main` through `bdd7bc0113`. Its embedded SQL and
+source-catalog changes do not enter the grep-only dependency graph. Native macOS,
+Linux ARM64 and Windows x86_64 product binaries are checked byte-for-byte against
+the qualified artifacts after that merge; the native conformance target and
+license boundary are rerun on the merged tree.
