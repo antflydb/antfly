@@ -16199,6 +16199,15 @@ pub const ApiHttpServer = struct {
         prepared: *PreparedIndexInstallation,
         enqueue_if_absent: bool,
     ) bool {
+        return self.activatePreparedIndexInstallationWithReplacement(prepared, enqueue_if_absent, true);
+    }
+
+    fn activatePreparedIndexInstallationWithReplacement(
+        self: *ApiHttpServer,
+        prepared: *PreparedIndexInstallation,
+        enqueue_if_absent: bool,
+        replace_existing: bool,
+    ) bool {
         const runtime = self.cfg.backend_runtime orelse return false;
         if (!prepared.reservation_active or !prepared.owns_payload) return false;
 
@@ -16215,6 +16224,7 @@ pub const ApiHttpServer = struct {
             }
         }
         if (existing == null and !enqueue_if_absent) return false;
+        if (existing != null and !replace_existing) return true;
 
         const generation = self.index_installation_next_generation;
         self.index_installation_next_generation +%= 1;
@@ -16301,6 +16311,15 @@ pub const ApiHttpServer = struct {
         var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
         defer prepared.deinit(self);
         self.activateLakeCommit(&prepared);
+    }
+
+    /// Read-side freshness checks can observe an external commit before the
+    /// periodic inventory sweep. Coalesce that hint without resetting an active
+    /// build's generation, failure count, or retry deadline on every poll.
+    pub fn requestLakePublication(self: *ApiHttpServer, table_name: []const u8) !void {
+        var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
+        defer prepared.deinit(self);
+        _ = self.activatePreparedIndexInstallationWithReplacement(&prepared, true, false);
     }
 
     fn resumeNativeLakeIndexPublication(self: *ApiHttpServer) !void {
@@ -58027,4 +58046,40 @@ test "external lake native server resumes bounded collection across maintenance 
     try std.testing.expect(turns > 30);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, expired, .{}));
     try cut.validate(a, io, source, request, namespace, .none);
+}
+
+test "external lake read refresh hints coalesce without superseding active publication work" {
+    const a = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var raw: u8 = 0;
+    var server = ApiHttpServer.init(a, .{ .backend_runtime = &runtime }, .{ .ptr = &raw, .vtable = &.{ .status = Source.status } }, null, null);
+    defer server.deinit();
+    // Hold execution so the test can inspect the authoritative keyed wakeup
+    // and its retry state independently of worker scheduling.
+    server.index_installation_worker_in_flight.store(true, .release);
+    defer server.index_installation_worker_in_flight.store(false, .release);
+    try server.requestLakePublication("docs");
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    const generation = server.index_installation_queue.items[0].generation;
+    server.index_installation_queue.items[0].failures = 3;
+    server.index_installation_queue.items[0].retry_after_ns = 987654321;
+    for (0..20) |_| try server.requestLakePublication("docs");
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    try std.testing.expectEqual(generation, server.index_installation_queue.items[0].generation);
+    try std.testing.expectEqual(@as(u8, 3), server.index_installation_queue.items[0].failures);
+    try std.testing.expectEqual(@as(u64, 987654321), server.index_installation_queue.items[0].retry_after_ns);
+    try std.testing.expectEqual(@as(usize, 0), server.index_installation_reserved_slots);
+    // An actual commit still supersedes the hint so work that raced the commit
+    // cannot complete and discard the new generation's wakeup.
+    try server.notifyLakeCommit("docs");
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    try std.testing.expect(server.index_installation_queue.items[0].generation != generation);
+    try std.testing.expectEqual(@as(u8, 0), server.index_installation_queue.items[0].failures);
+    try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
 }

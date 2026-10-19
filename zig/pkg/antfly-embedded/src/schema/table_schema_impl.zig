@@ -1782,77 +1782,56 @@ noinline fn validatePropertyScalarKeywords(context: SchemaContext, object: std.j
     }
 }
 
+// Dispatch child keywords through one runtime loop. Keeping one Value and
+// iterator live per level avoids a Debug stack slot for every optional keyword
+// on every recursive descent, without allocating or changing schema semantics.
 noinline fn validatePropertyChildKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
-    if (object.get("$defs")) |definitions| {
-        if (definitions != .null) try validateDefinitionsDefinition(context, definitions);
-    }
-    if (object.get("properties")) |properties| {
-        if (properties != .null) {
-            if (properties != .object) return error.InvalidSchemaUpdateRequest;
-            var it = properties.object.iterator();
-            while (it.next()) |entry| try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
+    const Child = enum { definitions, properties, schema, pattern, boolean_schema, dependent, dependencies, array, additional_items };
+    const children = std.StaticStringMap(Child).initComptime(.{
+        .{ "$defs", .definitions },
+        .{ "properties", .properties },
+        .{ "propertyNames", .schema },
+        .{ "patternProperties", .pattern },
+        .{ "additionalProperties", .boolean_schema },
+        .{ "unevaluatedProperties", .boolean_schema },
+        .{ "dependentSchemas", .dependent },
+        .{ "dependencies", .dependencies },
+        .{ "items", .schema },
+        .{ "prefixItems", .array },
+        .{ "additionalItems", .additional_items },
+        .{ "unevaluatedItems", .boolean_schema },
+        .{ "contains", .schema },
+        .{ "anyOf", .array },
+        .{ "oneOf", .array },
+        .{ "allOf", .array },
+        .{ "not", .schema },
+        .{ "if", .schema },
+        .{ "then", .schema },
+        .{ "else", .schema },
+    });
+    for (object.keys(), object.values()) |key, value| {
+        if (value == .null) continue;
+        switch (children.get(key) orelse continue) {
+            .definitions => try validateDefinitionsDefinition(context, value),
+            .properties => {
+                if (value != .object) return error.InvalidSchemaUpdateRequest;
+                var it = value.object.iterator();
+                while (it.next()) |entry| try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
+            },
+            .schema => try validatePropertySchemaDefinitionWithContext(context, value),
+            .pattern => try validatePatternPropertiesDefinition(context, value),
+            .boolean_schema => {
+                if (value != .bool and value != .object) return error.InvalidSchemaUpdateRequest;
+                if (value == .object) try validatePropertySchemaDefinitionWithContext(context, value);
+            },
+            .dependent => try validateDependentSchemasDefinition(context, value),
+            .dependencies => try validateDependenciesDefinition(context, value),
+            .array => {
+                if (value != .array) return error.InvalidSchemaUpdateRequest;
+                for (value.array.items) |variant| try validatePropertySchemaDefinitionWithContext(context, variant);
+            },
+            .additional_items => try validateAdditionalItemsDefinition(context, object),
         }
-    }
-    if (object.get("propertyNames")) |property_names| {
-        if (property_names != .null) try validatePropertySchemaDefinitionWithContext(context, property_names);
-    }
-    if (object.get("patternProperties")) |pattern_properties| {
-        if (pattern_properties != .null) try validatePatternPropertiesDefinition(context, pattern_properties);
-    }
-    if (object.get("additionalProperties")) |additional_properties| {
-        if (additional_properties != .null and additional_properties != .bool and additional_properties != .object) {
-            return error.InvalidSchemaUpdateRequest;
-        }
-        if (additional_properties == .object) try validatePropertySchemaDefinitionWithContext(context, additional_properties);
-    }
-    if (object.get("unevaluatedProperties")) |unevaluated_properties| {
-        if (unevaluated_properties != .null and unevaluated_properties != .bool and unevaluated_properties != .object) {
-            return error.InvalidSchemaUpdateRequest;
-        }
-        if (unevaluated_properties == .object) try validatePropertySchemaDefinitionWithContext(context, unevaluated_properties);
-    }
-    if (object.get("dependentSchemas")) |dependent_schemas| {
-        if (dependent_schemas != .null) try validateDependentSchemasDefinition(context, dependent_schemas);
-    }
-    if (object.get("dependencies")) |dependencies| {
-        if (dependencies != .null) try validateDependenciesDefinition(context, dependencies);
-    }
-    if (object.get("items")) |items| {
-        if (items != .null) try validatePropertySchemaDefinitionWithContext(context, items);
-    }
-    if (object.get("prefixItems")) |prefix_items| {
-        if (prefix_items != .null) try validatePrefixItemsDefinition(context, prefix_items);
-    }
-    try validateAdditionalItemsDefinition(context, object);
-    if (object.get("unevaluatedItems")) |unevaluated_items| {
-        if (unevaluated_items != .null and unevaluated_items != .bool and unevaluated_items != .object) {
-            return error.InvalidSchemaUpdateRequest;
-        }
-        if (unevaluated_items == .object) try validatePropertySchemaDefinitionWithContext(context, unevaluated_items);
-    }
-    if (object.get("contains")) |contains| {
-        if (contains != .null) try validatePropertySchemaDefinitionWithContext(context, contains);
-    }
-    if (object.get("anyOf")) |any_of| {
-        if (any_of != .null) try validateAnyOfDefinition(context, any_of);
-    }
-    if (object.get("oneOf")) |one_of| {
-        if (one_of != .null) try validateOneOfDefinition(context, one_of);
-    }
-    if (object.get("allOf")) |all_of| {
-        if (all_of != .null) try validateAllOfDefinition(context, all_of);
-    }
-    if (object.get("not")) |not_schema| {
-        if (not_schema != .null) try validatePropertySchemaDefinitionWithContext(context, not_schema);
-    }
-    if (object.get("if")) |if_schema| {
-        if (if_schema != .null) try validatePropertySchemaDefinitionWithContext(context, if_schema);
-    }
-    if (object.get("then")) |then_schema| {
-        if (then_schema != .null) try validatePropertySchemaDefinitionWithContext(context, then_schema);
-    }
-    if (object.get("else")) |else_schema| {
-        if (else_schema != .null) try validatePropertySchemaDefinitionWithContext(context, else_schema);
     }
 }
 

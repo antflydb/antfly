@@ -256,6 +256,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     parser_source.addOptions("antfly_local_test_sources", parser_selection);
     const schema_parser_tests = b.addTest(.{
         .root_module = parser_source,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .filters = selectTestFilters(b, &.{"relational contract schema parsing uses bounded stack"}),
     });
     const schema_contract_step = b.step("antfly-schema-contract-test", "Run bounded schema parsing and public response/sort contracts");

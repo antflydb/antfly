@@ -1863,7 +1863,7 @@ fn readerGatherScenario(a: std.mem.Allocator) !void {
 }
 test "SQL physical readers gather selected dictionary lanes without scalar reads" {
     try readerGatherScenario(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, readerGatherScenario, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, readerGatherScenario, .{});
 }
 
 test "SQL physical string comparisons retain temporary payloads through numeric gathers" {
