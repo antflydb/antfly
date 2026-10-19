@@ -26,6 +26,8 @@ pub const filetypes = @import("filetypes.zig");
 pub const decision = @import("decision.zig");
 const Allocator = std.mem.Allocator;
 pub const Summary = struct {
+    lexical_cache_hits: usize = 0,
+    lexical_files_evaluated: usize = 0,
     index_requests: usize = 0,
     incremental_cache_hits: usize = 0,
     incremental_files_evaluated: usize = 0,
@@ -217,13 +219,16 @@ fn evaluationRuns(a: Allocator, selected: []const bool, probabilities: []const f
     return try runs.toOwnedSlice(a);
 }
 const Incremental = @import("incremental.zig").Index(Summary, SavedEvaluation);
+const SavedLexical = struct { summary: Summary, rows: []const u8, binary_offset: ?usize };
 const WorkspaceReuse = struct {
+    lexical: @import("reuse_cache.zig").Cache(SavedLexical, 4096, 8 * 1024 * 1024),
     queries: @import("reuse_cache.zig").Cache(SavedQuery, 32, 4 * 1024 * 1024),
     files: @import("reuse_cache.zig").Cache(SavedEvaluation, 4096, 8 * 1024 * 1024),
     pub fn init(a: Allocator, io: std.Io) WorkspaceReuse {
-        return .{ .queries = .{ .a = a, .io = io }, .files = .{ .a = a, .io = io } };
+        return .{ .lexical = .{ .a = a, .io = io }, .queries = .{ .a = a, .io = io }, .files = .{ .a = a, .io = io } };
     }
     pub fn deinit(self: *WorkspaceReuse) void {
+        self.lexical.deinit();
         self.queries.deinit();
         self.files.deinit();
     }
@@ -272,6 +277,7 @@ const retainedClone = @import("reuse_cache.zig").retainedClone;
 const Region = @import("regions.zig").Region;
 const ExternalDictionary = @import("external_dictionary.zig").Shared;
 pub const Search = struct {
+    const lexical_limit = 256 * 1024;
     pub const Reuse = WorkspaceReuse;
     pub const IncrementalIndex = Incremental;
     pub const Delivery = @import("incremental.zig").Delivery;
@@ -347,6 +353,9 @@ pub const Search = struct {
     retaining_output: bool = false,
     output_bytes: usize = 0,
     output_buffer: std.ArrayList(u8) = .empty,
+    lexical_rows: std.ArrayList(u8) = .empty,
+    lexical_capture: bool = false,
+    lexical_overflow: bool = false,
     collecting: bool = true,
     pipeline: ?*Pipeline = null,
     tasks: std.ArrayList(Task) = .empty,
@@ -378,6 +387,35 @@ pub const Search = struct {
     /// A registered conditional hit needs no matcher, provider, cwd lookup,
     /// option parsing or option hashing. The immutable handle already binds
     /// those inputs; evidence lifetime and final cancellation remain live checks.
+    pub const SummaryType = Summary;
+    pub fn lexicalCertificateEligible(o: *const Options) bool {
+        return o.ask == null and !o.no_cache and !o.debug and !o.trace and !o.quiet;
+    }
+    pub fn completedConditional(a: Allocator, io: std.Io, o: *const Options, generation: *const @import("workspace_store.zig").Generation, summary: Summary, token: [64]u8) !u8 {
+        var search: Search = .{ .a = a, .io = io, .options = o, .matcher = undefined, .decider = decision.Client.init(a, io, o) };
+        defer search.output_buffer.deinit(a);
+        defer search.decider.deinit();
+        const guard = @import("interrupt.zig").Guard.init(&search.limits.cancel);
+        defer guard.deinit();
+        const started = std.Io.Clock.awake.now(io);
+        search.summary = summary;
+        search.summary.query_cache_hits = 1;
+        search.summary.lexical_cache_hits = 0;
+        search.summary.lexical_files_evaluated = 0;
+        search.summary.incremental_cache_hits = 0;
+        search.summary.incremental_files_evaluated = 0;
+        search.summary.incremental_results_materialized = 0;
+        if (!search.limits.cancel.load(.acquire)) try search.protocolJson(.{ .type = "workspace_unchanged", .result_token = token, .revision = generation.revision, .observed_at = generation.captured_at }, false);
+        return search.finish(started);
+    }
+    pub fn publishCompletion(self: *Search) ![64]u8 {
+        var nonce: [32]u8 = undefined;
+        self.io.random(&nonce);
+        const token = std.fmt.bytesToHex(nonce, .lower);
+        try self.protocolJson(.{ .type = "result_token", .result_token = token }, true);
+        try self.flushOutput();
+        return token;
+    }
     pub fn conditional(a: Allocator, io: std.Io, o: *const Options, generation: *const @import("workspace_store.zig").Generation, reuse: *Reuse, identity: [32]u8, token: []const u8) !?u8 {
         if (o.ask == null or o.no_cache or o.cache_dir == null or o.cache_ttl_seconds == 0 or o.debug or o.trace or !o.ranked or o.quiet or o.count or o.count_matches or o.files_with_matches or o.files_without_match or o.multiline or o.max_result_files == std.math.maxInt(usize)) return null;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -450,6 +488,7 @@ pub const Search = struct {
             views.deinit(self.io);
             self.a.destroy(views);
         }
+        self.lexical_rows.deinit(self.a);
         self.output_buffer.deinit(self.a);
         self.matcher.deinit();
         self.decider.deinit();
@@ -1170,7 +1209,7 @@ pub const Search = struct {
             ctx.mutex.lockUncancelable(root.io);
             defer ctx.mutex.unlock(root.io);
             root.summary.occurrences_exact = root.summary.occurrences_exact and local.summary.occurrences_exact;
-            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits", "source_parses", "file_evaluation_cache_hits" }) |field| @field(root.summary, field) += @field(local.summary, field);
+            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "lexical_cache_hits", "lexical_files_evaluated", "source_cache_hits", "source_parses", "file_evaluation_cache_hits" }) |field| @field(root.summary, field) += @field(local.summary, field);
             root.summary.complete = root.summary.complete and local.summary.complete;
             root.decider.requests += local.decider.requests;
             root.decider.input_tokens += local.decider.input_tokens;
@@ -1338,13 +1377,82 @@ pub const Search = struct {
             index.commit(self.pending_record, summaryDelta(self.summary, before), self.best_probability);
             self.pending_record = null;
         };
+        const lexical_key = self.lexicalKey(display);
+        if (lexical_key) |key| {
+            if (self.reuse.?.lexical.lease(key, self.options.cache_ttl_seconds)) |lease| {
+                defer lease.release();
+                try self.replayLexical(display, lease.value);
+                try self.jsonEnd(display, before);
+                return;
+            }
+            self.lexical_rows.clearRetainingCapacity();
+            self.lexical_overflow = false;
+            self.lexical_capture = true;
+            self.summary.lexical_files_evaluated += 1;
+        }
+        defer self.lexical_capture = false;
         self.readFile(path_name, display) catch |err| {
             try self.jsonEnd(display, before);
             return err;
         };
         if (self.matcher.failure) |err| return err;
         try self.jsonEnd(display, before);
+        self.lexical_capture = false;
+        if (lexical_key) |key| if (!self.lexical_overflow and !self.stopped() and self.summary.complete and self.summary.errors == before.errors) {
+            var times: @import("reuse_cache.zig").Times = .{};
+            times.add(std.Io.Clock.real.now(self.io).toSeconds());
+            var outcome = summaryDelta(self.summary, before);
+            outcome.lexical_cache_hits = 0;
+            outcome.lexical_files_evaluated = 0;
+            self.reuse.?.lexical.put(key, times, .{ .summary = outcome, .rows = self.lexical_rows.items, .binary_offset = self.binary_offset });
+        };
         if (self.deferred_candidate) |c| c.elapsed_ns = if (self.file_started) |start| @intCast(@max(0, start.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds)) else 0;
+    }
+    fn lexicalKey(self: *Search, path: []const u8) ?[32]u8 {
+        const o = self.options;
+        if (self.reuse == null or self.reuse_identity == null or o.ask != null or o.no_cache or o.cache_ttl_seconds == 0 or o.debug or o.trace or !o.json or self.retaining_output or o.quiet or o.count or o.count_matches or o.files_with_matches or o.files_without_match or o.max_output_bytes != std.math.maxInt(usize)) return null;
+        const entry = self.workspace_entry orelse return null;
+        // Small sources are cheaper to match directly than to hash, lease and
+        // decode JSON. Completion certificates still cover their whole query.
+        if (entry.bytes.len < 4096) return null;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-workspace-lexical-v1");
+        hash.update(&self.reuse_identity.?);
+        hash.update(&entry.revision);
+        hash.update(&.{ @intFromBool(self.explicit_file), @intFromBool(self.render_filename) });
+        hash.update(path);
+        var key: [32]u8 = undefined;
+        hash.final(&key);
+        return key;
+    }
+    fn replayLexical(self: *Search, path: []const u8, saved: SavedLexical) !void {
+        // Rebuild the envelope and end statistics. Cached observation timestamps,
+        // snapshot IDs, compact file IDs and elapsed times must never leak.
+        inline for (@typeInfo(Summary).@"struct".field_names) |name| {
+            if (@TypeOf(@field(self.summary, name)) == bool) {
+                @field(self.summary, name) = @field(self.summary, name) and @field(saved.summary, name);
+            } else @field(self.summary, name) += @field(saved.summary, name);
+        }
+        self.summary.lexical_cache_hits += 1;
+        self.binary_offset = saved.binary_offset;
+        var rows = std.mem.splitScalar(u8, saved.rows, '\n');
+        while (rows.next()) |row| {
+            if (row.len == 0) continue;
+            if ((self.shared_limits orelse &self.limits).cancel.load(.acquire)) return error.Canceled;
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.a, row, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            var value = parsed.value;
+            const kind = value.object.get("type").?.string;
+            if (std.mem.eql(u8, kind, "begin")) {
+                try self.jsonBegin(path);
+                continue;
+            }
+            if (std.mem.eql(u8, kind, "end")) continue;
+            _ = value.object.swapRemove("source");
+            _ = value.object.swapRemove("result_schema_version");
+            _ = value.object.swapRemove("file_id");
+            try self.json(value);
+        }
     }
     fn reportStagedError(self: *Search, path: []const u8, err: anyerror) !void {
         self.reportError(path, err) catch |failure| {
@@ -1437,7 +1545,7 @@ pub const Search = struct {
         local.retaining_output = ranked;
         local.sink = if (ranked) &output.writer else &forward.writer;
         defer {
-            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits", "source_parses", "file_evaluation_cache_hits" }) |field| @field(self.summary, field) += @field(local.summary, field);
+            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "lexical_cache_hits", "lexical_files_evaluated", "source_cache_hits", "source_parses", "file_evaluation_cache_hits" }) |field| @field(self.summary, field) += @field(local.summary, field);
             self.summary.complete = self.summary.complete and local.summary.complete;
             self.summary.occurrences_exact = self.summary.occurrences_exact and local.summary.occurrences_exact;
             self.decider.requests += local.decider.requests;
@@ -3189,6 +3297,18 @@ pub const Search = struct {
             return count;
         }
     };
+    noinline fn captureLexical(self: *Search, bytes: []const u8) void {
+        if (self.lexical_overflow) return;
+        if (bytes.len > lexical_limit - self.lexical_rows.items.len) {
+            self.lexical_overflow = true;
+            return;
+        }
+        self.lexical_rows.ensureTotalCapacityPrecise(self.a, @min(lexical_limit, @max(self.lexical_rows.items.len + bytes.len, self.lexical_rows.capacity + self.lexical_rows.capacity / 2 + 64))) catch {
+            self.lexical_overflow = true;
+            return;
+        };
+        self.lexical_rows.appendSliceAssumeCapacity(bytes);
+    }
     pub fn write(self: *Search, bytes: []const u8) !void {
         if (self.retaining_output) if (self.shared_limits) |limits| {
             if (!Limits.reserve(&limits.pending_output, bytes.len, self.options.max_pending_output)) {
@@ -3531,15 +3651,25 @@ pub const Search = struct {
         writer: std.Io.Writer,
         failure: ?anyerror = null,
         fn drain(writer: *std.Io.Writer, slices: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            return drainImpl(writer, slices, splat, false);
+        }
+        fn captureDrain(writer: *std.Io.Writer, slices: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            return drainImpl(writer, slices, splat, true);
+        }
+        fn send(self: *@This(), bytes: []const u8, comptime capture: bool) !void {
+            try self.search.write(bytes);
+            if (capture) self.search.captureLexical(bytes);
+        }
+        fn drainImpl(writer: *std.Io.Writer, slices: []const []const u8, splat: usize, comptime capture: bool) std.Io.Writer.Error!usize {
             const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
-            self.search.write(writer.buffer[0..writer.end]) catch |err| {
+            self.send(writer.buffer[0..writer.end], capture) catch |err| {
                 self.failure = err;
                 return error.WriteFailed;
             };
             writer.end = 0;
             var count: usize = 0;
             for (slices[0 .. slices.len - 1]) |bytes| {
-                self.search.write(bytes) catch |err| {
+                self.send(bytes, capture) catch |err| {
                     self.failure = err;
                     return error.WriteFailed;
                 };
@@ -3547,7 +3677,7 @@ pub const Search = struct {
             }
             for (0..splat) |_| {
                 const bytes = slices[slices.len - 1];
-                self.search.write(bytes) catch |err| {
+                self.send(bytes, capture) catch |err| {
                     self.failure = err;
                     return error.WriteFailed;
                 };
@@ -3563,7 +3693,7 @@ pub const Search = struct {
     }
     fn emitReplay(self: *Search, path: []const u8, text: []const u8, line: usize, offset: usize, terminated: bool) !void {
         var buffer: [65536]u8 = undefined;
-        var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = OutputWriter.drain }, .buffer = &buffer } };
+        var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = if (self.lexical_capture) OutputWriter.captureDrain else OutputWriter.drain }, .buffer = &buffer } };
         self.renderReplay(&output.writer, path, text, line, offset, terminated) catch |err| return self.outputError(&output, err);
         output.writer.flush() catch |err| return output.failure orelse err;
     }
@@ -3758,6 +3888,10 @@ pub const Search = struct {
         if (err == error.PendingOutputBudgetExceeded) self.retaining_output = false;
         return err;
     }
+    fn eventKind(value: anytype) []const u8 {
+        if (@TypeOf(value) == std.json.Value) return value.object.get("type").?.string;
+        return value.type;
+    }
     fn encodeJson(self: *Search, value: anytype, writer: *std.Io.Writer) !void {
         const Envelope = struct {
             value: @TypeOf(value),
@@ -3766,7 +3900,13 @@ pub const Search = struct {
             file_id: ?[64]u8,
             pub fn jsonStringify(envelope: @This(), json_writer: *std.json.Stringify) !void {
                 try json_writer.beginObject();
-                inline for (@typeInfo(@FieldType(@This(), "value")).@"struct".field_names) |field_name| {
+                if (@TypeOf(value) == std.json.Value) {
+                    var fields = envelope.value.object.iterator();
+                    while (fields.next()) |field| {
+                        try json_writer.objectField(field.key_ptr.*);
+                        try json_writer.write(field.value_ptr.*);
+                    }
+                } else inline for (@typeInfo(@FieldType(@This(), "value")).@"struct".field_names) |field_name| {
                     try json_writer.objectField(field_name);
                     try json_writer.write(@field(envelope.value, field_name));
                 }
@@ -3778,12 +3918,12 @@ pub const Search = struct {
                         try json_writer.write(@as([]const u8, &id));
                     }
                 }
-                if (@hasField(@TypeOf(value), "type") and !std.mem.eql(u8, envelope.value.type, "summary")) {
+                if (!std.mem.eql(u8, eventKind(envelope.value), "summary")) {
                     if (!envelope.compact) {
                         try json_writer.objectField("result_schema_version");
                         try json_writer.write(@as(u32, 1));
                     }
-                    if (!envelope.compact or envelope.file_id == null or std.mem.eql(u8, envelope.value.type, "begin")) {
+                    if (!envelope.compact or envelope.file_id == null or std.mem.eql(u8, eventKind(envelope.value), "begin")) {
                         try json_writer.objectField("source");
                         try json_writer.write(envelope.source);
                     }
@@ -3791,13 +3931,13 @@ pub const Search = struct {
                 try json_writer.endObject();
             }
         };
-        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .file_id = if (self.options.json_compact and (@hasField(@TypeOf(value), "type") and (std.mem.eql(u8, value.type, "begin") or (self.json_started and !std.mem.eql(u8, value.type, "summary") and !std.mem.eql(u8, value.type, "inventory") and !std.mem.eql(u8, value.type, "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
+        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .file_id = if (self.options.json_compact and ((std.mem.eql(u8, eventKind(value), "begin") or (self.json_started and !std.mem.eql(u8, eventKind(value), "summary") and !std.mem.eql(u8, eventKind(value), "inventory") and !std.mem.eql(u8, eventKind(value), "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
         try writer.writeByte('\n');
     }
     fn json(self: *Search, value: anytype) !void {
         if (self.options.max_output_bytes == std.math.maxInt(usize) and !self.retaining_output) {
             var buffer: [65536]u8 = undefined;
-            var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = OutputWriter.drain }, .buffer = &buffer } };
+            var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = if (self.lexical_capture) OutputWriter.captureDrain else OutputWriter.drain }, .buffer = &buffer } };
             self.encodeJson(value, &output.writer) catch |err| return self.outputError(&output, err);
             output.writer.flush() catch |err| return output.failure orelse err;
         } else {

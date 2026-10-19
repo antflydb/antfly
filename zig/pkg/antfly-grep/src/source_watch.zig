@@ -37,8 +37,11 @@ pub const Watch = struct {
     handles: std.AutoHashMapUnmanaged(c_int, usize) = .empty,
     identities: std.AutoHashMapUnmanaged(Identity, usize) = .empty,
     slots: [4096]Slot = @splat(.{}),
+    occupied: [64]u64 = @splat(0),
+    free_groups: u64 = std.math.maxInt(u64),
+    registration_attempts: usize = 0,
     const Identity = struct { device: u64, inode: u64 };
-    const Slot = struct { handle: c_int = -1, users: usize = 0, dirty: bool = true, generation: u64 = 0, sequence: u64 = 0, device: u64 = 0, inode: u64 = 0 };
+    const Slot = struct { handle: c_int = -1, users: usize = 0, dirty: bool = true, generation: u64 = 0, sequence: u64 = 0, device: u64 = 0, inode: u64 = 0, mask: u32 = 0 };
     pub fn clearEvents(self: *Watch) void {
         self.event_count = 0;
         @memset(&self.event_seen, false);
@@ -82,6 +85,8 @@ pub const Watch = struct {
         self.identities.deinit(std.heap.page_allocator);
         self.identities = .empty;
         self.clearEvents();
+        @memset(&self.occupied, 0);
+        self.free_groups = std.math.maxInt(u64);
     }
     pub fn reset(self: *Watch) void {
         self.deinit();
@@ -114,37 +119,69 @@ pub const Watch = struct {
     pub fn armDirectory(self: *Watch, dir: std.Io.Dir) ?Token {
         return self.armKind(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } }, true);
     }
+    fn freeSlot(self: *const Watch) ?usize {
+        const limit = @min(self.limit, self.slots.len);
+        if (limit == 0) return null;
+        const groups = std.math.divCeil(usize, limit, 64) catch unreachable;
+        const allowed = if (groups == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(groups)) - 1;
+        const available = self.free_groups & allowed;
+        if (available == 0) return null;
+        const group: usize = @ctz(available);
+        const count = @min(64, limit - group * 64);
+        const mask = if (count == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
+        const bits = ~self.occupied[group] & mask;
+        if (bits == 0) return null;
+        return group * 64 + @as(usize, @ctz(bits));
+    }
+    fn linuxMask(directory: bool) u32 {
+        const IN = std.os.linux.IN;
+        const changes: u32 = if (directory) IN.CREATE | IN.DELETE | IN.MOVED_FROM | IN.MOVED_TO else IN.MODIFY | IN.CLOSE_WRITE;
+        return changes | IN.ATTRIB | IN.DELETE_SELF | IN.MOVE_SELF | IN.UNMOUNT;
+    }
+    fn linuxArm(self: *Watch, file: std.Io.File, mask: u32) c_int {
+        var path: [64]u8 = undefined;
+        const name = std.mem.printSentinel(&path, "/proc/self/fd/{d}", .{file.handle}, 0) catch return -1;
+        self.registration_attempts += 1;
+        return std.c.inotify_add_watch(self.fd, name, mask | std.os.linux.IN.MASK_ADD);
+    }
     fn armKind(self: *Watch, file: std.Io.File, directory: bool) ?Token {
         if (comptime !supported) return null;
         self.poll();
         if (self.fd < 0 or self.failed) return null;
         const id = identity(file.handle) orelse return null;
-        var handle: c_int = -1;
-        if (comptime builtin.os.tag == .macos) if (self.identities.get(id)) |i| {
+        const mask = if (comptime builtin.os.tag == .linux) linuxMask(directory) else 0;
+        if (self.identities.get(id)) |i| {
             const slot = &self.slots[i];
-            slot.users += 1;
-            return .{ .slot = i, .generation = slot.generation, .sequence = slot.sequence };
-        };
-        if (comptime builtin.os.tag == .linux) {
-            var path: [64]u8 = undefined;
-            const name = std.mem.printSentinel(&path, "/proc/self/fd/{d}", .{file.handle}, 0) catch return null;
-            const IN = std.os.linux.IN;
-            const changes: u32 = if (directory) IN.CREATE | IN.DELETE | IN.MOVED_FROM | IN.MOVED_TO else IN.MODIFY | IN.CLOSE_WRITE;
-            handle = std.c.inotify_add_watch(self.fd, name, changes | IN.ATTRIB | IN.DELETE_SELF | IN.MOVE_SELF | IN.UNMOUNT | IN.MASK_ADD);
-            if (handle < 0) return null;
-            if (self.handles.get(handle)) |i| {
-                const slot = &self.slots[i];
+            if (slot.handle >= 0) {
+                if (comptime builtin.os.tag == .linux) if (mask & ~slot.mask != 0) {
+                    const handle = self.linuxArm(file, mask);
+                    if (handle < 0) return null;
+                    if (handle != slot.handle) {
+                        _ = std.c.inotify_rm_watch(self.fd, handle);
+                        self.failClosed();
+                        return null;
+                    }
+                    slot.mask |= mask;
+                };
                 slot.users += 1;
                 return .{ .slot = i, .generation = slot.generation, .sequence = slot.sequence };
             }
+            _ = self.identities.remove(id);
         }
-        const free = for (self.slots[0..@min(self.limit, self.slots.len)], 0..) |slot, i| {
-            if (slot.users == 0) break i;
+        // Admission precedes any kernel registration. A full table still
+        // permits identity reuse and mask upgrades, with no linear slot walk.
+        const free = self.freeSlot() orelse return null;
+        var handle: c_int = -1;
+        if (comptime builtin.os.tag == .linux) {
+            handle = self.linuxArm(file, mask);
+            if (handle < 0) return null;
+            if (self.handles.contains(handle)) {
+                // A recycled kernel descriptor cannot certify an older inode.
+                self.failClosed();
+                return null;
+            }
         } else {
-            if (comptime builtin.os.tag == .linux) _ = std.c.inotify_rm_watch(self.fd, handle);
-            return null;
-        };
-        if (comptime builtin.os.tag == .macos) {
+            self.registration_attempts += 1;
             handle = std.c.fcntl(file.handle, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
             if (handle < 0) return null;
             var change: std.c.Kevent = .{ .ident = @intCast(handle), .filter = std.c.EVFILT.VNODE, .flags = std.c.EV.ADD | std.c.EV.CLEAR, .fflags = std.c.NOTE.DELETE | std.c.NOTE.WRITE | std.c.NOTE.EXTEND | std.c.NOTE.ATTRIB | std.c.NOTE.LINK | std.c.NOTE.RENAME | std.c.NOTE.REVOKE, .data = 0, .udata = free + 1 };
@@ -158,12 +195,18 @@ pub const Watch = struct {
             _ = std.c.inotify_rm_watch(self.fd, handle);
             return null;
         };
-        if (comptime builtin.os.tag == .macos) self.identities.put(std.heap.page_allocator, id, free) catch {
-            _ = std.c.close(handle);
+        self.identities.put(std.heap.page_allocator, id, free) catch {
+            if (comptime builtin.os.tag == .linux) {
+                _ = self.handles.remove(handle);
+                _ = std.c.inotify_rm_watch(self.fd, handle);
+            } else _ = std.c.close(handle);
             return null;
         };
         self.generation +%= 1;
-        self.slots[free] = .{ .handle = handle, .users = 1, .generation = self.generation, .device = id.device, .inode = id.inode };
+        self.slots[free] = .{ .handle = handle, .users = 1, .generation = self.generation, .device = id.device, .inode = id.inode, .mask = mask };
+        const group = free / 64;
+        self.occupied[group] |= @as(u64, 1) << @intCast(free % 64);
+        if (self.occupied[group] == std.math.maxInt(u64)) self.free_groups &= ~(@as(u64, 1) << @intCast(group));
         return .{ .slot = free, .generation = self.generation, .sequence = 0 };
     }
     fn get(self: *Watch, token: Token) ?*Slot {
@@ -178,14 +221,17 @@ pub const Watch = struct {
         if (slot.users == 0 or slot.generation != token.generation) return;
         slot.users -= 1;
         if (slot.users != 0) return;
+        const id: Identity = .{ .device = slot.device, .inode = slot.inode };
+        if (self.identities.get(id) == token.slot) _ = self.identities.remove(id);
         if (comptime builtin.os.tag == .macos) {
-            _ = self.identities.remove(.{ .device = slot.device, .inode = slot.inode });
-            _ = std.c.close(slot.handle);
+            if (slot.handle >= 0) _ = std.c.close(slot.handle);
         } else if (self.fd >= 0 and slot.handle >= 0) {
             _ = self.handles.remove(slot.handle);
             _ = std.c.inotify_rm_watch(self.fd, slot.handle);
         }
         slot.handle = -1;
+        self.occupied[token.slot / 64] &= ~(@as(u64, 1) << @intCast(token.slot % 64));
+        self.free_groups |= @as(u64, 1) << @intCast(token.slot / 64);
     }
     pub fn certify(self: *Watch, token: Token) void {
         self.poll();
@@ -299,6 +345,8 @@ pub const Watch = struct {
                         if (event.mask & std.os.linux.IN.IGNORED != 0) {
                             _ = self.handles.remove(event.wd);
                             self.slots[i].handle = -1;
+                            const id: Identity = .{ .device = self.slots[i].device, .inode = self.slots[i].inode };
+                            if (self.identities.get(id) == i) _ = self.identities.remove(id);
                         }
                         self.note(i);
                         dirty(&self.slots[i]);
@@ -378,4 +426,73 @@ test "pathname identity rejects symlink retargeting independently of watch state
     try tmp.dir.symLink(io, "b", "link", .{});
     try std.testing.expect(!watch.identityMatchesPath(token, path));
     try std.testing.expect(!watch.unchangedPath(token, path));
+}
+
+test "full witness admission avoids registrations but preserves reuse and recycled slots" {
+    if (comptime !supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b", .data = "b" });
+    const a = try tmp.dir.openFile(io, "a", .{});
+    defer a.close(io);
+    const b = try tmp.dir.openFile(io, "b", .{});
+    defer b.close(io);
+    var watch = Watch.init();
+    defer watch.deinit();
+    watch.limit = 1;
+    const first = watch.arm(a) orelse return error.SkipZigTest;
+    const attempts = watch.registration_attempts;
+    for (0..100) |_| try std.testing.expect(watch.arm(b) == null);
+    const reused = watch.arm(a).?;
+    try std.testing.expectEqual(first.slot, reused.slot);
+    try std.testing.expectEqual(attempts, watch.registration_attempts);
+    watch.release(first);
+    try std.testing.expect(watch.arm(b) == null);
+    watch.release(reused);
+    const next = watch.arm(b).?;
+    defer watch.release(next);
+    try std.testing.expectEqual(first.slot, next.slot);
+    try std.testing.expect(next.generation != first.generation);
+    try std.testing.expectEqual(attempts + 1, watch.registration_attempts);
+}
+
+test "full witness table preserves hard links and Linux directory mask upgrades" {
+    if (comptime !supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "a" });
+    try tmp.dir.hardLink("a", tmp.dir, "alias", io, .{});
+    const a = try tmp.dir.openFile(io, "a", .{});
+    defer a.close(io);
+    const alias = try tmp.dir.openFile(io, "alias", .{});
+    defer alias.close(io);
+    var watch = Watch.init();
+    defer watch.deinit();
+    watch.limit = 1;
+    const first = watch.arm(a) orelse return error.SkipZigTest;
+    const attempts = watch.registration_attempts;
+    const linked = watch.arm(alias).?;
+    try std.testing.expectEqual(first.slot, linked.slot);
+    try std.testing.expectEqual(attempts, watch.registration_attempts);
+    watch.release(first);
+    watch.release(linked);
+    if (comptime builtin.os.tag == .linux) {
+        const file_token = watch.arm(.{ .handle = tmp.dir.handle, .flags = .{ .nonblocking = false } }).?;
+        const before = watch.registration_attempts;
+        const directory_token = watch.armDirectory(tmp.dir).?;
+        defer watch.release(file_token);
+        defer watch.release(directory_token);
+        try std.testing.expectEqual(file_token.slot, directory_token.slot);
+        try std.testing.expectEqual(before + 1, watch.registration_attempts);
+        const mask = watch.slots[directory_token.slot].mask;
+        try std.testing.expect(mask & std.os.linux.IN.MODIFY != 0);
+        try std.testing.expect(mask & std.os.linux.IN.CREATE != 0);
+        watch.certify(directory_token);
+        try tmp.dir.writeFile(io, .{ .sub_path = "new", .data = "new" });
+        watch.poll();
+        try std.testing.expect(watch.slots[directory_token.slot].dirty);
+    }
 }

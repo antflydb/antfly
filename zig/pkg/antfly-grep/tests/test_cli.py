@@ -6506,6 +6506,172 @@ class CliTests(unittest.TestCase):
                 "WorkspaceInvalidated",
             )
 
+    def test_workspace_lexical_certificates_include_misses_and_bind_handles(self):
+        self.write("src/a.txt", "STOP here\n")
+        with self.workspace("src") as (ready, request):
+            for pattern, code in (("STOP", 0), ("missing", 1), ("S.*P", 0)):
+                handle = request("register", args=[pattern])[0]["query_handle"]
+                first = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                self.assertEqual(first[-1]["exit_code"], code)
+                token = next(
+                    r["result_token"] for r in first if r["type"] == "result_token"
+                )
+                warm = request(
+                    "search",
+                    revision=ready["revision"],
+                    query_handle=handle,
+                    if_result_token=token,
+                )
+                self.assertEqual(warm[-1]["exit_code"], code)
+                self.assertTrue(
+                    any(r["type"] == "workspace_unchanged" for r in warm), warm
+                )
+                stats = next(r["stats"] for r in warm if r["type"] == "summary")
+                self.assertEqual(stats["query_cache_hits"], 1)
+                self.assertEqual(stats["lexical_files_evaluated"], 0)
+                self.assertFalse(any(r["type"] == "match" for r in warm), warm)
+                wrong = request(
+                    "search",
+                    revision=ready["revision"],
+                    query_handle=handle,
+                    if_result_token="0" * 64,
+                )
+                self.assertFalse(any(r["type"] == "workspace_unchanged" for r in wrong))
+                if code == 0:
+                    self.assertTrue(any(r["type"] == "match" for r in wrong), wrong)
+
+    def test_workspace_lexical_reuse_refreshes_provenance_and_negative_outcomes(self):
+        self.write("src/a.txt", "before\nSTOP one\nafter\n" + "padding\n" * 600)
+        b = self.write("src/b.txt", "negative\n" + "padding\n" * 600)
+        self.write("src/c.txt", "STOP three\n" + "padding\n" * 600)
+        for compact in (False, True):
+            with self.workspace("src") as (ready, request):
+                args = ["-C1", "S.*P", "--threads=2"] + (
+                    ["--json-compact"] if compact else []
+                )
+                handle = request("register", args=args, compact=compact)[0][
+                    "query_handle"
+                ]
+                first = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                old_token = next(
+                    r["result_token"] for r in first if r["type"] == "result_token"
+                )
+                full = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                stats = next(r["stats"] for r in full if r["type"] == "summary")
+                self.assertEqual(stats["lexical_cache_hits"], 3, full)
+                self.assertEqual(stats["lexical_files_evaluated"], 0, full)
+                b.write_text("STOP changed\n" + "padding\n" * 600)
+                changed = request("refresh")[0]
+                rows = request(
+                    "search",
+                    revision=changed["revision"],
+                    query_handle=handle,
+                    if_result_token=old_token,
+                )
+                self.assertFalse(any(r["type"] == "workspace_unchanged" for r in rows))
+                stats = next(r["stats"] for r in rows if r["type"] == "summary")
+                self.assertEqual(stats["lexical_cache_hits"], 2, rows)
+                self.assertEqual(stats["lexical_files_evaluated"], 1, rows)
+                self.assertEqual(stats["matches"], 3)
+                begins = [r for r in rows if r["type"] == "begin"]
+                self.assertEqual(len(begins), 3)
+                self.assertTrue(
+                    all(r["source"]["snapshot"] == changed["revision"] for r in begins)
+                )
+                if compact:
+                    self.assertTrue(
+                        {r["file_id"] for r in begins}.isdisjoint(
+                            {r["file_id"] for r in first if r["type"] == "begin"}
+                        )
+                    )
+                cold = request(
+                    "search", revision=changed["revision"], args=[*args, "--no-cache"]
+                )
+
+                def signature(records):
+                    return sorted(
+                        json.dumps(r["data"], sort_keys=True)
+                        for r in records
+                        if r["type"] in ("match", "context")
+                    )
+
+                self.assertEqual(signature(rows), signature(cold))
+                b.write_text("negative\n" + "padding\n" * 600)
+
+    def test_workspace_lexical_reuse_has_bounded_dense_fallback_and_trim(self):
+        self.write("src/dense.txt", "STOP\n" * 2000)
+        self.write("src/tiny.txt", "STOP\n" + "padding\n" * 600)
+        with self.workspace("src") as (ready, request):
+            handle = request("register", args=["STOP"])[0]["query_handle"]
+            for _ in range(2):
+                rows = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                self.assertEqual(rows[-1]["exit_code"], 0)
+            stats = next(r["stats"] for r in rows if r["type"] == "summary")
+            self.assertEqual(stats["lexical_cache_hits"], 1)
+            self.assertEqual(stats["lexical_files_evaluated"], 1)
+            request("trim")
+            self.assertEqual(
+                request("search", revision=ready["revision"], query_handle=handle)[0][
+                    "message"
+                ],
+                "UnknownQueryHandle",
+            )
+
+    def test_workspace_lexical_reuse_preserves_binary_transcoding_and_multiline(self):
+        cases = [
+            ("STOP\n" + "padding\n" * 700 + "\x00late", ["STOP"]),
+            (("STOP\n" + "padding\n" * 700).encode("utf-16"), ["STOP"]),
+            ("STOP\nagain\n" + "padding\n" * 700, ["-U", "STOP\\nagain"]),
+            ("STOP\x00next\x00" + "padding\x00" * 700, ["--null-data", "STOP"]),
+        ]
+        for content, args in cases:
+            self.write("src/a.txt", content)
+            with self.workspace("src") as (ready, request):
+                handle = request("register", args=args, compact=False)[0][
+                    "query_handle"
+                ]
+                first = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                warm = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                self.assertEqual(first[-1]["exit_code"], warm[-1]["exit_code"])
+                self.assertEqual(
+                    next(r["stats"] for r in warm if r["type"] == "summary")[
+                        "lexical_cache_hits"
+                    ],
+                    1,
+                    warm,
+                )
+
+                def signature(records):
+                    return [
+                        (r["type"], r.get("data"), r.get("text"))
+                        for r in records
+                        if r["type"] in ("match", "context", "binary")
+                    ]
+
+                self.assertEqual(signature(first), signature(warm))
+
+    def test_workspace_lexical_certificates_respect_no_cache_and_partial_output(self):
+        self.write("src/a.txt", "STOP\n")
+        with self.workspace("src") as (ready, request):
+            for args in (["STOP", "--no-cache"], ["STOP", "--max-output-bytes=32"]):
+                handle = request("register", args=args)[0]["query_handle"]
+                rows = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                self.assertFalse(any(r["type"] == "result_token" for r in rows), rows)
+
     @unittest.skipUnless(os.name == "posix", "POSIX descriptor quotas")
     def test_workspace_parallel_capture_respects_descriptor_headroom(self):
         for i in range(100):

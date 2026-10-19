@@ -769,7 +769,7 @@ pub const Generation = struct {
         self.budget.limit -= reservation;
         self.preparation_mutex.unlock(io);
         var hit = false;
-        const owner = PreparedOwner.create(self.backing, reservation, io, entry.path, entry.bytes, options, scope, state, &hit) catch {
+        const owner = PreparedOwner.create(self.backing, reservation, io, entry.path, entry.bytes, entry.revision, options, scope, state, &hit) catch {
             self.preparation_mutex.lockUncancelable(io);
             self.budget.limit += reservation;
             self.preparation_mutex.unlock(io);
@@ -877,7 +877,7 @@ const PreparedOwner = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
     value: source.Prepared,
-    fn create(a: A, maximum: usize, io: std.Io, path: []const u8, bytes_value: []const u8, options: *const Options, scope: ?[32]u8, state: *source.State, hit: *bool) !*PreparedOwner {
+    fn create(a: A, maximum: usize, io: std.Io, path: []const u8, bytes_value: []const u8, revision: [64]u8, options: *const Options, scope: ?[32]u8, state: *source.State, hit: *bool) !*PreparedOwner {
         const self = try a.create(PreparedOwner);
         errdefer a.destroy(self);
         self.* = .{ .backing = a, .budget = .{ .backing = a, .limit = maximum - @sizeOf(PreparedOwner) }, .arena = undefined, .value = undefined };
@@ -886,7 +886,9 @@ const PreparedOwner = struct {
         var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        const value = try source.get(temporary, io, options, path, bytes_value, scope, hit, state);
+        var digest: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&digest, &revision);
+        const value = try source.getHashed(temporary, io, options, path, bytes_value, scope, hit, state, digest);
         self.value = try clonePrepared(self.arena.allocator(), temporary, bytes_value, value);
         return self;
     }

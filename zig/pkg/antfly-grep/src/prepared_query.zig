@@ -35,6 +35,9 @@ pub fn Registry(comptime Search: type) type {
             evaluation: [32]u8 = undefined,
             handle: [64]u8 = undefined,
             stamp: u64 = 0,
+            // One scalar certificate per immutable registration. No result
+            // payload, generation, matcher scratch or source bytes are pinned.
+            completion: ?struct { token: [64]u8, revision: [64]u8, summary: Search.SummaryType } = null,
             index: Search.IncrementalIndex = undefined,
             delivery_arena: ?std.heap.ArenaAllocator = null,
             delivery: ?Search.Delivery = null,

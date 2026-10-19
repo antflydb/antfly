@@ -121,7 +121,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
         } else if (std.mem.eql(u8, request.op, "trim")) {
             // Protocol requests are serial and every search joins its workers.
             // Drop optional state without changing the published source lease.
-            const released = registrations.retainedBytes() + session.plans.physical.load(.monotonic) + reuse.files.physical.load(.monotonic) + reuse.queries.physical.load(.monotonic) + (if (session.memo) |memo| memo.bytes else @as(usize, 0));
+            const released = registrations.retainedBytes() + session.plans.physical.load(.monotonic) + reuse.lexical.physical.load(.monotonic) + reuse.files.physical.load(.monotonic) + reuse.queries.physical.load(.monotonic) + (if (session.memo) |memo| memo.bytes else @as(usize, 0));
             if (watch) |watcher| watcher.reset();
             if (journal) |value| value.reset();
             session.deinit();
@@ -197,6 +197,10 @@ fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generat
 }
 
 fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, plan: *@import("prepared_query.zig").Registry(Search).Plan, token: ?[]const u8, delta: bool) !u8 {
+    if (Search.lexicalCertificateEligible(&plan.options)) if (plan.completion) |certificate| {
+        if (token != null and std.mem.eql(u8, token.?, &certificate.token) and std.mem.eql(u8, &generation.revision, &certificate.revision))
+            return Search.completedConditional(a, io, &plan.options, generation, certificate.summary, certificate.token);
+    };
     if (token) |value| if (try Search.conditional(a, io, &plan.options, generation, reuse, plan.identity, value)) |code| return code;
     var searcher = try Search.initCompiled(a, io, &plan.options, &plan.matcher, plan.cwd);
     defer searcher.deinit();
@@ -224,6 +228,10 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
     const guard = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);
     defer guard.deinit();
     const code = try searcher.run();
+    if (Search.lexicalCertificateEligible(&plan.options) and code <= 1 and searcher.summary.complete and !searcher.limits.cancel.load(.acquire)) {
+        const completed_token = try searcher.publishCompletion();
+        plan.completion = .{ .token = completed_token, .revision = generation.revision, .summary = searcher.summary };
+    }
     if (plan.options.trace) std.debug.print("antfly-grep: registered index attached={} healthy={} files={d}/{d} bytes={d} revision_present={} query_hit={d} incremental_hit={d}\n", .{ searcher.incremental != null, plan.index.healthy, plan.index.files.count(), generation.entries.items.len, plan.index.budget.live, plan.index.revision != null, searcher.summary.query_cache_hits, searcher.summary.incremental_cache_hits });
     if (searcher.incremental != null and code <= 1 and searcher.summary.complete and plan.index.healthy and plan.index.files.count() == generation.entries.items.len) {
         // Only a cold population or an incremental run may publish a revision.

@@ -42,8 +42,19 @@ def main():
     parser.add_argument("--files", type=int, default=32)
     parser.add_argument("--lines", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=7)
+    parser.add_argument(
+        "--prewarm-both",
+        action="store_true",
+        help="Prime each binary's preparation format before measuring",
+    )
+    parser.add_argument(
+        "--padding-bytes",
+        type=int,
+        default=0,
+        help="Append a single long comment to expose source-sized validation/hashing work",
+    )
     args = parser.parse_args()
-    if min(args.files, args.lines, args.iterations) < 1:
+    if min(args.files, args.lines, args.iterations) < 1 or args.padding_bytes < 0:
         parser.error("sizes and iterations must be positive")
     binaries = {"current": args.current.resolve(), "baseline": args.baseline.resolve()}
     report = {
@@ -52,6 +63,8 @@ def main():
         "cpu_count": os.cpu_count(),
         "files": args.files,
         "lines_per_file": args.lines,
+        "padding_bytes": args.padding_bytes,
+        "prewarmed": list(binaries) if args.prewarm_both else ["current"],
         "output_max_count": 1,
         "cgroup_cpu_max": Path("/sys/fs/cgroup/cpu.max").read_text().strip()
         if Path("/sys/fs/cgroup/cpu.max").exists()
@@ -73,7 +86,9 @@ def main():
         (root / "src").mkdir()
         for i in range(args.files):
             (root / "src" / f"f{i:04}.py").write_text(
-                f"def retry_{i}():\n" + "    STOP()\n" * args.lines
+                f"def retry_{i}():\n"
+                + "    STOP()\n" * args.lines
+                + ("#" + "x" * args.padding_bytes + "\n" if args.padding_bytes else "")
             )
         env = {
             key: value
@@ -93,11 +108,16 @@ def main():
             "--no-rank",
             "--threads=1",
         ]
-        service = Service(binaries["current"], root, "src", query, env)
-        try:
-            _, expected = service.search(require_warm=False)
-        finally:
-            service.close()
+        expected = None
+        for name in report["prewarmed"]:
+            service = Service(binaries[name], root, "src", query, env)
+            try:
+                _, evidence = service.search(require_warm=False)
+                if expected is not None and evidence != expected:
+                    raise RuntimeError("prewarming evidence mismatch")
+                expected = evidence
+            finally:
+                service.close()
         report["evidence_sha256"] = hashlib.sha256(
             json.dumps(expected, sort_keys=True).encode()
         ).hexdigest()

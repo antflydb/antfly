@@ -2694,3 +2694,112 @@ Evidence: [Linux capture](bench/results/compact-capture-linux.json),
 [restart queries](bench/results/compact-restart-linux.json),
 [macOS capture](bench/results/compact-capture-macos.json), and
 [all source/binary/report/archive identities](bench/results/compact-validation.json).
+
+### Lexical completion certificates and bounded file reuse
+
+Registered literal and regex searches can return `result_token` after a complete
+exit-0 or exit-1 result, including a complete miss. Repeating that handle, pinned
+workspace revision and token returns `workspace_unchanged` and a fresh summary,
+without cloning the matcher or visiting source entries. Each of the eight bounded
+registrations owns one scalar certificate. Unknown or superseded tokens take the
+ordinary search path; changed revisions require searching the new snapshot.
+`--no-cache`, quiet mode, debugging/tracing, cancellation, errors and partial
+results do not publish lexical certificates. This is exact reuse of immutable
+local data, independent of decision-provider evidence lifetimes. Ranked decision
+certificates retain their existing TTL and evidence checks.
+
+Full lexical delivery can reuse per-file outcomes across workspace revisions.
+Keys bind the complete effective query identity, displayed path, content revision
+and file/render flags. Negative outcomes are reusable too. The shared cache is
+process-local, four-way associative, limited to 4,096 entries and 8 MiB of physical
+retained memory including active leases. Per-file staging is capped at 256 KiB;
+large/dense outputs fall back to scanning without changing the result. Files below
+4 KiB match directly: a tiny-file probe showed that hashing, leasing and decoding
+cached JSON could cost more than scanning their contents. Count/file-list/quiet
+modes and finite output budgets use their existing paths. Whole-query completion
+certificates still cover these complete non-quiet searches.
+
+Replay regenerates source envelopes, snapshot IDs, observation times, compact
+file IDs and end-record timing/statistics. It preserves match/context data,
+submatches, binary offsets and logical counts. `lexical_cache_hits` and
+`lexical_files_evaluated` report actual cache and evaluation work; a conditional
+acknowledgement reports neither. Cancellation and ordinary output/pending-memory
+limits remain active during replay. Optional payload capture uses a separate JSON
+writer callback; the general output writer has no cache-capture branch. `trim`, `forget`, registration eviction and
+process exit release their respective optional state. Cache eviction is an
+ordinary miss and cannot suppress results.
+
+Watch admission uses two levels of free-slot bitsets instead of a linear scan.
+Both supported watcher platforms reuse device/inode identities before attempting
+registration, including when all slots are occupied. Linux upgrades existing
+masks by union when the same inode needs both file and directory notifications.
+A full table makes no new registration/removal calls for a distinct identity;
+released slots become immediately available. Lost identities are retired without
+removing a newer subscription for the same inode. Safe tests cover full-table
+rejection, hard links, reference-counted release, slot recycling and Linux mask
+upgrades. Watch loss and incomplete coverage still force conservative capture.
+
+Workspace preparation passes its already captured SHA-256 to the source-artifact
+identity calculation instead of hashing the entire source again. Ordinary search
+computes that digest itself. The v2 identity binds the digest to parser identity,
+path, line mode and authorization scope. Older preparation keys become disposable
+cache misses; decision-score identities and inventory-v3 revisions are unchanged.
+Line-boundary/range validation, UTF-8 validation and binary checks remain in place.
+No additional per-file digest or descriptor is retained. Further metadata packing
+or combining those validation passes needs evidence of a worthwhile gain; a
+scalar loop replacing vectorized validation is not an assumed optimization.
+
+Source snapshots, lexical payloads, certificates and inventory metadata live in
+RAM. This change creates no persistent source-content or lexical-result index.
+The configured disk cache still contains bounded derived parser metadata and
+decision evidence; existing temporary ranked spills may contain excerpts. Idle
+services block on stdin. Unchanged conditional queries avoid source-sized work,
+but framing, freshness/invalidation, output, memory and changed files still have
+cost. These mechanisms do not make search literally resource-free.
+
+Paired controls against the preceding PR binary `328bca376b` use alternating
+trials, warm filesystem data and synthetic files. Capture is outside lexical
+search timing; full/edit deliveries compare exact match/context data outside
+timing. The conditional baseline delivers a full result because it has no lexical
+certificate. Preparation controls prewarm both preparation-key versions and
+require zero parser/provider calls from both binaries. The Linux environment is
+an ARM64 Docker VM capped at two CPUs; macOS is a shared 14-CPU host. Builds and
+this task's tests were stopped before the final serial benchmark pass, but other
+host workloads remain uncontrolled. Each report records load and binary hashes.
+
+| Linux VM workload | Before → after (median elapsed) |
+|---|---:|
+| Initial capture, 100K tiny files | 1,320 → 832 ms |
+| Full lexical delivery, 64 files / roughly 64 MiB | 4.324 → 0.889 ms |
+| One-file lexical edit, same fixture | 4.402 → 0.899 ms |
+| Conditional lexical acknowledgement | 4.497 → 0.083 ms |
+| Warm preparation after restart, 32 files with 64 KiB comments | 21.579 → 15.859 ms |
+| Full lexical delivery, 1K tiny files / dense JSON output | 11.868 → 14.011 ms |
+
+The tiny-file full-output regression is retained in the qualification. macOS tiny
+full/edit controls also regress about 5–7%; these paths deliberately scan directly
+and still serialize all output. Clients retaining a result should send its token:
+conditional acknowledgements avoid both that scan and payload delivery. There is
+no claim of universal throughput or memory improvement. At 100K Linux files,
+accounted retained source bytes remain 55,579,336 on both binaries; sampled ready
+RSS increases 62,676→63,340 KiB as bounded witness/cache structures are added.
+Further packing must justify its complexity against measured working-set costs.
+
+The final binaries pass 234 CLI tests each on macOS and Linux (two expected skips
+each), 91/92 package tests on each platform (one expected skip), macOS ReleaseSafe
+package tests, native grep conformance/hardening targets and 1,000 generated
+ripgrep/PCRE2 comparisons without mismatches or timeouts. Windows x86_64
+cross-compilation, three release archives with exact binary/documentation/schema/
+notice/completion/man-page identities, license boundaries and release checks pass.
+Full PR CI still requires repository admission; native Linux hardware, Windows
+runtime and live-model quality/billing remain unqualified.
+
+Evidence: [Linux lexical reuse](bench/results/certificates-lexical-linux.json),
+[tiny-file controls](bench/results/certificates-tiny-linux.json),
+[Linux capture](bench/results/certificates-capture-linux.json),
+[preparation controls](bench/results/certificates-preparation-linux.json),
+[macOS lexical reuse](bench/results/certificates-lexical-macos.json), and
+[all source/binary/report/archive identities](bench/results/certificates-validation.json).
+Reproduce lexical controls with `python3 bench/lexical_reuse.py CURRENT BASELINE
+OUTPUT`; use `bench/restart.py` with `--prewarm-both --padding-bytes=65536` and a
+local fixture library to isolate preparation work across cache-key versions.

@@ -26,9 +26,9 @@ fn cache(directory: []const u8) @import("artifact_cache.zig").Cache {
     return .{ .directory = directory, .namespace = "source-v3", .buckets = 1024, .limit = limit };
 }
 const parser_digest = @import("grep_cache_options").parser_digest;
-fn identity(path: []const u8, bytes: []const u8, delimiter: u8, crlf: bool, scope: ?[32]u8) [32]u8 {
+fn identity(path: []const u8, delimiter: u8, crlf: bool, scope: ?[32]u8, content_digest: [32]u8) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly-source-preparation-v1");
+    hash.update("antfly-source-preparation-v2");
     hash.update(&parser_digest);
     var path_len: [8]u8 = undefined;
     std.mem.writeInt(u64, &path_len, path.len, .little);
@@ -36,15 +36,28 @@ fn identity(path: []const u8, bytes: []const u8, delimiter: u8, crlf: bool, scop
     hash.update(path);
     hash.update(&.{ delimiter, @intFromBool(crlf) });
     hash.update(if (scope) |*value| value else &@as([32]u8, @splat(0)));
-    hash.update(bytes);
+    hash.update(&content_digest);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;
 }
 pub fn get(a: A, io: std.Io, o: *const @import("options.zig").Options, path: []const u8, bytes: []const u8, scope: ?[32]u8, hit: *bool, state: *State) !Prepared {
+    return getHashed(a, io, o, path, bytes, scope, hit, state, null);
+}
+/// A captured immutable revision can supply its SHA-256 without a second
+/// source-sized hashing pass. Callers must bind the digest to these exact bytes.
+/// Disk offsets are still independently validated against content on every load.
+pub fn getHashed(a: A, io: std.Io, o: *const @import("options.zig").Options, path: []const u8, bytes: []const u8, scope: ?[32]u8, hit: *bool, state: *State, captured: ?[32]u8) !Prepared {
     const delimiter: u8 = if (o.null_data) 0 else '\n';
     const enabled = !o.no_cache and o.cache_dir != null;
-    const key = if (enabled) identity(path, bytes, delimiter, o.crlf, scope) else @as([32]u8, @splat(0));
+    const key = if (enabled) blk: {
+        const digest = captured orelse digest: {
+            var value: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &value, .{});
+            break :digest value;
+        };
+        break :blk identity(path, delimiter, o.crlf, scope, digest);
+    } else @as([32]u8, @splat(0));
     hit.* = false;
     if (enabled) if (load(a, io, o, key, bytes, delimiter, o.crlf, !o.cached_only, state)) |prepared| {
         hit.* = true;
