@@ -31,6 +31,46 @@ spec.loader.exec_module(deps)
 
 
 class DependencyTests(unittest.TestCase):
+    def test_mirror_token_is_sent_only_to_the_exact_bucket(self):
+        import io
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(os.environ, {deps.MIRROR_TOKEN_ENV: "test-token"}),
+        ):
+            target = Path(temp) / "download"
+            with patch.object(deps, "build_opener") as opener:
+                opener.return_value.open.return_value = io.BytesIO(b"source")
+                deps.download(deps.MIRROR + "/expected.tar.gz", target)
+                request = opener.return_value.open.call_args.args[0]
+                self.assertEqual(
+                    request.get_header("Authorization"), "Bearer test-token"
+                )
+            for source in (
+                "https://upstream.test/source.tar.gz",
+                deps.MIRROR + "-other/source.tar.gz",
+            ):
+                with patch.object(
+                    deps, "urlopen", return_value=io.BytesIO(b"source")
+                ) as fetch:
+                    deps.download(source, target)
+                    self.assertEqual(fetch.call_args.args[0], source)
+
+    def test_authenticated_redirect_cannot_forward_credentials_to_other_origin(self):
+        request = deps.Request(
+            deps.MIRROR + "/source.tar.gz",
+            headers={"Authorization": "Bearer test-token"},
+        )
+        for destination in (
+            "https://upstream.test/archive",
+            "http://storage.googleapis.com/archive",
+            "https://storage.googleapis.com/another-bucket/archive",
+        ):
+            with self.subTest(destination=destination), self.assertRaises(ValueError):
+                deps.MirrorRedirects().redirect_request(
+                    request, None, 302, "redirect", {}, destination
+                )
+
     def test_inventory_covers_all_remote_project_packages(self):
         manifest = deps.load_manifest()
         expected = {
@@ -97,12 +137,14 @@ class DependencyTests(unittest.TestCase):
                 deps.subprocess,
                 "run",
                 return_value=subprocess.CompletedProcess([], 0, "wrong\n", ""),
-            ),
+            ) as run,
+            patch.dict(os.environ, {deps.MIRROR_TOKEN_ENV: "test-token"}),
         ):
             with self.assertRaises(ValueError):
                 deps.fetch_verified(
                     "zig", "/seed/archive.tar.gz", "expected", Path(temp) / "p"
                 )
+            self.assertNotIn(deps.MIRROR_TOKEN_ENV, run.call_args.kwargs["env"])
 
     def test_archive_cache_hit_never_fetches_or_recompiles_driver(self):
         import tarfile

@@ -384,6 +384,12 @@ jobs:
         run: scripts/test-backup-s3-integration.sh
 
   arm64-codec:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -448,7 +454,7 @@ jobs:
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Prepare verified Zig source dependencies
-        run: python3 scripts/ci/prepare_zig_dependencies.py
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         env:
@@ -472,6 +478,12 @@ jobs:
           zig test zig/lib/hash/src/mod.zig -O safe -mcpu=baseline -lc
 
   zig-base-tests:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -534,7 +546,7 @@ jobs:
           mkdir -p "$local_cache" "$global_cache"
 
       - name: Prepare verified Zig source dependencies
-        run: python3 scripts/ci/prepare_zig_dependencies.py
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -764,6 +776,12 @@ jobs:
   # Independent target matrices own their clocks and disposable compiler caches;
   # they do not consume the native unit gate's watchdog allowance.
   zig-base-wasm:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -822,7 +840,7 @@ jobs:
           mkdir -p "$local_cache" "$global_cache"
 
       - name: Prepare verified Zig source dependencies
-        run: python3 scripts/ci/prepare_zig_dependencies.py
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -853,6 +871,12 @@ jobs:
         run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
 
   zig-base-lite-models:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -912,7 +936,7 @@ jobs:
           mkdir -p "$local_cache" "$global_cache"
 
       - name: Prepare verified Zig source dependencies
-        run: python3 scripts/ci/prepare_zig_dependencies.py
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -980,6 +1004,12 @@ jobs:
         run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
 
   zig-full-tests:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -1049,7 +1079,7 @@ jobs:
           mkdir -p "$local_cache" "$global_cache"
 
       - name: Prepare verified Zig source dependencies
-        run: python3 scripts/ci/prepare_zig_dependencies.py
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -1509,6 +1539,12 @@ jobs:
           test "$ARM64_CODEC_RESULT" = "success"
 
   e2e-base-build:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -1574,7 +1610,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Prepare verified Zig source dependencies
-        run: python3 scripts/ci/prepare_zig_dependencies.py
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2167,6 +2203,12 @@ jobs:
           key: antfly-e2e-durations-v2-${{ github.run_id }}-${{ github.run_attempt }}
 
   e2e-full-build:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -2231,7 +2273,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Prepare verified Zig source dependencies
-        run: python3 scripts/ci/prepare_zig_dependencies.py
+        uses: ./.github/actions/prepare-zig-dependencies
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh

@@ -29,12 +29,25 @@ from pathlib import Path
 import re
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 import subprocess
 import tarfile
 import tempfile
 
 MANIFEST = Path(__file__).with_name("zig-dependencies.json")
+MIRROR = "https://storage.googleapis.com/antfly-image-artifacts-zig-dependencies"
+MIRROR_TOKEN_ENV = "ANTFLY_ZIG_MIRROR_TOKEN"
+
+
+class MirrorRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if (
+            not newurl.startswith(MIRROR + "/")
+            or urlsplit(newurl)[:2] != urlsplit(req.full_url)[:2]
+        ):
+            raise ValueError("refusing authenticated mirror redirect to another origin")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def load_manifest(path: Path = MANIFEST) -> dict:
@@ -56,11 +69,24 @@ def load_manifest(path: Path = MANIFEST) -> dict:
 
 
 def download(source: str, target: Path) -> None:
+    # Never send a cloud token to upstream, even when fallback is required.
+    token = (
+        os.environ.get(MIRROR_TOKEN_ENV) if source.startswith(MIRROR + "/") else None
+    )
+    request = (
+        Request(source, headers={"Authorization": "Bearer " + token})
+        if token
+        else source
+    )
+    open_source = build_opener(MirrorRedirects()).open if token else urlopen
     for attempt in range(3):
         try:
             deadline = time.monotonic() + 120
             size = 0
-            with urlopen(source, timeout=30) as response, target.open("wb") as output:
+            with (
+                open_source(request, timeout=30) as response,
+                target.open("wb") as output,
+            ):
                 while chunk := response.read(64 * 1024):
                     size += len(chunk)
                     if size > 64 * 1024 * 1024 or time.monotonic() > deadline:
@@ -113,7 +139,14 @@ def fetch_verified(
                 archive,
             ],
             cwd=scratch,
-            env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(package_dir.parent)},
+            env={
+                **{
+                    key: value
+                    for key, value in os.environ.items()
+                    if key != MIRROR_TOKEN_ENV
+                },
+                "ZIG_GLOBAL_CACHE_DIR": str(package_dir.parent),
+            },
             check=True,
             capture_output=True,
             text=True,

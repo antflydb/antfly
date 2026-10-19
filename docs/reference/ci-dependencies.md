@@ -3,7 +3,11 @@
 Zig dependencies stay pinned by content hash in `build.zig.zon`. CI prepares
 remote source packages from the verified GCS mirror before building, with
 bounded upstream fallback while the mirror is being bootstrapped or unavailable.
-The compiler installation and runner images are unchanged.
+The bucket stays private. CI uses Workload Identity Federation and the dedicated
+`zig-dependency-reader` account, which can only read this bucket. Its access token
+is scoped to the preparation step, never sent to upstream or compiler subprocesses,
+and never persisted in a credential file. The compiler installation and runner
+images are unchanged. Developer runs without a token retain upstream fallback.
 
 To use the same preparation locally, select the policy-pinned Zig compiler and
 run from the repository root:
@@ -31,7 +35,11 @@ fetch's reported hash misses a malformed cache root.
 
 The source mirror publishes only public upstream archives, under hash-derived
 paths, using generation-zero writes. It never shares private compiled artifacts.
-A mirror-only availability check is available with `--mirror-only`. A cold source
+The manual **Verify private Zig dependency mirror** workflow tests the dedicated
+reader from a cold cache with upstream fallback disabled, then checks Zig's
+complete dependency graph and repeats with remote fetching disabled (`--system`).
+A local mirror-only availability check is available with `--mirror-only` and an
+`ANTFLY_ZIG_MIRROR_TOKEN` obtained through your approved cloud identity. A cold source
 cache with `--offline --seed PATH` verifies a set of local hash-named archives
 without contacting either mirror or upstream.
 
