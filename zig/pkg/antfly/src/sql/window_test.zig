@@ -359,7 +359,7 @@ test "SQL unused named windows validate without evaluating discarded expressions
     try std.testing.expectEqualStrings("1", quoted_result.output.rows[0][0].string);
     var missing_order = try compiler.compile(std.testing.allocator, "SELECT 1 WINDOW unused AS (RANGE 1 PRECEDING)", .{});
     defer missing_order.deinit();
-    try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, backend.backend(), &missing_order, &.{}, .{}));
+    try std.testing.expectError(error.SqlWindowingError, runtime.execute(std.testing.allocator, backend.backend(), &missing_order, &.{}, .{}));
     var wrong_type = try compiler.compile(std.testing.allocator, "SELECT 1 WINDOW unused AS (ORDER BY 'a' RANGE 1 PRECEDING)", .{});
     defer wrong_type.deinit();
     try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, backend.backend(), &wrong_type, &.{}, .{}));

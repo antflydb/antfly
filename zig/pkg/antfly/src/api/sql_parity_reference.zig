@@ -517,15 +517,17 @@ pub const PostgresMutationReference = struct {
         sql_nulls: []const []const bool,
     };
     profile: struct { schema: Json, primary_key: []const []const u8 = &.{}, unique: []const []const []const u8 = &.{}, index_owner_ddl: ?[]const u8 = null, admission_probes: []const AdmissionProbe = &.{}, rows: []const Seed, additional_tables: []const Table },
+    rejection_final_tables: ?std.json.ArrayHashMap(Rows) = null,
     entries: []const struct {
         id: []const u8,
         command_tag: []const u8,
+        sqlstate: ?[]const u8 = null,
         affected: i64,
         columns: []const []const u8,
         column_oids: []const u32,
         rows: []const []const Json,
         sql_nulls: []const []const bool,
-        final_tables: std.json.ArrayHashMap(Rows),
+        final_tables: ?std.json.ArrayHashMap(Rows) = null,
         noop_contract: ?struct { kind: []const u8, eligible_rows: usize } = null,
     },
 };
@@ -570,10 +572,11 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
         const expected = for (reference.entries) |entry| {
             if (std.mem.eql(u8, id, entry.id)) break entry;
         } else return error.MissingPostgresMutationReference;
+        const final_tables = expected.final_tables orelse if (expected.sqlstate != null) reference.rejection_final_tables orelse return error.MissingPostgresMutationTable else return error.MissingPostgresMutationTable;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        try std.testing.expectEqual(tables.len, expected.final_tables.map.count());
+        try std.testing.expectEqual(tables.len, final_tables.map.count());
         for (tables, 0..) |table, table_index| {
             for (tables[0..table_index]) |prior| try std.testing.expect(!std.mem.eql(u8, table.name, prior.name));
             const seeds = if (std.mem.eql(u8, table.name, "usage_records")) reference.profile.rows else for (reference.profile.additional_tables) |profile| {
@@ -611,6 +614,18 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
         }
         var noop_primaries: std.ArrayList(NoopPrimary) = .empty;
         defer for (noop_primaries.items) |*primary| primary.before.deinit(a);
+        if (expected.sqlstate != null) {
+            for (tables, 0..) |table, index| {
+                const seeds = if (index == 0) reference.profile.rows else reference.profile.additional_tables[index - 1].rows;
+                for (seeds) |seed| {
+                    if (noop_primaries.items.len == 4096) return error.InvalidNoopMutationFixture;
+                    var before = (try table.db.lookup(a, seed.key, .{ .include_primary_digest = true })) orelse return error.MissingNoopPrimary;
+                    errdefer before.deinit(a);
+                    try std.testing.expect(before.version != null and before.expected_content_digest != null);
+                    try noop_primaries.append(a, .{ .table = index, .key = seed.key, .before = before });
+                }
+            }
+        }
         if (expected.noop_contract) |contract| {
             try std.testing.expectEqualStrings("primary_conflict_do_nothing", contract.kind);
             try std.testing.expectEqual(@as(i64, 0), expected.affected);
@@ -636,9 +651,12 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
                 }
             }
         }
-        const response = try execute(a, handler, try corpus.get(id));
-        defer response.deinit();
-        const result = response.value;
+        var response: ?std.json.Parsed(wire.SQLResponse) = null;
+        defer if (response) |*value| value.deinit();
+        if (expected.sqlstate) |code| {
+            try expectRejection(a, handler, id, code);
+        } else response = try execute(a, handler, try corpus.get(id));
+        const result: wire.SQLResponse = if (response) |value| value.value else .{ .command_tag = "", .rows_affected = 0, .columns = &.{}, .rows = &.{} };
         try std.testing.expectEqualStrings(expected.command_tag, result.command_tag);
         try std.testing.expectEqual(expected.affected, result.rows_affected);
         for (noop_primaries.items) |primary| {
@@ -671,7 +689,7 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
             try std.testing.expect(matched);
         }
         for (tables) |table| {
-            const final = expected.final_tables.map.get(table.name) orelse return error.MissingPostgresMutationTable;
+            const final = final_tables.map.get(table.name) orelse return error.MissingPostgresMutationTable;
             try std.testing.expectEqual(final.columns.len, final.column_oids.len);
             try std.testing.expectEqual(final.rows.len, final.sql_nulls.len);
             var stored = try table.db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
@@ -956,6 +974,7 @@ pub fn expectRejection(alloc: std.mem.Allocator, handler: anytype, case_id: []co
     defer context.deinit();
     var response = try handler.executeSQL(&context);
     defer response.deinit();
+    errdefer std.debug.print("original SQL rejection {s}: expected={s} status={d} body={s}\n", .{ case_id, sqlstate, response.status.code, response.body orelse "" });
     try std.testing.expectEqual(@as(u16, 400), response.status.code);
     const diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, alloc, response.body.?, .{});
     defer diagnostic.deinit();
@@ -1228,7 +1247,6 @@ fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_id
     for (reference.value.entries, case_ids) |expected, case_id| {
         try std.testing.expectEqualStrings(case_id, expected.id);
         const case = try corpus.get(expected.id);
-        try std.testing.expect(!std.mem.eql(u8, case.source_expectation, "rejection"));
         const parsed = executeWithTransport(alloc, handler, case, described_transport) catch |err| {
             if (err == error.NativeParityAdmissionFailed) {
                 if (!discovery) failures += 1;

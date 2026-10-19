@@ -120,6 +120,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlAmbiguousIndex => .{ .code = "42725", .message = "The index name matches more than one table. Specify ON table.", .retryable = false },
         error.IndexNotFound, error.EmbeddingIndexNotFound, error.SqlIndexNotFound => .{ .code = "42704", .message = "The index does not exist.", .retryable = false },
         error.SqlWrongObjectType => .{ .code = "42809", .message = "The named relation has an incompatible object type.", .retryable = false },
+        error.SqlWindowingError => .{ .code = "42P20", .message = "A RANGE frame with offset PRECEDING or FOLLOWING requires exactly one ORDER BY column.", .retryable = false },
         error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped => .{ .code = "42P16", .message = "The replacement view must preserve existing output column names, order, and types.", .hint = "Keep the existing output prefix unchanged; new columns may be appended.", .retryable = false },
         error.SqlDependentObjectsExist => .{ .code = "2BP01", .message = "A stored view depends on this relation or column.", .hint = "Remove the dependent views explicitly before changing their referenced columns or dropping the relation.", .retryable = false },
         error.InvalidSqlViewRecord => .{ .code = "XX001", .message = "The stored view catalog or its dependency records are inconsistent.", .retryable = false },
@@ -153,6 +154,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.UnknownSqlArrayType => .{ .code = "42P18", .message = "The array element type cannot be inferred.", .hint = "Provide an explicit array element type." },
         error.SqlCannotCoerce => .{ .code = "42846", .message = "The source type cannot be cast to the requested type.", .hint = "Use compatible builtin types or an explicit intermediate conversion." },
         error.SqlUndefinedOperator => .{ .code = "42883", .message = "No operator matches the operand types.", .hint = "Use explicit casts to compatible operand types." },
+        error.SqlSetTypeMismatch => .{ .code = "42804", .message = "Set operation columns have incompatible types.", .hint = "Use explicit casts to compatible types in corresponding output columns.", .retryable = false },
+        error.SqlSetColumnCountMismatch => .{ .code = "42601", .message = "Each branch of a set operation must have the same number of output columns.", .hint = "Select matching column counts in every UNION, INTERSECT or EXCEPT branch.", .retryable = false },
         error.SqlUndefinedFunction => .{ .code = "42883", .message = "No function matches the argument types.", .hint = "Use explicit casts to compatible argument types." },
         error.SqlArrayAppendDimensions => .{ .code = "22000", .message = "Appending or prepending requires an empty or one-dimensional array.", .hint = "Use array_cat for compatible multidimensional slices." },
         error.SqlArrayConcatenationDimensions => .{ .code = "2202E", .message = "Array dimensions are incompatible for concatenation.", .hint = "Match the element dimensions and lower bounds of the concatenated slices." },
@@ -204,6 +207,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.DatabaseNotEmpty, error.NamespaceNotEmpty, error.TablespaceInUse, error.ProtectedCatalogResource => .{ .code = "2BP01", .message = "The catalog object cannot be removed while protected or in use.", .retryable = false },
         error.RelationalIndexColumnNotFound, error.UndefinedColumn, error.UnknownColumn => .{ .code = "42703", .message = "A referenced column does not exist.", .hint = "Check column names against the current table schema." },
         error.DuplicateColumn, error.DuplicateSqlColumn => .{ .code = "42701", .message = "A column was specified more than once.", .hint = "Remove the duplicate column reference." },
+        error.DuplicateSqlAssignment => .{ .code = "42601", .message = "A column was assigned more than once.", .hint = "Assign each target column only once per statement.", .retryable = false },
         error.AmbiguousSqlColumn => .{ .code = "42702", .message = "A column reference is ambiguous.", .hint = "Use an unambiguous column name or alias." },
         error.DuplicateSqlAlias => .{ .code = "42712", .message = "A relation alias was specified more than once.", .hint = "Use a distinct alias for the merged USING columns." },
         error.SqlAmbiguousFunction => .{ .code = "42725", .message = "The function argument type is ambiguous.", .hint = "Cast the argument to an explicit SQL type." },
@@ -218,6 +222,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlNotNullViolation => .{ .code = "23502", .message = "A required column cannot be null.", .hint = "Provide a non-null value for every required column.", .retryable = false },
         error.SqlPrimaryKeyNotNull => .{ .code = "42P16", .message = "A primary-key column cannot drop its NOT NULL constraint.", .hint = "Drop the primary-key constraint before relaxing nullability.", .retryable = false },
         error.SqlCardinalityViolation => .{ .code = "21000", .message = "A scalar subquery returned more than one row.", .hint = "Use a unique predicate or an aggregate to produce at most one value.", .retryable = false },
+        error.SqlConflictCardinalityViolation => .{ .code = "21000", .message = "ON CONFLICT DO UPDATE cannot affect the same row more than once.", .hint = "Use distinct arbiter keys within the proposed rows.", .retryable = false },
         error.SqlMutationCardinalityViolation => .{ .code = "21000", .message = "A target row matched more than one mutation source row.", .hint = "Make the source unique per target row; no changes were committed.", .retryable = false },
         error.SqlTruncateReferenced => .{ .code = "2BP01", .message = "TRUNCATE has referencing tables outside the requested set.", .hint = "List every referencing table or explicitly request CASCADE.", .retryable = false },
         error.UnsupportedEmptyGenerationAuthority => .{ .code = "0A000", .message = "TRUNCATE requires owners with durable generation-handoff receipt authority.", .hint = "Native-only owners do not yet support this barrier. No TRUNCATE job was admitted; use DELETE instead.", .retryable = false },
@@ -343,4 +348,19 @@ test "durable SQL destination credential rejection is forbidden, not internal" {
 test "SQL row evaluation classification preserves resource and control failures" {
     for ([_]anyerror{ error.SqlInvalidTextRepresentation, error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlCardinalityViolation, error.SqlArraySubscriptError, error.SqlInvalidPowerArgument }) |err| try std.testing.expect(isRowEvaluationError(err));
     for ([_]anyerror{ error.OutOfMemory, error.QueryCanceled, error.DeadlineExceeded, error.SqlProgramLimitExceeded, error.ArtifactIntegrityMismatch, error.InvalidSqlBackendResponse }) |err| try std.testing.expect(!isRowEvaluationError(err));
+}
+
+test "SQL context-specific assignment window and conflict diagnostics preserve PostgreSQL identities" {
+    try std.testing.expectEqualStrings("42601", describe(error.DuplicateSqlAssignment).code);
+    try std.testing.expectEqualStrings("42701", describe(error.DuplicateSqlColumn).code);
+    try std.testing.expectEqualStrings("42P20", describe(error.SqlWindowingError).code);
+    try std.testing.expectEqualStrings("42804", describe(error.SqlSetTypeMismatch).code);
+    try std.testing.expectEqualStrings("42846", describe(error.SqlCannotCoerce).code);
+    try std.testing.expectEqualStrings("42601", describe(error.SqlSetColumnCountMismatch).code);
+    const conflict = describe(error.SqlConflictCardinalityViolation);
+    try std.testing.expectEqualStrings("21000", conflict.code);
+    try std.testing.expect(std.mem.indexOf(u8, conflict.message, "ON CONFLICT") != null);
+    try std.testing.expectEqual(@as(?bool, false), conflict.retryable);
+    try std.testing.expect(!isRowEvaluationError(error.SqlWindowingError));
+    try std.testing.expect(isRowEvaluationError(error.SqlConflictCardinalityViolation));
 }

@@ -690,7 +690,7 @@ const Builder = struct {
         try self.collectSet(query.set_operation.?.right, ctes, &leaves, depth + 1);
         const width = self.prepared.get(leaves.items[0]).?.expressions.len;
         const common = try self.alloc.alloc(scalar.Type, width);
-        for (leaves.items) |leaf| if (self.prepared.get(leaf).?.expressions.len != width) return error.SqlTypeMismatch;
+        for (leaves.items) |leaf| if (self.prepared.get(leaf).?.expressions.len != width) return error.SqlSetColumnCountMismatch;
         for (0..self.parameters.len + 2) |_| {
             @memset(common, .{});
             // All arms contribute before any unknown slot is constrained.
@@ -698,7 +698,7 @@ const Builder = struct {
                 const prepared = self.prepared.get(leaf).?;
                 const columns = try self.scalarColumns(prepared.source.columns);
                 for (prepared.expressions, common) |expression_, *kind| {
-                    try mergeInferredType(kind, try self.setType(expression_, columns), leaf_index == 0);
+                    try mergeSetType(kind, try self.setType(expression_, columns), leaf_index == 0);
                 }
             }
             var changed = false;
@@ -737,6 +737,13 @@ const Builder = struct {
         var resolved = kind;
         if (resolved.kind == null) resolved.kind = .string;
         return resolved;
+    }
+
+    fn mergeSetType(current: *scalar.Type, inferred: scalar.Type, first: bool) !void {
+        return mergeInferredType(current, inferred, first) catch |err| switch (err) {
+            error.SqlTypeMismatch => error.SqlSetTypeMismatch,
+            else => err,
+        };
     }
 
     fn mergeInferredType(current: *scalar.Type, inferred: scalar.Type, first: bool) !void {
@@ -1301,13 +1308,13 @@ const Builder = struct {
             if (!self.shape_only) try self.inferSet(statement, scope, depth + 1);
             const left = try self.derivedContext(set.left, "", &.{}, ctes, depth + 1, false);
             const right = try self.derivedContext(set.right, "", &.{}, ctes, depth + 1, false);
-            if (left.columns.len != right.columns.len) return error.SqlTypeMismatch;
+            if (left.columns.len != right.columns.len) return error.SqlSetColumnCountMismatch;
             const columns = try self.alloc.dupe(Column, left.columns);
             for (columns, right.columns) |*column, other| {
                 if (self.shape_only) {
                     var common: scalar.Type = .{};
-                    try mergeInferredType(&common, try self.setType(column.origin.?, self.shape_columns.items), true);
-                    try mergeInferredType(&common, try self.setType(other.origin.?, self.shape_columns.items), false);
+                    try mergeSetType(&common, try self.setType(column.origin.?, self.shape_columns.items), true);
+                    try mergeSetType(&common, try self.setType(other.origin.?, self.shape_columns.items), false);
                     common = resolveUnknown(common);
                     const args = try self.alloc.dupe(*const ast.Scalar, &.{ try self.scalarNode(.{ .cast = .{ .operand = column.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier } }), try self.scalarNode(.{ .cast = .{ .operand = other.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier } }) });
                     column.origin = try self.scalarNode(.{ .call = .{ .name = "coalesce", .args = args } });
@@ -1316,7 +1323,7 @@ const Builder = struct {
                     column.numeric_modifier = common.numeric_modifier;
                     try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
                 } else {
-                    if (column.type != other.type or column.element_type != other.element_type) return error.SqlTypeMismatch;
+                    if (column.type != other.type or column.element_type != other.element_type) return error.SqlSetTypeMismatch;
                     if (!scalar.NumericModifier.eql(column.numeric_modifier, other.numeric_modifier)) column.numeric_modifier = null;
                 }
                 column.internal = try self.internal();

@@ -268,7 +268,7 @@ pub fn waitServingSchema(ctx: *Context, name: []const u8, minimum: u32) !Serving
                     .relational_topology_json = "{\"mode\":\"public_schema\"}",
                     .execution_deadline_ns = deadline,
                 }, .read_index) catch |err| switch (err) {
-                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.TableNotFound, error.IntegrityCatalogChanged => null,
+                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.Timeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.TableNotFound, error.IntegrityCatalogChanged, error.CatalogRoutingUnavailable => null,
                     else => return err,
                 };
                 if (observed) |value| {
@@ -288,6 +288,12 @@ pub fn waitServingSchema(ctx: *Context, name: []const u8, minimum: u32) !Serving
 }
 
 pub fn run(comptime Campaign: type) !void {
+    return runWithState(Campaign, .{});
+}
+
+/// Runtime campaign data avoids compiling the same mounted owner and restart
+/// machinery once per original contract. Each run still owns isolated roots.
+pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);
     const internal_secret = "pk-rewrite-e2e-internal-service-secret-v1";
@@ -331,6 +337,17 @@ pub fn run(comptime Campaign: type) !void {
     defer alloc.free(snapshots);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
+    // Session campaigns opt in to the same native durable registry used by
+    // production, not a mock or the legacy filesystem DocStore fallback.
+    const native_sessions = if (@hasDecl(Campaign, "native_sessions")) Campaign.native_sessions else false;
+    const session_path = try std.fmt.allocPrint(alloc, "{s}/sql-sessions", .{root});
+    defer alloc.free(session_path);
+    const local = @import("antfly_local_sources");
+    var session_backend: ?local.storage_lsm_backend.BackendHandle = if (native_sessions) try local.storage_lsm_backend.BackendHandle.open(alloc, session_path, .{}) else null;
+    defer if (session_backend) |*backend| backend.close();
+    var session_store: ?local.storage_backend_erased.Store = if (session_backend) |*backend| try backend.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" }) else null;
+    defer if (session_store) |*store| store.deinit();
+    var sessions = if (session_store) |*store| @import("transactions.zig").DurableSessionStore.initRuntime(alloc, store) else null;
     var metadata = try metadata_runtime.Server.init(process_alloc, .{
         .local_node_id = 1,
         .metadata_group_id = 2188,
@@ -359,7 +376,7 @@ pub fn run(comptime Campaign: type) !void {
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
+        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
     }, metadata_uri);
     var data_live = true;
     defer if (data_live) data.deinit();
@@ -408,7 +425,7 @@ pub fn run(comptime Campaign: type) !void {
         .base = base,
         .progress = .{ &meta_raft, &meta_control, &data_raft, &data_control },
     };
-    var campaign: Campaign = .{};
+    var campaign = initial;
     try enrollOwnedTestRoot(&context, data_root);
     try campaign.beforeRestart(&context);
     try context.checkDrivers();
@@ -423,7 +440,7 @@ pub fn run(comptime Campaign: type) !void {
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
+        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
     }, metadata_uri);
     data_live = true;
     try data.start();

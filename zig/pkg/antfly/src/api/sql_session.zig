@@ -148,7 +148,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         // Stronger isolation requires native retained snapshots + range
         // validation, not a label on an ordinary staged transaction.
-        if (options.isolation != .read_committed and !self.supports_range_guards) return error.UnsupportedSqlExecution;
+        if (options.isolation != .read_committed and !self.supports_range_guards) return error.SqlRangeTrackingRequired;
         const txn_id = transactions.newSessionTxnId(self.node_id);
         if (self.connection_id) |connection| try self.connectionMutation(scope, .{ .begin = .{
             .id = connection,
@@ -261,7 +261,7 @@ test "SQL native session owns durable savepoint and failure state" {
     var adapter = Adapter{ .alloc = alloc, .registry = &registry, .node_id = 1, .commit_context = &ignored, .commit_fn = Commit.run };
     var session = sql.Session{ .owner = adapter.owner(), .scope = .{ .principal = "alice" } };
     defer session.deinit();
-    try std.testing.expectError(error.UnsupportedSqlExecution, session.execute(.{ .begin = .{} }));
+    try std.testing.expectError(error.SqlRangeTrackingRequired, session.execute(.{ .begin = .{} }));
     _ = try session.execute(.{ .begin = .{ .isolation = .read_committed } });
     const started = (try session.statement(false)).started_at.?;
     try std.testing.expectEqual(@as(?i128, @as(i128, registry.getInfo(session.transaction_id.?).?.begin_timestamp / 1000) * 1000), started.unixNanoseconds());

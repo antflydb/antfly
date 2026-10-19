@@ -2422,6 +2422,94 @@ class PostgresReferenceTest(unittest.TestCase):
         self.assertEqual("42601", excluded["sql-0574"]["sqlstate"])
         self.assertEqual("42P10", excluded["sql-1394"]["sqlstate"])
 
+    def test_explicit_mutation_rejections_preserve_complete_postimages(self):
+        cases = [
+            {
+                **self.case(
+                    "UPDATE usage_records SET amount=amount+1 WHERE id='u1' RETURNING 1/0"
+                ),
+                "id": "negative-divide",
+            },
+            {
+                **self.case("INSERT INTO usage_records(id,amount) VALUES ('u1',99)"),
+                "id": "negative-duplicate",
+            },
+        ]
+        result = mutation_reference(
+            self.db,
+            cases,
+            self.mutation_profile(),
+            negative_sqlstates={
+                "negative-divide": "22012",
+                "negative-duplicate": "23505",
+            },
+        )
+        self.assertFalse(result["excluded"])
+        self.assertEqual(2, len(result["entries"]))
+        for entry in result["entries"]:
+            self.assertEqual(0, entry["affected"])
+            self.assertEqual([], entry["rows"])
+            self.assertEqual(
+                [["u1", 5, {"source": "api"}], ["u2", 9, None]],
+                entry["final_tables"]["usage_records"]["rows"],
+            )
+
+    def test_mutation_rejection_oracle_fails_closed_on_success_or_wrong_state(self):
+        cases = [
+            {
+                **self.case(
+                    "UPDATE usage_records SET amount=123 WHERE id='u1' RETURNING amount"
+                ),
+                "id": "unexpected-success",
+            },
+            {
+                **self.case(
+                    "UPDATE usage_records SET amount=42 WHERE id='u1' RETURNING 1/0"
+                ),
+                "id": "wrong-state",
+            },
+            {
+                **self.case("INSERT INTO usage_records(id,amount) VALUES ('u1',99)"),
+                "id": "verified",
+            },
+        ]
+        result = mutation_reference(
+            self.db,
+            cases,
+            self.mutation_profile(),
+            negative_sqlstates={case["id"]: "23505" for case in cases},
+        )
+        self.assertEqual(
+            ["unexpected-success", "wrong-state"],
+            [entry["id"] for entry in result["excluded"]],
+        )
+        self.assertEqual("22012", result["excluded"][1]["sqlstate"])
+        self.assertEqual(
+            [["u1", 5, {"source": "api"}], ["u2", 9, None]],
+            result["entries"][0]["final_tables"]["usage_records"]["rows"],
+        )
+        self.assertIsNone(
+            self.db.execute("SELECT to_regclass('public.usage_records')").fetchone()[0]
+        )
+
+    def test_mutation_rejection_declarations_validate_before_database_access(self):
+        for declared in (
+            {"unknown": "23505"},
+            {"sql-0001": "bad"},
+            {"sql-0001": None},
+            {"sql-0001": 23505},
+        ):
+            with (
+                self.subTest(declared=declared),
+                self.assertRaisesRegex(ValueError, "explicit mutation rejection"),
+            ):
+                mutation_reference(
+                    None,
+                    [self.case("DELETE FROM usage_records")],
+                    self.mutation_profile(),
+                    negative_sqlstates=declared,
+                )
+
     def test_mutation_stream_byte_quota_covers_returning_and_post_state(self):
         cases = [
             self.case(

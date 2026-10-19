@@ -256,17 +256,17 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-0790", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0791", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0792", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0793", .expected = error.UnsupportedSqlShape },
+        .{ .id = "sql-0793", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0794", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0795", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0796", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0839", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0840", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0841", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0842", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0843", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0844", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0845", .expected = error.UnsupportedSqlShape },
+        .{ .id = "sql-0839", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0840", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0841", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0842", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0843", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0844", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0845", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0892", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0904", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0905", .expected = error.UnsupportedSqlShape },
@@ -297,6 +297,7 @@ test "SQL exact original rejection contracts fail before backend access" {
     var admitted: usize = 0;
     for (cases) |expected| {
         const case = try corpus.get(expected.id);
+        errdefer std.debug.print("original rejection contract {s}\n", .{case.id});
         try std.testing.expectEqualStrings("rejection", case.source_expectation);
         var diagnostic: compiler.Diagnostic = .{};
         if (compiler.compileDiagnostic(std.testing.allocator, case.sql, .{}, &diagnostic)) |value_| {

@@ -25905,7 +25905,7 @@ const RemoteMetadataSource = struct {
     validation_slots: [128]ValidationSlot = @splat(.{}),
     validation_head_mutex: std.atomic.Mutex = .unlocked,
     validation_head: ?antfly.metadata_api.MetadataHead = null,
-    validation_head_at_ns: u64 = 0,
+    validation_head_started_ns: u64 = 0,
     validation_head_generation: u64 = 0,
     cache_mutex: std.atomic.Mutex = .unlocked,
     cached_head: ?antfly.metadata_api.MetadataHead = null,
@@ -28557,21 +28557,25 @@ const RemoteMetadataSource = struct {
             const generation = self.snapshot_invalidation_generation;
             self.cache_mutex.unlock();
             // The durable catalog revision includes extension membership but
-            // excludes heartbeats. Checking it is one metadata point read,
-            // independent of catalog size, shared by every validation stripe.
+            // excludes heartbeats. Check it once per validation batch, not per
+            // row. A wall-clock TTL is unsafe: a completed remote DDL need not
+            // invalidate this process's routing cache. Only coalesce a read
+            // that STARTED after this request, so its linearization cannot
+            // precede a schema change completed before the request began.
             const head = head: {
                 while (!self.validation_head_mutex.tryLock()) {
                     try bounded.ensureActive();
                     try self.io.sleep(.fromMilliseconds(1), .awake);
                 }
                 defer self.validation_head_mutex.unlock();
-                if (self.validation_head) |cached| if (self.validation_head_generation == generation and self.awakeNs() -| self.validation_head_at_ns < std.time.ns_per_s) break :head cached;
+                if (self.validation_head) |cached| if (self.validation_head_generation == generation and self.validation_head_started_ns > started) break :head cached;
+                const head_started = self.awakeNs();
                 const bytes = try self.readSystemCatalog(alloc, bounded, .write_validation_revision);
                 defer alloc.free(bytes);
                 var parsed = try std.json.parseFromSlice(antfly.metadata_api.MetadataHead, alloc, bytes, .{});
                 defer parsed.deinit();
                 self.validation_head = parsed.value;
-                self.validation_head_at_ns = self.awakeNs();
+                self.validation_head_started_ns = head_started;
                 self.validation_head_generation = generation;
                 break :head parsed.value;
             };
@@ -35309,10 +35313,11 @@ fn consumerTests() type {
                 defer alloc.free(bytes);
                 try std.testing.expect(std.mem.indexOf(u8, bytes, "old") != null);
             }
-            try std.testing.expectEqual(@as(usize, 1), fake.heads);
+            try std.testing.expectEqual(@as(usize, 8), fake.heads);
             try std.testing.expectEqual(@as(usize, 1), fake.projections);
             fake.revision = 2;
-            source.validation_head_at_ns = 0;
+            // No local invalidation or clock manipulation: another metadata
+            // client has just committed DDL. The next request must observe it.
             const revised = try source.readWriteValidation(alloc, .{}, "docs");
             defer alloc.free(revised);
             try std.testing.expect(std.mem.indexOf(u8, revised, "new") != null);

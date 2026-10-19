@@ -132,6 +132,10 @@ test "httpx SQL original PostgreSQL mutation syntax errors never access storage"
         "sql-1576",
         "sql-1577",
     };
+    try expectClosedSyntax(&ids);
+}
+
+fn expectClosedSyntax(ids: []const []const u8) !void {
     const a = std.testing.allocator;
     const Closed = struct {
         calls: usize = 0,
@@ -157,6 +161,46 @@ test "httpx SQL original PostgreSQL mutation syntax errors never access storage"
         try @import("sql_parity_reference.zig").expectRejection(a, &handler, id, "42601");
         try std.testing.expectEqual(@as(usize, 0), closed.calls);
     }
+}
+
+test "httpx SQL original PostgreSQL invalid grammar rejects before catalog access" {
+    const ids = [_][]const u8{
+        "sql-0021",
+        "sql-0022",
+        "sql-0023",
+        "sql-0024",
+        "sql-0025",
+        "sql-0026",
+        "sql-0027",
+        "sql-0028",
+        "sql-0029",
+        "sql-0030",
+        "sql-0031",
+        "sql-0032",
+        "sql-0033",
+        "sql-0067",
+        "sql-0354",
+        "sql-0355",
+        "sql-0682",
+        "sql-0684",
+        "sql-0686",
+        "sql-0687",
+        "sql-0688",
+        "sql-0689",
+        "sql-0690",
+        "sql-0691",
+        "sql-0693",
+        "sql-0694",
+        "sql-0698",
+        "sql-0846",
+        "sql-0847",
+        "sql-0848",
+        "sql-0849",
+        "sql-0850",
+        "sql-0851",
+        "sql-0852",
+    };
+    try expectClosedSyntax(&ids);
 }
 
 const schema_json =

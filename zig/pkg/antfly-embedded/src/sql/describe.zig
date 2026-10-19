@@ -500,9 +500,23 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         else => false,
     };
     const relational_returning = returningReads(returning_columns);
+    var returning_scope_failure: ?anyerror = null;
     const returning_select: ?ast.Select = if (returning_columns) |projections| selection: {
         if (joined) break :selection null;
-        if (!relational_returning) break :selection .{ .table = target.name, .columns = try @import("relation_binding.zig").normalizeTargetProjection(allocator, backend, table, projection_name, target_aliased, projections) };
+        if (!relational_returning) {
+            const normalized = @import("relation_binding.zig").normalizeTargetProjection(allocator, backend, table, projection_name, target_aliased, projections) catch |err| {
+                // PostgreSQL analyzes ON CONFLICT before RETURNING. Retain a
+                // definite later scope failure without rebinding a valid
+                // projection or losing its shared parameter inference. Memory,
+                // cancellation and authority failures remain immediate.
+                if (compiled.statement == .insert and compiled.statement.insert.conflict != null and (err == error.UndefinedColumn or err == error.AmbiguousSqlColumn)) {
+                    returning_scope_failure = err;
+                    break :selection null;
+                }
+                return err;
+            };
+            break :selection .{ .table = target.name, .columns = normalized };
+        }
         const source = try allocator.create(ast.Relation);
         source.* = .{ .table = .{ .name = target.name, .alias = if (target_aliased) projection_name.table else null, .prepared_rows = true } };
         break :selection .{ .source = source, .columns = projections, .ctes = switch (compiled.statement) {
@@ -624,6 +638,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         }
         result.conflict = try @import("conflict.zig").bind(allocator, backend, table, projection_name, target_aliased, clause, parameters, capture_types);
     };
+    if (returning_scope_failure) |err| return err;
     if (returning_select) |selection| {
         var adapter: @import("relation_binding.zig").TargetResolveAdapter = .{ .backend = backend, .table = table, .name = target.name };
         const returning_compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = selection }, .parameter_count = compiled.parameter_count };
@@ -877,7 +892,7 @@ const Context = struct {
                 .string => |key| {
                     if (key.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(key)) return error.SqlTypeMismatch;
-                    if ((try literal_keys.getOrPut(self.allocator, key)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
+                    if ((try literal_keys.getOrPut(self.allocator, key)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return @import("conflict.zig").duplicateRowError(statement.conflict);
                 },
                 else => return error.SqlRowIdentityRequired,
             }
@@ -1265,7 +1280,7 @@ test "SQL set description cannot infer through resolved text boundaries" {
         var fake: FakeBackend = .{};
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(error.SqlTypeMismatch, describe(std.testing.allocator, fake.backend(), &compiled, &.{}));
+        try std.testing.expectError(error.SqlSetTypeMismatch, describe(std.testing.allocator, fake.backend(), &compiled, &.{}));
     }
     for ([_][]const u8{ "SELECT $1 AS x UNION SELECT 1 UNION SELECT 1.5", "SELECT 1.5 AS x UNION SELECT 1 UNION SELECT $1" }, 0..) |sql, index| {
         var fake: FakeBackend = .{};

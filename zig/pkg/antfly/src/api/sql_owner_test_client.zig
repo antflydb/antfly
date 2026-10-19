@@ -53,13 +53,38 @@ const Diagnostic = struct {
     mutation_outcome: ?[]const u8 = null,
     admission_outcome: ?[]const u8 = null,
     status: ?[]const u8 = null,
+    ddl_receipt: ?std.json.Value = null,
 };
 
 fn definiteReadAdmission(diagnostic: Diagnostic) bool {
     return diagnostic.retryable and std.mem.eql(u8, diagnostic.code, "53300") and
         std.mem.startsWith(u8, diagnostic.message, "A consistent SQL statement read is temporarily unavailable.") and
         std.mem.eql(u8, diagnostic.transaction_status, "idle") and diagnostic.transaction_id == null and
-        diagnostic.mutation_outcome == null and diagnostic.admission_outcome == null and diagnostic.status == null;
+        diagnostic.mutation_outcome == null and diagnostic.admission_outcome == null and diagnostic.status == null and diagnostic.ddl_receipt == null;
+}
+
+fn definiteDdlNonadmission(diagnostic: Diagnostic) bool {
+    return diagnostic.retryable and std.mem.eql(u8, diagnostic.code, "53300") and
+        std.mem.startsWith(u8, diagnostic.message, "The relation catalog publication is not ready to authorize this DDL. No schema change was admitted.") and
+        std.mem.eql(u8, diagnostic.transaction_status, "idle") and diagnostic.transaction_id == null and
+        diagnostic.mutation_outcome == null and diagnostic.admission_outcome == null and diagnostic.status == null and diagnostic.ddl_receipt == null;
+}
+
+test "SQL catalog lifecycle retries only explicit definite DDL nonadmission" {
+    const safe: Diagnostic = .{ .code = "53300", .message = "The relation catalog publication is not ready to authorize this DDL. No schema change was admitted.", .retryable = true, .transaction_status = "idle" };
+    try std.testing.expect(definiteDdlNonadmission(safe));
+    var changed = safe;
+    changed.ddl_receipt = .null;
+    try std.testing.expect(!definiteDdlNonadmission(changed));
+    changed = safe;
+    changed.admission_outcome = "unknown";
+    try std.testing.expect(!definiteDdlNonadmission(changed));
+    changed = safe;
+    changed.mutation_outcome = "committed_pending";
+    try std.testing.expect(!definiteDdlNonadmission(changed));
+    changed = safe;
+    changed.message = "The declaration committed; activation is still pending.";
+    try std.testing.expect(!definiteDdlNonadmission(changed));
 }
 
 test "SQL default lifecycle retries only definite read admission" {
@@ -109,7 +134,7 @@ pub fn executeIn(ctx: *fixture.Context, namespace: ?[]const u8, statement: []con
                 return err;
             };
             defer diagnostic.deinit();
-            if (definiteReadAdmission(diagnostic.value)) {
+            if (definiteReadAdmission(diagnostic.value) or (retry == .write_admission and definiteDdlNonadmission(diagnostic.value))) {
                 response.deinit(ctx.alloc);
                 try ctx.io.sleep(.fromMilliseconds(20), .awake);
                 continue;

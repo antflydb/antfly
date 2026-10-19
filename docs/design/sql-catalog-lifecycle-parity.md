@@ -12752,3 +12752,100 @@ four opt-in tests skipped, zero failures and zero leaks. The Apache product
 boundary check also passed (2,330 source files); ledger integrity tests passed
 all 20 cases. These results qualify this expansion, not the remaining 524
 unresolved inventory cases or the unrelated architectural work listed above.
+
+### Original typed reads, index mutations and schema/session lifecycles (2026-10-18)
+
+This expansion keeps all 1,586 original statements, parameters and source hashes
+unchanged. New PostgreSQL references cover typed arrays and correlated reads,
+document-backed typed views, binding and mutation diagnostics, schema lifecycle
+changes, public index activation and transaction-control transcripts. Successful
+reads compare types, SQL-null provenance and complete result multisets; ordered
+frontiers use deterministic witnesses instead of freezing arbitrary peer order.
+Negative mutation campaigns compare complete postimages and native primary
+versions/digests, not merely HTTP errors. Definite grammar errors are independently
+checked with PostgreSQL's parse protocol without executing utility statements.
+
+Public index campaigns create real UUID-primary tables and full/partial UNIQUE
+indexes before executing the original mutations. Matching and predicate-ineligible
+rows, future ownership-retention/release probes and independently reopened data
+owners distinguish enforcement from historical schema annotations. Rejection
+probes use otherwise absent primary identities so a PK collision cannot hide a
+lost secondary UNIQUE or CHECK constraint. DDL commands are never replayed after
+admission: tests observe the original receipt/job and serving publication. Only
+the explicit definite-publication-nonadmission response is retryable.
+
+Transaction controls run on a native durable session store with actual retained
+snapshot/range-guard support. An independent connection observes every command,
+including committed versus staged writes, savepoint rollback/release and abort.
+The data owner is subsequently reopened and the committed postimage rechecked.
+This does not qualify live SQL-session failover or stronger isolation at a
+metadata-only gateway that lacks the required capability. Unsupported stronger
+isolation reports the actionable range-tracking capability error and is never
+silently downgraded. DEFERRABLE is accepted only where PostgreSQL defines it as
+ineffective; SERIALIZABLE READ ONLY DEFERRABLE still requires safe-snapshot
+admission. START TRANSACTION retains its public command tag separately from
+durable transaction options.
+
+Post-DDL write validation no longer trusts a one-second cached catalog head.
+Each validation batch checks an authoritative, linearizable revision using a
+constant-size metadata point read; the bounded table/schema payload cache remains.
+Concurrent requests can share only a head read started after their own admission,
+never a TTL value that predates an externally committed schema change. This adds
+no per-row catalog scans or schema parsing and preserves cancellation budgets.
+
+Native scan pages now own one logical requested-field layout instead of borrowing
+the first physical row's projection shape. Old and new row encodings can coexist:
+missing historical fields occupy absent/NULL slots without displacing later
+columns. Complete projections retain direct ordinal decoding; only incomplete
+historical projections need name-to-output-slot mapping. The page owns its names
+after reader and historical binding retirement. Physical row schema versions and
+integrity values are not rewritten or mislabeled as the active query epoch.
+
+The storage-shard discovery audit also exposed twelve existing relational test
+sources omitted from its manifest. They now have explicit imports and disjoint
+shard ownership rather than bypassing the audit for the mixed-layout regression.
+
+CHECK failures retain their permanent validation identity through native row
+normalization, independently compiled callback archives and the authenticated
+retained-read transport. The runtime detail is appended without renumbering
+released identities. Pure normalization accepts only an exact stable error name,
+matching diagnostic HTTP status and protocol ACK; malformed names, missing ACKs,
+transport ambiguity and stateful page operations keep the poisoned-cursor path.
+No normalization RPC is replayed. This prevents a real 23514 CHECK rejection from
+being misreported as a retryable statement-snapshot failure. The shared stable
+registry, not a second hand-maintained SQL error-name list, owns classification.
+
+An already-validated CHECK rejection is supplemental evidence for sql-1412, not
+qualification of its original unvalidated-constraint precondition. That case
+remains unresolved until the actual NOT VALID lifecycle is exercised.
+
+The qualified ledger now records **668 implemented / 133 rejected / 386
+superseded / 399 unresolved**, down from 524 unresolved: 125 additional original
+contracts adjudicated, not 125 distinct new features. The closures comprise 34
+grammar diagnostics, 16 document-view reads, 18 unchanged-postimage mutation
+rejections, 10 extended typed reads, four floating-document MOD rejections,
+seven pre-read binding rejections, one users-table read, eight publicly activated
+index mutations, 14 schema lifecycle contracts and 13 transaction controls.
+Of those, 48 become implemented, five retain their original rejection contract,
+and 72 have explicitly tested PostgreSQL-standard supersessions. The extraction
+inventory, original SQL/parameters and source checksums are unchanged.
+
+PostgreSQL 18 independently reproduces all nine new frozen reference campaigns
+and 34 parse-only grammar diagnostics; the combined oracle/inventory unit gate
+passes 147 tests. Native qualification covers real LSM handlers, mounted metadata
+and data owners, exact types/nulls/postimages, future-write probes, public
+activation receipts and cold row-owner recovery. It does not claim multi-owner
+fault-injection coverage, live connection/session failover, an unvalidated CHECK
+transition, or completion of the remaining 399 contracts. Inventory integrity
+and evidence availability are not a claim of full SQL release readiness.
+
+Final Debug qualification passes `sql-test` (1,237 local and 234 dependent tests,
+four opt-in skips, 25/25 build steps), the selected native API bundle (20 tests,
+86/86 steps), schema/index lifecycle gates (89/89 steps), the owned mixed-layout
+LSM page regression (53/53 steps), and normalization transport/no-replay tests
+(57/57 steps). Independent-archive error identities, original transaction and
+document-view restart campaigns, and the authoritative write-validation cache
+regression also pass. No failing, leaked or silently empty native campaign is
+counted as evidence. The 20 inventory tests pass again at the final 399 count;
+Zig/Python formatting, source licenses, the Apache boundary, storage discovery,
+generated engine-error names and generated control-source catalog checks pass.

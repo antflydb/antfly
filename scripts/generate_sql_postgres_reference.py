@@ -183,6 +183,8 @@ def pg_type(prop):
 
 
 def encoded(value):
+    if isinstance(value, UUID):
+        return str(value)
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("non-finite numeric needs a dedicated wire contract")
@@ -791,7 +793,13 @@ def mutation_noop_contract(db, case, profile, row_limit):
 
 
 def mutation_reference(
-    db, cases, profile, row_limit=ROW_LIMIT, byte_limit=16 * 1024 * 1024
+    db,
+    cases,
+    profile,
+    row_limit=ROW_LIMIT,
+    byte_limit=16 * 1024 * 1024,
+    *,
+    negative_sqlstates=None,
 ):
     """Exact mutations, isolated by savepoints, with complete multi-table state.
 
@@ -805,6 +813,13 @@ def mutation_reference(
     from psycopg import sql
     from psycopg.generators import fetch
     from psycopg.pq import ExecStatus
+
+    negative_sqlstates = negative_sqlstates or {}
+    if set(negative_sqlstates) - {case["id"] for case in cases} or any(
+        not isinstance(code, str) or not re.fullmatch(r"[0-9A-Z]{5}", code)
+        for code in negative_sqlstates.values()
+    ):
+        raise ValueError("invalid explicit mutation rejection contracts")
 
     if psycopg.__version__ != "3.3.6":
         raise RuntimeError("mutation streaming oracle requires pinned psycopg 3.3.6")
@@ -981,7 +996,7 @@ def mutation_reference(
                 raise ValueError("mutation admission probe unexpectedly succeeded")
         for case in cases:
             try:
-                if re.search(
+                if case["id"] not in negative_sqlstates and re.search(
                     r"\b(CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|random|randomblob|gen_random_uuid)\b",
                     case["sql"],
                     re.I,
@@ -1031,8 +1046,33 @@ def mutation_reference(
                                 "zero-effect mutation changed its result or table state"
                             )
                         entry["noop_contract"] = noop
+                    if case["id"] in negative_sqlstates:
+                        raise ValueError(
+                            "declared mutation rejection unexpectedly succeeded"
+                        )
                     entries.append(entry)
             except (psycopg.Error, ValueError, KeyError, TypeError) as error:
+                if (
+                    case["id"] in negative_sqlstates
+                    and isinstance(error, psycopg.Error)
+                    and error.sqlstate == negative_sqlstates[case["id"]]
+                ):
+                    entries.append(
+                        {
+                            "id": case["id"],
+                            "sqlstate": error.sqlstate,
+                            "command_tag": "",
+                            "affected": 0,
+                            "columns": [],
+                            "column_oids": [],
+                            "rows": [],
+                            "sql_nulls": [],
+                            "final_tables": capture_tables(
+                                tables, [byte_limit], "rejected mutation final state"
+                            ),
+                        }
+                    )
+                    continue
                 excluded.append(
                     {
                         "id": case["id"],
@@ -1099,7 +1139,7 @@ def join_order_observer(case, retain_offset=True):
     return f"SELECT join_witness.*, {expression} AS order_key FROM ({body}) AS join_witness ORDER BY {expression} {direction}{nulls or ''}{suffix}"
 
 
-def read_reference(db, cases, profile):
+def read_reference(db, cases, profile, *, order_observers=None):
     import psycopg
 
     entries, excluded = [], []
@@ -1119,9 +1159,11 @@ def read_reference(db, cases, profile):
                         read=True,
                         exact_numeric=profile.get("exact_numeric", False),
                     )
-                    observer_sql = ORDER_OBSERVERS.get(
-                        case["id"]
-                    ) or aggregate_order_observer(case)
+                    observer_sql = (
+                        (order_observers or {}).get(case["id"])
+                        or ORDER_OBSERVERS.get(case["id"])
+                        or aggregate_order_observer(case)
+                    )
                     if profile.get("original_join_witnesses"):
                         observer_sql = join_order_observer(case)
                         offset = re.search(r" OFFSET ([0-9]+)$", case["sql"])
@@ -1544,6 +1586,10 @@ def document_witness_rows(identity):
 
 
 DOCUMENT_NEGATIVE_IDS = {
+    "sql-0970",
+    "sql-0971",
+    "sql-0972",
+    "sql-0973",
     "sql-0891",
     "sql-0911",
     "sql-0913",

@@ -125,6 +125,21 @@ pub const Client = struct {
             self.poisoned = true;
             return error.SqlRangeTrackingRequired;
         }
+        // Normalization is pure preparation, not a stateful page advance or
+        // commit. An authenticated, protocol-acknowledged, canonical negative
+        // result must preserve validation/cancellation/resource identity.
+        // Unknown names, mismatched status, missing ACK and other operations
+        // retain the fail-closed restart path; never replay this RPC.
+        if (request.operation == .normalize and response.status >= 400 and response.status < 600 and
+            std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value))
+        {
+            if (@import("antfly_runtime_abi").error_abi.errorFromStableName(response.body)) |err| {
+                if (rpc.normalizationFailureHttpStatus(err) == response.status) {
+                    self.poisoned = true;
+                    return err;
+                }
+            }
+        }
         if (response.status != 200 or !std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value)) {
             self.poisoned = true;
             if (unpublishedAdmissionBusy(request.operation, response.status, std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value), response.body)) return error.ReadUnavailable;
@@ -308,6 +323,50 @@ fn consumerTests() type {
             try std.testing.expectError(error.ConnectionResetByPeer, Client.next(client, alloc, 1));
             try std.testing.expectError(error.RetainedReadRestartRequired, Client.next(client, alloc, 1));
             try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        }
+
+        test "retained read client preserves only canonical acknowledged normalization failures without replay" {
+            const Fixture = struct {
+                status: u16,
+                body: []const u8,
+                ack: bool,
+                calls: usize = 0,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    const headers = try alloc.alloc(http.Header, @intFromBool(self.ack));
+                    if (self.ack) headers[0] = .{
+                        .name = try alloc.dupe(u8, metadata.catalog_route_fence_ack_header),
+                        .value = try alloc.dupe(u8, metadata.catalog_route_fence_ack_value),
+                    };
+                    return .{ .status = self.status, .body = try alloc.dupe(u8, self.body), .headers = headers };
+                }
+            };
+            const Case = struct { operation: @FieldType(rpc.Request, "operation") = .normalize, status: u16 = 400, body: []const u8 = "RelationalCheckViolation", ack: bool = true, expected: anyerror = error.RetainedReadRestartRequired };
+            for ([_]Case{
+                .{ .expected = error.RelationalCheckViolation },
+                .{ .body = "UniqueConstraintViolation", .expected = error.UniqueConstraintViolation },
+                .{ .body = "InvalidBatchRequest", .expected = error.InvalidBatchRequest },
+                .{ .status = 500, .body = "OutOfMemory", .expected = error.OutOfMemory },
+                .{ .status = 503, .body = "ReadUnavailable", .expected = error.ReadUnavailable },
+                .{ .ack = false },
+                .{ .status = 409 },
+                .{ .body = "RelationalCheckViolation\n" },
+                .{ .body = "PrivateProviderSecret" },
+                .{ .operation = .next },
+                .{ .operation = .open },
+            }) |case| {
+                var fixture: Fixture = .{ .status = case.status, .body = case.body, .ack = case.ack };
+                const alloc = std.testing.allocator;
+                const client = try Client.create(alloc, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "rows", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+                defer client.destroy();
+                client.token = .{ .incarnation = 1, .sequence = 1, .slot = 0 };
+                const request: rpc.Request = .{ .operation = case.operation, .schema_version = 5, .token = client.token };
+                try std.testing.expectError(case.expected, client.call(request));
+                try std.testing.expect(client.poisoned);
+                try std.testing.expectError(error.RetainedReadRestartRequired, client.call(request));
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            }
         }
 
         test "retained read client round trips owned snapshots and exact typed pages" {

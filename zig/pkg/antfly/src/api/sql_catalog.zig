@@ -225,7 +225,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const initially_captured = admission orelse blk: {
         const use_path = ddl.name.namespace == null and ddl.name.database == null and path != null;
         const namespaces = if (use_path) path.?.len else 1;
-        if (namespaces == 0) return error.TableNotFound;
+        if (namespaces == 0) return if (ddl.conditional) .{} else error.TableNotFound;
         if (namespaces > SearchPath.max_namespaces) return error.InvalidParameter;
         var candidates: [SearchPath.max_namespaces]domain.RelationTarget = undefined;
         for (0..namespaces) |i| candidates[i] = .{
@@ -239,7 +239,9 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         try snapshot.validateRelations(lookup);
         var selected: usize = 0;
         while (selected < snapshot.relations.len and snapshot.relations[selected] == null) : (selected += 1) {}
-        const owner = if (selected < snapshot.relations.len) snapshot.relations[selected].? else return error.TableNotFound;
+        // An attested absent owner is the linearization point for IF EXISTS.
+        // Never submit a schema mutation or turn a failed lookup into absence.
+        const owner = if (selected < snapshot.relations.len) snapshot.relations[selected].? else return if (ddl.conditional) .{} else error.TableNotFound;
         const resolved_target: domain.Target = .{
             .database = lookup.relations[selected].database,
             .namespace = lookup.relations[selected].namespace,

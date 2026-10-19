@@ -36,6 +36,7 @@ pub const Error = std.mem.Allocator.Error || error{
     InvalidSqlParameter,
     InvalidSqlNumber,
     DuplicateSqlColumn,
+    DuplicateSqlAssignment,
     SqlInvalidUnicodeEscape,
     SqlInvalidTextEncoding,
     SqlInvalidParameterValue,
@@ -127,20 +128,31 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     };
     if (tokens.items.len > limits.max_tokens) return error.SqlLimitExceeded;
     var parser: Parser = .{ .alloc = alloc, .tokens = tokens.items, .source = sql, .limits = limits, .diagnostic = diagnostic };
-    const statement = try parser.statement();
+    const statement = parser.statement() catch |err| {
+        // An unsupported table producer must not hide a definite grammar
+        // error later in its arguments. Keep this bounded, allocation-free
+        // validation off the supported-query hot path. Quoted names and
+        // string contents are never reinterpreted as reserved identifiers.
+        if (err == error.UnsupportedSqlShape) try parser.validateReservedNamedArguments();
+        return err;
+    };
     _ = parser.take(.semicolon);
-    if (parser.pos != tokens.items.len) return parser.fail(switch (statement) {
-        // PostgreSQL row locks belong to a SELECT producer, not to the
-        // mutation itself. Likewise UPDATE/DELETE do not accept ORDER/LIMIT.
-        // Never execute a valid mutation prefix while discarding its suffix.
-        .update, .delete => if (tokens.items[parser.pos].isKeyword(.@"for") or
-            tokens.items[parser.pos].isKeyword(.order) or tokens.items[parser.pos].isKeyword(.limit) or
-            tokens.items[parser.pos].isKeyword(.offset) or tokens.items[parser.pos].isKeyword(.fetch))
-            error.InvalidSqlSyntax
-        else
-            error.UnsupportedSqlShape,
-        else => error.UnsupportedSqlShape,
-    }, "unexpected trailing SQL; only one supported statement is allowed");
+    const tail_statement = if (statement == .explain) statement.explain.statement.* else statement;
+    if (parser.pos != tokens.items.len) {
+        try parser.validateReservedNamedArguments();
+        return parser.fail(switch (tail_statement) {
+            // PostgreSQL row locks belong to a SELECT producer, not to the
+            // mutation itself. Likewise UPDATE/DELETE do not accept ORDER/LIMIT.
+            // Never execute a valid mutation prefix while discarding its suffix.
+            .update, .delete => if (tokens.items[parser.pos].isKeyword(.@"for") or
+                tokens.items[parser.pos].isKeyword(.order) or tokens.items[parser.pos].isKeyword(.limit) or
+                tokens.items[parser.pos].isKeyword(.offset) or tokens.items[parser.pos].isKeyword(.fetch))
+                error.InvalidSqlSyntax
+            else
+                error.UnsupportedSqlShape,
+            else => error.UnsupportedSqlShape,
+        }, "unexpected trailing SQL; only one supported statement is allowed");
+    }
     return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting };
 }
 
@@ -258,7 +270,7 @@ test "SQL MERGE rejects invalid arm/action and insert shapes before execution" {
             var compiled = result;
             compiled.deinit();
             return error.TestUnexpectedResult;
-        } else |err| try std.testing.expect(err == error.InvalidSqlSyntax or err == error.DuplicateSqlColumn or err == error.UnsupportedSqlShape);
+        } else |err| try std.testing.expect(err == error.InvalidSqlSyntax or err == error.DuplicateSqlColumn or err == error.DuplicateSqlAssignment or err == error.UnsupportedSqlShape);
     }
 }
 
@@ -339,6 +351,16 @@ const Parser = struct {
             .message = message,
         };
         return err;
+    }
+
+    fn validateReservedNamedArguments(self: *Parser) Error!void {
+        for (self.tokens, 0..) |current, i| {
+            if (current.owned or current.keyword == null or token.keywordClass(current.keyword.?) != .reserved or i + 2 >= self.tokens.len) continue;
+            if (self.tokens[i + 1].kind == .eq and self.tokens[i + 2].kind == .gt) {
+                self.pos = i;
+                return self.fail(error.InvalidSqlSyntax, "reserved named arguments must be quoted");
+            }
+        }
     }
 
     fn node(self: *Parser) Error!void {
@@ -1656,14 +1678,14 @@ const Parser = struct {
             const tuple = self.take(.lparen);
             try self.node();
             const first = try self.identifier();
-            if ((try seen.getOrPut(self.alloc, first)).found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate conflict assignment");
+            if ((try seen.getOrPut(self.alloc, first)).found_existing) return self.fail(error.DuplicateSqlAssignment, "duplicate conflict assignment");
             const targets: []const []const u8 = if (tuple) columns: {
                 var names: std.ArrayList([]const u8) = .empty;
                 try names.append(self.alloc, first);
                 while (self.take(.comma)) {
                     try self.node();
                     const column = try self.identifier();
-                    if ((try seen.getOrPut(self.alloc, column)).found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate conflict assignment");
+                    if ((try seen.getOrPut(self.alloc, column)).found_existing) return self.fail(error.DuplicateSqlAssignment, "duplicate conflict assignment");
                     try names.append(self.alloc, column);
                 }
                 try self.expect(.rparen);
@@ -1727,7 +1749,7 @@ const Parser = struct {
                     break :blk field_name[separator + 1 ..];
                 } else field_name;
                 const entry = try seen.getOrPut(self.alloc, column);
-                if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate UPDATE assignment");
+                if (entry.found_existing) return self.fail(error.DuplicateSqlAssignment, "duplicate UPDATE assignment");
                 try targets.append(self.alloc, column);
                 if (!tuple or !self.take(.comma)) break;
             }
@@ -1788,7 +1810,7 @@ const Parser = struct {
                         break :blk field_name[separator + 1 ..];
                     } else field_name;
                     const entry = try seen.getOrPut(self.alloc, column);
-                    if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate MERGE assignment");
+                    if (entry.found_existing) return self.fail(error.DuplicateSqlAssignment, "duplicate MERGE assignment");
                     try self.expect(.eq);
                     if (self.keyword(.default)) {
                         try assignments.append(self.alloc, .{ .field = column, .use_default = true });
@@ -1983,6 +2005,8 @@ const Parser = struct {
     fn columnType(self: *Parser) Error!ast.ColumnType {
         if (!self.peek(.identifier)) return self.fail(error.InvalidSqlSyntax, "expected SQL column type");
         const t = self.tokens[self.pos];
+        if (t.keyword) |word| if (token.keywordClass(word) == .reserved)
+            return self.fail(error.InvalidSqlSyntax, "reserved keyword is not a column type");
         self.pos += 1;
         // Quoted type names denote user-defined types, which require catalog
         // lookup; never silently reinterpret them as builtins.
@@ -2279,7 +2303,7 @@ const Parser = struct {
     fn catalogDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
         const kind: @FieldType(ast.CatalogDdl, "kind") = if (self.keyword(.database)) .database else if (self.keyword(.schema)) .namespace else if (self.keyword(.tablespace)) .tablespace else if (self.keyword(.table)) .table else return self.fail(error.UnsupportedSqlShape, "expected a table, database, schema, or tablespace");
         var conditional = false;
-        if (action == .create or action == .drop) {
+        if (action == .create or action == .drop or (action == .rename and kind == .table)) {
             conditional = self.keyword(.@"if");
             if (conditional) {
                 if (action == .create) try self.expectKeyword(.not);
@@ -2377,6 +2401,8 @@ const Parser = struct {
                 ddl.location = location.string;
             }
         } else if (action == .create and self.keyword(.tablespace)) ddl.tablespace = try self.identifier();
+        if (conditional and kind == .table and action == .rename and ddl.action != .alter_schema)
+            return self.fail(error.UnsupportedSqlShape, "conditional catalog ALTER requires atomic missing-owner admission");
         return ddl;
     }
 
@@ -2938,7 +2964,10 @@ const Parser = struct {
         if (self.keyword(.merge)) return .{ .merge = try self.merge() };
         if (self.keyword(.create)) {
             if (self.keyword(.@"or")) {
-                if (!self.ddlWord("REPLACE") or !self.ddlWord("VIEW")) return self.fail(error.UnsupportedSqlShape, "CREATE OR REPLACE requires VIEW");
+                if (!self.ddlWord("REPLACE")) return self.fail(error.InvalidSqlSyntax, "CREATE OR requires REPLACE");
+                if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.table) or self.tokens[self.pos].isKeyword(.materialized)))
+                    return self.fail(error.InvalidSqlSyntax, "PostgreSQL does not permit CREATE OR REPLACE TABLE or MATERIALIZED VIEW");
+                if (!self.ddlWord("VIEW")) return self.fail(error.UnsupportedSqlShape, "this CREATE OR REPLACE object is not supported");
                 return .{ .catalog_ddl = try self.viewDdl(.create, true) };
             }
             if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.create, false) };
@@ -2993,7 +3022,9 @@ const Parser = struct {
         }
         if (self.keyword(.start)) {
             try self.expectKeyword(.transaction);
-            return .{ .begin = try self.transactionOptions() };
+            var options = try self.transactionOptions();
+            options.syntax = .start_transaction;
+            return .{ .begin = options };
         }
         if (self.keyword(.commit)) {
             _ = self.keyword(.transaction) or self.keyword(.work);
@@ -3015,8 +3046,9 @@ const Parser = struct {
         return self.fail(error.UnsupportedSqlShape, "unsupported SQL statement");
     }
 
-    fn transactionOptions(self: *Parser) Error!@import("session.zig").Begin {
-        var options: @import("session.zig").Begin = .{};
+    fn transactionOptions(self: *Parser) Error!ast.Begin {
+        var options: ast.Begin = .{};
+        var deferrable = false;
         var isolation_seen = false;
         var mode_seen = false;
         while (true) {
@@ -3039,12 +3071,34 @@ const Parser = struct {
                     try self.expectKeyword(.write);
                     options.mode = .read_write;
                 }
+            } else if (self.keyword(.deferrable)) {
+                deferrable = true;
+            } else if (self.pos + 1 < self.tokens.len and self.tokens[self.pos].isKeyword(.not) and self.tokens[self.pos + 1].isKeyword(.deferrable)) {
+                self.pos += 2;
+                deferrable = false;
             } else break;
             if (self.take(.comma) and (self.pos >= self.tokens.len or self.tokens[self.pos].kind == .semicolon)) return self.fail(error.InvalidSqlSyntax, "transaction mode required after comma");
         }
+        // PostgreSQL DEFERRABLE has no effect except for SERIALIZABLE READ
+        // ONLY. That stronger safe-snapshot promise needs native admission;
+        // never silently label an ordinary retained snapshot as deferrable.
+        if (deferrable and options.isolation == .serializable and options.mode == .read_only) return self.fail(error.UnsupportedSqlShape, "serializable read-only DEFERRABLE requires safe snapshot admission");
         return options;
     }
 };
+
+test "compiler transaction DEFERRABLE only claims implemented snapshot semantics" {
+    for ([_][]const u8{ "BEGIN READ WRITE DEFERRABLE", "BEGIN DEFERRABLE READ WRITE", "BEGIN NOT DEFERRABLE" }) |sql| {
+        var parsed = try compile(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@import("session.zig").ReadMode.read_write, parsed.statement.begin.mode);
+    }
+    var ignored = try compile(std.testing.allocator, "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY DEFERRABLE", .{});
+    defer ignored.deinit();
+    try std.testing.expectEqual(@import("session.zig").Isolation.read_committed, ignored.statement.begin.isolation);
+    try std.testing.expectEqual(@import("session.zig").ReadMode.read_only, ignored.statement.begin.mode);
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE", .{}));
+}
 
 test "compiler deferred uniqueness and constraint timing are explicit" {
     var declaration = try compile(std.testing.allocator, "ALTER TABLE rows ADD CONSTRAINT u UNIQUE (id) DEFERRABLE INITIALLY DEFERRED", .{});
@@ -3252,8 +3306,8 @@ test "compiler UPDATE row assignments flatten simultaneous typed expressions" {
     try std.testing.expect(defaults.statement.update.assignments[0].use_default);
     try std.testing.expect(!defaults.statement.update.assignments[1].use_default);
     try std.testing.expect(defaults.statement.update.assignments[2].use_default);
-    try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE rows SET (quantity, quantity) = ROW(1, 2)", .{}));
-    try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1, 'x'), status='y'", .{}));
+    try std.testing.expectError(error.DuplicateSqlAssignment, compile(std.testing.allocator, "UPDATE rows SET (quantity, quantity) = ROW(1, 2)", .{}));
+    try std.testing.expectError(error.DuplicateSqlAssignment, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1, 'x'), status='y'", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1)", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1, 'x', 3)", .{}));
     var queried = try compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = (SELECT n, 'copied' FROM source ORDER BY n LIMIT 1)", .{});
@@ -3297,11 +3351,36 @@ test "compiler INSERT defaults retain per-row omission beside scalar sources" {
     try std.testing.expectEqual(@as(usize, 0), all_default.statement.insert.columns.len);
 }
 
+test "compiler conditional schema ALTER preserves atomic absence admission" {
+    var added = try compile(std.testing.allocator, "ALTER TABLE IF EXISTS missing_records ADD COLUMN optional_status text", .{});
+    defer added.deinit();
+    try std.testing.expect(added.statement.catalog_ddl.conditional);
+    try std.testing.expectEqual(.alter_schema, added.statement.catalog_ddl.action);
+    var dropped = try compile(std.testing.allocator, "ALTER TABLE IF EXISTS missing_records DROP COLUMN optional_status", .{});
+    defer dropped.deinit();
+    try std.testing.expect(dropped.statement.catalog_ddl.conditional);
+    try std.testing.expectEqual(.alter_schema, dropped.statement.catalog_ddl.action);
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "ALTER TABLE IF EXISTS missing_records RENAME TO renamed_records", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "ALTER TABLE IF EXISTS missing_records SET TABLESPACE fast", .{}));
+}
+
+test "compiler reserved named argument diagnostics do not reinterpret quoted identifiers or strings" {
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "SELECT unsupported_fn(limit => 1)", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT unsupported_fn(\"limit\" => 1)", .{}));
+    var text = try compile(std.testing.allocator, "SELECT 'limit => 1'", .{});
+    defer text.deinit();
+}
+
 test "compiler transaction modes and quoted savepoints are explicit" {
     var begin = try compile(std.testing.allocator, "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", .{});
     defer begin.deinit();
     try std.testing.expectEqual(@import("session.zig").Isolation.repeatable_read, begin.statement.begin.isolation);
     try std.testing.expectEqual(@import("session.zig").ReadMode.read_only, begin.statement.begin.mode);
+    try std.testing.expectEqualStrings("START TRANSACTION", begin.statement.begin.commandTag());
+    var ordinary = try compile(std.testing.allocator, "BEGIN WORK", .{});
+    defer ordinary.deinit();
+    try std.testing.expectEqualStrings("BEGIN", ordinary.statement.begin.commandTag());
+    try std.testing.expectEqual(@import("session.zig").Isolation.repeatable_read, begin.statement.begin.options().isolation);
     var rollback = try compile(std.testing.allocator, "ROLLBACK TO SAVEPOINT \"Before Update\"", .{});
     defer rollback.deinit();
     try std.testing.expectEqualStrings("Before Update", rollback.statement.rollback_to_savepoint);
@@ -3344,7 +3423,7 @@ test "compiler conflict row assignments preserve defaults simultaneous expressio
     for ([_][]const u8{
         "INSERT INTO users(id) VALUES('a') ON CONFLICT(id) DO UPDATE SET (age,age)=ROW(1,2)",
         "INSERT INTO users(id) VALUES('a') ON CONFLICT(id) DO UPDATE SET (name,age)=ROW('x',2),age=3",
-    }) |sql| try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, sql, .{}));
+    }) |sql| try std.testing.expectError(error.DuplicateSqlAssignment, compile(std.testing.allocator, sql, .{}));
     for ([_][]const u8{
         "INSERT INTO users(id) VALUES('a') ON CONFLICT(id) DO UPDATE SET (name,age)=ROW('x')",
         "INSERT INTO users(id) VALUES('a') ON CONFLICT(id) DO UPDATE SET (name,age)=ROW('x',2,3)",
@@ -3446,7 +3525,7 @@ test "compiler bounds resources and validates parameters and numbers" {
         defer exact.deinit();
         try std.testing.expect(exact.statement.select.columns[0].expression.?.literal == .numeric);
     }
-    try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE t SET x=1,X=2", .{}));
+    try std.testing.expectError(error.DuplicateSqlAssignment, compile(std.testing.allocator, "UPDATE t SET x=1,X=2", .{}));
 }
 
 test "compiler DDL literal defaults and count" {
@@ -3660,7 +3739,7 @@ test "SQL original row-lock clauses on non-locking SQL surfaces reject before ba
 
 test "SQL original duplicate point update target rejects before backend access" {
     // sql-0576
-    try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE usage_records SET status = 'active', status = lower(status) WHERE id = 'u1'", .{}));
+    try std.testing.expectError(error.DuplicateSqlAssignment, compile(std.testing.allocator, "UPDATE usage_records SET status = 'active', status = lower(status) WHERE id = 'u1'", .{}));
 }
 
 test "SQL original absent named conflict target rejects before row evaluation" {
@@ -3974,4 +4053,60 @@ test "compiler leaves anonymous constraint identities for native admission" {
     var table_key = try compile(std.testing.allocator, "CREATE TABLE foo(id TEXT, PRIMARY KEY(id))", .{});
     defer table_key.deinit();
     try std.testing.expect(!table_key.statement.create_table.columns[0].nullable);
+}
+
+test "SQL original PostgreSQL invalid grammar retains syntax diagnostics" {
+    const ids = [_][]const u8{
+        "sql-0021",
+        "sql-0022",
+        "sql-0023",
+        "sql-0024",
+        "sql-0025",
+        "sql-0026",
+        "sql-0027",
+        "sql-0028",
+        "sql-0029",
+        "sql-0030",
+        "sql-0031",
+        "sql-0032",
+        "sql-0033",
+        "sql-0067",
+        "sql-0354",
+        "sql-0355",
+        "sql-0682",
+        "sql-0684",
+        "sql-0686",
+        "sql-0687",
+        "sql-0688",
+        "sql-0689",
+        "sql-0690",
+        "sql-0691",
+        "sql-0693",
+        "sql-0694",
+        "sql-0698",
+        "sql-0846",
+        "sql-0847",
+        "sql-0848",
+        "sql-0849",
+        "sql-0850",
+        "sql-0851",
+        "sql-0852",
+    };
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    var failures: usize = 0;
+    for (ids) |id| {
+        const original = try corpus.get(id);
+        if (compile(a, original.sql, .{})) |value| {
+            var owned = value;
+            owned.deinit();
+            std.debug.print("PG grammar {s}: unexpectedly compiled\n", .{id});
+            failures += 1;
+        } else |err| if (err != error.InvalidSqlSyntax) {
+            std.debug.print("PG grammar {s}: expected InvalidSqlSyntax got {s}\n", .{ id, @errorName(err) });
+            failures += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
 }

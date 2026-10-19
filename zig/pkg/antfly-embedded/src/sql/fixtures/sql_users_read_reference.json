@@ -1,0 +1,100 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "keyword"
+              },
+              "email": {
+                "type": "keyword"
+              },
+              "tenant_id": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "0",
+        "value": {
+          "id": "user-0",
+          "email": "ADA@EXAMPLE.TEST",
+          "tenant_id": "tenant-0",
+          "status": "active"
+        }
+      },
+      {
+        "key": "1",
+        "value": {
+          "id": "user-1",
+          "email": "ada@example.test",
+          "tenant_id": "tenant-1",
+          "status": "active"
+        }
+      },
+      {
+        "key": "2",
+        "value": {
+          "id": "user-2",
+          "email": "Ada@Example.Test",
+          "tenant_id": "tenant-2",
+          "status": "active"
+        }
+      },
+      {
+        "key": "3",
+        "value": {
+          "id": "user-3",
+          "email": "other@example.test",
+          "tenant_id": "tenant-3",
+          "status": "active"
+        }
+      }
+    ]
+  },
+  "entries": [
+    {
+      "id": "sql-0171",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "user-2"
+        ],
+        [
+          "user-1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    }
+  ],
+  "excluded": []
+}

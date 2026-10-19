@@ -284,6 +284,11 @@ pub fn allowsDuplicateKeys(clause: ast.Conflict) bool {
     return clause.assignments.len == 0 and (primary(clause) or (clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0));
 }
 
+pub fn duplicateRowError(clause: ?ast.Conflict) error{ DuplicateSqlRow, SqlConflictCardinalityViolation } {
+    if (clause) |value| if (value.assignments.len != 0) return error.SqlConflictCardinalityViolation;
+    return error.DuplicateSqlRow;
+}
+
 /// A retained point snapshot plus an atomic version predicate is optimistic
 /// concurrency control, not a read-then-overwrite. A racing insert/update is a
 /// definite serialization conflict, never an automatically replayed mutation.
@@ -324,7 +329,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         }
         const identity = if (owner) |item| item.identity orelse mutation.key else mutation.key;
         if ((try seen.getOrPut(context.arena, identity)).found_existing) {
-            if (clause.assignments.len != 0) return error.DuplicateSqlRow;
+            if (clause.assignments.len != 0) return duplicateRowError(clause);
             continue;
         }
         if (owner) |item| {

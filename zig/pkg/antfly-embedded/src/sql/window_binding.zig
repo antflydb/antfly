@@ -319,7 +319,9 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         if (call.window.?.frame) |frame| if (frame.mode == .groups and call.window.?.order.len == 0) return error.InvalidSqlSyntax;
         if (call.window.?.frame) |frame| if (frame.mode == .range and (frame.start == .preceding or frame.start == .following or frame.end == .preceding or frame.end == .following)) {
             const sort = builder.sorts.items[pending.sort];
-            if (sort.order.len != 1) return error.UnsupportedSqlShape;
+            // Validate after named-window expansion. This is an invalid
+            // window definition, not a missing execution capability.
+            if (sort.order.len != 1) return error.SqlWindowingError;
             const order_type = input.columns[sort.order[0]].type;
             if (order_type != .integer and order_type != .number) return error.SqlTypeMismatch;
         };

@@ -272,7 +272,7 @@ test "SQL secondary arbiter retains native owner identity and opaque atomic guar
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
         if (std.mem.startsWith(u8, action, "DO UPDATE")) {
-            try std.testing.expectError(error.DuplicateSqlRow, runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+            try std.testing.expectError(error.SqlConflictCardinalityViolation, runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
             try std.testing.expectEqual(@as(usize, 0), fixture.commits);
         } else {
             var result = try runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{});

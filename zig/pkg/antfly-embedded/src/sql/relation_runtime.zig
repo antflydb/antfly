@@ -695,7 +695,8 @@ test "SQL set admission rejects incompatible shapes and enforces the shared memo
     }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        const expected = if (std.mem.eql(u8, sql, "SELECT 1 UNION SELECT 1, 2")) error.SqlSetColumnCountMismatch else error.SqlSetTypeMismatch;
+        try std.testing.expectError(expected, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
     }
     for ([_][]const u8{
         "SELECT ARRAY[1]::int4[] UNION SELECT ARRAY[TRUE]::boolean[]",

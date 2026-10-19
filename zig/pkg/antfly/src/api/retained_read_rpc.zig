@@ -25,6 +25,28 @@ const reads = @import("antfly_local_sources").api_table_read_source;
 const time = @import("antfly_platform").time;
 
 pub const max_request_bytes = 4 << 20;
+
+/// SQL validation keeps its public diagnostic; operational failures retain
+/// the shared runtime class instead of becoming an unknown SQL/internal error.
+pub fn normalizationFailureHttpStatus(err: anyerror) u16 {
+    const diagnostic = @import("antfly_local_sources").sql_errors.describe(err);
+    if (!std.mem.eql(u8, diagnostic.code, "XX000")) return diagnostic.httpStatus();
+    const errors = @import("antfly_runtime_abi").error_abi;
+    const code = std.enums.fromInt(errors.Code, errors.statusFromError(err).code) orelse return 500;
+    return switch (code) {
+        .invalid_argument => 400,
+        .not_found => 404,
+        .already_exists, .conflict => 409,
+        .unauthorized => 401,
+        .forbidden => 403,
+        .unavailable, .retryable => 503,
+        .timeout => 504,
+        .cancelled => 408,
+        .unsupported => 501,
+        .ok, .out_of_memory, .corrupt, .internal => 500,
+    };
+}
+
 test "retained read admission is independent of RLS primary lookup and fails closed without a barrier" {
     const Fake = struct {
         admissions: usize = 0,

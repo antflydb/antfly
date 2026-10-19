@@ -64976,6 +64976,48 @@ test "db default primary backend survives reopen" {
     }
 }
 
+test "relational rows snapshot native pages preserve logical slots across historical layouts" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("relational-native-mixed-layout");
+    defer directory.cleanup();
+    var database = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } });
+    defer database.close();
+    try database.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"text"},"z":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try database.batch(.{ .writes = &.{.{ .key = "a-old", .value = "{\"id\":\"old\",\"z\":1}" }} });
+    try database.setSchemaJson(alloc,
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"text"},"id":{"type":"text"},"z":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try database.batch(.{ .writes = &.{.{ .key = "b-new", .value = "{\"a\":\"present\",\"id\":\"new\",\"z\":2}" }} });
+    var reader = try database.beginRelationalRows(alloc, .{ .fields = &.{ "z", "a", "id" }, .expected_schema_version = 2 });
+    var reader_live = true;
+    defer if (reader_live) reader.deinit();
+    var page = try reader.nextTypedPage(alloc, null, .{ .native_cells = true, .rows = 10, .time_ns = std.time.ns_per_s });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+    try std.testing.expectEqual(@as(u32, 1), page.rows[0].schema_version);
+    try std.testing.expectEqual(@as(u32, 2), page.rows[1].schema_version);
+    // Retire every reader/source binding before consuming the owned page.
+    reader.deinit();
+    reader_live = false;
+    const old = page.rows[0].typed_cells.?;
+    const new = page.rows[1].typed_cells.?;
+    try std.testing.expect(old.layout == new.layout);
+    try std.testing.expectEqual(@as(usize, 3), old.layout.names.len);
+    for ([_][]const u8{ "z", "a", "id" }, old.layout.names) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expectEqual(@as(usize, 3), old.values.len);
+    try std.testing.expectEqual(@as(usize, 3), new.values.len);
+    try std.testing.expectEqual(@as(i64, 1), old.values[0].value.integer);
+    try std.testing.expect(!old.presence.?[1]);
+    try std.testing.expect(old.values[1].sql_null);
+    try std.testing.expectEqualStrings("old", old.values[2].value.string);
+    try std.testing.expectEqual(@as(i64, 2), new.values[0].value.integer);
+    try std.testing.expect(new.presence.?[1]);
+    try std.testing.expectEqualStrings("present", new.values[1].value.string);
+    try std.testing.expectEqualStrings("new", new.values[2].value.string);
+}
+
 test "relational runtime-only and mixed schema epochs survive portable restore" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |upgrade| {

@@ -2687,6 +2687,20 @@ const Binder = struct {
                     }
                     break :blk .{ .kind = if (function == .jsonb_extract_path) .json else .string, .element_type = if (function == .jsonb_extract_path) .jsonb else .text, .nullable = true };
                 }
+                if (function == .date_part or function == .date_trunc) {
+                    // Resolve signatures from declared types before capturing
+                    // rows. Only unknown string literals may acquire a temporal
+                    // type; a BIGINT or typed TEXT is not a timestamp overload.
+                    var nullable = false;
+                    for (call.args, 0..) |arg, index| {
+                        const actual = try self.infer(arg, depth + 1);
+                        const expected: ast.ColumnType = if (index == 0) .string else .datetime;
+                        const unknown = arg.* == .literal and arg.literal == .string;
+                        if (actual.kind != null and actual.kind != expected and !unknown) return error.SqlUndefinedFunction;
+                        nullable = nullable or actual.nullable;
+                    }
+                    break :blk .{ .kind = if (function == .date_part) .number else .datetime, .element_type = if (function == .date_part) .float64 else null, .nullable = nullable };
+                }
                 if (function == .starts_with or function == .md5) {
                     var nullable = false;
                     for (call.args) |arg| {
@@ -2783,7 +2797,10 @@ const Binder = struct {
                         const desired: ast.ColumnType = if (function == .@"$array_quantified") (if (i == 0) arrayScalarType(input.element_type.?) else if (i == 2) .integer else .boolean) else .integer;
                         if (actual.kind != null and actual.kind != desired and !(numeric(actual.kind) and numeric(desired))) return error.SqlTypeMismatch;
                     }
-                    break :blk .{ .kind = if (function == .@"$array_quantified") .boolean else .integer, .nullable = true };
+                    // PostgreSQL array dimensions, bounds and cardinality are
+                    // int4. Retain that width so SUM(array_length(...)) widens
+                    // to int8, rather than accidentally choosing NUMERIC.
+                    break :blk .{ .kind = if (function == .@"$array_quantified") .boolean else .integer, .element_type = if (function == .@"$array_quantified") .boolean else .int32, .nullable = true };
                 }
                 if (function == .jsonb_exists_any or function == .jsonb_exists_all) {
                     var nullable = false;
@@ -2883,6 +2900,12 @@ const Binder = struct {
                         else => .text,
                     }, .nullable = nullable };
                 }
+                if (function == .mod) for (call.args) |arg| {
+                    const actual = try self.infer(arg, depth + 1);
+                    // mod has integer/NUMERIC overloads, never float4/float8.
+                    // Do not silently substitute fmod for PostgreSQL binding.
+                    if (actual.kind == .number and actual.element_type != .numeric) return error.SqlUndefinedFunction;
+                };
                 if (function == .nullif) try arrayOperator(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1));
                 switch (function) {
                     .@"$single" => merged = try self.infer(call.args[0], depth + 1),
@@ -7780,4 +7803,39 @@ test "SQL quantified JSONB compatibility inputs are logical while text casts sti
     defer arena.deinit();
     try std.testing.expect((try program.evaluate(arena.allocator(), &.{ .json(.{ .string = "\"alpha\"" }), .typedArray(&source) }, &.{}, .{})).value.bool);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, program.evaluate(arena.allocator(), &.{ .json(.{ .string = "alpha" }), .typedArray(&source) }, &.{}, .{}));
+}
+
+test "SQL builtin signatures reject temporal and floating MOD mismatches before evaluation" {
+    const a = std.testing.allocator;
+    const columns = [_]Column{
+        .{ .name = "i", .type = .integer, .element_type = .int64 },
+        .{ .name = "f", .type = .number, .element_type = .float64 },
+        .{ .name = "r", .type = .number, .element_type = .float32 },
+        .{ .name = "t", .type = .string, .element_type = .text },
+    };
+    for ([_][]const u8{
+        "date_trunc('hour',i)", "date_part('epoch',i)",
+        "date_trunc('day',t)",  "date_part(42,'2026-01-01'::datetime)",
+        "mod(f,f)",             "mod(r,r)",
+        "mod(i,f)",
+    }) |sql| {
+        var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlUndefinedFunction, inferOutput(a, parsed.expression, &columns, &.{}));
+    }
+    for ([_][]const u8{ "mod(i,i)", "mod(1.25,0.5)", "date_part('year','2026-01-01'::datetime)", "date_trunc('day','2026-01-01'::datetime)" }) |sql| {
+        var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        _ = try inferOutput(a, parsed.expression, &columns, &.{});
+    }
+}
+
+test "SQL array navigation retains PostgreSQL int4 result identity" {
+    for ([_][]const u8{ "cardinality(ARRAY[1,2])", "array_ndims(ARRAY[1,2])", "array_length(ARRAY[1,2],1)", "array_lower(ARRAY[1,2],1)", "array_upper(ARRAY[1,2],1)" }) |sql| {
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        const actual = try inferOutput(std.testing.allocator, parsed.expression, &.{}, &.{});
+        try std.testing.expectEqual(@as(?ast.ColumnType, .integer), actual.kind);
+        try std.testing.expectEqual(@as(?arrays.ElementType, .int32), actual.element_type);
+    }
 }

@@ -378,6 +378,10 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
                 const constraints = try list(schema, alloc, key);
                 if (named(constraints.items, constraint_name, "name")) |position| {
                     if (std.mem.eql(u8, key, "unique_constraints") and indexOwned(constraints.items[position])) return error.SqlConstraintNotFound;
+                    // PostgreSQL VALIDATE applies only to CHECK and FK rules.
+                    // UNIQUE/PRIMARY ownership is enforced at activation; a
+                    // validation request must not silently publish a new epoch.
+                    if (change == .validate_constraint and std.mem.eql(u8, key, "unique_constraints")) return error.SqlWrongObjectType;
                     if (change == .drop_constraint) {
                         _ = constraints.orderedRemove(position);
                     }
@@ -628,4 +632,21 @@ test "primary key schema lowering rejects deferred timing and empty keys" {
     empty.schema_change = .{ .add_unique = .{ .name = "items_pk", .columns = &.{}, .primary = true } };
     try std.testing.expectError(error.InvalidSqlSyntax, apply(alloc, &schema, empty));
     try std.testing.expect(schema.object.get("unique_constraints") == null);
+}
+
+test "SQL VALIDATE UNIQUE rejects the wrong constraint kind without publishing a candidate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema = try value(a, .{
+        .storage_mode = "relational",
+        .default_type = "row",
+        .document_schemas = .{ .row = .{ .schema = .{ .type = "object", .properties = .{ .id = .{ .type = "integer" } }, .additionalProperties = false } } },
+        .unique_constraints = .{.{ .name = "id_key", .columns = .{"id"} }},
+    });
+    const before = try std.json.Stringify.valueAlloc(a, schema, .{});
+    var compiled = try @import("compiler.zig").compile(a, "ALTER TABLE items VALIDATE CONSTRAINT id_key", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlWrongObjectType, apply(a, &schema, compiled.statement.catalog_ddl));
+    try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
 }

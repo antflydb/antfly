@@ -857,6 +857,8 @@ pub const Detail = enum(c_int) {
     invalid_relational_index_budget,
     private_index_claim_backlog_full,
     partial_index_predicate_not_implied,
+    // Append only: existing detail integers are a released runtime contract.
+    relational_check_violation,
 };
 
 test "partial index proof rejection preserves exact callback error identity" {
@@ -1218,6 +1220,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.ForeignKeyParentMissing => status(.conflict, .foreign_key_parent_missing),
         error.ForeignKeyReferenced => status(.conflict, .foreign_key_referenced),
         error.UniqueConstraintViolation => status(.conflict, .unique_constraint_violation),
+        error.RelationalCheckViolation => status(.invalid_argument, .relational_check_violation),
         error.UnsupportedNativeIndexOwner => status(.unsupported, .unsupported_native_index_owner),
         error.InvalidPrivateIndexClaimInventory => status(.invalid_argument, .invalid_private_index_claim_inventory),
         error.InvalidPrivateIndexClaimReceipt => status(.corrupt, .invalid_private_index_claim_receipt),
@@ -1737,6 +1740,7 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .relational_check_violation => "RelationalCheckViolation",
         .model_chunk_audio_too_large => "AudioTooLarge",
         .model_chunk_chunk_output_too_large => "ChunkOutputTooLarge",
         .model_chunk_chunk_request_failed => "ChunkRequestFailed",
@@ -2848,6 +2852,33 @@ test "inference worker setup and transport failures retain distinct boundary sem
     for ([_]anyerror{ error.InferenceWorkerExecutableNotConfigured, error.InferenceWorkerUnavailable }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.InferenceProviderFailure)));
     }
+}
+
+/// Exact lookup for authenticated textual compatibility transports. Never
+/// construct compilation-local errors from untrusted or arbitrary names.
+pub fn errorFromStableName(name: []const u8) ?anyerror {
+    const lookup = comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        const details = std.meta.tags(Detail);
+        var entries: [details.len]struct { []const u8, anyerror } = undefined;
+        for (details, 0..) |detail, index| {
+            const spelling = detailErrorName(detail);
+            entries[index] = .{ spelling, @field(anyerror, spelling) };
+        }
+        break :blk std.StaticStringMap(anyerror).initComptime(entries);
+    };
+    const err = lookup.get(name) orelse return null;
+    return if (errorHasStableDetail(err)) err else null;
+}
+
+test "native normalization failures retain exact stable identities without accepting arbitrary names" {
+    for ([_]anyerror{ error.RelationalCheckViolation, error.InvalidBatchRequest, error.UniqueConstraintViolation, error.OutOfMemory, error.DeadlineExceeded }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+        try std.testing.expectEqual(err, errorFromStableName(@errorName(err)).?);
+    }
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.RelationalCheckViolation).code);
+    try std.testing.expectEqual(@backingInt(Detail.partial_index_predicate_not_implied) + 1, @backingInt(Detail.relational_check_violation));
+    for ([_][]const u8{ "RelationalCheckViolation\n", "relationalcheckviolation", "PrivateProviderSecret", "RuntimeBoundaryFailure" }) |name| try std.testing.expect(errorFromStableName(name) == null);
 }
 
 test "merged runtime error details preserve main wire identifiers" {

@@ -2,6 +2,205 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-schema-lifecycle-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-schema-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-schema-lifecycle-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_schema_lifecycle_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_schema_lifecycle_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-original-session-control-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-session-control-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-session-control-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_session_control_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_session_control_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-original-binding-rejections-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "public-api-parity-test",
+        "-Dtest-filter=httpx SQL PostgreSQL original binding rejections",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-binding-rejections-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_binding_rejection_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_binding_rejection_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-original-users-read-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "public-api-parity-test",
+        "-Dtest-filter=httpx SQL PostgreSQL original users alias read",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-users-read-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_users_read_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_users_read_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-original-indexed-mutation-lifecycle-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-indexed-mutation-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-indexed-mutation-lifecycle-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_indexed_mutation_lifecycle_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_indexed_mutation_lifecycle_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-original-extended-reads-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "public-api-parity-test",
+        "-Doptimize=Debug",
+        "-j1",
+        "-Dtest-filter=httpx SQL PostgreSQL original extended reads"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-extended-reads-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_extended_read_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_extended_read_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-original-document-numeric-rejections-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "public-api-parity-test",
+        "-Doptimize=Debug",
+        "-j1",
+        "-Dtest-filter=httpx SQL original floating document MOD"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-document-numeric-rejections-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_document_numeric_rejection_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_numeric_rejection_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-original-mutation-rejections-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL PostgreSQL original mutation rejections"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-mutation-rejections-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","scripts/generate_sql_mutation_rejection_reference.py","--check","zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_rejection_reference.json"],"cwd":".","timeout_seconds":180},
+    "sql-original-grammar-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL original PostgreSQL invalid grammar rejects"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-grammar-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","scripts/check_sql_grammar_rejection_reference.py"],"cwd":".","timeout_seconds":180},
+    "sql-original-document-array-view-native-debug": {"command":["zig","build","antfly-api-sql-document-array-view-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-document-array-view-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","scripts/generate_sql_document_read_reference.py","--check","zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_read_reference.json"],"cwd":".","timeout_seconds":180},
     "sql-document-expansion-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL document expression mutations","-Dtest-filter=httpx SQL original PostgreSQL mutation syntax errors","-Dtest-filter=httpx SQL document campaign verifies exact native mutation"],"cwd":"zig","timeout_seconds":1800},
     "sql-document-expansion-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","scripts/generate_sql_postgres_reference.py","document_projection","--check","zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_projection_reference.json"],"cwd":".","timeout_seconds":180},
     "sql-original-mutation-syntax-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","scripts/check_sql_mutation_syntax_reference.py"],"cwd":".","timeout_seconds":180},
@@ -653,68 +852,224 @@
     },
     {
       "id": "sql-0021",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0022",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0023",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0024",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0025",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0026",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0027",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0028",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0029",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0030",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0031",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0032",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0033",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0034",
@@ -939,8 +1294,20 @@
     },
     {
       "id": "sql-0067",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0068",
@@ -1038,13 +1405,37 @@
     },
     {
       "id": "sql-0085",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0086",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0087",
@@ -1053,8 +1444,20 @@
     },
     {
       "id": "sql-0088",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0089",
@@ -1073,18 +1476,54 @@
     },
     {
       "id": "sql-0092",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0093",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0094",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0095",
@@ -1563,8 +2002,20 @@
     },
     {
       "id": "sql-0171",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original alias-qualified users query and parameter execute over an explicit native LSM table. PostgreSQL verifies matching and excluded email cases, complete column identity, ordering and a nonempty LIMIT frontier; no generated-column or index authority is inferred.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original users alias read preserves the bounded matching frontier",
+          "gate": "sql-original-users-read-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original users alias read preserves the bounded matching frontier",
+          "gate": "sql-original-users-read-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0172",
@@ -1977,13 +2428,37 @@
     },
     {
       "id": "sql-0203",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0204",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0205",
@@ -2089,8 +2564,20 @@
     },
     {
       "id": "sql-0215",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: Exact source SQL and parameters reject before any native row capture or scan. PostgreSQL independently verifies regex/temporal signature errors (42883), set-column incompatibility (42804), offset RANGE ordering (42P20) and duplicate assignments (42601). These are standard diagnostics, not generic unsupported-shape fallbacks.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0216",
@@ -2969,18 +3456,54 @@
     },
     {
       "id": "sql-0261",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: Exact source SQL and parameters reject before any native row capture or scan. PostgreSQL independently verifies regex/temporal signature errors (42883), set-column incompatibility (42804), offset RANGE ordering (42P20) and duplicate assignments (42601). These are standard diagnostics, not generic unsupported-shape fallbacks.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0262",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: Exact source SQL and parameters reject before any native row capture or scan. PostgreSQL independently verifies regex/temporal signature errors (42883), set-column incompatibility (42804), offset RANGE ordering (42P20) and duplicate assignments (42601). These are standard diagnostics, not generic unsupported-shape fallbacks.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0263",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: Exact source SQL and parameters reject before any native row capture or scan. PostgreSQL independently verifies regex/temporal signature errors (42883), set-column incompatibility (42804), offset RANGE ordering (42P20) and duplicate assignments (42601). These are standard diagnostics, not generic unsupported-shape fallbacks.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0264",
@@ -3788,13 +4311,37 @@
     },
     {
       "id": "sql-0354",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0355",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0356",
@@ -6222,8 +6769,20 @@
     },
     {
       "id": "sql-0552",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "Exact source SQL and parameters reject before any native row capture or scan. PostgreSQL independently verifies regex/temporal signature errors (42883), set-column incompatibility (42804), offset RANGE ordering (42P20) and duplicate assignments (42601). These are standard diagnostics, not generic unsupported-shape fallbacks.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0553",
@@ -7814,13 +8373,37 @@
     },
     {
       "id": "sql-0677",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0678",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0679",
@@ -7829,18 +8412,54 @@
     },
     {
       "id": "sql-0680",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0681",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0682",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0683",
@@ -7849,8 +8468,20 @@
     },
     {
       "id": "sql-0684",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0685",
@@ -7859,33 +8490,105 @@
     },
     {
       "id": "sql-0686",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0687",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0688",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0689",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0690",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0691",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0692",
@@ -7899,13 +8602,37 @@
     },
     {
       "id": "sql-0693",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0694",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0695",
@@ -7928,8 +8655,20 @@
     },
     {
       "id": "sql-0698",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0699",
@@ -8178,28 +8917,88 @@
     },
     {
       "id": "sql-0727",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0728",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0729",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0730",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0731",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0732",
@@ -8208,8 +9007,20 @@
     },
     {
       "id": "sql-0733",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL VALIDATE CONSTRAINT rejects a UNIQUE constraint as the wrong object kind with 42809; it is not a CHECK/FK validation command or an index-build acknowledgement. The exact original SQL returns that diagnostic through mounted native SQL while complete postimages and existing UNIQUE enforcement remain intact, including absent-key rejection probes and cold owner recovery.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0734",
@@ -8233,8 +9044,20 @@
     },
     {
       "id": "sql-0738",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0739",
@@ -8243,8 +9066,20 @@
     },
     {
       "id": "sql-0740",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0741",
@@ -8383,38 +9218,122 @@
     },
     {
       "id": "sql-0764",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0765",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0766",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0767",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0768",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0769",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0770",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction control executes on a real connection-backed native durable session store. Exact control command tags and complete inside/outside postimages match independent PostgreSQL sessions after every write/control, covering savepoint rollback/release and commit/abort. Committed rows survive cold data-owner recovery. This does not claim live session failover or stronger isolation on a metadata-only gateway without range guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
+          "gate": "sql-original-session-control-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0771",
@@ -8476,8 +9395,20 @@
     },
     {
       "id": "sql-0779",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original schema DDL executes through public SQL with native schema CAS or atomic staged generation publication as required. Complete typed postimages, future PK/UNIQUE/CHECK/default/generated/nullability/column-visibility probes and independently reopened final owners match PostgreSQL. Pending declarations are observed through their original receipt and public enforced constraint status, never replayed or treated as ready from schema version alone. Conditional missing-table ALTER proves attested absence without creating an owner.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0780",
@@ -8845,63 +9776,207 @@
     },
     {
       "id": "sql-0824",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0825",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0826",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0827",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0828",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0829",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0830",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0831",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0832",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0833",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0834",
-      "status": "unresolved",
-      "reason": "The native UNNEST grammar now admits this exact source, so its former compile-rejection proof no longer holds. The original indexed document/mapped-view execution contract and any PostgreSQL supersession remain unqualified; grammar admission receives no parity credit."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0835",
-      "status": "unresolved",
-      "reason": "The native UNNEST grammar now admits this exact source, so its former compile-rejection proof no longer holds. The original indexed document/mapped-view execution contract and any PostgreSQL supersession remain unqualified; grammar admission receives no parity credit."
+      "status": "superseded",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0836",
@@ -9006,38 +10081,122 @@
     },
     {
       "id": "sql-0846",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0847",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0848",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0849",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0850",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0851",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0852",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is invalid PostgreSQL grammar, independently verified with Parse only (42601). The native public SQL handler returns 42601 before any catalog or storage access. This qualifies rejection of this original form, not implementation of its broader search, graph, or DDL feature intent.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0853",
@@ -10337,23 +11496,71 @@
     },
     {
       "id": "sql-0970",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: The original document schema declares floating numeric columns, not SQL NUMERIC. PostgreSQL has no mod(float8,float8) overload: binding rejects the exact statement with 42883 before mutation. Native qualification verifies every original primary version, digest and full document postimage is unchanged; no empty-result waiver or inferred index proof is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL original floating document MOD rejects signatures without changing primary bytes",
+          "gate": "sql-original-document-numeric-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL original floating document MOD rejects signatures without changing primary bytes",
+          "gate": "sql-original-document-numeric-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0971",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original document schema declares floating numeric columns, not SQL NUMERIC. PostgreSQL has no mod(float8,float8) overload: binding rejects the exact statement with 42883 before mutation. Native qualification verifies every original primary version, digest and full document postimage is unchanged; no empty-result waiver or inferred index proof is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL original floating document MOD rejects signatures without changing primary bytes",
+          "gate": "sql-original-document-numeric-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL original floating document MOD rejects signatures without changing primary bytes",
+          "gate": "sql-original-document-numeric-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0972",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original document schema declares floating numeric columns, not SQL NUMERIC. PostgreSQL has no mod(float8,float8) overload: binding rejects the exact statement with 42883 before mutation. Native qualification verifies every original primary version, digest and full document postimage is unchanged; no empty-result waiver or inferred index proof is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL original floating document MOD rejects signatures without changing primary bytes",
+          "gate": "sql-original-document-numeric-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL original floating document MOD rejects signatures without changing primary bytes",
+          "gate": "sql-original-document-numeric-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0973",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original document schema declares floating numeric columns, not SQL NUMERIC. PostgreSQL has no mod(float8,float8) overload: binding rejects the exact statement with 42883 before mutation. Native qualification verifies every original primary version, digest and full document postimage is unchanged; no empty-result waiver or inferred index proof is used.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL original floating document MOD rejects signatures without changing primary bytes",
+          "gate": "sql-original-document-numeric-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL original floating document MOD rejects signatures without changing primary bytes",
+          "gate": "sql-original-document-numeric-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0974",
@@ -14141,8 +15348,20 @@
     },
     {
       "id": "sql-1224",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1225",
@@ -14184,8 +15403,20 @@
     },
     {
       "id": "sql-1229",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1230",
@@ -14681,8 +15912,20 @@
     },
     {
       "id": "sql-1266",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1267",
@@ -14955,8 +16198,20 @@
     },
     {
       "id": "sql-1302",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1303",
@@ -15906,8 +17161,20 @@
     },
     {
       "id": "sql-1370",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: Exact source SQL and parameters reject before any native row capture or scan. PostgreSQL independently verifies regex/temporal signature errors (42883), set-column incompatibility (42804), offset RANGE ordering (42P20) and duplicate assignments (42601). These are standard diagnostics, not generic unsupported-shape fallbacks.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1371",
@@ -16019,23 +17286,71 @@
     },
     {
       "id": "sql-1378",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1379",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1380",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1381",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters match PostgreSQL over declared typed-array, metric and scope columns. Qualification includes result OIDs, SQL NULLs, full eligible ordered peer frontiers and nonempty OFFSET witnesses. Array navigation retains int4 identity so grouped SUM widens to int8 rather than NUMERIC.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows",
+          "gate": "sql-original-extended-reads-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1382",
@@ -16232,13 +17547,37 @@
     },
     {
       "id": "sql-1396",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1397",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1398",
@@ -16275,8 +17614,20 @@
     },
     {
       "id": "sql-1401",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1402",
@@ -16296,13 +17647,37 @@
     },
     {
       "id": "sql-1404",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1405",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1406",
@@ -16328,8 +17703,20 @@
     },
     {
       "id": "sql-1408",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The unchanged original ON CONFLICT statement returns PostgreSQL 42P10 after a real public nonunique email index is declared. That index cannot arbitrate uniqueness. Complete postimages remain unchanged by rejection; an ordinary duplicate-email INSERT is accepted, and the exact rejection plus final owner/postimage survive cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1409",
@@ -16358,7 +17745,19 @@
     {
       "id": "sql-1412",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Partial evidence only: exact original SQL rejects with PostgreSQL 23514 through native callback and authenticated remote normalization, with complete unchanged postimages and cold enforcement under an already-validated CHECK. The original unvalidated-constraint precondition and historical-invalid-row transition have not been qualified; this case remains unresolved and earns no closure credit.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
+          "gate": "sql-original-schema-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1413",
@@ -16467,18 +17866,54 @@
     },
     {
       "id": "sql-1433",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1434",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1435",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: PostgreSQL rejects the legacy boolean regexp_like flags argument with 42883. The exact source runs against activated logical owners and leaves every primary version, digest and complete three-table postimage unchanged.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1436",
@@ -16521,8 +17956,20 @@
     },
     {
       "id": "sql-1441",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1442",
@@ -16570,8 +18017,20 @@
     },
     {
       "id": "sql-1446",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1447",
@@ -16580,23 +18039,71 @@
     },
     {
       "id": "sql-1448",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1449",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1450",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1451",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1452",
@@ -16708,8 +18215,20 @@
     },
     {
       "id": "sql-1466",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1467",
@@ -16750,8 +18269,20 @@
     },
     {
       "id": "sql-1472",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: PostgreSQL rejects the legacy boolean regexp_like flags argument with 42883. The exact source runs against activated logical owners and leaves every primary version, digest and complete three-table postimage unchanged.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1473",
@@ -16897,13 +18428,37 @@
     },
     {
       "id": "sql-1485",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1486",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "The unchanged original is a PostgreSQL semantic rejection under explicitly declared, native-activated primary and UNIQUE(email) owners. The public handler matches the independent PostgreSQL SQLSTATE, complete postimages of all three tables, every primary version and physical digest. Duplicate ON CONFLICT DO UPDATE uses cardinality violation 21000 rather than uniqueness violation 23505; no proposed writes escape on any rejection.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner",
+          "gate": "sql-original-mutation-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1487",
@@ -17047,8 +18602,20 @@
     },
     {
       "id": "sql-1501",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: Exact source SQL and parameters reject before any native row capture or scan. PostgreSQL independently verifies regex/temporal signature errors (42883), set-column incompatibility (42804), offset RANGE ordering (42P20) and duplicate assignments (42601). These are standard diagnostics, not generic unsupported-shape fallbacks.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access",
+          "gate": "sql-original-binding-rejections-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1502",
@@ -17107,31 +18674,71 @@
     },
     {
       "id": "sql-1509",
-      "status": "unresolved",
-      "reason": "Exact DML and parameters match PostgreSQL under an activated UNIQUE(email) index. Native evidence requires a digest-bearing equality index span, complete postimages and bounded schema-only normalization; no table capture is permitted. Original setup incorrectly validates an index as a constraint. Public catalog activation and the corrected complete setup remain unproven, so this is partial evidence only.",
+      "status": "implemented",
+      "reason": "Exact original DML and parameters match PostgreSQL after real public CREATE UNIQUE INDEX and UUID-primary table activation. Full and partial indexes include matching/ineligible witnesses, complete RETURNING and postimages, retained/released uniqueness on future writes, absent-key rejection probes and cold owner recovery. The former invalid VALIDATE-index-as-constraint setup is replaced by attested index publication, not bypassed activation.",
       "evidence": [
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-native-unique-selectors"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-postgres"
+        }
       ]
     },
     {
       "id": "sql-1510",
-      "status": "unresolved",
-      "reason": "Exact DML and parameters match PostgreSQL under an activated partial UNIQUE(email) index WHERE status='active'. Native evidence requires a digest-bearing equality index span, complete postimages and bounded schema-only normalization; no table capture is permitted. Original setup incorrectly validates an index as a constraint. Public catalog activation and the corrected complete setup remain unproven, so this is partial evidence only.",
+      "status": "implemented",
+      "reason": "Exact original DML and parameters match PostgreSQL after real public CREATE UNIQUE INDEX and UUID-primary table activation. Full and partial indexes include matching/ineligible witnesses, complete RETURNING and postimages, retained/released uniqueness on future writes, absent-key rejection probes and cold owner recovery. The former invalid VALIDATE-index-as-constraint setup is replaced by attested index publication, not bypassed activation.",
       "evidence": [
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-native-unique-selectors"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-postgres-partial-mutation-reference"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-postgres"
+        }
       ]
     },
     {
       "id": "sql-1511",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original DML and parameters match PostgreSQL after real public CREATE UNIQUE INDEX and UUID-primary table activation. Full and partial indexes include matching/ineligible witnesses, complete RETURNING and postimages, retained/released uniqueness on future writes, absent-key rejection probes and cold owner recovery. The former invalid VALIDATE-index-as-constraint setup is replaced by attested index publication, not bypassed activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1512",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original DML and parameters match PostgreSQL after real public CREATE UNIQUE INDEX and UUID-primary table activation. Full and partial indexes include matching/ineligible witnesses, complete RETURNING and postimages, retained/released uniqueness on future writes, absent-key rejection probes and cold owner recovery. The former invalid VALIDATE-index-as-constraint setup is replaced by attested index publication, not bypassed activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1513",
@@ -17144,31 +18751,71 @@
     },
     {
       "id": "sql-1514",
-      "status": "unresolved",
-      "reason": "Exact DELETE and parameters match PostgreSQL under an activated UNIQUE(email) index, with digest-bearing equality index reads and complete three-table postimages. Original setup incorrectly validates an index as a constraint. Public catalog activation and the corrected complete setup remain unproven, so this is partial evidence only.",
+      "status": "implemented",
+      "reason": "Exact original DML and parameters match PostgreSQL after real public CREATE UNIQUE INDEX and UUID-primary table activation. Full and partial indexes include matching/ineligible witnesses, complete RETURNING and postimages, retained/released uniqueness on future writes, absent-key rejection probes and cold owner recovery. The former invalid VALIDATE-index-as-constraint setup is replaced by attested index publication, not bypassed activation.",
       "evidence": [
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-native-unique-selectors"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-postgres"
+        }
       ]
     },
     {
       "id": "sql-1515",
-      "status": "unresolved",
-      "reason": "Exact DELETE and parameters match PostgreSQL under an activated partial UNIQUE(email) index WHERE status='active', with digest-bearing equality index reads and complete three-table postimages. Original setup incorrectly validates an index as a constraint. Public catalog activation and the corrected complete setup remain unproven, so this is partial evidence only.",
+      "status": "implemented",
+      "reason": "Exact original DML and parameters match PostgreSQL after real public CREATE UNIQUE INDEX and UUID-primary table activation. Full and partial indexes include matching/ineligible witnesses, complete RETURNING and postimages, retained/released uniqueness on future writes, absent-key rejection probes and cold owner recovery. The former invalid VALIDATE-index-as-constraint setup is replaced by attested index publication, not bypassed activation.",
       "evidence": [
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-native-unique-selectors"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-postgres-partial-mutation-reference"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-postgres"
+        }
       ]
     },
     {
       "id": "sql-1516",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original DML and parameters match PostgreSQL after real public CREATE UNIQUE INDEX and UUID-primary table activation. Full and partial indexes include matching/ineligible witnesses, complete RETURNING and postimages, retained/released uniqueness on future writes, absent-key rejection probes and cold owner recovery. The former invalid VALIDATE-index-as-constraint setup is replaced by attested index publication, not bypassed activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1517",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original DML and parameters match PostgreSQL after real public CREATE UNIQUE INDEX and UUID-primary table activation. Full and partial indexes include matching/ineligible witnesses, complete RETURNING and postimages, retained/released uniqueness on future writes, absent-key rejection probes and cold owner recovery. The former invalid VALIDATE-index-as-constraint setup is replaced by attested index publication, not bypassed activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart",
+          "gate": "sql-original-indexed-mutation-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1518",
@@ -18154,13 +19801,37 @@
     },
     {
       "id": "sql-1580",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1581",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1582",
@@ -18173,13 +19844,37 @@
     },
     {
       "id": "sql-1583",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1584",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches PostgreSQL through an explicit public typed view over raw document JSON, before and after real metadata/data-owner restart. SQL arrays are declared through jsonb_to_record TEXT[] rather than inferred from JSON or legacy index annotations. Complete bags, labels, OIDs and SQL NULLs match; all four aggregates also run on an empty owner. No indexed-access or implicit document-array typing claim is made.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
+          "gate": "sql-original-document-array-view-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1585",

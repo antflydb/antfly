@@ -6294,6 +6294,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("bounded-read-integration-test", "Verify scoped row reads and bounded scratch through relational scans")
         .dependOn(&addFilteredTestRunArtifact(b, bounded_read_integration_tests).step);
 
+    const relational_read_layout_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"relational rows snapshot native pages preserve logical slots across historical layouts"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const relational_read_layout_run = addFilteredTestRunArtifact(b, relational_read_layout_tests);
+    relational_read_layout_run.addArg("--require-no-skips");
+    b.step("antfly-relational-read-layout-test", "Verify owned native scan pages across mixed physical schema versions")
+        .dependOn(&relational_read_layout_run.step);
+
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const query_capture_tests = b.addTest(.{
@@ -6950,6 +6960,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.query_metrics.",
             "storage.db.range_state.",
             "storage.db.relational_columns.",
+            "storage.db.relational_catalog_benchmark.",
+            "storage.db.relational_index_cancellation_intent.",
+            "storage.db.relational_index_candidate.",
+            "storage.db.relational_index_owner_control.",
+            "storage.db.relational_index_owner_job.",
+            "storage.db.relational_index_predicate.",
+            "storage.db.relational_index_private_claims.",
+            "storage.db.relational_index_publication_progress.",
+            "storage.db.relational_index_release.",
+            "storage.db.relational_index_validation.",
+            "storage.db.relational_nullability.",
+            "storage.db.relational_rows.",
             "storage.db.relational_index_keys.",
             "storage.db.relational_index_plan.",
             "storage.db.relational_index_catalog.",

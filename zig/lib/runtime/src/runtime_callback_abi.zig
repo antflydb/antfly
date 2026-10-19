@@ -44,7 +44,7 @@ test "boundary dispatcher preserves graph metric readiness and storage contentio
             return TestBoundary.local_dispatch(contract, callback, args, output);
         }
     };
-    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock }) |err| {
+    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock, error.RelationalCheckViolation }) |err| {
         try std.testing.expectError(err, TestBoundary.call("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
     }
 }

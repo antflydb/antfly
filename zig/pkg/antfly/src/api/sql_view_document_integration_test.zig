@@ -23,6 +23,16 @@ const compare = @import("sql_parity_reference.zig");
 const wire = @import("antfly_metadata_openapi").types;
 const Json = std.json.Value;
 const golden_bytes = local.sql_parity_fixtures.view_read_reference;
+const Entry = struct {
+    id: []const u8,
+    sql: []const u8,
+    columns: []const []const u8,
+    column_oids: []const u32,
+    rows: []const []const Json,
+    sql_nulls: []const []const bool,
+    affected: u64,
+};
+
 const Golden = struct {
     format: u8,
     reference: []const u8,
@@ -32,15 +42,8 @@ const Golden = struct {
         rows: []const struct { key: []const u8, value: Json },
         view_sql: []const u8,
     },
-    entries: []const struct {
-        id: []const u8,
-        sql: []const u8,
-        columns: []const []const u8,
-        column_oids: []const u32,
-        rows: []const []const Json,
-        sql_nulls: []const []const bool,
-        affected: u64,
-    },
+    entries: []const Entry,
+    empty_reference: ?struct { reference: []const u8, entries: []const Entry } = null,
 };
 
 fn query(ctx: *fixture.Context, statement: []const u8, admin: bool) !@import("../raft/transport/http_common.zig").HttpResponse {
@@ -97,57 +100,79 @@ fn qualify(ctx: *fixture.Context, golden: Golden, phase: []const u8) !void {
     std.debug.print("document view cohort phase={s} cases={d} elapsed_ms={d}\n", .{ phase, golden.entries.len, elapsed / std.time.ns_per_ms });
 }
 
-const Campaign = struct {
-    credentials: client.ApiKeyHeaders = .{},
+fn seedDocuments(ctx: *fixture.Context, golden: Golden, source_table: []const u8) !void {
+    var inserts: std.json.ObjectMap = .empty;
+    defer inserts.deinit(ctx.alloc);
+    for (golden.profile.rows) |seed| try inserts.put(ctx.alloc, seed.key, seed.value);
+    const batch = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .inserts = Json{ .object = inserts }, .sync_level = "full_text" }, .{});
+    defer ctx.alloc.free(batch);
+    var inserted = try fixture.batch(ctx.alloc, ctx.transport, ctx.headers, ctx.base, source_table, batch);
+    defer inserted.deinit(ctx.alloc);
+    if (inserted.status != 201) std.debug.print("document source seed status={d} body={s}\n", .{ inserted.status, inserted.body });
+    try std.testing.expectEqual(@as(u16, 201), inserted.status);
+}
 
-    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
-        try self.credentials.activate(ctx);
-        var parsed = try std.json.parseFromSlice(Golden, ctx.alloc, golden_bytes, .{});
-        defer parsed.deinit();
-        const golden = parsed.value;
-        try std.testing.expectEqual(@as(u8, 2), golden.format);
-        try std.testing.expectEqualStrings("PostgreSQL exact SQL", golden.reference);
-        try std.testing.expectEqual(@as(usize, 38), golden.entries.len);
-        // Storage epochs are server-owned at public table creation.
-        var declaration = golden.profile.schema;
-        _ = declaration.object.orderedRemove("version");
-        const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .schema = declaration }, .{});
-        defer ctx.alloc.free(body);
-        var created = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/docs", .POST, body);
-        defer created.deinit(ctx.alloc);
-        if (created.status != 201 and created.status != 200) std.debug.print("document source creation status={d} body={s}\n", .{ created.status, created.body });
-        try std.testing.expect(created.status == 201 or created.status == 200);
-        var observed = try fixture.table(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "docs");
-        defer observed.deinit(ctx.alloc);
-        var table = try std.json.parseFromSlice(Json, ctx.alloc, observed.body, .{});
-        defer table.deinit();
-        const id = try std.fmt.parseUnsigned(u64, (try fixture.field(table.value, "table_id")).string, 10);
-        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, id);
-        _ = try fixture.waitServingSchema(ctx, "docs", 0);
-        try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "docs");
-        var inserts: std.json.ObjectMap = .empty;
-        defer inserts.deinit(ctx.alloc);
-        for (golden.profile.rows) |seed| try inserts.put(ctx.alloc, seed.key, seed.value);
-        const batch = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .inserts = Json{ .object = inserts }, .sync_level = "full_text" }, .{});
-        defer ctx.alloc.free(batch);
-        var inserted = try fixture.batch(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "docs", batch);
-        defer inserted.deinit(ctx.alloc);
-        if (inserted.status != 201) std.debug.print("document source seed status={d} body={s}\n", .{ inserted.status, inserted.body });
-        try std.testing.expectEqual(@as(u16, 201), inserted.status);
-        var view = try query(ctx, golden.profile.view_sql, true);
-        defer view.deinit(ctx.alloc);
-        if (view.status != 200) std.debug.print("document view creation status={d} body={s}\n", .{ view.status, view.body });
-        try std.testing.expectEqual(@as(u16, 200), view.status);
-        try qualify(ctx, golden, "initial-owner");
-    }
+fn qualifyEmpty(ctx: *fixture.Context, golden: Golden, source_table: []const u8) !void {
+    const empty = golden.empty_reference orelse return;
+    try std.testing.expectEqualStrings("PostgreSQL exact SQL", empty.reference);
+    const statement = try std.fmt.allocPrint(ctx.alloc, "DELETE FROM {s}", .{source_table});
+    defer ctx.alloc.free(statement);
+    var response = try query(ctx, statement, true);
+    defer response.deinit(ctx.alloc);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    var selected = golden;
+    selected.entries = empty.entries;
+    try qualify(ctx, selected, "empty-owner");
+    try seedDocuments(ctx, golden, source_table);
+}
 
-    pub fn afterRestart(_: *@This(), ctx: *fixture.Context) !void {
-        _ = try fixture.waitServingSchema(ctx, "docs", 0);
-        var parsed = try std.json.parseFromSlice(Golden, ctx.alloc, golden_bytes, .{});
-        defer parsed.deinit();
-        try qualify(ctx, parsed.value, "reopened-owner");
-    }
-};
+fn Campaign(comptime reference_bytes: []const u8, comptime source_table: []const u8, comptime expected_count: usize) type {
+    return struct {
+        credentials: client.ApiKeyHeaders = .{},
+
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activate(ctx);
+            var parsed = try std.json.parseFromSlice(Golden, ctx.alloc, reference_bytes, .{});
+            defer parsed.deinit();
+            const golden = parsed.value;
+            try std.testing.expectEqual(@as(u8, 2), golden.format);
+            try std.testing.expectEqualStrings("PostgreSQL exact SQL", golden.reference);
+            try std.testing.expectEqual(expected_count, golden.entries.len);
+            // Storage epochs are server-owned at public table creation.
+            var declaration = golden.profile.schema;
+            _ = declaration.object.orderedRemove("version");
+            const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .schema = declaration }, .{});
+            defer ctx.alloc.free(body);
+            var created = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.base, std.fmt.comptimePrint("/db/v1/tables/{s}", .{source_table}), .POST, body);
+            defer created.deinit(ctx.alloc);
+            if (created.status != 201 and created.status != 200) std.debug.print("document source creation status={d} body={s}\n", .{ created.status, created.body });
+            try std.testing.expect(created.status == 201 or created.status == 200);
+            var observed = try fixture.table(ctx.alloc, ctx.transport, ctx.headers, ctx.base, source_table);
+            defer observed.deinit(ctx.alloc);
+            var table = try std.json.parseFromSlice(Json, ctx.alloc, observed.body, .{});
+            defer table.deinit();
+            const id = try std.fmt.parseUnsigned(u64, (try fixture.field(table.value, "table_id")).string, 10);
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, id);
+            _ = try fixture.waitServingSchema(ctx, source_table, 0);
+            try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, source_table);
+            try seedDocuments(ctx, golden, source_table);
+            var view = try query(ctx, golden.profile.view_sql, true);
+            defer view.deinit(ctx.alloc);
+            if (view.status != 200) std.debug.print("document view creation status={d} body={s}\n", .{ view.status, view.body });
+            try std.testing.expectEqual(@as(u16, 200), view.status);
+            try qualify(ctx, golden, "initial-owner");
+            try qualifyEmpty(ctx, golden, source_table);
+        }
+
+        pub fn afterRestart(_: *@This(), ctx: *fixture.Context) !void {
+            _ = try fixture.waitServingSchema(ctx, source_table, 0);
+            var parsed = try std.json.parseFromSlice(Golden, ctx.alloc, reference_bytes, .{});
+            defer parsed.deinit();
+            try qualify(ctx, parsed.value, "reopened-owner");
+            try qualifyEmpty(ctx, parsed.value, source_table);
+        }
+    };
+}
 
 test "mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart" {
     const original_ids = [_][]const u8{
@@ -168,5 +193,19 @@ test "mounted SQL original document views preserve real paths typed arrays and l
         try std.testing.expectEqualStrings(id, entry.id);
         try std.testing.expectEqualStrings((try corpus.get(id)).sql, entry.sql);
     }
-    try fixture.run(Campaign);
+    try fixture.run(Campaign(golden_bytes, "docs", 38));
+}
+
+test "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart" {
+    const ids = [_][]const u8{
+        "sql-0824", "sql-0825", "sql-0826", "sql-0827", "sql-0828", "sql-0829",
+        "sql-0830", "sql-0831", "sql-0832", "sql-0833", "sql-0834", "sql-0835",
+        "sql-1580", "sql-1581", "sql-1583", "sql-1584",
+    };
+    const bytes = local.sql_parity_fixtures.document_read_reference;
+    var parsed = try std.json.parseFromSlice(Golden, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(ids.len, parsed.value.entries.len);
+    for (ids, parsed.value.entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    try fixture.run(Campaign(bytes, "document_source", ids.len));
 }

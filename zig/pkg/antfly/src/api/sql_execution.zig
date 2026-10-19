@@ -26,7 +26,8 @@ const db_types = @import("antfly_local_sources").storage_db_types;
 const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
 
 /// Normalize only snapshot admission failures, before the adapter publishes
-/// rows or prepares writes. Never apply this to an unknown mutation outcome.
+/// rows or admits writes. Pure row normalization is also pre-admission; never
+/// apply this classifier to an unknown mutation outcome or an advanced page.
 fn statementReadAdmissionError(err: anyerror) anyerror {
     return switch (@import("table_reads.zig").normalizeDistributedQueryOperationalError(err)) {
         error.ReadUnavailable, error.DistributedQueryUnavailable => error.SqlStatementReadUnavailable,
@@ -395,7 +396,7 @@ pub const Adapter = struct {
             return result;
         }
         const control: ?sessions.Control = switch (compiled.statement) {
-            .begin => |options| .{ .begin = options },
+            .begin => |options| .{ .begin = options.options() },
             .commit => .commit,
             .rollback => .rollback,
             .savepoint => |name| .{ .savepoint = name },
@@ -417,7 +418,7 @@ pub const Adapter = struct {
                 null;
             defer if (control_lease) |held| held.release();
             const tag: []const u8 = switch (command) {
-                .begin => "BEGIN",
+                .begin => compiled.statement.begin.commandTag(),
                 .commit => "COMMIT",
                 .rollback, .rollback_to => "ROLLBACK",
                 .savepoint => "SAVEPOINT",
@@ -1884,7 +1885,7 @@ pub const Adapter = struct {
             .cancellation = self.context.cancellation,
         }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.UnsupportedSqlExecution;
         defer view.deinit();
-        const normalized = try view.normalize(alloc, writes);
+        const normalized = view.normalize(alloc, writes) catch |err| return statementReadAdmissionError(err);
         const result = try images.merge(alloc, input, normalized);
         // RETURNING requires SELECT policy on the resulting row as well as
         // write authority. Do not publish postimages that an ordinary read hides.
@@ -1959,7 +1960,7 @@ pub const Adapter = struct {
                 }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.UnsupportedSqlExecution;
                 defer view.deinit();
                 try self.verify(alloc, table);
-                break :blk try view.normalize(alloc, writes.items);
+                break :blk view.normalize(alloc, writes.items) catch |err| return statementReadAdmissionError(err);
             } else writes.items;
             const scope = table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);
@@ -2297,6 +2298,7 @@ test "SQL API document preparation uses native normalization and retains mutatio
     const Fake = struct {
         normalized: bool = false,
         closed: bool = false,
+        failure: ?anyerror = null,
         fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             return alloc.dupe(u8, "{\"revision\":3,\"tables\":[{\"table_id\":7,\"name\":\"physical\"}]}");
@@ -2314,6 +2316,7 @@ test "SQL API document preparation uses native normalization and retains mutatio
             try std.testing.expectEqual(@as(usize, 1), writes[0].json_null_fields.len);
             try std.testing.expectEqualStrings("j", writes[0].json_null_fields[0]);
             self.normalized = true;
+            if (self.failure) |err| return err;
             return alloc.dupe(db_types.BatchWrite, &.{.{ .key = "a", .value = "{\"j\":null,\"undeclared\":9007199254740993}", .json_null_fields = &.{"j"} }});
         }
         fn close(ptr: *anyopaque) void {
@@ -2338,6 +2341,20 @@ test "SQL API document preparation uses native normalization and retains mutatio
     try std.testing.expectEqual(input.expected_content_digest, output[0].expected_content_digest);
     try std.testing.expect(output[0].row.?.object.contains("undeclared"));
     try std.testing.expectEqualStrings("j", output[0].json_null_fields[0]);
+    const Failure = struct { native: anyerror, expected: anyerror };
+    for ([_]Failure{
+        .{ .native = error.ReadUnavailable, .expected = error.SqlStatementReadUnavailable },
+        .{ .native = error.RelationalCheckViolation, .expected = error.RelationalCheckViolation },
+        .{ .native = error.OutOfMemory, .expected = error.OutOfMemory },
+        .{ .native = error.Cancelled, .expected = error.Cancelled },
+        .{ .native = error.CrcMismatch, .expected = error.CrcMismatch },
+        .{ .native = error.SqlMutationOutcomeUnknown, .expected = error.SqlMutationOutcomeUnknown },
+    }) |failure| {
+        fake.failure = failure.native;
+        fake.closed = false;
+        try std.testing.expectError(failure.expected, Adapter.prepareMutations(&adapter, alloc, table, &.{input}));
+        try std.testing.expect(fake.closed);
+    }
 }
 
 test "SQL API guarded sessions retain reads and atomic MERGE writes across transaction boundaries" {
@@ -2491,7 +2508,7 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
     var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
     // A provider flag is necessary; merely having callbacks is insufficient.
     server.table_writes.?.supports_sql_range_guards = false;
-    try std.testing.expectError(error.UnsupportedSqlExecution, Fake.run(&adapter, "BEGIN ISOLATION LEVEL SERIALIZABLE"));
+    try std.testing.expectError(error.SqlRangeTrackingRequired, Fake.run(&adapter, "BEGIN ISOLATION LEVEL SERIALIZABLE"));
     try std.testing.expectError(error.SqlRangeTrackingRequired, Fake.run(&adapter, "MERGE INTO docs d USING docs s ON d._id=s._id WHEN MATCHED THEN DELETE"));
     try std.testing.expect(adapter.result_session_id == null);
     server.table_writes.?.supports_sql_range_guards = true;

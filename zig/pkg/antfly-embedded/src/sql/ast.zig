@@ -435,6 +435,23 @@ pub const CopyOptions = struct {
     }
 };
 
+pub const Begin = struct {
+    isolation: @import("session.zig").Isolation = .serializable,
+    mode: @import("session.zig").ReadMode = .read_write,
+    syntax: enum { begin, start_transaction } = .begin,
+
+    pub fn options(self: Begin) @import("session.zig").Begin {
+        return .{ .isolation = self.isolation, .mode = self.mode };
+    }
+
+    pub fn commandTag(self: Begin) []const u8 {
+        return switch (self.syntax) {
+            .begin => "BEGIN",
+            .start_transaction => "START TRANSACTION",
+        };
+    }
+};
+
 pub const Statement = union(enum) {
     /// Read plan plus output contract. Ordinary execute must never silently
     /// expose this as SELECT; the COPY-capable stream owns protocol framing.
@@ -449,7 +466,7 @@ pub const Statement = union(enum) {
     drop_table: DropTable,
     catalog_ddl: CatalogDdl,
     policy_ddl: PolicyDdl,
-    begin: @import("session.zig").Begin,
+    begin: Begin,
     commit,
     rollback,
     savepoint: []const u8,

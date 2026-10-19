@@ -1140,10 +1140,21 @@ pub const Reader = struct {
                 if (matches) {
                     const projection = if (self.index_only) self.covering_projection.? else self.selected.?;
                     const native = typed_output and budget.native_cells;
-                    const cells = if (native) try row.projectSqlDatumsAlloc(page, projection) else null;
                     if (native and native_layout == null) {
-                        native_layout = try sqlLayout(page, row, projection);
+                        // One logical output shape per page, independent of
+                        // which historical physical layout sorts first. Names
+                        // must outlive the reader and source-binding cache.
+                        const names = try page.alloc([]const u8, self.fields.len);
+                        for (self.fields, names) |name, *out| out.* = try page.dupe(u8, name);
+                        native_layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(page, names);
                     }
+                    // Complete projections already follow requested-field
+                    // order. Preserve their direct ordinal fast path; only
+                    // historical schemas missing fields need slot remapping.
+                    const cells = if (!native) null else if (projection.ordinals.len == self.fields.len)
+                        try row.projectSqlDatumsAlloc(page, projection)
+                    else
+                        try row.projectSqlDatumsMappedAlloc(page, projection, native_layout);
                     const typed_projection = if (typed_output and !native) try row.projectSqlTypedAlloc(page, projection) else null;
                     const typed = if (typed_projection) |projected| projected.value else null;
                     const json = if (typed_output) "" else try row.projectAlloc(temporary, projection);

@@ -3467,12 +3467,16 @@ pub const AntflyApiHandler = struct {
             .group_id = route.route.group_id,
             .topology_revision = route.topology_epoch,
             .schema_version = parsed.value.schema_version,
-        }, params.table_name, parsed.value, @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse "")) catch |err| return textResponse(ctx, switch (err) {
-            error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
-            error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
-            error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
-            else => 503,
-        }, @errorName(err));
+        }, params.table_name, parsed.value, @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse "")) catch |err| {
+            if (parsed.value.operation == .normalize)
+                return textResponse(ctx, rpc.normalizationFailureHttpStatus(err), @errorName(err));
+            return textResponse(ctx, switch (err) {
+                error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
+                error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
+                error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
+                else => 503,
+            }, @errorName(err));
+        };
         defer ctx.allocator.free(encoded);
         try ctx.setHeader("content-type", if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").compact_magic)) @import("retained_read_page.zig").compact_media_type else if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").magic)) @import("retained_read_page.zig").media_type else "application/json");
         return ctx.response.body(try ctx.allocator.dupe(u8, encoded)).build();
@@ -13622,6 +13626,19 @@ test "httpx SQL document campaign verifies exact native mutation and storage out
     try documentMutationCampaign(@import("antfly_local_sources").sql_parity_fixtures.document_reference);
 }
 
+test "httpx SQL original floating document MOD rejects signatures without changing primary bytes" {
+    const ids = [_][]const u8{ "sql-0970", "sql-0971", "sql-0972", "sql-0973" };
+    const bytes = @import("antfly_local_sources").sql_parity_fixtures.document_numeric_rejection_reference;
+    var parsed = try std.json.parseFromSlice(struct { entries: []const struct { id: []const u8, sqlstate: []const u8 } }, std.testing.allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(ids.len, parsed.value.entries.len);
+    for (ids, parsed.value.entries) |id, entry| {
+        try std.testing.expectEqualStrings(id, entry.id);
+        try std.testing.expectEqualStrings("42883", entry.sqlstate);
+    }
+    try documentMutationCampaign(bytes);
+}
+
 test "httpx SQL document expression mutations do not trust historical index annotations" {
     const ids = [_][]const u8{
         "sql-0891",
@@ -14042,18 +14059,17 @@ test "httpx SQL PostgreSQL original aggregate reads preserve filters captures an
     try std.testing.expectEqual(@as(usize, 0), source.captures);
 }
 
-test "httpx SQL PostgreSQL original stored array reads preserve typed column semantics" {
+fn postgresNativeSingleTableReads(reference_bytes: []const u8, table_name: []const u8, ids: []const []const u8, codes: ?[]const []const u8) !void {
     const alloc = std.testing.allocator;
-    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.typed_array_read_reference;
     const profile = try std.json.parseFromSlice(struct {
         profile: struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } },
-        entries: []const struct { id: []const u8 },
+        entries: []const struct { id: []const u8, sqlstate: ?[]const u8 = null },
     }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
     defer profile.deinit();
-    try std.testing.expectEqual(@as(usize, 14), profile.value.entries.len);
-    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-typed-array-originals");
+    try std.testing.expectEqual(ids.len, profile.value.entries.len);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-single-table-originals");
     defer directory.cleanup();
-    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
     defer db.close();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -14065,19 +14081,52 @@ test "httpx SQL PostgreSQL original stored array reads preserve typed column sem
     try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
     const Source = @import("sql_parity_sources.zig").Tables(1);
     var source: Source = .{
-        .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
-        .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+        .records = .{.{ .table_id = 7, .name = table_name, .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init(table_name, 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
     };
     var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
+    for (ids, profile.value.entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    if (codes) |expected_codes| {
+        try std.testing.expectEqual(ids.len, expected_codes.len);
+        for (ids, expected_codes, profile.value.entries) |id, code, entry| {
+            try std.testing.expectEqualStrings(code, entry.sqlstate orelse return error.MissingRejectionContract);
+            try @import("sql_parity_reference.zig").expectRejection(alloc, &handler, id, code);
+        }
+        try std.testing.expectEqual(@as(usize, 0), source.captures);
+        try std.testing.expectEqual(@as(usize, 0), source.native_reads.load(.monotonic));
+    } else try @import("sql_parity_reference.zig").runReferenceDescribedTransportStrict(alloc, &handler, ids, reference_bytes);
+}
+
+test "httpx SQL PostgreSQL original users alias read preserves the bounded matching frontier" {
+    const ids = [_][]const u8{"sql-0171"};
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.users_read_reference, "users", &ids, null);
+}
+
+test "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access" {
+    const ids = [_][]const u8{ "sql-0215", "sql-0261", "sql-0262", "sql-0263", "sql-0552", "sql-1370", "sql-1501" };
+    const codes = [_][]const u8{ "42883", "42883", "42883", "42883", "42804", "42P20", "42601" };
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.binding_rejection_reference, "usage_records", &ids, &codes);
+}
+
+test "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows" {
     const ids = [_][]const u8{
-        "sql-0167", "sql-0168", "sql-0185", "sql-0186", "sql-0187", "sql-0200", "sql-0288",
-        "sql-0289", "sql-0290", "sql-0291", "sql-0293", "sql-0294", "sql-0298", "sql-0299",
+        "sql-0203", "sql-0204", "sql-1224", "sql-1229", "sql-1266", "sql-1302", "sql-1378", "sql-1379", "sql-1380", "sql-1381",
     };
-    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.extended_read_reference, "usage_records", &ids, null);
+}
+
+test "httpx SQL PostgreSQL original stored array reads preserve typed column semantics" {
+    const ids = [_][]const u8{
+        "sql-0167", "sql-0168", "sql-0185", "sql-0186", "sql-0187", "sql-0190", "sql-0194",
+        "sql-0200", "sql-0211", "sql-0212", "sql-0213", "sql-0280", "sql-0283", "sql-0285",
+        "sql-0286", "sql-0287", "sql-0288", "sql-0289", "sql-0290", "sql-0291", "sql-0293",
+        "sql-0294", "sql-0295", "sql-0296", "sql-0298", "sql-0299",
+    };
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.typed_array_read_reference, "usage_records", &ids, null);
 }
 
 test "httpx SQL catalog JSON generated rows preserve public DDL and restart semantics" {
@@ -14822,20 +14871,31 @@ test "httpx SQL PostgreSQL partial and expression arbiters preserve complete nat
 const PostgresMutationOwner = enum { constraint, index, expression };
 
 test "httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages" {
-    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1509", "sql-1514" }, true, .index, true);
-    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1510", "sql-1515" }, true, .expression, true);
+    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1509", "sql-1514" }, true, .index, true, false);
+    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1510", "sql-1515" }, true, .expression, true, false);
+}
+
+test "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner" {
+    const ids = [_][]const u8{
+        "sql-1396", "sql-1397", "sql-1401", "sql-1404", "sql-1405",
+        "sql-1433", "sql-1434", "sql-1441", "sql-1446", "sql-1448",
+        "sql-1449", "sql-1450", "sql-1451", "sql-1466", "sql-1485",
+        "sql-1486", "sql-1435", "sql-1472",
+    };
+    try postgresNativeMutationCampaignsWithReadPolicy(&ids, true, .constraint, false, true);
 }
 
 fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner) !void {
-    try postgresNativeMutationCampaignsWithReadPolicy(selected, unique, index_owned, false);
+    try postgresNativeMutationCampaignsWithReadPolicy(selected, unique, index_owned, false, false);
 }
 
-fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner, comptime indexed_selectors: bool) !void {
+fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner, comptime indexed_selectors: bool, comptime rejections: bool) !void {
     const alloc = std.testing.allocator;
     const parity = @import("sql_parity_reference.zig");
     const Source = @import("sql_parity_sources.zig").Tables(3);
     var completed_campaigns: usize = 0;
-    for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null, unique: bool = false, expression: bool = false }{
+    for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null, unique: bool = false, expression: bool = false, rejections: bool = false }{
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.mutation_rejection_reference, .ids = &.{}, .unique = true, .rejections = true },
         .{
             .bytes = @import("antfly_local_sources").sql_parity_fixtures.mutation_postgres_reference,
             .ids = &.{
@@ -14857,6 +14917,7 @@ fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []co
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.mixed_mutation_postgres_reference, .ids = &.{"sql-1460"}, .unique = true, .expression = true },
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.upper_mutation_postgres_reference, .ids = &.{"sql-1461"}, .unique = true, .expression = true },
     }) |campaign| {
+        if (campaign.rejections != rejections) continue;
         if (campaign.unique != unique) continue;
         if (campaign.expression != (index_owned == .expression)) continue;
         if (campaign.expression) {
@@ -14978,7 +15039,7 @@ fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []co
             try std.testing.expect(source.lookup_calls.load(.monotonic) > 0);
         }
         completed_campaigns += 1;
-        if (unique) {
+        if (unique and !rejections) {
             // Logical UNIQUE ownership must resolve through native point
             // reads, not table-size-dependent statement capture or scans.
             try std.testing.expect(source.lookup_calls.load(.monotonic) > 0);
