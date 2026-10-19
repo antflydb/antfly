@@ -138346,6 +138346,49 @@ test "lite bounded reader integration scans native relational dirty rows" {
     try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).retained_readers);
 }
 
+test "lite full text status follows writes after adding a sibling index (#1207)" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/status.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptions(&opts);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const empty = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, empty);
+    try std.testing.expectEqual(@as(u64, 0), empty.indexes[0].doc_count);
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"orchard alpha\"}" }} });
+    try db.runUntilIdle();
+    try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"body\":\"orchard beta\"}" }} });
+    try db.runUntilIdle();
+    const stats = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, stats);
+    try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].doc_count);
+    try std.testing.expect(stats.indexes[0].term_count > 0);
+    db.close();
+    db = try DB.open(a, path, opts);
+    const reopened_stats = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, reopened_stats);
+    try std.testing.expectEqual(@as(u64, 2), reopened_stats.indexes[0].doc_count);
+    try std.testing.expectEqual(@import("publication.zig").Stamp.Order.newer, reopened_stats.indexes[0].serving_publication.?.order(stats.indexes[0].serving_publication.?));
+    try db.batch(.{ .deletes = &.{"a"} });
+    try db.runUntilIdle();
+    const deleted_stats = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, deleted_stats);
+    try std.testing.expectEqual(@as(u64, 1), deleted_stats.indexes[0].doc_count);
+    var result = try db.search(a, .{ .index_name = "text", .query = .{ .match = .{ .field = "body", .text = "orchard" } }, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+}
+
 test "lite bounded reader integration publishes full text mappings through db" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;

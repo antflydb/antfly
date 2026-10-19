@@ -21077,7 +21077,7 @@ pub const ApiHttpServer = struct {
             }
         }.less);
         try context.ensureActive();
-        const encoded = try std.json.Stringify.valueAlloc(arena, listed, .{});
+        const encoded = try std.json.Stringify.valueAlloc(arena, listed, .{ .emit_null_optional_fields = false });
         return .{ .body = try self.projectForeignKeyNames(self.alloc, context, encoded), .cursor = next_cursor };
     }
 

@@ -20,10 +20,12 @@ import os
 import subprocess
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 import requests
+from conftest import EMBEDDINGGEMMA2_MODEL
 from helpers import (
     assert_created_index,
     assert_single_top_hit,
@@ -33,9 +35,6 @@ from helpers import (
 )
 
 pytestmark = pytest.mark.reuse_antfly_process
-
-
-CLIPCLAP_MODEL = "antflydb/clipclap"
 
 
 def test_text_quickstart_and_document_artifact(serverless_api):
@@ -1052,6 +1051,16 @@ def test_public_managed_chunked_semantic_full_index_pipeline(
         until="complete",
     )
 
+    # Check the actual public table response without requiring model weights.
+    # Nullable struct defaults used to leak into this nonnullable chunker wire
+    # contract on list, even though the single-table encoder omitted them.
+    for tables in (backup_api.get("/tables"), [backup_api.get_table(table_name)]):
+        listed = next(table for table in tables if table["name"] == table_name)
+        chunker = listed["indexes"]["semantic_chunked_idx"]["chunker"]
+        assert chunker["text"]["target_tokens"] == 4
+        for absent in ("audio", "embedding", "policy"):
+            assert absent not in chunker, chunker
+
     batch = backup_api.batch_write(
         table_name,
         inserts={
@@ -1710,7 +1719,7 @@ def test_live_index_activation_preempts_an_active_enrichment_quantum(
                 "execution": {"embedding": {"batch_items": 1}},
                 "embedder": {
                     "provider": "antfly",
-                    "model": CLIPCLAP_MODEL,
+                    "model": EMBEDDINGGEMMA2_MODEL,
                     "api_url": slow_inference_embedder.url,
                 },
             },
@@ -1743,7 +1752,7 @@ def test_live_index_activation_preempts_an_active_enrichment_quantum(
             sync_level="write",
         )["inserted"] == len(documents)
 
-        # This is the real quickstart shape: a ClipClap image projection owns
+        # This is the real quickstart shape: an EmbeddingGemma2 image projection owns
         # an inference request while another embeddings index is created.
         assert slow_inference_embedder.wait_for_embedding_request(20.0), (
             __import__("json").dumps(
@@ -2276,20 +2285,20 @@ def test_public_managed_antfly_chunked_semantic_full_index_pipeline(
 
 
 @pytest.mark.real_model
-def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup_api):
-    backup_api = real_clipclap_backup_api
-    table_name = f"quickstart_antfly_clipclap_semantic_{__import__('time').time_ns()}"
+def test_public_managed_antfly_embeddinggemma2_embedder_smoke(
+    real_embeddinggemma2_backup_api,
+):
+    backup_api = real_embeddinggemma2_backup_api
+    table_name = (
+        f"quickstart_antfly_embeddinggemma2_semantic_{__import__('time').time_ns()}"
+    )
 
-    try:
-        warmup = backup_api.inference_embed(
-            CLIPCLAP_MODEL, "alpha body", timeout_s=120.0
-        )
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code in {400, 404}:
-            pytest.skip(f"Embedded Antfly inference ClipClap model unavailable: {exc}")
-        raise
+    # The fixture checks installation first; inference errors must fail the test.
+    warmup = backup_api.inference_embed(
+        EMBEDDINGGEMMA2_MODEL, "alpha body", timeout_s=120.0
+    )
     warmup_embedding = warmup["data"][0]["embedding"]
-    assert len(warmup_embedding) == 512
+    assert len(warmup_embedding) == 768
 
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -2297,25 +2306,25 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
     assert_created_index(
         backup_api.create_index(
             table_name,
-            "semantic_clipclap_idx",
+            "semantic_embeddinggemma2_idx",
             {
-                "name": "semantic_clipclap_idx",
+                "name": "semantic_embeddinggemma2_idx",
                 "type": "embeddings",
                 "field": "body",
-                "dimension": 512,
+                "dimension": 768,
                 "embedder": {
                     "provider": "antfly",
-                    "model": CLIPCLAP_MODEL,
+                    "model": EMBEDDINGGEMMA2_MODEL,
                 },
             },
         ),
-        "semantic_clipclap_idx",
+        "semantic_embeddinggemma2_idx",
         "embeddings",
     )
 
     backup_api.wait_index_ready(
         table_name,
-        "semantic_clipclap_idx",
+        "semantic_embeddinggemma2_idx",
         timeout_s=60.0,
         interval_s=0.5,
         until="complete",
@@ -2323,22 +2332,20 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
 
 
 @pytest.mark.real_model
-def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
-    real_clipclap_backup_api,
+def test_public_managed_antfly_embeddinggemma2_chunked_full_index_pipeline(
+    real_embeddinggemma2_backup_api,
 ):
-    backup_api = real_clipclap_backup_api
-    table_name = f"quickstart_antfly_clipclap_chunked_{__import__('time').time_ns()}"
+    backup_api = real_embeddinggemma2_backup_api
+    table_name = (
+        f"quickstart_antfly_embeddinggemma2_chunked_{__import__('time').time_ns()}"
+    )
 
-    try:
-        warmup = backup_api.inference_embed(
-            CLIPCLAP_MODEL, "alpha body", timeout_s=120.0
-        )
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code in {400, 404}:
-            pytest.skip(f"Embedded Antfly inference ClipClap model unavailable: {exc}")
-        raise
+    # The fixture checks installation first; inference errors must fail the test.
+    warmup = backup_api.inference_embed(
+        EMBEDDINGGEMMA2_MODEL, "alpha body", timeout_s=120.0
+    )
     warmup_embedding = warmup["data"][0]["embedding"]
-    assert len(warmup_embedding) == 512
+    assert len(warmup_embedding) == 768
 
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -2346,19 +2353,19 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
     assert_created_index(
         backup_api.create_index(
             table_name,
-            "semantic_clipclap_idx",
+            "semantic_embeddinggemma2_idx",
             {
-                "name": "semantic_clipclap_idx",
+                "name": "semantic_embeddinggemma2_idx",
                 "type": "embeddings",
                 "field": "body",
-                "dimension": 512,
+                "dimension": 768,
                 "embedder": {
                     "provider": "antfly",
-                    "model": CLIPCLAP_MODEL,
+                    "model": EMBEDDINGGEMMA2_MODEL,
                 },
                 "chunker": {
                     "provider": "antfly",
-                    "model": CLIPCLAP_MODEL,
+                    "model": EMBEDDINGGEMMA2_MODEL,
                     "store_chunks": True,
                     "text": {
                         "target_tokens": 4,
@@ -2368,13 +2375,13 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
                 },
             },
         ),
-        "semantic_clipclap_idx",
+        "semantic_embeddinggemma2_idx",
         "embeddings",
     )
 
     backup_api.wait_index_ready(
         table_name,
-        "semantic_clipclap_idx",
+        "semantic_embeddinggemma2_idx",
         timeout_s=60.0,
         interval_s=0.5,
         until="complete",
@@ -2407,7 +2414,219 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
     )
     assert len(scan) == 1
     assert scan[0]["title"] == "Alpha in chunks"
-    chunks = scan[0]["_chunks"]["semantic_clipclap_idx_chunks"]
+    chunks = scan[0]["_chunks"]["semantic_embeddinggemma2_idx_chunks"]
     assert len(chunks) >= 2
     assert chunks[0]["body"].startswith("alpha")
     assert any(chunk["body"].startswith("beta") for chunk in chunks)
+
+
+@pytest.mark.real_model
+@pytest.mark.parametrize("backup_api", [8192], indirect=True, ids=["host-budget-8gib"])
+def test_embeddinggemma2_quickstart_foreground_and_repull_during_backfill(
+    embeddinggemma2_model_available, backup_api
+):
+    api = backup_api
+    server = api._server
+    assert server is not None
+    assert server.inference_host_budget_mb == 8192
+    table = f"quickstart_gemma_runtime_{time.time_ns()}"
+    index = "title_body"
+    sample = json.loads(
+        (Path(__file__).resolve().parents[3] / "wikipedia-config.json").read_text()
+    )["indexes"]
+    config = sample[index]
+    api.create_table(table, num_shards=1)
+    api.create_index(table, index, config)
+
+    model_dir = embeddinggemma2_model_available
+    models_dir = str(model_dir.parent.parent)
+    env = os.environ.copy()
+    env["ANTFLY_URL"] = server.url
+    env.pop("ANTFLY_TOKEN", None)
+
+    def cli(*args):
+        command = [server.binary, *args]
+        if args[:2] == ("inference", "pull"):
+            command.extend(["--models-dir", models_dir])
+        result = subprocess.run(
+            command, env=env, text=True, capture_output=True, timeout=120
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return result.stdout
+
+    # Exercise the typed native client too: requests.json() accepts nulls that
+    # violate the response schema and previously hid this table-list failure.
+    listed = json.loads(cli("table", "list", "--output", "json"))
+    assert table in {entry["name"] for entry in listed}
+    detail = json.loads(cli("table", "get", "--table", table))
+    assert detail["indexes"][index]["chunker"]["text"]["target_tokens"] == 200
+    for entry in api.get("/tables"):
+        for cfg in entry.get("indexes", {}).values():
+            chunker = cfg.get("chunker") or {}
+            assert all(value is not None for value in chunker.values()), chunker
+
+    # Many distinct chunks keep native inference active throughout the probes;
+    # repeated bodies would be served by the enrichment cache instead.
+    docs = {
+        f"doc:{i:04d}": {
+            "title": f"Anatomy and physiology reference {i}",
+            "body": " ".join(
+                f"Anatomy study {i} section {j} describes physiology medicine organs "
+                f"and clinical research findings for patient group {i * 1000 + j}."
+                for j in range(48)
+            ),
+        }
+        for i in range(512)
+    }
+    # A valid local 32x32 red PNG keeps the shared-model image path hermetic.
+    image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg=="
+    for document in list(docs.values())[:8]:
+        document["thumbnail_url"] = image
+    assert api.batch_write(table, inserts=docs, sync_level="write")["inserted"] == len(
+        docs
+    )
+
+    last_status = None
+
+    def active_status():
+        nonlocal last_status
+        status = api.get_index(table, index)["status"]
+        last_status = status
+        coverage = status.get("source_coverage") or {}
+        assert int(coverage.get("failed") or 0) == 0, status
+        if (
+            int(coverage.get("covered") or 0) > 0
+            and int(coverage.get("pending") or 0) > 0
+        ):
+            return status
+        return None
+
+    assert wait_until(active_status, timeout_s=120, interval_s=0.1), api.get_index(
+        table, index
+    )
+
+    def foreground_query(sequence):
+        # No caller retries, and a new query defeats the query-embedding cache.
+        response = api.query_table(
+            table,
+            {
+                "semantic_search": f"anatomy and physiology research {sequence}",
+                "indexes": [index],
+                "fields": ["title"],
+                "limit": 3,
+            },
+        )
+        assert response["responses"][0]["hits"]["hits"], response
+
+    def require_active():
+        # Coverage observations can be temporarily unavailable while a live
+        # checkpoint changes. Wait for a confirmed pending observation rather
+        # than treating unknown counters as completed backfill.
+        assert wait_until(active_status, timeout_s=15, interval_s=0.05), json.dumps(
+            {"status": last_status, "logs": api.debug_logs()[-12000:]}, indent=2
+        )
+
+    for sequence in range(3):
+        require_active()
+        foreground_query(sequence)
+
+    watched = [model_dir / "model.safetensors", model_dir / "model_manifest.json"]
+    before = [
+        (p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in watched
+    ]
+    # Cached pulls must enforce the same limits as staged pulls. Use the
+    # actual CLI and pin its cache path so a fallback download cannot hide this.
+    for flag, expected_error in (
+        ("--max-model-bytes", "ModelSizeLimitExceeded"),
+        ("--max-artifact-bytes", "DownloadSizeLimitExceeded"),
+    ):
+        rejected = subprocess.run(
+            [
+                server.binary,
+                "inference",
+                "pull",
+                f"hf:{EMBEDDINGGEMMA2_MODEL}",
+                "--models-dir",
+                models_dir,
+                flag,
+                "1",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        assert rejected.returncode != 0, rejected.stdout + rejected.stderr
+        assert expected_error in rejected.stdout + rejected.stderr
+    assert [
+        (p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in watched
+    ] == before, "rejected cached pull mutated live artifacts"
+
+    # The normal pinned re-pull must preserve the live installation, even its
+    # metadata: an otherwise harmless hard link used to poison every next call.
+    pull = subprocess.Popen(
+        [
+            server.binary,
+            "inference",
+            "pull",
+            f"hf:{EMBEDDINGGEMMA2_MODEL}",
+            "--models-dir",
+            models_dir,
+        ],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        foreground_query("during-pull")
+        output, _ = pull.communicate(timeout=120)
+        assert pull.returncode == 0, output
+    finally:
+        if pull.poll() is None:
+            pull.kill()
+            pull.wait()
+    after = [
+        (p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in watched
+    ]
+    assert after == before, "unchanged pull mutated live artifacts"
+
+    # Explicit overrides traverse staged publication. Preserve the installed
+    # tasks while exercising the formerly persistent ctime/cache failure too.
+    manifest = json.loads((model_dir / "model_manifest.json").read_text())
+    cli(
+        "inference",
+        "pull",
+        f"hf:{EMBEDDINGGEMMA2_MODEL}",
+        "--tasks",
+        ",".join(manifest["tasks"]),
+    )
+    require_active()
+    foreground_query("after-staged-pull")
+    # All requests encounter the same metadata-only invalidation. The native
+    # regression counts snapshot executions; this checks the public path stays
+    # usable concurrently while indexing, without timing-dependent assertions.
+    link = model_dir / f".quickstart-validation-{time.time_ns()}"
+    try:
+        os.link(model_dir / "model.safetensors", link)
+    finally:
+        link.unlink(missing_ok=True)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(foreground_query, (f"revalidation-{i}" for i in range(8))))
+    # Omitting dimension forces the live validation probe through the same
+    # supervised native worker while the original index is still backfilling.
+    image_config = dict(sample["thumbnail"])
+    image_config.pop("name", None)
+    image_config.pop("dimension", None)
+    api.create_index(table, "live_image", image_config)
+    foreground_query("after-live-ddl")
+    for name, covered in ((index, len(docs)), ("live_image", 8)):
+        complete = api.wait_index_ready(table, name, until="complete", timeout_s=600)
+        assert complete["source_coverage"]["covered"] == covered, complete
+        assert (complete["source_coverage"].get("failed") or 0) == 0, complete
+    image_query = api.query_table(
+        table,
+        {"semantic_search": "a red picture", "indexes": ["live_image"], "limit": 3},
+    )
+    assert image_query["responses"][0]["hits"]["hits"], image_query
+    cli("table", "list", "--output", "json")
