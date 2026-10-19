@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "qualification_base": "b261a10f84c42279cf3baa0ebbfb93c3d1f0de6f",
-  "merged_main": "358489688225d7b5b9184f3ae6a50df8b6b811f4",
+  "merged_main": "dfc6007c5d772f199ccfe8a32a126ba1cecfac3e",
   "compiler": "0.17.0",
   "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
   "build_flags": [
@@ -17,7 +17,7 @@
     "zig/pkg/antfly-grep/src/workspace_store.zig": "37a25301a023b6c5bd1a18fdabb3591d7100c03f4aef57db6772bf50294147d5",
     "zig/pkg/antfly-grep/src/lexical_index.zig": "866291a1699ae5a46d9a73a89eefabee813604de53dc89675c7b0ce2dff6a2ed",
     "zig/pkg/antfly-grep/src/prepared_query.zig": "f020eb23bccb80886bd5b2a013b8a610851fe437f8a323f6a0190c344f6aa78e",
-    "zig/pkg/antfly-grep/README.md": "7bdf0a17ce80c8b7fc93b0e615b67337f22e95440e95d7db3e205e78dbf27b07",
+    "zig/pkg/antfly-grep/README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
     "zig/pkg/antfly-grep/COMPATIBILITY.md": "192e928eb2e85b9c6b80633f331ec0e45d6fb5aeceee00adf6ffe9388c194058",
     "zig/pkg/antfly-grep/compatibility.json": "5220514f986a1699e0cc9910fa57e7dbe3538569d35bd84d4d8bdcc81690c6dd",
     "zig/pkg/antfly-grep/bench/lexical_reuse.py": "92d1c90c5c32115dd4e2ab45750b2bce6ec035f25c975a3884d092ca03a25003",
@@ -43,12 +43,12 @@
   "archives": {
     "macos": {
       "binary_sha256": "19000033d633a4d2c95241abac3a27643a92a28e246deea395ee068f8038c400",
-      "archive_sha256": "ef7af3179740f674ec66de9c5fd126eb68c2bc17ad10c0688d585bebac1202de",
+      "archive_sha256": "de2d05d70894af0c1db5e83c69633bb640abf79ce1118164fc55ab3c6adba522",
       "binary_bytes": 7596680,
       "runtime_verified": true,
       "verified_members": {
-        "README.md": "7bdf0a17ce80c8b7fc93b0e615b67337f22e95440e95d7db3e205e78dbf27b07",
-        "share/antfly-grep/README.md": "7bdf0a17ce80c8b7fc93b0e615b67337f22e95440e95d7db3e205e78dbf27b07",
+        "README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+        "share/antfly-grep/README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
         "share/antfly-grep/COMPATIBILITY.md": "192e928eb2e85b9c6b80633f331ec0e45d6fb5aeceee00adf6ffe9388c194058",
         "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
         "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
@@ -93,12 +93,12 @@
     },
     "linux": {
       "binary_sha256": "389c59476fbe2fab6f80678ae5c684b4f52505ca78d84fd1386aa873209cd68c",
-      "archive_sha256": "ee75965ab2f1df3a7f7629df057b50586ef041cb4c006377a4aaba9a82f5b8b1",
+      "archive_sha256": "59a109a59b2b545ea2232eccb3701e1860d46a777242600350e5d0deb5a54a53",
       "binary_bytes": 7609368,
       "runtime_verified": true,
       "verified_members": {
-        "README.md": "7bdf0a17ce80c8b7fc93b0e615b67337f22e95440e95d7db3e205e78dbf27b07",
-        "share/antfly-grep/README.md": "7bdf0a17ce80c8b7fc93b0e615b67337f22e95440e95d7db3e205e78dbf27b07",
+        "README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+        "share/antfly-grep/README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
         "share/antfly-grep/COMPATIBILITY.md": "192e928eb2e85b9c6b80633f331ec0e45d6fb5aeceee00adf6ffe9388c194058",
         "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
         "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
@@ -143,12 +143,12 @@
     },
     "windows": {
       "binary_sha256": "675182827c279318a286ec8a5bf02fb9c80f051cf38051a99bf9445e5b5fa4bc",
-      "archive_sha256": "c4a9f49f8557cb83faba8daf3c446f5521d4ffc596362603f5b1b0121a470738",
+      "archive_sha256": "938acf2e914198e0fac14a43aebdb8e8c2dc34776261445851ae5913df88ae06",
       "binary_bytes": 8514048,
       "runtime_verified": false,
       "verified_members": {
-        "README.md": "7bdf0a17ce80c8b7fc93b0e615b67337f22e95440e95d7db3e205e78dbf27b07",
-        "share/antfly-grep/README.md": "7bdf0a17ce80c8b7fc93b0e615b67337f22e95440e95d7db3e205e78dbf27b07",
+        "README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+        "share/antfly-grep/README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
         "share/antfly-grep/COMPATIBILITY.md": "192e928eb2e85b9c6b80633f331ec0e45d6fb5aeceee00adf6ffe9388c194058",
         "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
         "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
@@ -270,6 +270,16 @@
     "build-windows.log": "6f9b3a22fda99be6a1ff6b650437c935f87a2496d3d655858e90d6a66f635f09",
     "build-safe.log": "5cd5593032745c1cc35c456e229a660fbd3fd0d1b75147703dc880f203b45bf1",
     "native-conformance-final.log": "1af1675d5eaadafd293513a51187db6ef7c00bbba5f93ef00c86c282f647f036"
+  },
+  "post_qualification_merge": {
+    "qualified_commit": "18ec53341f17e63e115bc148db34e18224859f3d",
+    "merged_main": "dfc6007c5d",
+    "scope": "Workflow action updates and unrelated guide; three rebuilt product binaries are byte-identical to qualified artifacts. Native unit/hardening targets pass.",
+    "logs": {
+      "merge-linux.log": "3d9a345b2216cbb725b40ed74a3c58d7547d00a81338b16b0c7d814d3ceebd0e",
+      "merge-windows.log": "28b2022fcd22106bde132f9582f793cf3f105e1c7cbc178818efeea62d68a62f",
+      "merge-native.log": "33dd348f9bc503db65e8ece9fbbf0a286dc4f0131bb2723aeb0903d0b1454e72"
+    }
   },
   "exploratory_profile": {
     "binary_sha256": "1003a780c38012e546a35f0011462975336bb8c4f55ad207cbe0940f399275e8",

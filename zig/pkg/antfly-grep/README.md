@@ -2889,7 +2889,10 @@ these controls use warm synthetic data, not cold-storage or independent native
 Linux hardware. Changes and output still cost resources; avoiding an unnecessary
 request in the consuming client remains the cheapest unchanged-result path.
 
-This branch merges `origin/main` through `3584896882`.
+This branch merges `origin/main` through `dfc6007c5d`. The final main update
+changes workflow action pins and an unrelated guide. All three product binaries
+are rebuilt and checked byte-for-byte against the qualified `18ec53341f`
+artifacts; native unit/hardening checks also pass on the merged tree.
 
 Final controls against `b261a10f84` use alternating serial trials, warm synthetic
 files and the same client for each binary. This task's builds/tests were stopped
