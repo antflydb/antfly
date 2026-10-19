@@ -163,8 +163,8 @@ def main() -> int:
     quickstart_tape = QUICKSTART_TAPE.read_text(encoding="utf-8")
 
     embedding_model = "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
-    if f"antfly inference pull hf:{embedding_model}" not in source:
-        fail("the quickstart must install the pinned EmbeddingGemma2 bundle")
+    if source.count(f"antfly inference pull hf:{embedding_model}") != 1:
+        fail("install EmbeddingGemma2 once, before indexing; reuse it for image search")
     demo_config = json.loads((REPO / "wikipedia-config.json").read_text())
     for name, config in demo_config["indexes"].items():
         if config["embedder"]["model"] != embedding_model:

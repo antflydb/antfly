@@ -622,11 +622,15 @@ EmbeddingGemma2 places text and images in one embedding space, so you can descri
 <Steps>
 ### Confirm the EmbeddingGemma2 model is available
 
-Use the same model installed for text search. If you skipped that step, pull it now:
+Use the model already installed for text search. Confirm it appears in the list:
 
 ```bash
-antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
+antfly inference list
 ```
+
+If you skipped the [model installation step](#install-the-text-embedding-model),
+complete it before adding this index. Avoid pulling the model again while it is
+being used for indexing.
 
 <Callout type="info">
 The running process picks up the new model on its next model-list or inference
