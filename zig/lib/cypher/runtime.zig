@@ -25,6 +25,7 @@ const value_work = @import("value_work.zig");
 const A = std.mem.Allocator;
 const Count = @import("multiplicity.zig").Count;
 const path_summaries = @import("path_summaries.zig");
+const reduction_plan = @import("reduction.zig");
 pub const Row = []const v.Entry;
 pub const max_response_bytes: usize = 32 << 20;
 pub const Limits = struct { memory_bytes: usize = 64 << 20, scanned_anchors: usize = 1_000_000, explored_edges: usize = 1_000_000, intermediate_states: usize = 1_000_000, path_depth: usize = 1024, recursion_depth: usize = 64 };
@@ -1153,6 +1154,7 @@ const Engine = struct {
     lookups: []Lookup = &.{},
     lookup: ?*Lookup = null,
     aggregate_overrides: ?AggregateOverrides = null,
+    group_overrides: ?GroupOverrides = null,
     projection_overrides: ?struct { items: []const ast.Item, row: Row } = null,
     projection_locals: ?*const @import("expressions.zig").Local = null,
     read_nodes: std.HashMapUnmanaged(v.Identity, ?*const v.Node, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
@@ -1191,7 +1193,12 @@ const Engine = struct {
         if (amount > self.limits.intermediate_states -| self.stats.intermediate_states) return error.CypherStateBudgetExceeded;
         self.stats.intermediate_states += amount;
     }
-    const AggregateOverrides = struct { index: *const std.AutoHashMapUnmanaged(*const ast.Expr, usize), values: []const v.Value };
+    const AggregateOverrides = struct {
+        index: *const std.AutoHashMapUnmanaged(*const ast.Expr, usize),
+        values: []v.Value,
+        lazy: ?struct { ready: []bool, rows: []const Row } = null,
+    };
+    const GroupOverrides = struct { index: *const std.AutoHashMapUnmanaged(*const ast.Expr, usize), values: []const v.Value, aliases: Row = &.{} };
     fn checkpoint(self: *Engine) !void {
         try self.backend.vtable.checkpoint(self.backend.ptr);
     }
@@ -1453,20 +1460,19 @@ const Engine = struct {
             return self.best;
         }
     };
-    fn collectStreamingAggregates(self: *Engine, expression: *const ast.Expr, calls: *std.ArrayList(*const ast.Expr)) !bool {
+    fn collectStreamingAggregates(self: *Engine, expression: *const ast.Expr, calls: *reduction_plan.Calls) !bool {
         // Pattern subqueries own their aggregate scope.
         if (expression.value == .exists or expression.value == .pattern_comprehension) return true;
         if (expression.value == .call and aggregateName(expression.value.call.name)) {
             const call_value = expression.value.call;
             for (call_value.args) |arg| if (aggregates(arg)) return false;
             if (call_value.args.len != (if (call_value.star) @as(usize, 0) else 1)) return error.CypherFunctionArity;
-            for (calls.items) |prior| if (prior == expression) return true;
             try calls.append(self.a, expression);
             return true;
         }
         return self.collectStreamingChildren(expression.value, calls);
     }
-    fn collectStreamingChildren(self: *Engine, value: anytype, calls: *std.ArrayList(*const ast.Expr)) anyerror!bool {
+    fn collectStreamingChildren(self: *Engine, value: anytype, calls: *reduction_plan.Calls) anyerror!bool {
         switch (@typeInfo(@TypeOf(value))) {
             .pointer => |pointer| {
                 if (pointer.size == .one and pointer.child == ast.Expr) return self.collectStreamingAggregates(value, calls);
@@ -1487,12 +1493,60 @@ const Engine = struct {
         }
         return true;
     }
+    const GroupRetention = struct {
+        a: A,
+        keys: reduction_plan.Index = .{},
+        aliases: std.StringHashMapUnmanaged(void) = .empty,
+        fields: std.StringHashMapUnmanaged(void) = .empty,
+        uses: std.AutoHashMapUnmanaged(*const ast.Expr, usize) = .empty,
+        all: bool = false,
+        pub fn skip(self: *@This(), expression: *const ast.Expr, locals: ?*const @import("expressions.zig").Local) bool {
+            if (expression.value == .call and aggregateName(expression.value.call.name)) return true;
+            if (self.keys.find(expression) == null or !@import("expressions.zig").unshadowed(expression, locals)) return false;
+            var aliases = self.aliases.keyIterator();
+            while (aliases.next()) |alias| if (@import("expressions.zig").references(expression, alias.*)) return false;
+            return true;
+        }
+        pub fn reference(self: *@This(), name: []const u8) !void {
+            if (!self.aliases.contains(name)) try self.fields.put(self.a, name, {});
+        }
+        pub fn pattern(self: *@This(), _: *const ast.Expr, _: ?*const @import("expressions.zig").Local) !void {
+            self.all = true;
+        }
+    };
+    fn groupRetention(self: *Engine, projection: ast.Projection) !GroupRetention {
+        var plan: GroupRetention = .{ .a = self.a };
+        var slot: usize = 0;
+        for (projection.items) |item| {
+            if (!aggregates(item.expression)) {
+                _ = try plan.keys.intern(self.a, item.expression, slot);
+                slot += 1;
+            }
+            try plan.aliases.put(self.a, item.alias orelse try self.expressionName(item.expression), {});
+        }
+        for (projection.order) |order| try @import("expressions.zig").visitFree(order.expression, &plan);
+        try reduction_plan.keyUses(self.a, &plan.keys, projection.items, &plan.uses);
+        try reduction_plan.keyUses(self.a, &plan.keys, projection.order, &plan.uses);
+        return plan;
+    }
     const StreamGroup = struct { key: []const v.Value, source: Row, states: []StreamingAggregate };
-    fn newStreamGroup(self: *Engine, a: A, key: []const v.Value, source: Row, calls: []const *const ast.Expr) !StreamGroup {
+    fn newStreamGroup(self: *Engine, a: A, key: []const v.Value, input: Row, retention: ?*const GroupRetention, projection: ast.Projection, calls: []const *const ast.Expr) !StreamGroup {
         const states = try a.alloc(StreamingAggregate, calls.len);
         for (states, calls) |*state_value, call_value| state_value.* = .{ .function = call_value.value.call, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
         const copied = try (v.Value{ .list = key }).clone(a);
-        return .{ .key = copied.list, .source = (try (v.Value{ .map = source }).clone(a)).map, .states = states };
+        // Grouping validation permits only grouping keys outside aggregates.
+        // Bare key variables also serve map selectors, whose names are not Exprs.
+        var source: std.ArrayList(v.Entry) = .empty;
+        var slot: usize = 0;
+        for (projection.items) |item| if (!aggregates(item.expression)) {
+            if (item.expression.value == .variable) try source.append(a, .{ .name = item.expression.value.variable, .value = copied.list[slot] });
+            slot += 1;
+        };
+        if (retention) |plan| for (input) |entry| {
+            if ((plan.all or plan.fields.contains(entry.name)) and lookup(source.items, entry.name) == null)
+                try source.append(a, .{ .name = try a.dupe(u8, entry.name), .value = try entry.value.clone(a) });
+        };
+        return .{ .key = copied.list, .source = source.items, .states = states };
     }
     fn boundedGroupWindow(self: *Engine, projection: ast.Projection) bool {
         // Invalid/unknown window expressions retain the original late error
@@ -1506,16 +1560,15 @@ const Engine = struct {
         }
         return true;
     }
-    fn finishStreamGroups(self: *Engine, groups: []const StreamGroup, calls: []const *const ast.Expr, projection: ast.Projection) ![]const Row {
+    fn finishStreamGroups(self: *Engine, groups: []const StreamGroup, calls: *const reduction_plan.Calls, retention: *const GroupRetention, projection: ast.Projection) ![]const Row {
         var projected: std.ArrayList(Projected) = .empty;
         var window: ?TopK = if (self.boundedGroupWindow(projection)) try TopK.init(self, projection, &.{}) else null;
         defer if (window) |*top| top.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
         defer scratch.deinit();
         const retained = self.a;
-        var indices: std.AutoHashMapUnmanaged(*const ast.Expr, usize) = .empty;
-        defer indices.deinit(retained);
-        for (calls, 0..) |expression, index| try indices.put(retained, expression, index);
+        const previous_keys = self.group_overrides;
+        defer self.group_overrides = previous_keys;
         const previous = self.aggregate_overrides;
         defer self.aggregate_overrides = previous;
         var unique_rows: DistinctRows = .{};
@@ -1524,11 +1577,13 @@ const Engine = struct {
             const evaluation = if (window != null) scratch.allocator() else retained;
             const eval_scope: ?EvalScope = if (window != null) EvalScope.enter(self, evaluation) else null;
             defer if (eval_scope) |scope_| scope_.leave(self);
-            const overrides = try self.a.alloc(v.Value, calls.len);
+            const overrides = try self.a.alloc(v.Value, calls.items.len);
             for (overrides, group.states) |*override, state_value| override.* = if (window != null) state_value.result() else try state_value.result().clone(retained);
-            self.aggregate_overrides = .{ .index = &indices, .values = overrides };
+            self.aggregate_overrides = .{ .index = &calls.index.pointers, .values = overrides };
+            self.group_overrides = .{ .index = &retention.uses, .values = group.key };
             const row = try self.a.alloc(v.Entry, projection.items.len);
             for (projection.items, row) |item, *entry| entry.* = .{ .name = item.alias orelse try self.expressionName(item.expression), .value = try self.eval(item.expression, group.source, &.{}) };
+            self.group_overrides.?.aliases = row;
             const scope = if (projection.order.len != 0) try self.projectionScope(group.source, row) else group.source;
             if (projection.predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
             if (projection.distinct and !try unique_rows.accept(self, retained, row)) continue;
@@ -1584,6 +1639,8 @@ const Engine = struct {
         middle: []const ast.Clause,
         projection: ast.Projection,
         calls: []const *const ast.Expr,
+        call_aliases: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, usize) = null,
+        retention: ?*const GroupRetention = null,
         top: *?TopK,
         groups: *std.ArrayList(StreamGroup),
         group_index: *value_work.Index,
@@ -1770,9 +1827,16 @@ const Engine = struct {
             if (found == null) {
                 found = fold.groups.items.len;
                 try fold.group_index.insert(fold.retained, hash, found.?);
-                try fold.groups.append(fold.retained, try engine.newStreamGroup(fold.retained, key.items, row, fold.calls));
+                try fold.groups.append(fold.retained, try engine.newStreamGroup(fold.retained, key.items, row, fold.retention, fold.projection, fold.calls));
             } else if (!fold.has_keys and fold.groups.items[0].source.len == 0) {
-                fold.groups.items[0].source = (try (v.Value{ .map = row }).clone(fold.retained)).map;
+                // Capture only fields needed by an ORDER BY expression behind
+                // alias shadowing; global aggregate arguments are already consumed.
+                if (fold.retention) |plan| {
+                    var retained_source: std.ArrayList(v.Entry) = .empty;
+                    for (row) |entry| if (plan.all or plan.fields.contains(entry.name))
+                        try retained_source.append(fold.retained, .{ .name = try fold.retained.dupe(u8, entry.name), .value = try entry.value.clone(fold.retained) });
+                    fold.groups.items[0].source = retained_source.items;
+                }
             }
             if (engine.statistic_packet) |arguments| {
                 for (arguments) |argument| {
@@ -2170,7 +2234,7 @@ const Engine = struct {
             if (clause.operation == .project and clause.operation.project.value.order.len != 0) break true;
         } else false;
         if (!ordered or projection.items.len == 0 or !self.read_only) return middle;
-        var calls: std.ArrayList(*const ast.Expr) = .empty;
+        var calls: reduction_plan.Calls = .{};
         for (projection.items) |item| {
             if (!aggregates(item.expression) or !try self.collectStreamingAggregates(item.expression, &calls)) return middle;
         }
@@ -2552,7 +2616,7 @@ const Engine = struct {
             self.cache_reads = previous_cache;
             if (!previous_cache) self.read_nodes = previous_reads;
         }
-        var calls: std.ArrayList(*const ast.Expr) = .empty;
+        var calls: reduction_plan.Calls = .{};
         if (grouped) {
             if (projection.wildcard) return null;
             for (projection.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return null;
@@ -2627,7 +2691,7 @@ const Engine = struct {
         };
         var has_keys = false;
         for (projection.items) |item| has_keys = has_keys or !aggregates(item.expression);
-        if (grouped and !has_keys) try groups.append(retained, try self.newStreamGroup(retained, &.{}, &.{}, calls.items));
+        if (grouped and !has_keys) try groups.append(retained, try self.newStreamGroup(retained, &.{}, &.{}, null, projection, calls.items));
         var matched: usize = 0;
         const stage_counts = try retained.alloc(usize, middle.len + 1);
         @memset(stage_counts, 0);
@@ -2639,7 +2703,8 @@ const Engine = struct {
         const probes = try retained.alloc(CallMemo, middle.len);
         for (probes, middle) |*probe, clause| probe.* = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) }, .disabled = clause.operation != .match and clause.operation != .subquery };
         defer for (probes) |*probe| probe.deinit();
-        var fold: StreamFold = .{ .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
+        var fold: StreamFold = .{ .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         var adaptive_probe = adaptive_candidate;
         if (adaptive_probe) for (input) |row| {
             if (operation.predicate) |predicate| if (!endpointExpression(predicate, path, row)) {
@@ -2765,7 +2830,7 @@ const Engine = struct {
         self.shortest_count = previous_count;
         self.stream_fold = previous_fold;
         if (continuation != null) return &.{};
-        const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, calls.items, projection);
+        const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, &calls, &retention, projection);
         try self.stages.append(self.a, .{ .operation = "match", .span = match_span, .input_rows = input.len, .output_rows = stage_counts[0] });
         for (middle, 0..) |clause, index| try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = stage_counts[index], .output_rows = stage_counts[index + 1] });
         try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = matched, .output_rows = if (self.pending_window) |weighted| weighted.count() else rows.len });
@@ -3059,7 +3124,7 @@ const Engine = struct {
         for (clauses) |clause| switch (clause.operation) {
             .match, .unwind => {},
             .project => |p| {
-                var calls: std.ArrayList(*const ast.Expr) = .empty;
+                var calls: reduction_plan.Calls = .{};
                 for (p.value.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return .exact;
                 for (p.value.order) |order| if (!try self.collectStreamingAggregates(order.expression, &calls)) return .exact;
                 if (calls.items.len != 0) {
@@ -3220,7 +3285,7 @@ const Engine = struct {
             .subquery => |inner| if (!consolidatableCall(inner)) return null,
             .project => |p| {
                 if (p.value.order.len != 0 or p.value.skip != null or p.value.limit != null) return null;
-                var calls: std.ArrayList(*const ast.Expr) = .empty;
+                var calls: reduction_plan.Calls = .{};
                 for (p.value.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return null;
                 if (calls.items.len == 0) continue;
                 for (calls.items) |expression| {
@@ -3402,7 +3467,7 @@ const Engine = struct {
             .subquery => |inner| if (!consolidatableCall(inner)) return false,
             .project => |p| {
                 if (p.value.order.len != 0 or p.value.skip != null or p.value.limit != null) return false;
-                var calls: std.ArrayList(*const ast.Expr) = .empty;
+                var calls: reduction_plan.Calls = .{};
                 for (p.value.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return false;
                 if (calls.items.len == 0) continue;
                 var sum = false;
@@ -3566,7 +3631,7 @@ const Engine = struct {
                         projection.items = items;
                         projection.wildcard = false;
                     }
-                    var calls: std.ArrayList(*const ast.Expr) = .empty;
+                    var calls: reduction_plan.Calls = .{};
                     for (projection.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return error.CypherInvalidAggregate;
                     for (projection.order) |order| if (!try self.collectStreamingAggregates(order.expression, &calls)) return error.CypherInvalidAggregate;
                     const grouped = projection.distinct or calls.items.len != 0;
@@ -3583,10 +3648,11 @@ const Engine = struct {
                     // key per input, and no group at all for empty input.
                     var has_keys = projection.distinct and calls.items.len == 0;
                     for (projection.items) |item| has_keys = has_keys or !aggregates(item.expression);
-                    if (calls.items.len != 0 and !has_keys) try groups.append(self.a, try self.newStreamGroup(self.a, &.{}, &.{}, calls.items));
+                    if (calls.items.len != 0 and !has_keys) try groups.append(self.a, try self.newStreamGroup(self.a, &.{}, &.{}, null, projection, calls.items));
                     var matched: usize = 0;
                     var counts = [_]usize{0};
-                    var fold: StreamFold = .{ .retained = self.a, .middle = &.{}, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = &counts, .matched = &matched, .distinct = &.{} };
+                    const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
+                    var fold: StreamFold = .{ .retention = &retention, .retained = self.a, .middle = &.{}, .projection = projection, .calls = calls.items, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = &counts, .matched = &matched, .distinct = &.{} };
                     for (bags.rows, bags.weights) |row, weight| {
                         fold.weight = weight;
                         fold.add(self, row) catch |err| switch (err) {
@@ -3594,7 +3660,7 @@ const Engine = struct {
                             else => return err,
                         };
                     }
-                    const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, calls.items, projection);
+                    const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, &calls, &retention, projection);
                     if (self.pending_window) |weighted| {
                         self.pending_window = null;
                         bags = weighted;
@@ -5026,6 +5092,7 @@ const Engine = struct {
             .pointer => |p| {
                 if (p.size == .one and p.child == ast.Expr) {
                     if (self.stream_fold) |fold| if (fold.active_calls) |active| {
+                        if (fold.call_aliases) |aliases| if (aliases.get(value)) |slot| if (!active[slot]) return true;
                         for (fold.calls, active) |call_value, enabled| if (!enabled and call_value == value) return true;
                     };
                     return self.momentSafe(value.*, names);
@@ -7470,7 +7537,19 @@ const Engine = struct {
         if (expression.value != .variable) if (self.projection_overrides) |overrides| for (overrides.items, overrides.row) |item, entry| {
             if (@import("expressions.zig").same(item.expression, expression) and @import("expressions.zig").unshadowed(expression, self.projection_locals)) return entry.value;
         };
-        if (self.aggregate_overrides) |overrides| if (overrides.index.get(expression)) |index| return overrides.values[index];
+        if (self.aggregate_overrides) |overrides| if (overrides.index.get(expression)) |index| {
+            if (overrides.lazy) |lazy| if (!lazy.ready[index]) {
+                overrides.values[index] = try self.aggregate(expression.value.call, lazy.rows);
+                lazy.ready[index] = true;
+            };
+            return overrides.values[index];
+        };
+        if (self.group_overrides) |overrides| if (overrides.index.get(expression)) |index| key: {
+            if (!@import("expressions.zig").unshadowed(expression, self.projection_locals)) break :key;
+            // ORDER BY aliases shadow input variables, including entity aliases.
+            for (overrides.aliases) |alias| if (@import("expressions.zig").references(expression, alias.name)) break :key;
+            return overrides.values[index];
+        };
         try self.checkpoint();
         return switch (expression.value) {
             .literal => |value| switch (value) {
@@ -8373,12 +8452,25 @@ const Engine = struct {
             try group.append(self.a, row);
             try groups.append(self.a, group);
         }
+        // Materialized/write-barrier scopes share pure reducers too. Compute
+        // lazily, preserving CASE/coalesce errors and nonrepeatable arguments.
+        var calls: reduction_plan.Calls = .{};
+        if (grouped) {
+            for (projection.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return error.CypherInvalidAggregate;
+            for (projection.order) |order| if (!try self.collectStreamingAggregates(order.expression, &calls)) return error.CypherInvalidAggregate;
+        }
+        const values = try self.a.alloc(v.Value, calls.items.len);
+        const ready = try self.a.alloc(bool, calls.items.len);
+        const previous_aggregates = self.aggregate_overrides;
+        defer self.aggregate_overrides = previous_aggregates;
         var projected: std.ArrayList(Projected) = .empty;
         var projected_index: value_work.Index = .{};
         var columns: std.ArrayList([]const u8) = .empty;
         if (projection.wildcard and rows.len > 0) for (rows[0]) |entry| try columns.append(self.a, entry.name);
         for (projection.items) |item| try columns.append(self.a, item.alias orelse try self.expressionName(item.expression));
         for (groups.items) |group| {
+            @memset(ready, false);
+            if (grouped) self.aggregate_overrides = .{ .index = &calls.index.pointers, .values = values, .lazy = .{ .ready = ready, .rows = group.items } };
             const source: Row = if (group.items.len > 0) group.items[0] else &.{};
             var row: std.ArrayList(v.Entry) = .empty;
             if (projection.wildcard) try row.appendSlice(self.a, source);
@@ -8914,4 +9006,24 @@ test "adjacency page index growth reclaims obsolete hash tables" {
         const identity: v.Identity = .{ .table = "docs", .key = try std.fmt.bufPrint(&key, "node-{d:0>32}", .{i}) };
         try std.testing.expect(cache.pages.contains(.{ .mapping = 0, .node = identity, .direction = .out, .cursor = null }));
     }
+}
+
+test "materialized reductions share pure calls without evaluating unused aggregate branches" {
+    const Noop = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dummy: u8 = 0;
+    var engine: Engine = .{ .a = a, .scratch_allocator = a, .regex = undefined, .backend = .{ .ptr = &dummy, .vtable = &.{ .bind = undefined, .checkpoint = Noop.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } }, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
+    engine.values = .{ .a = a, .ptr = &engine, .charge = Engine.chargeWork };
+    var diagnostic: compiler.Diagnostic = .{};
+    var compiled = try compiler.compile(a, "RETURN CASE WHEN false THEN sum(1/0) ELSE size(collect(x)) END AS a,size(COLLECT(x)) AS b", .{}, &diagnostic);
+    defer compiled.deinit();
+    const output = try engine.project(&.{ &.{.{ .name = "x", .value = .{ .integer = 1 } }}, &.{.{ .name = "x", .value = .{ .integer = 2 } }} }, compiled.query.clauses[0].operation.project.value, true);
+    try std.testing.expectEqual(@as(usize, 1), output.len);
+    try std.testing.expectEqual(@as(i64, 2), output[0][0].value.integer);
+    try std.testing.expectEqual(@as(i64, 2), output[0][1].value.integer);
+    try std.testing.expect(engine.aggregate_overrides == null);
 }

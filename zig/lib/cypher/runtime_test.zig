@@ -77,7 +77,10 @@ fn check(text: []const u8, expected: []const u8) !void {
     var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
     defer compiled.deinit();
     var fixture: Fixture = .{};
-    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+    var result = runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}) catch |err| {
+        std.debug.print("query failed ({s}): {s}\n", .{ @errorName(err), text });
+        return err;
+    };
     defer result.deinit();
     const json = try std.json.Stringify.valueAlloc(std.testing.allocator, result.rows, .{});
     defer std.testing.allocator.free(json);
@@ -3264,4 +3267,31 @@ test "group windows preserve alias shadowing, stable ties and projection failure
         var fixture: Fixture = .{};
         try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
     }
+}
+
+test "group key slots preserve compound expressions lexical bindings aliases and entity selectors" {
+    try check("UNWIND [1,2,1] AS x RETURN x+1 AS key,count(*) AS c,(x+1)+count(*) AS total ORDER BY x+1", "[[2,2,4],[3,1,4]]");
+    try check("UNWIND [1,2,1] AS x RETURN x AS key,count(*) AS c,[x IN [7,8] | x] AS locals ORDER BY key", "[[1,2,[7,8]],[2,1,[7,8]]]");
+    try check("UNWIND [1,2,1] AS x RETURN x+1 AS key,count(*) AS c,[x IN [7] | x+1] AS locals ORDER BY key", "[[2,2,[8]],[3,1,[8]]]");
+    try check("UNWIND [1,2,1] AS x RETURN x AS key,count(*) AS x ORDER BY x DESC,key", "[[1,2],[2,1]]");
+    try check("MATCH (n:Document) WITH n AS entity,count(*) AS c,n{.title} AS projected ORDER BY n.rank LIMIT 1 RETURN entity.title,c,projected", "[[\"Alpha\",1,{\"title\":\"Alpha\"}]]");
+    try check("UNWIND [1,2,1] AS x RETURN x+1 AS key,[x IN [7] | x+1]+[count(*)] AS totals ORDER BY key", "[[2,[8,2]],[3,[8,1]]]");
+    try check("UNWIND [1,2] AS x WITH {v:1} AS m,x RETURN m AS map,x,count(*)+m{x}.x AS total ORDER BY x", "[[{\"v\":1},1,2],[{\"v\":1},2,3]]");
+    try check("UNWIND [1,1] AS x WITH x AS x,count(*) AS c WHERE c=2 RETURN x,c", "[[1,2]]");
+    try check("UNWIND [1,2,1] AS x RETURN x AS key,count(*) AS c ORDER BY count(*) DESC,key", "[[1,2],[2,1]]");
+}
+
+test "shared aggregates preserve distinct flags case spelling and lexical scopes" {
+    try check("UNWIND [1,1,2] AS x RETURN count(x) AS a,COUNT(x) AS b,count(DISTINCT x) AS c,size(collect(x)) AS d,size(COLLECT(x)) AS e", "[[3,3,2,3,3]]");
+    try check("UNWIND [1,2,1] AS x RETURN x AS key,sum(x) AS a,SUM(x) AS b ORDER BY sum(x) DESC,key", "[[1,2,2],[2,2,2]]");
+}
+
+test "group key reuse preserves ORDER BY alias type errors" {
+    const text = "UNWIND [{x:1}] AS n RETURN n.x AS n,count(*) AS c ORDER BY n.x";
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    try check("UNWIND [{x:1}] AS n RETURN DISTINCT n.x AS n,count(*) AS c ORDER BY n.x", "[[1,1]]");
 }

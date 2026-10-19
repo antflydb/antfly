@@ -304,6 +304,11 @@ pub fn visitFree(expression: *const ast.Expr, context: anytype) anyerror!void {
     return visitFreeScoped(expression, context, null);
 }
 fn visitFreeScoped(expression: *const ast.Expr, context: anytype, locals: ?*const Local) anyerror!void {
+    const Context = switch (@typeInfo(@TypeOf(context))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(context),
+    };
+    if (@hasDecl(Context, "skip")) if (context.skip(expression, locals)) return;
     switch (expression.value) {
         .variable => |name| {
             var local = locals;
@@ -358,7 +363,7 @@ fn visitFreeChildren(value: anytype, context: anytype, locals: ?*const Local) an
     }
 }
 
-fn references(expr: *const ast.Expr, name: []const u8) bool {
+pub fn references(expr: *const ast.Expr, name: []const u8) bool {
     return switch (expr.value) {
         .literal, .parameter => false,
         .variable => |variable| std.mem.eql(u8, variable, name),

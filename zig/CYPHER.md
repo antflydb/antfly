@@ -1868,6 +1868,21 @@ and row expansion are independent of the endpoint; otherwise statistics stay
 with their original binding. Native and SQL execution share the same pinned,
 authorized traversal and cycle/uniqueness proofs.
 
+Each reduction scope interns structurally equal, repeatable aggregate calls into
+one physical slot, including repeated calls in ordering expressions. Original
+AST pointers map directly to that slot; DISTINCT flags and lexical scope remain
+part of the identity. Pattern consumers and unknown/nonrepeatable functions do
+not license structural sharing. Materialized scopes cache reducers lazily so
+CASE/coalesce evaluation retains its error behavior.
+
+Groups retain evaluated grouping keys and bare key-variable bindings rather
+than entire source rows. Final expressions use compiled key-slot lookups with
+lexical and ORDER BY alias-shadowing guards. A free-variable walk retains only
+additional source bindings required behind those guards (including map selector
+variables); unproved pattern dependencies conservatively retain their source.
+Entity-valued keys keep their complete observed entity. Aggregate-only input
+payloads are released with their producer pages.
+
 Grouped projection constructs its source/alias environment once. Proved finite
 SKIP/LIMIT windows use the existing stable TopK selector, with per-group scratch
 for projection and ordering and independent ownership for selected rows. Every

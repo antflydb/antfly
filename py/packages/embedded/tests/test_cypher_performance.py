@@ -4295,3 +4295,57 @@ def test_wide_grouped_projection_retains_only_its_window(graph_db):
     assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
         [key] + [1] * 32 for key in (1997, 1996, 1995)
     ]
+
+
+def _populate_payload_graph(db, count, payload_bytes):
+    db.sql("CREATE TABLE payloads (score BIGINT,payload TEXT)")
+    payload = "x" * payload_bytes
+    for start in range(0, count, 50):
+        db.sql(
+            "INSERT INTO payloads (_id,score,payload) VALUES "
+            + ",".join(f"('n{i}',{i},'{payload}')" for i in range(start, min(start + 50, count)))
+        )
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "payloads",
+            "definition": {"labels": [{"name": "W", "table": "payloads"}], "relationships": []},
+        }
+    )
+
+
+def test_repeated_pure_aggregates_share_one_physical_state(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 1500, 4096)
+    columns = ",".join(f"size({'COLLECT' if k % 2 else 'collect'}(n.payload)) AS c{k}" for k in range(8))
+    result = db.cypher_json(
+        "payloads",
+        {"query": "MATCH (n:W) RETURN " + columns, "limits": {"memory_bytes": 32 << 20}},
+    )
+    assert [int(cell["value"]) for cell in result["rows"][0]] == [1500] * 8
+    populate(db, 10000)
+    columns = ",".join(f"count(*) AS c{k}" for k in range(32))
+    result = db.cypher_json(
+        "g",
+        {
+            "query": f"MATCH (n:D) RETURN n.score AS key,{columns} ORDER BY key LIMIT 1",
+            "limits": {"memory_bytes": 32 << 20},
+        },
+    )
+    assert [int(cell["value"]) for cell in result["rows"][0]] == [0] + [1] * 32
+
+
+def test_group_sources_release_payloads_consumed_only_by_aggregates(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 1400, 32768)
+    for tail in (
+        "RETURN n.score AS key,count(n.payload) AS c ORDER BY key LIMIT 1",
+        "RETURN n.score+1 AS key,count(n.payload) AS c ORDER BY n.score+1 LIMIT 1",
+        "RETURN n.score+1 AS key,count(n.payload)+(n.score+1) AS c ORDER BY key LIMIT 1",
+    ):
+        result = db.cypher_json(
+            "payloads",
+            {"query": "MATCH (n:W) " + tail, "limits": {"memory_bytes": 32 << 20}},
+        )
+        expected = [0, 1] if tail.startswith("RETURN n.score AS") else [1, 2 if "+(n.score+1)" in tail else 1]
+        assert [int(cell["value"]) for cell in result["rows"][0]] == expected
