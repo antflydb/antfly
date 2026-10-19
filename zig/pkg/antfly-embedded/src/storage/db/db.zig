@@ -141069,7 +141069,7 @@ test "grouped sources production ordered transaction resolution never waits on d
     const txn = try db.beginTransaction(1);
     try db.writeTransaction(txn, .{ .writes = &.{.{ .key = "member", .value = "{\"thread\":\"t\",\"turn\":\"a\",\"ordinal\":1,\"text\":\"source\"}" }} });
     const Cancelled = struct {
-        fn check(_: *anyopaque) bool {
+        fn check(_: *const anyopaque) bool {
             return true;
         }
     };

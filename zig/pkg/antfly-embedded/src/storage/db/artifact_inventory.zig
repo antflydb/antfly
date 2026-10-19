@@ -36,6 +36,11 @@ pub const Binding = struct {
         return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= 16);
     }
 
+    /// Protocol 16 extends protocol 15's receipt-backed stream witnesses.
+    /// Keep this a capability check so compatible extensions retain them.
+    pub fn supportsProducerWitnesses(self: Binding) bool {
+        return self.valid() and self.effect_protocol >= 15;
+    }
     pub fn compatible(a: Binding, b: Binding) bool {
         return a.valid() and b.valid() and a.effect_protocol == b.effect_protocol and std.mem.eql(u8, &a.semantic_digest, &b.semantic_digest);
     }
@@ -99,14 +104,20 @@ pub const Ordered = struct { command: Command, applied_index: u64 };
 pub const LocalBinding = struct { epoch: u64, digest: [32]u8 };
 pub const Status = struct { ordered: ?Binding, applied_index: u64, local: LocalBinding, ready: bool };
 
-test "ordered artifact inventory compatibility binds the complete effect protocol" {
+test "grouped sources production ordered artifact inventory compatibility binds the complete effect protocol" {
     const direct: Binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3) };
     var extended = direct;
     extended.effect_protocol = 15;
     try std.testing.expect(direct.valid() and extended.valid());
     try std.testing.expect(!direct.compatible(extended));
     try std.testing.expect(extended.compatible(extended));
+    try std.testing.expect(!direct.supportsProducerWitnesses());
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = 16;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    try std.testing.expect(!direct.compatible(extended));
     extended.effect_protocol = 17;
+    try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }
 
