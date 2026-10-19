@@ -1744,6 +1744,14 @@ per-resolver runtime edits return `ResolverNamespaceCurationRequired` after
 adoption. Inline aliases remain source configuration, applied before shared
 namespace corrections. Lite retains its local resolver curation contract.
 
+Namespace projection is read-only; reverse dependency edges change only after
+table admission succeeds, in the same metadata transaction. Updates apply the edge
+set difference, so policy-only replay pages do not rewrite unchanged edges.
+Destination namespace records are private metadata and are excluded from index
+reconciliation and public table/index resources. Owner route discovery shares
+the caller's absolute deadline and cancellation token, including peer-cache
+refresh and periodic checkpoints through metadata routing scans.
+
 Curator REVIEW decisions use a private ordered data-Raft command. The artifact,
 configuration, policy bundle and prior override are checked at apply; override,
 outcome receipt, source replay and ordered marker commit together. Retrying an

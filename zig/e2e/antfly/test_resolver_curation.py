@@ -59,6 +59,9 @@ def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
     wait = {"timeout_ms": 5000}
     merged = api.post(entity + ":merge", {"into": "concept/beta", "wait": wait})
     assert merged["complete"] and merged["applied"], merged
+    # Destination-owned policy is metadata, never an index or public config.
+    assert "_resolver_namespaces" not in str(api.get_table(destination))
+    assert "_resolver_namespaces" not in str(api.get(f"/tables/{destination}/indexes"))
     assert len(merged["results"]) == 2
     assert all(row["accepted"] and row["revision"] == 1 for row in merged["results"])
     mention = {"text": "Alpha", "label": "concept"}

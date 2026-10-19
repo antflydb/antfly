@@ -10985,3 +10985,15 @@ test "artifact enrichment list does not expose internal JSON or producer credent
     try std.testing.expect(std.mem.indexOf(u8, listed, "chunker_json") == null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "\"chunker\":{") != null);
 }
+
+test "resolver curation HTTP hides destination namespace metadata from index resources" {
+    const a = std.testing.allocator;
+    const source = "{\"default\":{\"type\":\"full_text\"},\"_resolver_curation\":{\"identities\":[]},\"_resolver_namespaces\":{\"version\":1,\"namespaces\":[]}}";
+    const configs = try encodeIndexConfigMap(a, source);
+    defer a.free(configs);
+    try std.testing.expect(std.mem.indexOf(u8, configs, "_resolver_") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, configs, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+    try std.testing.expect(parsed.value.object.contains("default"));
+}

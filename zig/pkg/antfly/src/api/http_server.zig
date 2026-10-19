@@ -19752,9 +19752,16 @@ pub const ApiHttpServer = struct {
         try context.ensureActive();
         if (self.cfg.deployment_mode == .standalone) return (try (self.table_writes orelse return error.UnsupportedOperation).resolverOperationGroupLocal(alloc, group_id, table_name, body)) orelse return error.UnknownGroup;
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
-        const router = self.cfg.session_router orelse fallback.router();
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+        const router = (self.cfg.session_router orelse fallback.router()).withBudget(.{ .clock = .{ .deadline_ns = context.deadline_ns }, .cancellation = context.cancellation });
+        var route = (table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader) catch |err| {
+            try context.ensureActive();
+            return err;
+        }) orelse {
+            try context.ensureActive();
+            return error.GroupLeaderUnavailable;
+        };
         defer route.deinit(alloc);
+        try context.ensureActive();
         switch (route) {
             .local => return self.executeResolverOperationLocal(alloc, table_name, group_id, body, context),
             .remote => |remote| {
@@ -58345,4 +58352,49 @@ test "external lake native server resumes bounded collection across maintenance 
     try std.testing.expect(turns > 30);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, expired, .{}));
     try cut.validate(a, io, source, request, namespace, .none);
+}
+
+test "resolver curation HTTP routing carries deadlines and in-flight cancellation" {
+    const Fixture = struct {
+        canceled: std.atomic.Value(bool) = .init(false),
+        cancel_during_route: bool = false,
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn node(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn absent(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+        fn uri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return error.UnexpectedTransport;
+        }
+        fn routes(ptr: *anyopaque, _: std.mem.Allocator, _: []const u64, _: table_router.RoutePolicy, budget: table_router.RouteBudget) !?[]table_router.GroupRoute {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(budget.clock.deadline_ns != null);
+            try std.testing.expect(budget.cancellation != null);
+            if (self.cancel_during_route) {
+                self.canceled.store(true, .release);
+            } else {
+                const remaining = (try budget.remainingTimeoutMs()).?;
+                try std.testing.expect(remaining <= 20);
+                try std.testing.io.sleep(.fromMilliseconds(@as(i64, remaining) + 1), .awake);
+            }
+            try budget.check();
+            return error.RequestBudgetNotObserved;
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.node, .local_status = Fixture.absent, .node_base_uri = Fixture.uri, .resolve_group_routes = Fixture.routes } },
+    }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    const context: api_operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 20 * std.time.ns_per_ms, .cancellation = CancellationToken.fromAtomic(&fixture.canceled) };
+    try std.testing.expectError(error.DeadlineExceeded, server.executeResolverOperation(std.testing.allocator, "source", 7, "{\"operation\":\"progress\"}", context));
+    fixture.cancel_during_route = true;
+    try std.testing.expectError(error.Canceled, server.executeResolverOperation(std.testing.allocator, "source", 7, "{\"operation\":\"progress\"}", .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s, .cancellation = CancellationToken.fromAtomic(&fixture.canceled) }));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }
