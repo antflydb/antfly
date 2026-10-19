@@ -62,6 +62,7 @@ const row_policy_bundle_mod = @import("row_policy_bundle.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
 const schema_registry_mod = @import("schema_registry.zig");
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const table_catalog_mod = @import("table_catalog.zig");
 const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
@@ -1817,10 +1818,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         defer S.ownerField(self, "alloc").*.free(state);
                         const contender = try internal_keys.graphGlobalEdgeContenderKeyAlloc(S.ownerField(self, "alloc").*, clear.index_name, graph_entry.config.coverage_generation, entry.key, @intCast(graph_mod.direct_source_priority), state);
                         defer S.ownerField(self, "alloc").*.free(contender);
-                        const direct = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, contender) catch |err| switch (err) {
-                            error.NotFound => null,
-                            else => return err,
-                        };
+                        const direct = try missingAsNull(S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, contender));
                         defer if (direct) |raw| S.ownerField(self, "alloc").*.free(raw);
                         if (direct == null) continue;
                     }
@@ -2037,10 +2035,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const job_key = try cleanup_contract.ownerJobKeyAlloc(S.ownerField(self, "alloc").*, write.key);
                 var key_owned = true;
                 defer if (key_owned) S.ownerField(self, "alloc").*.free(job_key);
-                const pending = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, job_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const pending = try missingAsNull(S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, job_key));
                 defer if (pending) |value| S.ownerField(self, "alloc").*.free(value);
                 var needs_revival = pending != null;
                 if (!needs_revival and try S.ownerField(self, "core").*.store.mayHaveGraphRetirements()) {
@@ -2616,10 +2611,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (page_plan != .unchanged) {
                     const chunks = @import("merge_page_chunks.zig");
-                    const manifest = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, chunks.manifest_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const manifest = try missingAsNull(S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, chunks.manifest_key));
                     defer if (manifest) |value| S.ownerField(self, "alloc").*.free(value);
                     if (manifest) |value| {
                         const count = try chunks.slotCount(value);
@@ -3107,10 +3099,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // A read-only handle can predate the writer's import. Its local flag
             // cannot observe publication, so consult the shared durable fence.
             if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) {
-                const pending = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, graph_merge_import_recovery_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const pending = try missingAsNull(S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, graph_merge_import_recovery_key));
                 if (pending) |record| {
                     S.ownerField(self, "alloc").*.free(record);
                     return error.GraphMaintenanceInProgress;
@@ -3152,10 +3141,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (isMetadataKey(write.key)) return error.RowPolicyMutationUnsupported;
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
                 defer S.ownerField(self, "alloc").*.free(store_key);
-                const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const old_bytes: ?[]const u8 = try missingAsNull(probe.getLeased(store_key));
                 if (old_bytes) |bytes| {
                     if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
                     const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())

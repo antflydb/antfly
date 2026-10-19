@@ -15,6 +15,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
@@ -867,10 +868,7 @@ pub const NamespaceWriteTxn = struct {
         if (self.vtable.get_many_sorted) |get_many_sorted| return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, namespace, keys, values });
         @memset(values, null);
         for (keys, values) |key, *value| {
-            value.* = BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key }) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            value.* = try missingAsNull(BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key }));
         }
     }
 
@@ -1073,10 +1071,7 @@ pub const NamespaceBatch = struct {
         if (self.vtable.get_many_sorted) |get_many_sorted| return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, namespace, keys, values });
         @memset(values, null);
         for (keys, values) |key, *value| {
-            value.* = BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key }) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            value.* = try missingAsNull(BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key }));
         }
     }
 

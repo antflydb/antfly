@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const wire = @import("online_merge_io_contract.zig");
@@ -199,10 +200,7 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
             eligible = false; // Resume this exact already-started ordinary plan.
         }
     }
-    const marker = txn.get(&@import("../internal_keys.zig").ordered_document_applied_entry_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const marker = try missingAsNull(txn.get(&@import("../internal_keys.zig").ordered_document_applied_entry_key));
     const term = if (marker) |raw| blk: {
         if (raw.len != 16 or std.mem.readInt(u64, raw[8..16], .little) == 0) return error.CorruptOrderedApplyReceipt;
         const value = std.mem.readInt(u64, raw[0..8], .little);
@@ -915,10 +913,7 @@ pub fn requireSnapshotIndexes(db: *DB, alloc: Allocator, identity: pages.Source,
 fn receiverStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellation: types.CancellationToken) ![]u8 {
     var txn = try db.core.store.beginReadTxn();
     defer txn.abort();
-    const state_bytes = txn.get(@import("merge_state.zig").key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const state_bytes = try missingAsNull(txn.get(@import("merge_state.zig").key));
     var state = if (state_bytes) |bytes| try @import("merge_contract.zig").decodeAlloc(alloc, bytes) else null;
     defer if (state) |*value| value.deinit(alloc);
     if (state) |*value| if (value.transition_id != scope.fence.transition_id and (value.phase == .finalized or value.phase == .rolled_back)) {
@@ -928,10 +923,7 @@ fn receiverStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellati
     };
     if (state) |value| if (value.transition_id != scope.fence.transition_id or value.donor_group_id != scope.fence.owner_group_id or
         value.receiver_group_id != scope.fence.peer_group_id or (value.copy_attempt.sequence != 0 and !std.meta.eql(value.copy_attempt, scope.copy_attempt))) return error.MergeCopyFenced;
-    const receipt_bytes = txn.get(pages.key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const receipt_bytes = try missingAsNull(txn.get(pages.key));
     var receipt = if (receipt_bytes) |bytes| try pages.decode(alloc, bytes) else null;
     defer if (receipt) |*value| value.deinit();
     if (receipt) |value| try wire.validateReceiptScope(scope, value.value);

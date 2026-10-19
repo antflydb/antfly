@@ -79,6 +79,7 @@ const sparse_mod = if (builtin.os.tag == .freestanding)
 else
     @import("../../sparse/sparse.zig");
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const template_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("template_stub.zig")
 else
@@ -1525,10 +1526,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendOwnedKey(alloc, artifact_delete_keys, manifest_key);
             const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
             errdefer alloc.free(state_key);
-            const existing_state = S.ownerField(db, "core").*.getStoreValue(alloc, state_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing_state = try missingAsNull(S.ownerField(db, "core").*.getStoreValue(alloc, state_key));
             defer if (existing_state) |value| alloc.free(value);
             if (existing_state != null) {
                 var previous_state = try loadDocumentExtractionPreviousState(alloc, db, view, doc_key, artifact_name, existing_state);
@@ -2182,10 +2180,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
             owned_values: *std.ArrayListUnmanaged([]u8),
         ) !u64 {
-            const raw = store.get(alloc, internal_keys.graph_endpoint_cleanup_generation_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const raw = try missingAsNull(store.get(alloc, internal_keys.graph_endpoint_cleanup_generation_key));
             defer if (raw) |value| alloc.free(value);
             if (raw != null and raw.?.len != 8) return error.InvalidGraphSegment;
             const previous = if (raw) |value| std.mem.readInt(u64, value[0..8], .little) else 0;
@@ -2243,10 +2238,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
                 fn value(self: *@This(), value_alloc: Allocator, key: []const u8) !?[]const u8 {
                     if (self.positions.get(key)) |pos| return self.writes[pos].value;
-                    return self.store.get(value_alloc, key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    return try missingAsNull(self.store.get(value_alloc, key));
                 }
 
                 fn contender(self: *@This(), index: *index_manager_mod.IndexManager.GraphIndex, key: []const u8, raw: []const u8, state: ?docstore_mod.KVPair) !void {
@@ -2888,10 +2880,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         };
                         try writes.append(alloc, .{ .key = revision_key, .value = revision_value });
                     }
-                    const existing = store.get(alloc, marker_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const existing = try missingAsNull(store.get(alloc, marker_key));
                     const existing_outcome: ?DerivedCoverageOutcome = if (existing) |value| blk: {
                         defer alloc.free(value);
                         break :blk std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse
@@ -4696,10 +4685,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             changed: *std.ArrayListUnmanaged([]u8),
             changed_set: *std.StringHashMapUnmanaged(void),
         ) !void {
-            const raw_state = store.get(alloc, state_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const raw_state = try missingAsNull(store.get(alloc, state_key));
             defer if (raw_state) |raw| alloc.free(raw);
             if (raw_state) |raw| {
                 if (try graph_asset_state.coverageGeneration(raw) != generation) {
@@ -5223,10 +5209,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // from the explicit source node when one is embedded (entity-sourced
                 // relations, zig/AUTOSCHEMA.md).
 
-                const raw = txn.get(artifact_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const raw = try missingAsNull(txn.get(artifact_key));
                 if (raw) |value| {
                     var decoded = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value) catch |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -6309,15 +6292,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
             defer alloc.free(state_key);
-            const existing_state = S.ownerField(db, "core").*.getStoreValue(alloc, state_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing_state = try missingAsNull(S.ownerField(db, "core").*.getStoreValue(alloc, state_key));
             defer if (existing_state) |value| alloc.free(value);
-            const existing_manifest = S.ownerField(db, "core").*.getStoreValue(alloc, manifest_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing_manifest = try missingAsNull(S.ownerField(db, "core").*.getStoreValue(alloc, manifest_key));
             defer if (existing_manifest) |value| alloc.free(value);
             var previous_child_ranges: []types.DocumentArtifactChildRange = &.{};
             defer freeDocumentArtifactChildRanges(alloc, previous_child_ranges);
@@ -7429,10 +7406,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (!oriented.any()) continue;
                     if (!table_loaded) {
                         if (active.primary_store) |store| {
-                            stored_table = store.get(alloc, internal_keys.graph_owning_table_key) catch |err| switch (err) {
-                                error.NotFound => null,
-                                else => return err,
-                            };
+                            stored_table = try missingAsNull(store.get(alloc, internal_keys.graph_owning_table_key));
                             table = stored_table;
                         }
                         table_loaded = true;
@@ -7448,10 +7422,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const store = active.primary_store orelse break :previous null;
                         const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, mutation.producingDocument(), mutation.index_name, mutation.edge_type, mutation.target, mutation.source, mutation.edge_id);
                         defer alloc.free(artifact);
-                        persisted = store.get(alloc, artifact) catch |err| switch (err) {
-                            error.NotFound => null,
-                            else => return err,
-                        };
+                        persisted = try missingAsNull(store.get(alloc, artifact));
                         const raw = persisted orelse break :previous null;
                         break :previous (try enrichment_artifact_codec.decodeGraphEdgeBorrowed(raw)).metadata_json;
                     };
@@ -8216,10 +8187,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var ttl_created_ns = write.ttl_created_ns;
             if (ttl_duration_ns != 0 and ttl_created_ns == 0) {
                 ttl_created_ns = @max(1, timestamp_ns);
-                const existing = store.get(alloc, key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const existing = try missingAsNull(store.get(alloc, key));
                 if (existing) |raw| {
                     defer alloc.free(raw);
                     var previous = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, raw) catch null;
@@ -9311,17 +9279,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !?[]u8 {
             if (try sourceArtifactKeyFromResolutionScopeAlloc(alloc, doc_key, source_artifact)) |source_key| {
                 defer alloc.free(source_key);
-                return store.get(alloc, source_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                return try missingAsNull(store.get(alloc, source_key));
             }
             const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", source_artifact);
             defer alloc.free(extraction_key);
-            return store.get(alloc, extraction_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            return try missingAsNull(store.get(alloc, extraction_key));
         }
 
         pub fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WriteProfile) void {
@@ -9871,10 +9833,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     continue;
                 };
 
-                const raw = store.get(alloc, artifact_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const raw = try missingAsNull(store.get(alloc, artifact_key));
                 defer if (raw) |value| alloc.free(value);
 
                 var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
@@ -9938,10 +9897,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, state_name);
                 defer alloc.free(state_key);
 
-                const had_state = store.get(alloc, state_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const had_state = try missingAsNull(store.get(alloc, state_key));
                 defer if (had_state) |value| alloc.free(value);
                 if (had_state == null and sources.len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
                     const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
@@ -9959,10 +9915,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // a source withdrawal, including replay after a snapshot import.
                         const direct_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, generation, entry.key, @intCast(graph_mod.direct_source_priority), direct_state);
                         defer alloc.free(direct_key);
-                        const direct_raw = store.get(alloc, direct_key) catch |err| switch (err) {
-                            error.NotFound => null,
-                            else => return err,
-                        };
+                        const direct_raw = try missingAsNull(store.get(alloc, direct_key));
                         if (direct_raw) |raw_direct| {
                             defer alloc.free(raw_direct);
                             const direct = (try graph_edge_contender.decode(raw_direct, generation)) orelse return error.InvalidGraphEdgeContender;
@@ -10057,10 +10010,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer alloc.free(parsed_key.doc_key);
             defer alloc.free(parsed_key.artifact_name);
 
-            const raw_resolution = store.get(alloc, resolution_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const raw_resolution = try missingAsNull(store.get(alloc, resolution_key));
             defer if (raw_resolution) |raw| alloc.free(raw);
             if (raw_resolution) |raw| {
                 if (raw.len > options.max_input_bytes) {
@@ -10593,10 +10543,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 !pending.write_positions.contains(direct_contender_key) and
                 !graphContenderStateChanged(edge_changes, direct_state_key))
             {
-                const direct_raw = store.get(alloc, direct_contender_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const direct_raw = try missingAsNull(store.get(alloc, direct_contender_key));
                 defer if (direct_raw) |raw| alloc.free(raw);
                 if (direct_raw) |raw| {
                     const direct = (try graph_edge_contender.decode(raw, expected_generation)) orelse return error.InvalidGraphEdgeContender;
@@ -10642,10 +10589,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (edge_changes) |change| {
                 const contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, expected_generation, edge_key, change.source_priority, change.state_key);
                 if (ttl_duration_ns != 0) {
-                    const previous_owned = store.get(alloc, contender_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const previous_owned = try missingAsNull(store.get(alloc, contender_key));
                     defer if (previous_owned) |value| alloc.free(value);
                     // An imported pending put is the afterimage. Its donor deadline
                     // cannot identify the receiver deadline that this page replaces.
@@ -10673,10 +10617,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (incoming_edge.ttl_created_ns != 0) {
                         const tombstone_key = try internal_keys.graphEdgeTtlTombstoneKeyAlloc(alloc, edge_key, index_name, expected_generation, change.state_key);
                         defer alloc.free(tombstone_key);
-                        const tombstone_raw = if (pending.delete_keys.contains(tombstone_key)) null else store.get(alloc, tombstone_key) catch |err| switch (err) {
-                            error.NotFound => null,
-                            else => return err,
-                        };
+                        const tombstone_raw = if (pending.delete_keys.contains(tombstone_key)) null else try missingAsNull(store.get(alloc, tombstone_key));
                         defer if (tombstone_raw) |value| alloc.free(value);
                         const changed_source_revision = if (tombstone_raw) |raw| blk: {
                             const tombstone = try graph_edge_ttl_tombstone.Tombstone.decode(raw);
@@ -10688,10 +10629,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const lifetime_key = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, edge_key, index_name, expected_generation, change.state_key);
                         var lifetime_key_owned = true;
                         errdefer if (lifetime_key_owned) alloc.free(lifetime_key);
-                        const lifetime_raw = store.get(alloc, lifetime_key) catch |err| switch (err) {
-                            error.NotFound => null,
-                            else => return err,
-                        };
+                        const lifetime_raw = try missingAsNull(store.get(alloc, lifetime_key));
                         defer if (lifetime_raw) |value| alloc.free(value);
                         var source_timestamp = incoming_edge.ttl_created_ns;
                         if (lifetime_raw != null and !changed_source_revision and !preserve_incoming_lifetimes) {
@@ -10700,10 +10638,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             source_timestamp = std.mem.readInt(u64, raw[0..8], .big);
                             if (source_timestamp == 0) return error.InvalidGraphEdgeTtlLifetime;
                         } else if (!changed_source_revision and !preserve_incoming_lifetimes) {
-                            const previous_owned = store.get(alloc, contender_key) catch |err| switch (err) {
-                                error.NotFound => null,
-                                else => return err,
-                            };
+                            const previous_owned = try missingAsNull(store.get(alloc, contender_key));
                             defer if (previous_owned) |value| alloc.free(value);
                             const previous_raw: ?[]const u8 = if (previous_owned) |raw| raw else if (pending.write_positions.get(contender_key)) |position| pending_writes[position].value else null;
                             if (previous_raw) |raw| {
@@ -10985,10 +10920,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (graph_writes) |write| {
                 const tombstone_key = try internal_keys.graphEdgeTtlTombstoneKeyAlloc(alloc, write.key, index_name, expected_generation, state_key);
                 defer alloc.free(tombstone_key);
-                const tombstone_raw = store.get(alloc, tombstone_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const tombstone_raw = try missingAsNull(store.get(alloc, tombstone_key));
                 defer if (tombstone_raw) |raw| alloc.free(raw);
                 const suppressed = if (tombstone_raw) |raw| blk: {
                     const tombstone = try graph_edge_ttl_tombstone.Tombstone.decode(raw);
@@ -11952,10 +11884,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 inline for (tags, 0..) |outcome, i| {
                     counter_keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(outcome));
                     initialized_counters += 1;
-                    const raw = counter_probe.get(counter_keys[i]) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const raw = try missingAsNull(counter_probe.get(counter_keys[i]));
                     if (raw) |value| {
                         counter_counts[i] = try internal_keys.decodeDerivedCoverageOutcomeCount(value);
                     } else {
@@ -11984,10 +11913,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         alloc.free(marker_key);
                         return err;
                     };
-                    const existing = marker_probe.get(marker_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const existing = try missingAsNull(marker_probe.get(marker_key));
                     const existing_outcome: ?DerivedCoverageOutcome = if (existing) |value|
                         std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome
                     else
@@ -12083,10 +12009,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 try internal_keys.documentKeyAlloc(alloc, doc_key);
             defer alloc.free(internal_doc_key);
-            const raw = store.get(alloc, internal_doc_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const raw = try missingAsNull(store.get(alloc, internal_doc_key));
             if (raw == null) return null;
             defer alloc.free(raw.?);
             return try index_manager.materializeStoredValueAlloc(alloc, internal_doc_key, raw.?);

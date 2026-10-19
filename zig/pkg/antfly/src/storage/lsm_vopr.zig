@@ -17,6 +17,7 @@
 //! maintenance, and modeled storage implementation.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const builtin = @import("builtin");
 const vopr = @import("vopr");
 const backend_types = @import("antfly_local_sources").storage_backend_types;
@@ -370,14 +371,8 @@ fn modelMatches(state: anytype) !bool {
         var lsm_read = try lsm_store.beginRead();
         defer lsm_read.abort();
         for (keys) |key| {
-            const mem_value = mem_read.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            const lsm_value = lsm_read.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const mem_value = try missingAsNull(mem_read.get(key));
+            const lsm_value = try missingAsNull(lsm_read.get(key));
             if (mem_value == null or lsm_value == null) {
                 if ((mem_value == null) != (lsm_value == null)) return false;
             } else if (!std.mem.eql(u8, mem_value.?, lsm_value.?)) return false;

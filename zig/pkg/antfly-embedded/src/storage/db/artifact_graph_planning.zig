@@ -17,6 +17,7 @@
 //! snapshot through a read-only Store facade and collect guarded commands;
 //! they never materialize worker-local graph state under producer authority.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const erased = @import("../backend_erased.zig");
 const snapshot_store = @import("../snapshot_store_view.zig");
 const publication = @import("artifact_publication.zig");
@@ -131,29 +132,20 @@ pub const Context = struct {
     /// Resolution input participates in the publication receipt and CAS guard.
     pub fn getResolutionAlloc(self: *Context, key: []const u8) !?[]u8 {
         for (self.base.artifact_sources) |source| if (std.mem.eql(u8, source.key, key)) {
-            return self.getAlloc(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            return try missingAsNull(self.getAlloc(key));
         };
         const sources = try self.owned.alloc(publication.ArtifactSource, self.base.artifact_sources.len + 1);
         @memcpy(sources[0..self.base.artifact_sources.len], self.base.artifact_sources);
         sources[sources.len - 1] = try self.guard(key);
         std.mem.sort(publication.ArtifactSource, sources, {}, guardLess);
         self.base.artifact_sources = sources;
-        return self.getAlloc(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.getAlloc(key));
     }
 
     fn guard(self: *Context, key: []const u8) !publication.ArtifactSource {
         var fork = try self.read.forkRead();
         defer fork.abort();
-        const value = fork.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const value = try missingAsNull(fork.get(key));
         var digest: ?publication.Digest = null;
         if (value) |bytes| {
             var hash: publication.Digest = undefined;

@@ -18,6 +18,7 @@
 //! retaining earlier accepted commands. This is NOT a user-row savepoint:
 //! native row/index/artifact side effects require their own complete protocol.
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const local = @import("antfly_local_sources");
 const Txn = local.storage_docstore.DocStore.Txn;
 const Capture = local.storage_txn_mutation_capture.Capture;
@@ -89,10 +90,7 @@ pub const Journal = struct {
         if (self.verification_filter) |filter| if (!try filter.call(filter.group_id, key)) return;
         if (self.originals.contains(key)) return;
         if (self.originals.count() == max_keys) return error.MetadataCommandTooLarge;
-        const before = self.txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const before = try missingAsNull(self.txn.get(key));
         var bytes = std.math.add(usize, self.bytes, key.len + @sizeOf(?[]const u8)) catch return error.MetadataCommandTooLarge;
         if (before) |value| bytes = std.math.add(usize, bytes, value.len) catch return error.MetadataCommandTooLarge;
         if (bytes > max_bytes) return error.MetadataCommandTooLarge;

@@ -18,6 +18,7 @@
 //! fences the epoch, namespace, owner and progress CAS. A bad source is rechecked
 //! at publication, so a concurrent repair cannot publish a stale failure.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const time = @import("antfly_platform").time;
 const registry = @import("schema_registry.zig");
 const schema = @import("../schema.zig");
@@ -84,10 +85,7 @@ pub const Progress = struct {
 };
 
 fn optional(txn: *docstore.DocStore.Txn, key: []const u8) !?[]const u8 {
-    return txn.get(key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(txn.get(key));
 }
 
 pub fn status(txn: *docstore.DocStore.Txn, view: registry.SchemaView) !Progress {

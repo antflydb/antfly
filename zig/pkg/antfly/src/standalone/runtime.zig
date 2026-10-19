@@ -17,6 +17,7 @@ const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.
 const hot_standby_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
 const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const hot_standby_wal = @import("../storage/wal_runtime.zig");
 const inference_provider = @import("inference_provider.zig");
@@ -13603,10 +13604,7 @@ test "standalone schema finalizer defers fenced tables independently and resumes
     // racing with the observation. Preserve and restore its original bytes.
     var key_buf: [192]u8 = undefined;
     const actual_key = try std.fmt.bufPrint(&key_buf, "\x00\x00__metadata__:metadata_table_transition_fence:{d}:7", .{group_ids.main_metadata_group_id});
-    const original = store.store.get(alloc, actual_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const original = try missingAsNull(store.store.get(alloc, actual_key));
     defer if (original) |bytes| alloc.free(bytes);
     var fence: [12]u8 = @splat(0);
     std.mem.writeInt(u32, fence[8..12], 1, .little);

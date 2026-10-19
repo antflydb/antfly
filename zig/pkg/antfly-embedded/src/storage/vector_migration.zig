@@ -18,6 +18,7 @@
 //! mutation capture maintains one latest reference per artifact in that same
 //! transaction, so replay cannot lag or retain a second unbounded payload log.
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 pub const contract = @import("../common/vector_migration.zig");
 const payload = @import("artifact_payload.zig");
 const docstore = @import("docstore.zig");
@@ -231,10 +232,7 @@ pub fn advance(alloc: Allocator, primary: *docstore.DocStore, source: payload.St
         if (raw.len != 8) return error.InvalidVectorMigrationState;
         next.charged_temporary_bytes = std.mem.readInt(u64, raw[0..8], .little);
     } else |err| if (err != error.NotFound) return err;
-    const epoch = txn.get(payload.reference_epoch_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const epoch = try missingAsNull(txn.get(payload.reference_epoch_key));
     if (epoch) |bytes| {
         if (bytes.len != 8) return error.InvalidVectorReferenceEpoch;
         next.replay_cursor = std.mem.readInt(u64, bytes[0..8], .little);
@@ -267,10 +265,7 @@ pub fn publish(alloc: Allocator, primary: *docstore.DocStore, job: contract.Job)
     var txn = try primary.runtime_store.beginWrite();
     var committed = false;
     defer if (!committed) txn.abort();
-    const epoch = txn.get(payload.reference_epoch_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const epoch = try missingAsNull(txn.get(payload.reference_epoch_key));
     if (epoch) |bytes| {
         if (bytes.len != 8) return error.InvalidVectorReferenceEpoch;
         next.replay_cursor = std.mem.readInt(u64, bytes[0..8], .little);

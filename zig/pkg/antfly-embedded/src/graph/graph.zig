@@ -21,6 +21,7 @@
 //!   - Edge value: [weight:f64 LE][created_at:u64 LE][updated_at:u64 LE][metadata_json]
 
 const std = @import("std");
+const missingAsNull = @import("../storage/backend_types.zig").missingAsNull;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
@@ -7455,10 +7456,7 @@ pub const GraphIndex = struct {
 
     fn replaceProjectedExpirationInBatch(self: *GraphIndex, batch: anytype, reverse_key: []const u8, replacement: ?[]const u8) !void {
         if (self.ttl_duration_ns == 0) return;
-        const previous = batch.get(reverse_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous = try missingAsNull(batch.get(reverse_key));
         if (previous) |raw| {
             const decoded = try decodeEdgeValue(raw);
             if (decoded.ttl_created_ns != 0) {

@@ -14,6 +14,7 @@
 // limitations.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const vopr = @import("vopr");
 const metadata_api = @import("api.zig");
 const metadata_control_loop = @import("control_loop.zig");
@@ -3758,10 +3759,7 @@ pub const MetadataHttpNodeVopr = struct {
         };
         defer db.close();
 
-        return db.findMedianKey(alloc) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(db.findMedianKey(alloc));
     }
 
     pub fn reconcileLeaseStats(self: MetadataHttpNodeVopr) metadata_reconcile_lease.Stats {

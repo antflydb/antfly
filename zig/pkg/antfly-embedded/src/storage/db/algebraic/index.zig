@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("../../backend_types.zig").missingAsNull;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const platform_sync = @import("antfly_platform").sync;
@@ -3288,10 +3289,7 @@ pub const Index = struct {
                 errdefer index.alloc.free(registry_prefix);
                 const counter_key = try storageBytesKeyAlloc(index.alloc, index.storage_namespace);
                 errdefer index.alloc.free(counter_key);
-                const raw = inner.get(counter_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const raw = try missingAsNull(inner.get(counter_key));
                 if (raw) |value| if (value.len != @sizeOf(u64))
                     return error.InvalidAlgebraicStorageByteCounter;
                 return .{
@@ -3693,10 +3691,7 @@ pub const Index = struct {
         if (generation == 0) return;
         const key = try self.appliedGenerationKeyAlloc();
         defer self.alloc.free(key);
-        const existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(key));
         if (existing) |raw| {
             if (raw.len != @sizeOf(u64)) return error.CorruptAlgebraicStorage;
             if (std.mem.readInt(u64, raw[0..8], .big) >= generation) return;
@@ -3975,10 +3970,7 @@ pub const Index = struct {
             .bucket = bucket,
         });
         defer self.alloc.free(key);
-        const existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(key));
         const encoded = (try tensor_mod.applyRowSlotToBytesAlloc(self.alloc, existing, &.{law_id}, 0, law_id, delta, true)) orelse {
             txn.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -4192,10 +4184,7 @@ pub const Index = struct {
                 .bucket = expression_coordinate.bucket,
             });
             defer self.alloc.free(key);
-            const existing = txn.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing = try missingAsNull(txn.get(key));
             const encoded = (try tensor_mod.applyRowSlotToBytesAlloc(self.alloc, existing, &.{law_id}, 0, law_id, entry.value, true)) orelse continue;
             defer self.alloc.free(encoded);
             try txn.put(key, encoded);
@@ -10545,10 +10534,7 @@ pub const Index = struct {
             var txn = try storage_accounting.txn(&raw_txn);
             defer txn.deinit();
             try self.persistPathProfileHistoryTxn(&txn, recommendation);
-            const prior_state_payload = txn.get(state_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const prior_state_payload = try missingAsNull(txn.get(state_key));
             var should_write_state = true;
             if (prior_state_payload) |payload| {
                 var prior_state = self.decodePersistedMaterializationState(payload) catch null;
@@ -10558,10 +10544,7 @@ pub const Index = struct {
                 }
             }
             var prior_candidate: ?PersistedAdaptiveCandidate = null;
-            const prior_candidate_payload = txn.get(candidate_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const prior_candidate_payload = try missingAsNull(txn.get(candidate_key));
             if (prior_candidate_payload) |payload| prior_candidate = self.decodePersistedAdaptiveCandidate(payload) catch null;
             defer if (prior_candidate) |*candidate| candidate.deinit(self.alloc);
             const generation = if (prior_candidate) |candidate| candidate.generation + 1 else 1;
@@ -13516,10 +13499,7 @@ pub const Index = struct {
         errdefer raw_txn.abort();
         var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
-        const existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(key));
         const prior = if (existing) |payload|
             self.decodePersistedObservation(payload) catch PersistedObservationMeta{}
         else
@@ -13747,10 +13727,7 @@ pub const Index = struct {
         var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         var prior_candidate: ?PersistedAdaptiveCandidate = null;
-        const prior_payload = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const prior_payload = try missingAsNull(txn.get(key));
         if (prior_payload) |payload| prior_candidate = self.decodePersistedAdaptiveCandidate(payload) catch null;
         defer if (prior_candidate) |*candidate| candidate.deinit(self.alloc);
         const generation = if (prior_candidate) |candidate| candidate.generation + 1 else 1;
@@ -13824,10 +13801,7 @@ pub const Index = struct {
     ) !void {
         const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(state_key);
-        const existing_state = txn.get(state_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_state = try missingAsNull(txn.get(state_key));
         const observation_count: u64 = if (existing_state) |payload| blk: {
             var state = self.decodePersistedMaterializationState(payload) catch break :blk 0;
             defer state.deinit(self.alloc);
@@ -13839,10 +13813,7 @@ pub const Index = struct {
 
         const progress_key = try adaptive_mod.progressKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(progress_key);
-        const existing_progress = txn.get(progress_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_progress = try missingAsNull(txn.get(progress_key));
         if (existing_progress) |payload| {
             var progress = self.decodePersistedAdaptiveProgress(payload) catch return;
             defer progress.deinit(self.alloc);
@@ -13892,10 +13863,7 @@ pub const Index = struct {
     ) !void {
         const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, progress.recommendation);
         defer self.alloc.free(state_key);
-        const existing_state = txn.get(state_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_state = try missingAsNull(txn.get(state_key));
         const observation_count: u64 = if (existing_state) |payload| blk: {
             var state = self.decodePersistedMaterializationState(payload) catch break :blk 0;
             defer state.deinit(self.alloc);
@@ -14441,10 +14409,7 @@ pub const Index = struct {
                 .bucket = null,
             });
             defer self.alloc.free(key);
-            const existing = txn.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing = try missingAsNull(txn.get(key));
             const encoded = (try tensor_mod.applyRowSlotToBytesAlloc(self.alloc, existing, &.{.count}, 0, .count, delta, true)) orelse {
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
@@ -14953,10 +14918,7 @@ pub const Index = struct {
             .bucket = bucket_start,
         });
         defer self.alloc.free(key);
-        const existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(key));
         const encoded = try tensor_mod.applyRowSlotToBytesAlloc(self.alloc, existing, &.{law_id}, 0, law_id, delta, true);
         if (encoded) |bytes| {
             defer self.alloc.free(bytes);
@@ -15045,10 +15007,7 @@ pub const Index = struct {
         });
         defer self.alloc.free(key);
 
-        const existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(key));
         const encoded = try tensor_mod.applyRowSlotToBytesAlloc(self.alloc, existing, &.{law_id}, 0, law_id, delta, true);
         if (encoded) |bytes| {
             defer self.alloc.free(bytes);
@@ -15204,10 +15163,7 @@ pub const Index = struct {
             .bucket = bucket,
         });
         defer self.alloc.free(expr_key);
-        const expr_existing = txn.get(expr_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const expr_existing = try missingAsNull(txn.get(expr_key));
         const expr_encoded = (try tensor_mod.applyRowSlotToBytesAlloc(self.alloc, expr_existing, &.{law_id}, 0, law_id, delta, true)) orelse {
             txn.delete(expr_key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -15793,10 +15749,7 @@ pub const Index = struct {
         errdefer self.alloc.free(id);
         const key = try self.symbolKeyAlloc(id);
         defer self.alloc.free(key);
-        const existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(key));
         if (existing) |value| {
             if (!std.mem.eql(u8, value, canonical)) return error.AlgebraicSymbolCollision;
             return id;
@@ -15810,10 +15763,7 @@ pub const Index = struct {
         errdefer self.alloc.free(id);
         const key = try self.symbolKeyAlloc(id);
         defer self.alloc.free(key);
-        const existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(key));
         if (existing) |value| {
             if (!std.mem.eql(u8, value, canonical)) return error.AlgebraicSymbolCollision;
             return id;
@@ -16027,10 +15977,7 @@ pub const Index = struct {
             .bucket = bucket_start,
         });
         defer self.alloc.free(expr_key);
-        const existing = txn.get(expr_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(expr_key));
         const encoded = (try tensor_mod.applyRowSlotToBytesAlloc(self.alloc, existing, &.{law_id}, 0, law_id, delta, omit_empty)) orelse {
             txn.delete(expr_key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -16062,10 +16009,7 @@ pub const Index = struct {
             .bucket = bucket_start,
         });
         defer self.alloc.free(expr_key);
-        const existing = txn.get(expr_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(expr_key));
         const next_owned = if (next) |value| try self.alloc.dupe(u8, value) else null;
         const encoded = (try tensor_mod.replaceRowSlotToBytesAlloc(self.alloc, existing, &.{law_id}, 0, law_id, next_owned, true)) orelse {
             txn.delete(expr_key) catch |err| switch (err) {
@@ -16148,10 +16092,7 @@ pub const Index = struct {
             if (delta_count == 0) continue;
             const delta = try algebra.encodeI64Alloc(self.alloc, delta_count);
             defer self.alloc.free(delta);
-            const old_support = txn.get(pending.key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const old_support = try missingAsNull(txn.get(pending.key));
             var support_mutation = try tensor_mod.applyCountSupportDeltaBytesAlloc(self.alloc, old_support, delta);
             defer support_mutation.deinit(self.alloc);
             if (support_mutation.encoded) |encoded_support| {
@@ -16167,10 +16108,7 @@ pub const Index = struct {
         var expression_it = accumulator.expression_rows.iterator();
         while (expression_it.next()) |entry| {
             const pending = entry.value_ptr;
-            const old_row = txn.get(pending.key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const old_row = try missingAsNull(txn.get(pending.key));
             var deltas = std.ArrayListUnmanaged(tensor_mod.SlotDelta).empty;
             defer deltas.deinit(self.alloc);
             const pending_slots = try pending.slotDeltasAlloc(self.alloc);
@@ -16345,10 +16283,7 @@ pub const Index = struct {
         defer self.alloc.free(measure_id);
         const support_key = try self.keyAlloc(&.{ "minmax", expr_id, support_group_id, measure_id });
         defer self.alloc.free(support_key);
-        const old_support = txn.get(support_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const old_support = try missingAsNull(txn.get(support_key));
         var support_mutation = try tensor_mod.applyCountSupportDeltaAlloc(self.alloc, old_support, sign);
         defer support_mutation.deinit(self.alloc);
         if (support_mutation.encoded) |encoded_support| {
@@ -17078,10 +17013,7 @@ pub const Index = struct {
             .bucket = null,
         });
         defer self.alloc.free(key);
-        const existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(key));
         const encoded = try tensor_mod.applyRowSlotToBytesAlloc(self.alloc, existing, &.{.count}, 0, .count, delta, true);
         if (encoded) |bytes| {
             defer self.alloc.free(bytes);
@@ -17937,10 +17869,7 @@ pub const Index = struct {
 
         // `current` borrows txn-owned bytes (valid until the next txn write);
         // the union allocates a fresh buffer before we write it back.
-        const current = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const current = try missingAsNull(txn.get(key));
         const merged = (try law_mod.combineAlloc(self.alloc, .hll, current, contribution)) orelse return;
         defer self.alloc.free(merged);
         try txn.put(key, merged);
@@ -18239,10 +18168,7 @@ pub const Index = struct {
         const dirty_key = try self.hllCardinalityGroupDirtyKeyAlloc(hcfg.name, group_key);
         defer self.alloc.free(dirty_key);
 
-        const progress = txn.get(progress_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const progress = try missingAsNull(txn.get(progress_key));
         var staged: ?[]u8 = if (progress == null) null else blk: {
             const bytes = txn.get(stage_key) catch |err| switch (err) {
                 error.NotFound => break :blk null,
@@ -19002,10 +18928,7 @@ pub const Index = struct {
         defer self.alloc.free(empty_group);
         const key = try self.hllCardinalityKeyAlloc(spec.name, empty_group);
         defer self.alloc.free(key);
-        const encoded = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded = try missingAsNull(txn.get(key));
         if (encoded) |bytes| {
             _ = hll.estimateEncoded(bytes) catch return error.CorruptHllMaterialization;
             return try self.alloc.dupe(u8, bytes);

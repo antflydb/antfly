@@ -14,6 +14,7 @@
 // limitations.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
@@ -1272,19 +1273,13 @@ pub const RaftApplyStore = struct {
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return .{};
         var result: admission.Observation = .{};
         var key_buf: [160]u8 = undefined;
-        const watermark = group_store.store.get(alloc, try keyForGroup(&key_buf, group_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const watermark = try missingAsNull(group_store.store.get(alloc, try keyForGroup(&key_buf, group_id)));
         defer if (watermark) |raw| alloc.free(raw);
         if (watermark) |raw| {
             if (raw.len < 8) return error.InvalidDataApplyBatch;
             result.applied_index = std.mem.readInt(u64, raw[0..8], .little);
         }
-        const reservation = group_store.store.get(alloc, try arbitration.reservationKey(&key_buf, group_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const reservation = try missingAsNull(group_store.store.get(alloc, try arbitration.reservationKey(&key_buf, group_id)));
         defer if (reservation) |raw| alloc.free(raw);
         if (reservation) |raw| {
             const value = try arbitration.Reservation.decode(raw);

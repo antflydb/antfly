@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const db_config = @import("config.zig");
@@ -531,10 +532,7 @@ pub const DBCore = struct {
         // first row that references them. Large, long-lived tables should not
         // deserialize every schema generation during startup.
         if (opened.schema) |active_schema| {
-            const public_json = opened.store.get(alloc, public_schema_json_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const public_json = try missingAsNull(opened.store.get(alloc, public_schema_json_key));
             defer if (public_json) |json| alloc.free(json);
             if (active_schema.requires_public_schema and public_json == null)
                 return error.InvalidSchemaUpdateRequest;
@@ -1256,10 +1254,7 @@ pub const DBCore = struct {
     }
 
     pub fn getStoreValue(self: *DBCore, alloc: Allocator, key: []const u8) !?[]u8 {
-        return self.store.get(alloc, key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.store.get(alloc, key));
     }
 
     pub fn putStoreBatch(self: *DBCore, writes: []const docstore_mod.KVPair, deletes: []const []const u8) !void {
@@ -1750,10 +1745,7 @@ pub const DBCore = struct {
             deletes_versioned = deletes_versioned or std.mem.eql(u8, key, versioned_key);
         }
 
-        const existing_versioned = self.store.get(self.alloc, versioned_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_versioned = try missingAsNull(self.store.get(self.alloc, versioned_key));
         defer if (existing_versioned) |value| self.alloc.free(value);
         if (existing_versioned) |existing| {
             if (deletes_versioned) return error.ImmutableSchemaVersionConflict;
@@ -1763,10 +1755,7 @@ pub const DBCore = struct {
         }
 
         if (!same_active_epoch) return;
-        const existing_active = self.store.get(self.alloc, public_schema_json_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_active = try missingAsNull(self.store.get(self.alloc, public_schema_json_key));
         defer if (existing_active) |value| self.alloc.free(value);
         if (incoming_active) |incoming| {
             if (existing_active) |existing| {
@@ -1864,10 +1853,7 @@ pub const DBCore = struct {
         var public_json: ?[]u8 = null;
         defer if (public_json) |json| self.alloc.free(json);
         if (next_schema != null) {
-            public_json = self.store.get(self.alloc, public_schema_json_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            public_json = try missingAsNull(self.store.get(self.alloc, public_schema_json_key));
         }
         const next_epoch = if (next_schema) |schema| try self.prepareSchemaEpoch(schema, public_json) else null;
         var epoch_owned = next_epoch != null;
@@ -2528,10 +2514,7 @@ fn loadTransactionSchemaVersionView(alloc: Allocator, store: *docstore_mod.DocSt
     errdefer schema_mod.freeSchema(alloc, schema);
     const key = try public_schema_mod.versionedSchemaKeyAlloc(alloc, version);
     defer alloc.free(key);
-    const json = store.get(alloc, key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const json = try missingAsNull(store.get(alloc, key));
     defer if (json) |value| alloc.free(value);
     var validator = if (json) |value| try public_schema_mod.CompiledTableValidator.init(alloc, value) else null;
     errdefer if (validator) |*compiled| compiled.deinit(alloc);

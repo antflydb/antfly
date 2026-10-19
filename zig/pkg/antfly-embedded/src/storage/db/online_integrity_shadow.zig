@@ -17,6 +17,7 @@
 //! shadow. The canonical physical claim keys do not change; normal readers and
 //! participants may only observe the live base interval until atomic publish.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const ranges = @import("range_state.zig");
 const ByteRange = @import("types.zig").ByteRange;
 const types = @import("types.zig");
@@ -124,10 +125,7 @@ pub fn cleanup(alloc: std.mem.Allocator, txn: anytype, donor: ByteRange, after: 
 }
 
 pub fn rawRange(txn: anytype) !?[]const u8 {
-    return txn.get(range_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(txn.get(range_key));
 }
 
 /// Borrow only while the read/apply transaction is alive. This path is shared

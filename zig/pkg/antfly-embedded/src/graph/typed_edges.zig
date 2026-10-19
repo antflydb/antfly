@@ -17,6 +17,7 @@
 //! needs edge identity, not timestamps, weights or document metadata. Each
 //! type range preserves the original reverse-key partition order.
 const std = @import("std");
+const missingAsNull = @import("../storage/backend_types.zig").missingAsNull;
 const backend = @import("../storage/backend_erased.zig");
 const keys = @import("../storage/internal_keys.zig");
 const Allocator = std.mem.Allocator;
@@ -33,10 +34,7 @@ pub const MaintenanceState = struct { active: bool, ready: bool };
 /// partial indexes are detected once before recording an inactive marker; an
 /// upgrade must never silently stop maintaining already persisted postings.
 pub fn maintenanceState(batch: anytype, demanded: bool) !MaintenanceState {
-    const marker = batch.get(active_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const marker = try missingAsNull(batch.get(active_key));
     var active = demanded;
     var was_active = false;
     if (marker) |raw| {

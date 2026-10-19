@@ -16,6 +16,7 @@
 //! Authenticated source-copy provenance. These are inert donor proof bodies
 //! plus selected-output bitmaps, never copied receipt or authority records.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const provenance = @import("artifact_producer_provenance.zig");
 const publication = @import("artifact_publication.zig");
 const inventory = @import("artifact_inventory.zig");
@@ -356,10 +357,7 @@ pub fn prepareReceiverCandidate(
     }
     const artifact_sources = try owned.alloc(publication.ArtifactSource, proof.artifact_sources.len);
     for (proof.artifact_sources, artifact_sources) |donor, *receiver| {
-        const raw = txn.get(donor.key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(txn.get(donor.key));
         if (raw) |value| {
             const expected = donor.content_digest orelse return null;
             var actual: publication.Digest = undefined;
@@ -377,10 +375,7 @@ pub fn prepareReceiverCandidate(
     var selected_count: usize = 0;
     for (proof.effects) |effect| {
         if (decoded.bitmap[effect.source_index / 8] & (@as(u8, 1) << @intCast(effect.source_index % 8)) == 0) continue;
-        const raw = txn.get(effect.key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(txn.get(effect.key));
         if (raw) |value| {
             const expected = effect.value_digest orelse return null;
             if (value.len != effect.value_bytes) return null;
@@ -465,10 +460,7 @@ pub fn revalidateReceiverCandidate(
     };
     for (candidate.effects) |selected| {
         if (!std.meta.eql(try publication.artifactRevision(txn, receiver_namespace, selected.effect.key), selected.input_position)) return false;
-        const raw = txn.get(selected.effect.key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(txn.get(selected.effect.key));
         if (raw) |value| {
             const expected = selected.effect.value_digest orelse return false;
             if (value.len != selected.effect.value_bytes) return false;

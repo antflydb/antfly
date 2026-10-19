@@ -18,6 +18,7 @@
 //! values and a committed producer epoch. Payloads contain final values, never
 //! local staging paths or promotion keys.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const keys = @import("../internal_keys.zig");
 
 pub const max_mutations = 4096;
@@ -635,10 +636,7 @@ pub fn validateArtifactSources(alloc: std.mem.Allocator, txn: anytype, namespace
         defer alloc.free(document);
         if (!std.mem.eql(u8, document, sources[source.source_index].document_key)) return error.InvalidBatchRequest;
         if (!std.meta.eql(try artifactRevision(txn, namespace, source.key), source.input_position)) return error.EnrichmentSourceChanged;
-        const raw = txn.get(source.key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(txn.get(source.key));
         if (raw) |value| {
             const expected = source.content_digest orelse return error.EnrichmentSourceChanged;
             var actual: Digest = undefined;
@@ -655,14 +653,8 @@ pub fn capturePrimarySource(alloc: std.mem.Allocator, txn: anytype, namespace: N
     defer alloc.free(doc_key);
     const row_key = try keys.relationalRowKeyAlloc(alloc, document);
     defer alloc.free(row_key);
-    const doc = txn.get(doc_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    const row = txn.get(row_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const doc = try missingAsNull(txn.get(doc_key));
+    const row = try missingAsNull(txn.get(row_key));
     if (doc != null and row != null) return error.EnrichmentSourceChanged;
     const raw = doc orelse row orelse return error.EnrichmentSourceChanged;
     var digest_value: Digest = undefined;
@@ -867,14 +859,8 @@ pub fn validateSources(alloc: std.mem.Allocator, txn: anytype, namespace: Namesp
         defer alloc.free(primary_key);
         const relational_key = try keys.relationalRowKeyAlloc(alloc, source.document_key);
         defer alloc.free(relational_key);
-        const primary = txn.get(primary_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        const relational = txn.get(relational_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const primary = try missingAsNull(txn.get(primary_key));
+        const relational = try missingAsNull(txn.get(relational_key));
         if (!source.exists) {
             if (source.input_position == null or primary != null or relational != null) return error.EnrichmentSourceChanged;
             continue;
@@ -1092,10 +1078,7 @@ pub fn stageCoverage(alloc: std.mem.Allocator, txn: anytype, command: Command, c
         const target: ?usize = if (tombstonedSource(command.sources, item.document_key)) null else if (item.outcome) |outcome| (if (outcome == .produced) @as(usize, 0) else 1) else if (produced) 0 else 1;
         const marker = try epoch.marker(alloc, scope, item.index_name, item.generation, item.document_key);
         defer alloc.free(marker);
-        const previous_raw = txn.get(marker) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous_raw = try missingAsNull(txn.get(marker));
         const previous: ?usize = if (previous_raw) |raw| for (outcomes, 0..) |name, index| {
             if (std.mem.eql(u8, name, raw)) break index;
         } else return error.InvalidDerivedCoverageOutcome else null;

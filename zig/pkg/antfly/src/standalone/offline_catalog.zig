@@ -17,6 +17,7 @@
 //! Only the selected table and epoch change; resources, extensions, range and
 //! listing indexes remain in the original transactionally durable store.
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const lsm = @import("antfly_local_sources").storage_lsm_backend;
 const erased = @import("antfly_local_sources").storage_backend_erased;
 const files = @import("../common/migration_files.zig");
@@ -71,10 +72,7 @@ pub const Catalog = struct {
         errdefer store.deinit();
         var txn = try store.beginRead();
         defer txn.abort();
-        const head_bytes = txn.get(format.head_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const head_bytes = try missingAsNull(txn.get(format.head_key));
         if (head_bytes) |raw| {
             var decoded = try std.json.parseFromSlice(format.Head, alloc, raw, .{});
             defer decoded.deinit();

@@ -17,6 +17,7 @@
 //! sequence is advanced in the same transaction as control or retained row
 //! effects; it is not a fabricated Raft watermark.
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const keys = @import("internal_keys.zig");
 pub const Kind = enum(u8) { raft = 1, native = 2 };
 pub const key = "\x00\x00__metadata__:source_authority";
@@ -88,10 +89,7 @@ pub fn require(txn: anytype, kind: Kind, namespace: [24]u8) !State {
 }
 
 fn requireNoRaftMarker(txn: anytype) !void {
-    const marker = txn.get(&keys.ordered_document_applied_entry_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const marker = try missingAsNull(txn.get(&keys.ordered_document_applied_entry_key));
     if (marker != null) return error.OnlineSourceScopeChanged;
 }
 

@@ -17,6 +17,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const storage_engine = @import("engine.zig");
 pub const scraping = if (builtin.os.tag == .freestanding) @import("db/scraping_stub.zig") else @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
@@ -295,10 +296,7 @@ pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
 const owner_catalog_initialized_key = "\x00\x00__metadata__:owner_catalog_initialized";
 
 fn loadOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {
-    return db.core.store.get(alloc, owner_catalog_initialized_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(db.core.store.get(alloc, owner_catalog_initialized_key));
 }
 
 fn persistOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !void {
@@ -1086,10 +1084,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
 
 pub fn loadLocalTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {
     if (comptime storage_engine.enabled) return storage_engine.call("writeLoadLocalTableSchemaJson", .{ alloc, db });
-    return db.core.store.get(alloc, local_schema_json_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(db.core.store.get(alloc, local_schema_json_key));
 }
 
 pub fn freeOwnedBatchWrites(alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite) void {

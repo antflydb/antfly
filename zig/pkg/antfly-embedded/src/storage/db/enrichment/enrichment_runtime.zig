@@ -15,6 +15,7 @@
 
 const server_test_adapter = if (builtin.is_test) @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter else struct {};
 const std = @import("std");
+const missingAsNull = @import("../../backend_types.zig").missingAsNull;
 const antfly_image = @import("antfly_image");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -31769,10 +31770,7 @@ fn storeGetAllocWithRetry(runtime: anytype, key: []const u8) ![]u8 {
 }
 
 fn storeGetOptionalDocumentAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) !?[]u8 {
-    return readAllocWithRetry(runtime, key, storeGetDocumentAlloc) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(readAllocWithRetry(runtime, key, storeGetDocumentAlloc));
 }
 
 /// `NotFound` is the only absence proof. In particular, writer contention is
@@ -31782,10 +31780,7 @@ fn storeGetOptionalDocumentAllocWithRetry(runtime: *EnrichmentRuntime, key: []co
 /// empty replacement. Retry bounded contention and propagate every remaining
 /// operational failure to the supervised worker boundary.
 fn storeGetOptionalAllocWithRetry(runtime: anytype, key: []const u8) !?[]u8 {
-    return storeGetAllocWithRetry(runtime, key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(storeGetAllocWithRetry(runtime, key));
 }
 
 test "optional enrichment reads never classify contention as source absence" {
@@ -31809,17 +31804,11 @@ test "optional enrichment reads never classify contention as source absence" {
     };
 
     var reader = Reader{};
-    const value = readAllocWithRetry(&reader, "source", Reader.get) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const value = try missingAsNull(readAllocWithRetry(&reader, "source", Reader.get));
     try std.testing.expectEqualStrings("value", value.?);
     try std.testing.expectEqual(@as(usize, 2), reader.attempts);
 
-    const missing = readAllocWithRetry(&reader, "source", Reader.missing) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const missing = try missingAsNull(readAllocWithRetry(&reader, "source", Reader.missing));
     try std.testing.expectEqual(@as(?[]u8, null), missing);
     try std.testing.expectError(error.ReadFailed, readAllocWithRetry(&reader, "source", Reader.failed));
 }
@@ -34155,10 +34144,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             if (graph and deleted) {
                 const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc", "g");
                 defer alloc.free(count_key);
-                const count = db.core.store.get(alloc, count_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const count = try missingAsNull(db.core.store.get(alloc, count_key));
                 defer if (count) |value| alloc.free(value);
                 if (count) |value| try std.testing.expectEqual(@as(?usize, 0), try graph_edge_contender.decodeVisibleCount(value, db.core.index_manager.graphIndex("g").?.config.coverage_generation));
             }

@@ -99,6 +99,7 @@ const document_child_range_effects = @import("document_child_range_effects.zig")
 const document_child_range_outbox = @import("document_child_range_outbox.zig");
 const replicated_mutation = @import("replicated_mutation.zig");
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
 const replication_contract = @import("replication_contract.zig");
 const durable_outbox = @import("durable_outbox.zig");
@@ -1790,10 +1791,7 @@ fn clearPortableImportTargetBounded(alloc: Allocator, store: *docstore_mod.DocSt
         else => return err,
     };
     defer alloc.free(marker);
-    const encoded_baseline = store.getPortableImportRollback(alloc, portable_import_identity_baseline_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const encoded_baseline = try missingAsNull(store.getPortableImportRollback(alloc, portable_import_identity_baseline_key));
     defer if (encoded_baseline) |encoded| alloc.free(encoded);
     const baseline = if (encoded_baseline) |encoded|
         try backup_codec.decodeKeyValueBatch(alloc, encoded)
@@ -3297,10 +3295,7 @@ pub const DB = struct {
         try self.enforcePortableRuntimeGate();
         // A failed split may have withdrawn only some graph owners. Keep the
         // live handle closed to reads until the durable retirement is repaired.
-        const pending = self.core.store.get(self.alloc, graph_split_retire_cursor_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const pending = try missingAsNull(self.core.store.get(self.alloc, graph_split_retire_cursor_key));
         if (pending) |cursor| {
             self.alloc.free(cursor);
             return error.GraphMaintenanceInProgress;
@@ -4242,10 +4237,7 @@ pub const DB = struct {
 
             if (opts.primary_only_readonly and opts.open_mode != .query_readonly) return error.UnsupportedOperation;
             if (opts.open_mode == .query_readonly) {
-                const pending_merge = db.core.store.get(alloc, graph_merge_import_recovery_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const pending_merge = try missingAsNull(db.core.store.get(alloc, graph_merge_import_recovery_key));
                 if (pending_merge) |record| {
                     alloc.free(record);
                     return error.GraphMaintenanceInProgress;
@@ -4338,10 +4330,7 @@ pub const DB = struct {
                 try db.persistIndexLoadFailuresFromManager(alloc);
             }
             db.recordStartupOpenStats(profile);
-            const split_retire_cursor = db.core.store.get(alloc, graph_split_retire_cursor_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const split_retire_cursor = try missingAsNull(db.core.store.get(alloc, graph_split_retire_cursor_key));
             if (split_retire_cursor) |cursor| {
                 alloc.free(cursor);
                 if (openModeRequiresReadOnlyBackends(opts.open_mode)) {
@@ -4354,10 +4343,7 @@ pub const DB = struct {
                 }
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
-                const graph_due_rebuild = db.core.store.get(alloc, graph_edge_ttl_due_rebuild_marker) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const graph_due_rebuild = try missingAsNull(db.core.store.get(alloc, graph_edge_ttl_due_rebuild_marker));
                 if (graph_due_rebuild) |marker| {
                     alloc.free(marker);
                     try rebuildGraphTtlDueIndexInRange(alloc, db.core.store, db.core.index_manager, db.core.index_manager.byte_range);
@@ -4486,10 +4472,7 @@ pub const DB = struct {
     fn initializeTableStorage(self: *DB, requested: ?table_storage_mod.Settings) !void {
         var migration_job = try vector_migration.load(self.alloc, self.core.store);
         defer if (migration_job) |*job| job.deinit();
-        const raw = self.core.store.get(self.alloc, &internal_keys.table_storage_settings_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(self.core.store.get(self.alloc, &internal_keys.table_storage_settings_key));
         defer if (raw) |value| self.alloc.free(value);
         if (raw) |value| {
             var parsed = try std.json.parseFromSlice(table_storage_mod.Settings, self.alloc, value, .{});
@@ -4679,10 +4662,7 @@ pub const DB = struct {
         try self.openSourceVectors(true);
         try self.local_execution.source_vectors.load(.acquire).?.beginMigrationRetention();
         errdefer self.requireVectorMigrationRecovery();
-        const raw_epoch = self.core.store.get(self.alloc, @import("../artifact_payload.zig").reference_epoch_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw_epoch = try missingAsNull(self.core.store.get(self.alloc, @import("../artifact_payload.zig").reference_epoch_key));
         defer if (raw_epoch) |value| self.alloc.free(value);
         const epoch: u64 = if (raw_epoch) |value| blk: {
             if (value.len != 8) return error.InvalidVectorReferenceEpoch;
@@ -5075,10 +5055,7 @@ pub const DB = struct {
         if (settings.engine != .local) return error.ObjectStorageRequiresHostedTable;
         lockApply(self);
         defer self.core.unlockApply();
-        const raw = self.core.store.get(self.alloc, &internal_keys.table_storage_settings_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(self.core.store.get(self.alloc, &internal_keys.table_storage_settings_key));
         defer if (raw) |value| self.alloc.free(value);
         if (raw) |value| {
             var parsed = try std.json.parseFromSlice(table_storage_mod.Settings, self.alloc, value, .{});
@@ -7708,10 +7685,7 @@ pub const DB = struct {
         const key = try identity.key(&key_buf);
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        const bytes = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const bytes = try missingAsNull(self.core.store.get(self.alloc, key));
         if (bytes) |encoded| {
             defer self.alloc.free(encoded);
             const stored = try row_policy_bundle_mod.Receipt.decode(encoded);
@@ -7903,10 +7877,7 @@ pub const DB = struct {
             if (self.local_execution.row_policy_gate.currentPhase() != .active or previous.row_policy_phase != .active or
                 publication.policy_generation <= previous.row_policy_generation or
                 (try self.pendingRowPolicyReceipt()) != null) return error.RowPolicyCatalogChanged;
-            const existing_candidate = self.core.store.get(self.alloc, row_policy_bundle_mod.candidate_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing_candidate = try missingAsNull(self.core.store.get(self.alloc, row_policy_bundle_mod.candidate_key));
             defer if (existing_candidate) |value| self.alloc.free(value);
             if (existing_candidate != null) return error.RowPolicyCatalogChanged;
             const encoded_receipt = expected_receipt.encode();
@@ -9578,10 +9549,7 @@ pub const DB = struct {
 
         const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
         defer alloc.free(state_key);
-        const state = self.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const state = try missingAsNull(self.core.getStoreValue(alloc, state_key));
         var state_owned = true;
         errdefer if (state_owned) if (state) |value| alloc.free(value);
 
@@ -9625,10 +9593,7 @@ pub const DB = struct {
 
             const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_ref.name);
             defer alloc.free(state_key);
-            const state = self.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const state = try missingAsNull(self.core.getStoreValue(alloc, state_key));
             errdefer if (state) |value| alloc.free(value);
 
             const manifest_json = try alloc.dupe(u8, row.value);
@@ -10471,10 +10436,7 @@ pub const DB = struct {
         defer alloc.free(rebuild_root_summary_key);
         const progress_key = try internal_keys.artifactRepairSummaryProgressKeyAlloc(alloc);
         defer alloc.free(progress_key);
-        const raw_progress = self.core.store.get(alloc, progress_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw_progress = try missingAsNull(self.core.store.get(alloc, progress_key));
         defer if (raw_progress) |value| alloc.free(value);
 
         const invalidation_pending = if (raw_progress) |progress|
@@ -10789,10 +10751,7 @@ pub const DB = struct {
 
         const progress_key = try internal_keys.artifactRepairKindIndexProgressKeyAlloc(alloc);
         defer alloc.free(progress_key);
-        const raw_progress = self.core.store.get(alloc, progress_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw_progress = try missingAsNull(self.core.store.get(alloc, progress_key));
         defer if (raw_progress) |value| alloc.free(value);
 
         const lower = lower: {
@@ -18469,10 +18428,7 @@ pub const DB = struct {
             if (isMetadataKey(intent.key)) return error.RowPolicyMutationUnsupported;
             const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, intent.key);
             defer self.alloc.free(store_key);
-            const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const old_bytes: ?[]const u8 = try missingAsNull(probe.getLeased(store_key));
             if (old_bytes) |bytes| {
                 if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
                 const old = if (self.core.store.valuesAreAuthenticated())
@@ -18661,10 +18617,7 @@ pub const DB = struct {
     fn lookupSnapshotTimestamp(alloc: Allocator, key: []const u8, probe: *docstore_mod.DocStore.Txn) !u64 {
         const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
         defer alloc.free(timestamp_key);
-        const timestamp = probe.get(timestamp_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const timestamp = try missingAsNull(probe.get(timestamp_key));
         const bytes = timestamp orelse return 0;
         if (bytes.len != 8) return error.InvalidTimestamp;
         return std.mem.readInt(u64, bytes[0..8], .little);
@@ -18744,10 +18697,7 @@ pub const DB = struct {
             error.NotFound => return null,
             else => return err,
         } else "";
-        const raw_progress: ?[]const u8 = read.get(retirement.key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw_progress: ?[]const u8 = try missingAsNull(read.get(retirement.key));
         const Response = struct {
             catalog: []const u8,
             progress: ?[]const u8,
@@ -20467,10 +20417,7 @@ pub const DB = struct {
         defer if (locked) self.core.unlockApplyShared();
         var txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
         defer txn.abort();
-        const raw = txn.get(merge_state_mod.key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(txn.get(merge_state_mod.key));
         var state = if (raw) |value| try merge_state_mod.decodeAlloc(alloc, value) else null;
         defer if (state) |*value| value.deinit(alloc);
         const allowed = merge_state_mod.copyAllowed(state, req.merge_replication.?);
@@ -21115,27 +21062,18 @@ pub const DB = struct {
         // other tables at a later cut. Keep the candidate unpublished until a
         // cluster-coordinated restore/activation barrier is available.
         if (purpose == .historical_table) {
-            const topology_fence = opened_primary.store.get(alloc, @import("relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const topology_fence = try missingAsNull(opened_primary.store.get(alloc, @import("relational_integrity_topology.zig").fence_key));
             if (topology_fence) |bytes| {
                 alloc.free(bytes);
                 return error.CoordinatedConstraintRestoreRequired;
             }
-            const retirement = opened_primary.store.get(alloc, @import("relational_integrity_retirement.zig").key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const retirement = try missingAsNull(opened_primary.store.get(alloc, @import("relational_integrity_retirement.zig").key));
             if (retirement) |bytes| {
                 alloc.free(bytes);
                 return error.CoordinatedConstraintRestoreRequired;
             }
         }
-        const restored_integrity = opened_primary.store.get(alloc, @import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const restored_integrity = try missingAsNull(opened_primary.store.get(alloc, @import("relational_integrity_catalog.zig").key));
         if (restored_integrity) |bytes| {
             defer alloc.free(bytes);
             var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
@@ -23254,10 +23192,7 @@ pub const DB = struct {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             const admission = @import("relational_integrity_generation_admission.zig");
-            const raw = read.get(admission.source_install_receipt_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const raw = try missingAsNull(read.get(admission.source_install_receipt_key));
             if (raw) |bytes| {
                 const receipt = try admission.AppliedReceipt.decode(bytes);
                 const expected = try admission.sourceInstallDigest(publication.fence, publication.before_schema_json_digest, publication.schema_json_digest, publication.before_catalog_digest, publication.after_catalog_digest);
@@ -23911,10 +23846,7 @@ pub const DB = struct {
                 try buffers.ensureUnusedCapacity(alloc, 2);
                 const owned_key = try alloc.dupe(u8, key);
                 buffers.appendAssumeCapacity(owned_key);
-                const raw = read.get(key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const raw = try missingAsNull(read.get(key));
                 const value = if (raw) |bytes| try alloc.dupe(u8, bytes) else null;
                 if (value) |bytes| buffers.appendAssumeCapacity(bytes);
                 try output.append(alloc, .{ .key = owned_key, .comparison = .exact_value, .expected_value = value });
@@ -24582,17 +24514,11 @@ pub const DB = struct {
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const raw = read.get(merge_state_mod.key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const raw = try missingAsNull(read.get(merge_state_mod.key));
                 var state = if (raw) |value| try merge_state_mod.decodeAlloc(alloc, value) else null;
                 defer if (state) |*value| value.deinit(alloc);
                 const table = @import("table_catalog.zig");
-                const table_raw = read.get(table.key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const table_raw = try missingAsNull(read.get(table.key));
                 const row_derived_document = if (table_raw) |value| blk: {
                     const catalog = try table.Catalog.decode(value);
                     break :blk catalog.mode_initialized and catalog.storage_mode == .document and
@@ -24694,19 +24620,10 @@ pub const DB = struct {
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const table_raw = read.get(@import("table_catalog.zig").key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const table_raw = try missingAsNull(read.get(@import("table_catalog.zig").key));
                 const row_count: u64 = if (table_raw) |raw| (try @import("table_catalog.zig").Catalog.decode(raw)).row_count else 0;
-                const existing_schema = read.get(public_schema_json_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
-                const existing_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const existing_schema = try missingAsNull(read.get(public_schema_json_key));
+                const existing_catalog = try missingAsNull(read.get(@import("relational_integrity_catalog.zig").key));
                 try @import("relational_integrity_json.zig").write(.{
                     .namespace = self.core.identity_namespace,
                     .row_count = row_count,
@@ -25172,10 +25089,7 @@ pub const DB = struct {
             const plan = try merge_state_mod.planCheckpointApply(self.alloc, if (existing) |*state| state else null, self.core.byteRange(), checkpoint);
             defer plan.deinit(self.alloc);
             const pages = @import("merge_page_contract.zig");
-            const page_raw = txn.get(pages.key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const page_raw = try missingAsNull(txn.get(pages.key));
             var progress = if (page_raw) |bytes| try pages.decode(self.alloc, bytes) else null;
             defer if (progress) |*value| value.deinit();
             _ = try pages.checkpointPlan(existing, plan.state, checkpoint, if (progress) |value| value.value else null);
@@ -26386,10 +26300,7 @@ pub const DB = struct {
                 }
                 if (try topology.current(&txn) == null) {
                     if (command.fence.role == .split_destination) {
-                        const previous_manifest = txn.get(@import("relational_integrity_handoff.zig").manifest_key) catch |err| switch (err) {
-                            error.NotFound => null,
-                            else => return err,
-                        };
+                        const previous_manifest = try missingAsNull(txn.get(@import("relational_integrity_handoff.zig").manifest_key));
                         if (previous_manifest) |bytes| {
                             var previous = try std.json.parseFromSlice(@import("relational_integrity_handoff.zig").Manifest, self.alloc, bytes, .{});
                             defer previous.deinit();
@@ -26528,10 +26439,7 @@ pub const DB = struct {
                     // can be canceled immediately. Once copying started,
                     // rollback must first restore the range and drain all
                     // off-owner integrity records under the same fence.
-                    const manifest = txn.get(handoff.manifest_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const manifest = try missingAsNull(txn.get(handoff.manifest_key));
                     if (manifest != null) {
                         const raw_progress = txn.get(handoff.prune_key) catch |err| switch (err) {
                             error.NotFound => return error.IntegrityHandoffIncomplete,
@@ -27716,10 +27624,7 @@ pub const DB = struct {
     /// Requires the DB apply lock.
     fn finalizeCompletedIndexAdmissionLocked(self: *DB, index_name: []const u8, key: []const u8) !void {
         if (self.core.denseIndex(index_name)) |entry| {
-            const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const raw = try missingAsNull(self.core.store.get(self.alloc, key));
             defer if (raw) |value| self.alloc.free(value);
             if (raw) |value| {
                 const marker = try decodeManagedIndexAdmissionMarker(value);
@@ -28545,10 +28450,7 @@ pub const DB = struct {
                         try internal_keys.relationalRowKeyAlloc(a, owner_key)
                     else
                         try internal_keys.documentKeyAlloc(a, owner_key);
-                    const primary_value = read.get(primary) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const primary_value = try missingAsNull(read.get(primary));
                     if (primary_value == null) {
                         count += 1;
                         try artifacts.append(a, try a.dupe(u8, kv.key));
@@ -29316,10 +29218,7 @@ pub const DB = struct {
 
         const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(self.alloc, doc_key, source_artifact, resolution_artifact);
         defer self.alloc.free(override_key);
-        const existing = self.core.store.get(self.alloc, override_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(self.core.store.get(self.alloc, override_key));
         defer if (existing) |raw| self.alloc.free(raw);
         const override_bytes = try resolution_runtime_mod.buildReviewDecisionBytesAlloc(self.alloc, existing, local_id, decision, table, key);
         defer self.alloc.free(override_bytes);
@@ -35662,10 +35561,7 @@ pub const DB = struct {
                 try failure_batch.put(key, err_name);
                 wrote = true;
             } else {
-                const persisted = self.core.store.get(alloc, key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const persisted = try missingAsNull(self.core.store.get(alloc, key));
                 if (persisted) |value| {
                     alloc.free(value);
                     failure_batch.delete(key) catch {};
@@ -36497,10 +36393,7 @@ pub const DB = struct {
             var schema_json: ?[]u8 = null;
             defer if (schema_json) |value| self.alloc.free(value);
             if (runtime_schema.storage_mode == .relational) {
-                schema_json = source_store.get(self.alloc, public_schema_json_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                schema_json = try missingAsNull(source_store.get(self.alloc, public_schema_json_key));
             }
             prepared_epoch = try self.core.prepareSchemaEpoch(runtime_schema, schema_json);
         }
@@ -36892,24 +36785,15 @@ pub const DB = struct {
             if (!std.mem.eql(u8, &status.value.scope.digest(), &scope.digest())) return error.RestoreStagingScopeChanged;
             history_mutable = status.value.phase == .reserved;
         } else if (self.core.table_catalog.row_count != 0) return error.RestoreStagingTargetNotEmpty;
-        const prior_bootstrap = txn.get(@import("restore_staging.zig").bootstrap_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const prior_bootstrap = try missingAsNull(txn.get(@import("restore_staging.zig").bootstrap_key));
         if (prior_bootstrap) |bytes| {
             var prior = try @import("restore_staging.zig").OwnerBootstrap.decode(alloc, bytes);
             defer prior.deinit();
             if (!std.mem.eql(u8, prior.value.read_schema_json, read_json)) return error.RestoreStagingScopeChanged;
         }
-        const existing = txn.get(runtime_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(runtime_key));
         if (existing) |bytes| if (!std.mem.eql(u8, bytes, encoded)) return error.RestoreStagingScopeChanged;
-        const existing_public = txn.get(public_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_public = try missingAsNull(txn.get(public_key));
         if (existing_public) |bytes| if (!std.mem.eql(u8, bytes, read_json)) return error.RestoreStagingScopeChanged;
         if (existing != null and existing_public != null) return;
         if (!history_mutable) return error.RestoreStagingScopeChanged;
@@ -36938,10 +36822,7 @@ pub const DB = struct {
         var progress = try staging.Progress.decode(alloc, marker);
         defer progress.deinit();
         if (!std.mem.eql(u8, &progress.value.scope.digest(), &descriptor.scope.digest())) return error.RestoreStagingScopeChanged;
-        const previous = txn.get(staging.bootstrap_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous = try missingAsNull(txn.get(staging.bootstrap_key));
         if (previous) |bytes| {
             if (!std.mem.eql(u8, bytes, encoded)) return error.RestoreStagingScopeChanged;
             return;
@@ -37245,10 +37126,7 @@ pub const DB = struct {
                 try txn.put(&internal_keys.range_document_count_key, &zero);
             }
         }
-        const raw_catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw_catalog = try missingAsNull(txn.get(@import("relational_integrity_catalog.zig").key));
         if (raw_catalog) |bytes| {
             var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
             defer catalog.deinit();
@@ -37257,10 +37135,7 @@ pub const DB = struct {
                 try txn.put(@import("relational_integrity_activation.zig").key, coverage);
             }
         }
-        const bootstrap_raw = txn.get(staging.bootstrap_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const bootstrap_raw = try missingAsNull(txn.get(staging.bootstrap_key));
         var source_proofs_required = false;
         if (bootstrap_raw) |bytes| {
             var bootstrap = try staging.OwnerBootstrap.decode(alloc, bytes);
@@ -37659,10 +37534,7 @@ pub const DB = struct {
             return next.receipt();
         }
         if (phase == .validated) {
-            const bootstrap_raw = txn.get(staging.bootstrap_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const bootstrap_raw = try missingAsNull(txn.get(staging.bootstrap_key));
             if (bootstrap_raw) |bytes| {
                 var bootstrap = try staging.OwnerBootstrap.decode(alloc, bytes);
                 defer bootstrap.deinit();
@@ -37686,10 +37558,7 @@ pub const DB = struct {
             // receive the same PreparedRow writes. Seal their durable state
             // before acknowledging this owner's completion receipt.
             try self.core.index_manager.syncAll(true);
-            const raw_catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const raw_catalog = try missingAsNull(txn.get(@import("relational_integrity_catalog.zig").key));
             if (raw_catalog) |bytes| {
                 var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
                 defer catalog.deinit();
@@ -39908,10 +39777,7 @@ pub const DB = struct {
                         state.ttl_key_scratch.clearRetainingCapacity();
                         try internal_keys.appendDocumentPrefix(&state.ttl_key_scratch, state.alloc, raw_key);
                         try state.ttl_key_scratch.append(state.alloc, internal_keys.ttl_kind);
-                        const timestamp_bytes = state.read_txn.get(state.ttl_key_scratch.items) catch |err| switch (err) {
-                            error.NotFound => null,
-                            else => return err,
-                        };
+                        const timestamp_bytes = try missingAsNull(state.read_txn.get(state.ttl_key_scratch.items));
                         break :blk if (timestamp_bytes) |value|
                             if (value.len >= @sizeOf(u64)) std.mem.readInt(u64, value[0..8], .little) else 0
                         else
@@ -47335,10 +47201,7 @@ fn prepareEntityGraphRewrite(alloc: Allocator, db: *DB, index_name: []const u8, 
                 const expected = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, generation, old_key, view.source_priority, view.state_key);
                 if (!std.mem.eql(u8, row.key, expected)) return error.InvalidGraphEdgeContender;
                 const destination = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, generation, new_key, view.source_priority, view.state_key);
-                const existing = db.core.store.get(alloc, destination) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const existing = try missingAsNull(db.core.store.get(alloc, destination));
                 // An already canonical assertion by the same producer wins a
                 // collision. Moving another assertion must not overwrite it.
                 const payload = if (existing) |raw| blk: {
@@ -47353,10 +47216,7 @@ fn prepareEntityGraphRewrite(alloc: Allocator, db: *DB, index_name: []const u8, 
                 if (entry.ttl_duration_ns != 0) {
                     const old_lifetime = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, old_key, index_name, generation, view.state_key);
                     const new_lifetime = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, new_key, index_name, generation, view.state_key);
-                    const lifetime = db.core.store.get(alloc, old_lifetime) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const lifetime = try missingAsNull(db.core.store.get(alloc, old_lifetime));
                     if (lifetime) |raw| if (existing == null) try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, new_lifetime, raw);
                     try deletes.append(alloc, old_lifetime);
                 }
@@ -47416,10 +47276,7 @@ fn prepareEntityGraphRewrite(alloc: Allocator, db: *DB, index_name: []const u8, 
             const entities = if (parsed.value == .object) parsed.value.object.getPtr("entities") orelse continue else continue;
             if (entities.* != .array) return error.InvalidGraphEdgeArtifact;
             const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(alloc, group.doc, cfg.source_artifact, cfg.resolution_artifact);
-            const override: ?[]const u8 = db.core.store.get(temporary, override_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const override: ?[]const u8 = try missingAsNull(db.core.store.get(temporary, override_key));
             var decisions: std.ArrayListUnmanaged(resolution_runtime_mod.ReviewDecision) = .empty;
             for (entities.array.items) |*entity| {
                 if (entity.* != .object) continue;
@@ -49488,10 +49345,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
         try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
         try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
         const catalog_mod = @import("relational_integrity_catalog.zig");
-        const raw = lifecycle.get(catalog_mod.key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(lifecycle.get(catalog_mod.key));
         if (raw) |bytes| {
             var catalog = try catalog_mod.decode(ctx.alloc, bytes);
             defer catalog.deinit();
@@ -49875,10 +49729,7 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
 }
 
 fn graphTtlOptionalStoreValue(alloc: Allocator, store: *docstore_mod.DocStore, key: []const u8) !?[]u8 {
-    return store.get(alloc, key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(store.get(alloc, key));
 }
 
 fn expireGraphTtlCandidates(ptr: *anyopaque, candidates: []const graph_edge_ttl_expiration.Due) !ttl_runtime_mod.GraphExpireCounts {
@@ -49983,10 +49834,7 @@ fn pruneStaleGraphTtlDueEntry(ttl_ctx: *TtlCleanupContext, due: StaleGraphTtlDue
             const doc_key = (try internal_keys.decodeDocumentComponentAlloc(ctx.alloc, due.document_key_source)) orelse return error.InvalidGraphTtlCandidate;
             defer ctx.alloc.free(doc_key);
             if (ctx.index_manager.byte_range.contains(doc_key)) {
-                const raw = txn.get(due.record_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const raw = try missingAsNull(txn.get(due.record_key));
                 if (raw) |record| {
                     var digest: [32]u8 = undefined;
                     GraphTtlSha256.hash(record, &digest, .{});
@@ -56312,10 +56160,7 @@ fn rebuildGraphReplacementDocumentsWithRead(ctx: *AsyncContext, name: []const u8
             }
         }
         const stored_key = if (ctx.relational_base_rows) try internal_keys.relationalRowKeyAlloc(a, key) else try internal_keys.documentKeyAlloc(a, key);
-        const raw = read.get(stored_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(read.get(stored_key));
         if (raw) |value| {
             const json = try ctx.index_manager.materializeStoredValueAlloc(a, stored_key, value);
             const root = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
@@ -56717,10 +56562,7 @@ fn retireSplitEntitySourcedEdgesLocked(self: *DB, split_state: shard_mod.SplitSt
         state.deletes.deinit(alloc);
         if (state.last_key) |key| alloc.free(key);
     }
-    const cursor = self.core.store.get(alloc, graph_split_retire_cursor_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const cursor = try missingAsNull(self.core.store.get(alloc, graph_split_retire_cursor_key));
     defer if (cursor) |key| alloc.free(key);
     if (cursor) |key| {
         if (key.len != 0 and (std.mem.order(u8, key, lower) == .lt or
@@ -58119,10 +57961,7 @@ fn rebuildDenseIndexFromPrimaryVectorsSliceContext(
                 defer if (!transferred) state.ctx.alloc.free(doc_key);
                 const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(state.ctx.alloc, doc_key, state.index_name);
                 defer state.ctx.alloc.free(artifact_key);
-                const artifact = state.source_read.get(artifact_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const artifact = try missingAsNull(state.source_read.get(artifact_key));
                 if (artifact) |raw| {
                     const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.ctx.alloc, raw);
                     errdefer if (!transferred) state.ctx.alloc.free(vector);
@@ -130216,10 +130055,7 @@ fn expectPhysicalSplitRetirements(options: OpenOptions) !void {
     // Replay/materialization writes must honor the primary marker even when
     // physical shard copying bypassed transactional directory maintenance.
     try child.core.store.put(artifact, "reconstructed");
-    const revived = child.core.store.get(alloc, artifact) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const revived = try missingAsNull(child.core.store.get(alloc, artifact));
     defer if (revived) |value| alloc.free(value);
     try std.testing.expect(revived == null);
     const split_lower = try documentRangeLowerAlloc(alloc, "m");

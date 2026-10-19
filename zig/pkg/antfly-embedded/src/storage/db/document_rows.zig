@@ -16,6 +16,7 @@
 //! Retained document SQL read view. Shares docstore snapshot, schema epoch,
 //! owner-prefix traversal, TTL and authorization machinery with native reads.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const storage_engine = @import("../engine_selection.zig");
 const store_mod = @import("../docstore.zig");
 const registry = @import("schema_registry.zig");
@@ -262,10 +263,7 @@ pub const Session = struct {
                 const duration = if (session.schema) |schema| schema.visibilityTtlDurationNs() else 0;
                 const version: u64 = version: {
                     const ttl_key = try internal.ttlKeyAlloc(temporary, key);
-                    const timestamp = session.txn.get(ttl_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const timestamp = try missingAsNull(session.txn.get(ttl_key));
                     if (timestamp) |value| {
                         if (value.len != 8) return error.InvalidData;
                         const ns = std.mem.readInt(u64, value[0..8], .little);

@@ -18,6 +18,7 @@
 //! constructs it from the validated command; transfer authenticates its bytes
 //! together with source receipts and the immutable source snapshot/tail.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const publication = @import("artifact_publication.zig");
 const inventory = @import("artifact_inventory.zig");
 const binary = @import("relational_integrity_json.zig");
@@ -255,10 +256,7 @@ pub const Proof = struct {
     pub fn validateEffects(self: Proof, txn: anytype) !void {
         try self.validate();
         for (self.effects) |effect| {
-            const raw = txn.get(effect.key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const raw = try missingAsNull(txn.get(effect.key));
             if (effect.value_digest) |expected| {
                 const value = raw orelse return error.EnrichmentSourceChanged;
                 if (value.len != effect.value_bytes) return error.EnrichmentSourceChanged;
@@ -1223,10 +1221,7 @@ fn collectObsoleteReferencePage(alloc: std.mem.Allocator, store_handle: anytype,
 
 fn changeReferences(txn: anytype, namespace: publication.Namespace, digest: publication.Digest, increment: bool) !void {
     const count_key = countKey(namespace, digest);
-    const raw = txn.get(&count_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw = try missingAsNull(txn.get(&count_key));
     if (raw != null and raw.?.len != 8) return error.ArtifactCatalogCorrupt;
     const old: u64 = if (raw) |value| std.mem.readInt(u64, value[0..8], .little) else 0;
     const next = if (increment) std.math.add(u64, old, 1) catch return error.ArtifactCatalogCorrupt else std.math.sub(u64, old, 1) catch return error.ArtifactCatalogCorrupt;
@@ -1308,10 +1303,7 @@ const AdoptedEffects = struct { proof: Proof, positions: []const ?publication.Po
 fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encoded_proof: []const u8, position: publication.Position, prepared: ?*const PreparedDocumentReferences, adopted: ?AdoptedEffects) !void {
     const owners = if (adopted) |selected| try selectedOwners(selected.proof) else try command.outputSources();
     const proof_key = key(command.namespace, command.publication_digest);
-    const old = txn.get(&proof_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const old = try missingAsNull(txn.get(&proof_key));
     if (old) |value| {
         if (!std.mem.eql(u8, value, encoded_proof)) return error.ArtifactCatalogCorrupt;
     } else try txn.put(&proof_key, encoded_proof);
@@ -1319,10 +1311,7 @@ fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encod
     for (command.sources, 0..) |source, source_index| {
         if (!owners.isSet(source_index)) continue;
         const reference = referenceKey(command, source);
-        const previous = txn.get(&reference) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous = try missingAsNull(txn.get(&reference));
         var unchanged = false;
         if (previous) |digest| {
             if (digest.len != 32) return error.ArtifactCatalogCorrupt;
@@ -1357,10 +1346,7 @@ fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encod
         const effect_position = if (adopted) |selected| try (selected.positions[effect_index] orelse position).encode() else encoded_position;
         @memcpy(value[32..], &effect_position);
         const reference = artifactReferenceKey(authority, effect_key);
-        const previous = txn.get(&reference) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous = try missingAsNull(txn.get(&reference));
         if (previous) |old_value| {
             if (old_value.len != value.len) return error.ArtifactCatalogCorrupt;
             if (std.mem.eql(u8, old_value, &value)) continue;

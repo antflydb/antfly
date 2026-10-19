@@ -17,6 +17,7 @@
 //! effect. Replicas share desired maintenance but keep independent local build
 //! progress; comparing the leader's local progress in Raft apply is incorrect.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const contract = @import("relational_index_maintenance_contract.zig");
 const jobs = @import("relational_index_jobs.zig");
 const plans = @import("relational_index_plan.zig");
@@ -54,10 +55,7 @@ pub fn prepareCommand(parent_alloc: std.mem.Allocator, txn: *docstore.DocStore.T
     defer alloc.free(range.end);
     if (!std.mem.eql(u8, range.start, command.routing_key)) return error.PreparedGenerationChanged;
     const key = try alloc.dupe(u8, &contract.controlKey(index.id()));
-    const raw = txn.get(key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw = try missingAsNull(txn.get(key));
     if (!std.mem.eql(u8, &(try jobs.ownership(txn)), &command.owner)) return error.PreparedGenerationChanged;
     var current = try contract.readControl(txn, index.id());
     const identity = command.fingerprint();

@@ -42,6 +42,7 @@ const relational_store = @import("relational_store.zig");
 const schema_mod = @import("../schema.zig");
 const schema_registry_mod = @import("schema_registry.zig");
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const transactions_mod = @import("../transactions.zig");
 const transform_mod = @import("transform.zig");
 const types = @import("types.zig");
@@ -249,10 +250,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (keys.items, 0..) |key, index| {
                 const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
                 defer alloc.free(store_key);
-                const raw = read_txn.get(store_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const raw = try missingAsNull(read_txn.get(store_key));
                 const value = if (raw) |stored| blk: {
                     if (!internal_keys.isRelationalRowKey(store_key))
                         break :blk try alloc.dupe(u8, stored);
@@ -295,10 +293,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else blk: {
                     const timestamp_key = try makeTimestampKey(alloc, key);
                     defer alloc.free(timestamp_key);
-                    const timestamp = read_txn.get(timestamp_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const timestamp = try missingAsNull(read_txn.get(timestamp_key));
                     break :blk if (timestamp) |bytes|
                         if (bytes.len >= @sizeOf(u64)) std.mem.readInt(u64, bytes[0..8], .little) else 0
                     else
@@ -1230,10 +1225,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const intent = @import("artifact_reprocess_intent.zig");
                     const key = try intent.embeddingKeyAlloc(alloc, request.doc_key, requestEmbeddingName(request.*));
                     defer alloc.free(key);
-                    const old = self.core.*.store.get(alloc, key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const old = try missingAsNull(self.core.*.store.get(alloc, key));
                     defer if (old) |raw| alloc.free(raw);
                     request.reprocess_generation = if (old) |raw| try intent.generationForConfig(raw, request.producer_json) else 0;
                     if (containsName(force_generated_artifact_names, requestEmbeddingName(request.*))) {
@@ -1273,10 +1265,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 const intent = @import("artifact_reprocess_intent.zig");
                                 const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
                                 defer alloc.free(manifest_key);
-                                const manifest = S.ownerField(self, "core").*.store.get(alloc, manifest_key) catch |err| switch (err) {
-                                    error.NotFound => null,
-                                    else => return err,
-                                };
+                                const manifest = try missingAsNull(S.ownerField(self, "core").*.store.get(alloc, manifest_key));
                                 defer if (manifest) |raw| alloc.free(raw);
                                 const generation = if (manifest) |raw| try S.documentExtractionManifestGeneration(alloc, raw) else 0;
                                 const encoded = intent.encode(request.producer_json, std.math.add(u64, generation, 1) catch return error.ResourceLimitExceeded);

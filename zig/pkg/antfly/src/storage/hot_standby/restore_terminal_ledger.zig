@@ -16,6 +16,7 @@
 //! Indexed cancellation authority. Durable applied-prefix admission floors
 //! permit bounded reclamation only after exact native owner cleanup completes.
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const lsm = @import("antfly_local_sources").storage_lsm_backend;
 const fs = @import("antfly_runtime_fs").fs_paths;
 const record_mod = @import("antfly_local_sources").storage_db_replication_record;
@@ -166,10 +167,7 @@ pub const Ledger = struct {
         const bytes = try terminal.encode();
         var txn = try self.backend.backend.beginWrite();
         defer txn.abort();
-        const existing = txn.get(ns, &key(terminal.group_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(ns, &key(terminal.group_id)));
         if (existing) |value| {
             const previous = try Terminal.decode(value);
             if (previous.table_id != terminal.table_id or previous.cluster_id != terminal.cluster_id or !std.mem.eql(u8, &previous.scope, &terminal.scope)) return error.RestoreStagingScopeChanged;
@@ -184,10 +182,7 @@ pub const Ledger = struct {
         const encoded = try next.encode();
         var txn = try self.backend.backend.beginWrite();
         defer txn.abort();
-        const previous = txn.get(meta_ns, "floor") catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous = try missingAsNull(txn.get(meta_ns, "floor"));
         if (previous) |bytes| if (try (try replay_floor.Floor.decode(bytes)).covers(next)) return;
         try txn.put(meta_ns, "floor", &encoded);
         try txn.commit();
@@ -204,10 +199,7 @@ pub const Ledger = struct {
         var snapshot_view = try self.snapshot();
         defer snapshot_view.deinit();
         const current = (try snapshot_view.floor()) orelse return .{};
-        const after = snapshot_view.txn.get(meta_ns, "cursor") catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const after = try missingAsNull(snapshot_view.txn.get(meta_ns, "cursor"));
         if (after) |bytes| if (bytes.len != 8) return error.InvalidRestoreTerminal;
         var cursor = try snapshot_view.txn.openCursor(ns);
         defer cursor.close();

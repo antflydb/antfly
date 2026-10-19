@@ -16,6 +16,7 @@
 //! One authenticated chunk result, projected to its immutable catalog consumers.
 //! Per-member acceptance is deliberately not document-wide coverage completion.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const publication = @import("artifact_publication.zig");
 const keys = @import("../internal_keys.zig");
 const manager = @import("catalog/index_manager.zig");
@@ -116,10 +117,7 @@ fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enric
     // upstream provenance, and merges inherited sources/ordinals into token.
     const selected = try @import("artifact_asset_publication.zig").readUpstream(temporary, &token, txn, scope);
     const value = if (token.source.exists and selected != null) try owned.dupe(u8, selected.?) else null;
-    const previous = txn.get(output) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const previous = try missingAsNull(txn.get(output));
     try token.observePrecondition(output, previous, try publication.artifactRevision(txn, authority.namespace, output));
     return .{ .token = token, .value = value, .output_key = output };
 }

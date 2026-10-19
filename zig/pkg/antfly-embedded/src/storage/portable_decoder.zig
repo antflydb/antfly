@@ -15,6 +15,7 @@
 
 //! Bounded, restartable physical materialization for disposable restore decoders.
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const engine = @import("engine.zig");
 const portable = @import("portable_backup.zig");
 const store_mod = @import("docstore.zig");
@@ -69,10 +70,7 @@ pub fn bindRange(alloc: std.mem.Allocator, store: *store_mod.DocStore, range: @i
     var transaction = try store.beginWriteTxn();
     var transaction_open = true;
     defer if (transaction_open) transaction.abort();
-    const prior = transaction.get(range_state.range_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const prior = try missingAsNull(transaction.get(range_state.range_key));
     if (prior) |bytes| {
         if (!std.mem.eql(u8, bytes, encoded)) return error.RestoreStagingScopeChanged;
         transaction.abort();

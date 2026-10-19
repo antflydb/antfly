@@ -29,6 +29,7 @@
 //!   "hbc_vecs"   - vector metadata and legacy/index-local raw vectors keyed by vector ID
 
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -2753,10 +2754,7 @@ const ExperimentalPostingReadState = struct {
     fn resolveValueAlloc(self: *ExperimentalPostingReadState, alloc: Allocator, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !?ExperimentalPostingResolvedValue {
         if (self.materialized.get(experimentalPostingValueKey(posting_id, kind))) |stored|
             return if (stored.bytes) |bytes| .{ .bytes = bytes } else null;
-        return self.resolveSegmentValueAlloc(alloc, self.segments.len, posting_id, kind) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.resolveSegmentValueAlloc(alloc, self.segments.len, posting_id, kind));
     }
 
     fn hasValue(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !bool {
@@ -9369,10 +9367,7 @@ pub const HBCIndex = struct {
             return if (captured) |blob| blob.bytes() else null;
         }
         const generation = self.experimental_posting_mutation_base_generation orelse return null;
-        return generation.value(vector_id, .vector_metadata) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(generation.value(vector_id, .vector_metadata));
     }
 
     fn setCapturedExactVectorMutation(
@@ -11020,10 +11015,7 @@ pub const HBCIndex = struct {
         for (vector_ids.items, metadata_values.items, projection_values.items, 0..) |*vector_id, *metadata_value, *projection, i| {
             const offset = i * @sizeOf(u64);
             vector_id.* = std.mem.readInt(u64, member_id_bytes[offset..][0..@sizeOf(u64)], .little);
-            metadata_value.* = generation.value(vector_id.*, .vector_metadata) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            metadata_value.* = try missingAsNull(generation.value(vector_id.*, .vector_metadata));
             projection.* = .{};
         }
         projection_source.loader(
@@ -13217,19 +13209,13 @@ pub const HBCIndex = struct {
         if (comptime Child == vectorindex_store.NamespaceReadTxn) {
             if (txn.read_lease != null) {
                 for (keys, values) |key, *value| {
-                    value.* = self.getNamespaced(txn, namespace, key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    value.* = try missingAsNull(self.getNamespaced(txn, namespace, key));
                 }
                 return;
             }
         } else if (self.experimental_posting_mutation_base_generation != null) {
             for (keys, values) |key, *value| {
-                value.* = self.getNamespaced(txn, namespace, key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                value.* = try missingAsNull(self.getNamespaced(txn, namespace, key));
             }
             return;
         }
@@ -18216,10 +18202,7 @@ pub const HBCIndex = struct {
                     } else {
                         for (ids, 0..) |id, i| {
                             if (resolved[i]) continue;
-                            values[i] = state.value(id, .vector_metadata) catch |err| switch (err) {
-                                error.NotFound => null,
-                                else => return err,
-                            };
+                            values[i] = try missingAsNull(state.value(id, .vector_metadata));
                         }
                     }
                     return;

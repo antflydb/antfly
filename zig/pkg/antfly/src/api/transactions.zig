@@ -14,6 +14,7 @@
 // limitations.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const platform_sync = @import("antfly_platform").sync;
 const batch_api = @import("antfly_local_sources").api_batch;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
@@ -1136,10 +1137,7 @@ pub const DurableSessionStore = struct {
         const lease_key = try makeSessionLeaseKey(self.alloc, session.txn_id);
         defer self.alloc.free(lease_key);
 
-        const current_raw = txn.get(session_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const current_raw = try missingAsNull(txn.get(session_key));
         if (expected_owner) |owner| {
             const raw = current_raw orelse return false;
             var current = try decodeSessionRecord(self.alloc, session.txn_id, raw);
@@ -1149,10 +1147,7 @@ pub const DurableSessionStore = struct {
 
         const owner_id = try ownerLeaseId(self.alloc, session.owner_node_id);
         defer self.alloc.free(owner_id);
-        const lease_raw = txn.get(lease_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const lease_raw = try missingAsNull(txn.get(lease_key));
         if (lease_raw) |raw| {
             const parsed = try std.json.parseFromSlice(lease_mod.LeaseRecord, self.alloc, raw, .{ .allocate = .alloc_always });
             defer parsed.deinit();

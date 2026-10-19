@@ -22,6 +22,7 @@
 //!   - BM25 scoring
 
 const std = @import("std");
+const missingAsNull = @import("../storage/backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const roaring = @import("../encoding/roaring.zig");
 const chunked = @import("../encoding/chunked_coder.zig");
@@ -9368,10 +9369,7 @@ pub const RangeInvertedIndexReader = struct {
         if (end - start > self.max_dictionary_block_bytes) return error.SegmentReadBudgetExceeded;
         const block = try scratch.allocator().alloc(u8, end - start);
         try self.view.readInto(self.blocks_offset + start, block);
-        return lookupBlockedTerm(self.allocator, block, 0, term) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(lookupBlockedTerm(self.allocator, block, 0, term));
     }
 
     fn ceilingBlock(self: *const RangeInvertedIndexReader, term: []const u8) !?u32 {

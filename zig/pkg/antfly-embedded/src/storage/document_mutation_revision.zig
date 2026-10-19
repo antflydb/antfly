@@ -17,6 +17,7 @@
 //! Revisions advance atomically with mutations, independently of TTL clocks.
 //! Keep tombstones after deletion to reject delete/reinsert ABA.
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const keys = @import("internal_keys.zig");
 const prefix = "\x00\x00__metadata__:document_mutation_revision_v1:";
 pub const Key = [prefix.len + 32]u8;
@@ -327,10 +328,7 @@ pub const BackfillPage = struct {
         return .{ .arena = arena, .before = before, .after = after, .entries = entries.items, .complete = complete };
     }
     pub fn stage(self: *const @This(), txn: anytype) !usize {
-        const current = txn.get(backfill_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const current = try missingAsNull(txn.get(backfill_key));
         if ((current == null) != (self.before == null) or (current != null and !std.mem.eql(u8, current.?, self.before.?))) return error.DocumentAuthorityCursorChanged;
         var installed: usize = 0;
         for (self.entries) |entry| {

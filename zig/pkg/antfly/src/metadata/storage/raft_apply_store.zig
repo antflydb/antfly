@@ -16,6 +16,7 @@
 const hot_standby_write_gate_adapter = @import("../../storage/hot_standby/write_gate.zig");
 const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const store_report_baseline = @import("../store_report_baseline.zig");
 const secret_store = @import("../secret_store.zig");
 const secret_collection = @import("../../common/secret_collection.zig");
@@ -11266,10 +11267,7 @@ pub const RaftApplyStore = struct {
     /// Its auxiliary extension projection is committed with the indexed
     /// tables/ranges; after restore publication those indexes are authoritative.
     pub fn loadStandaloneCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator) !?[]u8 {
-        return self.store.get(alloc, standalone_catalog_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.store.get(alloc, standalone_catalog_key));
     }
 
     pub fn loadStandaloneCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator) !?[]u8 {
@@ -12225,10 +12223,7 @@ pub const RaftApplyStore = struct {
         defer state.deinit();
         const policy_install_snapshots = try exportPolicyInstallSnapshotsTxn(a, &txn, group_id, state.value.policy_publications);
         var buf: [160]u8 = undefined;
-        const revision = txn.get(try catalogRevisionKeyForGroup(&buf, group_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const revision = try missingAsNull(txn.get(try catalogRevisionKeyForGroup(&buf, group_id)));
         return std.json.Stringify.valueAlloc(alloc, @import("../../system_catalog/projection.zig").Export{
             .epoch = if (revision) |bytes| if (bytes.len == 8) @max(1, std.mem.readInt(u64, bytes[0..8], .little)) else return error.InvalidCatalogRecord else 1,
             .system_catalog = state.value,
@@ -12546,10 +12541,7 @@ pub const RaftApplyStore = struct {
         const identity = try self.policyTableSchemaTxn(a, &txn, group_id, request.table_id);
         if (request.enable and (identity.has_indexes or identity.has_schema_search)) return error.RowPolicyUnsupported;
         var fingerprint_key_buf: [192]u8 = undefined;
-        const stored_fingerprint = txn.get(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, request.table_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const stored_fingerprint = try missingAsNull(txn.get(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, request.table_id)));
         if (stored_fingerprint) |value| if (value.len != 32 or !std.mem.eql(u8, value, &identity.record_digest)) return error.RowPolicyCatalogChanged;
         const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, request.table_id);
         if (fence.active()) return error.RowPolicyCatalogChanged;
@@ -12675,10 +12667,7 @@ pub const RaftApplyStore = struct {
                     // it atomically with their first policy publication.
                     var fingerprint_key_buf: [192]u8 = undefined;
                     const key = try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, publication.table_id);
-                    const persisted = txn.get(key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const persisted = try missingAsNull(txn.get(key));
                     if (persisted) |value| {
                         if (value.len != 32 or !std.mem.eql(u8, value, &publication.schema_record_digest)) return error.RowPolicyCatalogChanged;
                     } else try txn.put(key, &publication.schema_record_digest);
@@ -12874,10 +12863,7 @@ pub const RaftApplyStore = struct {
             if (i != 0 and table_id == plan.child_before.table_id) continue;
             var key_buf: [160]u8 = undefined;
             const key = try fk_generation_publication.tableLockKey(&key_buf, group_id, table_id);
-            const existing = txn.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing = try missingAsNull(txn.get(key));
             if (acquire) {
                 if (existing != null) return error.GenerationPublicationChanged;
                 try txn.put(key, &value);
@@ -13934,10 +13920,7 @@ pub const RaftApplyStore = struct {
         const table_id = command.child_table_id;
         var key_buf: [160]u8 = undefined;
         const key = try fk_generation_publication.key(&key_buf, group_id, table_id);
-        const existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(key));
         var publication: fk_generation_publication.Publication = undefined;
         const source_tracked = try relation_reconciliation.readSourceRevision(txn, group_id) != 0;
         var previous_source_digest: ?[32]u8 = null;
@@ -14411,10 +14394,7 @@ pub const RaftApplyStore = struct {
         if (command.topology) |topology| {
             try self.applyTableTopologyMutationTxn(txn, group_id, topology);
             var key_buf: [160]u8 = undefined;
-            const encoded = txn.get(try tableKeyForGroup(&key_buf, group_id, command.mutation.table_id)) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const encoded = try missingAsNull(txn.get(try tableKeyForGroup(&key_buf, group_id, command.mutation.table_id)));
             switch (topology) {
                 .create => |create| {
                     const table = try decodeTableRecord(self.alloc, encoded orelse return);
@@ -14558,10 +14538,7 @@ pub const RaftApplyStore = struct {
 
         var revision_key_buf: [160]u8 = undefined;
         const revision_key = try catalogRevisionKeyForGroup(&revision_key_buf, group_id);
-        const applied = txn.get(revision_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const applied = try missingAsNull(txn.get(revision_key));
         const catalog_revision = if (applied) |encoded| blk: {
             if (encoded.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
             break :blk std.mem.readInt(u64, encoded[0..8], .little);
@@ -14569,10 +14546,7 @@ pub const RaftApplyStore = struct {
 
         var incarnation_key_buf: [160]u8 = undefined;
         const incarnation_key = try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id);
-        const incarnation_encoded = txn.get(incarnation_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const incarnation_encoded = try missingAsNull(txn.get(incarnation_key));
         const incarnation = if (incarnation_encoded) |encoded|
             (try decodeMetadataIncarnationRecord(encoded)).incarnation
         else
@@ -14601,10 +14575,7 @@ pub const RaftApplyStore = struct {
 
         var revision_key_buf: [160]u8 = undefined;
         const revision_key = try catalogRevisionKeyForGroup(&revision_key_buf, group_id);
-        const applied = txn.get(revision_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const applied = try missingAsNull(txn.get(revision_key));
         const revision = if (applied) |encoded| blk: {
             if (encoded.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
             break :blk std.mem.readInt(u64, encoded[0..8], .little);
@@ -14612,10 +14583,7 @@ pub const RaftApplyStore = struct {
 
         var incarnation_key_buf: [160]u8 = undefined;
         const incarnation_key = try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id);
-        const encoded_incarnation = txn.get(incarnation_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded_incarnation = try missingAsNull(txn.get(incarnation_key));
         return .{
             .metadata_incarnation = if (encoded_incarnation) |encoded|
                 (try decodeMetadataIncarnationRecord(encoded)).incarnation
@@ -14888,10 +14856,7 @@ pub const RaftApplyStore = struct {
 
         var table_key_buf: [160]u8 = undefined;
         const table_key = try tableKeyForGroup(&table_key_buf, group_id, expected_table.table_id);
-        const encoded_table = txn.get(table_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded_table = try missingAsNull(txn.get(table_key));
         if (encoded_table) |encoded| {
             const existing = try decodeTableRecord(alloc, encoded);
             defer metadata_table_manager.freeTable(alloc, existing);
@@ -16696,10 +16661,7 @@ pub const RaftApplyStore = struct {
         for (ordered) |*id| id.* = keys.next().?.*;
         std.mem.sort(u64, ordered, {}, std.sort.asc(u64));
         for (ordered) |id| {
-            const reference = txn.get(try listingReportKey(a, group_id, store_id, id)) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const reference = try missingAsNull(txn.get(try listingReportKey(a, group_id, store_id, id)));
             const slot = if (reference) |ref| blk: {
                 if (ref.len != 16 or std.mem.readInt(u64, ref[0..8], .little) != ReportAddress.from(store_id).store_id) return error.InvalidCatalogRecord;
                 break :blk std.mem.readInt(u64, ref[8..16], .little);
@@ -16735,10 +16697,7 @@ pub const RaftApplyStore = struct {
         var key_buf: [160]u8 = undefined;
         const address: ReportAddress = if (staging) |generation| .{ .store_id = store_id, .generation = generation } else try ReportAddress.active(a, txn, group_id, store_id);
         const key = if (staging != null) try address.key(a, group_id, "header", 0) else try storeKeyForGroup(&key_buf, group_id, store_id);
-        const old_header = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const old_header = try missingAsNull(txn.get(key));
         const membership_key = try reportMembershipKey(a, group_id, address);
         var assigned: std.AutoHashMapUnmanaged(u64, u64) = .empty;
         const old_membership = (if (removed_groups) |removed|
@@ -16919,10 +16878,7 @@ pub const RaftApplyStore = struct {
                 if (free_bits == 0) {
                     _ = slots.?.free.remove(page_id);
                 } else try slots.?.free.put(a, page_id, free_bits);
-                const existed = txn.get(try reportMemberPageKey(a, group_id, address, page_id)) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const existed = try missingAsNull(txn.get(try reportMemberPageKey(a, group_id, address, page_id)));
                 directory_changed = directory_changed or ((existed != null) != live);
             }
             if (page.members_dirty) {
@@ -16942,10 +16898,7 @@ pub const RaftApplyStore = struct {
                     try txn.delete(page_key);
                     continue;
                 }
-                const prior_page = txn.get(page_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const prior_page = try missingAsNull(txn.get(page_key));
                 var bytes: std.ArrayListUnmanaged(u8) = .empty;
                 try bytes.appendNTimes(a, 0, report_page_directory_bytes);
                 for (page.groups, 0..) |maybe_id, local_slot| {
@@ -17104,10 +17057,7 @@ pub const RaftApplyStore = struct {
     ) !bool {
         var version_key_buf: [160]u8 = undefined;
         const version_key = try derivedCatalogIndexVersionKey(&version_key_buf, group_id);
-        const current_version = txn.get(version_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const current_version = try missingAsNull(txn.get(version_key));
         if (current_version) |value| {
             if (std.mem.eql(u8, value, derived_catalog_index_version)) return false;
         }
@@ -17351,19 +17301,13 @@ pub const RaftApplyStore = struct {
     pub fn getSecretCollection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, scope: []const u8) !?[]u8 {
         var key_buf: [256]u8 = undefined;
         const key = try secret_store.keyForScope(&key_buf, group_id, scope);
-        return self.store.get(alloc, key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.store.get(alloc, key));
     }
 
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
         var key_buf: [256]u8 = undefined;
         const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
-        return self.store.get(alloc, key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.store.get(alloc, key));
     }
 
     pub fn getBackupCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
@@ -17403,10 +17347,7 @@ pub const RaftApplyStore = struct {
 
     pub fn getBackupCohortProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
         var key_buf: [192]u8 = undefined;
-        return self.store.get(alloc, try backupCohortProgressKeyForGroup(&key_buf, group_id, job_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.store.get(alloc, try backupCohortProgressKeyForGroup(&key_buf, group_id, job_id)));
     }
 
     /// Page by exact physical key; callers never load the complete job ledger.
@@ -19284,10 +19225,7 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, value, &id)) return error.InvalidCatalogRecord;
     }
     fn relationOptional(reader: anytype, key: []const u8) !?[]const u8 {
-        return reader.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(reader.get(key));
     }
     fn relationRestoreLoadActiveJob(a: std.mem.Allocator, txn: anytype, group_id: u64, id: [16]u8, comptime check_progress: bool) !std.json.Parsed(RelationRestoreProjection) {
         var buf: [256]u8 = undefined;
@@ -20053,10 +19991,7 @@ pub const RaftApplyStore = struct {
                 const publication = try secret_store.decodePublication(self.alloc, bytes);
                 var key_buf: [256]u8 = undefined;
                 const key = try secret_store.keyForScope(&key_buf, group_id, publication.scope);
-                const old = txn.get(key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const old = try missingAsNull(txn.get(key));
                 var view = try secret_collection.decode(self.alloc, publication.scope, old);
                 defer view.deinit(self.alloc);
                 if (view.revision != publication.expected_revision) return;
@@ -20320,10 +20255,7 @@ pub const RaftApplyStore = struct {
                 const key = try schemaProgressKeyForGroup(&key_buf, group_id, record.table_id, record.node_id);
                 const value = try encodeSchemaProgressRecord(self.alloc, record);
                 defer self.alloc.free(value);
-                const previous = txn.get(key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const previous = try missingAsNull(txn.get(key));
                 if (previous) |old| if (std.mem.eql(u8, old, value)) return;
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
@@ -20400,10 +20332,7 @@ pub const RaftApplyStore = struct {
                 // its observations until metadata atomically completes it.
                 var range_key_buf: [160]u8 = undefined;
                 const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
-                const encoded_range = txn.get(range_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const encoded_range = try missingAsNull(txn.get(range_key));
                 if (encoded_range) |encoded| {
                     const range = try decodeRangeRecord(self.alloc, encoded);
                     defer metadata_table_manager.freeRange(self.alloc, range);
@@ -20457,10 +20386,7 @@ pub const RaftApplyStore = struct {
                 if (table_name == null) return;
                 var key_buf: [160]u8 = undefined;
                 const key = try rangeKeyForGroup(&key_buf, group_id, record.group_id);
-                const encoded_existing = txn.get(key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const encoded_existing = try missingAsNull(txn.get(key));
                 if (encoded_existing == null) {
                     var reserved_buf: [256]u8 = undefined;
                     if (try stagingGet(txn, try restore_staging.identityKey(&reserved_buf, group_id, .group, record.group_id)) != null or
@@ -20649,10 +20575,7 @@ pub const RaftApplyStore = struct {
                 var key_buf: [256]u8 = undefined;
                 const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
                 if (command == .create_restore_job) {
-                    const existing = txn.get(key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const existing = try missingAsNull(txn.get(key));
                     if (existing != null) return;
                 }
                 try txn.put(key, record.value);
@@ -20708,10 +20631,7 @@ pub const RaftApplyStore = struct {
             .upsert_reallocation_request => |record| admit: {
                 var active_key_buf: [160]u8 = undefined;
                 const active_key = try reallocationRequestKeyForGroup(&active_key_buf, group_id);
-                const active: ?[]const u8 = txn.get(active_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const active: ?[]const u8 = try missingAsNull(txn.get(active_key));
                 if (active) |encoded| {
                     var pos: usize = 0;
                     const current = try readReallocationRequestRecord(encoded, &pos);
@@ -20759,10 +20679,7 @@ pub const RaftApplyStore = struct {
 
                 var pending_key_buf: [168]u8 = undefined;
                 const pending_key = try pendingReallocationRequestKeyForGroup(&pending_key_buf, group_id);
-                const pending_encoded: ?[]const u8 = txn.get(pending_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const pending_encoded: ?[]const u8 = try missingAsNull(txn.get(pending_key));
                 if (pending_encoded) |pending_value| {
                     var pending_pos: usize = 0;
                     const pending = try readReallocationRequestRecord(pending_value, &pending_pos);
@@ -20816,10 +20733,7 @@ pub const RaftApplyStore = struct {
             .upsert_extension_member => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
-                const encoded_existing = txn.get(key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const encoded_existing = try missingAsNull(txn.get(key));
                 if (encoded_existing) |encoded| {
                     var existing = try decodeExtensionMemberRecord(self.alloc, encoded);
                     defer existing.deinitOwned(self.alloc);
@@ -20834,10 +20748,7 @@ pub const RaftApplyStore = struct {
             .remove_extension_member => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
-                const encoded_existing = txn.get(key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const encoded_existing = try missingAsNull(txn.get(key));
                 if (encoded_existing) |encoded| {
                     var existing = try decodeExtensionMemberRecord(self.alloc, encoded);
                     defer existing.deinitOwned(self.alloc);
@@ -20921,10 +20832,7 @@ pub const RaftApplyStore = struct {
         // preparatory initial FK publication indefinitely.
         var key_buf: [160]u8 = undefined;
         const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
-        const encoded_existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded_existing = try missingAsNull(txn.get(key));
         var retained: ?metadata.TableRecord = null;
         defer if (retained) |existing| metadata_table_manager.freeTable(self.alloc, existing);
         var admission = record;
@@ -21084,10 +20992,7 @@ pub const RaftApplyStore = struct {
     }
 
     fn stagingGet(txn: *docstore.DocStore.Txn, key: []const u8) !?[]const u8 {
-        return txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(txn.get(key));
     }
 
     /// Only internal placement/provisioning uses this paired snapshot. Public
@@ -21373,10 +21278,7 @@ pub const RaftApplyStore = struct {
 
     pub fn loadRestoreStagingReceipt(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id, state: restore_staging.State, owner_group_id: u64) !?[]u8 {
         var key_buf: [256]u8 = undefined;
-        return self.store.get(alloc, try restore_staging.receiptKey(&key_buf, group_id, id, state, owner_group_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.store.get(alloc, try restore_staging.receiptKey(&key_buf, group_id, id, state, owner_group_id)));
     }
 
     fn restoreReplacementMatchesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, target: restore_staging.Target) !bool {
@@ -22058,10 +21960,7 @@ pub const RaftApplyStore = struct {
                     group_id,
                     create.table.table_id,
                 );
-                const encoded_table = txn.get(table_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const encoded_table = try missingAsNull(txn.get(table_key));
                 if (encoded_table) |encoded| {
                     const existing = try decodeTableRecord(self.alloc, encoded);
                     defer metadata_table_manager.freeTable(self.alloc, existing);
@@ -22110,10 +22009,7 @@ pub const RaftApplyStore = struct {
                 for (create.ranges) |record| {
                     var range_key_buf: [160]u8 = undefined;
                     const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
-                    const existing_range = txn.get(range_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const existing_range = try missingAsNull(txn.get(range_key));
                     if (existing_range != null) continue;
                     changed = true;
                     const encoded_range = try encodeRangeRecord(self.alloc, record);
@@ -22282,10 +22178,7 @@ pub const RaftApplyStore = struct {
             record.table_id,
             record.source_ordinal,
         );
-        const encoded_existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded_existing = try missingAsNull(txn.get(key));
         if (encoded_existing) |encoded| {
             const existing = try decodeReplicationSourceStatusRecord(self.alloc, encoded);
             defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing);
@@ -22339,10 +22232,7 @@ pub const RaftApplyStore = struct {
             record.table_id,
             record.source_ordinal,
         );
-        const encoded_existing = txn.get(status_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded_existing = try missingAsNull(txn.get(status_key));
         if (encoded_existing) |encoded| {
             const existing = try decodeReplicationSourceStatusRecord(self.alloc, encoded);
             defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing);
@@ -22815,10 +22705,7 @@ pub const RaftApplyStore = struct {
         record: metadata.TableRecord,
         published_fk_generation: bool,
     ) !void {
-        const encoded_existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded_existing = try missingAsNull(txn.get(key));
         const source_tracked = try relation_reconciliation.readSourceRevision(txn, group_id) != 0;
         var previous_digest: ?[32]u8 = null;
         if (encoded_existing) |encoded| {
@@ -22976,10 +22863,7 @@ pub const RaftApplyStore = struct {
         if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
         var key_buf: [160]u8 = undefined;
         const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-        const encoded_existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded_existing = try missingAsNull(txn.get(key));
         const encoded = encoded_existing orelse {
             // New splits must use admit_split_transition, which atomically
             // validates the source epoch, range identity, and table contract.
@@ -23131,10 +23015,7 @@ pub const RaftApplyStore = struct {
         if (record.online) |online| try online.validateRecord(record);
         var key_buf: [160]u8 = undefined;
         const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-        const encoded_existing = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded_existing = try missingAsNull(txn.get(key));
         var existing_active = false;
         if (!allow_online_change and encoded_existing == null and record.online != null) return;
         if (encoded_existing) |encoded| {
@@ -23211,10 +23092,7 @@ pub const RaftApplyStore = struct {
 
         var transition_key_buf: [160]u8 = undefined;
         const transition_key = try splitTransitionKeyForGroup(&transition_key_buf, group_id, record.transition_id);
-        const existing_transition = txn.get(transition_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_transition = try missingAsNull(txn.get(transition_key));
         if (existing_transition) |encoded| {
             const existing = try decodeSplitTransitionRecord(self.alloc, encoded);
             defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
@@ -23464,10 +23342,7 @@ pub const RaftApplyStore = struct {
             if (!try self.relationalParentsExistTxn(txn, group_id, record)) return;
             var key_buf: [160]u8 = undefined;
             const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
-            const encoded_existing = txn.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const encoded_existing = try missingAsNull(txn.get(key));
             if (encoded_existing) |encoded| {
                 const existing = try decodeTableRecord(self.alloc, encoded);
                 defer metadata_table_manager.freeTable(self.alloc, existing);
@@ -23492,10 +23367,7 @@ pub const RaftApplyStore = struct {
         for (delta.remove_extension_members) |record| {
             var key_buf: [256]u8 = undefined;
             const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
-            const encoded_existing = txn.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const encoded_existing = try missingAsNull(txn.get(key));
             if (encoded_existing) |encoded| {
                 var existing = try decodeExtensionMemberRecord(self.alloc, encoded);
                 defer existing.deinitOwned(self.alloc);
@@ -23535,10 +23407,7 @@ pub const RaftApplyStore = struct {
         for (delta.upsert_extension_members) |record| {
             var key_buf: [256]u8 = undefined;
             const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
-            const encoded_existing = txn.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const encoded_existing = try missingAsNull(txn.get(key));
             if (encoded_existing) |encoded| {
                 var existing = try decodeExtensionMemberRecord(self.alloc, encoded);
                 defer existing.deinitOwned(self.alloc);
@@ -29799,15 +29668,9 @@ fn backupCohortLockKeyForGroup(buf: []u8, group_id: u64, table_id: u64) ![]const
 /// backup's source definitions cannot change until all owner fences retire.
 pub fn restoreStagingLocksTableTxn(txn: anytype, group_id: u64, table_id: u64) !bool {
     var buf: [256]u8 = undefined;
-    const old = txn.get(try restore_staging.identityKey(&buf, group_id, .old_table, table_id)) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const old = try missingAsNull(txn.get(try restore_staging.identityKey(&buf, group_id, .old_table, table_id)));
     if (old != null) return true;
-    const parent = txn.get(try restore_staging.identityKey(&buf, group_id, .parent_table, table_id)) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const parent = try missingAsNull(txn.get(try restore_staging.identityKey(&buf, group_id, .parent_table, table_id)));
     return parent != null;
 }
 

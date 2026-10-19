@@ -16,6 +16,7 @@
 //! Common source-payload boundary. Primary transactions select visibility;
 //! implementations prepare immutable payloads before primary commit.
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const codec = @import("db/enrichment/artifact_codec.zig");
 const keys = @import("internal_keys.zig");
 const migration = @import("../common/vector_migration.zig");
@@ -523,10 +524,7 @@ pub const Session = struct {
         // Scheduling hint only; primary references and ANN leases still
         // decide reachability. Read the old owner before replacing it.
         if (self.store.vtable.retired_payloads != null) {
-            const old = txn.get(&owner_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const old = try missingAsNull(txn.get(&owner_key));
             if (old) |owner| {
                 if (owner.len != 36) return error.InvalidVectorOwnershipRecord;
                 const unchanged = if (value) |raw| if (isReference(raw))
@@ -557,10 +555,7 @@ pub const Session = struct {
         if (self.ownership_failed) return error.VectorOwnershipMutationFailed;
         if (!self.reference_mutated or self.reference_epoch_staged) return;
         if (self.migration_allowance) |limit| {
-            const before = txn.get(migration.accounting_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const before = try missingAsNull(txn.get(migration.accounting_key));
             var charged: u64 = if (before) |raw| blk: {
                 if (raw.len != 8) return error.InvalidVectorMigrationState;
                 break :blk std.mem.readInt(u64, raw[0..8], .little);
@@ -576,10 +571,7 @@ pub const Session = struct {
             try txn.put(migration.accounting_key, &encoded);
         }
 
-        const previous = txn.get(reference_epoch_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous = try missingAsNull(txn.get(reference_epoch_key));
         const epoch: u64 = if (previous) |raw| blk: {
             if (raw.len != 8) return error.InvalidVectorReferenceEpoch;
             break :blk std.mem.readInt(u64, raw[0..8], .little);
@@ -587,10 +579,7 @@ pub const Session = struct {
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &bytes, try std.math.add(u64, epoch, 1), .little);
         if (ownershipEnabled()) {
-            const prior_owner = txn.get(ownership_epoch_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const prior_owner = try missingAsNull(txn.get(ownership_epoch_key));
             const owner_epoch: ?u64 = if (prior_owner) |raw|
                 if (raw.len == 8) std.mem.readInt(u64, raw[0..8], .little) else null
             else if (epoch == 0) 0 else null;

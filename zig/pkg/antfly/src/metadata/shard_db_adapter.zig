@@ -14,6 +14,7 @@
 // limitations.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const storage_source_options = @import("storage_source_options");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
@@ -160,10 +161,7 @@ const PhysicalFallbackLocalShardDbAdapter = struct {
         };
         defer db.close();
 
-        return db.findMedianKey(alloc) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(db.findMedianKey(alloc));
     }
 
     fn schemaIndexReady(

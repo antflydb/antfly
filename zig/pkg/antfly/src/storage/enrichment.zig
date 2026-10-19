@@ -27,6 +27,7 @@
 //!   src/store/db/indexes/embeddingenricher.go — backfill loop
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("antfly_local_sources").storage_backend_erased;
 const backend_scan = @import("antfly_local_sources").storage_backend_scan;
@@ -240,10 +241,7 @@ pub const RebuildState = struct {
     /// Check if a rebuild is in progress.
     /// Returns the resume key (caller-owned), or null if no rebuild in progress.
     pub fn check(self: *RebuildState, alloc: Allocator) !?[]u8 {
-        return self.store.get(alloc, self.state_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.store.get(alloc, self.state_key));
     }
 
     /// Update rebuild progress to the given key.

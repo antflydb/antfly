@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("../../backend_types.zig").missingAsNull;
 const ordinal_core = @import("storage_ordinals");
 const builtin = @import("builtin");
 const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
@@ -22451,10 +22452,7 @@ pub const IndexManager = struct {
                 defer runtime_store.deinit();
                 var ready_txn = try runtime_store.store.beginProbe();
                 defer ready_txn.abort();
-                const ready_value: ?[]const u8 = ready_txn.get(ready_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const ready_value: ?[]const u8 = try missingAsNull(ready_txn.get(ready_key));
                 if (ready_value) |value| {
                     if (value.len == @sizeOf(u64) and
                         std.mem.readInt(u64, value[0..@sizeOf(u64)], .little) == types.indexConfigHash(cfg))
@@ -22496,10 +22494,7 @@ pub const IndexManager = struct {
         const current_format = try resolver_catalog.catalogReaderVersion(self.alloc, current_resolvers);
         if (desired_format < current_format or (current_reader >= resolver_catalog.graph_expiration_namespace_reader_version and desired_format < current_reader))
             return error.ArtifactCatalogDrift;
-        const reservation = txn.get(replacement_reader_base_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const reservation = try missingAsNull(txn.get(replacement_reader_base_key));
         // Row-only reconciliation does not own private graph reservations.
         if (reservation != null) return error.ArtifactCatalogDrift;
         if (expected.resolvers.len == 0) {
@@ -23128,10 +23123,7 @@ pub const IndexManager = struct {
     /// separate baseline. Marker publication/removal and fencing share a txn.
     fn stampCatalogReaderVersion(self: *IndexManager, txn: anytype, catalog: []const u8) !CatalogReaderStamp {
         const current = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
-        const baseline_raw = txn.get(replacement_reader_base_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const baseline_raw = try missingAsNull(txn.get(replacement_reader_base_key));
         const baseline = if (baseline_raw) |raw| try std.fmt.parseInt(u32, raw, 10) else current;
         if (baseline > resolver_catalog.supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
         const producer_version: u32 = for (self.enrichments.items) |producer| {
@@ -23215,10 +23207,7 @@ pub const IndexManager = struct {
         }
         if (required > resolver_catalog.supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
         const current = try resolver_catalog.readMinimumReaderVersion(&txn, resolver_catalog.supported_reader_version);
-        const fenced = txn.get(replacement_reader_base_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const fenced = try missingAsNull(txn.get(replacement_reader_base_key));
         if (fenced != null) try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(required));
         const version = @max(current, required);
         try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(version));
@@ -23337,10 +23326,7 @@ pub const IndexManager = struct {
         // Routing is a dependency of a catch-all, even when its own config did
         // not change. Compare the last durable catalog, covering label-owner
         // activation, reactivation, removal and label changes as well.
-        const before = txn.get(resolver_catalog_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const before = try missingAsNull(txn.get(resolver_catalog_key));
         const previous = try resolver_catalog.deserializeActiveCatalog(self.alloc, before orelse "[]");
         defer {
             for (previous) |*cfg| cfg.deinit(self.alloc);
@@ -25173,10 +25159,7 @@ pub const IndexManager = struct {
             }
             if (cache.get(vector_id) == false) return .absent;
         }
-        const existing_metadata = entry.index.getMetadata(vector_id) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_metadata = try missingAsNull(entry.index.getMetadata(vector_id));
         if (existing_metadata) |metadata| {
             defer self.alloc.free(metadata);
             if (memo) |cache| try cache.notePresent(self.alloc, vector_id, metadata);
@@ -25683,18 +25666,12 @@ pub const IndexManager = struct {
         defer self.alloc.free(legacy_next_key);
 
         var next_id: u64 = 1;
-        const next_raw = mutable_txn.get(next_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const next_raw = try missingAsNull(mutable_txn.get(next_key));
         if (next_raw) |raw| {
             if (raw.len != 8) return error.InvalidDenseVectorMetadata;
             next_id = std.mem.readInt(u64, raw[0..8], .little);
         }
-        const legacy_next_raw = mutable_txn.get(legacy_next_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const legacy_next_raw = try missingAsNull(mutable_txn.get(legacy_next_key));
         if (legacy_next_raw) |raw| {
             if (raw.len != 8) return error.InvalidDenseVectorMetadata;
             next_id = @max(next_id, std.mem.readInt(u64, raw[0..8], .little));
@@ -25724,19 +25701,13 @@ pub const IndexManager = struct {
         const legacy_next_key = try legacyDenseNextIdKey(self.alloc, index_name);
         defer self.alloc.free(legacy_next_key);
 
-        const next_raw = mutable_txn.get(next_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const next_raw = try missingAsNull(mutable_txn.get(next_key));
         var current_next_id: u64 = 1;
         if (next_raw) |raw| {
             if (raw.len != 8) return error.InvalidDenseVectorMetadata;
             current_next_id = std.mem.readInt(u64, raw[0..8], .little);
         }
-        const legacy_next_raw = mutable_txn.get(legacy_next_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const legacy_next_raw = try missingAsNull(mutable_txn.get(legacy_next_key));
         if (legacy_next_raw) |raw| {
             if (raw.len != 8) return error.InvalidDenseVectorMetadata;
             current_next_id = @max(current_next_id, std.mem.readInt(u64, raw[0..8], .little));
@@ -27229,10 +27200,7 @@ pub const IndexManager = struct {
             if ((try graph_edge_contender.decode(row.value, generation)) != null) existing_member = true;
         }
         const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, owner, entry.config.name);
-        const count_raw = primary.get(alloc, count_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const count_raw = try missingAsNull(primary.get(alloc, count_key));
         const visible_count = if (count_raw) |raw| (try graph_edge_contender.decodeVisibleCount(raw, generation)) orelse 0 else 0;
         if (existing_member and visible_count == 0) return error.InvalidGraphEdgeContenderCount;
         const next_count = if (existing_member) visible_count else try std.math.add(usize, visible_count, 1);
@@ -27337,10 +27305,7 @@ pub const IndexManager = struct {
         snapshots: *std.ArrayListUnmanaged(graph_mod.ContributionSnapshot),
     ) !void {
         const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source, edge_id);
-        const raw = primary.get(alloc, artifact_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(primary.get(alloc, artifact_key));
         var contributors = std.ArrayListUnmanaged(graph_mod.EdgeContribution).empty;
         if (raw) |artifact| {
             const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, entry.config.name, entry.config.coverage_generation, artifact_key);

@@ -18,6 +18,7 @@
 
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const topology = @import("relational_integrity_topology_contract.zig");
 const position = @import("receipt_position.zig");
 const authority = @import("../source_authority.zig");
@@ -85,10 +86,7 @@ pub fn stage(alloc: std.mem.Allocator, txn: anytype, command: topology.Command, 
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(serialized, &digest, .{});
     const slot = key(command);
-    const previous = txn.get(&slot) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const previous = try missingAsNull(txn.get(&slot));
     if (previous) |bytes| {
         if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "NTR1")) return error.InvalidControlReceiptPosition;
         var checksum: [32]u8 = undefined;

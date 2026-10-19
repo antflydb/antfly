@@ -22,6 +22,7 @@
 //!   - TableSchema: version, TTL config, default type, dynamic templates
 
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
@@ -1711,10 +1712,7 @@ pub fn saveEncodedSchemaWithMetadataAndStage(
     const schema_changed = changed_blk: {
         var probe = try runtime.store.beginProbe();
         defer probe.abort();
-        const previous_data = probe.get(schema_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous_data = try missingAsNull(probe.get(schema_key));
         // Reopening an unchanged epoch with a newer serializer must not rewrite
         // either its active or historical bytes. Other metadata can still be
         // committed below, including an identical public-validator backfill.
@@ -1726,20 +1724,14 @@ pub fn saveEncodedSchemaWithMetadataAndStage(
             previous_version = std.mem.readInt(u32, loaded[8..12], .little);
             if (schema_version < previous_version.?) return error.SchemaVersionRegression;
         }
-        const existing_version = probe.get(versioned_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_version = try missingAsNull(probe.get(versioned_key));
         if (existing_version) |existing|
             if (!std.mem.eql(u8, existing, data)) return error.ImmutableSchemaVersionConflict;
 
         if (previous_data) |loaded| if (previous_version.? != schema_version) {
             const previous_versioned_key = try schemaVersionKeyAlloc(alloc, previous_version.?);
             defer alloc.free(previous_versioned_key);
-            const existing_previous = probe.get(previous_versioned_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing_previous = try missingAsNull(probe.get(previous_versioned_key));
             if (existing_previous == null) previous_versioned_data = try alloc.dupe(u8, loaded);
         };
         break :changed_blk true;
@@ -1781,10 +1773,7 @@ pub fn loadSchema(store: anytype, alloc: Allocator) !?TableSchema {
     };
     const data = try alloc.dupe(u8, raw);
     defer alloc.free(data);
-    const public_json = txn.get("\x00\x00__metadata__:schema_json") catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const public_json = try missingAsNull(txn.get("\x00\x00__metadata__:schema_json"));
     return try deserializeStoredSchema(alloc, data, public_json);
 }
 
@@ -1803,10 +1792,7 @@ pub fn loadSchemaVersion(store: anytype, alloc: Allocator, version: u32) !?Table
     defer alloc.free(data);
     const public_key = try @import("../schema/mod.zig").versionedSchemaKeyAlloc(alloc, version);
     defer alloc.free(public_key);
-    const public_json = txn.get(public_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const public_json = try missingAsNull(txn.get(public_key));
     return try deserializeStoredSchema(alloc, data, public_json);
 }
 

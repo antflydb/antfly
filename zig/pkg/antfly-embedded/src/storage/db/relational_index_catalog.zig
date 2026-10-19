@@ -20,6 +20,7 @@
 //! Only publish a prebuilt execution snapshot after the caller commits.
 
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const schema = @import("../schema.zig");
 const native = @import("../relational_index.zig");
 const registry = @import("schema_registry.zig");
@@ -279,10 +280,7 @@ pub const Prepared = struct {
     /// transaction. On ANY error it must abort, not commit a partial stage.
     /// No in-memory state or readiness is published here.
     pub fn stage(self: *const Prepared, txn: anytype) !bool {
-        const current_bytes = txn.get(head_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const current_bytes = try missingAsNull(txn.get(head_key));
         const current = if (current_bytes) |bytes| try Head.decode(bytes) else null;
         // Validate the target schema even on idempotent retries.
         const schema_bytes = txn.get(schema.schema_key) catch |err| switch (err) {
@@ -305,10 +303,7 @@ pub const Prepared = struct {
             if (current == null or !current.?.eql(expected)) return error.PreparedGenerationChanged;
         } else if (current != null) return error.PreparedGenerationChanged;
         const key = blobKey(self.head.blob_digest);
-        const existing = txn.get(&key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = try missingAsNull(txn.get(&key));
         if (existing) |bytes| {
             if (!std.mem.eql(u8, bytes, self.blob)) return error.ImmutableRelationalIndexDefinitionConflict;
         } else try txn.put(&key, self.blob);

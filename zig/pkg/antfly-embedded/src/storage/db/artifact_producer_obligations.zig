@@ -17,6 +17,7 @@
 //! touched while the baseline scan runs create obligations in the same write
 //! transaction, so moving the scan cursor never certifies a missed mutation.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const publication = @import("artifact_publication.zig");
 const Position = publication.Position;
 pub const key = "\x00\x00__artifact_publication__:obligations";
@@ -143,10 +144,7 @@ pub fn mark(alloc: std.mem.Allocator, txn: anytype, authority: publication.Autho
     if (state.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
     const dirty = try documentKey(alloc, authority, document);
     defer alloc.free(dirty);
-    const previous = txn.get(dirty) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const previous = try missingAsNull(txn.get(dirty));
     if (previous == null or (try decodeRecord(previous.?)).epoch != authority.epoch)
         state.pending_documents = std.math.add(u64, state.pending_documents, 1) catch return error.ArtifactCatalogCorrupt;
     state.work_revision = std.math.add(u64, state.work_revision, 1) catch return error.ResourceLimitExceeded;

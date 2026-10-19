@@ -16,6 +16,7 @@
 //! Asset providers author bytes; the ordered catalog authorizes their exact
 //! output and derives durable projection work. Local skip-state is not proof.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const publication = @import("artifact_publication.zig");
 const inventory = @import("artifact_inventory.zig");
 const context = @import("artifact_producer_context.zig");
@@ -83,10 +84,7 @@ pub fn capture(alloc: std.mem.Allocator, txn: anytype, request: requests.Generat
 }
 
 fn optional(txn: anytype, key: []const u8) !?[]const u8 {
-    return txn.get(key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(txn.get(key));
 }
 
 pub const UpstreamFence = struct {

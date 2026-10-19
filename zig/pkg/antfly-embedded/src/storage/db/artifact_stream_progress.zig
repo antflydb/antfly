@@ -18,6 +18,7 @@
 //! Root-only scope closure is receiver-derived, not a sender claim. Neither
 //! enumeration nor one closed stream is document discharge or replay ACK.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const census = @import("artifact_stream_census.zig");
 const checkpoints = @import("artifact_stream_checkpoint.zig");
 const publication = @import("artifact_publication.zig");
@@ -822,10 +823,7 @@ pub fn stage(txn: anytype, root: u128, prepared: *const Prepared) !bool {
     const work = (try obligations.load(txn)) orelse return error.ArtifactCoverageBaselinePending;
     try work.requireAuthority(prepared.record.progress.observation.authority);
     if (work.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
-    const raw = txn.get(&prepared.selected) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw = try missingAsNull(txn.get(&prepared.selected));
     if (raw) |value| {
         const previous = try decode(value, &prepared.selected, root);
         if (std.mem.eql(u8, &previous.digest, &prepared.record.digest)) return false;
