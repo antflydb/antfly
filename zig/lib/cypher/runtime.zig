@@ -197,7 +197,7 @@ pub const NodeCursor = struct {
         var names: Engine.MomentNames = .empty;
         for (targets, 0..) |part, index| {
             var form = Engine.Affine.column(index).bounded(.{ .low = 0, .high = std.math.cast(i64, self.engine.limits.path_depth) orelse std.math.maxInt(i64) });
-            form.numeric = try Engine.Numeric.Form.column(self.engine.a, .{ .low = 0, .high = form.interval.?.high }, if (targets.len == 1) 1 else plan.path.edges.len, if (targets.len == 1) null else part.edge);
+            form.numeric = if (targets.len == 1) try Engine.Numeric.Form.column(self.engine.a, .{ .low = 0, .high = form.interval.?.high }, 1, null) else try self.engine.summaryNumeric(plan.path, part.edge, .{ .low = 0, .high = form.interval.?.high });
             try names.put(self.engine.a, part.name, .{ .scalar = form });
         }
         var found = false;
@@ -4390,7 +4390,7 @@ const Engine = struct {
     // alias keeps its original bag binding without reviving a shadowed value.
     const MomentBinding = union(enum) { scalar: Affine, entity: []const u8, blocked };
     const MomentNames = std.StringHashMapUnmanaged(MomentBinding);
-    const SummaryTarget = struct { name: []const u8, edge: ?usize = null, zero: bool = false };
+    const SummaryTarget = struct { name: []const u8, edge: ?usize = null, zero: bool = false, edges: ?[]const bool = null };
     const MomentStats = struct { sum: Count = Count.init(0), min: usize = 0, max: usize = 0 };
     /// The fields are independent marginals. Their joint distribution is never
     /// synthesized unless every downstream consumer observes only a certified
@@ -4428,7 +4428,7 @@ const Engine = struct {
             const parts = try a.alloc(MomentStats, targets.len);
             for (parts, targets, 0..) |*out, target, i| {
                 out.* = self.part(i);
-                if (!target.zero and (target.edge == null or target.edge.? == edge)) {
+                if (!target.zero and (if (target.edges) |edges| edges[edge] else target.edge == null or target.edge.? == edge)) {
                     out.sum = try out.sum.add(a, self.count);
                     out.min += 1;
                     out.max += 1;
@@ -4754,7 +4754,7 @@ const Engine = struct {
     fn momentTargets(self: *Engine, path: ast.Path) !?[]const SummaryTarget {
         if (self.weighted_sink == null and path.edges.len > 1 and (try self.summaryTargets(path)).len > 1) {
             self.moment_total_axis = true;
-            if (try self.planMomentTargets(path)) |targets| return try self.totalTargets(targets);
+            if (try self.planMomentTargets(path)) |targets| return try self.totalTargets(path, targets);
             self.moment_checks = .empty;
             self.moment_invariants = .empty;
             self.moment_representatives = false;
@@ -4762,17 +4762,47 @@ const Engine = struct {
         }
         self.moment_total_axis = self.external_total_axis;
         const targets = (try self.planMomentTargets(path)) orelse return null;
-        return if (self.moment_total_axis) try self.totalTargets(targets) else targets;
+        return if (self.moment_total_axis) try self.totalTargets(path, targets) else targets;
     }
-    fn totalTargets(self: *Engine, targets: []const SummaryTarget) ![]const SummaryTarget {
-        const out = try self.a.dupe(SummaryTarget, targets);
-        for (out) |*target| {
-            target.zero = target.edge != null and target.edge.? != 0;
-            target.edge = null;
+    fn fixedHops(edge: ast.Edge) ?u32 {
+        return if (edge.max_hops != null and edge.max_hops.? == edge.min_hops) edge.min_hops else null;
+    }
+    /// Fixed segments are constants; only variable segments span the geometry.
+    /// Use the same normalization for native and external SQL certificates.
+    fn summaryNumeric(self: *Engine, path: ast.Path, segment: ?usize, range: Numeric.Lattice) !Numeric.Form {
+        var dimensions: usize = 0;
+        var index: ?usize = null;
+        var offset: i64 = 0;
+        for (path.edges, 0..) |edge, i| {
+            if (fixedHops(edge)) |hops| {
+                if (segment == null or segment.? == i) offset += hops;
+            } else {
+                if (segment != null and segment.? == i) index = dimensions;
+                dimensions += 1;
+            }
         }
-        // Original expressions run on the canonical representative: the first
-        // segment carries the total, all others are zero. The certificate proves
-        // that every consumer is invariant under this substitution.
+        if (segment != null and fixedHops(path.edges[segment.?]) != null) return Numeric.Form.literal(Numeric.Lattice.integer(offset));
+        var proof = try Numeric.Form.column(self.a, range, dimensions, if (segment == null) null else index.?);
+        proof.offset = Numeric.Lattice.integer(offset);
+        return proof;
+    }
+    fn totalTargets(self: *Engine, path: ast.Path, targets: []const SummaryTarget) ![]const SummaryTarget {
+        const out = try self.a.dupe(SummaryTarget, targets);
+        const variable = try self.a.alloc(bool, path.edges.len);
+        var first: ?usize = null;
+        for (path.edges, variable, 0..) |edge, *included, i| {
+            included.* = fixedHops(edge) == null;
+            if (included.* and first == null) first = i;
+        }
+        for (out) |*target| if (target.edge) |edge| {
+            if (fixedHops(path.edges[edge]) != null) continue;
+            target.zero = edge != first;
+            target.edges = variable;
+        };
+        // Keep fixed segments at their actual lengths. The first variable
+        // segment carries all variable hops and the others carry zero; a whole
+        // path target still counts every hop. Certified consumers are invariant
+        // under this substitution, including each finite UNWIND branch.
         self.moment_representatives = true;
         self.moment_calls = null;
         return out;
@@ -4784,7 +4814,7 @@ const Engine = struct {
         var names: MomentNames = .empty;
         for (targets, 0..) |target, i| {
             var form = Affine.column(i).bounded(.{ .low = 0, .high = std.math.cast(i64, self.limits.path_depth) orelse std.math.maxInt(i64) });
-            form.numeric = try Numeric.Form.column(self.a, .{ .low = 0, .high = form.interval.?.high }, path.edges.len, target.edge);
+            form.numeric = try self.summaryNumeric(path, target.edge, .{ .low = 0, .high = form.interval.?.high });
             try names.put(self.a, target.name, .{ .scalar = form });
         }
         if (referencesAny(self.stream_predicate, names)) return null;

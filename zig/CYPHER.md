@@ -1788,13 +1788,19 @@ conversion. Ordinary unweighted states stay compact. Floating SUM retains its
 ordered overflow behavior and REAL retains its own rounding rules.
 
 Segment provenance identifies a further shared axis: a linear consumer whose
-coefficient is identical for every path segment depends only on total length.
+coefficient is identical for every variable path segment depends only on total
+length.
 For example, `min(size(xs)+size(ys))` on a two-segment path uses total-length
 extrema. This is an algebraic certificate, not an inference from independent
 marginal extrema. The executor substitutes a canonical segment vector carrying
-the total in the first segment and zero in the others; bounded totality proofs
-cover all intermediate projections before substitution. Every native aggregate
-in that pass must factor through the same axis. SQL reducers negotiate separate
+all variable hops in the first variable segment and zero in the other variable
+segments. Fixed-hop segments retain their actual lengths and contribute constant
+offsets to the geometry; whole-path slots still count every hop. Bounded totality
+proofs cover all intermediate projections before substitution. Finite UNWIND
+choices retain total-axis dependence even when their coefficients or offsets
+differ. Their range certificate does not fabricate one shared linear formula;
+subsequent arithmetic must remain total over the union of branch bounds. Every
+native aggregate in that pass must factor through the same axis. SQL reducers negotiate separate
 passes, and certificates compose through CTE projections and positional UNION
 ALL mappings. Invariant predicates and grouping observations cannot read a
 collapsed segment. Partial segment sums, unequal segment coefficients, unknown

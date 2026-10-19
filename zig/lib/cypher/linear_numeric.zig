@@ -144,6 +144,9 @@ pub const Form = struct {
     range: Lattice,
     terms: []const Lattice = &.{},
     offset: Lattice,
+    // A bounded choice of total-axis expressions need not have one set of
+    // coefficients. Retain dependence without inventing a linear formula.
+    opaque_total: bool = false,
     pub fn literal(n: Lattice) Form {
         return .{ .range = n, .offset = n };
     }
@@ -156,6 +159,7 @@ pub const Form = struct {
         return if (i < self.terms.len) self.terms[i] else Lattice.integer(0);
     }
     pub fn constant(self: Form) bool {
+        if (self.opaque_total) return false;
         for (self.terms) |t| if (!t.zero()) return false;
         return true;
     }
@@ -165,23 +169,42 @@ pub const Form = struct {
         return true;
     }
     pub fn choice(left: Form, right: Form) ?Form {
-        if (left.terms.len != right.terms.len or left.range.shift != right.range.shift or left.range.floating != right.range.floating or !Lattice.equal(left.offset, right.offset)) return null;
-        for (left.terms, right.terms) |l, r| if (!Lattice.equal(l, r)) return null;
-        var result = left;
-        result.range.low = @min(left.range.low, right.range.low);
-        result.range.high = @max(left.range.high, right.range.high);
-        return result;
+        if (left.range.floating != right.range.floating) return null;
+        const shift = @min(left.range.shift, right.range.shift);
+        const range: Lattice = .{
+            .low = std.math.cast(i64, @min(Lattice.scale(left.range.low, @as(i32, left.range.shift) - shift) orelse return null, Lattice.scale(right.range.low, @as(i32, right.range.shift) - shift) orelse return null)) orelse return null,
+            .high = std.math.cast(i64, @max(Lattice.scale(left.range.high, @as(i32, left.range.shift) - shift) orelse return null, Lattice.scale(right.range.high, @as(i32, right.range.shift) - shift) orelse return null)) orelse return null,
+            .shift = shift,
+            .floating = left.range.floating,
+        };
+        if (range.floating and !range.exactFloat()) return null;
+        const same = same: {
+            if (left.opaque_total or right.opaque_total or left.terms.len != right.terms.len or !Lattice.equal(left.offset, right.offset)) break :same false;
+            for (left.terms, right.terms) |l, r| if (!Lattice.equal(l, r)) break :same false;
+            break :same true;
+        };
+        if (same) {
+            var result = left;
+            result.range = range;
+            return result;
+        }
+        if (!left.total() or !right.total()) return null;
+        return .{ .range = range, .offset = Lattice.integer(0), .opaque_total = true };
     }
     pub fn negative(self: Form, a: A) !?Form {
         const range = self.range.negative() orelse return null;
         const offset = self.offset.negative() orelse return null;
         const terms = try a.alloc(Lattice, self.terms.len);
         for (self.terms, terms) |t, *out| out.* = t.negative() orelse return null;
-        return .{ .range = range, .terms = terms, .offset = offset };
+        return .{ .range = range, .terms = terms, .offset = offset, .opaque_total = self.opaque_total };
     }
     pub fn combine(l: Form, r: Form, a: A, op: Op) !?Form {
         if ((op == .multiply and !l.constant() and !r.constant()) or (op == .divide and !r.constant())) return null;
         const range = Lattice.combine(l.range, r.range, op) orelse return null;
+        if (l.opaque_total or r.opaque_total) {
+            if (!l.total() or !r.total()) return null;
+            return .{ .range = range, .offset = Lattice.integer(0), .opaque_total = true };
+        }
         const offset = Lattice.combine(l.offset, r.offset, op) orelse return null;
         const terms = try a.alloc(Lattice, @max(l.terms.len, r.terms.len));
         for (terms, 0..) |*out, i| out.* = switch (op) {

@@ -3773,3 +3773,111 @@ def test_numeric_and_total_axis_proofs_preserve_exact_observers(graph_db):
         db.sql(f"SELECT avg((a+b)/0.0) FROM {relation}")
     with pytest.raises(SQLStateError, match="22003"):
         db.sql(f"SELECT min((a+9223372036854775807)+b) FROM {relation}")
+
+
+@pytest.mark.parametrize("prefix,bridge", [("", "[:R]"), ("[:R]->()", "[:R*2..2]")])
+def test_fixed_segments_keep_total_axis_summaries(graph_db, prefix, bridge):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    leading = f"-{prefix}" if prefix else ""
+    base = f"MATCH p=(s:D {{id:'start'}}){leading}-[xs:R*1..]->()-{bridge}->()-[ys:R*1..]->(b:D) "
+    fixed = 3 if prefix else 1
+    limits = {"explored_edges": 1000, "intermediate_states": 50000}
+    expected = db.cypher_json(
+        "g", {"query": base + f"RETURN min(length(p)-{fixed}),max(length(p)-{fixed})", "limits": limits}
+    )["rows"]
+    for tail in (
+        "RETURN min(size(xs)+size(ys)),max(size(xs)+size(ys))",
+        "WITH size(xs) AS a,size(ys) AS b RETURN min(a+b),max(a+b)",
+        "CALL { WITH xs,ys RETURN size(xs) AS x,size(ys) AS y } RETURN min(x+y),max(x+y)",
+    ):
+        actual = db.cypher_json("g", {"query": base + tail, "limits": limits})
+        assert actual["rows"] == expected
+    sql_base = (
+        base.replace(":D", " IS D")
+        .replace(":R", " IS R")
+        .replace(" {id:'start'}", "")
+        .replace("*1..", "*")
+        .replace("*2..2", "*2")
+    )
+    relation = f"GRAPH_TABLE(g {sql_base} WHERE s.id='start' COLUMNS(size(xs) AS a,size(ys) AS b,length(p) AS n)) q"
+    ordinary = db.sql(f"SELECT min(n-{fixed}),max(n-{fixed}) FROM {relation}")["rows"]
+    for query in (
+        f"SELECT min(a+b),max(a+b) FROM {relation}",
+        f"WITH t AS (SELECT a+3 AS x,b+4 AS y FROM {relation}) SELECT min(x+y-7),max(x+y-7) FROM t",
+    ):
+        assert db.sql(query)["rows"] == ordinary
+
+
+def test_differing_total_axis_unwind_branches_stay_compressed(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[xs:R*1..]->()-[ys:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 60000}
+    for branches, expression in (
+        ("n,2*n", "n"),
+        ("n,7,2*n+1", "n"),
+        ("0.5*n,2.0*n+7.0", "n"),
+        ("n,2*n+7,-n", "n+3"),
+        ("n,2*n", "-n"),
+        ("n,2*n", "n/2.0"),
+        ("n,2*n", "n+n"),
+        ("n,2*n", "n+(size(xs)+size(ys))"),
+    ):
+        tail = f"UNWIND [{branches}] AS n RETURN min({expression}),max({expression})"
+        control = tail.replace(f"[{branches}]", "[" + branches.replace("n", "length(p)") + "]").replace(
+            "(size(xs)+size(ys))", "length(p)"
+        )
+        expected = db.cypher_json("g", {"query": base + control, "limits": limits})["rows"]
+        actual_tail = tail.replace(f"[{branches}]", "[" + branches.replace("n", "(size(xs)+size(ys))") + "]")
+        actual = db.cypher_json("g", {"query": base + actual_tail, "limits": limits})
+        assert actual["rows"] == expected
+
+
+def test_fixed_and_choice_certificates_preserve_joint_values_and_errors(graph_db):
+    db = graph_db
+    populate_layered_graph(db, layers=6)
+    base = "MATCH p=(s:D {id:'start'})-[xs:R*1..]->()-[f:R]->()-[ys:R*1..]->(b:D) "
+    rows = db.cypher_json("g", {"query": base + "RETURN size(xs),size(ys),length(p)"})["rows"]
+    pairs = [(int(row[0]["value"]), int(row[1]["value"])) for row in rows]
+    for branches, values in (
+        ("size(xs)+size(ys),2*(size(xs)+size(ys))+7", [v for a, b in pairs for v in (a + b, 2 * (a + b) + 7)]),
+        ("size(xs)+size(ys),2*size(xs)+size(ys)", [v for a, b in pairs for v in (a + b, 2 * a + b)]),
+        ("size(xs)+size(ys),size(xs)-size(ys)", [v for a, b in pairs for v in (a + b, a - b)]),
+        (
+            "0.1*(size(xs)+size(ys)),0.3*(size(xs)+size(ys))",
+            [v for a, b in pairs for v in (0.1 * (a + b), 0.3 * (a + b))],
+        ),
+    ):
+        result = db.cypher_json("g", {"query": base + f"UNWIND [{branches}] AS n RETURN min(n),max(n),avg(n)"})["rows"][
+            0
+        ]
+        assert [float(cell["value"]) for cell in result] == pytest.approx(
+            [min(values), max(values), sum(values) / len(values)]
+        )
+    fixed_base = base.replace("[f:R]", "[fs:R*2..2]")
+    exact = db.cypher_json("g", {"query": fixed_base + "RETURN size(xs),size(ys),size(fs),length(p)"})["rows"]
+    totals = [int(row[3]["value"]) for row in exact]
+    actual = db.cypher_json(
+        "g",
+        {
+            "query": fixed_base
+            + "RETURN min(size(xs)+size(ys)+size(fs)),max(size(xs)+size(ys)+size(fs)),min(size(fs)),max(size(fs))"
+        },
+    )["rows"][0]
+    assert [int(cell["value"]) for cell in actual] == [min(totals), max(totals), 2, 2]
+    assert db.cypher_json("g", {"query": fixed_base + "RETURN min(size(xs)+size(ys)-length(p))"})["rows"] == [
+        [{"type": "integer", "value": "-2"}]
+    ]
+    for tail, error in (
+        (
+            "UNWIND [size(xs)+size(ys),2*(size(xs)+size(ys))] AS n RETURN min(n+9223372036854775807)",
+            "CypherNumericOverflow",
+        ),
+        ("UNWIND [size(xs)+size(ys),2*(size(xs)+size(ys))] AS n RETURN min(n/0.0)", "CypherDivisionByZero"),
+        ("RETURN min((size(xs)+9223372036854775807)+size(ys))", "CypherNumericOverflow"),
+    ):
+        with pytest.raises(af.GraphError, match=error):
+            db.cypher_json("g", {"query": base + tail})
