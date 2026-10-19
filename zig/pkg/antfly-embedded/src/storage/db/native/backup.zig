@@ -1706,7 +1706,7 @@ test "shared vector acceleration corruption preserves native posting authority" 
 
 test "native v02 released generation manifest recovers only canonical install paths" {
     const alloc = std.testing.allocator;
-    var loaded = try parseManifestBytes(alloc, @embedFile("../testdata/v02-server/native-generation.json"));
+    var loaded = try parseManifestBytes(alloc, @embedFile("../../testdata/v02-server/native-generation.json"));
     defer loaded.deinit();
     try std.testing.expectEqual(@as(u32, 3), loaded.value().format_version);
     try std.testing.expect(loaded.projectionInvalid("dense"));
@@ -1717,7 +1717,7 @@ test "native v02 released generation manifest recovers only canonical install pa
         try std.testing.expectEqualStrings(try artifactInstallPath(artifact.path, artifact.role), artifact.install_path);
     }
     // A modern manifest missing its authenticated install paths must fail.
-    const modern = try alloc.dupe(u8, @embedFile("../testdata/v02-server/native-generation.json"));
+    const modern = try alloc.dupe(u8, @embedFile("../../testdata/v02-server/native-generation.json"));
     defer alloc.free(modern);
     const offset = std.mem.indexOf(u8, modern, "\"format_version\":3").?;
     modern[offset + "\"format_version\":".len] = '5';

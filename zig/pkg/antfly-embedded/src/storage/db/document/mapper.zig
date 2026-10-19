@@ -6510,7 +6510,7 @@ test "relational index system SQL array preparation roundtrips PostgreSQL fixtur
     const wire = @import("../../../sql/array_wire.zig");
     const storage = @import("../../../sql/array_storage.zig");
     const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
-    const fixture = try std.json.parseFromSlice(Fixture, alloc, @embedFile("../../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    const fixture = try std.json.parseFromSlice(Fixture, alloc, @embedFile("../../../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
     for (fixture.value.entries) |entry| {
         const pg = try alloc.alloc(u8, entry.binary.len / 2);
@@ -6606,7 +6606,7 @@ test "relational index system NUMERIC scalar preparation matches PostgreSQL bina
     const a = std.testing.allocator;
     const fixture = try std.json.parseFromSlice(struct {
         senders: []const struct { input: []const u8, binary: []const u8 },
-    }, a, @embedFile("../../sql/fixtures/sql_exact_numeric_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    }, a, @embedFile("../../../sql/fixtures/sql_exact_numeric_binary_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
     try std.testing.expectEqual(@as(usize, 65), fixture.value.senders.len);
     const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .allows_null = true }} };

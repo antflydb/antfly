@@ -20,9 +20,9 @@ const Allocator = std.mem.Allocator;
 /// An already optional payload stays single-optional: absent and missing
 /// both become `null`.
 pub fn missingAsNull(result: anytype) MissingAsNull(@TypeOf(result)) {
-    return result catch |err| switch (err) {
-        error.NotFound => null,
-        else => |other| other,
+    return result catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
     };
 }
 
