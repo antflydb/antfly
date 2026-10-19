@@ -91,6 +91,7 @@ comptime {
 }
 
 pub const MetalNativeProvider = if (build_options.enable_metal) struct {
+    pub const image_coefficient_budget: usize = 16 * 1024 * 1024;
     raw_provider: ?*RawMetalProvider,
     raw_decode_runtime: ?*RawMetalDecodeRuntime,
     embedding_workspace_leases: [64]?memory.AdmissionLease = @splat(null),
@@ -106,6 +107,9 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_vision_linear_cache_bytes: usize = 0,
     embeddinggemma2_audio_linear_cache_bytes: usize = 0,
     embedding_vision_workspaces: [2]?*@import("../ops/metal_embedding_bindings.zig").VisionWorkspace = @splat(null),
+    /// One model-owned RGB preparer; coefficients replace by geometry and are
+    /// admitted independently of request workspace. The provider lease serializes it.
+    embedding_image_preparer: ?@import("antfly_video").preparation.Metal = null,
     embedding_vision_clock: u64 = 0,
     embedding_vision_retry: u64 = 0,
     embedding_bindings: ?*@import("../ops/metal_embedding_bindings.zig").State = null,
@@ -218,6 +222,15 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             std.heap.c_allocator.destroy(workspace);
             entry.* = null;
         };
+        if (self.embedding_image_preparer) |*preparer| {
+            preparer.deinit(); // Fence before releasing persistent admission.
+            self.embedding_image_preparer = null;
+            if (self.embeddinggemma2_cache_admission) |cache| {
+                cache.noteRelease(.host, @sizeOf(@import("antfly_video").preparation.Metal));
+                cache.noteRelease(.backend, image_coefficient_budget);
+            }
+            bytes += image_coefficient_budget + @sizeOf(@import("antfly_video").preparation.Metal);
+        }
         self.embedding_vision_retry = 0;
         return bytes;
     }

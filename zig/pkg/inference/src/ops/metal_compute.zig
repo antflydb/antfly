@@ -1860,6 +1860,72 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return metal_runtime.termite_metal_decode_runtime_device(self.provider_impl.raw_decode_runtime) orelse error.MetalRuntimeUnavailable;
     }
 
+    /// Shared provider ownership amortizes shader setup and exact torchvision
+    /// coefficients. Optional cache admission failure declines to CPU preparation;
+    /// cancellation and submitted GPU failures propagate after fencing staging.
+    pub fn prepareEmbeddingImagePatches(cb: *const ops.ComputeBackend, view: @import("antfly_image").processing.ImageU8, width: u32, height: u32) !?CT {
+        if (comptime !build_options.enable_metal) return null;
+        if (cb.kind() != .metal or @import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION")) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const io = self.io orelse return null;
+        const p = self.provider_impl;
+        if (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return null;
+        try cb.checkExecutionControl();
+        const preparation = @import("antfly_video").preparation;
+        if (p.embedding_image_preparer == null) {
+            const cache = if (self.data.tier_cache) |*v| v else return null;
+            if (p.embeddinggemma2_cache_admission) |bound| if (bound != cache) return null;
+            const budget = @TypeOf(p.*).image_coefficient_budget;
+            const device = try videoDevice(cb);
+            self.data.prefetch.lock();
+            cache.reserve(.host, @sizeOf(preparation.Metal)) catch {
+                self.data.prefetch.unlock();
+                return null;
+            };
+            cache.reserve(.backend, budget) catch {
+                cache.noteRelease(.host, @sizeOf(preparation.Metal));
+                self.data.prefetch.unlock();
+                return null;
+            };
+            self.data.prefetch.unlock();
+            const preparer = preparation.Metal.init(device) catch |err| {
+                self.data.prefetch.lock();
+                cache.noteRelease(.host, @sizeOf(preparation.Metal));
+                cache.noteRelease(.backend, budget);
+                self.data.prefetch.unlock();
+                return err;
+            };
+            p.embedding_image_preparer = preparer;
+            p.embeddinggemma2_cache_admission = cache;
+        }
+        var context = struct {
+            backend: *const ops.ComputeBackend,
+            fn check(raw: ?*const anyopaque) anyerror!void {
+                const ctx: *const @This() = @ptrCast(@alignCast(raw.?));
+                try ctx.backend.checkExecutionControl();
+            }
+        }{ .backend = cb };
+        const control = @import("antfly_media").source.Control{ .context = &context, .check_fn = @TypeOf(context).check };
+        var prepared = p.embedding_image_preparer.?.submitImageView(self.allocator, view, .{
+            .width = width,
+            .height = height,
+            .matrix = .bt601,
+            .torchvision = true,
+            .max_soft_tokens = 280,
+            .max_scratch_bytes = 256 * 1024 * 1024,
+        }, control) catch |err| switch (err) {
+            error.ResourceLimitExceeded => return null,
+            else => return err,
+        };
+        defer prepared.deinit();
+        try prepared.wait(io, control);
+        try prepared.releaseSource();
+        const tensor = try importVideoBuffer(cb, try prepared.buffer(), prepared.geometry.values());
+        errdefer cb.free(tensor);
+        try cb.checkExecutionControl();
+        return tensor;
+    }
+
     /// Caller waits for producer completion and releases its Prepared owner
     /// before consuming this tensor. The CT retains the Metal allocation.
     pub fn importVideoBuffer(cb: *const ops.ComputeBackend, buffer: *anyopaque, values: usize) !CT {
@@ -16410,7 +16476,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         toBuf(ct).metal_tensor.?.invalidateHostMirror();
         return ct;
     }
-    fn embeddingVisionNormOp(ctx: *anyopaque, input: CT, _: CT, residual: ?CT, eps: f32, index: usize) anyerror!?CT {
+    fn embeddingVisionNormOp(ctx: *anyopaque, input: CT, residual: ?CT, eps: f32, index: usize) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const workspace = self.embedding_vision_workspace orelse return null;
         const layer = index / 4;
@@ -35721,6 +35787,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
 
+    pub fn prepareEmbeddingImagePatches(_: *const ops.ComputeBackend, _: @import("antfly_image").processing.ImageU8, _: u32, _: u32) !?CT {
+        return null;
+    }
+
     pub fn copyTensorInto(_: *const ops.ComputeBackend, _: CT, _: CT) !bool {
         return false;
     }
@@ -46900,7 +46970,7 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
         defer cb.free(input);
         const reference = (try cb.rmsNormResidual(input, workspace.views[11].?, input, 768, 1e-6, 1, 1)).?;
         defer cb.free(reference);
-        const output = (try cb.vtable.embeddingVisionNorm.?(cb.ptr, input, workspace.views[11].?, input, 1e-6, 3)).?;
+        const output = (try cb.vtable.embeddingVisionNorm.?(cb.ptr, input, input, 1e-6, 3)).?;
         const expected = try cb.toFloat32(reference, a);
         defer a.free(expected);
         const actual = try cb.toFloat32(output, a);
@@ -46929,6 +46999,100 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
     const p = store.shared_metal_native_provider.?;
     try std.testing.expect(try p.reclaimEmbeddingGemma2Weights(.vision) > 0);
     for (p.embedding_vision_workspaces) |entry| try std.testing.expect(entry == null);
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
+}
+
+test "embeddinggemma2 Metal RGB and RGBA preparation preserves strided torchvision pixels warm cache cancellation and reclamation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{});
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const preparation = @import("antfly_video").preparation;
+    for ([_][4]usize{ .{ 13, 7, 48, 48 }, .{ 193, 129, 96, 48 }, .{ 17, 131, 48, 144 } }) |geometry| {
+        const w = geometry[0];
+        const h = geometry[1];
+        const tw: u32 = @intCast(geometry[2]);
+        const th: u32 = @intCast(geometry[3]);
+        for ([_]usize{ 3, 4 }) |channels| {
+            const stride = w * channels + 11;
+            const source = try a.alloc(u8, stride * (h - 1) + w * channels);
+            defer a.free(source);
+            const rgba = try a.alloc(u8, w * h * 4);
+            defer a.free(rgba);
+            @memset(source, 253);
+            for (0..h) |y| for (0..w) |x| {
+                for (0..3) |c| {
+                    const value: u8 = @truncate(x * 19 + y * 71 + c * 83);
+                    source[y * stride + x * channels + c] = value;
+                    rgba[(y * w + x) * 4 + c] = value;
+                }
+                rgba[(y * w + x) * 4 + 3] = 37;
+            };
+            const view = @import("antfly_image").processing.ImageU8{ .data = source, .width = @intCast(w), .height = @intCast(h), .format = if (channels == 3) .rgb8 else .rgba8, .row_stride_bytes = stride };
+            const expected = try preparation.referenceRgba(a, rgba, @intCast(w), @intCast(h), .{ .width = tw, .height = th, .matrix = .bt601, .torchvision = true }, .{});
+            defer a.free(expected);
+            var coefficient: ?*anyopaque = null;
+            for (0..2) |round| {
+                const tensor = (try MetalCompute.prepareEmbeddingImagePatches(&cb, view, tw, th)).?;
+                defer cb.free(tensor);
+                try std.testing.expect(MetalCompute.debugHasDeviceTensor(&cb, tensor));
+                const actual = try cb.toFloat32(tensor, a);
+                defer a.free(actual);
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+                const current = compute.provider_impl.embedding_image_preparer.?.coefficients;
+                if (round == 0) coefficient = current else try std.testing.expectEqual(coefficient, current);
+            }
+            const Cancel = struct {
+                fn check(raw: ?*const anyopaque) !void {
+                    const count: *usize = @ptrCast(@alignCast(@constCast(raw.?)));
+                    count.* += 1;
+                    if (count.* >= 3) return error.Cancelled;
+                }
+            };
+            var checks: usize = 0;
+            var canceled = cb;
+            canceled.execution_control = .{ .ptr = &checks, .check_fn = Cancel.check, .native_call_policy = .in_process };
+            try std.testing.expectError(error.Cancelled, MetalCompute.prepareEmbeddingImagePatches(&canceled, view, tw, th));
+            const retry = (try MetalCompute.prepareEmbeddingImagePatches(&cb, view, tw, th)).?;
+            defer cb.free(retry);
+            const actual = try cb.toFloat32(retry, a);
+            defer a.free(actual);
+            for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+        }
+    }
+    try std.testing.expect(try compute.provider_impl.reclaimEmbeddingGemma2Weights(.vision) >= 16 * 1024 * 1024);
+    try std.testing.expect(compute.provider_impl.embedding_image_preparer == null);
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+}
+
+test "embeddinggemma2 Metal image preparation declines denied persistent admission without leaking credit" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{ .backend_limit_bytes = 1 });
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const rgb: [13 * 7 * 3]u8 = @splat(128);
+    try std.testing.expect(try MetalCompute.prepareEmbeddingImagePatches(&cb, .{ .data = &rgb, .width = 13, .height = 7, .format = .rgb8 }, 48, 48) == null);
+    try std.testing.expect(compute.provider_impl.embedding_image_preparer == null);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
 }

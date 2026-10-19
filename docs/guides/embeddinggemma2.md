@@ -1457,6 +1457,7 @@ embedding API with two real image fixtures.
 | Full encoder, 3000 rows, partial final tile | 307.159 ms | 260.519 ms |
 | Full encoder, 4096 rows | 423.597 ms | 363.938 ms |
 | Public raster embeddings, previous / optimized vision | 537.062 ms | 416.280 ms |
+| Public raster embeddings, CPU / device image preparation, separate shared-host run | 586.933 ms | 575.591 ms |
 | Masked backbone, 512 rectangular / 448 active rows | 33.925 ms | 29.868 ms |
 | Masked backbone, 512 rectangular / 511 active rows | 35.430 ms | 32.822 ms |
 
@@ -1555,6 +1556,46 @@ packed projection, GELU and down projection into final hidden rows. Residual
 normalization/addition uses one dispatch. Position gathering/addition and the
 spatial projector each have an owned frame, respecting external frame owners.
 Cancellation drains both layer slots before clearing the request's layout view.
+
+Metal image preparation consumes RGB or RGBA bytes with an explicit row stride,
+ignores alpha/padding, and writes exact torchvision bicubic, centered patch rows
+on the device. Encoded images retain decoded RGB until consumption; raster
+attachments borrow caller-owned bytes. Single images import the patch buffer
+directly. Cohorts copy patch rows into one device matrix and perform one patch
+projection per compatible geometry, avoiding batched host F32 pixels and host
+patch packing. Unsupported preparation or denied optional retention keeps the
+CPU torchvision fallback.
+
+The shared model provider owns one preparer and its current geometry/policy
+coefficients. A 16 MiB coefficient ceiling is admitted separately from request
+workspace; geometry replacement reuses shader pipelines. Vision pressure and
+unload fence the preparer before releasing its cache credit. Cancellation fences
+submitted preparation before input/output ownership is released; retry starts
+with a clean request. Prepared vision norm callbacks are consulted before any
+fallback coefficient load, avoiding 64 redundant small weight materializations
+per tower when model-owned snapshots are available.
+
+Dedicated raster CPU preparation runs before the model execution lock and
+backend lease. Raster host preparation is derived from source/target geometry;
+Metal borrowed rasters require no separate decoded host copy. After decoding,
+image requests use actual soft-token geometry and the larger of vision/encoder
+workspace peaks. Projection releases owned preparation pixels before composition
+and encoder execution, reducing the host lease and matching run credit together.
+The encoder phase then retires drained vision workspace. CPU/CUDA retain their
+qualified preparation policies and every phase remains subject to shared model
+and process admission.
+
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION=1` selects CPU torchvision
+preparation for qualification. `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_IMAGE_PREPARATION=1`
+adds a completed alternating CPU/device preparation comparison to the pretrained
+ordered-media oracle, with identical vision/backbone execution on both routes.
+
+A separate completed two-image comparison on the shared M4 Max host measured
+586.933 ms with CPU preparation versus 575.591 ms with Metal preparation (seven
+samples after two warmups, alternating order, parity checked). Both routes used
+the new vision execution. This roughly 1.9% public-path improvement is specific
+to those fixtures; absolute latencies are not comparable with earlier runs or a
+clean-host campaign.
 
 MPS linear slots retain four immutable multiplication shapes and their matrix
 descriptors, including full tiles and tails. Activation-bound matrix views keep

@@ -134,7 +134,7 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         AVCoefficients *c = (__bridge AVCoefficients *)coefficients;
         AVPrepared *result = [AVPrepared new];
         if (params[8] < 8 || params[8] > 14 || params[11] > 16 - params[8] || (params[8] == 8 && params[11] != 0)) return -1;
-        if ((params[5] == 3 && !rgba && (params[9] != 3 || !params[6] || params[12])) || params[5] > 3 || params[12] > 2 || (params[5] == 2 && params[12] == 0) || (rgba && params[12] != 0)) return -1;
+        if ((!rgba && ((params[5] == 3 && (params[9] != 3 || !params[6] || params[12])) || params[5] > 3 || (params[5] == 2 && params[12] == 0))) || params[12] > 2 || (rgba && params[12] != 0)) return -1;
         id<MTLBuffer> toneLUT = params[12] == 1 ? p.pqLUT : p.hlgLUT;
         if (params[12] && !toneLUT) {
             float table[16385];
@@ -171,8 +171,11 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
             }
             result.nativeY = y = nativeY; result.nativeUV = uv = nativeUV;
         } else if (rgba) {
-            if (rgba_size != (size_t)params[0] * params[1] * 4) return -1;
-            // Copies before returning; the producer can immediately free RGBA.
+            size_t channels = params[5], stride = params[6];
+            if ((channels != 3 && channels != 4) || !params[0] || !params[1] ||
+                stride < (size_t)params[0] * channels ||
+                rgba_size != stride * (params[1] - 1) + (size_t)params[0] * channels) return -1;
+            // Copies before returning; the producer can immediately free RGB/RGBA.
             result.rgba = upload(p.device, rgba, rgba_size);
             if (!result.rgba) return -1;
         } else {

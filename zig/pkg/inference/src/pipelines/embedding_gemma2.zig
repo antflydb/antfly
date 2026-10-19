@@ -2167,7 +2167,7 @@ const PreparationSlot = struct {
             };
             self.input_bytes = std.math.add(usize, self.input_bytes, partBytes(part).len) catch return error.ResourceLimitExceeded;
         }
-        self.permit = try self.session.admitHostPreprocess(std.math.add(usize, self.input_bytes, 512 * 1024 * 1024) catch return error.ResourceLimitExceeded);
+        self.permit = try self.session.admitHostPreprocess(std.math.add(usize, self.input_bytes, if (self.source == .rasters) try rasterPreparationBytes(self.session.backend(), self.source.rasters) else 512 * 1024 * 1024) catch return error.ResourceLimitExceeded);
         const image_scope = @import("antfly_image").work_control.Scope.enter(self.control.imageWorkControl());
         defer image_scope.deinit();
         for (0..self.source.len()) |index| {
@@ -2281,14 +2281,16 @@ fn retainPackedPhase(permit: *RunPermit, batch: usize, packed_rows: ResidentPack
     const old = permit.request orelse return;
     var active: usize = 0;
     for (packed_rows.mask) |value| active += @intFromBool(value != 0);
-    try permit.retainForRun(.{ .batch = 1, .sequence = active, .input_bytes = old.input_bytes, .pre_admitted_host_bytes = old.pre_admitted_host_bytes, .host_preprocess_bytes = old.host_preprocess_bytes, .workspace_bytes = @min(old.workspace_bytes, 256 * 1024 * 1024 + active * 192 * 1024), .output_bytes = batch * 768 * 4 });
+    try permit.retainForRun(.{ .batch = 1, .sequence = active, .input_bytes = old.input_bytes, .pre_admitted_host_bytes = old.pre_admitted_host_bytes, .host_preprocess_bytes = @min(old.host_preprocess_bytes, 128 * 1024 * 1024 + active * 192 * 1024), .preprocessing_complete = true, .workspace_bytes = @min(old.workspace_bytes, 256 * 1024 * 1024 + active * 192 * 1024), .output_bytes = batch * 768 * 4 });
 }
 fn retainPreparedPhase(permit: *RunPermit, batch: usize, sequence: usize) !void {
     const old = permit.request orelse return;
     var phase = try preparedRunRequest(permit.session.backend(), old.input_bytes, old.pre_admitted_host_bytes, batch, sequence, 0);
-    // Pixels/features and packing allocations remain owned until the cohort
-    // returns. Keep that host ceiling; release the drained projector workspace.
-    phase.host_preprocess_bytes = old.host_preprocess_bytes;
+    // Keep any still-owned features and packing allocations within the previous
+    // host ceiling while retiring the drained projector workspace. Image callers
+    // have already released their owned preparation and its matching credit.
+    phase.host_preprocess_bytes = @min(old.host_preprocess_bytes, phase.host_preprocess_bytes);
+    phase.preprocessing_complete = true;
     try permit.retainForRun(phase);
 }
 
@@ -2296,9 +2298,46 @@ fn preparedRunRequest(backend: @import("../backends/backends.zig").BackendType, 
     if (batch == 0 or sequence == 0 or sequence > 1024) return error.EmbeddingInputTooLong;
     const per_row = try std.math.add(usize, try std.math.mul(usize, sequence, 192 * 1024), try std.math.mul(usize, try std.math.mul(usize, sequence, sequence), 48));
     const language = try std.math.add(usize, 64 * 1024 * 1024, try std.math.mul(usize, batch, per_row));
-    const host = @min(@as(usize, 512 * 1024 * 1024), @max(retained_bytes, try std.math.add(usize, 64 * 1024 * 1024, language)));
+    // Retained preparation is additive so it can be released independently
+    // without increasing the execution lease or borrowing its host credit.
+    const prepared = retained_bytes -| input_bytes;
+    const host = try std.math.add(usize, prepared, @min(@as(usize, 512 * 1024 * 1024), try std.math.add(usize, 64 * 1024 * 1024, language)));
     const legacy: usize = if (backend == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024;
     return .{ .batch = batch, .sequence = sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = retained_bytes, .host_preprocess_bytes = host, .workspace_bytes = @max(media_workspace, @min(legacy, try std.math.add(usize, 256 * 1024 * 1024, language))), .output_bytes = try std.math.mul(usize, batch, 768 * 4) };
+}
+
+/// Raster geometry is known before execution. Metal borrows its source;
+/// CPU resize and CUDA RGB packing reserve their actual bounded preparation.
+fn rasterPreparationBytes(backend: @import("../backends/backends.zig").BackendType, rasters: []const Raster) !usize {
+    if (backend == .metal) return 0;
+    var bytes: usize = 64 * 1024 * 1024;
+    for (rasters) |raster| {
+        const g = try projector.embeddingGemma2ImageGeometry(raster.width, raster.height);
+        const area = if (backend == .cuda) try std.math.mul(usize, raster.width, raster.height) else try std.math.mul(usize, g.width, g.height);
+        bytes = try std.math.add(usize, bytes, try std.math.mul(usize, area, if (backend == .cuda) 3 else 12));
+    }
+    return bytes;
+}
+fn preparedImageRunRequest(backend: @import("../backends/backends.zig").BackendType, input: usize, retained: usize, pixels: []const projector.PreparedImage, max_tokens: usize, scratch: usize) !@import("../backends/session.zig").RunRequest {
+    var sequence: usize = 1;
+    for (pixels) |item| sequence = @max(sequence, item.geometry.tokenCount() + 4);
+    return preparedRunRequest(backend, input, retained, pixels.len, @min(sequence, max_tokens), scratch);
+}
+/// Projection has fenced all reads of these sources. Release owned pixels and
+/// reduce both leases together: no stale credit survives in the run request.
+fn releaseImagePreparation(pixels: []projector.PreparedImage, host: *RunPermit, run: *RunPermit) !void {
+    const old = run.request orelse return;
+    const released = old.pre_admitted_host_bytes -| old.input_bytes;
+    for (pixels) |*item| {
+        item.deinit();
+        item.pixels = &.{};
+        item.source = null;
+    }
+    var phase = old;
+    phase.pre_admitted_host_bytes = old.input_bytes;
+    phase.host_preprocess_bytes -= released;
+    try run.retainForRun(phase);
+    try host.retainHostBytes(old.input_bytes);
 }
 
 pub fn imageRunRequest(backend: @import("../backends/backends.zig").BackendType, input_bytes: usize, retained_bytes: usize, batch: usize, vision_scratch: usize) @import("../backends/session.zig").RunRequest {
@@ -2327,7 +2366,7 @@ fn consumePreparedMedia(slot: *PreparationSlot, tokenizer: Tokenizer, cfg: encod
     for (slot.pixels[0..slot.retained]) |pixels| sequence = @max(sequence, pixels.geometry.tokenCount() + 4);
     const request = try preparedRunRequest(session.backend(), slot.input_bytes, slot.retained_bytes, slot.retained, sequence, vision_scratch);
     if (slot.bounded.live > request.host_preprocess_bytes) return error.MemoryBudgetExceeded;
-    slot.bounded.limit = request.host_preprocess_bytes;
+    slot.bounded.limit = @min(@as(usize, 512 * 1024 * 1024), request.host_preprocess_bytes);
     var permit = admitWithVisionCacheReclaim(session, request, control) catch |err| blk: {
         const future = lookahead orelse return err;
         if (!isPreparationPressure(err)) return err;
@@ -2349,6 +2388,8 @@ fn consumePreparedMedia(slot: *PreparationSlot, tokenizer: Tokenizer, cfg: encod
         var resident = try projector.encodePreparedEmbeddingGemma2ImagesResident(&managed.backend, a, slot.pixels[0..slot.retained], .{ .max_scratch_bytes = vision_scratch });
         defer resident.deinit();
         if (options.timings) |t| t.vision_ns += mediaNow() - vision_started;
+        try releaseImagePreparation(slot.pixels[0..slot.retained], &slot.permit.?, &permit);
+        slot.retained_bytes = slot.input_bytes;
         const compact = try runResidentImageBatch(a, &managed.backend, cfg, tokenizer, &resident, options, &permit);
         defer a.free(compact);
         for (slot.indexes[0..slot.retained], compact) |index, vector| vectors[index] = vector;
@@ -2358,6 +2399,8 @@ fn consumePreparedMedia(slot: *PreparationSlot, tokenizer: Tokenizer, cfg: encod
     if (options.timings) |t| t.host_cohorts += 1;
     var projected = try projector.encodePreparedEmbeddingGemma2Images(&managed.backend, a, slot.pixels[0..slot.retained], .{ .max_scratch_bytes = vision_scratch });
     defer projected.deinit();
+    try releaseImagePreparation(slot.pixels[0..slot.retained], &slot.permit.?, &permit);
+    slot.retained_bytes = slot.input_bytes;
     const pack_started = mediaNow();
     var groups: [raster_max_batch]PreparedGroup = undefined;
     var initialized: usize = 0;
@@ -2388,7 +2431,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
         };
         input_bytes = std.math.add(usize, input_bytes, bytes.len) catch return error.ResourceLimitExceeded;
     }
-    const vision_scratch: usize = if (session.backend() == .metal or session.backend() == .cuda) 2 * 1024 * 1024 * 1024 else 512 * 1024 * 1024;
+    const vision_limit: usize = if (session.backend() == .metal or session.backend() == .cuda) 2 * 1024 * 1024 * 1024 else 512 * 1024 * 1024;
     // Encoded dimensions are not known until decoding. Reserve bounded host
     // preprocessing before codecs; reserve GPU scratch under the model lock.
     const preprocessing_bytes = std.math.add(usize, input_bytes, 512 * 1024 * 1024) catch return error.ResourceLimitExceeded;
@@ -2426,9 +2469,11 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
     var retained_bytes = input_bytes;
     for (pixels[0..retained]) |item| retained_bytes = std.math.add(usize, retained_bytes, item.retainedBytes()) catch return error.ResourceLimitExceeded;
     try host_permit.retainHostBytes(retained_bytes);
+    const vision_scratch = try projector.embeddingGemma2PreparedScratch(pixels[0..retained], vision_limit);
+    const request = try preparedImageRunRequest(session.backend(), input_bytes, retained_bytes, pixels[0..retained], options.max_tokens, vision_scratch);
     if (lock) |mutex| try control.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
-    var permit = try admitWithVisionCacheReclaim(session, .{ .batch = images.len, .sequence = raster_max_sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = retained_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = vision_scratch + (if (session.backend() == .metal) @as(usize, 768 * 1024 * 1024) else @as(usize, 512 * 1024 * 1024)), .output_bytes = images.len * options.dimensions * 4 }, control);
+    var permit = try admitWithVisionCacheReclaim(session, request, control);
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
@@ -2440,6 +2485,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
         var resident = try projector.encodePreparedEmbeddingGemma2ImagesResident(&managed.backend, a, pixels[0..retained], .{ .max_scratch_bytes = vision_scratch });
         defer resident.deinit();
         if (options.timings) |t| t.vision_ns += mediaNow() - started;
+        try releaseImagePreparation(pixels[0..retained], &host_permit, &permit);
         const compact = try runResidentImageBatch(a, &managed.backend, cfg, tokenizer, &resident, options, &permit);
         defer a.free(compact);
         for (indexes[0..retained], compact) |index, vector| vectors[index] = vector;
@@ -2450,6 +2496,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
     const vision_started = mediaNow();
     var projected = try projector.encodePreparedEmbeddingGemma2Images(&managed.backend, a, pixels[0..retained], .{ .max_scratch_bytes = vision_scratch });
     defer projected.deinit();
+    try releaseImagePreparation(pixels[0..retained], &host_permit, &permit);
     const pack_started = mediaNow();
     var prepared: [raster_max_batch]PreparedGroup = undefined;
     var initialized: usize = 0;
@@ -2478,21 +2525,10 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
         try validateGroup(.{ .content = &.{.{ .raster = raster }} }, options);
         input_bytes = std.math.add(usize, input_bytes, raster.bytes.len) catch return error.ResourceLimitExceeded;
     }
-    // Image soft tokens are capped at 280. Reserve a conservative 512-token
-    // row before projection; a cohort occupies at most 2048 padded slots.
-    const max_sequence = @min(raster_max_sequence, options.max_tokens);
     const vision_limit: usize = if (session.backend() == .metal or session.backend() == .cuda) 2 * 1024 * 1024 * 1024 else 512 * 1024 * 1024;
     const vision_scratch = try projector.embeddingGemma2RasterScratch(rasters, vision_limit);
-    var host_permit = try session.admitHostPreprocess(input_bytes);
+    var host_permit = try session.admitHostPreprocess(try std.math.add(usize, input_bytes, try rasterPreparationBytes(session.backend(), rasters)));
     defer host_permit.deinit();
-    if (lock) |mutex| try control.lock(mutex);
-    defer if (lock) |mutex| mutex.unlock();
-    var permit = try admitWithVisionCacheReclaim(session, .{ .batch = rasters.len, .sequence = max_sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = vision_scratch + (if (session.backend() == .metal) @as(usize, 768 * 1024 * 1024) else @as(usize, 512 * 1024 * 1024)), .output_bytes = rasters.len * options.dimensions * @sizeOf(f32) }, control);
-    defer permit.deinit();
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
-    defer managed.deinit();
-    const transfer_before = MediaTransferSnapshot.init(&managed.backend);
-    defer observeResidentTransfers(&managed.backend, transfer_before, options);
     const image_scope = @import("antfly_image").work_control.Scope.enter(control.imageWorkControl());
     defer image_scope.deinit();
     const preprocess_started = mediaNow();
@@ -2505,12 +2541,25 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
         pixel_count += 1;
     }
     if (options.timings) |t| t.preprocess_ns += mediaNow() - preprocess_started;
+    var retained_bytes = input_bytes;
+    for (pixels[0..pixel_count]) |item| retained_bytes = try std.math.add(usize, retained_bytes, item.retainedBytes());
+    try host_permit.retainHostBytes(retained_bytes);
+    const request = try preparedImageRunRequest(session.backend(), input_bytes, retained_bytes, pixels[0..pixel_count], options.max_tokens, vision_scratch);
+    if (lock) |mutex| try control.lock(mutex);
+    defer if (lock) |mutex| mutex.unlock();
+    var permit = try admitWithVisionCacheReclaim(session, request, control);
+    defer permit.deinit();
+    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    defer managed.deinit();
+    const transfer_before = MediaTransferSnapshot.init(&managed.backend);
+    defer observeResidentTransfers(&managed.backend, transfer_before, options);
     if (residentImagesEnabled(&managed.backend, options)) {
         if (options.timings) |t| t.resident_cohorts += 1;
         const started = mediaNow();
         var resident = try projector.encodePreparedEmbeddingGemma2ImagesResident(&managed.backend, a, pixels[0..pixel_count], .{ .max_scratch_bytes = vision_scratch });
         defer resident.deinit();
         if (options.timings) |t| t.vision_ns += mediaNow() - started;
+        try releaseImagePreparation(pixels[0..pixel_count], &host_permit, &permit);
         const vectors = try runResidentImageBatch(a, &managed.backend, cfg, tokenizer, &resident, options, &permit);
         errdefer {
             for (vectors) |vector| a.free(vector);
@@ -2523,6 +2572,7 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     const vision_started = mediaNow();
     var projected = try projector.encodePreparedEmbeddingGemma2Images(&managed.backend, a, pixels[0..pixel_count], .{ .max_scratch_bytes = vision_scratch });
     defer projected.deinit();
+    try releaseImagePreparation(pixels[0..pixel_count], &host_permit, &permit);
     const pack_started = mediaNow();
     var prepared: [raster_max_batch]PreparedGroup = undefined;
     var initialized: usize = 0;
@@ -4038,4 +4088,65 @@ test "embeddinggemma2 Metal direct packed rows exclude NaN padding and preserve 
         }
     };
     try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, Case.run);
+}
+
+test "embeddinggemma2 image phases free preparation and admit concurrent peers within shared budgets" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const tensor = @import("../backends/tensor.zig");
+    const Mock = struct {
+        fn run(_: *anyopaque, _: []const tensor.Tensor, _: std.mem.Allocator) anyerror![]tensor.Tensor {
+            return error.Unused;
+        }
+        fn info(_: *anyopaque) []const tensor.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .metal;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable = Session.VTable{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var dummy: u8 = 0;
+    const session = Session{ .ptr = &dummy, .vtable = &Mock.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 900 * 1024 * 1024, .host_limit_bytes = 1024 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    const a = std.testing.allocator;
+    const input: usize = 128;
+    const geometry = try projector.embeddingGemma2ImageGeometry(48, 48);
+    var pixels = [_]projector.PreparedImage{.{ .allocator = a, .pixels = try a.alloc(f32, geometry.width * geometry.height * 3), .geometry = geometry }};
+    defer pixels[0].deinit();
+    const retained = input + pixels[0].retainedBytes();
+    var host = try session.admitHostPreprocess(retained);
+    defer host.deinit();
+    const request = try preparedImageRunRequest(.metal, input, retained, &pixels, 512, 512 * 1024 * 1024);
+    try std.testing.expectEqual(geometry.tokenCount() + 4, request.sequence);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), request.workspace_bytes);
+    var run = try session.admit(request);
+    defer run.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admit(request));
+    const before = controller.snapshot();
+    try releaseImagePreparation(&pixels, &host, &run);
+    try std.testing.expectEqual(@as(usize, 0), pixels[0].pixels.len);
+    try std.testing.expectEqual(input, run.request.?.pre_admitted_host_bytes);
+    try std.testing.expectEqual(before.host_scratch_bytes - (retained - input), controller.snapshot().host_scratch_bytes);
+    try retainPreparedPhase(&run, 1, request.sequence);
+    try std.testing.expect(controller.snapshot().backend_scratch_bytes < before.backend_scratch_bytes);
+    var peer = try session.admit(request);
+    peer.deinit();
+    run.deinit();
+    host.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "embeddinggemma2 Metal raster preparation borrows strided bytes without host allocation" {
+    const bytes: [5 * 63 + 13 * 4]u8 = @splat(31);
+    const raster = Raster{ .bytes = &bytes, .width = 13, .height = 6, .stride_bytes = 63 };
+    var prepared = try projector.prepareEmbeddingGemma2RasterForBackend(std.testing.failing_allocator, raster, .metal);
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 0), prepared.pixels.len);
+    try std.testing.expect(!prepared.source_owned);
+    try std.testing.expectEqual(@intFromPtr(bytes[0..].ptr), @intFromPtr(prepared.source.?.data.ptr));
+    try std.testing.expectEqual(@as(usize, 63), try prepared.source.?.rowStride());
+    try std.testing.expectEqual(@as(usize, 0), prepared.retainedBytes());
+    try std.testing.expectEqual(@as(usize, 0), try rasterPreparationBytes(.metal, &.{raster}));
 }

@@ -37531,13 +37531,14 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         defer freeDirectDenseVectors(a, single.vectors);
         for (vector, single.vectors[0]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, @as(f32, if (metal) 1e-3 else 1e-4));
     }
-    if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_PIPELINED_VISION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP"))) {
+    if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_PIPELINED_VISION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_IMAGE_PREPARATION"))) {
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
             extern "c" fn unsetenv([*:0]const u8) c_int;
         };
         const followup = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP");
-        const flag = if (followup) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP" else "ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION";
+        const image_preparation = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_IMAGE_PREPARATION");
+        const flag = if (image_preparation) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION" else if (followup) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP" else "ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION";
         const saved = if (platform.env.getenv(flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
         defer if (saved) |old| a.free(old);
         defer {
@@ -37562,7 +37563,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
             } else reference = result.vectors;
         };
         for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
-        std.debug.print("embeddinggemma2 vision_{s} reference_ns={d} optimized_ns={d} samples=7 parity=true\n", .{ if (followup) "followup" else "pipeline", samples[0][3], samples[1][3] });
+        std.debug.print("embeddinggemma2 vision_{s} reference_ns={d} optimized_ns={d} samples=7 parity=true\n", .{ if (image_preparation) "image_preparation" else if (followup) "followup" else "pipeline", samples[0][3], samples[1][3] });
     }
     if (comptime @import("build_options").enable_metal) {
         if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP")) {

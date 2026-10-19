@@ -770,21 +770,32 @@ pub const Metal = struct {
     /// The producer may free its input immediately. Alpha/matrix are ignored
     /// as in referenceRgba; explicit rotation and centering still apply.
     pub fn submitRgba(self: *Metal, allocator: std.mem.Allocator, bytes: []const u8, width: u32, height: u32, options: Options, control: media.source.Control) !Prepared {
+        const size = try std.math.mul(usize, try std.math.mul(usize, width, height), 4);
+        if (bytes.len != size) return error.InvalidVideoGeometry;
+        return self.submitImageView(allocator, .{ .data = bytes, .width = width, .height = height, .format = .rgba8 }, options, control);
+    }
+    /// RGB/RGBA with explicit byte stride. Alpha and padding are ignored; only
+    /// the validated last-row span is staged. No host color expansion occurs.
+    pub fn submitImageView(self: *Metal, allocator: std.mem.Allocator, view: image.ImageU8, options: Options, control: media.source.Control) !Prepared {
         if (!supported) return error.UnsupportedVideoBackend;
         try control.check();
+        try view.validate();
         var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });
         defer scope.deinit();
-        const g = try geometry(width, height, options);
-        const size = std.math.mul(usize, try std.math.mul(usize, width, height), 4) catch return error.ResourceLimitExceeded;
-        if (bytes.len != size) return error.InvalidVideoGeometry;
+        const stride = try view.rowStride();
+        if (stride > std.math.maxInt(u32)) return error.ResourceLimitExceeded;
+        const size = try std.math.add(usize, try std.math.mul(usize, stride, view.height - 1), try std.math.mul(usize, view.width, view.channels()));
+        const g = try geometry(view.width, view.height, options);
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try std.math.add(usize, g.scratch_bytes, size), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
-        const uploaded = try self.ensureCoefficients(allocator, width, height, g, options, control);
-        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0, 0, options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
+        const uploaded = try self.ensureCoefficients(allocator, view.width, view.height, g, options, control);
+        // The RGB kernel uses the otherwise inapplicable matrix/range words
+        // for channel count/byte stride; YUV commands retain their ABI.
+        const params = [_]u32{ view.width, view.height, g.width, g.height, @backingInt(options.rotation), @intCast(view.channels()), @intCast(stride), @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0, 0, options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
-        if (av_prepare_rgba_submit(self.handle, bytes.ptr, bytes.len, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .rgba_staging_bytes = bytes.len, .coefficient_staging_bytes = uploaded };
+        if (av_prepare_rgba_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
+        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .rgba_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
 };
 /// Owns input import/staging, GPU command, and patch buffer. Destroy fences in-flight
