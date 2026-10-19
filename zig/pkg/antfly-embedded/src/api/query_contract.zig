@@ -534,11 +534,7 @@ fn appendJsonFieldU64(
     try out.appendSlice(alloc, rendered);
 }
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+const appendJsonString = @import("json_helpers.zig").appendJsonString;
 
 fn freeOwnedStringItems(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(@constCast(value));

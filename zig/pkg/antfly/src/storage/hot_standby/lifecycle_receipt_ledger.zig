@@ -583,13 +583,7 @@ fn validSha256(value: []const u8) bool {
     return true;
 }
 
-fn encodeHex(out: []u8, digest: *const [Sha256.digest_length]u8) void {
-    std.debug.assert(out.len == digest.len * 2);
-    for (digest, 0..) |byte, index| {
-        out[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
-        out[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
-    }
-}
+const encodeHex = @import("antfly_hash").encodeHexLower;
 
 fn freeWalEntries(alloc: Allocator, entries: []wal_mod.WalEntry) void {
     for (entries) |entry| alloc.free(@constCast(entry.data));

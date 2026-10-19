@@ -805,12 +805,7 @@ fn isSafeRelativePath(path: []const u8) bool {
     return !std.fs.path.isAbsolute(path) and validation.isNormalizedPath(path);
 }
 
-fn encodeHex(out: []u8, bytes: []const u8) void {
-    for (bytes, 0..) |byte, index| {
-        out[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
-        out[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
-    }
-}
+const encodeHex = @import("antfly_hash").encodeHexLower;
 
 fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));

@@ -5579,11 +5579,7 @@ fn requireString(obj: std.json.ObjectMap, key: []const u8) []const u8 {
     };
 }
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
-}
+const appendJsonString = @import("antfly_local_sources").api_json_helpers.appendJsonString;
 
 test "transaction commit parser keeps read set and table batches" {
     var req = try parseCommitRequest(std.testing.allocator,

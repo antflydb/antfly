@@ -37,12 +37,23 @@ pub fn getenvBool(name: [*:0]const u8) bool {
 
 pub fn getenvBoolDefault(name: [*:0]const u8, default: bool) bool {
     const value = getenv(name) orelse return default;
+    return flagValue(value);
+}
+
+/// An opt-out flag value: true unless empty or 0/false/no/off (any case).
+/// Stricter callers that want an explicit opt-in use `truthy`.
+pub fn flagValue(value: []const u8) bool {
     if (value.len == 0) return false;
     if (std.mem.eql(u8, value, "0")) return false;
     if (std.ascii.eqlIgnoreCase(value, "false")) return false;
     if (std.ascii.eqlIgnoreCase(value, "no")) return false;
     if (std.ascii.eqlIgnoreCase(value, "off")) return false;
     return true;
+}
+
+test "flagValue treats empty and negative words as off" {
+    for ([_][]const u8{ "1", "true", "yes", "on", "anything" }) |value| try std.testing.expect(flagValue(value));
+    for ([_][]const u8{ "", "0", "false", "FALSE", "no", "off", "Off" }) |value| try std.testing.expect(!flagValue(value));
 }
 
 pub fn getenvUsize(name: [*:0]const u8) ?usize {

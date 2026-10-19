@@ -80,11 +80,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 }
 
 fn envEnabled(name: [*:0]const u8) bool {
-    const raw_z = getenv(name) orelse return false;
-    const raw = std.mem.span(raw_z);
-    return !(std.mem.eql(u8, raw, "0") or
-        std.ascii.eqlIgnoreCase(raw, "false") or
-        std.ascii.eqlIgnoreCase(raw, "no"));
+    return @import("antfly_platform").env.getenvBoolDefault(name, false);
 }
 
 fn benchPersistentPublishEnabled() bool {

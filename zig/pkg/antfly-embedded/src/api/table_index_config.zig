@@ -338,11 +338,7 @@ fn normalizeManagedEmbeddingIndexDimensionsInternal(
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
-pub fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+pub const appendJsonString = @import("json_helpers.zig").appendJsonString;
 
 test "runtime index config strips catalog-only lifecycle metadata" {
     const alloc = std.testing.allocator;

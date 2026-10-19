@@ -691,15 +691,7 @@ fn freeManifest(allocator: Allocator, manifest: backups_api.TableBackupManifest)
     owned.deinit(allocator);
 }
 
-fn appendJsonString(
-    allocator: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    value: []const u8,
-) !void {
-    const escaped = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
-    defer allocator.free(escaped);
-    try out.appendSlice(allocator, escaped);
-}
+const appendJsonString = @import("../../api/json_helpers.zig").appendJsonString;
 
 fn appendJsonU64(
     allocator: Allocator,

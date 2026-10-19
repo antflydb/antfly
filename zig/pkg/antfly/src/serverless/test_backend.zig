@@ -103,6 +103,5 @@ fn envEnabled(env_name: []const u8) bool {
     const env_name_z = std.heap.page_allocator.dupeSentinel(u8, env_name, 0) catch return false;
     defer std.heap.page_allocator.free(env_name_z);
     const value_z = std.c.getenv(env_name_z.ptr) orelse return false;
-    const value = std.mem.span(value_z);
-    return value.len > 0 and !std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "false");
+    return @import("antfly_platform").env.flagValue(std.mem.span(value_z));
 }

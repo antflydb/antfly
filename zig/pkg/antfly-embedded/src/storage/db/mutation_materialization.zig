@@ -4593,14 +4593,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
         }
 
-        pub fn bytesToHexAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
-            const out = try alloc.alloc(u8, bytes.len * 2);
-            for (bytes, 0..) |byte, idx| {
-                out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
-                out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
-            }
-            return out;
-        }
+        pub const bytesToHexAlloc = @import("antfly_hash").allocHexLower;
 
         pub fn chunkArtifactKeysForChunksAlloc(
             alloc: Allocator,

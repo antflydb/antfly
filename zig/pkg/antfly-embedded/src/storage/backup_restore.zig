@@ -1307,11 +1307,7 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
     return try out.toOwnedSlice(alloc);
 }
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+const appendJsonString = @import("../api/json_helpers.zig").appendJsonString;
 
 const fixture_owner = @This();
 pub const test_support = if (@import("builtin").is_test) struct {

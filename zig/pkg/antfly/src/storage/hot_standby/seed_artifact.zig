@@ -1423,13 +1423,7 @@ fn hexAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     return out;
 }
 
-fn encodeHex(out: []u8, bytes: []const u8) void {
-    std.debug.assert(out.len == bytes.len * 2);
-    for (bytes, 0..) |byte, idx| {
-        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
-        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
-    }
-}
+const encodeHex = @import("antfly_hash").encodeHexLower;
 
 fn decodeHexDigest(hex: []const u8) ![Sha256.digest_length]u8 {
     if (hex.len != Sha256.digest_length * 2) return error.InvalidArtifactDigest;

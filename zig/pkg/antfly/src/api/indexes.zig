@@ -1584,11 +1584,7 @@ fn indexTypeName(index_type: ApiIndexType) []const u8 {
     };
 }
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+const appendJsonString = @import("antfly_local_sources").api_json_helpers.appendJsonString;
 
 fn appendJsonValue(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});

@@ -4136,7 +4136,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return false;
             }
             const enabled = if (getenv("ANTFLY_ASYNC_INDEX_PROFILE")) |raw_z|
-                envBoolEnabled(raw_z)
+                platform.env.flagValue(raw_z)
             else
                 benchMetricsEnabled();
             D.async_index_profile_enabled_cache.*.store(if (enabled) 2 else 1, .release);
@@ -4161,7 +4161,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 D.bench_metrics_enabled_cache.*.store(1, .release);
                 return false;
             };
-            const enabled = envBoolEnabled(raw_z);
+            const enabled = platform.env.flagValue(raw_z);
             D.bench_metrics_enabled_cache.*.store(if (enabled) 2 else 1, .release);
             return enabled;
         }
@@ -4468,11 +4468,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub const enforcePortableRuntimeGateOptional = execution_resources.enforcePortableRuntimeGateOptional;
 
-        pub fn envBoolEnabled(raw: []const u8) bool {
-            return !(std.mem.eql(u8, raw, "0") or
-                std.ascii.eqlIgnoreCase(raw, "false") or
-                std.ascii.eqlIgnoreCase(raw, "no"));
-        }
 
         pub fn getenv(name: [*:0]const u8) ?[]const u8 {
             return platform.env.getenv(name);

@@ -527,7 +527,6 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const encodeThinReplayRecordPayload = commit.encodeThinReplayRecordPayload;
         pub const encodeTimestampValue = preparation.encodeTimestampValue;
         pub const enforcePortableRuntimeGateOptional = commit.enforcePortableRuntimeGateOptional;
-        pub const envBoolEnabled = commit.envBoolEnabled;
         pub const extractAssetSourceValue = materialization.extractAssetSourceValue;
         pub const extractDocumentDownloadedAlloc = materialization.extractDocumentDownloadedAlloc;
         pub const extractStringField = preparation.extractStringField;

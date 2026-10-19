@@ -667,11 +667,7 @@ pub fn appendJsonFieldU32(
     try out.print(alloc, "{d}", .{value});
 }
 
-pub fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+pub const appendJsonString = @import("json_helpers.zig").appendJsonString;
 
 pub const indexes_openapi = @import("antfly_indexes_openapi");
 

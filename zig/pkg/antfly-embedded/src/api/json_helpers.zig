@@ -26,6 +26,11 @@ pub const ParsedJsonPathValue = struct {
     }
 };
 
+/// Append `value` to `out` as a quoted, escaped JSON string.
+pub fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    try out.print(alloc, "{f}", .{std.json.fmt(value, .{})});
+}
+
 pub fn parseJsonValueAlloc(alloc: Allocator, body: []const u8) !json.Parsed(json.Value) {
     return try json.parseFromSlice(json.Value, alloc, body, .{});
 }

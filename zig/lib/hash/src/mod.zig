@@ -20,6 +20,8 @@ pub const Crc64Nvme = @import("crc64.zig").Crc64Nvme;
 pub const RuntimeSha256 = @import("sha256.zig").RuntimeSha256;
 pub const Sha256 = @import("sha256.zig").Sha256;
 pub const Adler32 = @import("adler32.zig").Adler32;
+pub const encodeHexLower = @import("hex.zig").encodeHexLower;
+pub const allocHexLower = @import("hex.zig").allocHexLower;
 
 test {
     _ = @import("cpu.zig");
@@ -27,5 +29,6 @@ test {
     _ = @import("crc32.zig");
     _ = @import("crc64.zig");
     _ = @import("adler32.zig");
+    _ = @import("hex.zig");
     _ = @import("benchmark.zig");
 }

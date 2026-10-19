@@ -230,15 +230,7 @@ pub const DistributedCandidateSource = struct {
 /// incrementing the last non-`0xff` byte and truncating after it. Returns null
 /// when `prefix` is empty or all `0xff` (an unbounded range), in which case the
 /// caller skips the scan rather than reading the whole table.
-fn prefixUpperBoundAlloc(allocator: std.mem.Allocator, prefix: []const u8) !?[]u8 {
-    var end = prefix.len;
-    while (end > 0 and prefix[end - 1] == 0xff) end -= 1;
-    if (end == 0) return null;
-    const out = try allocator.alloc(u8, end);
-    @memcpy(out, prefix[0..end]);
-    out[end - 1] += 1;
-    return out;
-}
+const prefixUpperBoundAlloc = @import("antfly_local_sources").storage_internal_keys.nextPrefixAlloc;
 
 /// A scan ndjson row is the entity document object with an extra `"key"` field
 /// (see `table_reads.appendScanLine`). Pull the key out and hand the row to the

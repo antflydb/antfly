@@ -1259,13 +1259,7 @@ fn expectSha256(body: []const u8, expected_hex: []const u8, mismatch: anyerror) 
     if (!std.mem.eql(u8, &encoded, expected_hex)) return mismatch;
 }
 
-fn encodeHex(out: []u8, bytes: []const u8) void {
-    std.debug.assert(out.len == bytes.len * 2);
-    for (bytes, 0..) |byte, index| {
-        out[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
-        out[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
-    }
-}
+const encodeHex = @import("antfly_hash").encodeHexLower;
 
 fn sourceLessThan(_: void, a: OwnedSource, b: OwnedSource) bool {
     return std.mem.order(u8, a.artifact_path, b.artifact_path) == .lt;

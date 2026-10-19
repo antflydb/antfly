@@ -1353,12 +1353,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     return std.c.getenv(name);
 }
 
-fn envBoolEnabled(raw_z: [*:0]const u8) bool {
-    const raw = std.mem.span(raw_z);
-    return !(std.mem.eql(u8, raw, "0") or
-        std.ascii.eqlIgnoreCase(raw, "false") or
-        std.ascii.eqlIgnoreCase(raw, "no"));
-}
+
 
 fn sparseSearchProfileEnabled() bool {
     const cached = sparse_search_profile_enabled_cache.load(.monotonic);
@@ -1372,7 +1367,7 @@ fn sparseSearchProfileEnabled() bool {
         sparse_search_profile_enabled_cache.store(1, .monotonic);
         return false;
     };
-    const enabled = envBoolEnabled(raw_z);
+    const enabled = @import("antfly_platform").env.flagValue(std.mem.span(raw_z));
     sparse_search_profile_enabled_cache.store(if (enabled) 2 else 1, .monotonic);
     return enabled;
 }

@@ -1286,11 +1286,7 @@ fn appendRawJsonField(
     try out.appendSlice(alloc, raw_json);
 }
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
-}
+const appendJsonString = @import("antfly_local_sources").api_json_helpers.appendJsonString;
 
 test "table contract parses create table via generated openapi type" {
     var req = try parseCreateTableRequest(

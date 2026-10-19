@@ -45,16 +45,7 @@ fn digest(bytes: []const u8) Digest {
 }
 
 fn prefixEnd(alloc: Allocator, prefix: []const u8) ![]const u8 {
-    var len = prefix.len;
-    while (len > 0) {
-        len -= 1;
-        if (prefix[len] != 255) {
-            const end = try alloc.dupe(u8, prefix[0 .. len + 1]);
-            end[len] += 1;
-            return end;
-        }
-    }
-    return error.InvalidRelationalIndexProgress;
+    return (try @import("../internal_keys.zig").nextPrefixAlloc(alloc, prefix)) orelse error.InvalidRelationalIndexProgress;
 }
 
 pub const State = enum(u8) { building = 0, ready = 1, failed = 2 };

@@ -1478,7 +1478,6 @@ var bench_metrics_enabled_cache: std.atomic.Value(u8) = .init(0);
 var open_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
 var async_index_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
 
-const envBoolEnabled = local_mutation.envBoolEnabled;
 
 const waitForCachedBool = local_mutation.waitForCachedBool;
 
@@ -1500,7 +1499,7 @@ fn openProfileEnabled() bool {
         open_profile_enabled_cache.store(1, .release);
         return false;
     };
-    const enabled = envBoolEnabled(raw_z);
+    const enabled = platform.env.flagValue(raw_z);
     open_profile_enabled_cache.store(if (enabled) 2 else 1, .release);
     return enabled;
 }
