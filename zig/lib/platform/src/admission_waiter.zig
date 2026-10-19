@@ -19,7 +19,7 @@
 //! publisher may access the waiter after publish returns (or after its final
 //! release store). Cancellation must rejoin that same lock before retirement.
 const std = @import("std");
-const time = @import("antfly_platform").time;
+const time = @import("time.zig");
 
 pub const Cancellation = struct {
     ptr: *const anyopaque,

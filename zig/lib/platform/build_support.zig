@@ -102,9 +102,17 @@ pub fn addTests(b: *std.Build, options: struct {
         .optimize = optimize,
     }) });
     const run_entropy_tests = b.addRunArtifact(entropy_tests);
+    // Lock helpers, admission waiters and coalesced signals.
+    const sync_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/sync.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_sync_tests = b.addRunArtifact(sync_tests);
     const run_unit = b.addRunArtifact(unit);
     run_unit.step.dependOn(&run_atomic_tests.step);
     run_unit.step.dependOn(&run_entropy_tests.step);
+    run_unit.step.dependOn(&run_sync_tests.step);
     const one_shot = b.createModule(.{
         .root_source_file = options.root.path(b, "src/one_shot_process.zig"),
         .target = target,

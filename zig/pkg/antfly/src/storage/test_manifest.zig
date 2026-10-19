@@ -39,7 +39,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_publication_recovery_owner;
 
     _ = @import("antfly_local_sources").storage_db_embedding_activity_cache;
-    _ = @import("antfly_local_sources").storage_db_coalesced_job_admission;
     _ = @import("antfly_local_sources").storage_db_dense_publication_admission;
     _ = @import("antfly_local_sources").storage_db_local_runtime_owner;
 
@@ -114,12 +113,10 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_relational_index_gc;
     _ = @import("antfly_local_sources").storage_db_relational_row_cursor;
     _ = @import("antfly_local_sources").storage_db_relational_predicate;
-    _ = @import("antfly_local_sources").storage_admission_waiter;
     _ = @import("restore_owner.zig");
     _ = @import("antfly_local_sources").storage_restore_decoder_cache;
     _ = @import("antfly_local_sources").storage_artifact_payload;
     _ = @import("antfly_local_sources").storage_dense_work_admission;
-    _ = @import("antfly_local_sources").storage_maintenance_signal;
     _ = @import("antfly_local_sources").storage_projection_page_cache;
     _ = @import("antfly_local_sources").storage_projection_read_trace;
     _ = @import("antfly_local_sources").storage_vector_payload_store;

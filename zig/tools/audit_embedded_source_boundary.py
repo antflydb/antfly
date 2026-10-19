@@ -277,7 +277,6 @@ def check_replication_contract(relative: str, source: str) -> None:
         "storage/db/runtime_restart_owner.zig",
         "storage/db/cleanup_job_owner.zig",
         "storage/db/query_visibility.zig",
-        "storage/db/coalesced_job_admission.zig",
         "storage/db/dense_publication_admission.zig",
         "storage/db/local_runtime_owner.zig",
         "storage/db/embedding_activity_cache.zig",

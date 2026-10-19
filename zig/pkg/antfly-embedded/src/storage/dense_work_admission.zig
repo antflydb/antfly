@@ -17,7 +17,7 @@
 //! separate, nonblocking node budget; a caller never waits for a helper.
 const std = @import("std");
 const time = @import("antfly_platform").time;
-const admission = @import("admission_waiter.zig");
+const admission = @import("antfly_platform").sync.admission_waiter;
 pub const Cancellation = admission.Cancellation;
 
 pub const Queue = struct {

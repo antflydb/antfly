@@ -19,7 +19,7 @@ const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
 const cache_budget = @import("antfly_cache_budget");
 pub const DenseWorkAdmission = @import("dense_work_admission.zig");
-const admission = @import("admission_waiter.zig");
+const admission = @import("antfly_platform").sync.admission_waiter;
 const dense_perf = @import("dense_perf_experiments.zig");
 pub const ProjectionPageCache = @import("projection_page_cache.zig");
 
@@ -1076,7 +1076,7 @@ test "dense aggregate resource manager bounds callers and helpers together" {
 }
 
 pub const ResourceManager = struct {
-    dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
+    dense_checkpoint_ready: @import("antfly_platform").sync.maintenance_signal.Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
     // Slots are never compacted while the manager is live: an invocation can

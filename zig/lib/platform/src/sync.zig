@@ -30,6 +30,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const time = @import("time.zig");
 
+pub const admission_waiter = @import("admission_waiter.zig");
+pub const coalesced_job_admission = @import("coalesced_job_admission.zig");
+pub const maintenance_signal = @import("maintenance_signal.zig");
+
+test {
+    _ = admission_waiter;
+    _ = coalesced_job_admission;
+    _ = maintenance_signal;
+}
+
 const spin_limit = 64;
 
 /// Acquire `mutex` (any type exposing `tryLock`), spinning briefly and then

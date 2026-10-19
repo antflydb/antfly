@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const admission = @import("coalesced_job_admission.zig");
+const admission = @import("antfly_platform").sync.coalesced_job_admission;
 const builtin = @import("builtin");
 const runtime = @import("../background_runtime.zig");
 
