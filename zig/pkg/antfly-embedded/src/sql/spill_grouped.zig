@@ -159,6 +159,26 @@ pub const Grouped = struct {
             source.partition_inputs[index].clearRetainingCapacity();
         }
     }
+    fn bitmapSpec(spec: operators.AggregateSpec) bool {
+        return spec.kind == .count and spec.distinct and spec.input_type == .integer;
+    }
+    fn bitmapWord(self: *Grouped, sort: *spill.Sort, states: []operators.Aggregate, slot: usize, key: i64, bits: u64, ordinal: *u64, exact: bool) !void {
+        if (slot >= states.len or !bitmapSpec(self.specs[slot]) or bits == 0 or key < @divFloor(std.math.minInt(i64), 64) or key > @divFloor(std.math.maxInt(i64), 64)) return error.InvalidSqlSpill;
+        if (exact) return states[slot].addSupport(.{ .value = .{ .low = key * 64, .words = &.{bits} } });
+        try sort.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), Datum.json(.{ .integer = key }) }, .values = &.{Datum.json(.{ .integer = @bitCast(bits) })}, .ordinal = ordinal.* });
+        ordinal.* += 1;
+    }
+    fn bitmapValue(self: *Grouped, sort: *spill.Sort, states: []operators.Aggregate, slot: usize, input: Datum, ordinal: *u64, exact: bool) !void {
+        if (input.sql_null) return;
+        if (input.value != .integer) return error.SqlTypeMismatch;
+        const n = input.value.integer;
+        try self.bitmapWord(sort, states, slot, @divFloor(n, 64), @as(u64, 1) << @as(u6, @intCast(@mod(n, 64))), ordinal, exact);
+    }
+    fn finishBitmapWord(states: []operators.Aggregate, slot: usize, bits: u64) !void {
+        const count = std.math.add(u64, states[slot].count, @popCount(bits)) catch return error.SqlNumericOutOfRange;
+        if (count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+        states[slot].count = count;
+    }
     pub fn partial(self: *Grouped, keys: []const Datum, states: []const operators.Aggregate, ordinal: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -175,6 +195,12 @@ pub const Grouped = struct {
         }
         try self.append(.{ .keys = keys, .values = values, .ordinal = ordinal });
         for (states, 0..) |state, slot| if (state.distinct) {
+            if (state.distinct_support) |support| {
+                // Each bounded spill record retains one word, never one row
+                // per set bit or an unbounded whole-group bitmap frame.
+                var words = support.words.iterator();
+                while (words.next()) |entry| try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = -1 - @as(i64, @intCast(slot)) }), Datum.json(.{ .integer = entry.key_ptr.* }), Datum.json(.{ .integer = @bitCast(entry.value_ptr.*) }) }, .ordinal = ordinal });
+            }
             for (state.distinct_values.items) |entry| {
                 try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), entry.row.row.values[0] }, .ordinal = ordinal });
             }
@@ -644,24 +670,53 @@ pub const Grouped = struct {
         }
         const pattern_sets = try a.alloc(?*@import("pattern_spill.zig").Set, states.len);
         for (self.specs, pattern_sets) |spec, *set| set.* = if (spec.kind == .pattern_set) try @import("pattern_spill.zig").Set.create(self.sort.manager) else null;
-        var distinct = spill.Sort.init(self.a, self.sort.manager, &.{ .{}, .{} }, self.sort.memory_bytes);
+        var has_bitmap = false;
+        var has_generic = false;
+        for (self.specs) |spec| {
+            has_bitmap = has_bitmap or bitmapSpec(spec);
+            has_generic = has_generic or (spec.distinct and !bitmapSpec(spec));
+        }
+        const sort_memory = if (has_bitmap and has_generic) self.sort.memory_bytes / 2 else self.sort.memory_bytes;
+        var distinct = spill.Sort.init(self.a, self.sort.manager, &.{ .{}, .{} }, sort_memory);
         defer distinct.deinit();
+        var bitmap = spill.Sort.init(self.a, self.sort.manager, &.{ .{}, .{} }, sort_memory);
+        defer bitmap.deinit();
         var distinct_ordinal: u64 = 0;
+        var bitmap_ordinal: u64 = 0;
         while (true) {
             ordinal = @min(ordinal, row.ordinal);
             if (row.values.len == 0) return error.InvalidSqlSpill;
             if (row.values[0].value == .integer) {
-                if (row.values.len != 2) return error.InvalidSqlSpill;
-                const slot = std.math.cast(usize, row.values[0].value.integer) orelse return error.InvalidSqlSpill;
-                if (slot >= states.len) return error.InvalidSqlSpill;
-                try distinct.add(.{ .keys = &.{ row.values[0], row.values[1] }, .values = &.{row.values[1]}, .ordinal = distinct_ordinal });
-                distinct_ordinal += 1;
+                const tag = row.values[0].value.integer;
+                if (tag < 0) {
+                    if (row.values.len != 3 or row.values[1].value != .integer or row.values[2].value != .integer) return error.InvalidSqlSpill;
+                    const slot = std.math.cast(usize, -1 - @as(i128, tag)) orelse return error.InvalidSqlSpill;
+                    try self.bitmapWord(&bitmap, states, slot, row.values[1].value.integer, @bitCast(row.values[2].value.integer), &bitmap_ordinal, exact);
+                } else {
+                    if (row.values.len != 2) return error.InvalidSqlSpill;
+                    const slot = std.math.cast(usize, tag) orelse return error.InvalidSqlSpill;
+                    if (slot >= states.len) return error.InvalidSqlSpill;
+                    if (bitmapSpec(self.specs[slot])) {
+                        try self.bitmapValue(&bitmap, states, slot, row.values[1], &bitmap_ordinal, exact);
+                    } else {
+                        try distinct.add(.{ .keys = &.{ row.values[0], row.values[1] }, .values = &.{row.values[1]}, .ordinal = distinct_ordinal });
+                        distinct_ordinal += 1;
+                    }
+                }
             } else if (row.values[0].value != .bool) return error.InvalidSqlSpill else if (row.values[0].value.bool) {
                 if (row.values.len != 1 + states.len) return error.InvalidSqlSpill;
                 for (states, row.values[1..], self.specs, 0..) |*state, value, spec, slot| {
-                    var incoming = try @import("aggregate_partial.zig").decode(a, value, spec);
+                    // Decoded checkpoints are temporary: retaining every
+                    // incoming bitmap until the group ends defeats spill.
+                    var partial_arena = std.heap.ArenaAllocator.init(self.a);
+                    defer partial_arena.deinit();
+                    var incoming = try @import("aggregate_partial.zig").decode(partial_arena.allocator(), value, spec);
                     defer incoming.deinit();
                     if (spec.distinct and !exact) {
+                        if (incoming.distinct_support) |support| {
+                            var words = support.words.iterator();
+                            while (words.next()) |entry| try self.bitmapWord(&bitmap, states, slot, entry.key_ptr.*, entry.value_ptr.*, &bitmap_ordinal, false);
+                        }
                         // Final reducers deduplicate externally, not in the
                         // in-memory membership table of a decoded partial.
                         // This also accepts complete worker partials without
@@ -680,7 +735,9 @@ pub const Grouped = struct {
             } else {
                 if (row.values.len != states.len + 1) return error.InvalidSqlSpill;
                 for (states, row.values[1..], self.specs, 0..) |*state, input, spec, slot| {
-                    if (spec.distinct) {
+                    if (bitmapSpec(spec)) {
+                        try self.bitmapValue(&bitmap, states, slot, input, &bitmap_ordinal, exact);
+                    } else if (spec.distinct) {
                         if (!input.sql_null or spec.kind == .pattern_set) {
                             try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), input }, .values = &.{input}, .ordinal = distinct_ordinal });
                             distinct_ordinal += 1;
@@ -715,6 +772,27 @@ pub const Grouped = struct {
                 for (record.keys, copy) |v, *cell| cell.* = try operators.cloneDatum(previous.allocator(), v);
                 last = copy;
             }
+        }
+        if (bitmap_ordinal != 0) {
+            var current = std.heap.ArenaAllocator.init(self.a);
+            defer current.deinit();
+            var last: ?struct { slot: usize, key: i64, bits: u64 } = null;
+            while (true) {
+                _ = current.reset(.free_all);
+                const record = (try bitmap.next(current.allocator())) orelse break;
+                const slot: usize = @intCast(record.keys[0].value.integer);
+                const key = record.keys[1].value.integer;
+                const bits: u64 = @bitCast(record.values[0].value.integer);
+                if (last) |*prior| {
+                    if (prior.slot == slot and prior.key == key) {
+                        prior.bits |= bits;
+                        continue;
+                    }
+                    try finishBitmapWord(states, prior.slot, prior.bits);
+                }
+                last = .{ .slot = slot, .key = key, .bits = bits };
+            }
+            if (last) |prior| try finishBitmapWord(states, prior.slot, prior.bits);
         }
         const output_keys = try out.alloc(Datum, keys.len);
         for (keys, output_keys) |key, *copy| copy.* = try operators.cloneDatum(out, key);
@@ -1040,5 +1118,70 @@ test "SQL exact NUMERIC raw and checkpoint blocks reduce typed columns" {
         }
         try std.testing.expectEqual(@as(usize, 16), count);
         try std.testing.expect(if (partial_state) group.partial_reduced_rows > 0 else group.native_reduced_rows > 0);
+    }
+}
+
+fn bitmapSpillScenario(backing: Allocator, exact: bool, repeats: usize) !void {
+    var vtable = backing.vtable.*;
+    vtable.resize = Allocator.noResize;
+    vtable.remap = Allocator.noRemap;
+    const a: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false, .compression = .none };
+    defer manager.deinit();
+    const specs = [_]operators.AggregateSpec{
+        .{ .kind = .count, .distinct = true, .input_type = .integer },
+        .{ .kind = .count, .distinct = true, .input_type = .string },
+    };
+    var group = try Grouped.init(a, &manager, &specs, 1, 8192);
+    defer group.deinit();
+    const key = Datum.json(.{ .integer = 7 });
+    for (0..repeats) |i| {
+        var states: [2]operators.Aggregate = undefined;
+        var initialized: usize = 0;
+        defer for (states[0..initialized]) |*state| state.deinit();
+        for (&states, specs) |*state, spec| {
+            state.* = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+            state.distinct = true;
+            initialized += 1;
+        }
+        try states[0].addSupport(.{ .value = .{ .low = -1, .words = &.{0b10101} } });
+        try states[0].addSupport(.{ .value = .{ .low = -1, .words = &.{0b10101} }, .offset = 10000000000 });
+        try states[1].update(Datum.json(.{ .string = "a" }));
+        try group.partial(&.{key}, &states, i);
+        // Also exercise complete worker checkpoints and ordinary fallback rows.
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        try group.appendPartial(&.{key}, try @import("aggregate_partial.zig").encode(arena.allocator(), &states), i);
+        try group.add(&.{key}, &.{ Datum.json(.{ .integer = 0 }), Datum.json(.{ .string = "b" }) }, i);
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = (try (if (exact) group.nextPartial(arena.allocator()) else group.next(arena.allocator()))).?;
+    try std.testing.expectEqual(@as(u64, 0), result.ordinal);
+    if (exact) {
+        var state = try @import("aggregate_partial.zig").decode(a, result.aggregates[0], specs[0]);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 7), state.count);
+        try state.addSupport(.{ .value = .{ .low = -1, .words = &.{0b10101} } });
+        try std.testing.expectEqual(@as(u64, 7), state.count);
+        var generic = try @import("aggregate_partial.zig").decode(a, result.aggregates[1], specs[1]);
+        defer generic.deinit();
+        try std.testing.expectEqual(@as(u64, 2), generic.count);
+    } else {
+        try std.testing.expectEqual(@as(i64, 7), result.aggregates[0].value.integer);
+        try std.testing.expectEqual(@as(i64, 2), result.aggregates[1].value.integer);
+    }
+    try std.testing.expect((try (if (exact) group.nextPartial(arena.allocator()) else group.next(arena.allocator()))) == null);
+    try std.testing.expect(manager.written_bytes > 0);
+}
+
+test "SQL bitmap DISTINCT spill unions words with scalar and generic partials" {
+    inline for (.{ false, true }) |exact| {
+        try bitmapSpillScenario(std.testing.allocator, exact, 64);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, bitmapSpillScenario, .{ exact, @as(usize, 2) });
     }
 }

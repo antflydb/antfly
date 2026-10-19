@@ -4038,13 +4038,13 @@ def test_statistic_cohorts_and_grouped_supports_stay_compressed(graph_db):
         [depth, depth // 2 + 1] for depth in range(1, 11)
     ]
     relation = "GRAPH_TABLE(g MATCH p=(s IS D)-[xs IS R*]->()-[ys IS R*]->(b IS D) WHERE s.id='start' COLUMNS(size(xs) AS a,size(ys) AS b,length(p) AS n)) q"
-    reducers = ",".join(f"avg(n*n+{k}*n) AS a{k}" for k in range(12))
-    expected = [(third - second + k * (second - first)) / (first - counts) for k in range(12)]
+    reducers = ",".join(f"avg(n*n+{k}*n) AS a{k}" for k in range(32))
+    expected = [(third - second + k * (second - first)) / (first - counts) for k in range(32)]
     native = db.cypher_json(
         "g",
         {
             "query": "MATCH p=(s:D {id:'start'})-[xs:R*1..]->()-[ys:R*1..]->(b:D) RETURN "
-            + ",".join(f"avg(length(p)*length(p)+{k}*length(p))" for k in range(12)),
+            + ",".join(f"avg(length(p)*length(p)+{k}*length(p))" for k in range(32)),
             "limits": limits,
         },
     )
@@ -4053,6 +4053,31 @@ def test_statistic_cohorts_and_grouped_supports_stay_compressed(graph_db):
     for source in (relation, f"(SELECT n FROM {relation}) t"):
         result = db.sql(f"SELECT {reducers} FROM {source}")
         assert result["rows"][0] == pytest.approx(expected, rel=1e-13)
+    # One support or extreme direction must not allocate one lane per AVG.
+    split = "MATCH p=(s:D {id:'start'})-[xs:R*1..]->()-[ys:R*1..]->(b:D) RETURN "
+    native_reducers = ",".join(f"avg(length(p)*length(p)+{k}*length(p))" for k in range(32))
+    for reducer, wanted in (("count(DISTINCT length(p))", layers - 1), ("min(length(p))", 2)):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": split + native_reducers + "," + reducer,
+                "limits": {"explored_edges": 5000, "intermediate_states": 400000},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0][:-1]] == pytest.approx(expected, rel=1e-13)
+        assert int(result["rows"][0][-1]["value"]) == wanted
+    result = db.sql(f"SELECT {reducers},count(DISTINCT n) FROM {relation}")
+    assert result["rows"][0][:-1] == pytest.approx(expected, rel=1e-13)
+    assert int(result["rows"][0][-1]) == layers - 1
+    single = "GRAPH_TABLE(g MATCH p=(s IS D)-[r IS R*]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS n,b.score AS depth)) q"
+    wanted_groups = [[depth, depth // 2 + 1] for depth in range(1, 11)]
+    for source in (single, f"(SELECT n,depth FROM {single} UNION ALL SELECT n,depth FROM {single}) t"):
+        result = db.sql(f"SELECT depth,count(DISTINCT n) FROM {source} GROUP BY depth ORDER BY depth LIMIT 10")
+        assert [[int(value) for value in row] for row in result["rows"]] == wanted_groups
+    result = db.sql(
+        f"WITH paths AS (SELECT n,depth FROM {single}) SELECT depth,count(DISTINCT n) FILTER(WHERE depth<0) FROM paths GROUP BY depth ORDER BY depth LIMIT 10"
+    )
+    assert [[int(value) for value in row] for row in result["rows"]] == [[depth, 0] for depth in range(1, 11)]
     # Scalar tags must stay aligned across page boundaries and reducer kinds.
     result = db.sql(f"SELECT avg(n*n),min(2*a+b),max(2*a+b),count(DISTINCT n) FROM {relation}")
     assert [float(value) for value in result["rows"][0]] == pytest.approx(
@@ -4136,3 +4161,22 @@ def test_statistic_supports_deduplicate_ordinary_fallback_contributions(graph_db
             },
         )
         assert result["rows"] == [[{"type": "integer", "value": "3"}]]
+
+
+def test_sql_bitmap_arguments_preserve_signed_holes_offsets_and_filters(graph_db):
+    db = graph_db
+    populate_layered_graph(db, layers=3)
+    split = "MATCH p=(s:D {id:'start'})-[xs:R*1..]->()-[ys:R*1..]->(b:D) "
+    exact = db.cypher_json("g", {"query": split + "RETURN size(xs),size(ys),b.score"})["rows"]
+    costs = [(2 * int(row[0]["value"]) - int(row[1]["value"]), int(row[2]["value"])) for row in exact]
+    relation = "GRAPH_TABLE(g MATCH p=(s IS D)-[xs IS R*]->()-[ys IS R*]->(b IS D) WHERE s.id='start' COLUMNS(size(xs) AS a,size(ys) AS b,b.score AS depth)) q"
+    for source in (relation, f"(SELECT a,b,depth FROM {relation} UNION ALL SELECT a,b,depth FROM {relation}) t"):
+        result = db.sql(
+            f"SELECT depth,count(DISTINCT 2*a-b),count(DISTINCT 2*a-b-10000000000),"
+            f"count(DISTINCT 2*a-b+10000000000) FILTER(WHERE depth=3) FROM {source} GROUP BY depth ORDER BY depth"
+        )
+        expected = []
+        for depth in sorted({depth for _, depth in costs}):
+            n = len({cost for cost, d in costs if d == depth})
+            expected.append([depth, n, n, n if depth == 3 else 0])
+        assert [[int(value) for value in row] for row in result["rows"]] == expected

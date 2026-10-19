@@ -58,6 +58,11 @@ fn addCellsOverridden(context: anytype, bound: *const binding.Bound, grouped: an
             if (test_value.value != .bool) return error.SqlTypeMismatch;
             if (!test_value.value.bool) continue;
         }
+        if (input) |argument| if (argument.support) |support| {
+            const spec = bound.specs[aggregate_index];
+            if (spec.kind != .count or !spec.distinct or spec.input_type != .integer) return error.InvalidSqlBackendResponse;
+            return grouped.addSupport(values, aggregate_index, support);
+        };
         value.* = if (input) |value_input| Datum.json(.{ .integer = value_input.value }) else if (index) |slot| try context.evaluate(alloc, bound.input.projections[slot].?, cells) else Datum.json(.{ .integer = 1 });
     }
     try grouped.addCount(values, inputs, weight);

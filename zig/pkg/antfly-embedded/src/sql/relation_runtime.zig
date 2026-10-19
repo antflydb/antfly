@@ -3011,7 +3011,7 @@ fn Engine(comptime Context: type) type {
                     const projected = (try self.plan.project(a, self.engine.context, input, slots)) orelse continue;
                     try rows.append(a, projected);
                     try weights.append(a, weight);
-                    if (page.aggregate_inputs) |arguments| try inputs.append(a, arguments[weight_index]);
+                    if (page.aggregate_inputs) |arguments| try inputs.append(a, if (arguments[weight_index]) |argument| try argument.clone(a) else null);
                 }
                 self.done = page.after == null;
                 var result = try catalog.Page.counted(a, rows.items, weights.items, try a.dupe(usize, slots), if (self.done) null else "weighted");

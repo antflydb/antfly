@@ -3223,7 +3223,13 @@ test "mixed statistic cohorts and grouped supports agree with observable histori
 
 test "grouped sparse supports and certificate cohorts release every allocation failure" {
     const Campaign = struct {
-        fn run(a: std.mem.Allocator) !void {
+        fn run(backing: std.mem.Allocator) !void {
+            // Count allocation failures independently of opportunistic arena
+            // growth: successful resize/remap varies with the failing slot.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var diagnostic: c.Diagnostic = .{};
             var compiled = try c.compile(a, "UNWIND [-10000000000,0,10000000000] AS k MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN b.rank AS rank,count(DISTINCT length(p)+k),avg(length(p)*length(p)),avg(0.5*length(p)) ORDER BY rank", .{}, &diagnostic);
             defer compiled.deinit();

@@ -641,6 +641,7 @@ pub const Aggregate = struct {
     selected: ?OwnedRow = null,
     patterns: ?*PatternState = null,
     distinct: bool = false,
+    distinct_support: ?*@import("cypher").statistic.SupportSet = null,
     distinct_heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     distinct_values: std.ArrayList(struct { row: OwnedRow, next: ?usize }) = .empty,
     const PatternState = struct { values: std.json.Array, has_null: bool = false };
@@ -683,12 +684,52 @@ pub const Aggregate = struct {
             state.values.deinit();
             self.alloc.destroy(state);
         }
+        if (self.distinct_support) |support| {
+            support.deinit(self.alloc);
+            self.alloc.destroy(support);
+        }
         for (self.distinct_values.items) |*entry| entry.row.deinit();
         self.distinct_values.deinit(self.alloc);
         self.distinct_heads.deinit(self.alloc);
         self.* = undefined;
     }
 
+    fn ensureSupport(self: *Aggregate) !*@import("cypher").statistic.SupportSet {
+        if (self.kind != .count or !self.distinct or self.input_type != .integer) return error.InvalidSqlBackendResponse;
+        if (self.distinct_support) |support| return support;
+        const support = try self.alloc.create(@import("cypher").statistic.SupportSet);
+        support.* = .{};
+        errdefer {
+            support.deinit(self.alloc);
+            self.alloc.destroy(support);
+        }
+        // Legacy decoded/typed partials may still contain scalar members.
+        for (self.distinct_values.items) |entry| {
+            const value = entry.row.row.values[0];
+            if (value.sql_null or value.value != .integer) return error.InvalidSqlBackendResponse;
+            _ = try support.insert(self.alloc, value.value.integer);
+        }
+        for (self.distinct_values.items) |*entry| entry.row.deinit();
+        self.distinct_values.deinit(self.alloc);
+        self.distinct_heads.deinit(self.alloc);
+        self.distinct_values = .empty;
+        self.distinct_heads = .empty;
+        self.distinct_support = support;
+        return support;
+    }
+    fn addDistinctCount(self: *Aggregate, added: u64) !void {
+        if (added > @as(u64, std.math.maxInt(i64)) - self.count) return error.SqlNumericOutOfRange;
+        self.count += added;
+    }
+    pub fn addSupport(self: *Aggregate, input: @import("cypher").statistic.SupportInput) !void {
+        if (!input.valid()) return error.InvalidSqlBackendResponse;
+        const support = try self.ensureSupport();
+        try self.addDistinctCount(try support.add(self.alloc, input.value, input.offset));
+    }
+    pub fn mergeSupport(self: *Aggregate, source: @import("cypher").statistic.SupportSet) !void {
+        const support = try self.ensureSupport();
+        try self.addDistinctCount(try support.merge(self.alloc, source));
+    }
     pub fn update(self: *Aggregate, value: Datum) !void {
         if (self.wide) |wide| return wide.add(value, @import("catalog.zig").Count.one);
         if (value.sql_null) {
@@ -698,6 +739,12 @@ pub const Aggregate = struct {
                     state.has_null = true;
                 }
             }
+            return;
+        }
+        if (self.kind == .count and self.distinct and self.input_type == .integer) {
+            if (value.value != .integer) return error.SqlTypeMismatch;
+            const support = try self.ensureSupport();
+            try self.addDistinctCount(@intFromBool(try support.insert(self.alloc, value.value.integer)));
             return;
         }
         if (self.kind == .pattern_set and value.value != .string) return error.SqlTypeMismatch;
@@ -1811,6 +1858,19 @@ pub const Grouped = struct {
         self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
     }
 
+    pub fn addSupport(self: *Grouped, keys: []const Datum, slot: usize, input: @import("cypher").statistic.SupportInput) !void {
+        if (self.failed or self.finished or slot >= self.specs.len) return error.InvalidSqlBackendResponse;
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const spec = self.specs[slot];
+        var state = try Aggregate.initTyped(arena.allocator(), spec.kind, spec.input_type, spec.input_element);
+        defer state.deinit();
+        state.distinct = spec.distinct;
+        try state.addSupport(input);
+        const slots = [_]u16{@intCast(slot)};
+        try self.importTypedPartialMapped(keys, &.{state}, &slots, self.source_ordinal orelse self.rows_seen);
+        self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+    }
     pub fn addCount(self: *Grouped, keys: []const Datum, inputs: []const Datum, count: @import("catalog.zig").Count) !void {
         if (count.exact()) |weight| if (weight <= std.math.maxInt(i64) and (weight <= 1 or !self.hasFloatingAverage(inputs))) return self.addWeighted(keys, inputs, weight);
         if (self.failed or self.finished or inputs.len != self.specs.len or count.cap(1) == 0) return error.InvalidSqlBackendResponse;
@@ -2459,29 +2519,39 @@ pub const Grouped = struct {
     fn numericGrowth(self: *const Grouped, keys: []const Datum, inputs: []const Datum) !usize {
         if (inputs.len == 0) return 0;
         const present = for (self.specs) |spec| {
-            if (spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) break true;
+            if ((spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) or (spec.kind == .count and spec.distinct and spec.input_type == .integer)) break true;
         } else false;
         if (!present) return 0;
         const slot = try self.findGroup(keys);
         var bytes: usize = 0;
         for (self.specs, self.state_columns, inputs) |spec, column, input| {
-            if (input.sql_null or spec.input_element != .numeric or (spec.kind != .sum and spec.kind != .avg)) continue;
-            const value = input.numeric orelse return error.SqlTypeMismatch;
-            if (value.kind == .finite) bytes +|= column.numericGrowth(slot, value.weight, value.digits.len);
+            if (input.sql_null) continue;
+            if (spec.kind == .count and spec.distinct and spec.input_type == .integer) {
+                if (input.value == .integer) {
+                    const support: @import("cypher").statistic.SupportSet = if (slot) |index| (if (column.values.dynamic.items[index].distinct_support) |s| s.* else .{}) else .{};
+                    bytes +|= support.insertionGrowth(input.value.integer) +| 128;
+                }
+            } else if (spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) {
+                const value = input.numeric orelse return error.SqlTypeMismatch;
+                if (value.kind == .finite) bytes +|= column.numericGrowth(slot, value.weight, value.digits.len);
+            }
         }
         return bytes;
     }
     fn numericStateGrowth(self: *const Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16) !usize {
         const present = for (states) |state| {
-            if (state.numeric != null) break true;
+            if (state.numeric != null or state.distinct_support != null) break true;
         } else false;
         if (!present) return 0;
         const slot = try self.findGroup(keys);
         var bytes: usize = 0;
-        for (states, 0..) |state, index| if (state.numeric) |reducer| {
+        for (states, 0..) |state, index| {
             const column = if (slots) |mapping| mapping[index] else index;
-            bytes +|= self.state_columns[column].numericGrowth(slot, reducer.state.weight, reducer.state.buckets.items.len);
-        };
+            if (state.numeric) |reducer| bytes +|= self.state_columns[column].numericGrowth(slot, reducer.state.weight, reducer.state.buckets.items.len);
+            if (state.distinct_support) |source| if (slot) |id| {
+                if (self.state_columns[column].values.dynamic.items[id].distinct_support) |target| bytes +|= target.growth(source.*);
+            };
+        }
         return bytes;
     }
     pub fn addOrdered(self: *Grouped, keys: []const Datum, inputs: []const Datum, ordinal: u64) !void {
@@ -2673,6 +2743,7 @@ pub const Grouped = struct {
         for (states) |state| {
             if (state.wide) |wide| state_bytes +|= (@sizeOf(@import("wide_aggregate.zig").State) + (wide.total.value.digits.len + wide.count.value.digits.len) *| @sizeOf(u16)) *| 8;
             if (state.numeric) |reducer| state_bytes +|= (reducer.state.buckets.items.len *| @sizeOf(i128) +| @sizeOf(@import("numeric_aggregate.zig").Reducer)) *| 4;
+            if (state.distinct_support) |support| state_bytes +|= support.words.count() *| 64 +| 256;
             if (state.selected) |selected| state_bytes +|= (try datumBytes(selected.row.values[0])) *| 4;
             for (state.distinct_values.items) |entry| state_bytes +|= (try datumBytes(entry.row.row.values[0]) +| @sizeOf(Aggregate)) *| 4;
         }
@@ -5539,4 +5610,35 @@ test "SQL extrema and Boolean partials ignore exact bag count width beside AVG" 
     try Probe.run(std.testing.allocator, false);
     try Probe.run(std.testing.allocator, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{false});
+}
+
+fn groupedBitmapScenario(backing: Allocator, count: usize) !void {
+    var vtable = backing.vtable.*;
+    vtable.resize = Allocator.noResize;
+    vtable.remap = Allocator.noRemap;
+    const a: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false, .compression = .none };
+    defer manager.deinit();
+    const grouped = try Grouped.create(a, &.{.{ .kind = .count, .distinct = true, .input_type = .integer }}, .{ .bytes = 32 * 1024, .spill = &manager });
+    defer grouped.deinit();
+    for (0..2) |_| for (0..count) |i| {
+        const low: i64 = @as(i64, @intCast(i)) * 128;
+        try grouped.addSupport(&.{}, 0, .{ .value = .{ .low = low, .words = &.{0b10101} } });
+        try grouped.add(&.{}, &.{Datum.json(.{ .integer = low + 1 })});
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const row = (try grouped.nextResult(arena.allocator())).?;
+    try std.testing.expectEqual(@as(i64, @intCast(count * 4)), row.aggregates[0].value.integer);
+    try std.testing.expect((try grouped.nextResult(arena.allocator())) == null);
+    if (count >= 256) try std.testing.expect(manager.written_bytes > 0);
+}
+
+test "SQL grouped bitmap growth spills before retaining rehashes and merges scalar inputs" {
+    try groupedBitmapScenario(std.testing.allocator, 512);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, groupedBitmapScenario, .{@as(usize, 2)});
 }

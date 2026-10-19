@@ -413,7 +413,7 @@ pub const NodeCursor = struct {
     }
     fn appendWeighted(self: *NodeCursor, projected: Row, weight: Count, input: ?@import("statistic.zig").Input) !void {
         const a = self.weighted_arena.allocator();
-        try self.pending.append(a, .{ .row = (try (v.Value{ .map = projected }).clone(a)).map, .weight = try weight.clone(a), .statistic_input = input });
+        try self.pending.append(a, .{ .row = (try (v.Value{ .map = projected }).clone(a)).map, .weight = try weight.clone(a), .statistic_input = if (input) |argument| try argument.clone(a) else null });
     }
     fn emitWeighted(ptr: *anyopaque, row: Row, weight: Count) !void {
         const self: *NodeCursor = @ptrCast(@alignCast(ptr));
@@ -422,14 +422,7 @@ pub const NodeCursor = struct {
             try e.values.output(.{ .map = projected });
             if (e.statistic_bin) |bin| {
                 if (bin.support) |support| {
-                    for (support.value.words, 0..) |word, wi| {
-                        var bits = word;
-                        while (bits != 0) : (bits &= bits - 1) {
-                            try e.state();
-                            const input = std.math.cast(i64, @as(i128, support.offset) + support.value.low + @as(i128, wi * 64 + @ctz(bits))) orelse return error.CypherStatisticDeclined;
-                            try self.appendWeighted(projected, weight, .{ .slot = bin.slot, .value = input });
-                        }
-                    }
+                    try self.appendWeighted(projected, weight, .{ .slot = bin.slot, .support = support });
                     continue;
                 }
                 try self.appendWeighted(projected, weight, .{ .slot = bin.slot, .value = bin.input });
@@ -771,7 +764,7 @@ pub const NodeCursor = struct {
                 try output.append(a, (try (v.Value{ .map = pending.row }).clone(a)).map);
                 try self.last_weights.append(a, pending.weight.cap(std.math.maxInt(u64)));
                 try self.last_counts.append(a, try pending.weight.clone(a));
-                try self.last_statistic_inputs.append(a, pending.statistic_input);
+                try self.last_statistic_inputs.append(a, if (pending.statistic_input) |argument| try argument.clone(a) else null);
                 continue;
             }
             const frame = self.frames.items[self.frames.items.len - 1];
@@ -4553,7 +4546,7 @@ const Engine = struct {
         return false;
     }
     const Statistic = @import("statistic.zig");
-    const StatisticSupport = struct { value: Statistic.Support, offset: i64 };
+    const StatisticSupport = Statistic.SupportInput;
     const StatisticNames = std.StringHashMapUnmanaged(Statistic.Form);
     const StatisticPlan = struct { kernel: Statistic.Plan, calls: []const *const ast.Expr = &.{}, global: bool = false };
     fn statisticReferences(value: anytype, names: StatisticNames) bool {
@@ -4647,7 +4640,7 @@ const Engine = struct {
         for (targets) |target| try names.put(self.a, target.name, try Statistic.Form.column(self.a, path.edges.len, target.edge, statistic_depth));
         if (statisticReferences(self.stream_predicate, names)) return null;
         if (self.external_statistic) |requests| {
-            var kernel = Statistic.Plan.init(requests);
+            var kernel = try Statistic.Plan.init(self.a, requests);
             kernel.ptr = self;
             kernel.charge = chargeWork;
             return .{ .kernel = kernel, .global = self.external_statistic_global };
@@ -4679,7 +4672,7 @@ const Engine = struct {
             benefit = benefit or statisticBenefit(form, kind, path);
         }
         if (requests.items.len == 0 or (require_benefit and !benefit)) return null;
-        var kernel = Statistic.Plan.init(requests.items);
+        var kernel = try Statistic.Plan.init(self.a, requests.items);
         kernel.ptr = self;
         kernel.charge = chargeWork;
         return .{ .kernel = kernel, .calls = calls.items, .global = !fold.has_keys and global };
@@ -4708,11 +4701,11 @@ const Engine = struct {
         for (plan.kernel.requests, 0..) |request, i| switch (request.kind) {
             .count => try self.emitStatisticBin(row, i, 0, value.count),
             .min, .max => {
-                const e = value.extreme(i);
+                const e = value.extreme(plan.kernel, i);
                 const input = std.math.cast(i64, @as(i128, request.form.coefficients[0]) + (if (request.kind == .min) e.min else e.max)) orelse return error.CypherStatisticDeclined;
                 try self.emitStatisticBin(row, i, input, Count.one);
             },
-            .distinct => try self.emitStatisticInput(row, i, 0, .{ .value = value.support(i), .offset = request.form.coefficients[0] }, Count.one),
+            .distinct => try self.emitStatisticInput(row, i, 0, .{ .value = value.support(plan.kernel, i), .offset = request.form.coefficients[0] }, Count.one),
             .sum, .avg => {
                 const total = try (try value.total(self.a, request.form)).magnitude(self.a);
                 const divided = try total.amount.divRem(self.a, value.count);

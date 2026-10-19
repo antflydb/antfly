@@ -462,6 +462,7 @@ pub const Page = struct {
             if (inputs.len != self.rows.len or self.aggregate_slots == null or self.multiplicities == null) return error.InvalidSqlBackendResponse;
             for (inputs) |input| if (input) |argument| {
                 if (std.mem.indexOfScalar(usize, self.aggregate_slots.?, argument.slot) == null) return error.InvalidSqlBackendResponse;
+                if (argument.support) |support| if (!support.valid()) return error.InvalidSqlBackendResponse;
             };
         }
         if (self.multiplicities) |weights| {
@@ -478,7 +479,16 @@ pub const Page = struct {
         return if (self.exact_multiplicities) |weights| weights[index] else Count.init(if (self.multiplicities) |weights| weights[index] else 1);
     }
     pub fn cloneAggregateInputs(self: Page, a: std.mem.Allocator) !?[]const ?AggregateInput {
-        return if (self.aggregate_inputs) |inputs| try a.dupe(?AggregateInput, inputs) else null;
+        const inputs = self.aggregate_inputs orelse return null;
+        const owned = try a.alloc(?AggregateInput, inputs.len);
+        errdefer a.free(owned);
+        var initialized: usize = 0;
+        errdefer for (owned[0..initialized]) |input| if (input) |argument| if (argument.support) |support| a.free(support.value.words);
+        for (inputs, owned) |input, *out| {
+            out.* = if (input) |argument| try argument.clone(a) else null;
+            initialized += 1;
+        }
+        return owned;
     }
     pub fn cloneWeights(self: Page, a: std.mem.Allocator) !?[]const Count {
         const counts = self.exact_multiplicities orelse return null;
@@ -1133,4 +1143,40 @@ test "SQL certified aggregate arguments require aligned negotiated reducer slots
     page.aggregate_inputs = &inputs;
     page.multiplicities = null;
     try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+}
+
+test "SQL bitmap aggregate pages own cloned words and reject invalid supports" {
+    const a = std.testing.allocator;
+    var words = [_]u64{0b10101};
+    var inputs = [_]?AggregateInput{.{ .slot = 0, .support = .{ .value = .{ .low = -1, .words = &words }, .offset = 10000000000 } }};
+    const rows = [_]Row{.{ .id = "r", .version = 0, .value = .null }};
+    const page: Page = .{ .rows = &rows, .multiplicities = &.{1}, .aggregate_slots = &.{0}, .aggregate_inputs = &inputs };
+    try page.validateWeights();
+    const cloned = (try page.cloneAggregateInputs(a)).?;
+    defer a.free(cloned);
+    defer a.free(cloned[0].?.support.?.value.words);
+    words[0] = 0;
+    try std.testing.expectEqual(@as(u64, 0b10101), cloned[0].?.support.?.value.words[0]);
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    words[0] = 3;
+    inputs[0].?.support.?.value.low = std.math.maxInt(i64);
+    inputs[0].?.support.?.offset = 0;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+}
+
+fn cloneBitmapInputs(a: std.mem.Allocator) !void {
+    const inputs = [_]?AggregateInput{
+        .{ .slot = 0, .support = .{ .value = .{ .words = &.{ 1, 3 } } } },
+        null,
+        .{ .slot = 0, .support = .{ .value = .{ .words = &.{5} } } },
+    };
+    const page: Page = .{ .rows = &.{}, .aggregate_inputs = &inputs };
+    const cloned = (try page.cloneAggregateInputs(a)).?;
+    defer a.free(cloned);
+    defer for (cloned) |input| if (input) |argument| a.free(argument.support.?.value.words);
+    for (inputs, cloned) |input, copy| try std.testing.expectEqualDeep(input, copy);
+}
+
+test "SQL bitmap page clones release partially initialized arguments" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneBitmapInputs, .{});
 }

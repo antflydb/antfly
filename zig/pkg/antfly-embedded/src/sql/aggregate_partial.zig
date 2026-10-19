@@ -201,6 +201,24 @@ const Decoder = struct {
 pub fn cell(a: A, state: operators.Aggregate) !Datum {
     var encoder: Encoder = .{ .a = a };
     errdefer encoder.bytes.deinit(a);
+    if (state.distinct_support) |support| {
+        if (state.kind != .count or !state.distinct or state.input_type != .integer or state.distinct_values.items.len != 0) return error.InvalidSqlSpill;
+        try encoder.raw("AGB\x01");
+        try encoder.raw(&.{ kindId(state.kind), typeId(state.input_type), elementId(state.input_element) });
+        try encoder.integer(u64, state.count);
+        const keys = try a.alloc(i64, support.words.count());
+        defer a.free(keys);
+        var iterator = support.words.keyIterator();
+        var i: usize = 0;
+        while (iterator.next()) |key| : (i += 1) keys[i] = key.*;
+        std.mem.sort(i64, keys, {}, std.sort.asc(i64));
+        try encoder.integer(u64, keys.len);
+        for (keys) |key| {
+            try encoder.integer(i64, key);
+            try encoder.integer(u64, support.words.get(key).?);
+        }
+        return Datum.json(.{ .string = try encoder.bytes.toOwnedSlice(a) });
+    }
     if (state.wide) |wide| {
         try encoder.raw("AGW\x01");
         try encoder.raw(&.{ kindId(state.kind), typeId(state.input_type), elementId(state.input_element) });
@@ -308,6 +326,26 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     const sql_floating = spec.input_element == .float32 or spec.input_element == .float64;
     var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.value.string, .sql_floating = sql_floating };
     const version = try decoder.raw(4);
+    if (std.mem.eql(u8, version, "AGB\x01")) {
+        const signature = try decoder.raw(3);
+        if (spec.kind != .count or !spec.distinct or spec.input_type != .integer or signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != elementId(spec.input_element)) return error.InvalidSqlSpill;
+        const count = try decoder.integer(u64);
+        const words = try decoder.integer(u64);
+        if (count > std.math.maxInt(i64) or words > (decoder.bytes.len - decoder.position) / 16) return error.InvalidSqlSpill;
+        var state = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+        errdefer state.deinit();
+        state.distinct = true;
+        var previous: ?i64 = null;
+        for (0..@intCast(words)) |_| {
+            const key = try decoder.integer(i64);
+            const bits = try decoder.integer(u64);
+            if (bits == 0 or key < @divFloor(std.math.minInt(i64), 64) or key > @divFloor(std.math.maxInt(i64), 64) or (previous != null and previous.? >= key)) return error.InvalidSqlSpill;
+            previous = key;
+            try state.addSupport(.{ .value = .{ .low = key * 64, .words = &.{bits} } });
+        }
+        if (state.count != count or decoder.position != decoder.bytes.len) return error.InvalidSqlSpill;
+        return state;
+    }
     if (std.mem.eql(u8, version, "AGW\x01")) {
         const signature = try decoder.raw(3);
         if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != elementId(spec.input_element) or spec.distinct or (spec.kind != .sum and spec.kind != .avg)) return error.InvalidSqlSpill;
@@ -514,6 +552,7 @@ test "SQL NUMERIC aggregate extrema partials retain exact values and display sca
 pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
     if (target.kind != source.kind or target.input_type != source.input_type or target.input_element != source.input_element or target.distinct != source.distinct) return error.InvalidSqlSpill;
     if (source.distinct) {
+        if (source.distinct_support) |support| try target.mergeSupport(support.*);
         if (source.patterns) |patterns| {
             for (patterns.values.items) |value| try target.update(if (value == .null) Datum{} else Datum.json(value));
         } else for (source.distinct_values.items) |entry| try target.update(entry.row.row.values[0]);
@@ -781,4 +820,60 @@ test "SQL exact NUMERIC checkpoint lanes validate full signatures and truncated 
         try std.testing.expect(try lane.numeric.?.equivalent(&context, state.numeric.?.state));
         for (0..encoded.value.string.len) |end| try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(a, Datum.json(.{ .string = encoded.value.string[0..end] }), spec));
     }
+}
+
+fn bitmapScenario(backing: A, corruptions: bool) !void {
+    var vtable = backing.vtable.*;
+    vtable.resize = A.noResize;
+    vtable.remap = A.noRemap;
+    const a: A = .{ .ptr = backing.ptr, .vtable = &vtable };
+    const spec: operators.AggregateSpec = .{ .kind = .count, .input_type = .integer, .distinct = true };
+    var left = try operators.Aggregate.init(a, .count, .integer);
+    defer left.deinit();
+    left.distinct = true;
+    try left.update(Datum.json(.{ .integer = -1 }));
+    try left.addSupport(.{ .value = .{ .low = -1, .words = &.{0b10101} } });
+    try left.addSupport(.{ .value = .{ .low = -1, .words = &.{0b10101} }, .offset = 10000000000 });
+    try std.testing.expectEqual(@as(u64, 6), left.count);
+    const encoded = try cell(a, left);
+    defer a.free(encoded.value.string);
+    try std.testing.expectEqualStrings("AGB\x01", encoded.value.string[0..4]);
+    var restored = try decode(a, encoded, spec);
+    defer restored.deinit();
+    try merge(&left, restored);
+    try std.testing.expectEqual(@as(u64, 6), left.count);
+    try left.update(Datum.json(.{ .integer = 0 }));
+    try std.testing.expectEqual(@as(u64, 6), restored.count);
+    // An old scalar-member checkpoint is accepted and normalized to words.
+    var legacy = try operators.Aggregate.init(a, .count, .json);
+    defer legacy.deinit();
+    legacy.distinct = true;
+    for ([_]i64{ -1, 0, 64 }) |n| try legacy.update(Datum.json(.{ .integer = n }));
+    legacy.input_type = .integer;
+    const old = try cell(a, legacy);
+    defer a.free(old.value.string);
+    try std.testing.expectEqualStrings(magic, old.value.string[0..4]);
+    var decoded = try decode(a, old, spec);
+    defer decoded.deinit();
+    try merge(&left, decoded);
+    try std.testing.expectEqual(@as(u64, 8), left.count);
+    try std.testing.expect(decoded.distinct_support != null);
+    if (corruptions) {
+        for (0..encoded.value.string.len) |n| try std.testing.expectError(error.InvalidSqlSpill, decode(a, Datum.json(.{ .string = encoded.value.string[0..n] }), spec));
+        const bytes = try a.dupe(u8, encoded.value.string);
+        defer a.free(bytes);
+        @memset(bytes[31..39], 0); // An empty word is not a canonical record.
+        try std.testing.expectError(error.InvalidSqlSpill, decode(a, Datum.json(.{ .string = bytes }), spec));
+        var wrong = spec;
+        wrong.distinct = false;
+        try std.testing.expectError(error.InvalidSqlSpill, decode(a, encoded, wrong));
+        wrong = spec;
+        wrong.input_type = .number;
+        try std.testing.expectError(error.InvalidSqlSpill, decode(a, encoded, wrong));
+    }
+}
+
+test "integer DISTINCT bitmap checkpoints merge legacy members, retain holes and release failed allocations" {
+    try bitmapScenario(std.testing.allocator, true);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, bitmapScenario, .{false});
 }

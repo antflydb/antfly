@@ -1825,17 +1825,27 @@ unproved shapes use the existing executor rather than changing query semantics.
 
 Consumers receive tagged aggregate arguments, never fabricated ordinary graph
 rows. First-moment consumers receive at most two integral bins with exact bag
-weights; extrema receive their exact value, and DISTINCT receives supported
-values once. SQL tags identify one negotiated reducer per contribution and
+weights; extrema receive their exact value, and DISTINCT receives an owned
+bitmap argument. SQL tags identify one negotiated reducer per contribution and
 follow projection and positional UNION mappings. Compatible SQL polynomial
 reducers share one traversal and one count/first/cross-moment basis; only cost
-directions and DISTINCT supports add traversal state. Merged projections are
+directions and DISTINCT supports add traversal state. Physical slots are dense
+by unique coefficient direction, independently of the number of moment
+consumers. MIN/MAX and shifted DISTINCT arguments share their respective
+direction slots; constant offsets are applied only at emission. Merged projections are
 replanned together and retain their original orientation and totality proofs.
 Native reducers negotiate certificate families independently, so a floating
 first-moment consumer cannot force an integer second moment onto a full length
 distribution. These passes share the read cut, adjacency cache and quotas.
-Native grouped COUNT(DISTINCT) merges sparse aligned bitmap words directly into
-its group state. Sparse words preserve holes and widely separated correlated
+Native and SQL grouped integer COUNT(DISTINCT) merge sparse aligned bitmap
+words directly into group state. SQL pages, CTE projections and positional
+UNION ALL adapters own and clone bitmap arguments without enumerating bits.
+The integer DISTINCT partial codec uses canonical sorted words (`AGB` version
+1), validates signatures and cardinalities, and accepts older scalar-member
+checkpoints. Spilling emits bounded word records; final reduction externally
+sorts by aggregate slot and word index, unions overlaps, and counts bits once.
+Hash-table growth is preflighted before retaining new state so memory pressure
+uses the existing spill boundary. Sparse words preserve holes and widely separated correlated
 offsets without expanding the support into scalar rows; ordinary fallback
 contributions deduplicate against the same support. Original grouping keys,
 filters and observed arithmetic retain independent invariance/totality

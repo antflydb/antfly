@@ -716,6 +716,10 @@ pub const Column = struct {
             },
             .dynamic => |values| {
                 if (values.items[from].numeric) |reducer| return self.numericGrowth(index, reducer.state.weight, reducer.state.buckets.items.len);
+                if (values.items[from].distinct_support) |source_| {
+                    const target: @import("cypher").statistic.SupportSet = if (index) |i| (if (self.values.dynamic.items[i].distinct_support) |target_| target_.* else .{}) else .{};
+                    return target.growth(source_.*) +| 128;
+                }
                 if (values.items[from].selected) |selected| return (try operators.datumBytes(selected.row.values[0])) *| 4;
             },
             .bytes => |values| return if (values.items[from].value) |bytes| bytes.len +| 64 else 0,

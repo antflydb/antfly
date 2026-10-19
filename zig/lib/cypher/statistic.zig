@@ -90,31 +90,79 @@ pub const Request = struct { form: Form, kind: Kind };
 /// A row in a negotiated summary stream contributes to exactly one reducer.
 /// The producer assigns a request ordinal; relation adapters map it to the
 /// owning aggregate slot. It never denotes an ordinary SQL column.
-pub const Input = struct { slot: usize, value: i64 };
+pub const SupportInput = struct {
+    value: Support,
+    offset: i64 = 0,
+    pub fn valid(self: SupportInput) bool {
+        if (self.value.words.len == 0 or self.value.words.len > 1027) return false;
+        var present = false;
+        for (self.value.words, 0..) |word, i| {
+            if (word == 0) continue;
+            present = true;
+            const base = @as(i128, self.value.low) + self.offset + @as(i128, i) * 64;
+            if (base + @ctz(word) < std.math.minInt(i64) or base + 63 - @clz(word) > std.math.maxInt(i64)) return false;
+        }
+        return present;
+    }
+};
+pub const Input = struct {
+    slot: usize,
+    value: i64 = 0,
+    support: ?SupportInput = null,
+    pub fn clone(self: Input, a: A) !Input {
+        var result = self;
+        if (self.support) |support_| {
+            result.support.?.value.words = try a.dupe(u64, support_.value.words);
+        }
+        return result;
+    }
+};
 pub const Plan = struct {
+    pub const Slot = struct { extreme: ?usize = null, support: ?usize = null };
     requests: []const Request,
     dimensions: usize,
     moments: bool,
     quadratic: bool,
-    extrema: bool = false,
-    supports: bool = false,
+    /// Dense physical state is independent of the number of moment reducers.
+    extrema: []const []const i64,
+    supports: []const []const i64,
+    slots: []const Slot,
     ptr: ?*anyopaque = null,
     charge: ?*const fn (*anyopaque, usize) anyerror!void = null,
-    pub fn init(requests: []const Request) Plan {
-        var result: Plan = .{ .requests = requests, .dimensions = requests[0].form.dimensions, .moments = false, .quadratic = false };
-        for (requests) |r| {
-            result.moments = result.moments or r.kind == .avg or r.kind == .sum or r.kind == .count;
-            result.quadratic = result.quadratic or r.form.quadratic();
-            result.extrema = result.extrema or r.kind == .min or r.kind == .max;
-            result.supports = result.supports or r.kind == .distinct;
+    pub fn init(a: A, requests: []const Request) !Plan {
+        const n = requests[0].form.dimensions;
+        const slots = try a.alloc(Slot, requests.len);
+        errdefer a.free(slots);
+        var extrema: std.ArrayList([]const i64) = .empty;
+        defer extrema.deinit(a);
+        var supports: std.ArrayList([]const i64) = .empty;
+        defer supports.deinit(a);
+        var moments = false;
+        var quadratic = false;
+        for (requests, slots) |r, *slot| {
+            slot.* = .{};
+            moments = moments or r.kind == .avg or r.kind == .sum or r.kind == .count;
+            quadratic = quadratic or r.form.quadratic();
+            // Constants are applied at emission. MIN/MAX of shifted forms and
+            // DISTINCT consumers with different offsets share a cost direction.
+            const coefficients = r.form.coefficients[1 .. 1 + n];
+            if (r.kind == .min or r.kind == .max) slot.extreme = try intern(a, &extrema, coefficients);
+            if (r.kind == .distinct) slot.support = try intern(a, &supports, coefficients);
         }
-        return result;
+        const ext = try extrema.toOwnedSlice(a);
+        errdefer a.free(ext);
+        return .{ .requests = requests, .dimensions = n, .moments = moments, .quadratic = quadratic, .extrema = ext, .supports = try supports.toOwnedSlice(a), .slots = slots };
+    }
+    fn intern(a: A, directions_: *std.ArrayList([]const i64), coefficients: []const i64) !usize {
+        for (directions_.items, 0..) |prior, index| if (std.mem.eql(i64, prior, coefficients)) return index;
+        try directions_.append(a, coefficients);
+        return directions_.items.len - 1;
     }
     fn work(self: Plan, amount: usize) !void {
         if (self.charge) |f| try f(self.ptr.?, amount);
     }
     fn directions(self: Plan) usize {
-        return if (self.extrema or self.supports) self.requests.len else 0;
+        return self.extrema.len + self.supports.len;
     }
 };
 
@@ -147,6 +195,27 @@ pub const SupportSet = struct {
             if (shift != 0) added += try self.putWord(a, index + 1, word >> @as(u6, @intCast(64 - @as(u7, shift))));
         }
         return added;
+    }
+    pub fn merge(self: *SupportSet, a: A, other: SupportSet) !u64 {
+        var added: u64 = 0;
+        var entries = other.words.iterator();
+        while (entries.next()) |entry| added += try self.putWord(a, entry.key_ptr.*, entry.value_ptr.*);
+        return added;
+    }
+    /// Peak allocation for inserting additional words, including the old hash
+    /// table while a replacement is allocated. Used before aggregate spilling.
+    pub fn growth(self: SupportSet, other: SupportSet) usize {
+        var additional: usize = 0;
+        var entries = other.words.keyIterator();
+        while (entries.next()) |key| additional += @intFromBool(!self.words.contains(key.*));
+        return self.growthFor(additional);
+    }
+    pub fn insertionGrowth(self: SupportSet, value: i64) usize {
+        return self.growthFor(@intFromBool(!self.words.contains(@divFloor(value, 64))));
+    }
+    fn growthFor(self: SupportSet, additional: usize) usize {
+        if (self.words.count() + additional <= @as(usize, self.words.capacity()) * 80 / 100) return 0;
+        return (self.words.count() + additional) *| 64 +| 256;
     }
 };
 pub const Signed = struct {
@@ -203,10 +272,16 @@ pub const Value = struct {
     fn cross(self: Value, i: usize) Count {
         return if (i < self.crosses.len) self.crosses[i] else Count.init(0);
     }
-    pub fn extreme(self: Value, i: usize) Extrema {
+    pub fn extreme(self: Value, plan: Plan, request: usize) Extrema {
+        return self.extremeSlot(plan.slots[request].extreme.?);
+    }
+    fn extremeSlot(self: Value, i: usize) Extrema {
         return if (i < self.extrema.len) self.extrema[i] else .{};
     }
-    pub fn support(self: Value, i: usize) Support {
+    pub fn support(self: Value, plan: Plan, request: usize) Support {
+        return self.supportSlot(plan.slots[request].support.?);
+    }
+    fn supportSlot(self: Value, i: usize) Support {
         return if (i < self.supports.len) self.supports[i] else .{};
     }
     pub fn add(l: Value, a: A, r: Value, plan: Plan) !Value {
@@ -220,16 +295,14 @@ pub const Value = struct {
         const crosses = try a.alloc(Count, @max(l.crosses.len, r.crosses.len));
         for (crosses, 0..) |*v, i| v.* = try l.cross(i).add(a, r.cross(i));
         out.crosses = crosses;
-        const ext = try a.alloc(Extrema, if (plan.extrema) plan.requests.len else 0);
-        const supports = try a.alloc(Support, if (plan.supports) plan.requests.len else 0);
-        if (plan.extrema or plan.supports) for (plan.requests, 0..) |request, i| {
-            if (plan.extrema) {
-                const le = l.extreme(i);
-                const re = r.extreme(i);
-                ext[i] = .{ .min = @min(le.min, re.min), .max = @max(le.max, re.max) };
-            }
-            if (plan.supports) supports[i] = if (request.kind == .distinct) try Support.merge(l.support(i), a, r.support(i), plan) else .{};
-        };
+        const ext = try a.alloc(Extrema, plan.extrema.len);
+        const supports = try a.alloc(Support, plan.supports.len);
+        for (ext, 0..) |*e, i| {
+            const le = l.extremeSlot(i);
+            const re = r.extremeSlot(i);
+            e.* = .{ .min = @min(le.min, re.min), .max = @max(le.max, re.max) };
+        }
+        for (supports, 0..) |*support_, i| support_.* = try Support.merge(l.supportSlot(i), a, r.supportSlot(i), plan);
         out.extrema = ext;
         out.supports = supports;
         return out;
@@ -251,31 +324,28 @@ pub const Value = struct {
             };
             out.crosses = crosses;
         }
-        const ext = try a.alloc(Extrema, if (plan.extrema) plan.requests.len else 0);
-        const supports = try a.alloc(Support, if (plan.supports) plan.requests.len else 0);
-        if (plan.extrema or plan.supports) for (plan.requests, 0..) |request, index| {
-            if (plan.extrema) {
-                const le = l.extreme(index);
-                const re = r.extreme(index);
-                ext[index] = .{ .min = std.math.add(i128, le.min, re.min) catch return error.CypherStatisticDeclined, .max = std.math.add(i128, le.max, re.max) catch return error.CypherStatisticDeclined };
-            }
-            if (plan.supports) supports[index] = .{};
-            if (request.kind == .distinct) {
-                const ls = l.support(index);
-                const rs = r.support(index);
-                var result: ?Support = null;
-                for (ls.words, 0..) |word, wi| {
-                    var bits = word;
-                    while (bits != 0) : (bits &= bits - 1) {
-                        try plan.work(1);
-                        var shifted = rs;
-                        shifted.low += ls.low + @as(i64, @intCast(wi * 64 + @ctz(bits)));
-                        result = if (result) |prior| try Support.merge(prior, a, shifted, plan) else shifted;
-                    }
+        const ext = try a.alloc(Extrema, plan.extrema.len);
+        const supports = try a.alloc(Support, plan.supports.len);
+        for (ext, 0..) |*e, index| {
+            const le = l.extremeSlot(index);
+            const re = r.extremeSlot(index);
+            e.* = .{ .min = std.math.add(i128, le.min, re.min) catch return error.CypherStatisticDeclined, .max = std.math.add(i128, le.max, re.max) catch return error.CypherStatisticDeclined };
+        }
+        for (supports, 0..) |*support_, index| {
+            const ls = l.supportSlot(index);
+            const rs = r.supportSlot(index);
+            var result: ?Support = null;
+            for (ls.words, 0..) |word, wi| {
+                var bits = word;
+                while (bits != 0) : (bits &= bits - 1) {
+                    try plan.work(1);
+                    var shifted = rs;
+                    shifted.low += ls.low + @as(i64, @intCast(wi * 64 + @ctz(bits)));
+                    result = if (result) |prior| try Support.merge(prior, a, shifted, plan) else shifted;
                 }
-                supports[index] = result.?;
             }
-        };
+            support_.* = result.?;
+        }
         out.extrema = ext;
         out.supports = supports;
         return out;
@@ -300,19 +370,17 @@ pub const Value = struct {
                 out.crosses = crosses;
             }
         }
-        const ext = try a.alloc(Extrema, if (plan.extrema) plan.requests.len else 0);
-        const supports = try a.alloc(Support, if (plan.supports) plan.requests.len else 0);
-        if (plan.extrema or plan.supports) for (plan.requests, 0..) |request, i| {
-            const cost = request.form.coefficients[1 + edge];
-            if (plan.extrema) {
-                const prior = self.extreme(i);
-                ext[i] = .{ .min = std.math.add(i128, prior.min, cost) catch return error.CypherStatisticDeclined, .max = std.math.add(i128, prior.max, cost) catch return error.CypherStatisticDeclined };
-            }
-            if (plan.supports) {
-                supports[i] = self.support(i);
-                if (request.kind == .distinct) supports[i].low = std.math.add(i64, supports[i].low, cost) catch return error.CypherStatisticDeclined;
-            }
-        };
+        const ext = try a.alloc(Extrema, plan.extrema.len);
+        const supports = try a.alloc(Support, plan.supports.len);
+        for (plan.extrema, ext, 0..) |coefficients, *e, i| {
+            const cost = coefficients[edge];
+            const prior = self.extremeSlot(i);
+            e.* = .{ .min = std.math.add(i128, prior.min, cost) catch return error.CypherStatisticDeclined, .max = std.math.add(i128, prior.max, cost) catch return error.CypherStatisticDeclined };
+        }
+        for (plan.supports, supports, 0..) |coefficients, *support_, i| {
+            support_.* = self.supportSlot(i);
+            support_.low = std.math.add(i64, support_.low, coefficients[edge]) catch return error.CypherStatisticDeclined;
+        }
         out.extrema = ext;
         out.supports = supports;
         return out;
@@ -337,16 +405,16 @@ test "statistics retain cross moments, signed costs and holes through compositio
     const polynomial = (try Form.combine(xx, xy, a, .add)).?;
     const direction = (try Form.combine(x, y, a, .subtract)).?;
     const requests = [_]Request{ .{ .form = polynomial, .kind = .avg }, .{ .form = direction, .kind = .min }, .{ .form = direction, .kind = .distinct } };
-    const plan = Plan.init(&requests);
+    const plan = try Plan.init(a, &requests);
     const one = Value.init(Count.one);
     const first = try (try one.advance(a, 0, plan)).advance(a, 0, plan); // (2,0)
     const second = try (try one.advance(a, 0, plan)).advance(a, 1, plan); // (1,1)
     const bag = try first.add(a, second, plan);
     const total = try (try bag.total(a, polynomial)).magnitude(a);
     try std.testing.expectEqual(@as(?u64, 6), total.amount.exact());
-    try std.testing.expectEqual(@as(i128, 0), bag.extreme(1).min);
-    try std.testing.expectEqual(@as(i128, 2), bag.extreme(1).max);
-    const support = bag.support(2);
+    try std.testing.expectEqual(@as(i128, 0), bag.extreme(plan, 1).min);
+    try std.testing.expectEqual(@as(i128, 2), bag.extreme(plan, 1).max);
+    const support = bag.support(plan, 2);
     try std.testing.expectEqual(@as(i64, 0), support.low);
     try std.testing.expectEqual(@as(u64, 5), support.words[0]);
     const product = try second.multiply(a, first, plan); // (3,1), x*x+x*y=12
@@ -370,4 +438,37 @@ test "sparse supports preserve holes, overlaps and distant signed offsets" {
     try std.testing.expectEqual(@as(u64, 1), try set.add(a, .{ .low = 0, .words = &.{1} }, std.math.maxInt(i64)));
     try std.testing.expectEqual(@as(u64, 1), try set.add(a, .{ .low = 0, .words = &.{1} }, std.math.minInt(i64)));
     try std.testing.expect(set.words.count() < 12);
+}
+
+test "direction slots deduplicate offsets without tracking moment consumers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const x = try Form.column(a, 2, 0, 20);
+    const y = try Form.column(a, 2, 1, 20);
+    const xx = (try Form.combine(x, x, a, .multiply)).?;
+    const offset = (try Form.combine(x, try Form.literal(a, 123456789, 2), a, .add)).?;
+    const requests = [_]Request{
+        .{ .form = xx, .kind = .avg },
+        .{ .form = y, .kind = .avg },
+        .{ .form = x, .kind = .min },
+        .{ .form = offset, .kind = .max },
+        .{ .form = x, .kind = .distinct },
+        .{ .form = offset, .kind = .distinct },
+        .{ .form = y, .kind = .distinct },
+    };
+    const plan = try Plan.init(a, &requests);
+    try std.testing.expectEqual(@as(usize, 1), plan.extrema.len);
+    try std.testing.expectEqual(@as(usize, 2), plan.supports.len);
+    const one = Value.init(Count.one);
+    const first = try (try one.advance(a, 0, plan)).advance(a, 0, plan);
+    const second = try one.advance(a, 1, plan);
+    const bag = try first.add(a, second, plan);
+    try std.testing.expectEqual(@as(i128, 0), bag.extreme(plan, 2).min);
+    try std.testing.expectEqual(@as(i128, 2), bag.extreme(plan, 3).max);
+    try std.testing.expectEqualSlices(u64, bag.support(plan, 4).words, bag.support(plan, 5).words);
+    try std.testing.expectEqual(@as(u64, 5), bag.support(plan, 4).words[0]);
+    try std.testing.expectEqual(@as(u64, 3), bag.support(plan, 6).words[0]);
+    const product = try first.multiply(a, second, plan);
+    try std.testing.expectEqual(@as(i128, 2), product.extreme(plan, 3).max);
 }

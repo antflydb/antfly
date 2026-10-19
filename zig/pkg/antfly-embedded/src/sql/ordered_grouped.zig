@@ -116,6 +116,10 @@ pub const Collector = struct {
         if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
         try self.grouped.addCount(keys, inputs, count);
     }
+    pub fn addSupport(self: *Collector, keys: []const Datum, slot: usize, input: @import("cypher").statistic.SupportInput) !void {
+        if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
+        try self.grouped.addSupport(keys, slot, input);
+    }
     pub fn addGlobalBatch(self: *Collector, inputs: []const []const Datum) !void {
         try self.grouped.addGlobalBatch(inputs);
         for (inputs) |row| try self.capture(&.{}, row);
