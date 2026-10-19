@@ -1054,7 +1054,7 @@ Six pinned pretrained F32 video cases qualify native CPU and Metal numerical
 parity, including ordered mixed groups, repeated frames and HTTP dimensions.
 JPEG RGB uses the independent Pillow/libjpeg reference policy; default FFmpeg
 MJPEG IDCT can differ. See
-[VIDEO.md](../../zig/lib/video/VIDEO.md#embeddinggemma-2-model-adapter-2026-10-09).
+[VIDEO.md](../../zig/lib/video/VIDEO.md#inference-admission-and-telemetry).
 
 Model FPS sampling currently requires progressive one-picture-per-sample AVC
 (Baseline/Main/High-family) or MJPEG. PAFF/MBAFF and Extended-profile partition
