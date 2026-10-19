@@ -40,8 +40,23 @@ pub fn release(a: A, root: ?*Node) void {
     if (n.refs != 0) return;
     release(a, n.left);
     release(a, n.right);
-    a.free(n.path);
-    a.destroy(n);
+    freeNode(a, n);
+}
+// Keep the immutable key adjacent to its node: one allocation, one budget
+// charge and one free, including persistent copies and cold construction.
+fn freeNode(a: A, n: *Node) void {
+    const bytes: [*]align(@alignOf(Node)) u8 = @ptrCast(n);
+    a.free(bytes[0 .. @sizeOf(Node) + n.path.len]);
+}
+fn allocate(a: A, path: []const u8, slot: usize, leaf: [32]u8) !*Node {
+    const size = try std.math.add(usize, @sizeOf(Node), path.len);
+    const bytes = try a.alignedAlloc(u8, .of(Node), size);
+    const n: *Node = @ptrCast(bytes.ptr);
+    const key = bytes[@sizeOf(Node)..];
+    @memcpy(key, path);
+    n.* = .{ .path = key, .slot = slot, .leaf = leaf, .priority = undefined, .hash = undefined, .left = null, .right = null, .height = 1, .count = 1 };
+    std.crypto.hash.sha2.Sha256.hash(path, &n.priority, .{});
+    return n;
 }
 fn rehash(n: *Node) !void {
     n.height = 1 + @max(if (n.left) |v| v.height else 0, if (n.right) |v| v.height else 0);
@@ -55,12 +70,10 @@ fn rehash(n: *Node) !void {
     h.final(&n.hash);
 }
 fn make(a: A, path: []const u8, slot: usize, leaf: [32]u8, left: ?*Node, right: ?*Node) !*Node {
-    const n = try a.create(Node);
-    errdefer a.destroy(n);
-    const key = try a.dupe(u8, path);
-    errdefer a.free(key);
-    n.* = .{ .path = key, .slot = slot, .leaf = leaf, .priority = undefined, .hash = undefined, .left = left, .right = right, .height = 0, .count = 0 };
-    std.crypto.hash.sha2.Sha256.hash(path, &n.priority, .{});
+    const n = try allocate(a, path, slot, leaf);
+    errdefer freeNode(a, n);
+    n.left = left;
+    n.right = right;
     try rehash(n);
     _ = retain(left);
     _ = retain(right);
@@ -172,7 +185,8 @@ pub fn build(a: A, entries: anytype, comptime leafHash: anytype) !?*Node {
     var stack: [128]*Node = undefined;
     var len: usize = 0;
     for (entries, 0..) |entry, slot| {
-        const n = try make(a, entry.path, slot, leafHash(entry), null, null);
+        // Hash only after final children are installed by the Cartesian build.
+        const n = try allocate(a, entry.path, slot, leafHash(entry));
         var last: ?*Node = null;
         while (len > 0 and before(n, stack[len - 1])) {
             len -= 1;
@@ -243,8 +257,28 @@ fn allocationCase(a: A) !void {
     release(a, root);
     root = next;
 }
+fn coldAllocationCase(a: A) !void {
+    const Record = struct {
+        path: []const u8,
+        fn hash(_: @This()) [32]u8 {
+            return @splat(7);
+        }
+    };
+    const records = [_]Record{ .{ .path = "" }, .{ .path = "a" }, .{ .path = "longer/path" }, .{ .path = "z" } };
+    const root = try build(a, &records, Record.hash);
+    defer release(a, root);
+    var copied: ?*Node = null;
+    defer release(a, copied);
+    for (records, 0..) |record, i| {
+        const next = try put(a, copied, record.path, i, Record.hash(record));
+        release(a, copied);
+        copied = next;
+    }
+    try std.testing.expectEqualSlices(u8, &root.?.hash, &copied.?.hash);
+}
 test "inventory allocation failures release every staged path and shared node" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, coldAllocationCase, .{});
 }
 
 test "mixed inventory mutations equal linear canonical rebuilds" {

@@ -2560,3 +2560,47 @@ Evidence: [macOS controls](bench/results/membership-refresh-macos.json),
 [wide-directory controls](bench/results/membership-wide-linux.json),
 [differential replay](bench/results/membership-differential.json), and
 [source/binary/archive identities](bench/results/membership-validation.json).
+
+
+### Startup allocation and hashing qualification
+
+Inventory nodes and their immutable pathname now share one aligned allocation,
+including persistent update copies. Allocation size arithmetic is checked and
+charged to the existing workspace budget. Cold Cartesian construction computes
+subtree hashes only after installing children, avoiding the earlier redundant
+leaf-shaped subtree hash. Inventory v3 identities and retained-byte accounting
+are unchanged. Cold and persistent construction agree under exhaustive allocation
+failure injection, including empty and longer pathnames.
+
+`bench/capture.py CURRENT BASELINE OUTPUT` alternates fresh processes over one
+immutable corpus, discards a warmup pair, includes spawn-to-ready latency, samples
+ready-state RSS, and checks revision equality across every run. Data is warm in
+the filesystem cache; this is not a cold-storage benchmark. Against the preceding
+PR binary (`752e0a8b7f`), seven pairs on macOS and five pairs in the two-CPU ARM64
+Linux VM measured:
+
+| Host / corpus (64 directories) | Startup before → after | Ready RSS before → after |
+|---|---:|---:|
+| macOS / 1,000 files | 57.73 → 57.26 ms | 6.36 → 6.31 MiB |
+| macOS / 10,000 files | 478.57 → 440.56 ms | 17.39 → 17.36 MiB |
+| Linux VM / 1,000 files | 19.34 → 15.46 ms | 6.20 → 6.18 MiB |
+| Linux VM / 10,000 files | 147.60 → 132.09 ms | 15.42 → 15.27 MiB |
+| Linux VM / 100,000 files | 1,399.78 → 1,311.90 ms | 107.28 → 106.13 MiB |
+
+The paired startup results supersede the earlier unpaired bootstrap samples as
+startup qualification against this immediate baseline. They do not compare
+against the pre-membership inventory revision format, establish native Linux
+hardware performance, or establish cold-cache performance. Separate refresh
+controls retain zero source reads/entries visited for unchanged workspaces and
+forced-rebuild revision equality after changes. Submillisecond timing and RSS
+results vary across cases; no universal improvement is claimed. Initial capture
+still reads every eligible source: validation, changed content and native watch
+subscriptions have real CPU, I/O and memory costs even when provider calls are
+zero.
+
+Evidence: [paired macOS startup](bench/results/startup-macos.json),
+[paired Linux startup](bench/results/startup-linux.json),
+[macOS refresh controls](bench/results/startup-refresh-macos.json),
+[Linux refresh controls](bench/results/startup-refresh-linux.json),
+[differential replay](bench/results/startup-differential.json), and
+[qualification identities](bench/results/startup-validation.json).
