@@ -298,6 +298,7 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
     });
     tests.root_module.addImport("build_options", ctx.graph.build_options_mod);
     tests.root_module.addImport("antfly_platform", platform);
+    tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     tests.root_module.addImport("antfly_image", ctx.graph.image_mod);
     tests.root_module.addImport("antfly_extracting", ctx.graph.extracting_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
