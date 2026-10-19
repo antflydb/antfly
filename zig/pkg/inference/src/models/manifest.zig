@@ -3656,10 +3656,9 @@ fn shouldUseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
 
 fn shouldParseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
     if (try shouldUseClipclapGgufVariant(catalog)) return true;
-    if (build_options.enable_cuda) {
-        return try catalog.exists("antfly_inference_variants.json");
-    }
-    return false;
+    // Artifact selection must not depend on compiled accelerator support.
+    // A GGUF pair includes its projections and cannot use ONNX sidecars.
+    return try catalog.exists("antfly_inference_variants.json");
 }
 
 fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8, json_bytes: []const u8) !void {
@@ -6390,6 +6389,92 @@ test "manifest loads canonical antfly clipclap variants before first gguf fallba
     try std.testing.expectEqualStrings("clipclap", manifest.config_model_arch);
     try expectCanonicalPath(allocator, clip_path, manifest.gguf_path.?);
     try expectCanonicalPath(allocator, clap_path, manifest.audio_model_path.?);
+}
+
+test "manifest mixed clipclap install selects a complete GGUF pair independently of CUDA" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-clipclap-mixed-variants");
+    defer {
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q4_K.gguf" });
+    defer allocator.free(clip_path);
+    const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q4_K.gguf" });
+    defer allocator.free(clap_path);
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clip_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clap_path, .data = "GGUFstub" });
+
+    const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
+    defer allocator.free(model_manifest_path);
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
+        .sub_path = model_manifest_path,
+        .data = "{\"type\":\"embedder\",\"tasks\":[\"embed\"],\"inputs\":[\"text\",\"image\",\"audio\"]}",
+    });
+
+    const clip_config_path = try std.fs.path.join(allocator, &.{ dir_path, "clip_config.json" });
+    defer allocator.free(clip_config_path);
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
+        .sub_path = clip_config_path,
+        .data = "{\"model_type\":\"clipclap\",\"text_config\":{\"max_position_embeddings\":77}}",
+    });
+
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(variants_path);
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
+        .sub_path = variants_path,
+        .data =
+        \\{
+        \\  "family": "clipclap_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "clip": "clipclap-clip.Q4_K.gguf",
+        \\      "clap": "clipclap-clap.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+        ,
+    });
+
+    const onnx_files = [_][]const u8{ "text_model.onnx", "visual_model.onnx", "audio_model.onnx", "text_projection.onnx", "visual_projection.onnx", "audio_projection.onnx" };
+    for (onnx_files) |name| {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, name });
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
+    }
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.isClipclapGgufBundle());
+    try std.testing.expectEqual(NativeArchHint.clip, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("clipclap", manifest.config_model_arch);
+    try expectCanonicalPath(allocator, clip_path, manifest.gguf_path.?);
+    try expectCanonicalPath(allocator, clap_path, manifest.audio_model_path.?);
+    try std.testing.expect(manifest.onnx_path == null);
+    try std.testing.expect(manifest.visual_model_path == null);
+    try std.testing.expect(manifest.text_projection_path == null);
+    try std.testing.expect(manifest.visual_projection_path == null);
+    try std.testing.expect(manifest.audio_projection_path == null);
+    var listing = try loadListingFromDir(allocator, dir_path);
+    defer listing.deinit();
+    try std.testing.expect(listing.isClipclapGgufBundle());
+    try std.testing.expectEqualStrings(manifest.gguf_path.?, listing.gguf_path.?);
+    try std.testing.expectEqualStrings(manifest.audio_model_path.?, listing.audio_model_path.?);
+    try std.testing.expect(listing.onnx_path == null);
+    try std.testing.expect(listing.text_projection_path == null);
+
+    // An ONNX-only pull retains the variants sidecar but has no GGUF pair.
+    try std.Io.Dir.cwd().deleteFile(compat.testingIo(), clip_path);
+    try std.Io.Dir.cwd().deleteFile(compat.testingIo(), clap_path);
+    var onnx_only = try loadFromDir(allocator, dir_path);
+    defer onnx_only.deinit();
+    try std.testing.expect(!onnx_only.isClipclapGgufBundle());
+    try std.testing.expect(onnx_only.gguf_path == null);
+    try std.testing.expect(std.mem.endsWith(u8, onnx_only.onnx_path.?, "/text_model.onnx"));
+    try std.testing.expect(std.mem.endsWith(u8, onnx_only.text_projection_path.?, "/text_projection.onnx"));
 }
 
 test "manifest ignores stale clipclap variants with missing gguf files" {

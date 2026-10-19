@@ -770,6 +770,9 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
+    // Match this one-shot command's execution control for session admission
+    // and close as well as the native call itself.
+    session_manager.native_call_policy = .in_process;
     session_manager.preferred_backends = switch (choice) {
         .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
@@ -879,6 +882,8 @@ test "EmbeddingGemma 2 CLI content groups preserve caller order and reject nesti
 test "embed auto backend prefers Metal then native" {
     var session_manager = backends.SessionManager.init(std.testing.allocator);
     configureBackendPreference(&session_manager, .auto);
+    try std.testing.expectEqual(.in_process, session_manager.native_call_policy);
+    try std.testing.expect(session_manager.uninterruptibleBackendsAllowed());
     if (build_options.enable_metal) {
         try std.testing.expectEqualSlices(backends.BackendType, &.{ .metal, .native }, session_manager.preferred_backends);
     } else {
