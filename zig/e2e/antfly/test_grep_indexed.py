@@ -522,12 +522,9 @@ def test_native_grep_accounted_misses_preserve_snapshot_stats_and_validation(
         stateful_api.url + f"/tables/{table}/query", json=query, timeout=60
     )
     assert frozen.status_code == 200, frozen.text
-    assert (
-        frozen.json()["responses"][0]["hits"]["hits"][0]["_computed"][
-            "antfly_grep_miss_v1"
-        ]
-        == proof
-    )
+    frozen_hit = frozen.json()["responses"][0]["hits"]["hits"][0]
+    assert "_computed" in frozen_hit, frozen.json()
+    assert frozen_hit["_computed"]["antfly_grep_miss_v1"] == proof
     # Compare complete, fresh scans including client-side permission skips and
     # binary fallback. Timing and independently issued snapshots vary by design.
     ordinary = run_grep(

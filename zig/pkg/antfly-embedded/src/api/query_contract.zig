@@ -4015,7 +4015,7 @@ fn ColumnWireResult(comptime T: type) type {
                                     return error.WriteFailed;
                                 };
                             }
-                            accounted_miss = applyGrepMiss(hit_arena.allocator(), self.grep_scan, self.base.remote_snapshot, &api_hit) catch |err| {
+                            accounted_miss = applyGrepMiss(hit_arena.allocator(), self.grep_scan, self.base.remote_snapshot orelse self.req.remote_snapshot, &api_hit) catch |err| {
                                 self.failure.* = err;
                                 return error.WriteFailed;
                             };
@@ -19731,6 +19731,30 @@ test "api query contract grep accounting validates complete source and binds the
     try std.testing.expectEqual(@as(i64, 13), proof.object.get("content_bytes").?.integer);
     try std.testing.expect(hit._source.?.map.get("grep").?.object.get("content") == null);
     try std.testing.expect(@import("antfly_grep_document").at(source, "grep.content") != null);
+
+    // Replayed multi-group snapshots are owned by the coordinator. Their
+    // column encoder has the retained request token but no new local cut/meta.
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "a" }};
+    const body = try std.json.Stringify.valueAlloc(sa, source.object.get("grep").?, .{});
+    const columns = [_]rows.ColumnVector{.{ .name = "grep", .values = .{ .json = &.{body} } }};
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "retained" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var column_hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "a"), .column_source = page.row(0) };
+    defer column_hit.deinit(a);
+    var column_hits = [_]db_mod.types.SearchHit{column_hit};
+    var replay = req;
+    replay.remote_snapshot = "snapshot-1";
+    var encoded = try encodeQueryResponses(a, "docs", replay, .{}, .{ .alloc = a, .hits = &column_hits, .total_hits = 1 });
+    defer encoded.deinit(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded.json, .{});
+    defer parsed.deinit();
+    const emitted = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+    try std.testing.expect(emitted.get("_computed") != null);
+    const replay_proof = emitted.get("_computed").?.object.get("antfly_grep_miss_v1").?.object;
+    try std.testing.expectEqualStrings("snapshot-1", replay_proof.get("snapshot").?.string);
+    try std.testing.expectEqual(@as(i64, 13), replay_proof.get("content_bytes").?.integer);
+    try std.testing.expect(emitted.get("_source").?.object.get("grep").?.object.get("content") == null);
 }
 
 test "api query contract grep accounting admits exact scans and rejects incomplete projections" {
