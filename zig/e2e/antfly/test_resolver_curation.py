@@ -118,7 +118,8 @@ def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
 
 
 @pytest.mark.parametrize("raft", [False, True], ids=["standalone", "raft"])
-def test_curator_review_decisions_survive_restart(request, monkeypatch, raft):
+@pytest.mark.parametrize("promote", [False, True], ids=["resolution", "promotion"])
+def test_curator_review_decisions_survive_restart(request, monkeypatch, raft, promote):
     import json
 
     from helpers import wait_until
@@ -160,7 +161,7 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft):
                     {
                         "name": "concepts",
                         "table": destination,
-                        "promote": False,
+                        "promote": promote,
                         "config_generation": 1,
                         "source_artifact": "kg",
                         "resolution_artifact": "resolved",
@@ -185,34 +186,44 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft):
         timeout_s=30,
         interval_s=0.1,
     ), api.get(resolver)
-    api.batch_write(
-        source,
-        inserts={
-            "doc": {
-                "kg": json.dumps(
-                    {"entities": [{"id": "e0", "label": "concept", "text": "Alpha"}]}
-                )
-            }
-        },
-        sync_level="full_index",
-    )
-    reviews = []
+    last_sequence = 0
+    # Reuse the same owner after each publication: initial startup can resolve
+    # before ordered producer authority is active and conceal output-read bugs.
+    for index in range(3):
+        api.batch_write(
+            source,
+            inserts={
+                f"doc-{index}": {
+                    "kg": json.dumps(
+                        {
+                            "entities": [
+                                {"id": "e0", "label": "concept", "text": "Alpha"}
+                            ]
+                        }
+                    )
+                }
+            },
+            sync_level="full_index",
+        )
+        reviews = []
 
-    def pending_review():
-        reviews[:] = api.get(resolver + "/reviews")["reviews"]
-        return bool(reviews)
+        def pending_review():
+            reviews[:] = api.get(resolver + "/reviews")["reviews"]
+            return bool(reviews)
 
-    assert wait_until(pending_review, timeout_s=30, interval_s=0.1), api.debug_logs()[
-        -16000:
-    ]
-    review_id = quote(reviews[0]["id"], safe="")
-    accepted = api.post(
-        resolver + "/reviews/" + review_id,
-        {"decision": "suppressed", "wait": {"timeout_ms": 5000}},
-    )
-    assert accepted["replay_sequence_kind"] == "source_journal", accepted
-    assert accepted["applied"], accepted
-    assert api.get(resolver + "/reviews")["reviews"] == []
+        assert wait_until(pending_review, timeout_s=30, interval_s=0.1), (
+            api.debug_logs()[-16000:]
+        )
+        review_id = quote(reviews[0]["id"], safe="")
+        accepted = api.post(
+            resolver + "/reviews/" + review_id,
+            {"decision": "suppressed", "wait": {"timeout_ms": 5000}},
+        )
+        assert accepted["replay_sequence_kind"] == "source_journal", accepted
+        assert accepted["replay_sequence"] > last_sequence, accepted
+        last_sequence = accepted["replay_sequence"]
+        assert accepted["applied"], accepted
+        assert api.get(resolver + "/reviews")["reviews"] == []
     api.restart_server()
     assert api.get(resolver + "/reviews")["reviews"] == []
 

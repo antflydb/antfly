@@ -1703,6 +1703,10 @@ worker. A shard with no runtime completes only with a durable proof of no
 primary records and no derived replay sequence; absent observations alone never
 prove completion. Native `pending_work_stats` includes these per-resolver revisions under
 `resolver_curation`.
+Generation-aware input reads dispatch by physical artifact family. Extraction
+heads govern asset roots and units; chunk heads govern chunks. Resolution
+outputs retain physical reads and exact absence/value preconditions, including
+when ordered replay recomputes an existing result after a curator decision.
 Busy is HTTP 429 with `Retry-After`; capacity and metadata unavailability are
 explicit retry states. Curation needs table-write authorization; namespace
 migration additionally requires administrative route admission and authority to
