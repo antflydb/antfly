@@ -2671,3 +2671,77 @@ evolution/deletes and source-unavailable reads after restart. The 33-index case
 completed in 28–33 seconds locally; the earlier serial checkpoint implementation
 exceeded its 90-second readiness deadline. These are bounded fixtures, not an
 archive-scale throughput or RSS benchmark.
+
+### Paged append frontiers, physical work accounting and adaptive packs (protocol 60)
+
+Cold publications beyond retained-cohort admission advance an attempt-private
+append frontier. The source snapshot and upload fence remain fixed; only one new
+file enters each configuration's checkpoint. Shared source positions are built
+once (or borrowed from the source catalog), and the reached public navigation
+tree path-copies one name per file. Prefix views never become serving authority.
+Only complete final roots enter progress/recovery and atomic publication, and
+only the final ordered root carries the complete source-cut commitment.
+
+Vector and sparse builders append one per-file record to their persistent file
+state directory instead of serializing a growing inline `file_states` array.
+The existing 16,384-file limit still protects legacy inline readers; the paged
+path does not inherit it. Text builders update their prior paged inventories,
+statistics and serving directories using only the new file. Ordered builders
+extend the slot/name/public trees and ordered pages without materializing the
+prior dictionary. Reuse requires the exact successful checkpoint, store
+implementation and upload scope from this attempt; public readers continue to
+check their ordinary snapshot/recipe/authority contracts.
+
+Aggregate configurations retain a private counted contribution tree. Each file
+inserts one leaf and path-copies its Patricia reduction ancestors, preserving
+unaffected reducer and alias ownership. The coordinator advances this directory
+after every configuration wave has joined. It transfers the completed directory
+and root keys to the publication owner once, rather than cloning every growing
+prefix's contribution list. Failed/canceled private trees remain under the
+existing upload-attempt fence and collector rules. Metadata crossing worker
+arenas is copied structurally, including nested slice/array/optional ownership;
+no JSON stringify/parse round trip is used for this transfer. Required native
+generation manifests still describe their retained physical chunks normally.
+
+A native generation retains its independent 1 GiB logical file-size ceiling.
+Cumulative output work across private checkpoints charges newly published
+chunks and roots, not unchanged immutable chunk references. In particular,
+reopening a retained native run consumes no cumulative read/upload work.
+Vector/sparse input work and private-key output quotas also remain cumulative
+across the append frontier. These distinctions prevent an otherwise valid small
+final index from exhausting its output allowance merely by retaining it in
+several checkpoints.
+
+Small nonempty aggregate results (up to 256 resident groups, within the 4 MiB
+pack ceiling) publish one flat immutable pack for all logical slots. They no
+longer eagerly scatter across 64 buckets. Large/spilled results retain radix
+routing, and a merge can explicitly promote a small flat child to the needed
+routing depth while retaining unaffected siblings. Oversized pack controls keep
+standalone block/root fallback. The 32-group/four-slot fixture now writes one
+object, compared with 28 in protocol 59 and 120 before leaf packing.
+
+Logical aggregate roots can consequently alias one physical metadata-v6 pack.
+Both sidecar and serving manifests accept distinct names only when immutable
+identity and integrity metadata agree; readers still verify each selected name
+and recipe against the complete authenticated pack. The graph-specific alias
+predicate remains restricted to graph artifacts. Protocol 60 fences readers
+whose manifest validation does not understand aggregate pack aliases; existing
+aggregate encodings remain readable.
+
+Per-file replay forwards integer, floating, boolean, byte and dictionary columns
+to the existing native physical spill codec, with one prepared physical view per
+source batch. Serialized JSON bytes retain their prior replay interpretation;
+exact decimal and unsupported physical kinds retain the established conversion
+or bounded streaming fallback. IEEE non-finite values, signed zero, NULLs and
+null dictionary identities remain covered by the disk round-trip regression.
+Attachment options and SQL/search syntax do not change.
+
+Protocol-60 qualification: 41 native and three shared focused regressions pass
+with no failures or leaks, including a valid 16,385-file append directory,
+immutable reuse with exhausted cumulative output work, pack alias fencing and
+metadata ownership allocation failures. All 17 selected public HTTP/pgwire
+Parquet/Iceberg cases pass, including real Iceberg evolution/deletes and
+source-unavailable grouped reads after restart. The corruption fixture locates
+both standalone blocks and embedded packs and requires integrity rejection
+before restoring the objects. The 33-index case completes in 29.8 seconds on
+the local stripped Debug server; archive-scale throughput/RSS is unmeasured.

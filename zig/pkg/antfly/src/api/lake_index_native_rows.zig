@@ -125,6 +125,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = if (definition.element_type == .numeric) "numeric" else @tagName(definition.type), .required = !definition.nullable };
     var input = provider.*;
     input.schema_contract = if (source.iceberg_schema) |selected| selected.columns else contract;
+    if (try @import("lake_index_native_rows_delta.zig").buildAppend(a, out, &input, store, schema, &layout, definitions, candidates, cancellation, &manager)) |built| return built;
     if (try @import("lake_index_native_rows_delta.zig").build(a, out, &input, store, schema, &layout, definitions, reusable, candidates, cancellation, &manager)) |built| {
         provider.ordered_delta_plans += 1;
         return built;
@@ -257,7 +258,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             };
             const retained = try a.alloc(bool, slot_names.items.len);
             errdefer a.free(retained);
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .retired_slots = retired.items, .files = slot_names.items, .fingerprints = slot_hashes.items, .public_navigation = if (input.native_delta) |delta| delta.public_navigation else null, .source_cut = if (input.native_delta) |delta| delta.source_cut else null, .checkpoint_base = if (input.native_delta) |delta| delta.prior_cut else null, .pending_files = if (input.native_delta != null) @intCast(std.mem.count(bool, changed, &.{true})) else 0 } });
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .retired_slots = retired.items, .files = slot_names.items, .fingerprints = slot_hashes.items, .public_navigation = if (input.resume_work) |work| work.navigation else if (input.native_delta) |delta| delta.public_navigation else null, .source_cut = if (input.resume_work) |work| work.source_cut else if (input.native_delta) |delta| delta.source_cut else null, .checkpoint_base = if (input.native_delta) |delta| delta.prior_cut else null, .pending_files = if (input.native_delta != null) @intCast(std.mem.count(bool, changed, &.{true})) else 0 } });
             entries.items[entries.items.len - 1].sort.shared_runs = true;
             entries.items[entries.items.len - 1].sort.encoded_bytes = true;
         }

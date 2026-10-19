@@ -96,11 +96,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (!std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.generation.domain, &store.upload_scope.?.domain)) continue;
             break root;
         } else null;
-        const previous_states = if (seed) |root| if (root.file_directory != null and !state.canUseDelta(provider, root.binding.snapshot_id)) try state.directoryFiles(ca, store.*, root.file_directory.?, root.generation.domain, cancellation) else root.file_states else &.{};
+        if (provider.resume_work) |work| if (work.file != null and seed != null) {
+            const accepted = for (candidates) |declaration| {
+                if (work.trusts(store.*, declaration.artifact) and std.mem.eql(u8, declaration.name, wanted.name)) break true;
+            } else false;
+            if (!accepted) return error.InvalidNativeLakeFileState;
+        };
+        const appending = if (provider.resume_work) |work| work.file != null else false;
+        const previous_states = if (appending) &.{} else if (seed) |root| if (root.file_directory != null and !state.canUseDelta(provider, root.binding.snapshot_id)) try state.directoryFiles(ca, store.*, root.file_directory.?, root.generation.domain, cancellation) else root.file_states else &.{};
         var plan = try state.Plan.initPaged(a, ca, provider, previous_states, if (seed) |root| root.file_directory else null, seed != null, if (seed) |root| state.canUseDelta(provider, root.binding.snapshot_id) else false);
         defer plan.deinit();
         var tracker = try state.Tracker.init(a, ca, &plan, store, cancellation);
         defer tracker.deinit();
+        tracker.cumulative_bytes = if (provider.resume_work) |work| &work.native_keys_left else null;
         const io = provider.context.io orelse return error.UnsupportedSqlExecution;
         var random: [16]u8 = undefined;
         try io.randomSecure(&random);
@@ -118,7 +126,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var finished = false;
         defer if (!finished and seed == null) index.abortBulkIngestSession();
         if (seed) |root| {
-            var deletes: state.Deletes = .{ .files = if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan };
+            var deletes: state.Deletes = .{ .files = if (appending) &.{} else if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan };
             defer deletes.deinit();
             while (try deletes.next(a, store.*, cancellation)) |keys| {
                 defer a.free(keys);
@@ -202,11 +210,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var checkpoint = try index.pinNativeCheckpoint();
         defer checkpoint.deinit();
         var output_remaining: u64 = 1024 * 1024 * 1024;
-        const output_bytes = if (provider.resume_work) |work| &work.native_output_left else &output_remaining;
+        const output_bytes: files.OutputBudget = .{ .generation = &output_remaining, .work = if (provider.resume_work) |work| &work.native_output_left else null };
         const generation = try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation } else null);
-        const root: Root = .{ .binding = binding, .config_json = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{}), .generation = generation, .recipe = recipe, .file_states = if (plan.selection == null) plan.files else &.{}, .file_directory = if (plan.selection != null) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
+        const root: Root = .{ .binding = binding, .config_json = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{}), .generation = generation, .recipe = recipe, .file_states = if (!plan.isPaged()) plan.files else &.{}, .file_directory = if (plan.isPaged()) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > files.max_root_bytes) return error.NativeLakeFilesTooLarge;
+        if (provider.resume_work) |work| try stores.chargeReadBudget(&work.native_output_left, bytes.len);
         var uploaded = try store.putWithCancellation(bytes, cancellation);
         defer uploaded.deinit(store.allocator);
         const declaration: Declared = .{ .name = wanted.name, .binding = binding, .artifact = .{ .kind = .sparse_segment, .name = wanted.name, .metadata_version = metadata_version, .artifact_id = uploaded.artifact_id, .byte_len = uploaded.byte_len, .checksum = uploaded.checksum } };

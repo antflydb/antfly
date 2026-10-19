@@ -25,8 +25,13 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Contribution = local.metadata_lake_index_catalog.FileContribution;
 const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+const cloneMetadata = @import("lake_index_metadata_ownership.zig").clone;
 pub const Kind = enum { aggregate, ordered, text, sparse, dense };
 pub const Result = struct {
+    /// Complete attempt-private contribution directory; installed only when
+    /// all file frontiers finish and the publication owner adopts the result.
+    contribution_root: ?@import("../serverless/graph_segment/page_tree.zig").Ref = null,
+    contribution_roots: []const [32]u8 = &.{},
     native: aggregates.BuildResult = .{ .declarations = &.{}, .contributions = &.{} },
     ordered: []const Declared = &.{},
     text: []const Declared = &.{},
@@ -246,7 +251,7 @@ const FileJob = struct {
         stage.out = next.allocator();
         stage.table = self.unit.table;
         stage.reusable = &.{};
-        stage.contributions = self.state.result.native.contributions;
+        stage.contributions = &.{};
         stage.candidates = switch (self.unit.kind) {
             .aggregate => &.{},
             .ordered => self.state.result.ordered,
@@ -259,13 +264,19 @@ const FileJob = struct {
         // producer arena retires, without retaining every historical prefix.
         var owned = std.heap.ArenaAllocator.init(self.args.a);
         errdefer owned.deinit();
-        const bytes = try std.json.Stringify.valueAlloc(next.allocator(), borrowed, .{});
-        const result = try std.json.parseFromSliceLeaky(Result, owned.allocator(), bytes, .{ .allocate = .alloc_always });
+        const result = try cloneMetadata(Result, owned.allocator(), borrowed);
         if (self.state.arena) |*previous| previous.deinit();
         self.state.arena = owned;
         self.state.result = result;
-        if (self.unit.kind == .text and result.text.len == 1) if (self.store.upload_scope) |scope| {
-            self.state.work.private = .{ .ref = result.text[0].artifact, .scope = scope, .store_ptr = self.store.ptr, .store_vtable = self.store.vtable };
+        const declarations = switch (self.unit.kind) {
+            .text => result.text,
+            .ordered => result.ordered,
+            .sparse => result.sparse,
+            .dense => result.dense,
+            .aggregate => result.native.declarations,
+        };
+        if (declarations.len != 0) if (self.store.upload_scope) |scope| {
+            self.state.work.private = .{ .ref = declarations[0].artifact, .more = declarations[1..], .scope = scope, .store_ptr = self.store.ptr, .store_vtable = self.store.vtable };
         };
     }
 };
@@ -311,29 +322,31 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
     const original_arena = replay.arena.child_allocator;
     replay.budget.backing = a;
     replay.arena.child_allocator = a;
-    const index_io = args.index.io;
-    const index_a = args.index.a;
-    const index_seed = args.index.seed_arena.child_allocator;
-    const index_store = args.index.store.allocator;
-    args.index.io = io;
-    args.index.a = a;
-    args.index.seed_arena.child_allocator = a;
-    args.index.store.allocator = a;
     defer {
         replay.reset() catch unreachable;
         replay.columns = original_columns;
         replay.budget.limit = original_budget;
         replay.budget.backing = original_backing;
         replay.arena.child_allocator = original_arena;
-        args.index.io = index_io;
-        args.index.a = index_a;
-        args.index.seed_arena.child_allocator = index_seed;
-        args.index.store.allocator = index_store;
     }
     var control = std.heap.ArenaAllocator.init(a);
     defer control.deinit();
     replay.columns = try projectionForUnits(args, control.allocator(), units);
     replay.budget.limit = replay_bytes;
+    var private_index: @import("lake_index_contributions.zig").Index = undefined;
+    try private_index.init(a, args.store.*, null, args.token);
+    defer private_index.deinit();
+    private_index.counted = true;
+    private_index.io = io;
+    var prior_roots: []local.metadata_lake_index_catalog.Digest = &.{};
+    defer a.free(prior_roots);
+    var positions: local.serverless_query_lake_inventory_catalog.Positions = .{ .catalog = parent.catalog() };
+    defer positions.deinit(a);
+    if (positions.catalog == null) for (parent.inventory.files, 0..) |entry, ordinal| try positions.put(a, entry.file_id, ordinal);
+    var public: @import("lake_index_ordered_files.zig").Public = .{ .identity_version = parent.inventory.row_identity_version, .root = null, .count = 0, .source = parent.inventory.source_id, .snapshot = parent.inventory.snapshot_id };
+    var navigation_reads: u64 = 512 * 1024 * 1024;
+    var navigation_writes: u64 = 512 * 1024 * 1024;
+    var navigation_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = args.store.upload_scope.?.domain, .attempt = args.store.upload_scope.?.attempt, .artifacts = args.store, .cancellation = args.token, .remaining_read_bytes = &navigation_reads, .remaining_write_bytes = &navigation_writes, .streaming = true };
     const states = try a.alloc(FileCheckpoint, units.len);
     defer a.free(states);
     @memset(states, .{});
@@ -361,6 +374,12 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
         // Freeze the file before workers borrow it or the parent's versions.
         // A declined oversized replay uses independent ordinary scan views.
         const prepared = if (replay.columns.len == 0) false else try replay.prepare(a, capture, file, args.token);
+        private_index.roots.clearRetainingCapacity();
+        var nav_arena = std.heap.ArenaAllocator.init(a);
+        defer nav_arena.deinit();
+        const key = local.storage_rowsource_identity.navigationDigest(public.identity_version, public.source, public.snapshot, parent.inventory.files[file].file_id);
+        public.root = try @import("../serverless/graph_segment/page_tree.zig").apply(nav_arena.allocator(), navigation_pages.store(), public.root, &.{.{ .key = &key, .value = parent.inventory.files[file].file_id }});
+        public.count += 1;
         var view = try parent.parallelView(a);
         defer view.closeParallelView(parent);
         view.inventory.files = parent.inventory.files[0 .. file + 1];
@@ -402,11 +421,16 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
                 provider.only_files = null;
                 provider.only_file = null;
                 provider.progress = null;
+                states[index].work.file = file;
+                states[index].work.positions = positions;
+                states[index].work.navigation = public;
+                states[index].work.source_cut = if (file + 1 == parent.inventory.files.len) (if (args.provider.native_delta) |delta| delta.source_cut else null) else null;
                 provider.resume_work = &states[index].work;
                 if (!prepared) provider.replay = null;
                 var job_args = args;
                 job_args.a = a;
-                job_args.unindexed_aggregates = file + 1 != parent.inventory.files.len;
+                job_args.index = &private_index;
+                job_args.unindexed_aggregates = false;
                 var store = args.store.*;
                 store.allocator = a;
                 jobs[slot] = .{ .args = job_args, .unit = units[index], .state = &states[index], .failure = &failure, .provider = provider, .source = try view.parallelView(a), .store = store, .execution = .{ .scheduler = scheduler, .bytes = worker_bytes } };
@@ -424,16 +448,27 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
             };
             begin += count;
         }
+        var metadata = std.heap.ArenaAllocator.init(a);
+        defer metadata.deinit();
+        var changes: std.ArrayList(Contribution) = .empty;
+        for (states) |state| try changes.appendSlice(metadata.allocator(), state.result.native.contributions);
+        private_index.root = try private_index.update(changes.items);
+        const next_roots = try private_index.rootKeys(a);
+        a.free(prior_roots);
+        prior_roots = next_roots;
+        private_index.prior_roots = prior_roots;
+        private_index.reduction_seeds.clearRetainingCapacity();
+        _ = private_index.seed_arena.reset(.free_all);
+        private_index.seeds_loaded = false;
         try replay.reset();
     }
-    var result: Result = .{};
+    var result: Result = .{ .contribution_root = private_index.root, .contribution_roots = try args.out.dupe([32]u8, prior_roots) };
     for (states) |state| {
         // Transfer only the final immutable metadata to the publication owner.
         // Old/new metadata overlaps only within the admitted worker wave.
-        var page = std.heap.ArenaAllocator.init(args.a);
-        defer page.deinit();
-        const encoded = try std.json.Stringify.valueAlloc(page.allocator(), state.result, .{});
-        const owned_result = try std.json.parseFromSliceLeaky(Result, args.out, encoded, .{ .allocate = .alloc_always });
+        var completed = state.result;
+        completed.native.contributions = &.{};
+        const owned_result = try cloneMetadata(Result, args.out, completed);
         try merge(args.out, &result, owned_result);
     }
     try args.provider.checkpointBatch(result.native.declarations);
@@ -845,6 +880,9 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(usize, 3), major.native.declarations.len);
     try std.testing.expectEqual(@as(usize, 3), replay.captures - captures_before_major);
     try std.testing.expectEqual(@as(usize, 8), progress.calls);
+    try std.testing.expect(major.contribution_root != null);
+    try std.testing.expectEqual(@as(usize, 0), major.native.contributions.len);
+    try std.testing.expectEqual(@as(usize, 3), major.contribution_roots.len);
     const held_ref = major.text[0].artifact;
     const private_work: Provider.ResumeWork = .{ .private = .{ .ref = held_ref, .scope = store.upload_scope.?, .store_ptr = store.ptr, .store_vtable = store.vtable } };
     try std.testing.expect(private_work.trusts(store, held_ref));
@@ -875,11 +913,15 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(u64, 12), major_ordered.page.?.records);
     const dense = try @import("lake_index_native_dense.zig").loadRoot(out, store, major.dense[0].artifact, .none, null);
     var dense_rows: u64 = 0;
-    for (dense.file_states) |file| dense_rows += file.count;
+    try std.testing.expectEqual(@as(usize, 0), dense.file_states.len);
+    try std.testing.expectEqual(@as(u64, 3), dense.file_directory.?.records);
+    for (try @import("lake_index_native_state.zig").directoryFiles(out, store, dense.file_directory.?, dense.generation.domain, .none)) |file| dense_rows += file.count;
     try std.testing.expectEqual(@as(u64, 12), dense_rows);
     const sparse = try @import("lake_index_native_sparse.zig").loadRoot(out, store, major.sparse[0].artifact, .none, null);
     var sparse_rows: u64 = 0;
-    for (sparse.file_states) |file| sparse_rows += file.count;
+    try std.testing.expectEqual(@as(usize, 0), sparse.file_states.len);
+    try std.testing.expectEqual(@as(u64, 3), sparse.file_directory.?.records);
+    for (try @import("lake_index_native_state.zig").directoryFiles(out, store, sparse.file_directory.?, sparse.generation.domain, .none)) |file| sparse_rows += file.count;
     try std.testing.expectEqual(@as(u64, 12), sparse_rows);
     const artifact_api = @import("lake_index_aggregate_artifact.zig");
     for (major.native.declarations) |declaration| {

@@ -1290,3 +1290,18 @@ Only final roots become serving/recovery publications. Warm delta publications
 and non-incremental aggregate recipes retain their existing paths. Oversized
 individual files preserve ordinary streaming fallback and existing disk/memory
 limits. Attachment, SQL and search UX are unchanged.
+
+Protocol 60 admits exact logical aggregate aliases of one immutable metadata-v6
+pack. Small resident grouped results remain flat (one object for the
+32-group/four-slot fixture); larger results and merges promote to radix routing
+as needed. Reader name/recipe checks and complete object authentication remain
+active, and legacy flat/partitioned encodings remain readable.
+
+Cold file-major builds now advance paged append frontiers for native file state,
+text inventories, ordered dictionaries and counted aggregate contribution trees.
+They transfer the finished contribution directory once at the final publication
+boundary, without repeated full-prefix file catalogs or JSON ownership copying.
+Native logical generation size and cumulative newly published output have
+separate limits, so unchanged chunk references do not exhaust output work.
+Replay capture forwards prepared native scalar/dictionary vectors directly to
+the physical spill codec while preserving established conversion/fallback paths.

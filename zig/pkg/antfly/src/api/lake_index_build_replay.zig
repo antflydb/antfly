@@ -387,7 +387,10 @@ pub const Replay = struct {
             // Bind borrowed source vectors once; the spill codec gathers one
             // bounded column at a time and chooses its physical dictionary.
             var capture_batch: CaptureBatch = .{ .vectors = vectors };
-            const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture_batch, .read = CaptureBatch.cell, .read_identity = CaptureBatch.identity, .count = batch.rowCount(), .width = self.columns.len } };
+            const borrowed: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture_batch, .read = CaptureBatch.cell, .read_physical = CaptureBatch.physical, .read_identity = CaptureBatch.identity, .count = batch.rowCount(), .width = self.columns.len } };
+            var physical_arena = std.heap.ArenaAllocator.init(self.budget.allocator());
+            defer physical_arena.deinit();
+            const values = try borrowed.preparePhysical(physical_arena.allocator());
             var begin: usize = 0;
             while (begin < batch.rowCount()) {
                 const external = switch (batch.rowRef(begin)) {
@@ -436,6 +439,21 @@ pub const Replay = struct {
     }
     const CaptureBatch = struct {
         vectors: []const rows.ColumnVector,
+        fn physical(raw: *anyopaque, _: A, ordinal: usize) !?local.sql_execution_batch.PhysicalColumn {
+            const self: *CaptureBatch = @ptrCast(@alignCast(raw));
+            const column = self.vectors[ordinal];
+            const kind: local.sql_ast.ColumnType = switch (column.values) {
+                .i64, .dictionary_i64 => .integer,
+                .f64, .dictionary_f64 => .number,
+                .bool => .boolean,
+                .bytes, .dictionary_bytes, .json => .string,
+                else => return null,
+            };
+            var vector = column;
+            // JSON source columns are serialized bytes in the replay contract.
+            if (vector.values == .json) vector.values = .{ .bytes = vector.values.json };
+            return .{ .vector = vector, .range = .{ .count = column.rowCount() }, .kind = kind, .element = if (kind == .number) .float64 else null };
+        }
         fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];

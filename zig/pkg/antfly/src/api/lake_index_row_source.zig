@@ -50,11 +50,19 @@ pub const Provider = struct {
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
     statistics: ?Statistics = null,
     pub const ResumeWork = struct {
+        /// Coordinator-owned append frontier; only the current immutable file
+        /// changes. These private roots never serve an incomplete snapshot.
+        file: ?usize = null,
+        positions: ?local.serverless_query_lake_inventory_catalog.Positions = null,
+        navigation: ?@import("lake_index_ordered_files.zig").Public = null,
+        source_cut: ?[32]u8 = null,
         aggregate: @import("../serverless/build/lake_build_limits.zig").Budget = .{ .limits = .{} },
         native_input_left: u64 = 512 * 1024 * 1024,
+        native_keys_left: u64 = 256 * 1024 * 1024,
         native_output_left: u64 = 1024 * 1024 * 1024,
         private: ?struct {
             ref: local.serverless_manifest_artifact_ref.ArtifactRef,
+            more: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = &.{},
             scope: stores.UploadScope,
             store_ptr: *anyopaque,
             store_vtable: *const stores.ArtifactStore.VTable,
@@ -64,12 +72,18 @@ pub const Provider = struct {
         pub fn trusts(self: *const ResumeWork, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef) bool {
             const proof = self.private orelse return false;
             const scope = store.upload_scope orelse return false;
-            if (store.ptr != proof.store_ptr or store.vtable != proof.store_vtable or !std.meta.eql(scope, proof.scope) or !std.mem.eql(u8, ref.name, proof.ref.name) or !std.mem.eql(u8, ref.artifact_id, proof.ref.artifact_id) or !std.mem.eql(u8, ref.checksum, proof.ref.checksum)) return false;
+            if (store.ptr != proof.store_ptr or store.vtable != proof.store_vtable or !std.meta.eql(scope, proof.scope)) return false;
+            if (sameReference(ref, proof.ref)) return true;
+            for (proof.more) |declaration| if (sameReference(ref, declaration.artifact)) return true;
+            return false;
+        }
+        fn sameReference(ref: local.serverless_manifest_artifact_ref.ArtifactRef, expected: local.serverless_manifest_artifact_ref.ArtifactRef) bool {
+            if (!std.mem.eql(u8, ref.name, expected.name) or !std.mem.eql(u8, ref.artifact_id, expected.artifact_id) or !std.mem.eql(u8, ref.checksum, expected.checksum)) return false;
             var normalized = ref;
-            normalized.name = proof.ref.name;
-            normalized.artifact_id = proof.ref.artifact_id;
-            normalized.checksum = proof.ref.checksum;
-            return std.meta.eql(normalized, proof.ref);
+            normalized.name = expected.name;
+            normalized.artifact_id = expected.artifact_id;
+            normalized.checksum = expected.checksum;
+            return std.meta.eql(normalized, expected);
         }
     };
     pub const Statistics = struct {

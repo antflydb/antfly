@@ -240,6 +240,9 @@ pub const Plan = struct {
     files: []File = &.{},
     changed: []bool = &.{},
     selection: ?Selection = null,
+    append_file: ?Selection.Item = null,
+    append_count: usize = 0,
+    append_provider: ?*Provider = null,
     force_all: bool = false,
     borrowed_positions: bool = false,
     updates: std.AutoHashMapUnmanaged(usize, File) = .empty,
@@ -251,6 +254,14 @@ pub const Plan = struct {
         return initPaged(a, out, provider, previous, null, previous.len != 0, false);
     }
     pub fn initPaged(a: A, out: A, provider: *Provider, previous: []const File, directory: ?@import("../serverless/graph_segment/page_tree.zig").Ref, has_seed: bool, delta_compatible: bool) !Plan {
+        if (provider.resume_work) |work| if (work.file) |ordinal| {
+            if (ordinal + 1 != provider.source.inventory.files.len or previous.len != 0 or (if (directory) |root| root.records else 0) != ordinal) return error.InvalidNativeLakeFileState;
+            const input = provider.source.inventory.files[ordinal];
+            var self: Plan = .{ .a = a, .append_provider = provider, .by_id = work.positions orelse return error.InvalidNativeLakeFileState, .borrowed_positions = true, .append_file = .{ .ordinal = ordinal, .file = .{ .id = input.file_id, .digest = try identity(a, provider, input) } }, .append_count = ordinal + 1, .prior_directory = directory };
+            errdefer self.deinit();
+            if (self.by_id.get(input.file_id) != ordinal) return error.InvalidNativeLakeFileState;
+            return self;
+        };
         if (!has_seed or delta_compatible or previous.len == 0 and directory == null) if (provider.native_delta) |delta| if (delta.selection) |selection| {
             const inventory = provider.source.inventory;
             if (!std.mem.eql(u8, delta.source, inventory.source_id) or !std.mem.eql(u8, delta.schema, inventory.schema_fingerprint) or delta.count() != inventory.files.len) return error.ExternalLakeSnapshotMismatch;
@@ -290,21 +301,33 @@ pub const Plan = struct {
         }
         return init(a, out, provider, previous);
     }
+    pub fn isPaged(self: *const Plan) bool {
+        return self.selection != null or self.append_file != null;
+    }
     pub fn count(self: *const Plan) usize {
+        if (self.append_file != null) return self.append_count;
         return if (self.selection) |selection| selection.files.len else self.files.len;
     }
     pub fn stateAt(self: *const Plan, index: usize) !File {
         if (self.updates.get(index)) |value| return value;
+        if (self.append_file) |item| {
+            if (index >= self.append_count) return error.InvalidNativeLakeFileState;
+            if (index == item.ordinal) return item.file;
+            const provider = self.append_provider.?;
+            const input = provider.source.inventory.files[index];
+            return .{ .id = input.file_id, .digest = try identity(self.a, provider, input) };
+        }
         return if (self.selection) |selection| selection.file(index) else self.files[index];
     }
     pub fn mutable(self: *Plan, index: usize) !*File {
-        if (self.selection == null) return &self.files[index];
+        if (!self.isPaged()) return &self.files[index];
         const value = try self.stateAt(index);
         const slot = try self.updates.getOrPut(self.a, index);
         if (!slot.found_existing) slot.value_ptr.* = value;
         return slot.value_ptr;
     }
     pub fn isChanged(self: *const Plan, index: usize) bool {
+        if (self.append_file) |item| return index == item.ordinal;
         return self.force_all or if (self.selection) |selection| selection.changed(index) else self.changed[index];
     }
     pub const Iterator = struct {
@@ -313,6 +336,11 @@ pub const Plan = struct {
         position: usize = 0,
         sparse: ?Selection.Iterator = null,
         pub fn next(self: *Iterator) !?Selection.Item {
+            if (self.plan.append_file) |item| {
+                if (self.position != 0) return null;
+                self.position = 1;
+                return .{ .ordinal = item.ordinal, .file = try self.plan.stateAt(item.ordinal) };
+            }
             if (self.sparse) |*iterator_| {
                 const item = (try iterator_.next()) orelse return null;
                 return .{ .ordinal = item.ordinal, .file = self.plan.updates.get(item.ordinal) orelse item.file };
@@ -399,6 +427,7 @@ pub const Plan = struct {
         return std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ std.fmt.bytesToHex(&(try self.stateAt(file)).digest, .lower), row.row_group_ordinal, row.row_ordinal });
     }
     pub fn unchanged(self: *const Plan, file: File) bool {
+        if (self.append_file) |item| return !std.mem.eql(u8, file.id, item.file.id) and (self.by_id.get(file.id) orelse return false) < self.append_count;
         const ordinal = self.by_id.get(file.id) orelse return false;
         return !self.isChanged(ordinal) and std.mem.eql(u8, &file.digest, &(self.stateAt(ordinal) catch return false).digest);
     }
@@ -413,6 +442,7 @@ pub const Tracker = struct {
     pending: std.ArrayList(u8) = .empty,
     active: ?usize = null,
     output_bytes: u64 = 256 * 1024 * 1024,
+    cumulative_bytes: ?*u64 = null,
     pub fn init(a: A, out: A, plan: *Plan, store: *stores.ArtifactStore, cancellation: Cancellation) !Tracker {
         return .{ .plan = plan, .a = a, .out = out, .store = store, .cancellation = cancellation };
     }
@@ -436,7 +466,7 @@ pub const Tracker = struct {
     }
     fn flush(self: *Tracker) !void {
         if (self.pending.items.len == 0) return;
-        try stores.chargeReadBudget(&self.output_bytes, self.pending.items.len);
+        try stores.chargeReadBudget(self.cumulative_bytes orelse &self.output_bytes, self.pending.items.len);
         var store = self.store.*;
         store.allocator = self.out;
         const ref = try store.putWithCancellation(self.pending.items, self.cancellation);
@@ -591,4 +621,70 @@ test "external lake incremental native file identity ignores snapshot labels and
     const position = try coordinates(private);
     try std.testing.expectEqual(@as(u32, 3), position.group);
     try std.testing.expectEqual(@as(u64, 9007199254740993), position.row);
+}
+
+test "external lake private append directory passes the legacy inline file ceiling" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const inventory_api = local.serverless_external_source_types;
+    const entries = try out.alloc(inventory_api.FileEntry, 16385);
+    var positions: local.serverless_query_lake_inventory_catalog.Positions = .empty;
+    defer positions.deinit(a);
+    for (entries, 0..) |*entry, ordinal| {
+        entry.* = .{ .file_id = try std.fmt.allocPrint(out, "file-{d}", .{ordinal}), .object_uri = @constCast("file://review/part.parquet"), .etag = @constCast("v1"), .byte_len = 1, .row_count = 0, .row_groups = &.{} };
+        try positions.put(a, entry.file_id, ordinal);
+    }
+    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    source.selected_catalog_view = true;
+    source.inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file://review"), .snapshot_id = @constCast("cut"), .schema_fingerprint = @constCast("schema"), .files = entries };
+    try source.inventory.validateAlloc(a);
+    source.verified_files = null;
+    source.prepared_deletes = null;
+    source.scanner.iceberg_delete_plan = null;
+    var work: Provider.ResumeWork = .{ .file = entries.len - 1, .positions = positions };
+    var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .resume_work = &work };
+    var directory = try local.common_test_directory.TestDirectory.init("append-file-directory");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    var reads: u64 = 32 * 1024 * 1024;
+    var writes: u64 = 32 * 1024 * 1024;
+    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = @splat(7), .attempt = @splat(3), .artifacts = &store, .cancellation = .none, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    const Key = struct { digest: [32]u8, file: File };
+    const keys = try out.alloc(Key, entries.len - 1);
+    for (keys, entries[0..keys.len]) |*key, entry| key.* = .{ .digest = Selection.idKey(entry.file_id), .file = .{ .id = entry.file_id, .digest = try identity(a, &provider, entry) } };
+    std.mem.sort(Key, keys, {}, struct {
+        fn less(_: void, left: Key, right: Key) bool {
+            return std.mem.lessThan(u8, &left.digest, &right.digest);
+        }
+    }.less);
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store() };
+    defer builder.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (keys) |key| {
+        _ = scratch.reset(.retain_capacity);
+        try builder.add(&key.digest, try std.json.Stringify.valueAlloc(scratch.allocator(), key.file, .{}));
+    }
+    const prior = (try builder.finish()).?;
+    var plan = try Plan.initPaged(a, out, &provider, &.{}, prior, true, false);
+    defer plan.deinit();
+    try std.testing.expect(plan.isPaged());
+    try std.testing.expectEqual(@as(usize, 0), plan.files.len);
+    var it = plan.iterator(true);
+    try std.testing.expectEqual(entries.len - 1, (try it.next()).?.ordinal);
+    try std.testing.expect((try it.next()) == null);
+    const next = (try plan.publishDirectory(a, &store, @splat(7), .none)).?;
+    try std.testing.expectEqual(@as(u64, entries.len), next.records);
+    const key = Selection.idKey(entries[entries.len - 1].file_id);
+    var cursor = try tree.Cursor.init(a, pages.store(), next, &key, null);
+    defer cursor.deinit();
+    const record = (try cursor.next()).?;
+    const decoded = try decodeDirectoryFile(out, record.key, record.value, @splat(7));
+    try std.testing.expectEqualStrings(entries[entries.len - 1].file_id, decoded.id);
 }

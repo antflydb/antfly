@@ -821,6 +821,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             seed_ref = .{ .artifact_id = declaration.artifact.artifact_id, .checksum = declaration.artifact.checksum, .byte_len = declaration.artifact.byte_len };
             break root;
         } else null;
+        if (provider.resume_work) |work| if (work.file) |ordinal| {
+            if ((if (seed) |old| old.file_count else 0) != ordinal) return error.InvalidNativeLakeFileState;
+            if (seed != null and !work.trusts(store.*, candidates[0].artifact)) return error.InvalidNativeLakeFileState;
+        };
         const paged_seed = if (seed) |root| root.inventory_version == 3 and root.serving_routes == null else false;
         const manifest_seed = if (seed) |root| !paged_seed and (root.manifests.len != 0 or root.checkpoint_base != null or root.checkpoint_files != null) and root.file_groups.len == 0 else false;
         const reference_seed = paged_seed or manifest_seed;
@@ -835,9 +839,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         // migrations retain the complete reconciliation path.
         const native_delta = if (paged_seed and baseline != null and seed.?.checkpoint_base == null) eligibleDelta(provider, baseline.?) else null;
         const inventory_delta = if (native_delta == null and paged_seed and baseline != null and seed.?.checkpoint_base == null) eligibleInventory(provider, baseline.?) else null;
-        var prepared_plan: ?state.Plan = if (native_delta) |delta| try state.Plan.fromDelta(a, ca, delta) else if (inventory_delta) |inventory| try state.Plan.fromInventory(a, ca, provider, inventory) else null;
+        const appending = if (provider.resume_work) |work| work.file != null else false;
+        var prepared_plan: ?state.Plan = if (appending) try state.Plan.initPaged(a, ca, provider, &.{}, if (baseline) |old| old.directories.files else null, baseline != null, false) else if (native_delta) |delta| try state.Plan.fromDelta(a, ca, delta) else if (inventory_delta) |inventory| try state.Plan.fromInventory(a, ca, provider, inventory) else null;
         errdefer if (prepared_plan) |*value| value.deinit();
-        const baseline_records = if (native_delta) |delta| try changedDeltaRecords(ca, store.*, baseline.?, delta, cancellation) else if (inventory_delta) |inventory|
+        const baseline_records = if (appending) &.{} else if (native_delta) |delta| try changedDeltaRecords(ca, store.*, baseline.?, delta, cancellation) else if (inventory_delta) |inventory|
             try changedInventoryRecords(a, ca, store.*, baseline.?, provider, inventory, &prepared_plan.?, cancellation, 128 * 1024 * 1024)
         else if (baseline) |old| try text_directory.fileRecords(ca, old, store.*, null, cancellation) else &.{};
         const records = if (paged_seed) (if (baseline != null) baseline_records else try text_directory.fileRecords(ca, seed.?, store.*, null, cancellation)) else if (manifest_seed) try checkpointFiles(a, ca, seed.?, baseline_records, store.*, cancellation) else &.{};

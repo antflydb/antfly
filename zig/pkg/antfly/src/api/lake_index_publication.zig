@@ -422,6 +422,12 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         const dense = @import("lake_index_native_dense.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "dense_build", attempt.generation);
         break :serial builders.Result{ .native = native, .ordered = ordered, .text = text, .sparse = sparse, .dense = dense };
     };
+    if (built.contribution_root) |root| {
+        contribution_index.root = root;
+        contribution_index.counted = true;
+        contribution_index.prior_roots = built.contribution_roots;
+        for (built.contribution_roots) |key| try contribution_index.includeRoot(key);
+    }
     const native = built.native;
     const native_declarations = native.declarations;
     const ordered = built.ordered;

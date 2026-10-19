@@ -266,6 +266,12 @@ pub fn publishCohortProven(a: A, result_alloc: A, store: *stores.ArtifactStore, 
     if (names.len == 0 or names.len != recipe.inputs.len or names.len > 256 or group.specs.len != names.len) return error.InvalidNativeAggregateArtifact;
     for (names, group.specs, recipe.inputs) |name, spec, input| if (name.len == 0 or !std.meta.eql(spec, input.spec)) return error.InvalidNativeAggregateArtifact;
     var input: PartialStream = .{ .group = group };
+    const remaining = group.groups.items.len - group.result_cursor;
+    if (group.external == null and remaining != 0 and remaining <= 256) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        return publishPackedRows(a, result_alloc, store, names, try input.next(arena.allocator()), recipe, cancellation, proofs);
+    }
     return publishPartialStream(a, result_alloc, store, names, &input, recipe, cancellation, proofs);
 }
 
@@ -867,7 +873,10 @@ test "external lake aggregate readers retain version one root compatibility" {
     defer group.deinit();
     try group.ensureGlobalGroup();
     try group.addGlobalCount(23);
-    const current = try publish(a, a, &store, "stats.count", group, recipe, .none);
+    var legacy_input: PartialStream = .{ .group = group };
+    const legacy_refs = try publishPartialStream(a, a, &store, &.{"stats.count"}, &legacy_input, recipe, .none, null);
+    defer a.free(legacy_refs);
+    const current = legacy_refs[0];
     defer a.free(current.artifact_id);
     defer a.free(current.checksum);
     const bytes = try store.getVerifiedAllocWithCancellation(current.artifact_id, current.byte_len, current.checksum, .none);
@@ -1029,10 +1038,21 @@ pub fn publishPartitionedAtProven(a: A, out: A, store: *stores.ArtifactStore, na
     try cancellation.check();
     var input: PartialStream = .{ .group = group };
     if (group.external == null and group.groups.items.len - group.result_cursor <= 256)
-        return publishSmallRadix(a, out, store, names, &input, recipe, cancellation, depth, proofs);
+        return publishSmallRadix(a, out, store, names, &input, recipe, cancellation, depth, proofs, false);
     var pool = try spill.Partitions.init(manager);
     defer pool.deinit();
     return publishRadixStream(a, out, store, names, &input, recipe, &pool, cancellation, depth, proofs);
+}
+/// A merge of differently shaped trees needs an explicit directory at this
+/// radix depth even when one child is small. Ordinary publication stays flat.
+pub fn publishPartitionDirectoryAt(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, group: *operators.Grouped, recipe: recipes.Recipe, manager: *spill.Manager, cancellation: Cancellation, depth: u8) ![]Ref {
+    if (depth > max_partition_depth or names.len == 0 or names.len != recipe.inputs.len or names.len > 256 or group.specs.len != names.len) return error.InvalidNativeAggregateArtifact;
+    for (names, group.specs, recipe.inputs) |name, spec, input| if (name.len == 0 or !std.meta.eql(spec, input.spec)) return error.InvalidNativeAggregateArtifact;
+    var input: PartialStream = .{ .group = group };
+    if (group.external == null and group.groups.items.len - group.result_cursor <= 256) return publishSmallRadix(a, out, store, names, &input, recipe, cancellation, depth, null, true);
+    var pool = try spill.Partitions.init(manager);
+    defer pool.deinit();
+    return publishRadixStream(a, out, store, names, &input, recipe, &pool, cancellation, depth, null);
 }
 fn groupHash(keys: []const local.sql_scalar.Datum) !u64 {
     var hasher = std.hash.Wyhash.init(0);
@@ -1073,12 +1093,13 @@ const RadixSelection = struct {
 };
 /// Small categorical reductions remain entirely resident. Partitioning copies
 /// only bounded row descriptors and writes each finished checkpoint once.
-fn publishSmallRadix(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, input: *PartialStream, recipe: recipes.Recipe, cancellation: Cancellation, depth: u8, proofs: ?[]StateProof) ![]Ref {
+fn publishSmallRadix(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, input: *PartialStream, recipe: recipes.Recipe, cancellation: Cancellation, depth: u8, proofs: ?[]StateProof, route: bool) ![]Ref {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const pa = arena.allocator();
     const rows = try input.next(pa);
     input.finish();
+    if (!route and rows.len != 0) return publishPackedRows(a, out, store, names, rows, recipe, cancellation, proofs);
     const selection = try RadixSelection.init(rows, recipe, depth);
     const lists = try pa.alloc(std.ArrayList(Partition), names.len);
     @memset(lists, .empty);
@@ -1319,7 +1340,7 @@ test "external lake partitioned cohorts fuse once per block and decline late mis
         fn check(_: *anyopaque) !void {}
     }.check, .async_writes = false };
     defer manager.deinit();
-    const refs = try publishPartitioned(a, out, &store, &.{ "stats.sum", "stats.count" }, group, recipe, &manager, .none);
+    const refs = try publishPartitionDirectoryAt(a, out, &store, &.{ "stats.sum", "stats.count" }, group, recipe, &manager, .none, 0);
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer cache.deinit();
     const cached: CachedRead = .{ .cache = &cache, .scope = @splat(8), .context = .{ .io = std.testing.io } };
@@ -1530,7 +1551,7 @@ test "external lake aggregate publishers carry authenticated proofs without chil
     store.vtable = &denied;
     // Fresh partitions provide their physical identity and logical slot at the
     // upload boundary. Even a completely cold store needs no child-root GETs.
-    const refs = try publishPartitioned(a, out, &store, &names, group, recipe, &manager, .none);
+    const refs = try publishPartitionDirectoryAt(a, out, &store, &names, group, recipe, &manager, .none, 0);
     try std.testing.expectEqual(@as(usize, 0), manager.peak_files);
     store.vtable = original;
     var lists = [_]std.ArrayList(Partition){ .empty, .empty };
@@ -1807,8 +1828,14 @@ test "external lake packed leaves bound writes and build directories share authe
     var dummy: u8 = 0;
     var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Counter.check, .async_writes = false };
     defer manager.deinit();
-    const refs = try publishPartitioned(a, out, &store, &.{ "a", "b", "c", "d" }, group, recipe, &manager, .none);
-    try std.testing.expectEqual(@as(usize, 28), Counter.writes); // Previously 120.
+    const small = try publishPartitioned(a, out, &store, &.{ "a", "b", "c", "d" }, group, recipe, &manager, .none);
+    try std.testing.expectEqual(@as(usize, 1), Counter.writes); // 120 -> 28 -> one bounded pack.
+    try std.testing.expectEqual(@as(u16, 6), small[0].metadata_version);
+    const routed = try operators.Grouped.create(a, &specs, .{});
+    defer routed.deinit();
+    for (0..512) |i| try routed.add(&.{local.sql_scalar.Datum.json(.{ .integer = @intCast(i) })}, &values);
+    const refs = try publishPartitioned(a, out, &store, &.{ "a", "b", "c", "d" }, routed, recipe, &manager, .none);
+    try std.testing.expect(Counter.writes <= 70);
     var cache = local.serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(a, 2 * 1024 * 1024);
     defer cache.deinit();
     cache.decoded.max_bytes = 4 * 1024 * 1024;
@@ -1819,7 +1846,7 @@ test "external lake packed leaves bound writes and build directories share authe
         for (refs, 0..) |ref, slot| {
             const single: recipes.Recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[slot..][0..1] };
             const parts = (try loadPartitionDirectoryWithCache(out, store, ref, single, .none, cached)).parts;
-            try std.testing.expectEqual(@as(usize, 23), parts.len);
+            try std.testing.expectEqual(@as(usize, 64), parts.len);
             if (slot == 0) first = parts[0].artifact;
         }
         try std.testing.expectEqual(@as(u64, if (pass == 0) 5 else 0), cache.stats.provider_reads - before);
@@ -1837,7 +1864,7 @@ test "external lake packed leaves bound writes and build directories share authe
                 rows += 1;
             }
         }
-        try std.testing.expectEqual(@as(usize, 32), rows);
+        try std.testing.expectEqual(@as(usize, 512), rows);
     }
     var wide_recipe = recipe;
     const long_path = try out.alloc(u8, 512 * 1024);

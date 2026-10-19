@@ -244,7 +244,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                 defer reduction.shape_keys.deinit(a);
                 defer reduction.proof_memo.deinit(a);
                 native_provider.only_file = null;
-                const root = (try reduction.reduceDelta(&native_provider)) orelse full: {
+                const root = (try reduction.reduceAppend(&native_provider)) orelse (try reduction.reduceDelta(&native_provider)) orelse full: {
                     if (file_keys == null) {
                         file_keys = try ca.alloc([32]u8, source.inventory.files.len);
                         for (source.inventory.files, file_keys.?) |file, *key| key.* = fileIdentity(source, file);
@@ -645,8 +645,15 @@ const Reduction = struct {
             self.out.free(aliases);
         }
         const was_complete = complete;
-        if (!complete and self.recipe.keys.len != 0 and artifacts.isPartitioned(left.refs[0].metadata_version) and artifacts.isPartitioned(right.refs[0].metadata_version)) {
-            const published = try self.mergePartitions(left, right, null, aliases, 0, null);
+        const routed = self.recipe.keys.len != 0 and (artifacts.isPartitioned(left.refs[0].metadata_version) or artifacts.isPartitioned(right.refs[0].metadata_version));
+        var routed_left = left;
+        var routed_right = right;
+        if (routed) {
+            routed_left.refs = try self.splitRefs(left.refs, 0);
+            routed_right.refs = try self.splitRefs(right.refs, 0);
+        }
+        if (!complete and routed) {
+            const published = try self.mergePartitions(routed_left, routed_right, null, aliases, 0, null);
             @memcpy(refs, published);
             self.out.free(published);
             complete = true;
@@ -657,12 +664,12 @@ const Reduction = struct {
             if (self.recipe.keys.len == 0) try group.ensureGlobalGroup();
             try importContributionsCached(self.a, self.store, left.refs, self.recipe, group, self.cancellation, self.cached);
             try importContributionsCached(self.a, self.store, right.refs, self.recipe, group, self.cancellation, self.cached);
-            const published = try artifacts.publishCohort(self.a, self.out, self.store, self.names, group, self.recipe, self.cancellation);
+            const published = if (self.recipe.keys.len != 0) try artifacts.publishPartitioned(self.a, self.out, self.store, self.names, group, self.recipe, self.spill, self.cancellation) else try artifacts.publishCohort(self.a, self.out, self.store, self.names, group, self.recipe, self.cancellation);
             @memcpy(refs, published);
             self.out.free(published);
         }
-        if (was_complete and self.recipe.keys.len != 0 and artifacts.isPartitioned(left.refs[0].metadata_version) and artifacts.isPartitioned(right.refs[0].metadata_version)) {
-            self.out.free(try self.mergePartitions(left, right, refs, aliases, 0, null));
+        if (was_complete and routed) {
+            self.out.free(try self.mergePartitions(routed_left, routed_right, refs, aliases, 0, null));
         }
         for (self.names, refs, 0..) |name, ref, slot| {
             const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
@@ -745,6 +752,26 @@ const Reduction = struct {
         if (right == null) return left;
         return try self.join(left.?, right.?);
     }
+    fn reduceAppend(self: *@This(), provider: *@import("lake_index_row_source.zig").Provider) anyerror!?Leaf {
+        const work = provider.resume_work orelse return null;
+        const file = work.file orelse return null;
+        const index = self.index orelse return error.InvalidLakeIndexCatalog;
+        if (file + 1 != provider.source.inventory.files.len) return error.InvalidLakeIndexCatalog;
+        const incoming = try self.resolver.?.resolve(.{ .key = fileIdentity(provider.source, provider.source.inventory.files[file]), .index = file });
+        if (file == 0) return incoming;
+        var prior: ?[32]u8 = null;
+        for (self.names, 0..) |name, slot| {
+            const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
+            const record = (try index.reductionRoot(self.out, single.fingerprint(), name, file)) orelse return error.InvalidLakeIndexCatalog;
+            if (prior) |key| if (!std.mem.eql(u8, &key, &record.file)) return error.InvalidLakeIndexCatalog;
+            prior = record.file;
+        }
+        const previous = try self.loadNode(prior.?);
+        const root = (try self.editBatch(previous, &.{.{ .key = incoming.key, .replacement = incoming }}, 0)) orelse return error.InvalidLakeIndexCatalog;
+        if (root.range.?.files != file + 1) return error.InvalidLakeIndexCatalog;
+        try index.recordDeltaReduction();
+        return root;
+    }
     fn reduceDelta(self: *@This(), provider: *@import("lake_index_row_source.zig").Provider) anyerror!?Leaf {
         const delta = provider.native_delta orelse return null;
         const index = self.index orelse return null;
@@ -804,7 +831,7 @@ const Reduction = struct {
         const group = try operators.Grouped.create(self.a, self.specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
         defer group.deinit();
         try importContributionsCached(self.a, self.store, refs, self.recipe, group, self.cancellation, self.cached);
-        return artifacts.publishPartitionedAt(self.a, self.out, self.store, self.names, group, self.recipe, self.spill, self.cancellation, depth);
+        return artifacts.publishPartitionDirectoryAt(self.a, self.out, self.store, self.names, group, self.recipe, self.spill, self.cancellation, depth);
     }
     fn mergePartitions(self: *@This(), left: Leaf, right: Leaf, known: ?[]const local.serverless_manifest_artifact_ref.ArtifactRef, ownership: []std.ArrayList([32]u8), depth: u8, output_proofs: ?[]artifacts.StateProof) anyerror![]local.serverless_manifest_artifact_ref.ArtifactRef {
         var arena = std.heap.ArenaAllocator.init(self.a);
@@ -1516,7 +1543,7 @@ test "external lake recursive group partitions retain sibling artifacts on a sin
     const delta = try operators.Grouped.create(a, &specs, .{});
     defer delta.deinit();
     try delta.add(&.{local.sql_scalar.Datum.fromJson(.{ .integer = first })}, &.{ local.sql_scalar.Datum.fromJson(.{ .integer = 1 }), local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 }) });
-    const fresh = try artifacts.publishPartitioned(a, out, &store, names, delta, recipe, &manager, .none);
+    const fresh = try artifacts.publishPartitionDirectoryAt(a, out, &store, names, delta, recipe, &manager, .none, 0);
     var old: ContributionIndex = .empty;
     defer old.deinit(a);
     var contributions: std.ArrayList(local.metadata_lake_index_catalog.FileContribution) = .empty;

@@ -184,6 +184,65 @@ fn planSlots(a: A, out: A, entry: *Entry, provider: *Provider, store: *stores.Ar
     std.mem.sort(u32, selected, {}, std.sort.asc(u32));
     entry.retired = selected;
 }
+/// Private append checkpoints already own their exact immutable predecessor.
+/// Extend the slot/name/public trees and ordered pages for one reached file,
+/// without flattening the prior dictionary or rebuilding a prefix-sized plan.
+pub fn buildAppend(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, schema: anytype, layout: anytype, definitions: anytype, candidates: []const Declared, token: Cancellation, manager: *spill.Manager) !?[]const Declared {
+    const work = provider.resume_work orelse return null;
+    const ordinal = work.file orelse return null;
+    if (ordinal == 0) return null;
+    const navigation = work.navigation orelse return error.InvalidNativeLakeFileState;
+    if (ordinal + 1 != provider.source.inventory.files.len or navigation.count != ordinal + 1) return error.InvalidNativeLakeFileState;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const result = try ca.alloc(Declared, definitions.len);
+    for (definitions, result) |definition, *declaration| {
+        var tuple = try tuples.TuplePlan.init(a, schema, layout, definition.keys);
+        defer tuple.deinit();
+        var predicate: ?predicates.Plan = if (definition.where.len != 0) try predicates.Plan.init(a, schema, layout, definition.where) else null;
+        defer if (predicate) |*value| value.deinit();
+        const cover = try parent.coverColumns(ca, definition);
+        const name = try parent.logicalName(ca, definition.name);
+        const binding = try parent.bindingFor(ca, provider.source, tuple, predicate, cover);
+        const digest = parent.fingerprint(tuple, predicate, cover);
+        const previous = for (candidates) |candidate| {
+            if (candidate.artifact.kind != .ordered_row_index or !std.mem.eql(u8, candidate.name, name) or !work.trusts(store.*, candidate.artifact)) continue;
+            const root = try ordered.loadRootLazy(ca, store.*, candidate.artifact, token, null);
+            if (root.building or root.file_dictionary == null or !root.file_dictionary.?.public_names or root.file_dictionary.?.public_count != ordinal or !std.mem.eql(u8, root.source, binding.source_id) or !std.mem.eql(u8, root.snapshot, binding.snapshot_id) or !std.mem.eql(u8, &root.fingerprint, &digest)) return error.InvalidNativeLakeRowIndex;
+            break root;
+        } else return error.InvalidNativeLakeRowIndex;
+        var entry: Entry = .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .root = previous, .sort = spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024), .arena = .init(a) };
+        // The tuple/predicate are borrowed above; only these two owners retire here.
+        defer entry.sort.deinit();
+        defer entry.arena.deinit();
+        entry.sort.shared_runs = true;
+        entry.sort.encoded_bytes = true;
+        var columns: std.StringHashMapUnmanaged(void) = .empty;
+        defer columns.deinit(a);
+        for (try tuple.columnBindings(ca)) |column| try columns.put(a, column, {});
+        for (cover) |column| try columns.put(a, column, {});
+        if (predicate) |plan| for (plan.conditions) |condition| for (try condition.tuple.columnBindings(ca)) |column| try columns.put(a, column, {});
+        var projected = binding;
+        const names = try ca.alloc([]const u8, columns.count());
+        var keys = columns.keyIterator();
+        for (names) |*column| column.* = keys.next().?.*;
+        projected.column_bindings = names;
+        var input = provider.*;
+        input.only_file = ordinal;
+        input.only_files = null;
+        input.only_plan = null;
+        const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, projected, token);
+        defer rows.deinit(a);
+        var row_ordinal: u64 = 0;
+        const file = provider.source.inventory.files[ordinal];
+        while (try rows.next(a)) |batch| try parent.consumeBatch(a, &entry, batch, file.file_id, @intCast(ordinal), &row_ordinal, provider.context, token);
+        const ref = try ordered.publishIncremental(a, ca, store, &entry.sort, name, digest, provider.source.inventory, cover, token, .{ .previous = previous, .sparse_slots = true, .retired_slots = &.{}, .dictionary_edits = &.{.{ .slot = @intCast(ordinal), .file = file.file_id, .fingerprint = try state.identity(a, provider, file) }}, .public_navigation = navigation, .source_cut = work.source_cut });
+        declaration.* = .{ .name = name, .binding = binding, .artifact = ref };
+    }
+    // Public declarations have bounded metadata; no archive-sized dictionary is owned.
+    return try @import("lake_index_metadata_ownership.zig").clone([]const Declared, out, result);
+}
 pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, schema: anytype, layout: anytype, definitions: anytype, reusable: []const Declared, candidates: []const Declared, token: Cancellation, manager: *spill.Manager) !?[]const Declared {
     const delta = provider.native_delta orelse return null;
     if (delta.prior_snapshot == null or delta.public_navigation == null or delta.count() != provider.source.inventory.files.len or

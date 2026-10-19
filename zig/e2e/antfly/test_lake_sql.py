@@ -243,12 +243,26 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         # fused cohort, so cover every matching root rather than the first one.
         server.pause()
         checksums = set()
+        packed_candidates = set()
         for artifact_path in artifact_root.rglob("*"):
             if not artifact_path.is_file():
                 continue
             original = artifact_path.read_bytes()
+            pack = original.find(b"AGPK\x01")
+            if pack >= 0:
+                # Small fused cohorts authenticate the native block inside the
+                # pack itself; its block checksum has no standalone object.
+                length = struct.unpack_from("<I", original, pack + 5)[0]
+                candidate = json.loads(original[pack + 9 : pack + 9 + length])
+                if not candidate["recipe"]["keys"] and any(
+                    item["spec"]["kind"] == "sum"
+                    and item["column"]["path"] == "amount"
+                    for item in candidate["recipe"]["inputs"]
+                ):
+                    packed_candidates.add(artifact_path)
+                continue
             marker = original.find(b'"format":"native-sql-aggregate-v')
-            if marker >= 0 and b"AGPK\x01" not in original[:marker]:
+            if marker >= 0:
                 candidate = json.loads(original[marker - 1 :])
                 inputs = candidate["recipe"]["inputs"]
                 if (
@@ -260,12 +274,15 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     checksums.update(
                         block["artifact"]["checksum"] for block in candidate["blocks"]
                     )
-        assert checksums, "Native exact aggregate blocks missing"
-        candidates = [
-            path
-            for checksum in sorted(checksums)
-            for path in (artifact_root / "objects").rglob(checksum)
-        ]
+        assert checksums or packed_candidates, "Native exact aggregate blocks missing"
+        candidates = sorted(
+            packed_candidates
+            | {
+                path
+                for checksum in checksums
+                for path in (artifact_root / "objects").rglob(checksum)
+            }
+        )
         assert candidates, "Native aggregate block missing"
         originals = []
         try:

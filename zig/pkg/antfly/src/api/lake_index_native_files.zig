@@ -91,35 +91,51 @@ pub const Reuse = struct {
         return if (ordinal < file.chunks.len) file.chunks[ordinal] else null;
     }
 };
-fn putChunk(out: A, path: []const u8, ordinal: usize, bytes: []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, reuse: ?Reuse) !artifacts.ChunkRef {
+/// Logical generation size and new physical publication work have independent
+/// limits. Reusing an immutable chunk charges no read/upload work.
+pub const OutputBudget = struct {
+    generation: *u64,
+    work: ?*u64 = null,
+    fn from(value: anytype) OutputBudget {
+        if (@TypeOf(value) == *u64) return .{ .generation = value };
+        return value;
+    }
+    fn produced(self: OutputBudget, bytes: usize) !void {
+        if (self.work) |remaining| try stores.chargeReadBudget(remaining, bytes);
+    }
+};
+fn putChunk(out: A, path: []const u8, ordinal: usize, bytes: []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, reuse: ?Reuse, budget: OutputBudget) !artifacts.ChunkRef {
     try cancellation.check();
     if (reuse) |old| if (try old.prior(store, path, ordinal)) |ref| {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         if (ref.byte_len == bytes.len and std.mem.eql(u8, &digest, &try stores.sha256DigestFromChecksum(ref.checksum))) return .{ .artifact_id = try out.dupe(u8, ref.artifact_id), .checksum = try out.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
     };
+    try budget.produced(bytes.len);
     var uploaded = try store.putWithCancellation(bytes, cancellation);
     defer uploaded.deinit(store.allocator);
     return .{ .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
 }
 
-pub fn publishBytes(out: A, path: []const u8, bytes: []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, remaining_bytes: *u64, reuse: ?Reuse) !File {
+pub fn publishBytes(out: A, path: []const u8, bytes: []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, output_budget: anytype, reuse: ?Reuse) !File {
+    const budget = OutputBudget.from(output_budget);
     if (!validPath(path)) return error.InvalidNativeLakeFiles;
-    try stores.chargeReadBudget(remaining_bytes, bytes.len);
+    try stores.chargeReadBudget(budget.generation, bytes.len);
     const chunks = try out.alloc(artifacts.ChunkRef, std.math.divCeil(usize, bytes.len, chunk_bytes) catch return error.InvalidNativeLakeFiles);
     if (chunks.len > max_chunks) return error.NativeLakeFilesTooLarge;
     for (chunks, 0..) |*chunk, ordinal| {
         const first = ordinal * chunk_bytes;
-        chunk.* = try putChunk(out, path, ordinal, bytes[first..@min(first + chunk_bytes, bytes.len)], store, cancellation, reuse);
+        chunk.* = try putChunk(out, path, ordinal, bytes[first..@min(first + chunk_bytes, bytes.len)], store, cancellation, reuse, budget);
     }
     return .{ .path = try out.dupe(u8, path), .bytes = bytes.len, .chunks = chunks };
 }
 /// Mutable native WALs are captured only through their retained committed tip.
-pub fn publishPrefix(a: A, out: A, source: Storage, physical: []const u8, relative: []const u8, size: u64, store: *stores.ArtifactStore, cancellation: Cancellation, remaining_bytes: *u64, reuse: ?Reuse) !File {
+pub fn publishPrefix(a: A, out: A, source: Storage, physical: []const u8, relative: []const u8, size: u64, store: *stores.ArtifactStore, cancellation: Cancellation, output_budget: anytype, reuse: ?Reuse) !File {
+    const budget = OutputBudget.from(output_budget);
     if (!validPath(relative)) return error.InvalidNativeLakeFiles;
     const n = std.math.cast(usize, size / chunk_bytes + @intFromBool(size % chunk_bytes != 0)) orelse return error.NativeLakeFilesTooLarge;
     if (n > max_chunks) return error.NativeLakeFilesTooLarge;
-    try stores.chargeReadBudget(remaining_bytes, size);
+    try stores.chargeReadBudget(budget.generation, size);
     const chunks = try out.alloc(artifacts.ChunkRef, n);
     for (chunks, 0..) |*chunk, ordinal| {
         const offset = @as(u64, @intCast(ordinal)) * chunk_bytes;
@@ -134,28 +150,29 @@ pub fn publishPrefix(a: A, out: A, source: Storage, physical: []const u8, relati
         };
         const bytes = try source.readFileRangeAlloc(a, physical, offset, @intCast(length));
         defer a.free(bytes);
-        chunk.* = try putChunk(out, relative, ordinal, bytes, store, cancellation, reuse);
+        chunk.* = try putChunk(out, relative, ordinal, bytes, store, cancellation, reuse, budget);
     }
     return .{ .path = try out.dupe(u8, relative), .bytes = size, .chunks = chunks };
 }
 /// Capture the retained manifest bytes and only its pinned immutable runs.
 /// A live manifest pathname may already describe a different generation.
-pub fn publishCheckpoint(a: A, out: A, checkpoint: *const local.storage_lsm_backend.Backend.NativeCheckpoint, store: *stores.ArtifactStore, cancellation: Cancellation, remaining_bytes: *u64, reuse: ?Reuse) !Root {
+pub fn publishCheckpoint(a: A, out: A, checkpoint: *const local.storage_lsm_backend.Backend.NativeCheckpoint, store: *stores.ArtifactStore, cancellation: Cancellation, output_budget: anytype, reuse: ?Reuse) !Root {
+    const budget = OutputBudget.from(output_budget);
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
     if (checkpoint.run_paths.len != checkpoint.run_ids.len or checkpoint.run_paths.len >= 8192) return error.InvalidNativeLakeFiles;
     const files = try out.alloc(File, checkpoint.run_paths.len + 1);
     const manifest = checkpoint.manifest_bytes;
-    try stores.chargeReadBudget(remaining_bytes, manifest.len);
+    try stores.chargeReadBudget(budget.generation, manifest.len);
     const chunks = try out.alloc(artifacts.ChunkRef, std.math.divCeil(usize, manifest.len, chunk_bytes) catch return error.InvalidNativeLakeFiles);
     for (chunks, 0..) |*chunk, ordinal| {
         const first = ordinal * chunk_bytes;
-        chunk.* = try putChunk(out, "manifest.bin", ordinal, manifest[first..@min(first + chunk_bytes, manifest.len)], store, cancellation, reuse);
+        chunk.* = try putChunk(out, "manifest.bin", ordinal, manifest[first..@min(first + chunk_bytes, manifest.len)], store, cancellation, reuse, budget);
     }
     files[0] = .{ .path = try out.dupe(u8, "manifest.bin"), .bytes = manifest.len, .chunks = chunks };
     for (checkpoint.run_paths, checkpoint.run_ids, files[1..]) |physical, id, *file| {
         const relative = try std.fmt.allocPrint(out, "runs/{d}.tbl", .{id});
         const size = try checkpoint.storage.fileSize(physical);
-        file.* = try publishPrefix(a, out, checkpoint.storage, physical, relative, size, store, cancellation, remaining_bytes, reuse);
+        file.* = try publishPrefix(a, out, checkpoint.storage, physical, relative, size, store, cancellation, budget, reuse);
     }
     std.mem.sort(File, files, {}, struct {
         fn less(_: void, l: File, r: File) bool {
@@ -168,7 +185,8 @@ pub fn publishCheckpoint(a: A, out: A, checkpoint: *const local.storage_lsm_back
 }
 /// Paths must be the exact files of a pinned native checkpoint, never an
 /// unbounded directory census containing mutable or obsolete generations.
-pub fn publishFiles(a: A, out: A, source: Storage, source_root: []const u8, paths: []const []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, remaining_bytes: *u64, reuse: ?Reuse) !Root {
+pub fn publishFiles(a: A, out: A, source: Storage, source_root: []const u8, paths: []const []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, output_budget: anytype, reuse: ?Reuse) !Root {
+    const budget = OutputBudget.from(output_budget);
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
     if (paths.len > 8192) return error.InvalidNativeLakeFiles;
     const files = try out.alloc(File, paths.len);
@@ -182,14 +200,14 @@ pub fn publishFiles(a: A, out: A, source: Storage, source_root: []const u8, path
         const n = std.math.cast(usize, size / chunk_bytes + @intFromBool(size % chunk_bytes != 0)) orelse return error.NativeLakeFilesTooLarge;
         total = std.math.add(usize, total, n) catch return error.NativeLakeFilesTooLarge;
         if (total > max_chunks) return error.NativeLakeFilesTooLarge;
-        try stores.chargeReadBudget(remaining_bytes, size);
+        try stores.chargeReadBudget(budget.generation, size);
         const chunks = try out.alloc(artifacts.ChunkRef, n);
         for (chunks, 0..) |*chunk, ordinal| {
             try cancellation.check();
             const offset = @as(u64, @intCast(ordinal)) * chunk_bytes;
             const bytes = try source.readFileRangeAlloc(a, physical, offset, @intCast(@min(chunk_bytes, size - offset)));
             defer a.free(bytes);
-            chunk.* = try putChunk(out, path, ordinal, bytes, store, cancellation, reuse);
+            chunk.* = try putChunk(out, path, ordinal, bytes, store, cancellation, reuse, budget);
         }
         file.* = .{ .path = try out.dupe(u8, path), .bytes = size, .chunks = chunks };
     }
@@ -968,4 +986,38 @@ test "external lake chunk wait observes its own deadline" {
     task.await(io);
     joined = true;
     try std.testing.expect(honored_deadline);
+}
+
+test "external lake cumulative output charges new chunks while generation limits fence reuse" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-output-work");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    const payload = "immutable native run";
+    var work: u64 = payload.len;
+    var generation: u64 = payload.len;
+    const budget: OutputBudget = .{ .generation = &generation, .work = &work };
+    const first = try publishBytes(out, "runs/1.tbl", payload, &store, .none, budget, null);
+    try std.testing.expectEqual(@as(u64, 0), work);
+    const reuse: Reuse = .{ .root = .{ .domain = @splat(7), .files = &.{first} } };
+    for (0..100) |_| {
+        generation = payload.len;
+        // No source read or put is possible with an exhausted work budget.
+        const next = try publishPrefix(a, out, undefined, "unused", "runs/1.tbl", payload.len, &store, .none, budget, reuse);
+        try std.testing.expectEqualStrings(first.chunks[0].artifact_id, next.chunks[0].artifact_id);
+        try std.testing.expectEqual(@as(u64, 0), generation);
+        generation = payload.len;
+        _ = try publishBytes(out, "runs/1.tbl", payload, &store, .none, budget, reuse);
+        try std.testing.expectEqual(@as(u64, 0), work);
+    }
+    generation = payload.len - 1;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, publishPrefix(a, out, undefined, "unused", "runs/1.tbl", payload.len, &store, .none, budget, reuse));
+    generation = payload.len;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, publishBytes(out, "runs/2.tbl", payload, &store, .none, budget, reuse));
 }
