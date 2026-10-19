@@ -1235,3 +1235,13 @@ cohorts also pin one next-file batch on a private cursor, overlapping reads with
 current indexing/uploads. Extra input/decode memory and shared I/O admission are
 required; denied or unused speculation drains safely and ordinary streaming
 remains available. These refinements retain reader protocol 58 and metadata v5.
+
+Publication cohorts divide CPU execution admission while preserving shared I/O
+headroom, including the full eight-consumer default configuration. Native Parquet
+frames retain immutable page/dictionary owners and copy only view metadata when
+admitted; constrained frames and mutable projections keep copied/borrowed fallback.
+Aggregate serving blocks cache recipe-validated typed reducer states, so warm
+readers import exact partials without decoding aggregate cells again. Scope,
+recipe, logical-directory and current reader checks still apply. Expanded typed
+states remain bounded and can fall back to encoded blocks. These optimizations
+retain metadata v5 and reader protocol 58.

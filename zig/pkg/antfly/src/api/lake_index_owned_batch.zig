@@ -46,6 +46,15 @@ fn external(a: A, value: rows.ExternalRowRef) !rows.ExternalRowRef {
 }
 /// All allocations belong to an enclosing bounded arena, including error paths.
 pub fn copy(a: A, input: rows.ColumnBatch) !rows.ColumnBatch {
+    return copyMode(a, input, false);
+}
+/// Copy only the small mutable view while a ColumnOwner pins native payloads.
+/// Missing/all-NULL vectors can belong to source scratch, so replace them with
+/// independent NULL storage instead of retaining their uninitialized payloads.
+pub fn descriptors(a: A, input: rows.ColumnBatch) !rows.ColumnBatch {
+    return copyMode(a, input, true);
+}
+fn copyMode(a: A, input: rows.ColumnBatch, retain_payload: bool) !rows.ColumnBatch {
     var result = input;
     result.snapshot.table_id = try a.dupe(u8, input.snapshot.table_id);
     result.snapshot.snapshot_id = try a.dupe(u8, input.snapshot.snapshot_id);
@@ -68,6 +77,17 @@ pub fn copy(a: A, input: rows.ColumnBatch) !rows.ColumnBatch {
     for (columns) |*column| {
         column.name = try a.dupe(u8, column.name);
         column.nulls = .{ .bytes = try column.nulls.dupeBytes(a, input.rowCount()) };
+        if (retain_payload) {
+            if (column.values == .encoded) return error.RowSourceColumnKindMismatch;
+            const all_null = for (0..input.rowCount()) |row| {
+                if (!column.nulls.isNull(row)) break false;
+            } else true;
+            if (all_null) {
+                // Consumers observe the original physical kind even for NULLs.
+                column.values = try nullValues(a, column.values, input.rowCount());
+            }
+            continue;
+        }
         column.values = switch (column.values) {
             .i64 => |v| .{ .i64 = try a.dupe(i64, v) },
             .f64 => |v| .{ .f64 = try a.dupe(f64, v) },
@@ -113,6 +133,20 @@ pub fn copy(a: A, input: rows.ColumnBatch) !rows.ColumnBatch {
     return result;
 }
 
+fn nullValues(a: A, values: rows.ColumnValues, n: usize) !rows.ColumnValues {
+    return switch (values) {
+        .i64 => .{ .i64 = try a.alloc(i64, n) },
+        .f64 => .{ .f64 = try a.alloc(f64, n) },
+        .bool => .{ .bool = try a.alloc(bool, n) },
+        .bytes => .{ .bytes = try a.alloc([]const u8, n) },
+        .json => .{ .json = try a.alloc([]const u8, n) },
+        .vector_f32 => .{ .vector_f32 = try a.alloc([]const f32, n) },
+        .decimal128 => |v| .{ .decimal128 = .{ .values = try a.alloc(i128, n), .precision = v.precision, .scale = v.scale } },
+        inline .dictionary_i64, .dictionary_f64, .dictionary_bytes => |_, tag| @unionInit(rows.ColumnValues, @tagName(tag), .{ .values = &.{}, .indices = try a.alloc(u32, n) }),
+        .encoded => return error.RowSourceColumnKindMismatch,
+    };
+}
+
 fn copyScenario(a: A) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -142,4 +176,27 @@ fn copyScenario(a: A) !void {
 test "external lake owned streaming batches preserve typed dictionaries decimals identities and allocation cleanup" {
     try copyScenario(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, copyScenario, .{});
+}
+
+test "external lake retained descriptors share dictionaries and replace scratch null payloads" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const dictionary = [_][]const u8{ "alpha", "beta" };
+    const indices = [_]u32{ 1, 0 };
+    var nulls = [_]u8{ 1, 1 };
+    const null_values: [2]i64 = undefined;
+    const input: rows.ColumnBatch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .external_span = .{ .first = .{ .source_id = "t", .snapshot_id = "s", .file_id = "f", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 2 }, .columns = &.{
+        .{ .name = "label", .values = .{ .dictionary_bytes = .{ .values = &dictionary, .indices = &indices } } },
+        .{ .name = "missing", .values = .{ .i64 = &null_values }, .nulls = .{ .bytes = &nulls } },
+    } };
+    const retained = try descriptors(arena.allocator(), input);
+    @memset(&nulls, 0);
+    try retained.validate();
+    try std.testing.expect(retained.columns[0].values.dictionary_bytes.values.ptr == &dictionary);
+    try std.testing.expect(retained.columns[0].values.dictionary_bytes.indices.ptr == &indices);
+    try std.testing.expectEqualStrings("beta", try retained.columns[0].bytesAt(0));
+    try std.testing.expect(retained.columns[1].values.i64.ptr != &null_values);
+    try std.testing.expect(retained.columns[1].nulls.isNull(0));
+    try std.testing.expect(retained.columns[1].nulls.isNull(1));
 }

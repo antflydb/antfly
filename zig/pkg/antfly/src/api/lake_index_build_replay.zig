@@ -256,6 +256,7 @@ pub const Replay = struct {
     captures: usize = 0,
     read_ahead_hits: usize = 0,
     streamed_batches: usize = 0,
+    retained_batches: usize = 0,
     pipeline: ?*@import("lake_index_build_pipeline.zig") = null,
     /// A speculative lane pins only the first borrowed source batch. Joining
     /// transfers its cursor and this batch together; no replay spool is built.

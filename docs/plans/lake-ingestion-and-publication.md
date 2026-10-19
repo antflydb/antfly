@@ -2434,3 +2434,50 @@ the final rebuilt server, including real Iceberg evolution/deletes and exact
 COUNT/SUM after restart with source payloads unavailable. The stripped Debug
 server, CLI, formatting, license/Apache boundary and source/engine-error catalog
 checks passed with pinned Zig 0.17.0. Main is merged through `dfc6007c5d`.
+
+### CPU admission, typed partials and retained native pages
+
+Configuration cohorts now divide the scheduler's available CPU execution workspace
+among their lanes, capped at the existing per-lane allowance and requiring at
+least 1 MiB per lane. Atomic CPU admission respects the scheduler's I/O reserve;
+statement working-set admission independently accounts for reducer and input
+retention. Eight consumers therefore keep one shared scan per file without
+exhausting the default 64 MiB scheduler before the next-file read. Contention can
+still decline a cohort before any builder starts, preserving smaller-cohort and
+serial fallback.
+
+Aggregate serving readers decode physical blocks into immutable typed reducer
+states in the existing bounded decoded cache. The key includes the full physical
+recipe fingerprint, artifact identity and authorized store scope. Each logical
+reader validates its own row counts and widths and gathers selected physical slots
+into one page allocation. Exact integer/numeric sums, DISTINCT membership, extrema
+and NULL semantics survive this boundary. Reducers import typed pages directly;
+expanded-state memory exhaustion falls back to the bounded encoded block path.
+Build readers without a shared cache retain their existing encoded fallback.
+Reader leases pin all typed payloads until block advancement or close, and current
+cancellation/deadline checks apply to warm reads.
+
+Native Parquet pages, including uncached pages and their shared dictionaries, now
+have reference-counted owners that track live allocations; decoder temporaries
+are freed promptly. The row-source contract optionally retains those
+immutable payloads while publication frames copy only view descriptors, identities
+and validity maps. Missing/all-NULL scratch vectors receive independent null
+storage. A frame conservatively charges complete retained pages and dictionary
+owners against its byte bound; declined retention uses the existing copied or
+borrowed paths. Mutable encoded projections also retain the copy fallback.
+Two-frame backpressure, file barriers and cancellation still drain all consumers
+before releasing their payload owners. No attachment/query settings or durable
+format/protocol changes are required.
+
+Qualification passed 326 native and 181 shared external-lake/scheduler tests
+without failures or leaks. Final ownership/composition refinements passed 11
+focused native regressions plus 25 native and 71 shared scan tests, including
+allocation-failure cleanup, dictionary/decimal pages and selected projections.
+All 16 selected real-file HTTP/pgwire E2Es passed against the final rebuilt server
+after merging main, including dictionary and compact nullable Parquet V1/V2,
+source-unavailable grouped aggregates after restart, real Iceberg evolution and
+deletes, signed decimal pruning and NUMERIC materializations. The stripped Debug
+server, CLI, formatting, license/Apache boundary, source/control and engine-error
+catalog checks passed with Zig 0.17.0; the merged quickstart documentation checks
+also passed. Main is merged through `282ad33e4a`. Archive-scale latency/RSS gains
+remain unmeasured, and live-provider retention qualification remains deferred.

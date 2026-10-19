@@ -972,7 +972,7 @@ fn importContributions(a: A, store: *stores.ArtifactStore, refs: []const local.s
         var page = std.heap.ArenaAllocator.init(a);
         defer page.deinit();
         const rows = (try reader.cursor().next(reader, page.allocator(), 256)) orelse break;
-        for (rows) |row| try group.importPartialMapped(row.keys, row.aggregates, row.aggregate_slots, row.ordinal);
+        try group.importPartialBatch(rows);
     };
 }
 
@@ -1268,7 +1268,7 @@ test "external lake aggregate radix reductions reuse unchanged subtrees across a
             const rows = (try reader.cursor().next(reader, output.allocator(), 8)).?;
             const group = try operators.Grouped.create(a, &.{recipe.inputs[0].spec}, .{});
             defer group.deinit();
-            try group.importPartial(rows[0].keys, rows[0].aggregates, rows[0].ordinal);
+            try group.importPartialBatch(rows[0..1]);
             const result = (try group.nextResult(output.allocator())).?;
             const files: i64 = if (phase == 1) 17 else 16;
             try std.testing.expectEqual(@as(i64, switch (slot) {
@@ -1436,7 +1436,7 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
             }
             const group = try operators.Grouped.create(a, &.{recipe.inputs[0].spec}, .{});
             defer group.deinit();
-            while (try reader.cursor().next(reader, output.allocator(), 8)) |rows| for (rows) |row| try group.importPartial(row.keys, row.aggregates, row.ordinal);
+            while (try reader.cursor().next(reader, output.allocator(), 8)) |rows| try group.importPartialBatch(rows);
             var count: usize = 0;
             while (try group.nextResult(output.allocator())) |result| {
                 const key = result.keys[0].value.integer;
@@ -1538,7 +1538,7 @@ test "external lake recursive group partitions retain sibling artifacts on a sin
     try std.testing.expect(try reader.fuse(sum_reader, 1));
     const grouped = try operators.Grouped.create(a, &specs, .{});
     defer grouped.deinit();
-    while (try reader.cursor().next(reader, out, 71)) |rows| for (rows) |row| try grouped.importPartialMapped(row.keys, row.aggregates, row.aggregate_slots, row.ordinal);
+    while (try reader.cursor().next(reader, out, 71)) |rows| for (rows) |row| try grouped.importPartialBatch(&.{row});
     count = 0;
     while (try grouped.nextResult(out)) |row| {
         try std.testing.expectEqual(@as(i64, if (row.keys[0].value.integer == first) 2 else 1), row.aggregates[0].value.integer);

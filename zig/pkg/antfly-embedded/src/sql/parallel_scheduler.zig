@@ -113,14 +113,18 @@ pub const Scheduler = struct {
         return self.acquireClass(.cpu, bytes);
     }
     fn acquireClass(self: *Scheduler, class: Class, bytes: usize) bool {
+        return self.acquireClassReserved(class, bytes, false);
+    }
+    fn acquireClassReserved(self: *Scheduler, class: Class, bytes: usize, reserve_io: bool) bool {
         self.lock();
         defer self.mutex.unlock();
+        const cpu_full = reserve_io and bytes > (self.max_bytes - @min(self.max_io_bytes, self.max_bytes / 2)) -| (self.bytes - self.io_bytes);
         const slots_full = switch (class) {
             .cpu => self.workers - self.io_workers >= self.max_workers,
             .io => self.io_workers >= self.max_io_workers,
         };
         const io_full = class == .io and bytes > @min(self.max_io_bytes, self.max_bytes / 2) -| self.io_bytes;
-        if (slots_full or io_full or bytes > self.max_bytes -| self.bytes) {
+        if (cpu_full or slots_full or io_full or bytes > self.max_bytes -| self.bytes) {
             self.inline_tasks += 1;
             return false;
         }
@@ -186,11 +190,20 @@ pub const Scheduler = struct {
     pub fn submit(self: *Scheduler, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         return self.submitClass(.cpu, io, bytes, function, args);
     }
+    /// CPU cohorts share their admitted workspace and leave bounded I/O
+    /// headroom, including races with other cohorts using this admission class.
+    pub fn submitWithIoReserve(self: *Scheduler, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+        if (!self.acquireClassReserved(.cpu, bytes, true)) return null;
+        return self.launch(.cpu, io, bytes, function, args);
+    }
     pub fn submitIo(self: *Scheduler, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         return self.submitClass(.io, io, bytes, function, args);
     }
     fn submitClass(self: *Scheduler, class: Class, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         if (!self.acquireClass(class, bytes)) return null;
+        return self.launch(class, io, bytes, function, args);
+    }
+    fn launch(self: *Scheduler, class: Class, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         const future = io.concurrent(function, args) catch {
             self.releaseClass(class, bytes);
             return null;

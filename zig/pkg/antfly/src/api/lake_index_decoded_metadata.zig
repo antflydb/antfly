@@ -67,22 +67,40 @@ pub fn lookup(comptime T: type, cached: artifacts.CachedRead, ref: local.serverl
 }
 
 pub fn acquire(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, comptime load: anytype) !Owned(T) {
+    const Adapter = struct {
+        fn decode(a: std.mem.Allocator, source: stores.ArtifactStore, reference: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, cache: artifacts.CachedRead, _: void) !T {
+            return load(a, source, reference, token, cache);
+        }
+    };
+    return acquireInterpreted(T, cached, store, ref, cancellation, "", {}, Adapter.decode);
+}
+
+/// Interpretation is authenticated by the caller on every use. Include it in
+/// the immutable cache key so a physical block cannot reuse incompatible state.
+pub fn acquireInterpreted(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype) !Owned(T) {
     try cached.context.ensureActive();
     try cancellation.check();
-    const key = try cacheKey(T, cached, ref);
+    var key = try cacheKey(T, cached, ref);
+    if (interpretation.len != 0) {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&key);
+        hash.update(interpretation);
+        hash.final(&key);
+    }
     var loader = struct {
         store: stores.ArtifactStore,
         ref: local.serverless_manifest_artifact_ref.ArtifactRef,
         cancellation: @import("antfly_cancellation").CancellationToken,
         cached: artifacts.CachedRead,
+        arguments: @TypeOf(arguments),
         fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const a = item.arena.allocator();
             const value = try a.create(T);
-            value.* = try load(a, self.store, self.ref, self.cancellation, self.cached);
+            value.* = try load(a, self.store, self.ref, self.cancellation, self.cached, self.arguments);
             item.payload = .{ .extension = value };
         }
-    }{ .store = store, .ref = ref, .cancellation = cancellation, .cached = cached };
+    }{ .store = store, .ref = ref, .cancellation = cancellation, .cached = cached, .arguments = arguments };
     // Both API cancellation and the serving deadline remain active while
     // waiting for another decoder or global decode memory admission.
     const Check = struct {

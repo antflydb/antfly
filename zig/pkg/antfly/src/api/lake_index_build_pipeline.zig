@@ -49,6 +49,7 @@ stream_batch: ?local.storage_rowsource_types.ColumnBatch = null,
 stream_eof: bool = false,
 stream_batches: usize = 0,
 buffered_fallbacks: usize = 0,
+retained_batches: usize = 0,
 stream_arena: ?std.heap.ArenaAllocator = null,
 candidates: ?[]usize = null,
 candidate_visits: usize = 0,
@@ -65,6 +66,7 @@ const Frame = struct {
     arena: ?std.heap.ArenaAllocator = null,
     generation: u64 = 0,
     borrowed: bool = false,
+    owner: ?local.storage_rowsource_types.ColumnOwner = null,
     pending: u8 = 0,
     batch: ?local.storage_rowsource_types.ColumnBatch = null,
 };
@@ -72,6 +74,10 @@ fn activeReplay(self: *Self) *Replay {
     return self.current orelse self.replay;
 }
 pub fn deinit(self: *Self) void {
+    for (&self.frames) |*frame| {
+        if (frame.owner) |owner| owner.release();
+        frame.owner = null;
+    }
     for (&self.frames) |*frame| if (frame.arena) |*arena| {
         arena.deinit();
         frame.arena = null;
@@ -227,6 +233,8 @@ fn driveInner(self: *Self, a: A, token: Token) !void {
             self.stream_batch = null;
             self.stream_eof = false;
             for (&self.frames) |*frame| {
+                if (frame.owner) |owner| owner.release();
+                frame.owner = null;
                 frame.generation = 0;
                 frame.pending = 0;
                 frame.batch = null;
@@ -307,6 +315,8 @@ pub fn produceStream(self: *Self, token: Token) !void {
             frame.budget = .{ .backing = self.activeReplay().live_allocator, .limit = self.frame_limit };
             frame.arena = .init(frame.budget.allocator());
         }
+        if (frame.owner) |owner| owner.release();
+        frame.owner = null;
         _ = frame.arena.?.reset(.free_all);
         frame.budget.exhausted = false;
         frame.borrowed = false;
@@ -315,6 +325,38 @@ pub fn produceStream(self: *Self, token: Token) !void {
             try self.source_mutex.lock(self.io);
             defer self.source_mutex.unlock(self.io);
             const raw = try self.activeReplay().nextLive() orelse break :input null;
+            const encoded = for (raw.columns) |column| {
+                if (column.values == .encoded) break true;
+            } else false;
+            if (!encoded) if (self.activeReplay().live.?.retainColumns(frame.arena.?.allocator()) catch |err| declined: {
+                if (err != error.OutOfMemory or !frame.budget.isLocallyExhausted()) return err;
+                _ = frame.arena.?.reset(.free_all);
+                frame.budget.exhausted = false;
+                break :declined null;
+            }) |owner| {
+                // Charge retained pages (including dictionaries) conservatively
+                // before admitting descriptors into this bounded queue frame.
+                if (owner.retained_bytes <= self.frame_limit) {
+                    const previous_limit = frame.budget.limit;
+                    frame.budget.limit = self.frame_limit - owner.retained_bytes;
+                    const retained = @import("lake_index_owned_batch.zig").descriptors(frame.arena.?.allocator(), raw) catch |err| failed: {
+                        frame.budget.limit = previous_limit;
+                        owner.release();
+                        if (err != error.OutOfMemory or !frame.budget.isLocallyExhausted()) return err;
+                        break :failed null;
+                    };
+                    frame.budget.limit = previous_limit;
+                    if (retained) |batch| {
+                        frame.owner = owner;
+                        self.retained_batches += 1;
+                        break :input batch;
+                    }
+                } else owner.release();
+                // Owners allocate their descriptors in this frame; release
+                // them before resetting after a declined retained admission.
+                _ = frame.arena.?.reset(.free_all);
+                frame.budget.exhausted = false;
+            };
             break :input @import("lake_index_owned_batch.zig").copy(frame.arena.?.allocator(), raw) catch |err| {
                 if (err != error.OutOfMemory or !frame.budget.isLocallyExhausted()) return err;
                 _ = frame.arena.?.reset(.free_all);

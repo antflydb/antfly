@@ -2490,6 +2490,25 @@ pub const Grouped = struct {
         }
         return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, require_fit);
     }
+    /// Import an entire provider page without reboxing typed reducer payloads.
+    pub fn importPartialBatch(self: *Grouped, rows: []const GroupResult) !void {
+        for (rows) |row| {
+            const count = try @import("aggregate_partial.zig").partialCount(row);
+            if (row.typed_states) |states| {
+                try self.importTypedPartialMapped(row.keys, states, row.aggregate_slots, row.ordinal);
+            } else if (row.state_reader != null) {
+                var arena = std.heap.ArenaAllocator.init(self.backing);
+                defer arena.deinit();
+                const states = try arena.allocator().alloc(Aggregate, count);
+                for (states, 0..) |*state, index| {
+                    const slot = if (row.aggregate_slots) |slots| slots[index] else index;
+                    if (slot >= self.specs.len) return error.InvalidSqlBackendResponse;
+                    state.* = try @import("aggregate_partial.zig").read(arena.allocator(), row, index, self.specs[slot]);
+                }
+                try self.importTypedPartialMapped(row.keys, states, row.aggregate_slots, row.ordinal);
+            } else try self.importPartialMapped(row.keys, row.aggregates, row.aggregate_slots, row.ordinal);
+        }
+    }
     pub fn importTypedPartialMapped(self: *Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16, ordinal: u64) !void {
         return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, false);
     }

@@ -98,7 +98,7 @@ pub const Provider = struct {
             if ((self.only_files != null and self.only_files.?.len != inventory.files.len) or (self.only_plan != null and self.only_plan.?.count() != inventory.files.len) or self.only_file != null) return error.InvalidNativeLakeFileState;
             const cursor = try a.create(FileCursor);
             cursor.* = .{ .provider = self.*, .binding = binding, .cancellation = cancellation, .planned = if (self.only_plan) |plan| plan.iterator(true) else null };
-            return .{ .kind = kind, .ctx = cursor, .next_batch = FileCursor.next, .deinit_fn = FileCursor.deinit };
+            return .{ .kind = kind, .ctx = cursor, .next_batch = FileCursor.next, .deinit_fn = FileCursor.deinit, .retain_columns = FileCursor.retain };
         }
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(a);
@@ -149,11 +149,15 @@ pub const Provider = struct {
         errdefer if (state.statistics) |statistics| a.destroy(statistics);
         if (self.only_file) |index| try state.stream.restrictFile(index);
         state.stream.schema_contract = if (self.source.iceberg_schema) |selected| selected.columns else self.schema_contract;
-        return .{ .kind = kind, .ctx = state, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
+        return .{ .kind = kind, .ctx = state, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit, .retain_columns = Cursor.retain };
     }
 };
 /// Open only changed files while retaining one decoded page at a time.
 const FileCursor = struct {
+    fn retain(raw: *anyopaque, a: A) !?rows.ColumnOwner {
+        const self: *FileCursor = @ptrCast(@alignCast(raw));
+        return if (self.active) |source| source.retainColumns(a) else null;
+    }
     provider: Provider,
     binding: bindings.Binding,
     cancellation: Cancellation,
@@ -263,6 +267,11 @@ const StatisticsCapture = struct {
     }
 };
 const Cursor = struct {
+    fn retain(raw: *anyopaque, a: A) !?rows.ColumnOwner {
+        const self: *Cursor = @ptrCast(@alignCast(raw));
+        if (self.stream.page_cursor) |*cursor| return cursor.retainColumns(a);
+        return null;
+    }
     fallback_guard: ?*@import("lake_index_build_pipeline.zig") = null,
     statistics: ?*StatisticsCapture = null,
     stream: stream_api.Stream,
@@ -436,6 +445,25 @@ test "external lake native index input opens one pinned real Parquet scan" {
     }
     try std.testing.expectEqual(@as(usize, 3), count);
     try std.testing.expectEqual(@as(i64, 3), total);
+    {
+        // Native pages can outlive their cursor without copying scalar lanes.
+        var retained_source = try provider_owner.provider().open(a, binding);
+        var opened = true;
+        defer if (opened) retained_source.deinit(a);
+        const borrowed = (try retained_source.next(a)).?;
+        const owner = (try retained_source.retainColumns(a)).?;
+        defer owner.release();
+        var view_arena = std.heap.ArenaAllocator.init(a);
+        defer view_arena.deinit();
+        const stable = try @import("lake_index_owned_batch.zig").descriptors(view_arena.allocator(), borrowed);
+        try std.testing.expect(stable.columns[0].values.i64.ptr == borrowed.columns[0].values.i64.ptr);
+        try std.testing.expect((try retained_source.next(a)) == null);
+        retained_source.deinit(a);
+        opened = false;
+        try stable.validate();
+        try std.testing.expectEqual(@as(i64, 9007199254740993), try stable.columns[0].integerAt(0));
+        try std.testing.expectEqual(@as(i64, -9007199254740993), try stable.columns[0].integerAt(1));
+    }
     {
         var replay = @import("lake_index_build_replay.zig").Replay.init(a, &provider_owner, &.{"amount"});
         defer replay.deinit();

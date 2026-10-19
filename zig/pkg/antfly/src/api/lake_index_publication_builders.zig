@@ -199,6 +199,12 @@ pub fn build(args: Args) !?Result {
 fn buildCohort(args_: Args, units: []const Unit) !?Result {
     const replay = args_.provider.replay.?;
     const io = args_.provider.context.io.?;
+    const scheduler = args_.scheduler orelse local.sql_parallel_scheduler.global();
+    // Reducer/input retention is admitted by the statement working set below.
+    // Share the scheduler's CPU execution allowance across this cohort instead
+    // of charging every lane the maximum and starving the producer's I/O lane.
+    const worker_bytes = scheduler.cpuWorkspaceBudget(units.len * 8 * 1024 * 1024) / units.len;
+    if (worker_bytes < 1024 * 1024) return null;
     // One input/decode workspace is shared under the source mutex, including
     // speculative reads. Scale the replay cache to actual remaining headroom.
     const decoded = std.math.mul(usize, args_.provider.limits.max_decoded_bytes, 2) catch return null;
@@ -288,6 +294,7 @@ fn buildCohort(args_: Args, units: []const Unit) !?Result {
     defer replay.captures += ahead.captures;
     defer replay.read_ahead_hits += pipeline.prefetched;
     defer replay.streamed_batches += pipeline.stream_batches;
+    defer replay.retained_batches += pipeline.retained_batches;
     replay.pipeline = &pipeline;
     defer replay.pipeline = null;
     var start: std.Io.Event = .unset;
@@ -314,7 +321,7 @@ fn buildCohort(args_: Args, units: []const Unit) !?Result {
         initialized[slot] = true;
         jobs[slot].provider.source = &jobs[slot].source;
         pipeline.activate(slot);
-        tasks[slot] = (args.scheduler orelse local.sql_parallel_scheduler.global()).submit(io, 8 * 1024 * 1024, Job.run, .{&jobs[slot]});
+        tasks[slot] = scheduler.submitWithIoReserve(io, worker_bytes, Job.run, .{&jobs[slot]});
         if (tasks[slot] == null) return null;
     }
     admitted = true;
@@ -420,6 +427,7 @@ test "external lake file-first publication shares one decode across five native 
     args.scheduler = null;
     try std.testing.expectEqual(@as(usize, 6), replay.captures);
     try std.testing.expect(replay.streamed_batches != 0);
+    try std.testing.expect(replay.retained_batches != 0);
     try std.testing.expectEqual(@as(usize, 0), replay.readers);
     try std.testing.expectEqual(@as(usize, 3), result.native.declarations.len);
     try std.testing.expectEqual(@as(usize, 1), result.ordered.len);
@@ -499,4 +507,21 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(u64, 12), fallback_ordered.page.?.records);
     const fallback_text = try @import("lake_index_native_text.zig").loadRootDirectory(out, store, fallback.text[0].artifact, .none, null);
     try std.testing.expectEqual(@as(u32, 12), fallback_text.collection.?.documents);
+    // The full eight-configuration cohort retains file-first sharing and the
+    // default node scheduler still admits the next-file I/O lane.
+    var eight = table;
+    const extra = ",\"words3\":{\"type\":\"full_text\",\"field\":\"body\"}}";
+    eight.indexes_json = try std.mem.concat(out, u8, &.{ table.indexes_json[0 .. table.indexes_json.len - 1], extra });
+    var default_scheduler: local.sql_parallel_scheduler.Scheduler = .{};
+    args.table = eight;
+    args.scheduler = &default_scheduler;
+    const captures_before_eight = replay.captures;
+    const hits_before_eight = replay.read_ahead_hits;
+    const eight_result = (try build(args)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), eight_result.text.len);
+    try std.testing.expectEqual(@as(usize, 8), default_scheduler.peak_workers - default_scheduler.peak_io_workers);
+    try std.testing.expect(default_scheduler.peak_io_workers > 0);
+    try std.testing.expect(replay.read_ahead_hits > hits_before_eight);
+    try std.testing.expectEqual(@as(usize, 3), replay.captures - captures_before_eight);
+    try std.testing.expectEqual(@as(usize, 0), default_scheduler.bytes);
 }
