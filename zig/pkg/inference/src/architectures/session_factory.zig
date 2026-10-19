@@ -7553,6 +7553,13 @@ const BackendData = union {
 };
 
 const ArchSession = struct {
+    // Independent of the model execution lane: preparation can overlap model
+    // work. Session close follows worker shutdown, like the borrowed device.
+    video_coefficient_mutex: std.Io.Mutex = .init,
+    video_coefficients: ?@import("antfly_video").preparation.CoefficientCache = null,
+    video_coefficient_permit: ?@import("../backends/session.zig").RunPermit = null,
+    video_coefficient_device_permit: ?@import("../backends/session.zig").RunPermit = null,
+    video_coefficient_suspended: bool = false,
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
     boundary_identity: ?boundary_bundle.Identity = null,
@@ -8633,7 +8640,29 @@ pub fn getEmbeddingGemma2Config(session: Session) ?embedding_gemma2_arch.Config 
 /// retained, and native destruction has the same interruption protection as
 /// compute construction. Busy providers keep their weights and return zero.
 pub fn reclaimEmbeddingGemma2VisionWeights(session: Session, control: InferenceExecutionControl) !usize {
-    return reclaimEmbeddingGemma2Weights(session, control, .vision);
+    const coefficients = try reclaimVideoPreparationCoefficients(session, control);
+    return coefficients + try reclaimEmbeddingGemma2Weights(session, control, .vision);
+}
+
+pub fn reclaimVideoPreparationCoefficients(session: Session, control: InferenceExecutionControl) !usize {
+    if (session.vtable != &arch_vtable) return 0;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const io = self.io orelse return 0;
+    try control.check();
+    self.video_coefficient_mutex.lockUncancelable(io);
+    defer self.video_coefficient_mutex.unlock(io);
+    if (self.video_coefficients) |*cache| {
+        if (self.video_coefficient_suspended) return 0;
+        // The native gate prevents racing producers from repopulating storage
+        // after its device lease is returned. Request pins remain admitted.
+        cache.disable();
+        if (self.video_coefficient_permit) |*permit| try permit.retainHostBytes(@import("antfly_video").preparation.CoefficientCache.host_budget);
+        if (self.video_coefficient_device_permit) |*permit| permit.deinit();
+        self.video_coefficient_device_permit = null;
+        self.video_coefficient_suspended = true;
+        return @import("antfly_video").preparation.CoefficientCache.device_budget;
+    }
+    return 0;
 }
 
 pub fn reclaimEmbeddingGemma2AudioWeights(session: Session, control: InferenceExecutionControl) !usize {
@@ -8661,12 +8690,37 @@ fn reclaimEmbeddingGemma2Weights(session: Session, control: InferenceExecutionCo
 /// Preparation owns its own queue and never borrows mutable provider execution
 /// state. The loaded session handle must remain alive through producer cleanup;
 /// callers guard native driver work before querying/retaining this device.
-pub fn videoPreparationContext(session: Session) !struct { io: ?std.Io, device: ?*anyopaque } {
+pub fn videoPreparationContext(session: Session, prepare: bool) !struct { io: ?std.Io, device: ?*anyopaque, coefficients: ?*const @import("antfly_video").preparation.CoefficientCache = null } {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (self.backend_type != .metal) return .{ .io = self.io, .device = null };
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     const device = metal_runtime.termite_metal_video_preparation_device() orelse return error.MetalRuntimeUnavailable;
+    if (self.io) |io| {
+        self.video_coefficient_mutex.lockUncancelable(io);
+        defer self.video_coefficient_mutex.unlock(io);
+        if (self.video_coefficients == null and prepare) {
+            const Cache = @import("antfly_video").preparation.CoefficientCache;
+            var permit = session.admitRetainedMedia(Cache.host_budget, Cache.device_budget) catch return .{ .io = self.io, .device = device };
+            const cache = Cache.init(device, Cache.device_budget) catch {
+                permit.deinit();
+                return .{ .io = self.io, .device = device };
+            };
+            self.video_coefficients = cache;
+            self.video_coefficient_permit = permit;
+        }
+        if (self.video_coefficients != null and self.video_coefficient_suspended and prepare) {
+            const Cache = @import("antfly_video").preparation.CoefficientCache;
+            var permit = session.admitRetainedMedia(0, Cache.device_budget) catch return .{ .io = self.io, .device = device };
+            self.video_coefficients.?.enable(Cache.device_budget) catch {
+                permit.deinit();
+                return .{ .io = self.io, .device = device };
+            };
+            self.video_coefficient_device_permit = permit;
+            self.video_coefficient_suspended = false;
+        }
+        return .{ .io = self.io, .device = device, .coefficients = if (self.video_coefficients) |*cache| cache else null };
+    }
     return .{ .io = self.io, .device = device };
 }
 
@@ -11367,6 +11421,9 @@ fn archBackend(ptr: *anyopaque) BackendType {
 
 fn archClose(ptr: *anyopaque) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.video_coefficients) |*cache| cache.deinit();
+    if (self.video_coefficient_permit) |*permit| permit.deinit();
+    if (self.video_coefficient_device_permit) |*permit| permit.deinit();
     if (self.generation_workspace) |*workspace| workspace.borrowed.deinit();
     if (self.laya_trunk_cache) |cache| {
         cache.deinit();
@@ -12366,4 +12423,43 @@ test "unsupported families keep their gguf weight mapping" {
         "model.layers.0.self_attn.q_a_proj.weight",
         normalizeGgufGptWeightKey(.{ .family = .deepseek_v4 }, "blk.0.attn_q_a.weight", &buf).?,
     );
+}
+
+test "embeddinggemma2 coefficient cache relinquishes device credit before recovery and readmits before publication" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const Cache = @import("antfly_video").preparation.CoefficientCache;
+    const device = metal_runtime.termite_metal_video_preparation_device() orelse return error.SkipZigTest;
+    var controller = runtime.tier.memory.AdmissionController{};
+    defer controller.deinit();
+    // This probe exercises only the independently owned preparation context;
+    // model weights and execution-provider fields are deliberately unused.
+    var self: ArchSession = undefined;
+    self.backend_type = .metal;
+    self.io = std.testing.io;
+    self.video_coefficient_mutex = .init;
+    self.video_coefficient_permit = null;
+    self.video_coefficient_device_permit = null;
+    self.video_coefficient_suspended = false;
+    self.video_coefficients = try Cache.init(device, Cache.device_budget);
+    defer if (self.video_coefficient_permit) |*permit| permit.deinit();
+    defer if (self.video_coefficient_device_permit) |*permit| permit.deinit();
+    defer self.video_coefficients.?.deinit();
+    const session = Session{ .ptr = &self, .vtable = &arch_vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .backend_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    self.video_coefficient_permit = try session.admitRetainedMedia(Cache.host_budget, Cache.device_budget);
+    try std.testing.expectEqual(@as(usize, Cache.device_budget), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, Cache.device_budget), try reclaimVideoPreparationCoefficients(session, .{}));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, Cache.host_budget), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), try reclaimVideoPreparationCoefficients(session, .{}));
+    var peer = try session.admitRetainedMedia(0, 120 * 1024 * 1024);
+    defer peer.deinit();
+    try std.testing.expect((try videoPreparationContext(session, true)).coefficients == null);
+    try std.testing.expect(self.video_coefficient_suspended);
+    try std.testing.expectEqual(@as(usize, 120 * 1024 * 1024), controller.snapshot().backend_scratch_bytes);
+    peer.deinit();
+    try std.testing.expect((try videoPreparationContext(session, true)).coefficients != null);
+    try std.testing.expect(!self.video_coefficient_suspended);
+    try std.testing.expectEqual(@as(usize, Cache.device_budget), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, Cache.device_budget), try reclaimVideoPreparationCoefficients(session, .{}));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
 }
