@@ -1803,6 +1803,22 @@ path as larger cohorts. Their completed samples train the prepared namespace,
 so cold calibration can advance beyond width one. The pretrained video
 qualifier checks samples from the serving path as well as direct tower parity.
 
+Video calibration caps exploration by compatible frames already ready and by
+geometry capacity; it never waits to fill a larger batch. Completed costs include
+imports and any required packing. Live vision admission shrinks cohorts before
+consuming preparations; legacy retries also split retained inputs to fit current
+capacity. Cancellation and non-pressure errors propagate without resizing.
+
+Metal video preparation writes into append-only final patch spans sized from
+the selected pictures and their display geometry. The clip owns a separate
+admission token for that buffer until all queued preparations and imported
+inputs drain. Contiguous compatible spans import as one tensor without stacking;
+other layouts retain bounded copying. Tighter caller pools keep independent
+outputs when the slab would displace their transient command window.
+
+Every Metal group, including preparation/residency opt-outs, admits any actual
+backbone deficit at its fenced transition before reducing its existing leases.
+
 Compact image/audio phase reductions preserve their explicit-workspace policy;
 a generic model-size floor cannot reappear during a qualified reduction. Mixed
 Metal groups inspect image geometry and audio duration before reserving retained

@@ -30,6 +30,10 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> chromaNative;
 @property(nonatomic, strong) id<MTLComputePipelineState> chromaFloat;
 @property(nonatomic) void *cache;
+// Single producer, append-only; never overwrite a span observed by inference.
+@property(nonatomic, strong) id<MTLBuffer> outputSlab;
+@property(nonatomic) size_t outputCapacity;
+@property(nonatomic) size_t outputUsed;
 @property(nonatomic, strong) id<MTLBuffer> pqLUT;
 @property(nonatomic, strong) id<MTLBuffer> hlgLUT;
 @end
@@ -80,6 +84,16 @@ void av_preparer_destroy(void *p) {
         // Fence all earlier submissions before releasing shared cache admission.
         id<MTLCommandBuffer> fence = [owner.queue commandBuffer];
         [fence commit]; [fence waitUntilCompleted];
+    }
+}
+int32_t av_preparer_output_slab(void *handle, size_t bytes) {
+    @autoreleasepool {
+        AVPreparer *p = (__bridge AVPreparer *)handle;
+        if (!bytes || bytes % sizeof(float) || p.outputCapacity) return -1;
+        p.outputSlab = [p.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!p.outputSlab) return -1;
+        p.outputCapacity = bytes;
+        return 0;
     }
 }
 static id<MTLBuffer> upload(id<MTLDevice> device, const void *bytes, size_t length) {
@@ -190,6 +204,12 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         size_t height = (params[4] & 1) ? params[0] - params[13] - params[15] : params[1] - params[14] - params[16];
         id<MTLBuffer> temp = [p.device newBufferWithLength:(size_t)params[2] * height * 3 options:MTLResourceStorageModePrivate];
         size_t outputBytes = (size_t)params[2] * params[3] * 3 * sizeof(float);
+        BOOL slab = !destination && p.outputCapacity;
+        if (slab) {
+            if (p.outputUsed > p.outputCapacity || outputBytes > p.outputCapacity - p.outputUsed) return -1;
+            destination = p.outputSlab;
+            destinationOffset = p.outputUsed;
+        }
         if (destination && (destination.device != p.device || destinationOffset % sizeof(float) || destinationOffset > destination.length || outputBytes > destination.length-destinationOffset)) return -1;
         result.output = destination ?: [p.device newBufferWithLength:outputBytes options:MTLResourceStorageModeShared];
         result.outputOffset = destination ? destinationOffset : 0;
@@ -226,7 +246,9 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         [encoder setComputePipelineState:p.vertical]; [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBuffer:result.output offset:result.outputOffset atIndex:1];
         [encoder setBytes:params length:68 atIndex:2]; [encoder setBuffer:c.yb offset:0 atIndex:3]; [encoder setBuffer:c.yw offset:0 atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(params[2], params[3], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
-        [result.command commit]; *out = (__bridge_retained void *)result; return 0;
+        [result.command commit];
+        if (slab) p.outputUsed += outputBytes;
+        *out = (__bridge_retained void *)result; return 0;
     }
 }
 int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params, void *coefficients, void *chromaCoefficients, void **out) {
@@ -256,6 +278,7 @@ int av_prepared_release_source(void *p) {
     result.rgba = nil; result.nativeY = nil; result.nativeUV = nil;
     return 0;
 }
+size_t av_prepared_offset(void *p) { return ((__bridge AVPrepared *)p).outputOffset; }
 void *av_prepared_buffer(void *p) { return (__bridge void *)((__bridge AVPrepared *)p).output; }
 int32_t av_prepared_copy(void *p, float *out, size_t count) {
     AVPrepared *result = (__bridge AVPrepared *)p;

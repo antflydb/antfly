@@ -21,6 +21,8 @@ const chroma_filter = @import("chroma.zig");
 const supported = @import("builtin").os.tag == .macos;
 extern fn av_preparer_create(*anyopaque, *?*anyopaque) i32;
 extern fn av_preparer_destroy(*anyopaque) void;
+extern fn av_preparer_output_slab(*anyopaque, usize) i32;
+extern fn av_prepared_offset(*anyopaque) usize;
 extern fn av_coefficients_create(*anyopaque, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
 extern fn av_chroma_create(*anyopaque, [*]const chroma_filter.Tap, usize, [*]const chroma_filter.Tap, usize, *?*anyopaque) i32;
 extern fn av_chroma_destroy(*anyopaque) void;
@@ -614,6 +616,8 @@ pub const Metal = struct {
     coefficient_build_bound: usize = 0,
     coefficient_limit: usize = 16 * 1024 * 1024,
     cache_reservation: media.admission.Token = .{},
+    output_reservation: media.admission.Token = .{},
+    output_slab_bytes: usize = 0,
     pub fn init(device: *anyopaque) !Metal {
         if (!supported) return error.UnsupportedVideoBackend;
         var out: ?*anyopaque = null;
@@ -626,6 +630,7 @@ pub const Metal = struct {
             if (self.chroma_coefficients) |resident| av_chroma_destroy(resident);
             av_preparer_destroy(self.handle);
             self.cache_reservation.deinit();
+            self.output_reservation.deinit();
         }
         self.* = undefined;
     }
@@ -636,6 +641,18 @@ pub const Metal = struct {
         if (self.coefficients != null or self.chroma_coefficients != null or self.cache_reservation.pool != null) return error.MetalPreparerAlreadyUsed;
         self.cache_reservation = try pool.acquire(.{ .device_bytes = max_coefficient_bytes });
         self.coefficient_limit = max_coefficient_bytes;
+    }
+    /// Append-only final patch storage for one bounded selection. The caller
+    /// drains all Prepared jobs/imports before deinit; no span is reused. This
+    /// reservation is additional to transient per-command preparation scratch.
+    pub fn admitOutputSlab(self: *Metal, pool: ?*media.admission.Pool, bytes: usize) !void {
+        if (!supported) return error.UnsupportedVideoBackend;
+        if (self.output_slab_bytes != 0 or bytes == 0 or bytes > 128 * 1024 * 1024) return error.ResourceLimitExceeded;
+        var reservation = if (pool) |shared| try shared.acquire(.{ .device_bytes = bytes }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        if (av_preparer_output_slab(self.handle, bytes) != 0) return error.MetalPreparationFailed;
+        self.output_reservation = reservation;
+        self.output_slab_bytes = bytes;
     }
     /// Device-wide allocated size, including other work using this device.
     pub fn deviceAllocatedBytes(self: *const Metal) u64 {
@@ -718,7 +735,7 @@ pub const Metal = struct {
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .coefficient_staging_bytes = uploaded };
     }
     /// Caller-owned integer Metal plane textures on this preparer's device.
     /// R8/RG8Uint or R16/RG16Uint contain right-aligned native samples. The
@@ -747,7 +764,7 @@ pub const Metal = struct {
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift, @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_native_submit(self.handle, surface.y, surface.uv, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .coefficient_staging_bytes = uploaded };
     }
     /// Upload native planes directly, without host RGB conversion. Metal owns
     /// its copies before return; padded byte strides remain explicit.
@@ -765,7 +782,7 @@ pub const Metal = struct {
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_host_submit(self.handle, surface.planes[0].bytes.ptr, surface.planes[0].stride, surface.planes[1].bytes.ptr, surface.planes[1].stride, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
     /// Copies tightly packed RGBA into owned Metal storage before returning.
     /// The producer may free its input immediately. Alpha/matrix are ignored
@@ -805,7 +822,7 @@ pub const Metal = struct {
         var out: ?*anyopaque = null;
         const rc = if (destination) |target| av_prepare_rgba_into_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, target, offset, &out) else av_prepare_rgba_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, &out);
         if (rc != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = offset, .rgba_staging_bytes = size, .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .rgba_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
 };
 /// Owns input import/staging, GPU command, and patch buffer. Destroy fences in-flight
@@ -814,7 +831,7 @@ pub const Prepared = struct {
     reservation: media.admission.Token = .{},
     handle: *anyopaque,
     geometry: Geometry,
-    /// Nonzero only when submitImageViewInto targets a final destination span.
+    /// Byte span in a shared output slab or explicit final destination.
     /// Add to buffer() when binding that span; readback() applies it internally.
     output_byte_offset: usize = 0,
     /// Logical bytes copied by newBufferWithBytes, not physical PCIe/DMA bytes.

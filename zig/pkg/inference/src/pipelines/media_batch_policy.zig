@@ -198,3 +198,26 @@ test "embeddinggemma2 prepared calibration is isolated from legacy fallback timi
     try std.testing.expectEqual(@as(usize, 6), capacityForPlan(true, 97, 51, 6, true));
     try std.testing.expectEqual(@as(usize, 1), capacityForPlan(true, 97, 51, 6, false));
 }
+
+test "embeddinggemma2 frame calibration learns partial ready cohorts without waiting for a larger batch" {
+    var policy = Entry{};
+    const geometry_cap = 6;
+    const ready = 3;
+    for ([_]usize{ 1, 2, 3 }) |width| for (0..2) |_| {
+        try std.testing.expectEqual(width, policy.choose(@min(ready, geometry_cap)));
+        policy.observe(width, if (width == 2) 100 else width * 300);
+    };
+    for (0..100) |_| {
+        const width = policy.choose(@min(ready, geometry_cap));
+        try std.testing.expect(width <= ready);
+        policy.observe(width, if (width == 2) 100 else width * 300);
+    }
+    try std.testing.expectEqual(@as(u32, 0), policy.costs[3].samples);
+    try std.testing.expectEqual(@as(usize, 4), policy.choose(geometry_cap));
+    var pressure = Entry{};
+    for ([_]usize{ 1, 2, 4, 5 }) |width| for (0..2) |_| pressure.observe(width, if (width == 2) 100 else width * 300);
+    try std.testing.expectEqual(@as(usize, 6), pressure.choose(6));
+    // After live admission rejects six but grants five, reselect under five
+    // instead of repeatedly executing its slower clipped width.
+    try std.testing.expectEqual(@as(usize, 2), pressure.choose(5));
+}

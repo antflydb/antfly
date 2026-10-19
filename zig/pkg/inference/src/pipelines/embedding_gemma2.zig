@@ -174,9 +174,11 @@ const StageLane = struct {
         return if (self.extra) |*extra| extra else null;
     }
     fn retain(self: *StageLane, request: @import("../backends/session.zig").RunRequest) !void {
-        if (self.video_phases) {
-            // The tower is fenced and only independent inputs remain. Admit
-            // the exact backbone phase instead of restoring its tower peak.
+        if (self.session.backend() == .metal) {
+            // Every Metal composition path reaches a fenced boundary, including
+            // preparation/residency opt-outs. The actual backbone can exceed
+            // its original conservative tower reservation; admit that deficit
+            // before reducing either independently owned lease.
             if (self.extra) |*extra| extra.deinit();
             self.extra = null;
             if (self.session.run_admission) |admission| self.extra = try self.admitPhase(try admission.estimateRequest(request, self.session.outputInfo()), null);
@@ -785,7 +787,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     defer leaveModel(lock, &execution_waiter);
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = idle_backend, .cb = &managed.backend, .control = effective, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, bounds.sequence) else null };
+    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = idle_backend, .cb = &managed.backend, .control = effective, .owns_unstaged_provider = session.backend() == .metal and lock == null, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, bounds.sequence) else null };
     lane.attach();
     defer lane.deinit();
     if (video_phases) try lane.reserve(null);
@@ -5003,4 +5005,24 @@ test "embeddinggemma2 mixed header bounds scale images and audio without maximum
     try std.testing.expect(encoded.bounds.sequence < 512);
     try std.testing.expect(encoded.bounds.host < 320 * 1024 * 1024);
     try std.testing.expect(encoded.bounds.host >= @import("audio.zig").default_decode_working_bytes);
+}
+
+test "embeddinggemma2 nonvideo Metal fallback admits larger actual backbone without losing peer credit" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var dummy: u8 = 0;
+    const session = Session{ .ptr = &dummy, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 2048 * 1024 * 1024 }, .static_workspace_bytes = 768 * 1024 * 1024, .check_live_memory = false } };
+    var base = try session.admit(.{ .batch = 1, .sequence = 8192, .workspace_bytes = 768 * 1024 * 1024, .host_preprocess_bytes = 512 * 1024 * 1024, .output_bytes = 512 });
+    defer base.deinit();
+    var peer = try session.admit(.{ .batch = 1, .sequence = 1, .workspace_planned = true, .workspace_bytes = 64 * 1024 * 1024, .output_bytes = 0 });
+    defer peer.deinit();
+    const peer_before = peer.lease.?.amounts;
+    const phase = try videoBackboneBounds(true, 6000, 0);
+    var lane = StageLane{ .session = session, .gate = null, .waiter = undefined, .cb = undefined, .control = .{}, .permit = &base, .idle_backend = 0, .video_phases = false };
+    defer if (lane.extra) |*extra| extra.deinit();
+    try lane.retain(.{ .batch = 1, .sequence = 6000, .backend_input_bytes = 6000 * 512 * 4, .workspace_planned = true, .workspace_bytes = phase.workspace, .host_preprocess_bytes = 128 * 1024 * 1024, .output_bytes = 512 });
+    try std.testing.expectEqual(peer_before, peer.lease.?.amounts);
+    try std.testing.expectEqual(phase.workspace + peer_before.backend_scratch_bytes, controller.snapshot().backend_scratch_bytes);
+    try std.testing.expect(lane.extra != null);
 }

@@ -662,16 +662,18 @@ pub const Plan = struct {
     preparation_bytes: usize = 0,
     vision_workspace_bytes: usize = 0,
     apple_surface_bytes: usize = 0,
+    patch_output_bytes: usize = 0,
     commands: u64 = 0,
     pub fn hostBytes(self: Plan) !usize {
         const queued = try std.math.mul(usize, self.preparation_bytes, @intCast(self.commands));
         return std.math.add(usize, 32 * 1024 * 1024, queued);
     }
     pub fn deviceBytes(self: Plan) !usize {
-        return std.math.add(usize, 16 * 1024 * 1024, try std.math.add(usize, self.apple_surface_bytes, try std.math.mul(usize, self.preparation_bytes, @intCast(self.commands))));
+        return std.math.add(usize, self.patch_output_bytes, try std.math.add(usize, 16 * 1024 * 1024, try std.math.add(usize, self.apple_surface_bytes, try std.math.mul(usize, self.preparation_bytes, @intCast(self.commands)))));
     }
     fn picture(self: *Plan, width: u32, height: u32, options: video.preparation.Options) !void {
         const geometry = try video.preparation.geometry(width, height, options);
+        self.patch_output_bytes = try std.math.add(usize, self.patch_output_bytes, geometry.values() * @sizeOf(f32));
         const capacity = try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024);
         const scratch = try projector.embeddingGemma2VideoScratch(options.width, options.height);
         self.vision_workspace_bytes = @max(self.vision_workspace_bytes, try std.math.mul(usize, @min(capacity, @as(usize, @intCast(self.commands))), scratch));
@@ -685,6 +687,51 @@ pub const Plan = struct {
         self.pixels = try std.math.add(u64, self.pixels, try std.math.mul(u64, width, height));
     }
 };
+/// Use the same decoded geometry/display policy as preflight. No packet reads,
+/// decoding, or second picture index is needed to size final preparation spans.
+const OutputSlabPlan = struct { bytes: usize = 0, transient: usize = 0, commands: u64 = 0 };
+fn selectionOutputBytes(a: std.mem.Allocator, selected: []const usize, reader: ?*media.mp4.Reader, configurations: ?*video.h264_dynamic.Session, webm_reader: ?*media.webm.Reader, webm_index: ?video.webm_pictures.Index) !OutputSlabPlan {
+    var result = OutputSlabPlan{ .commands = preparationSlots(selected) };
+    const static_config = if (reader) |r| (if (r.track.codec == .avc and configurations == null) try video.h264.configParse(a, r.track.avcc) else null) else null;
+    defer if (static_config) |cfg| cfg.groups.deinit(a);
+    for (selected) |id| {
+        var source_width: usize = 0;
+        var source_height: usize = 0;
+        const g = if (webm_index) |index| blk: {
+            const picture = index.pictures[id];
+            source_width = picture.width;
+            source_height = picture.height;
+            break :blk try video.preparation.geometry(picture.width, picture.height, try webmPolicy(webm_reader.?.track, picture.width, picture.height, .{}));
+        } else blk: {
+            const track = reader.?.track;
+            const cfg = if (configurations) |session| try session.configAt(id) else static_config;
+            const width: u32 = @intCast(if (cfg) |c| c.width else track.width);
+            const height: u32 = @intCast(if (cfg) |c| c.height else track.height);
+            source_width = width;
+            source_height = height;
+            break :blk try video.preparation.geometry(width, height, if (cfg) |c| try policySignal(track, width, height, c.color) else try policy(track, width, height));
+        };
+        result.bytes = try std.math.add(usize, result.bytes, g.values() * @sizeOf(f32));
+        const staging = try std.math.mul(usize, try std.math.mul(usize, std.mem.alignForward(usize, source_width, 64), std.mem.alignForward(usize, source_height, 64)), 6);
+        result.transient = @max(result.transient, try std.math.add(usize, g.scratch_bytes, staging));
+    }
+    return result;
+}
+fn configureOutputSlab(preparer: *video.preparation.Metal, pool: ?*media.admission.Pool, plan: OutputSlabPlan) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (pool) |shared| {
+        // Preserve the caller's whole command window, rather than grabbing an
+        // output slab that would starve the next submitted preparation.
+        const needed = try std.math.add(usize, plan.bytes, try std.math.mul(usize, plan.transient, @intCast(@min(shared.limits.commands, plan.commands))));
+        if (needed > shared.limits.device_bytes -| shared.snapshot().device_bytes) return;
+    }
+    preparer.admitOutputSlab(pool, plan.bytes) catch |err| switch (err) {
+        // A caller's tighter preparation pool retains independently allocated
+        // outputs. Never turn this copy optimization into a new failure mode.
+        error.SharedAdmissionExceeded, error.MetalPreparationFailed => {},
+        else => return err,
+    };
+}
 fn queueCapacity(pool: ?*media.admission.Pool, pictures: ?usize) usize {
     // One producer may be preparing while one cohort executes and one waits.
     // Smaller caller-owned pools must reduce buffering rather than overcommit.
@@ -996,6 +1043,7 @@ pub const Prefetch = struct {
             missing += 1;
         }
         if (missing == 0) return;
+        if (self.preparer) |*preparer| try configureOutputSlab(preparer, pool, try selectionOutputBytes(a, misses[0..missing], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
         capture.decode_slots = miss_slots[0..missing];
         if (webm) {
             try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, self.webm_input);
@@ -1234,6 +1282,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         miss_slots[missing] = slot;
         missing += 1;
     }
+    if (missing != 0) if (preparer) |*value| try configureOutputSlab(value, pool, try selectionOutputBytes(a, misses[0..missing], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
     capture.decode_slots = miss_slots[0..missing];
     const decoded = if (missing == 0) {} else if (webm)
         decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, webm_input)
@@ -1414,6 +1463,34 @@ fn compatibleApple(a: std.mem.Allocator, avcc: []const u8) !bool {
     defer cfg.groups.deinit(a);
     return cfg.frame_only and cfg.profile != 88 and !cfg.separate_planes and !cfg.full_range;
 }
+fn contiguousPreparationSpans(buffers: []const *anyopaque, offsets: []const usize, span: usize) bool {
+    if (buffers.len == 0 or buffers.len != offsets.len or span == 0) return false;
+    for (buffers, offsets, 0..) |buffer, offset, i| {
+        const expected = std.math.add(usize, offsets[0], std.math.mul(usize, i, span) catch return false) catch return false;
+        if (buffer != buffers[0] or offset != expected) return false;
+    }
+    return true;
+}
+fn visionScratch(options: video.preparation.Options, frames: usize, required: bool) !usize {
+    return if (required) projector.embeddingGemma2VideoPreparedScratch(options.width, options.height, frames) else std.math.mul(usize, try projector.embeddingGemma2VideoScratch(options.width, options.height), frames);
+}
+fn admitVisionFrames(stage: ?*const @import("../ops/ops.zig").EmbeddingStageControl, options: video.preparation.Options, maximum: usize, required: bool, control: media.source.Control) !usize {
+    if (maximum == 0 or maximum > 8) return error.InvalidTensorShape;
+    var count = maximum;
+    while (true) {
+        try control.check();
+        if (stage) |lane| lane.workspace(try visionScratch(options, count, required)) catch |err| switch (err) {
+            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => {
+                if (count == 1) return err;
+                count -= 1;
+                continue;
+            },
+            else => return err,
+        };
+        return count;
+    }
+}
+
 const ProjectionJob = struct { slot: usize, prepared: video.preparation.Prepared, options: video.preparation.Options };
 
 /// An admitted bounded cohort queued beside one executing projection. The producer owns
@@ -1620,12 +1697,19 @@ const Capture = struct {
         const stage = self.cb.embedding_stage orelse return false;
         return stage.workspace_fn != null and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN");
     }
+    fn admitGpuFrames(self: *Capture, options: video.preparation.Options, maximum: usize, required: bool) !usize {
+        return admitVisionFrames(self.cb.embedding_stage, options, maximum, required, self.control);
+    }
     fn encodeGpu(self: *Capture, input: CT, options: video.preparation.Options, frames: usize) !projector.EncodedDeviceImage {
-        const stage = self.cb.embedding_stage;
+        return self.encodeGpuAdmitted(input, options, frames, false);
+    }
+    fn encodeGpuAdmitted(self: *Capture, input: CT, options: video.preparation.Options, frames: usize, admitted: bool) !projector.EncodedDeviceImage {
         const required = self.preparedVision();
         self.last_prepared = required;
-        const scratch = if (required) try projector.embeddingGemma2VideoPreparedScratch(options.width, options.height, frames) else try std.math.mul(usize, try projector.embeddingGemma2VideoScratch(options.width, options.height), frames);
-        if (stage) |lane| try lane.workspace(scratch);
+        if (!admitted) {
+            const scratch = try visionScratch(options, frames, required);
+            if (self.cb.embedding_stage) |lane| try lane.workspace(scratch);
+        }
         return projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, input, options.width, options.height, frames, required) catch |err| {
             if (err != error.PreparedVisionUnavailable or !required) return err;
             // The failed required plan has fenced every command. The original
@@ -1638,23 +1722,18 @@ const Capture = struct {
     }
     fn encodeLegacyGpu(self: *Capture, input: CT, options: video.preparation.Options, frames: usize) !projector.EncodedDeviceImage {
         const capacity = try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024);
-        const per_frame = try projector.embeddingGemma2VideoScratch(options.width, options.height);
-        const stage = self.cb.embedding_stage.?;
-        if (frames <= capacity) {
-            try stage.workspace(per_frame * frames);
-            return projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, input, options.width, options.height, frames, false);
-        }
+        var take = try self.admitGpuFrames(options, @min(capacity, frames), false);
+        if (take == frames) return projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, input, options.width, options.height, frames, false);
         const patches = @as(usize, options.width / 16) * (options.height / 16);
         const tokens = @as(usize, options.width / 48) * (options.height / 48);
-        // Final projections and the original patch input remain independently
-        // owned throughout retry. Only one legacy subcohort is transiently live.
+        // Input and final projections remain owned across live-pressure retries.
+        // No partial projection is published and no source is decoded again.
         const output = (try self.cb.allocUninitF32Shape(&.{ @intCast(frames * tokens), 512 })) orelse return error.UnsupportedPrimitiveOp;
         errdefer self.cb.free(output);
         var first: usize = 0;
         while (first < frames) {
             try self.control.check();
-            const take = @min(capacity, frames - first);
-            try stage.workspace(per_frame * take);
+            if (first != 0) take = try self.admitGpuFrames(options, @min(capacity, frames - first), false);
             const slice = try self.cb.sliceRows2D(self.a, input, first * patches, take * patches, 768);
             defer self.cb.free(slice);
             const encoded = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, slice, options.width, options.height, take, false);
@@ -1672,11 +1751,23 @@ const Capture = struct {
         while (consumed < jobs.len) {
             const first = consumed;
             const options = jobs[first].options;
-            const capacity = batch_policy.capacityForPlan(true, options.width, options.height, if (self.preparedVision()) try projector.embeddingGemma2VideoPreparedCapacity(options.width, options.height, 768 * 1024 * 1024) else try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024), self.preparedVision());
-            var stop = first + 1;
-            while (stop < jobs.len and stop - first < capacity and jobs[stop].options.width == options.width and jobs[stop].options.height == options.height) : (stop += 1) {}
-            consumed = stop; // Cohort consumes all its leases, including on failure.
-            if (stop - first == 1) try self.projectGpuNow(jobs[first].slot, jobs[first].prepared, options) else try self.projectGpuCohort(jobs[first..stop]);
+            var ready = first + 1;
+            while (ready < jobs.len and jobs[ready].options.width == options.width and jobs[ready].options.height == options.height) : (ready += 1) {}
+            const required = self.preparedVision();
+            const geometry_capacity = if (required) try projector.embeddingGemma2VideoPreparedCapacity(options.width, options.height, 768 * 1024 * 1024) else try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024);
+            var ceiling = @min(ready - first, geometry_capacity);
+            // Admission precedes imports, allocation and consumption. Re-select
+            // against a reduced live ceiling, so pressure cannot trap learning
+            // at an unobserved larger width while a faster small width is known.
+            const take = while (true) {
+                const capacity = batch_policy.capacityForPlan(true, options.width, options.height, ceiling, required);
+                const admitted = try self.admitGpuFrames(options, capacity, required);
+                if (admitted == capacity) break admitted;
+                ceiling = admitted;
+            };
+            const stop = first + take;
+            consumed = stop;
+            if (stop - first == 1) try self.projectGpuNowAdmitted(jobs[first].slot, jobs[first].prepared, options, true) else try self.projectGpuCohort(jobs[first..stop]);
             if (stop < jobs.len) if (self.cb.embedding_stage) |stage| {
                 try stage.pause();
                 try stage.acquire();
@@ -1689,25 +1780,40 @@ const Capture = struct {
             if (live[i]) job.prepared.deinit();
         };
         if (comptime build_options.enable_metal) {
+            const started = batch_clock.monotonicNs();
             const io = self.io orelse return error.MissingVideoIo;
-            var inputs: [8]CT = undefined;
-            var imported: usize = 0;
-            defer for (inputs[0..imported]) |input| self.cb.free(input);
+            const options = jobs[0].options;
+            const rows = @as(usize, options.width) * options.height / 256;
+            const span = rows * 768 * @sizeOf(f32);
+            var buffers: [8]*anyopaque = undefined;
+            var offsets: [8]usize = undefined;
             for (jobs, 0..) |*job, i| {
                 try self.control.check();
                 try job.prepared.wait(io, self.control);
-                inputs[i] = try MetalCompute.importVideoBuffer(self.cb, try job.prepared.buffer(), job.prepared.geometry.values());
-                imported += 1;
+                buffers[i] = try job.prepared.buffer();
+                offsets[i] = job.prepared.output_byte_offset;
+            }
+            var inputs: [8]CT = undefined;
+            var imported: usize = 0;
+            defer for (inputs[0..imported]) |part| self.cb.free(part);
+            const input = if (contiguousPreparationSpans(buffers[0..jobs.len], offsets[0..jobs.len], span))
+                try MetalCompute.importVideoBufferSpan(self.cb, buffers[0], offsets[0], rows * jobs.len * 768)
+            else blk: {
+                const stacked = (try self.cb.allocUninitF32Shape(&.{ @intCast(rows * jobs.len), 768 })) orelse return error.UnsupportedPrimitiveOp;
+                errdefer self.cb.free(stacked);
+                for (jobs, 0..) |job, i| {
+                    inputs[i] = try MetalCompute.importVideoBufferSpan(self.cb, buffers[i], offsets[i], job.prepared.geometry.values());
+                    imported += 1;
+                    if (!try self.cb.copyRows2D(self.a, stacked, i * rows, inputs[i], 0, rows, 768)) return error.UnsupportedPrimitiveOp;
+                }
+                break :blk stacked;
+            };
+            defer self.cb.free(input);
+            for (jobs, 0..) |*job, i| {
                 job.prepared.deinit();
                 live[i] = false;
             }
-            const options = jobs[0].options;
-            const rows = @as(usize, options.width) * options.height / 256;
-            const input = (try self.cb.allocUninitF32Shape(&.{ @intCast(rows * jobs.len), 768 })) orelse return error.UnsupportedPrimitiveOp;
-            defer self.cb.free(input);
-            for (inputs[0..jobs.len], 0..) |part, i| if (!try self.cb.copyRows2D(self.a, input, i * rows, part, 0, rows, 768)) return error.UnsupportedPrimitiveOp;
-            const started = batch_clock.monotonicNs();
-            const encoded = try self.encodeGpu(input, options, jobs.len);
+            const encoded = try self.encodeGpuAdmitted(input, options, jobs.len, true);
             defer self.cb.free(encoded.tensor);
             if (encoded.tokens % jobs.len != 0) return error.InvalidTensorShape;
             const per_frame = encoded.tokens / jobs.len;
@@ -1736,19 +1842,22 @@ const Capture = struct {
         } else return error.UnsupportedVideoBackend;
     }
     fn projectGpuNow(self: *Capture, slot: usize, value: video.preparation.Prepared, options: video.preparation.Options) !void {
+        return self.projectGpuNowAdmitted(slot, value, options, false);
+    }
+    fn projectGpuNowAdmitted(self: *Capture, slot: usize, value: video.preparation.Prepared, options: video.preparation.Options, admitted: bool) !void {
+        const started = batch_clock.monotonicNs();
         var prepared = value;
         var live = true;
         defer if (live) prepared.deinit();
         if (comptime build_options.enable_metal) {
             const io = self.io orelse return error.MissingVideoIo;
             try prepared.wait(io, self.control);
-            const input = try MetalCompute.importVideoBuffer(self.cb, try prepared.buffer(), prepared.geometry.values());
+            const input = try MetalCompute.importVideoBufferSpan(self.cb, try prepared.buffer(), prepared.output_byte_offset, prepared.geometry.values());
             defer self.cb.free(input);
             // Give sole ownership to inference before runtime reuse can occur.
             prepared.deinit();
             live = false;
-            const started = batch_clock.monotonicNs();
-            const encoded = try self.encodeGpu(input, options, 1);
+            const encoded = try self.encodeGpuAdmitted(input, options, 1, admitted);
             if (self.resident) |tensors| {
                 const tensor = if (self.cb.embedding_stage != null) MetalCompute.escapeEmbeddingStage(self.cb, encoded.tensor) catch |err| {
                     self.cb.free(encoded.tensor);
@@ -3210,4 +3319,119 @@ test "embeddinggemma2 video phase denial precedes projector access" {
         try std.testing.expectEqual(expected, hook.observed);
         try std.testing.expectEqual(capture.preparedVision(), capture.last_prepared);
     }
+}
+
+test "embeddinggemma2 vision admission shrinks before consuming preparations and preserves terminal failures" {
+    const Hook = struct {
+        limit: usize,
+        attempts: usize = 0,
+        failure: ?anyerror = null,
+        fn reserve(raw: *anyopaque, bytes: ?usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            if (self.failure) |err| return err;
+            if (bytes.? > self.limit) return error.ResourceTemporarilyUnavailable;
+        }
+        fn unused(_: *anyopaque) anyerror!void {
+            return error.UnexpectedStageCall;
+        }
+        fn cleanup(_: *anyopaque) void {}
+        fn cancelled(_: ?*const anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
+    };
+    const options = video.preparation.Options{ .width = 576, .height = 528, .matrix = .bt709 };
+    for ([_]bool{ false, true }) |required| {
+        var hook = Hook{ .limit = try visionScratch(options, 2, required) };
+        const stage = @import("../ops/ops.zig").EmbeddingStageControl{ .ptr = &hook, .pause_fn = Hook.unused, .resume_fn = Hook.unused, .cleanup_fn = Hook.cleanup, .workspace_fn = Hook.reserve };
+        try std.testing.expectEqual(@as(usize, 2), try admitVisionFrames(&stage, options, 6, required, .{}));
+        try std.testing.expectEqual(@as(usize, 5), hook.attempts);
+        hook.limit = 0;
+        hook.attempts = 0;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, admitVisionFrames(&stage, options, 6, required, .{}));
+        try std.testing.expectEqual(@as(usize, 6), hook.attempts);
+        hook.failure = error.UnsupportedPrimitiveOp;
+        hook.attempts = 0;
+        try std.testing.expectError(error.UnsupportedPrimitiveOp, admitVisionFrames(&stage, options, 6, required, .{}));
+        try std.testing.expectEqual(@as(usize, 1), hook.attempts);
+        hook.attempts = 0;
+        try std.testing.expectError(error.Cancelled, admitVisionFrames(&stage, options, 6, required, .{ .check_fn = Hook.cancelled }));
+        try std.testing.expectEqual(@as(usize, 0), hook.attempts);
+    }
+}
+
+test "embeddinggemma2 final patch spans require one contiguous allocation with checked offsets" {
+    var marker: [2]u8 = undefined;
+    const buffers = [_]*anyopaque{ &marker[0], &marker[0], &marker[0] };
+    try std.testing.expect(contiguousPreparationSpans(&buffers, &.{ 128, 192, 256 }, 64));
+    try std.testing.expect(!contiguousPreparationSpans(&buffers, &.{ 128, 256, 320 }, 64));
+    try std.testing.expect(!contiguousPreparationSpans(&.{ &marker[0], &marker[1] }, &.{ 128, 192 }, 64));
+    try std.testing.expect(!contiguousPreparationSpans(&buffers, &.{ 0, 64, 128 }, std.math.maxInt(usize)));
+    try std.testing.expect(!contiguousPreparationSpans(&.{}, &.{}, 64));
+}
+
+test "embeddinggemma2 Metal final patch slab imports contiguous frames and nonzero singleton spans without copying" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const metal = @import("../ops/metal_compute.zig");
+    const hosted = @import("../ops/gpu_hosted_store.zig");
+    const a = std.testing.allocator;
+    var store = hosted.WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer {
+        metal.deinitPrefetchQueue(&store);
+        store.lazy_weights.deinit(a);
+    }
+    metal.initPrefetchQueue(&store, a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+    var pool = media.admission.Pool{ .limits = .{ .device_bytes = 64 * 1024 * 1024, .commands = 4 } };
+    defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+    var preparer = try video.preparation.Metal.init(try MetalCompute.videoDevice(&cb));
+    defer preparer.deinit();
+    const options = video.preparation.Options{ .width = 48, .height = 48, .matrix = .bt601, .torchvision = true, .admission_pool = &pool };
+    const g = try video.preparation.geometry(48, 48, options);
+    const span = g.values() * @sizeOf(f32);
+    try configureOutputSlab(&preparer, &pool, .{ .bytes = 64 * 1024 * 1024 - 256, .transient = 512, .commands = 4 });
+    try std.testing.expectEqual(@as(usize, 0), preparer.output_slab_bytes);
+    try preparer.admitOutputSlab(&pool, 2 * span);
+    const baseline = pool.snapshot();
+    const black: [48 * 48 * 4]u8 = @splat(0);
+    const white: [48 * 48 * 4]u8 = @splat(255);
+    var first = try preparer.submitRgba(a, &black, 48, 48, options, .{});
+    var first_live = true;
+    defer if (first_live) first.deinit();
+    const Stop = struct {
+        fn check(_: ?*const anyopaque) anyerror!void {
+            return error.Timeout;
+        }
+    };
+    try std.testing.expectError(error.Timeout, preparer.submitRgba(a, &white, 48, 48, options, .{ .check_fn = Stop.check }));
+    var second = try preparer.submitRgba(a, &white, 48, 48, options, .{});
+    var second_live = true;
+    defer if (second_live) second.deinit();
+    try first.wait(std.testing.io, .{});
+    try second.wait(std.testing.io, .{});
+    try std.testing.expectEqual(@as(usize, 0), first.output_byte_offset);
+    try std.testing.expectEqual(span, second.output_byte_offset);
+    try std.testing.expectEqual(try first.buffer(), try second.buffer());
+    const buffer = try first.buffer();
+    const full = try MetalCompute.importVideoBufferSpan(&cb, buffer, 0, g.values() * 2);
+    defer cb.free(full);
+    const tail = try MetalCompute.importVideoBufferSpan(&cb, buffer, span, g.values());
+    defer cb.free(tail);
+    first.deinit();
+    first_live = false;
+    second.deinit();
+    second_live = false;
+    try std.testing.expectEqual(baseline, pool.snapshot());
+    const values = try cb.toFloat32(full, a);
+    defer a.free(values);
+    for (values[0..g.values()]) |v| try std.testing.expectApproxEqAbs(@as(f32, -1), v, 1e-6);
+    for (values[g.values()..]) |v| try std.testing.expectApproxEqAbs(@as(f32, 1), v, 1e-6);
+    const last = try cb.toFloat32(tail, a);
+    defer a.free(last);
+    try std.testing.expectEqualSlices(f32, values[g.values()..], last);
+    try std.testing.expectError(error.MetalPreparationFailed, preparer.submitRgba(a, &white, 48, 48, options, .{}));
+    try std.testing.expectEqual(baseline, pool.snapshot());
 }

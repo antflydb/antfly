@@ -42,6 +42,7 @@ void *av_metal_plane_texture(void *, size_t);
 void av_metal_import_release(void *);
 int32_t av_preparer_create(void *, void **);
 void av_preparer_destroy(void *);
+int32_t av_preparer_output_slab(void *, size_t);
 int32_t av_coefficients_create(void *, const uint32_t *, size_t, const int32_t *, size_t, const uint32_t *, size_t, const int32_t *, size_t, void **);
 void av_coefficients_destroy(void *);
 int32_t av_chroma_create(void *, const void *, size_t, const void *, size_t, void **);
@@ -54,5 +55,6 @@ int32_t av_prepare_host_submit(void *, const uint8_t *, size_t, const uint8_t *,
 int32_t av_prepare_rgba_into_submit(void *, const uint8_t *, size_t, const uint32_t *, void *, void *, size_t, void **);
 int av_prepared_poll(void *);
 void *av_prepared_buffer(void *);
+size_t av_prepared_offset(void *);
 int32_t av_prepared_copy(void *, float *, size_t);
 void av_prepared_destroy(void *);

@@ -2041,12 +2041,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// Caller waits for producer completion and releases its Prepared owner
     /// before consuming this tensor. The CT retains the Metal allocation.
     pub fn importVideoBuffer(cb: *const ops.ComputeBackend, buffer: *anyopaque, values: usize) !CT {
-        if (cb.kind() != .metal or values == 0 or values % 768 != 0) return error.InvalidTensorShape;
+        return importVideoBufferSpan(cb, buffer, 0, values);
+    }
+    /// Retain a producer-owned final span without copying or exposing adjacent
+    /// frames. The external buffer may be larger than this logical tensor.
+    pub fn importVideoBufferSpan(cb: *const ops.ComputeBackend, buffer: *anyopaque, offset: usize, values: usize) !CT {
+        if (cb.kind() != .metal or values == 0 or values % 768 != 0 or offset % @sizeOf(f32) != 0) return error.InvalidTensorShape;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
         const bytes = try std.math.mul(usize, values, @sizeOf(f32));
-        const handle = metal_runtime.termite_metal_buffer_retain_external(runtime, buffer, bytes) orelse return error.ForeignResidentVideoBuffer;
-        var tensor = MetalTensor.deviceOwned(@ptrCast(runtime), handle, 0, bytes, &.{ @intCast(values / 768), 768 });
+        const handle = metal_runtime.termite_metal_buffer_retain_external(runtime, buffer, try std.math.add(usize, offset, bytes)) orelse return error.ForeignResidentVideoBuffer;
+        var tensor = MetalTensor.deviceOwned(@ptrCast(runtime), handle, offset, bytes, &.{ @intCast(values / 768), 768 });
         errdefer tensor.deinit();
         return self.ctFromOwnedMetalTensor(tensor);
     }

@@ -841,6 +841,13 @@ bindings, retries admission and selectively reclaims idle caches. Ownership is
 restored before return, including cancellation/error cleanup. Other quota or
 forced denials do not trigger cache eviction.
 
+Metal video final patch storage has its own selection-sized reservation and
+append-only spans; no span is recycled while a preparation or import may read
+it. Compatible ready frames import a contiguous batch without stacking. Live
+vision admission reduces batch size before consuming jobs, and calibration
+uses the ready ceiling and includes import/packing costs. All Metal group
+backbone transitions, including opt-outs, admit growth before lease reduction.
+
 Mixed Metal group reservations use inspected image geometry and trustworthy
 audio duration bounds for retained rows. Encoded audio retains its bounded
 decoder allowance even with a short header duration; unknown durations keep

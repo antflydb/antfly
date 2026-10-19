@@ -949,6 +949,18 @@ before the destination is released. Oversized staging windows or unsupported
 capabilities retain sequential preparation. Destination spans expose their byte
 offset; explicit debug readback supports both shared and private buffers.
 
+Video producers can reserve append-only final patch storage for a bounded
+selection, with explicit byte offsets on every `Prepared` output. Native YUV,
+host integer planes and RGB/RGBA use the same destination mechanism. The slab
+has separate admission, is never overwritten, and survives until imports and
+queued commands drain. Compatible contiguous spans import directly as one
+batch; unrelated buffers retain bounded stacking. Geometry-derived planning
+includes this storage, and tight caller pools may retain independent outputs.
+Video calibration considers only compatible ready frames and measures imports
+and packing as part of completed cost. Vision admission shrinks cohorts before
+consuming preparations; conservative fallback also adapts its retained-input
+subcohorts to live capacity.
+
 Mixed and video pipelines release the model gate and provider lease between
 ready stages, including CPU decode/preparation queue waits. Retained projections
 cross handoff in independent device buffers, preventing aliasing with a peer's
