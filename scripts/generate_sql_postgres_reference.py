@@ -1517,15 +1517,74 @@ def normalize_ordered_contract(entry):
     entry.pop("sql_nulls")
 
 
-def document_reference(db, cases, schemas):
+DOCUMENT_SLUG_IDS = {f"sql-{n:04}" for n in range(960, 967)}
+DOCUMENT_ARRAY_IDS = {
+    "sql-1007",
+    *[f"sql-{n:04}" for n in range(1018, 1023)],
+    "sql-1025",
+}
+DOCUMENT_POSITION_IDS = {f"sql-{n:04}" for n in range(1047, 1054)}
+
+
+def document_witness_rows(identity):
+    """Explicit matching rows; never rewrite original SQL or grant index proof."""
+    rows = deepcopy(SEEDS)
+    first = rows[0]["value"]
+    if identity in DOCUMENT_SLUG_IDS:
+        first["status"] = "Draft Launch"
+    elif identity in DOCUMENT_ARRAY_IDS:
+        first["metadata"]["flags"] = ["rated", "hot"]
+    elif identity in DOCUMENT_POSITION_IDS:
+        first["status"] = "warm"
+    elif identity == "sql-1091":
+        # Absent optional property is SQL NULL; explicit JSON null is a
+        # different document validation and projection contract.
+        del first["status"]
+    return rows
+
+
+DOCUMENT_NEGATIVE_IDS = {
+    "sql-0891",
+    "sql-0911",
+    "sql-0913",
+    "sql-0918",
+    "sql-0922",
+    "sql-0928",
+    "sql-0929",
+    "sql-0930",
+    "sql-0932",
+    "sql-0933",
+    "sql-0934",
+    "sql-0938",
+    "sql-0946",
+    "sql-1069",
+    "sql-1075",
+}
+
+
+def document_reference(db, cases, schemas, *, annotation_only=False):
     import psycopg
     from psycopg import sql
 
     entries, excluded = [], []
     for case in cases:
         schema = schemas[case["id"]]
+        seeds = document_witness_rows(case["id"]) if annotation_only else SEEDS
         raw = json.dumps(schema)
-        if '"generated"' in raw or "x-antfly-column-name" in raw:
+        generated_names = {
+            name for name, prop in properties(schema).items() if "generated" in prop
+        }
+        # Historical planner annotations are not active generated-column or
+        # index declarations in the public document schema. Qualify direct
+        # expressions independently of those annotations, but never claim
+        # generated-column reads/writes or path aliases from an inert profile.
+        uses_generated = any(
+            re.search(r"\b" + re.escape(name) + r"\b", case["sql"], re.I)
+            for name in generated_names
+        )
+        if "x-antfly-column-name" in raw or (
+            generated_names and (not annotation_only or uses_generated)
+        ):
             excluded.append(
                 {
                     "id": case["id"],
@@ -1536,7 +1595,7 @@ def document_reference(db, cases, schemas):
         try:
             with db.transaction(force_rollback=True):
                 props = properties(schema)
-                create_table(db, "docs", props, SEEDS, identity=True)
+                create_table(db, "docs", props, seeds, identity=True)
                 # SQL NULL and a missing document property are different
                 # physical states. PostgreSQL UPDATE OF triggers expose the
                 # actual assignment columns without parsing/rewriting the
@@ -1568,12 +1627,12 @@ def document_reference(db, cases, schemas):
                     ROW_LIMIT + 1
                 )
                 if len(final) > ROW_LIMIT or set(row[0] for row in final) - {
-                    seed["key"] for seed in SEEDS
+                    seed["key"] for seed in seeds
                 }:
                     raise ValueError("insert identity/default profile required")
                 stored = {row[0]: row[1:] for row in final}
                 expected = []
-                for seed in SEEDS:
+                for seed in seeds:
                     if seed["key"] not in stored:
                         continue
                     value = deepcopy(seed["value"])
@@ -1595,8 +1654,9 @@ def document_reference(db, cases, schemas):
                             value[name] = cell
                     expected.append({"key": seed["key"], "value": value})
                 native_schema = deepcopy(schema)
-                metadata = properties(native_schema).get("metadata")
-                if metadata is not None and metadata.get("type") == "json":
+                for metadata in properties(native_schema).values():
+                    if metadata.get("type") != "json":
+                        continue
                     # The source uses a historical relational-only shorthand
                     # for an object-valued document property. Publish the
                     # current document JSON Schema shape explicitly, retain
@@ -1604,9 +1664,31 @@ def document_reference(db, cases, schemas):
                     metadata["type"] = "object"
                     metadata["additionalProperties"] = True
                 entry.update(schema=schema, native_schema=native_schema, final=expected)
+                if seeds != SEEDS:
+                    entry["seeds"] = seeds
                 entries.append(entry)
         except (psycopg.Error, ValueError, KeyError, TypeError) as error:
-            excluded.append({"id": case["id"], "reason": str(error)})
+            if (
+                annotation_only
+                and case["id"] in DOCUMENT_NEGATIVE_IDS
+                and isinstance(error, psycopg.Error)
+                and error.sqlstate
+            ):
+                native_schema = deepcopy(schema)
+                for metadata in properties(native_schema).values():
+                    if metadata.get("type") == "json":
+                        metadata.update(type="object", additionalProperties=True)
+                entries.append(
+                    {
+                        "id": case["id"],
+                        "schema": schema,
+                        "native_schema": native_schema,
+                        "sqlstate": error.sqlstate,
+                        "final": deepcopy(SEEDS),
+                    }
+                )
+            else:
+                excluded.append({"id": case["id"], "reason": str(error)})
     return {
         "format": 2,
         "reference": "PostgreSQL exact SQL",
@@ -1631,6 +1713,7 @@ def main():
             "set_read",
             "join_read",
             "document",
+            "document_projection",
             "lateral",
             "mutation",
             "correlated_mutation",
@@ -1673,7 +1756,18 @@ def main():
         parser.error("constraint profiles require the mutation campaign")
     if args.include and not args.check:
         parser.error("--include requires a checked baseline golden")
-    manifest = json.loads((FIXTURES / f"sql_{args.campaign}_campaign.json").read_text())
+    manifest_name = (
+        "document" if args.campaign == "document_projection" else args.campaign
+    )
+    manifest = json.loads((FIXTURES / f"sql_{manifest_name}_campaign.json").read_text())
+    if args.campaign == "document_projection":
+        supplement = json.loads(
+            (FIXTURES / "sql_document_projection_campaign.json").read_text()
+        )
+        manifest["entries"].extend(supplement["entries"])
+        ids = [entry["id"] for entry in manifest["entries"]]
+        if len(ids) != len(set(ids)):
+            parser.error("document projection schemas contain duplicate IDs")
     requested = [entry["id"] for entry in manifest["entries"]]
     if args.only_id:
         requested = args.only_id
@@ -1739,6 +1833,7 @@ def main():
                 db,
                 cases,
                 {entry["id"]: entry["schema"] for entry in manifest["entries"]},
+                annotation_only=args.campaign == "document_projection",
             )
         result["server_version"] = db.info.server_version
     if expected:

@@ -13619,6 +13619,129 @@ test "httpx SQL document campaign verifies exact native mutation and storage out
     // sql-1085, sql-1086, sql-1087, sql-1089, sql-1090, sql-1092.
     // sql-1093, sql-1094, sql-1095, sql-1096, sql-1098, sql-1099.
     // sql-1100.
+    try documentMutationCampaign(@import("antfly_local_sources").sql_parity_fixtures.document_reference);
+}
+
+test "httpx SQL document expression mutations do not trust historical index annotations" {
+    const ids = [_][]const u8{
+        "sql-0891",
+        "sql-0911",
+        "sql-0913",
+        "sql-0918",
+        "sql-0922",
+        "sql-0928",
+        "sql-0929",
+        "sql-0930",
+        "sql-0932",
+        "sql-0933",
+        "sql-0934",
+        "sql-0938",
+        "sql-0946",
+        "sql-0956",
+        "sql-0957",
+        "sql-0958",
+        "sql-0959",
+        "sql-0960",
+        "sql-0961",
+        "sql-0962",
+        "sql-0963",
+        "sql-0964",
+        "sql-0965",
+        "sql-0966",
+        "sql-0967",
+        "sql-0968",
+        "sql-0969",
+        "sql-0974",
+        "sql-0975",
+        "sql-0976",
+        "sql-0977",
+        "sql-0978",
+        "sql-0979",
+        "sql-0980",
+        "sql-0982",
+        "sql-0983",
+        "sql-0984",
+        "sql-0985",
+        "sql-0987",
+        "sql-0988",
+        "sql-0989",
+        "sql-0990",
+        "sql-0991",
+        "sql-0992",
+        "sql-0993",
+        "sql-0994",
+        "sql-0996",
+        "sql-0997",
+        "sql-0998",
+        "sql-0999",
+        "sql-1001",
+        "sql-1002",
+        "sql-1003",
+        "sql-1004",
+        "sql-1005",
+        "sql-1006",
+        "sql-1007",
+        "sql-1009",
+        "sql-1010",
+        "sql-1011",
+        "sql-1012",
+        "sql-1014",
+        "sql-1015",
+        "sql-1016",
+        "sql-1017",
+        "sql-1018",
+        "sql-1019",
+        "sql-1020",
+        "sql-1021",
+        "sql-1022",
+        "sql-1023",
+        "sql-1024",
+        "sql-1025",
+        "sql-1026",
+        "sql-1027",
+        "sql-1028",
+        "sql-1030",
+        "sql-1031",
+        "sql-1032",
+        "sql-1033",
+        "sql-1034",
+        "sql-1035",
+        "sql-1036",
+        "sql-1037",
+        "sql-1038",
+        "sql-1039",
+        "sql-1040",
+        "sql-1041",
+        "sql-1042",
+        "sql-1043",
+        "sql-1044",
+        "sql-1045",
+        "sql-1046",
+        "sql-1047",
+        "sql-1048",
+        "sql-1049",
+        "sql-1050",
+        "sql-1051",
+        "sql-1052",
+        "sql-1053",
+        "sql-1058",
+        "sql-1065",
+        "sql-1066",
+        "sql-1067",
+        "sql-1069",
+        "sql-1075",
+        "sql-1091",
+        "sql-1097",
+    };
+    const bytes = @import("antfly_local_sources").sql_parity_fixtures.document_projection_reference;
+    const manifest = try std.json.parseFromSlice(struct { entries: []const struct { id: []const u8 } }, std.testing.allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer manifest.deinit();
+    try std.testing.expectEqual(ids.len, manifest.value.entries.len);
+    for (ids, manifest.value.entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    try documentMutationCampaign(bytes);
+}
+
+fn documentMutationCampaign(reference_bytes: []const u8) !void {
     const alloc = std.testing.allocator;
     const Source = struct {
         schema: []const u8 = "",
@@ -13666,7 +13789,7 @@ test "httpx SQL document campaign verifies exact native mutation and storage out
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     const parity = @import("sql_parity_reference.zig");
-    const reference = try std.json.parseFromSlice(parity.DocumentReference, alloc, @import("antfly_local_sources").sql_parity_fixtures.document_reference, .{ .ignore_unknown_fields = true });
+    const reference = try std.json.parseFromSlice(parity.DocumentReference, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
     defer reference.deinit();
     try parity.runDocuments(alloc, &handler, &db, &source, reference.value);
 }

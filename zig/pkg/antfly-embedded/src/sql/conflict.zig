@@ -56,7 +56,8 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         for (clause.columns) |column| _ = try table.column(column);
         // Undefined fields remain binding errors even on a provider without
         // unique-owner admission. Document properties are never unique claims.
-        if (table.storage_mode == .document or backend.vtable.resolve_conflict_owners == null) return error.UnsupportedSqlShape;
+        if (table.storage_mode == .document) return error.ConflictArbiterNotFound;
+        if (backend.vtable.resolve_conflict_owners == null) return error.UnsupportedSqlShape;
     }
     const arbiter_conditions = if (clause.arbiter_predicate) |predicate| try bindArbiterPredicate(alloc, table, predicate) else &.{};
     const arbiter_expressions = try alloc.alloc(catalog.ConflictExpression, clause.expressions.len);
@@ -289,7 +290,7 @@ pub fn allowsDuplicateKeys(clause: ast.Conflict) bool {
 pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation, captured: []const []const scalar.Datum) ![]const catalog.Mutation {
     if (clause.capture_count != 0 and captured.len != proposed.len) return error.InvalidSqlBackendResponse;
     if (!context.backend.predicate_only_mutations) return error.UnsupportedSqlExecution;
-    if (table.storage_mode == .document and !physicalArbiter(table, clause)) return error.UnsupportedSqlShape;
+    if (table.storage_mode == .document and !physicalArbiter(table, clause)) return error.ConflictArbiterNotFound;
     const prepare = context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
     const normalized = try prepare(context.backend.ptr, context.arena, table, proposed);
     if (normalized.len != proposed.len) return error.InvalidSqlBackendResponse;
@@ -837,7 +838,7 @@ test "SQL document conflict root replacements avoid cold preimages and skipped r
     };
     for ([_]struct { sql: []const u8, failure: anyerror }{
         .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(missing) DO NOTHING", .failure = error.UndefinedColumn },
-        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(title) DO NOTHING", .failure = error.UnsupportedSqlShape },
+        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(title) DO NOTHING", .failure = error.ConflictArbiterNotFound },
         .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO UPDATE SET _doc='[]'", .failure = error.SqlTypeMismatch },
         .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO UPDATE SET _doc=NULL", .failure = error.SqlNotNullViolation },
         .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO UPDATE SET _doc=DEFAULT", .failure = error.SqlNotNullViolation },

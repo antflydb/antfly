@@ -129,7 +129,18 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     var parser: Parser = .{ .alloc = alloc, .tokens = tokens.items, .source = sql, .limits = limits, .diagnostic = diagnostic };
     const statement = try parser.statement();
     _ = parser.take(.semicolon);
-    if (parser.pos != tokens.items.len) return parser.fail(error.UnsupportedSqlShape, "unexpected trailing SQL; only one supported statement is allowed");
+    if (parser.pos != tokens.items.len) return parser.fail(switch (statement) {
+        // PostgreSQL row locks belong to a SELECT producer, not to the
+        // mutation itself. Likewise UPDATE/DELETE do not accept ORDER/LIMIT.
+        // Never execute a valid mutation prefix while discarding its suffix.
+        .update, .delete => if (tokens.items[parser.pos].isKeyword(.@"for") or
+            tokens.items[parser.pos].isKeyword(.order) or tokens.items[parser.pos].isKeyword(.limit) or
+            tokens.items[parser.pos].isKeyword(.offset) or tokens.items[parser.pos].isKeyword(.fetch))
+            error.InvalidSqlSyntax
+        else
+            error.UnsupportedSqlShape,
+        else => error.UnsupportedSqlShape,
+    }, "unexpected trailing SQL; only one supported statement is allowed");
     return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting };
 }
 
@@ -812,6 +823,17 @@ const Parser = struct {
                 }, .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right }) } });
                 continue;
             }
+            if ((current.kind == .path_arrow_json or current.kind == .path_arrow_text) and minimum <= 4) {
+                self.pos += 1;
+                var path = try self.scalar(depth + 1, 5);
+                if (path.* == .literal and (path.literal == .string or path.literal == .null))
+                    path = try self.scalarNode(.{ .cast = .{ .operand = path, .type = .array, .element_type = .text } });
+                left = try self.scalarNode(.{ .call = .{
+                    .name = if (current.kind == .path_arrow_json) "$json_path" else "$json_path_text",
+                    .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, path }),
+                } });
+                continue;
+            }
             const op: ast.Scalar.Binary = switch (current.kind) {
                 .plus => .add,
                 .minus => .subtract,
@@ -836,7 +858,7 @@ const Parser = struct {
                 .concat => 4,
                 .add, .subtract => 5,
                 .multiply, .divide, .modulo => 6,
-                .json_get, .json_text => 7,
+                .json_get, .json_text => 4,
             };
             if (precedence < minimum) break;
             self.pos += 1;
@@ -3632,7 +3654,7 @@ test "SQL original row-lock clauses on non-locking SQL surfaces reject before ba
         "UPDATE usage_records AS u SET status = 'processing' WHERE u.status = 'queued' FOR UPDATE OF archived_records RETURNING u.id",
         "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id",
     }) |sql| {
-        try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+        try std.testing.expectError(if (std.mem.startsWith(u8, sql, "SELECT")) error.UnsupportedSqlShape else error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
     }
 }
 

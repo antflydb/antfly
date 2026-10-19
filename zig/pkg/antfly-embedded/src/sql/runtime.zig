@@ -3983,6 +3983,8 @@ test "SQL USING rejects missing ambiguous and duplicate keys before capture" {
         .{ .sql = "SELECT * FROM things a JOIN things b USING (absent)", .failure = error.UndefinedColumn },
         .{ .sql = "SELECT * FROM things a JOIN things b USING (id, id)", .failure = error.DuplicateSqlColumn },
         .{ .sql = "SELECT * FROM things a JOIN things b USING (id) AS a", .failure = error.DuplicateSqlAlias },
+        .{ .sql = "SELECT * FROM things a CROSS JOIN things a", .failure = error.DuplicateSqlAlias },
+        .{ .sql = "SELECT * FROM things a JOIN things a USING (id)", .failure = error.DuplicateSqlAlias },
         .{ .sql = "SELECT * FROM (SELECT id AS k, id AS k FROM things) a JOIN (SELECT id AS k FROM things) b USING (k)", .failure = error.AmbiguousSqlColumn },
     }) |case| {
         var backend: TestBackend = .{};

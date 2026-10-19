@@ -1787,7 +1787,7 @@ const Builder = struct {
                     if (join.kind != .left or join.condition != null or join.demand != null or lateral) return error.InvalidSqlBackendResponse;
                     break :blk try self.membershipNode(left, right, membership.probes, membership.correlations, membership.alias);
                 }
-                for (left.columns) |a| for (right.columns) |b| if (a.qualifier.len != 0 and std.mem.eql(u8, a.qualifier, b.qualifier)) return error.AmbiguousSqlColumn;
+                for (left.columns) |a| for (right.columns) |b| if (a.qualifier.len != 0 and std.mem.eql(u8, a.qualifier, b.qualifier)) return error.DuplicateSqlAlias;
                 if (join.keys != .none) {
                     if (join.condition != null or join.membership != null or join.demand != null or join.single_row or join.kind == .cross) return error.InvalidSqlBackendResponse;
                     break :blk try self.keyJoin(left, right, join.kind, join.keys, join.using_alias, apply_id);

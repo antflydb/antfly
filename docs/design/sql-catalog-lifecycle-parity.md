@@ -12706,3 +12706,49 @@ returning a post-commit cancellation error. Cold recovery must use this mode,
 not reconcile speculative descriptors. Actual dispatch, metadata permission/
 ACK/root adoption and coordinated publication/release remain required; decoder
 24 is still unadvertised. No original parity disposition is reclassified.
+
+### Original document-expression and mutation-grammar expansion (2026-10-18)
+
+The immutable 1,586-case inventory is unchanged. The native HTTP-handler gate
+now verifies 108 original document contracts: 93 successful mutations against
+matching witnesses and 15 rejections with unchanged primary versions, physical
+digests and complete postimages. Twelve successful contracts supersede former
+JSON-path syntax rejections. Of this cohort, 96 previously lacked qualified
+outcomes. A separate 105-case gate reproduces PostgreSQL's 42601 rejection of
+direct mutation locking/order/limit suffixes before catalog or storage access.
+Together these close 201 unresolved cases: 725 to 524. Current dispositions are
+620 implemented / 128 rejected / 314 superseded / 524 unresolved.
+
+JSON path operators consume typed text-array ordinals through the shared
+allocation-free JSON extraction kernel. Prepared paths retain bounds and ranks,
+own their input after parameter-buffer retirement and share execution work and
+cancellation. Unknown JSON comparison literals use bounded, once-per-program
+input preparation; explicitly typed text is not silently treated as JSON.
+Operator precedence, result types and SQL-null/JSON-null distinctions are checked
+against PostgreSQL. Nonexistent document conflict arbiters return 42P10, and
+duplicate relation aliases return 42712 before capture. Valid-but-unsupported
+operators retain capability errors rather than being mislabeled syntax errors.
+
+These are native single-owner handler/storage contracts, not distributed fault,
+active generated-column or index-authority claims. Historical annotation fields
+grant no permission or uniqueness. The supplemental path schemas are copied
+from the checksum-pinned source corpus; object-valued historical JSON shorthand
+is expressed using the current public schema. The generic relational oracle
+does not qualify document-specific explicit-NULL/default behavior (sql-0919),
+nor generated-field or path-alias activation. SQL operator contracts have a
+separate oracle corpus from the existing 25 durable JSON-function contracts;
+this does not advertise additional persistent expression capabilities.
+
+Qualification: native expansion and the previous 49-document baseline passed
+(86/86 build steps, no failures/skips/leaks); PostgreSQL independently reproduced
+the document outcomes and 105 syntax diagnostics; 128 oracle unit tests passed.
+Prepared-path Debug measurement: 10,000 evaluations, one input decode, zero
+scratch allocation, approximately 8.2 ms in a local run. This is a correctness/
+allocation check, not a production-throughput claim.
+
+Final full `zig build sql-test -Doptimize=Debug -j1 --summary all` qualification
+passed all 25 build steps: 1,154 local tests and 234 dependent tests passed,
+four opt-in tests skipped, zero failures and zero leaks. The Apache product
+boundary check also passed (2,330 source files); ledger integrity tests passed
+all 20 cases. These results qualify this expansion, not the remaining 524
+unresolved inventory cases or the unrelated architectural work listed above.

@@ -217,6 +217,14 @@ String literals assigned to JSON columns are interpreted as JSON input text;
 typed JSON parameters remain values. Numeric JSON text is retained losslessly.
 Identical JSON literals share one immutable parsed tree in the binding; Execute
 reuses that tree rather than parsing the literal again after validation.
+JSON path operators `#>` and `#>>` accept typed `text[]` paths, including
+parameters, non-default bounds and multidimensional paths. They use the same
+borrowed JSON extraction kernel as the path functions; paths are consumed by
+ordinal without expanding compact arrays or reconstructing the source JSON.
+Path components share the execution work/cancellation budget. JSON extraction
+retains JSON null, while text extraction maps JSON null to SQL NULL. The JSON
+operators use PostgreSQL's generic-operator precedence, including composition
+with JSON concatenation.
 Native typed reads and expression results carry separate SQL-null flags through
 HTTP and pgwire, including binary portals. Mutations carry explicit JSON-null
 field provenance into native validation and row preparation, so a JSON null

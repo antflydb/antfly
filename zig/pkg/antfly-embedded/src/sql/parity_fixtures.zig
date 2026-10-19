@@ -32,6 +32,7 @@ pub const correlated_mutation_postgres_reference = @embedFile("fixtures/sql_corr
 pub const conditional_subquery_reference = @embedFile("fixtures/sql_conditional_subquery_reference.json");
 pub const document_campaign = @embedFile("fixtures/sql_document_campaign.json");
 pub const document_reference = @embedFile("fixtures/sql_document_reference.json");
+pub const document_projection_reference = @embedFile("fixtures/sql_document_projection_reference.json");
 pub const read_campaign_reference = @embedFile("fixtures/sql_read_campaign_reference.json");
 pub const read_campaign_profile = @embedFile("fixtures/sql_read_campaign_profile.json");
 pub const name_resolution_campaign = @embedFile("fixtures/sql_name_resolution_campaign.json");

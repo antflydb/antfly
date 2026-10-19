@@ -24,6 +24,141 @@ const Handler = @import("httpx_handler.zig").AntflyApiHandler;
 const httpx = @import("httpx");
 const wire = @import("antfly_metadata_openapi").types;
 
+test "httpx SQL original PostgreSQL mutation syntax errors never access storage" {
+    const ids = [_][]const u8{
+        "sql-0573",
+        "sql-0574",
+        "sql-0575",
+        "sql-0596",
+        "sql-0597",
+        "sql-0603",
+        "sql-0604",
+        "sql-0605",
+        "sql-0613",
+        "sql-0614",
+        "sql-0615",
+        "sql-0621",
+        "sql-0622",
+        "sql-0624",
+        "sql-0625",
+        "sql-0626",
+        "sql-0627",
+        "sql-0628",
+        "sql-0629",
+        "sql-0630",
+        "sql-0631",
+        "sql-0632",
+        "sql-0633",
+        "sql-0634",
+        "sql-0635",
+        "sql-0636",
+        "sql-0637",
+        "sql-0638",
+        "sql-0639",
+        "sql-0640",
+        "sql-0643",
+        "sql-0644",
+        "sql-0645",
+        "sql-0646",
+        "sql-0647",
+        "sql-0648",
+        "sql-0649",
+        "sql-0650",
+        "sql-0651",
+        "sql-0652",
+        "sql-0653",
+        "sql-0654",
+        "sql-0655",
+        "sql-0656",
+        "sql-0658",
+        "sql-0659",
+        "sql-0660",
+        "sql-0661",
+        "sql-0662",
+        "sql-0663",
+        "sql-0664",
+        "sql-0665",
+        "sql-0666",
+        "sql-0668",
+        "sql-1523",
+        "sql-1524",
+        "sql-1525",
+        "sql-1526",
+        "sql-1527",
+        "sql-1528",
+        "sql-1529",
+        "sql-1530",
+        "sql-1534",
+        "sql-1535",
+        "sql-1536",
+        "sql-1537",
+        "sql-1538",
+        "sql-1539",
+        "sql-1540",
+        "sql-1541",
+        "sql-1542",
+        "sql-1543",
+        "sql-1544",
+        "sql-1545",
+        "sql-1546",
+        "sql-1547",
+        "sql-1548",
+        "sql-1549",
+        "sql-1550",
+        "sql-1551",
+        "sql-1552",
+        "sql-1553",
+        "sql-1554",
+        "sql-1555",
+        "sql-1556",
+        "sql-1557",
+        "sql-1558",
+        "sql-1559",
+        "sql-1560",
+        "sql-1561",
+        "sql-1562",
+        "sql-1563",
+        "sql-1565",
+        "sql-1566",
+        "sql-1567",
+        "sql-1568",
+        "sql-1569",
+        "sql-1570",
+        "sql-1571",
+        "sql-1572",
+        "sql-1573",
+        "sql-1574",
+        "sql-1575",
+        "sql-1576",
+        "sql-1577",
+    };
+    const a = std.testing.allocator;
+    const Closed = struct {
+        calls: usize = 0,
+        fn status(raw: *anyopaque) !metadata.MetadataStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UnexpectedStorageAccess;
+        }
+        fn catalog(raw: *anyopaque, _: std.mem.Allocator, _: local.api_operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UnexpectedStorageAccess;
+        }
+    };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var closed: Closed = .{};
+    var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &closed, .vtable = &.{ .status = Closed.status, .system_catalog = Closed.catalog, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    var handler: Handler = .{ .api_server = &server };
+    for (ids) |id| {
+        errdefer std.debug.print("PostgreSQL syntax original {s}\\n", .{id});
+        try @import("sql_parity_reference.zig").expectRejection(a, &handler, id, "42601");
+        try std.testing.expectEqual(@as(usize, 0), closed.calls);
+    }
+}
+
 const schema_json =
     \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"integer"},"metadata":{"type":"object","nullable":true}},"additionalProperties":true}}}}
 ;
