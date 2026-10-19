@@ -3001,6 +3001,7 @@ fn Engine(comptime Context: type) type {
                 try page.validateWeights();
                 var rows: std.ArrayList(catalog.Row) = .empty;
                 var weights: std.ArrayList(catalog.Count) = .empty;
+                var inputs: std.ArrayList(?i64) = .empty;
                 const slots = page.aggregate_slots orelse return error.InvalidSqlBackendResponse;
                 const multiplicities = page.multiplicities orelse return error.InvalidSqlBackendResponse;
                 if (page.rows.len != multiplicities.len or page.rows.len > limit) return error.InvalidSqlBackendResponse;
@@ -3010,9 +3011,12 @@ fn Engine(comptime Context: type) type {
                     const projected = (try self.plan.project(a, self.engine.context, input, slots)) orelse continue;
                     try rows.append(a, projected);
                     try weights.append(a, weight);
+                    if (page.aggregate_inputs) |arguments| try inputs.append(a, arguments[weight_index]);
                 }
                 self.done = page.after == null;
-                return catalog.Page.counted(a, rows.items, weights.items, try a.dupe(usize, slots), if (self.done) null else "weighted");
+                var result = try catalog.Page.counted(a, rows.items, weights.items, try a.dupe(usize, slots), if (self.done) null else "weighted");
+                result.aggregate_inputs = if (page.aggregate_inputs != null) inputs.items else null;
+                return result;
             }
             fn prepareWindow(self: *WeightedReader) !void {
                 const Cursor = @import("result_cursor.zig").Cursor;
@@ -3131,7 +3135,7 @@ fn Engine(comptime Context: type) type {
                             }
                             output.* = try row(a, self.plan.source.columns, values);
                         }
-                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .exact_multiplicities = try page.cloneWeights(a), .aggregate_slots = try a.dupe(usize, page.aggregate_slots orelse self.slots), .after = if (page.after) |after| try a.dupe(u8, after) else null };
+                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .exact_multiplicities = try page.cloneWeights(a), .aggregate_inputs = try page.cloneAggregateInputs(a), .aggregate_slots = try a.dupe(usize, page.aggregate_slots orelse self.slots), .after = if (page.after) |after| try a.dupe(u8, after) else null };
                     },
                     .replay => {
                         var rows: std.ArrayList(catalog.Row) = .empty;
@@ -3155,7 +3159,7 @@ fn Engine(comptime Context: type) type {
                             }
                             output.* = try row(a, self.plan.source.columns, values);
                         }
-                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, page.multiplicities.?), .exact_multiplicities = try page.cloneWeights(a), .aggregate_slots = try a.dupe(usize, page.aggregate_slots.?), .after = if (self.left.?.done and self.right.?.done) null else "union" };
+                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, page.multiplicities.?), .exact_multiplicities = try page.cloneWeights(a), .aggregate_inputs = try page.cloneAggregateInputs(a), .aggregate_slots = try a.dupe(usize, page.aggregate_slots.?), .after = if (self.left.?.done and self.right.?.done) null else "union" };
                     },
                     .window => {
                         if (self.window_cursor == null) try self.prepareWindow();

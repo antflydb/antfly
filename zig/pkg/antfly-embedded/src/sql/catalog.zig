@@ -436,6 +436,9 @@ pub const Page = struct {
     /// Only after enable_aggregate_weights: this page contributes to these
     /// reducer slots, not to an ordinary logical SQL row stream.
     aggregate_slots: ?[]const usize = null,
+    /// Certified arguments aligned with rows, only on single-reducer summary
+    /// streams. Ordinary pages allocate no argument vector or row metadata.
+    aggregate_inputs: ?[]const ?i64 = null,
     owned_arena: ?std.heap.ArenaAllocator = null,
     storage_page: ?@import("../storage/relational_read_view.zig").View.Page = null,
     /// Exclusive native continuation; null proves exhaustion. Implementations
@@ -453,6 +456,9 @@ pub const Page = struct {
         return .{ .rows = rows, .multiplicities = weights, .exact_multiplicities = if (promoted) counts else null, .aggregate_slots = slots, .after = after };
     }
     pub fn validateWeights(self: Page) !void {
+        if (self.aggregate_inputs) |inputs| {
+            if (inputs.len != self.rows.len or self.aggregate_slots == null or self.aggregate_slots.?.len != 1 or self.multiplicities == null) return error.InvalidSqlBackendResponse;
+        }
         if (self.multiplicities) |weights| {
             if (weights.len != self.rows.len) return error.InvalidSqlBackendResponse;
             for (weights) |weight_value| if (weight_value == 0) return error.InvalidSqlBackendResponse;
@@ -465,6 +471,9 @@ pub const Page = struct {
     }
     pub fn weight(self: Page, index: usize) Count {
         return if (self.exact_multiplicities) |weights| weights[index] else Count.init(if (self.multiplicities) |weights| weights[index] else 1);
+    }
+    pub fn cloneAggregateInputs(self: Page, a: std.mem.Allocator) !?[]const ?i64 {
+        return if (self.aggregate_inputs) |inputs| try a.dupe(?i64, inputs) else null;
     }
     pub fn cloneWeights(self: Page, a: std.mem.Allocator) !?[]const Count {
         const counts = self.exact_multiplicities orelse return null;
@@ -587,13 +596,14 @@ pub const ColumnPage = struct {
 pub const SummaryCertificate = struct {
     field: []const u8,
     invariants: []const []const u8 = &.{},
-    /// All observed non-invariant columns must be affine in one shared private
-    /// marginal. This is a consumer obligation, independently checked by the
-    /// graph producer; it never asserts that arbitrary columns are correlated.
+    /// A consumer obligation over several private length columns. The graph
+    /// producer checks every observed projection against its own geometry;
+    /// this never asserts correlation between arbitrary public columns.
     joint: bool = false,
-    /// Only non-distinct first-moment consumers may supply this request-local
-    /// totality check. The producer independently certifies marginal lineage.
-    /// Its context and integer slots stay pinned for this query, never a cached
+    /// Request-local scalar certificate. Legacy checks negotiate marginal
+    /// moments; statistic callbacks negotiate integer costs, cross moments or
+    /// support sets. The producer independently certifies geometry and totality.
+    /// Context and parameter slots stay pinned for this query, never a cached
     /// prepared plan or an external transport.
     linear: ?@import("cypher").linear_bounds.Check = null,
 };
@@ -1096,4 +1106,24 @@ test "SQL durable planner sketches merge duplicate keys nulls widths and bounded
     var malformed = left.encode();
     malformed[48] = 60;
     try std.testing.expectError(error.InvalidSqlBackendResponse, StatisticsSketch.decode(&malformed));
+}
+
+test "SQL certified aggregate arguments require aligned single-slot pages" {
+    const rows = [_]Row{.{ .id = "r", .version = 0, .value = .null }};
+    const inputs = [_]?i64{7};
+    var page: Page = .{ .rows = &rows, .multiplicities = &.{1}, .aggregate_slots = &.{0}, .aggregate_inputs = &inputs };
+    try page.validateWeights();
+    const cloned = (try page.cloneAggregateInputs(std.testing.allocator)).?;
+    defer std.testing.allocator.free(cloned);
+    try std.testing.expectEqualSlices(?i64, &inputs, cloned);
+    page.aggregate_slots = null;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    page.aggregate_slots = &.{ 0, 1 };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    page.aggregate_slots = &.{0};
+    page.aggregate_inputs = &.{};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    page.aggregate_inputs = &inputs;
+    page.multiplicities = null;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
 }

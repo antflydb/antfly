@@ -121,16 +121,19 @@ pub const NodeCursor = struct {
     summary: ?[]const u8 = null,
     linear_summary: bool = false,
     total_axis: bool = false,
+    statistic: ?@import("statistic.zig").Request = null,
+    statistic_global: bool = false,
     weighted_seeds: ?Engine.AnchorBatch = null,
     fallback_seed: ?usize = null,
     weighted_arena: std.heap.ArenaAllocator,
     adjacency_cache: Engine.AdjacencyCache,
-    pending: std.ArrayList(struct { row: Row, weight: Count }) = .empty,
+    pending: std.ArrayList(struct { row: Row, weight: Count, statistic_input: ?i64 = null }) = .empty,
     pending_position: usize = 0,
     /// Compact prefix counts; exact consumers must read last_counts.
     last_weights: std.ArrayList(u64) = .empty,
     last_counts: std.ArrayList(Count) = .empty,
-    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity, summary: ?[]const u8 = null, linear: bool = false, total_axis: bool = false };
+    last_statistic_inputs: std.ArrayList(?i64) = .empty,
+    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity, summary: ?[]const u8 = null, linear: bool = false, total_axis: bool = false, statistic: ?@import("statistic.zig").Request = null, statistic_global: bool = false };
     /// Plan a projected endpoint bag without advancing or rebinding the read
     /// cut. Plans and their AST storage belong to this cursor.
     pub fn planWeightFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity) !?WeightPlan {
@@ -193,6 +196,7 @@ pub const NodeCursor = struct {
         var plan = (try self.planWeightFields(fields, multiplicity)) orelse return null;
         const targets = try self.engine.summaryTargets(plan.path);
         if (targets.len == 0 or (targets.len != 1 and check == null)) return null;
+        if (check) |proof| if (proof.statistic != null) return self.planStatisticFields(plan, targets, proof, invariants);
         const target = targets[0].name;
         var names: Engine.MomentNames = .empty;
         for (targets, 0..) |part, index| {
@@ -232,6 +236,30 @@ pub const NodeCursor = struct {
         plan.summary = target;
         return plan;
     }
+    fn planStatisticFields(self: *NodeCursor, original: WeightPlan, targets: []const Engine.SummaryTarget, check: @import("linear_bounds.zig").Check, invariants: []const []const u8) !?WeightPlan {
+        var plan = original;
+        const n = plan.path.edges.len;
+        if (n == 0 or n > 32 or self.engine.component_leaves.len != 0) return null;
+        var names: Engine.StatisticNames = .empty;
+        const depth = std.math.cast(i64, self.engine.limits.path_depth) orelse return null;
+        for (targets) |target| try names.put(self.engine.a, target.name, try Engine.Statistic.Form.column(self.engine.a, n, target.edge, depth));
+        if (Engine.statisticReferences(.{ plan.projection.predicate, self.original_match.predicate }, names)) return null;
+        var fields: std.ArrayList(@import("linear_bounds.zig").Field) = .empty;
+        for (plan.projection.items) |item| {
+            const name = item.alias orelse try self.engine.expressionName(item.expression);
+            const form = try self.engine.statisticArgument(item.expression, names, n);
+            const reads = Engine.statisticReferences(item.expression, names);
+            if (reads and form == null) return null;
+            for (invariants) |invariant| if (reads and std.mem.eql(u8, invariant, name)) return null;
+            try fields.append(self.engine.a, .{ .name = name, .bounds = if (form) |f| f.range else null, .polynomial = form });
+        }
+        const form = (try check.statisticProof(self.engine.a, fields.items)) orelse return null;
+        if (!form.eligible(check.statistic_kind)) return null;
+        if (!Engine.statisticBenefit(form, check.statistic_kind, plan.path)) return null;
+        plan.statistic = .{ .form = form, .kind = check.statistic_kind };
+        plan.statistic_global = check.statistic_global and invariants.len == 0;
+        return plan;
+    }
     // Ordinary pull fallback traverses the accepted normalized path. Admit
     // only MATCH-wide relationship histories whose depth bound remains valid
     // after concatenation. Per-path node uniqueness and unbounded composite
@@ -259,6 +287,7 @@ pub const NodeCursor = struct {
         self.pending_position = 0;
         self.last_weights = .empty;
         self.last_counts = .empty;
+        self.last_statistic_inputs = .empty;
         self.started = false;
         self.done = false;
         const clauses = try self.engine.a.dupe(ast.Clause, self.query.clauses);
@@ -275,6 +304,8 @@ pub const NodeCursor = struct {
         self.summary = plan.summary;
         self.linear_summary = plan.linear;
         self.total_axis = plan.total_axis;
+        self.statistic = plan.statistic;
+        self.statistic_global = plan.statistic_global;
         const predicates = try self.engine.batchPredicates(plan.path, &.{}, clauses[0].operation.match.predicate);
         self.weighted_seeds = .{ .admission = predicates.admission, .residual = predicates.residual, .path = plan.path, .input = .{ .row = &.{} }, .mode = clauses[0].operation.match.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
     }
@@ -317,12 +348,16 @@ pub const NodeCursor = struct {
         e.external_summary = self.summary;
         e.external_linear_summary = self.linear_summary;
         e.external_total_axis = self.total_axis;
+        e.external_statistic = self.statistic;
+        e.external_statistic_global = self.statistic_global;
         e.stream_predicate = if (self.weighted_seeds != null and input.row.len == 0) self.weighted_seeds.?.residual else self.query.clauses[0].operation.match.predicate;
         defer {
             e.weighted_sink = null;
             e.external_summary = null;
             e.external_linear_summary = false;
             e.external_total_axis = false;
+            e.external_statistic = null;
+            e.external_statistic_global = false;
             e.stream_predicate = null;
         }
         var ignored: std.ArrayList(Engine.MatchState) = .empty;
@@ -357,7 +392,7 @@ pub const NodeCursor = struct {
         for (try e.projectUnordered(&.{row}, self.query.clauses[1].operation.project.value, false)) |projected| {
             try e.values.output(.{ .map = projected });
             const a = self.weighted_arena.allocator();
-            try self.pending.append(a, .{ .row = (try (v.Value{ .map = projected }).clone(a)).map, .weight = try weight.clone(a) });
+            try self.pending.append(a, .{ .row = (try (v.Value{ .map = projected }).clone(a)).map, .weight = try weight.clone(a), .statistic_input = if (e.statistic_bin) |bin| bin.input else null });
         }
     }
 
@@ -503,6 +538,7 @@ pub const NodeCursor = struct {
         var output: std.ArrayList(Row) = .empty;
         self.last_weights = .empty;
         self.last_counts = .empty;
+        self.last_statistic_inputs = .empty;
         if (!self.started) {
             try self.pushScan(.{ .row = &.{} }, 0);
             self.started = true;
@@ -694,6 +730,7 @@ pub const NodeCursor = struct {
                 try output.append(a, (try (v.Value{ .map = pending.row }).clone(a)).map);
                 try self.last_weights.append(a, pending.weight.cap(std.math.maxInt(u64)));
                 try self.last_counts.append(a, try pending.weight.clone(a));
+                try self.last_statistic_inputs.append(a, pending.statistic_input);
                 continue;
             }
             const frame = self.frames.items[self.frames.items.len - 1];
@@ -743,6 +780,7 @@ pub const NodeCursor = struct {
                             if (self.weighted) {
                                 try self.last_weights.append(a, 1);
                                 try self.last_counts.append(a, Count.one);
+                                try self.last_statistic_inputs.append(a, null);
                             }
                         };
                     }
@@ -1048,6 +1086,11 @@ const Engine = struct {
     external_linear_summary: bool = false,
     external_total_axis: bool = false,
     moment_total_axis: bool = false,
+    statistic_plan: ?StatisticPlan = null,
+    statistic_targets: []const SummaryTarget = &.{},
+    external_statistic: ?Statistic.Request = null,
+    external_statistic_global: bool = false,
+    statistic_bin: ?struct { call: ?*const ast.Expr, input: i64 } = null,
     moment_input: Row = &.{},
     moment_endpoint: ?[]const u8 = null,
     moment_invariants: std.ArrayList(*const ast.Expr) = .empty,
@@ -1613,6 +1656,15 @@ const Engine = struct {
             }
             for (fold.groups.items[found.?].states, 0..) |*accumulator, i| {
                 if (fold.active_calls) |active| if (!active[i]) continue;
+                if (engine.statistic_bin) |bin| {
+                    if (bin.call != fold.calls[i]) continue;
+                    const literal: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = bin.input } } };
+                    const saved = accumulator.function;
+                    accumulator.function.args = &.{&literal};
+                    defer accumulator.function = saved;
+                    try accumulator.addWeighted(engine, row, fold.weight);
+                    continue;
+                }
                 if (fold.moment_direct) |direct| if (direct.calls[i]) |input| {
                     try engine.validateMomentInput(input.expression);
                     try accumulator.addMoments(engine, input.kind, input.form, direct.values.part(input.form.field.?), direct.values.count, fold.weight);
@@ -4353,6 +4405,17 @@ const Engine = struct {
             self.moment_representatives = prior_representatives;
             self.moment_total_axis = prior_axis;
         }
+        if (try self.planStatistics(path)) |plan| {
+            const saved_plan = self.statistic_plan;
+            const saved_targets = self.statistic_targets;
+            self.statistic_plan = plan;
+            self.statistic_targets = try self.summaryTargets(path);
+            defer {
+                self.statistic_plan = saved_plan;
+                self.statistic_targets = saved_targets;
+            }
+            return self.countAllPathsTyped(Statistic.Value, input, path, mode, starts, output);
+        }
         if (try self.momentTargets(path)) |targets| {
             const saved = self.moment_targets;
             self.moment_targets = targets;
@@ -4382,6 +4445,180 @@ const Engine = struct {
             if (!call_value.distinct and (std.ascii.eqlIgnoreCase(call_value.name, "sum") or std.ascii.eqlIgnoreCase(call_value.name, "avg"))) return true;
         }
         return false;
+    }
+    const Statistic = @import("statistic.zig");
+    const StatisticNames = std.StringHashMapUnmanaged(Statistic.Form);
+    const StatisticPlan = struct { kernel: Statistic.Plan, calls: []const *const ast.Expr = &.{}, global: bool = false };
+    fn statisticReferences(value: anytype, names: StatisticNames) bool {
+        var keys = names.iterator();
+        while (keys.next()) |entry| {
+            var varying = false;
+            for (entry.value_ptr.coefficients[1..]) |coefficient| varying = varying or coefficient != 0;
+            if (varying and path_summaries.references(value, entry.key_ptr.*)) return true;
+        }
+        return false;
+    }
+    fn statisticArgument(self: *Engine, expression: *const ast.Expr, names: StatisticNames, dimensions: usize) anyerror!?Statistic.Form {
+        return switch (expression.value) {
+            .variable => |name| if (names.get(name)) |form| form else if (lookup(self.moment_input, name)) |value| (if (value == .integer) try Statistic.Form.literal(self.a, value.integer, dimensions) else null) else null,
+            .parameter => |name| if (lookup(self.parameters, name)) |value| (if (value == .integer) try Statistic.Form.literal(self.a, value.integer, dimensions) else null) else null,
+            .literal => |value| if (value == .integer) try Statistic.Form.literal(self.a, value.integer, dimensions) else null,
+            .unary => |u| blk: {
+                const operand = (try self.statisticArgument(u.operand, names, dimensions)) orelse break :blk null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => try operand.negative(self.a),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const op: Statistic.Op = switch (b.op) {
+                    .add => .add,
+                    .subtract => .subtract,
+                    .multiply => .multiply,
+                    else => break :blk null,
+                };
+                const l = (try self.statisticArgument(b.left, names, dimensions)) orelse break :blk null;
+                const r = (try self.statisticArgument(b.right, names, dimensions)) orelse break :blk null;
+                break :blk try Statistic.Form.combine(l, r, self.a, op);
+            },
+            else => null,
+        };
+    }
+    fn statisticProjection(self: *Engine, p: ast.Projection, names: StatisticNames, n: usize, global: *bool) !?StatisticNames {
+        if (p.distinct or p.order.len != 0 or p.skip != null or p.limit != null) return null;
+        var next: StatisticNames = if (p.wildcard) try names.clone(self.a) else .empty;
+        for (p.items) |item| {
+            if (aggregates(item.expression)) return null;
+            if (try self.statisticArgument(item.expression, names, n)) |f| try next.put(self.a, item.alias orelse try self.expressionName(item.expression), f) else if (statisticReferences(item.expression, names)) return null else global.* = false;
+        }
+        if (statisticReferences(p.predicate, names) or statisticReferences(p.predicate, next)) return null;
+        if (p.predicate) |predicate| if (self.constant(predicate, self.moment_input) == null) {
+            global.* = false;
+        };
+        return next;
+    }
+    fn statisticMiddle(self: *Engine, clauses: []const ast.Clause, initial: StatisticNames, n: usize, global: *bool) anyerror!?StatisticNames {
+        var names = initial;
+        for (clauses) |clause| switch (clause.operation) {
+            .project => |p| names = (try self.statisticProjection(p.value, names, n, global)) orelse return null,
+            .subquery => |inner| {
+                const exported = (try self.statisticMiddle(inner, names, n, global)) orelse return null;
+                var exports = exported.iterator();
+                while (exports.next()) |entry| try names.put(self.a, entry.key_ptr.*, entry.value_ptr.*);
+            },
+            .unwind => |u| {
+                if (statisticReferences(u.expression, names) or self.constant(u.expression, self.moment_input) == null) return null;
+                _ = names.remove(u.alias);
+            },
+            else => return null,
+        };
+        return names;
+    }
+    fn statisticBenefit(form: Statistic.Form, kind: Statistic.Kind, path: ast.Path) bool {
+        if (form.quadratic() or kind == .distinct) return true;
+        if (kind != .min and kind != .max) return false;
+        var coefficient: ?i64 = null;
+        var different = false;
+        var nonzero: usize = 0;
+        for (path.edges, 0..) |edge, index| if (fixedHops(edge) == null) {
+            const c = form.coefficients[1 + index];
+            if (coefficient) |prior| {
+                different = different or c != prior;
+            } else coefficient = c;
+            nonzero += @intFromBool(c != 0);
+        };
+        // Independent single-marginal extrema already have a cheaper plan.
+        return different and nonzero > 1;
+    }
+    fn planStatistics(self: *Engine, path: ast.Path) !?StatisticPlan {
+        if (path.edges.len == 0 or path.edges.len > 32 or self.component_leaves.len != 0 or path.selector != .all or self.shortest_count != null) return null;
+        const targets = try self.summaryTargets(path);
+        if (targets.len == 0) return null;
+        const statistic_depth = std.math.cast(i64, self.limits.path_depth) orelse return null;
+        var names: StatisticNames = .empty;
+        for (targets) |target| try names.put(self.a, target.name, try Statistic.Form.column(self.a, path.edges.len, target.edge, statistic_depth));
+        if (statisticReferences(self.stream_predicate, names)) return null;
+        if (self.external_statistic) |request| {
+            const requests = try self.a.dupe(Statistic.Request, &.{request});
+            var kernel = Statistic.Plan.init(requests);
+            kernel.ptr = self;
+            kernel.charge = chargeWork;
+            return .{ .kernel = kernel, .global = self.external_statistic_global };
+        }
+        if (self.weighted_sink != null) return null;
+        const fold = self.stream_fold orelse return null;
+        if (fold.continuation != null or fold.calls.len == 0) return null;
+        var global = true;
+        names = (try self.statisticMiddle(fold.middle, names, path.edges.len, &global)) orelse return null;
+        for (fold.projection.items) |item| if (!aggregates(item.expression) and statisticReferences(item.expression, names)) return null;
+        if (statisticReferences(fold.projection.predicate, names) or statisticReferences(fold.projection.order, names)) return null;
+        const requests = try self.a.alloc(Statistic.Request, fold.calls.len);
+        var benefit = false;
+        for (fold.calls, requests) |expression, *request| {
+            const f = expression.value.call;
+            if (!f.star and f.args.len != 1) return null;
+            const kind: Statistic.Kind = if (f.distinct) (if (std.ascii.eqlIgnoreCase(f.name, "count")) .distinct else return null) else kind: {
+                inline for (@typeInfo(Statistic.Kind).@"enum".field_names) |name| {
+                    if (std.ascii.eqlIgnoreCase(f.name, name)) break :kind @field(Statistic.Kind, name);
+                }
+                return null;
+            };
+            const form = if (f.star and kind == .count) try Statistic.Form.literal(self.a, 0, path.edges.len) else (try self.statisticArgument(f.args[0], names, path.edges.len)) orelse return null;
+            if (!form.eligible(kind)) return null;
+            request.* = .{ .form = form, .kind = kind };
+            benefit = benefit or statisticBenefit(form, kind, path);
+        }
+        if (!benefit) return null;
+        var kernel = Statistic.Plan.init(requests);
+        kernel.ptr = self;
+        kernel.charge = chargeWork;
+        return .{ .kernel = kernel, .calls = fold.calls, .global = !fold.has_keys and global };
+    }
+    fn emitStatisticBin(self: *Engine, row: Row, index: usize, input: i64, weight: Count) !void {
+        if (weight.cap(1) == 0) return;
+        try self.state();
+        const plan = self.statistic_plan.?;
+        const prior = self.statistic_bin;
+        self.statistic_bin = .{ .call = if (plan.calls.len == 0) null else plan.calls[index], .input = input };
+        defer self.statistic_bin = prior;
+        if (self.weighted_sink) |sink| return sink.emit(sink.ptr, row, weight);
+        const fold = self.stream_fold.?;
+        const saved = fold.weight;
+        fold.weight = try saved.multiply(fold.retained, weight);
+        defer fold.weight = saved;
+        try fold.add(self, row);
+    }
+    fn emitStatistics(self: *Engine, initial: Row, value: Statistic.Value) !void {
+        var row = initial;
+        for (self.statistic_targets) |target| row = try self.lengthRow(row, target.name, 0);
+        const plan = self.statistic_plan.?;
+        for (plan.kernel.requests, 0..) |request, i| switch (request.kind) {
+            .count => try self.emitStatisticBin(row, i, 0, value.count),
+            .min, .max => {
+                const e = value.extreme(i);
+                const input = std.math.cast(i64, @as(i128, request.form.coefficients[0]) + (if (request.kind == .min) e.min else e.max)) orelse return error.CypherStatisticDeclined;
+                try self.emitStatisticBin(row, i, input, Count.one);
+            },
+            .distinct => {
+                const support = value.support(i);
+                for (support.words, 0..) |word, wi| {
+                    var bits = word;
+                    while (bits != 0) : (bits &= bits - 1) {
+                        const input = std.math.add(i64, request.form.coefficients[0], support.low + @as(i64, @intCast(wi * 64 + @ctz(bits)))) catch return error.CypherStatisticDeclined;
+                        try self.emitStatisticBin(row, i, input, Count.one);
+                    }
+                }
+            },
+            .sum, .avg => {
+                const total = try (try value.total(self.a, request.form)).magnitude(self.a);
+                const divided = try total.amount.divRem(self.a, value.count);
+                const q = divided.quotient.exact() orelse return error.CypherNumericOverflow;
+                const low = std.math.cast(i64, if (total.negative) -@as(i128, q) else @as(i128, q)) orelse return error.CypherNumericOverflow;
+                try self.emitStatisticBin(row, i, low, try value.count.difference(self.a, divided.remainder));
+                if (divided.remainder.cap(1) != 0) try self.emitStatisticBin(row, i, std.math.add(i64, low, if (total.negative) -1 else 1) catch return error.CypherNumericOverflow, divided.remainder);
+            },
+        };
     }
     const MomentCall = enum { count, sum, avg, min, max };
     const DirectMoment = struct { kind: MomentCall, form: Affine, expression: *const ast.Expr };
@@ -4858,13 +5095,13 @@ const Engine = struct {
         }
     }
     fn waysCount(value: anytype) Count {
-        return if (@TypeOf(value) == PathMoments) value.count else if (@TypeOf(value) == Count) value else Count.init(value);
+        return if (@TypeOf(value) == Statistic.Value) value.count else if (@TypeOf(value) == PathMoments) value.count else if (@TypeOf(value) == Count) value else Count.init(value);
     }
     fn waysFromCount(comptime W: type, value: Count) W {
-        return if (W == PathMoments) PathMoments.init(value) else if (W == Count) value else waysCap(value);
+        return if (W == Statistic.Value) Statistic.Value.init(value) else if (W == PathMoments) PathMoments.init(value) else if (W == Count) value else waysCap(value);
     }
     fn advanceWays(self: *Engine, graph: *LowerGraph, value: anytype) !@TypeOf(value) {
-        return if (@TypeOf(value) == PathMoments) value.advance(self.a, self.moment_targets, graph.segment) else value;
+        return if (@TypeOf(value) == Statistic.Value) value.advance(self.a, graph.segment, self.statistic_plan.?.kernel) else if (@TypeOf(value) == PathMoments) value.advance(self.a, self.moment_targets, graph.segment) else value;
     }
     fn waysInit(comptime W: type, value: u64) W {
         return waysFromCount(W, Count.init(value));
@@ -4873,10 +5110,10 @@ const Engine = struct {
         return waysCount(value).cap(std.math.maxInt(u64));
     }
     fn waysAdd(self: *Engine, left: anytype, right: @TypeOf(left)) !@TypeOf(left) {
-        return if (@TypeOf(left) == Count or @TypeOf(left) == PathMoments) left.add(self.a, right) else mergePathWays(left, right);
+        return if (@TypeOf(left) == Statistic.Value) left.add(self.a, right, self.statistic_plan.?.kernel) else if (@TypeOf(left) == Count or @TypeOf(left) == PathMoments) left.add(self.a, right) else mergePathWays(left, right);
     }
     fn waysMultiply(self: *Engine, left: anytype, right: @TypeOf(left)) !@TypeOf(left) {
-        return if (@TypeOf(left) == Count or @TypeOf(left) == PathMoments) left.multiply(self.a, right) else multiplyPathWays(left, right);
+        return if (@TypeOf(left) == Statistic.Value) left.multiply(self.a, right, self.statistic_plan.?.kernel) else if (@TypeOf(left) == Count or @TypeOf(left) == PathMoments) left.multiply(self.a, right) else multiplyPathWays(left, right);
     }
     fn countAllPathsTyped(self: *Engine, comptime W: type, input: MatchState, path: ast.Path, mode: ast.PathMode, starts: []const *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
         if (starts.len != 1 and (if (path.execution_reversed) path.execution_summary.last != null else path.execution_summary.first != null)) return false;
@@ -4940,7 +5177,7 @@ const Engine = struct {
             }
         }
         var products: SummaryProducts = .{};
-        if (W != PathMoments and (path.execution_summary.length != null or for (path.edges) |edge| {
+        if (W != Statistic.Value and W != PathMoments and (path.execution_summary.length != null or for (path.edges) |edge| {
             if (edge.execution_length != null) break true;
         } else false)) graph.products = &products;
         const Counts = std.AutoHashMapUnmanaged(usize, W);
@@ -5142,6 +5379,8 @@ const Engine = struct {
                 }
             }
         }
+        var statistic_total: Statistic.Value = .init(Count.init(0));
+        var statistic_row: ?Row = null;
         var counts = current.iterator();
         while (counts.next()) |endpoint| {
             const ways = endpoint.value_ptr.*;
@@ -5161,6 +5400,13 @@ const Engine = struct {
                     }
                 }
                 if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
+                if (W == Statistic.Value) {
+                    if (self.statistic_plan.?.global) {
+                        statistic_total = try statistic_total.add(self.a, ways, self.statistic_plan.?.kernel);
+                        statistic_row = row;
+                    } else try self.emitStatistics(row, ways);
+                    continue;
+                }
                 if (W == PathMoments) {
                     try self.emitMomentBag(row, ways);
                     continue;
@@ -5182,6 +5428,7 @@ const Engine = struct {
                 try fold.add(self, row);
             }
         }
+        if (W == Statistic.Value) if (statistic_row) |row| try self.emitStatistics(row, statistic_total);
         return true;
     }
     /// Construct at most four integer bins for each marginal, preserving its

@@ -354,6 +354,67 @@ pub const Program = struct {
         }
         return true;
     }
+    pub fn statisticCandidate(self: Program) bool {
+        for (self.instructions) |instruction| {
+            if (instruction.input_function or instruction.type.kind != .integer) return false;
+            switch (instruction.operation) {
+                .column, .literal, .parameter => {},
+                .cast => |c| if (c.type != .integer) return false,
+                .unary => |u| if (u.op != .positive and u.op != .negative) return false,
+                .binary => |b| if (b.op != .add and b.op != .subtract and b.op != .multiply) return false,
+                else => return false,
+            }
+        }
+        return true;
+    }
+    pub fn statisticProof(self: Program, a: Allocator, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64) !?@import("cypher").statistic.Form {
+        const n = for (fields) |field| {
+            if (field.polynomial) |f| break f.dimensions;
+        } else return null;
+        return self.statisticInstruction(a, self.root, 0, columns, fields, integers, n);
+    }
+    fn statisticInstruction(self: Program, a: Allocator, index: u32, depth: usize, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64, n: usize) anyerror!?@import("cypher").statistic.Form {
+        const F = @import("cypher").statistic.Form;
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or instruction.type.kind != .integer) return null;
+        const result: ?F = switch (instruction.operation) {
+            .column => |column| blk: {
+                if (column >= columns.len) break :blk null;
+                for (fields) |field| if (std.mem.eql(u8, field.name, columns[column].name)) break :blk field.polynomial;
+                break :blk null;
+            },
+            .literal => |value| if (value == .integer) try F.literal(a, value.integer, n) else null,
+            .parameter => |slot| if (slot < integers.len) (if (integers[slot]) |value| try F.literal(a, value, n) else null) else null,
+            .unary => |u| blk: {
+                const operand = (try self.statisticInstruction(a, u.operand, depth + 1, columns, fields, integers, n)) orelse break :blk null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => try operand.negative(a),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const op: @import("cypher").statistic.Op = switch (b.op) {
+                    .add => .add,
+                    .subtract => .subtract,
+                    .multiply => .multiply,
+                    else => break :blk null,
+                };
+                const l = (try self.statisticInstruction(a, b.left, depth + 1, columns, fields, integers, n)) orelse break :blk null;
+                const r = (try self.statisticInstruction(a, b.right, depth + 1, columns, fields, integers, n)) orelse break :blk null;
+                break :blk try F.combine(l, r, a, op);
+            },
+            .cast => |c| if (c.type == .integer) try self.statisticInstruction(a, c.operand, depth + 1, columns, fields, integers, n) else null,
+            else => null,
+        };
+        const proof = result orelse return null;
+        if (instruction.type.element_type) |kind| if (@import("builtin_cast.zig").integral(kind)) {
+            _ = @import("builtin_cast.zig").checkedInteger(proof.range.low, kind) catch return null;
+            _ = @import("builtin_cast.zig").checkedInteger(proof.range.high, kind) catch return null;
+        };
+        return proof;
+    }
     pub fn numericProof(self: Program, a: Allocator, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, scalars: []const ?@import("cypher").linear_numeric.Lattice) !?@import("cypher").linear_numeric.Form {
         return self.numericInstruction(a, self.root, 0, columns, fields, scalars);
     }
@@ -7287,4 +7348,35 @@ test "SQL bounded linear certificates retain segment axes and exact numeric doma
         if (entry.admitted) try std.testing.expect(program.numericLinearCandidate());
         if (proof) |form| try std.testing.expectEqual(entry.total, form.total());
     }
+}
+
+test "SQL polynomial certificates retain every narrow integer intermediate" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const columns = [_]Column{.{ .name = "n", .type = .integer, .element_type = .int32 }};
+    const fields = [_]@import("cypher").linear_bounds.Field{.{ .name = "n", .bounds = .{ .low = 0, .high = 50000 }, .polynomial = try @import("cypher").statistic.Form.column(arena.allocator(), 1, 0, 50000) }};
+    for ([_][]const u8{ "n*n", "(n+2147483647)-2147483647" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &columns, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expect(try program.statisticProof(arena.allocator(), &columns, &fields, &.{}) == null);
+        try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{Datum.json(.{ .integer = 50000 })}, &.{}, .{}));
+    }
+}
+
+test "SQL integer statistic casts retain value and checked width" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const columns = [_]Column{.{ .name = "n", .type = .integer, .element_type = .int32 }};
+    const fields = [_]@import("cypher").linear_bounds.Field{.{ .name = "n", .bounds = .{ .low = 0, .high = 50000 }, .polynomial = try @import("cypher").statistic.Form.column(arena.allocator(), 1, 0, 50000) }};
+    var compiled = try @import("compiler.zig").compileScalar(a, "CAST(n AS bigint)*CAST(n AS bigint)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(program.statisticCandidate());
+    try std.testing.expect(try program.statisticProof(arena.allocator(), &columns, &fields, &.{}) != null);
+    try std.testing.expectEqual(@as(i64, 2500000000), (try program.evaluate(arena.allocator(), &.{Datum.json(.{ .integer = 50000 })}, &.{}, .{})).value.integer);
 }

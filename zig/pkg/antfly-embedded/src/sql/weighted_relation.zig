@@ -99,17 +99,31 @@ pub const Plan = struct {
                 out.* = .{ .name = from, .bounds = fieldBounds(fields, to) };
                 for (fields) |field| if (std.mem.eql(u8, field.name, to)) {
                     out.numeric = field.numeric;
+                    out.polynomial = field.polynomial;
                     break;
                 };
             }
             return self.next.accepts(a, renamed);
+        }
+        fn statistic(ptr: *const anyopaque, a: A, fields: []const FieldBounds) !?@import("cypher").statistic.Form {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const renamed = try a.alloc(FieldBounds, self.from.len);
+            for (self.from, self.to, renamed) |from, to, *out| {
+                out.* = .{ .name = from, .bounds = fieldBounds(fields, to) };
+                for (fields) |field| if (std.mem.eql(u8, field.name, to)) {
+                    out.numeric = field.numeric;
+                    out.polynomial = field.polynomial;
+                    break;
+                };
+            }
+            return self.next.statisticProof(a, renamed);
         }
     };
     fn renameCheck(a: A, check: ?LinearCheck, from: []const []const u8, to: []const []const u8) !?LinearCheck {
         const original = check orelse return null;
         const owned = try a.create(RenamedCheck);
         owned.* = .{ .next = original, .from = from, .to = to };
-        return .{ .ptr = owned, .validate = RenamedCheck.validate, .integers = original.integers, .scalars = original.scalars, .total_only = original.total_only, .numeric_required = original.numeric_required };
+        return .{ .ptr = owned, .validate = RenamedCheck.validate, .statistic = if (original.statistic != null) RenamedCheck.statistic else null, .statistic_kind = original.statistic_kind, .statistic_global = original.statistic_global, .integers = original.integers, .scalars = original.scalars, .total_only = original.total_only, .numeric_required = original.numeric_required };
     }
     const ProjectedCheck = struct {
         next: LinearCheck,
@@ -136,12 +150,33 @@ pub const Plan = struct {
             }
             return self.next.accepts(a, projected);
         }
+        fn statistic(ptr: *const anyopaque, a: A, fields: []const FieldBounds) !?@import("cypher").statistic.Form {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const query = self.node.operation.query;
+            const bound = query.binding.scalars;
+            const projected = try a.alloc(FieldBounds, self.fields.len);
+            for (self.fields, projected) |field, *out| {
+                const ordinal = columnIndex(self.node, field) orelse return null;
+                const program = if (ordinal < bound.projections.len) bound.projections[ordinal] else null;
+                const polynomial = if (program) |p| try p.statisticProof(a, bound.columns, fields, self.next.integers) else blk: {
+                    for (fields) |input| if (std.mem.eql(u8, input.name, query.statement.columns[ordinal].field)) break :blk input.polynomial;
+                    break :blk null;
+                };
+                // The source has marked every observed varying input. A failed
+                // projection proof cannot disappear behind an aggregate override.
+                if (program) |p| if (polynomial == null) for (p.required_columns) |input| {
+                    for (fields) |source| if (std.mem.eql(u8, source.name, bound.columns[input].name) and source.polynomial != null) return null;
+                };
+                out.* = .{ .name = field, .bounds = if (polynomial) |f| f.range else null, .polynomial = polynomial };
+            }
+            return self.next.statisticProof(a, projected);
+        }
     };
     fn projectCheck(a: A, check: ?LinearCheck, node: *const binding.Node, wanted: Names) !?LinearCheck {
         const original = check orelse return null;
         const owned = try a.create(ProjectedCheck);
         owned.* = .{ .next = original, .node = node, .fields = try names(a, wanted) };
-        return .{ .ptr = owned, .validate = ProjectedCheck.validate, .integers = original.integers, .scalars = original.scalars, .total_only = original.total_only, .numeric_required = original.numeric_required };
+        return .{ .ptr = owned, .validate = ProjectedCheck.validate, .statistic = if (original.statistic != null) ProjectedCheck.statistic else null, .statistic_kind = original.statistic_kind, .statistic_global = original.statistic_global, .integers = original.integers, .scalars = original.scalars, .total_only = original.total_only, .numeric_required = original.numeric_required };
     }
     fn projectCertificates(a: A, node: *const binding.Node, request: catalog.AggregateWeight, wanted: Names) ![]const catalog.SummaryCertificate {
         const query = node.operation.query;
@@ -157,7 +192,7 @@ pub const Plan = struct {
                     if (!wanted.contains(column.internal)) continue;
                     try projectionInputs(a, &inputs, node, ordinal);
                     if (ordinal < bound.projections.len) if (bound.projections[ordinal]) |program| {
-                        if (!program.affineTogether() and !program.numericLinearCandidate()) try programFields(a, &stable, program, bound.columns);
+                        if (!program.affineTogether() and !program.numericLinearCandidate() and !(certificate.linear != null and certificate.linear.?.statistic != null and program.statisticCandidate())) try programFields(a, &stable, program, bound.columns);
                     };
                 }
                 var input_keys = inputs.keyIterator();

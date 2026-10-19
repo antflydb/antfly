@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Total integer interval obligations for first-moment consumers. Unknown
+//! Integer bounds and producer geometry obligations for scalar statistics. Unknown
 //! bounds decline compression; interval failures never become query errors.
 const std = @import("std");
 pub const Interval = struct {
@@ -39,9 +39,13 @@ pub const Interval = struct {
         return .{ .low = std.math.cast(i64, low) orelse return null, .high = std.math.cast(i64, high) orelse return null };
     }
 };
-pub const Field = struct { name: []const u8, bounds: ?Interval, numeric: ?@import("linear_numeric.zig").Form = null };
+pub const Field = struct { name: []const u8, bounds: ?Interval, numeric: ?@import("linear_numeric.zig").Form = null, polynomial: ?@import("statistic.zig").Form = null };
 pub const Check = struct {
     ptr: *const anyopaque,
+    statistic: ?*const fn (*const anyopaque, std.mem.Allocator, []const Field) anyerror!?@import("statistic.zig").Form = null,
+    statistic_kind: @import("statistic.zig").Kind = .avg,
+    statistic_global: bool = false,
+
     total_only: bool = false,
     numeric_required: bool = false,
     scalars: []const ?@import("linear_numeric.zig").Lattice = &.{},
@@ -49,6 +53,10 @@ pub const Check = struct {
     /// NULL and other types remain unknown; they never become zero.
     integers: []const ?i64 = &.{},
     validate: *const fn (*const anyopaque, std.mem.Allocator, []const Field) anyerror!bool,
+    pub fn statisticProof(self: Check, a: std.mem.Allocator, fields: []const Field) !?@import("statistic.zig").Form {
+        return if (self.statistic) |f| try f(self.ptr, a, fields) else null;
+    }
+
     pub fn accepts(self: Check, a: std.mem.Allocator, fields: []const Field) !bool {
         return self.validate(self.ptr, a, fields);
     }

@@ -37,6 +37,10 @@ fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, all
     return addCellsMasked(context, bound, grouped, alloc, cells, catalog.Count.init(weight), null);
 }
 fn addCellsMasked(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: catalog.Count, active: ?[]const usize) !void {
+    return addCellsOverridden(context, bound, grouped, alloc, cells, weight, active, null);
+}
+fn addCellsOverridden(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: catalog.Count, active: ?[]const usize, input: ?i64) !void {
+    if (input != null and (active == null or active.?.len != 1)) return error.InvalidSqlBackendResponse;
     if (!try bound.input.matchesWithLimits(alloc, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) return;
     const values = try alloc.alloc(Datum, bound.group_count);
     for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
@@ -50,7 +54,7 @@ fn addCellsMasked(context: anytype, bound: *const binding.Bound, grouped: anytyp
             if (test_value.value != .bool) return error.SqlTypeMismatch;
             if (!test_value.value.bool) continue;
         }
-        value.* = if (index) |slot| try context.evaluate(alloc, bound.input.projections[slot].?, cells) else Datum.json(.{ .integer = 1 });
+        value.* = if (input) |value_input| Datum.json(.{ .integer = value_input }) else if (index) |slot| try context.evaluate(alloc, bound.input.projections[slot].?, cells) else Datum.json(.{ .integer = 1 });
     }
     try grouped.addCount(values, inputs, weight);
 }
@@ -362,6 +366,18 @@ const LinearConsumer = struct {
         return !self.total_only and self.program.linearBounds(self.columns, fields, self.integers) != null;
     }
 };
+const StatisticConsumer = struct {
+    program: scalar.Program,
+    columns: []const scalar.Column,
+    integers: []const ?i64,
+    fn validate(_: *const anyopaque, _: std.mem.Allocator, _: []const @import("cypher").linear_bounds.Field) !bool {
+        return false;
+    }
+    fn proof(ptr: *const anyopaque, a: std.mem.Allocator, fields: []const @import("cypher").linear_bounds.Field) !?@import("cypher").statistic.Form {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        return self.program.statisticProof(a, self.columns, fields, self.integers);
+    }
+};
 fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: catalog.Table, conditions: []const catalog.Condition, parameters: []const Json) ![]const catalog.AggregateWeight {
     const integers = try a.alloc(?i64, parameters.len);
     for (parameters, integers) |parameter, *integer| integer.* = if (parameter == .integer) parameter.integer else null;
@@ -401,6 +417,25 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
         };
         var summary: ?[]const u8 = null;
         var summaries: std.ArrayList(catalog.SummaryCertificate) = .empty;
+        if (input) |slot| if (bound.input.projections[slot]) |program| {
+            if (program.output_type.kind == .integer and program.statisticCandidate() and (spec.kind == .count or spec.kind == .sum or spec.kind == .avg or spec.kind == .min or spec.kind == .max) and (!spec.distinct or spec.kind == .count)) {
+                const consumer = try a.create(StatisticConsumer);
+                const columns = try a.dupe(scalar.Column, bound.input.columns);
+                for (program.required_columns) |ordinal| columns[ordinal].name = (try table.column(columns[ordinal].name)).path;
+                consumer.* = .{ .program = program, .columns = columns, .integers = integers };
+                var statistic_stable: std.ArrayList([]const u8) = .empty;
+                var stable_keys = invariant.keyIterator();
+                while (stable_keys.next()) |key| try statistic_stable.append(a, key.*);
+                if (program.required_columns.len != 0) try summaries.append(a, .{ .field = columns[program.required_columns[0]].name, .invariants = statistic_stable.items, .joint = true, .linear = .{ .ptr = consumer, .validate = StatisticConsumer.validate, .integers = integers, .statistic = StatisticConsumer.proof, .statistic_kind = if (spec.distinct) .distinct else switch (spec.kind) {
+                    .count => .count,
+                    .sum => .sum,
+                    .avg => .avg,
+                    .min => .min,
+                    .max => .max,
+                    else => unreachable,
+                }, .statistic_global = bound.group_count == 0 and invariant.count() == 0 } });
+            }
+        };
         if (!spec.distinct and
             (spec.kind == .count or spec.kind == .sum or spec.kind == .avg or spec.kind == .min or spec.kind == .max))
         {
@@ -545,7 +580,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                 visited += 1;
                 if (visited > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                 const cells = try bound.input.cells(arena.allocator(), row);
-                try addCellsMasked(context, bound, &collector, arena.allocator(), cells, page.weight(row_index), page.aggregate_slots);
+                try addCellsOverridden(context, bound, &collector, arena.allocator(), cells, page.weight(row_index), page.aggregate_slots, if (page.aggregate_inputs) |inputs| inputs[row_index] else null);
             }
             const next = page.after orelse break;
             if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;

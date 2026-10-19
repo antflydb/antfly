@@ -22,6 +22,7 @@ pub const value = @import("value.zig");
 pub const catalog = @import("catalog.zig");
 pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
+pub const statistic = @import("statistic.zig");
 pub const linear_numeric = @import("linear_numeric.zig");
 pub const linear_bounds = @import("linear_bounds.zig");
 pub const integer_affine = @import("integer_affine.zig");

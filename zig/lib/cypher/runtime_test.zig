@@ -3119,3 +3119,71 @@ test "exact floating summaries and total-axis bags retain aggregate values and a
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }
+
+test "directional, quadratic and support reductions agree with materialized paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "MATCH REPEATABLE ELEMENTS p=(a:Document {id:'a'})-[xs:CITES*0..2]->()-[ys:CITES*0..2]->(b) ";
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    var reference = try c.compile(a, try std.fmt.allocPrint(a, "{s}RETURN size(xs),size(ys)", .{base}), .{}, &diagnostic);
+    defer reference.deinit();
+    var rows = try runtime.execute(a, fixture.backend(), graph, &reference, &.{}, .{});
+    defer rows.deinit();
+    var min: i64 = std.math.maxInt(i64);
+    var max: i64 = std.math.minInt(i64);
+    var sum: i64 = 0;
+    var support: [5]bool = @splat(false);
+    for (rows.rows) |row| {
+        const x = row[0].integer;
+        const y = row[1].integer;
+        min = @min(min, 2 * x - y);
+        max = @max(max, 2 * x - y);
+        sum += x * x + x * y + y * y;
+        support[@intCast(x + y)] = true;
+    }
+    var compiled = try c.compile(a, try std.fmt.allocPrint(a, "{s}RETURN min(2*size(xs)-size(ys)),max(2*size(xs)-size(ys)),avg(size(xs)*size(xs)+size(xs)*size(ys)+size(ys)*size(ys)),count(DISTINCT size(xs)+size(ys))", .{base}), .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(min, result.rows[0][0].integer);
+    try std.testing.expectEqual(max, result.rows[0][1].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(rows.rows.len)), result.rows[0][2].number, 1e-12);
+    var cardinality: i64 = 0;
+    for (support) |present| {
+        cardinality += @intFromBool(present);
+    }
+    try std.testing.expectEqual(cardinality, result.rows[0][3].integer);
+}
+
+test "quadratic path statistics release every allocation failure" {
+    const Campaign = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH REPEATABLE ELEMENTS p=(a:Document {id:'a'})-[xs:CITES*0..1]->()-[ys:CITES*0..1]->(b) RETURN avg(length(p)*length(p)),min(2*size(xs)-size(ys)),count(DISTINCT length(p))", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expect(result.rows[0][0].number > 0);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "statistics keep shortest path selectors on their frontier executor" {
+    try check("MATCH p=allShortestPaths((a:Document {id:'a'})-[:CITES*0..2]->(b)) RETURN count(*),count(DISTINCT length(p)),avg(length(p)*length(p))", "[[5,3,2]]");
+    try check("MATCH p=shortestPath((a:Document {id:'a'})-[:CITES*0..2]->(b)) RETURN count(*),count(DISTINCT length(p)),avg(length(p)*length(p))", "[[3,3,1.6666666666666667]]");
+}
+
+test "directional extrema retain safe offsets across wide internal costs" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH REPEATABLE ELEMENTS p=(a:Document {id:'a'})-[xs:CITES*0..3]->()-[ys:CITES*0..1]->(b) RETURN min((2*size(xs)+size(ys)-6)*1537228672809129301),max((2*size(xs)+size(ys)-6)*1537228672809129301)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .path_depth = 4 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, -9223372036854775806), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1537228672809129301), result.rows[0][1].integer);
+}

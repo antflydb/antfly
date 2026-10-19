@@ -1806,6 +1806,34 @@ ALL mappings. Invariant predicates and grouping observations cannot read a
 collapsed segment. Partial segment sums, unequal segment coefficients, unknown
 arithmetic and expressions that may fail retain their original distributions.
 
+
+Certified integer reductions also use a shared path-statistics algebra. Linear
+cost directions carry signed extrema directly, so unequal segment coefficients
+do not require a joint length distribution. Quadratic arguments retain exact
+first and cross moments: advancing an axis updates its square by twice the
+first moment plus the count, while composition retains both cross terms.
+Polynomial certification checks every original intermediate against integer
+bounds; mixed-sign SUM and integer-to-binary64 conversions outside the exact
+range retain ordinary execution.
+
+DISTINCT integer length expressions carry bounded bitsets of reachable costs.
+Shifts, unions and composition preserve holes and zero-hop acceptance without
+retaining route multiplicities. Every bitset operation charges statement work
+and all storage belongs to the existing query memory budget. Current proof
+limits are degree two, 32 geometric axes and a 65,537-value support domain;
+unproved shapes use the existing executor rather than changing query semantics.
+
+Consumers receive tagged aggregate arguments, never fabricated ordinary graph
+rows. First-moment consumers receive at most two integral bins with exact bag
+weights; extrema receive their exact value, and DISTINCT receives supported
+values once. SQL tags are confined to negotiated single-reducer streams and
+follow projection and positional UNION mappings. Original grouping keys,
+filters and observed arithmetic retain independent invariance/totality
+obligations. Global endpoint merging is allowed only when those observations
+and row expansion are independent of the endpoint; otherwise statistics stay
+with their original binding. Native and SQL execution share the same pinned,
+authorized traversal and cycle/uniqueness proofs.
+
 Unproved length predicates, length grouping keys, non-extremum DISTINCT
 arguments and other distribution-dependent expressions retain exact hop states. Cyclic
 trail histories retain ordinary enumeration when uniqueness cannot be proved;
