@@ -75,31 +75,50 @@ const Job = struct {
     }
     fn execute(self: *Job) !void {
         self.provider.context.additional_checkpoint = .{ .ptr = self, .check = check };
-        const args = self.args;
-        const source = self.provider.source;
-        switch (self.kind) {
-            .aggregate => {
-                self.result.native = try aggregates.buildIndexed(args.a, args.out, args.table, source, &self.store, &self.provider, args.token, args.reusable, args.contributions, args.index);
-                try self.provider.checkpointBatch(self.result.native.declarations);
-            },
-            .ordered => {
-                self.result.ordered = try @import("lake_index_native_rows.zig").buildIncremental(args.a, args.out, args.table, source, &self.store, &self.provider, args.token, args.reusable, args.candidates);
-                for (self.result.ordered) |declaration| try self.provider.checkpoint(declaration);
-            },
-            .text => {
-                self.result.text = try @import("lake_index_native_text.zig").buildIncremental(args.a, args.out, args.table, source, args.base, &self.store, &self.provider, args.token, args.reusable, args.candidates);
-                for (self.result.text) |declaration| try self.provider.checkpoint(declaration);
-            },
-            .sparse => self.result.sparse = try @import("lake_index_native_sparse.zig").buildIncremental(args.a, args.out, args.table, source, args.base, &self.store, &self.provider, args.token, args.reusable, args.candidates),
-            .dense => self.result.dense = try @import("lake_index_native_dense.zig").buildIncremental(args.a, args.out, args.table, source, args.base, &self.store, &self.provider, args.token, args.reusable, args.candidates),
-        }
+        self.result = try executeFamily(self.args, self.kind, &self.provider, &self.store);
     }
 };
-/// Admission is all-or-nothing before starting work. Saturation retains the
-/// serial builder path; it cannot strand a rendezvous behind an inline task.
+fn executeFamily(args: Args, kind: Kind, provider: *Provider, store: *stores.ArtifactStore) !Result {
+    var result: Result = .{};
+    const source = provider.source;
+    switch (kind) {
+        .aggregate => {
+            result.native = try aggregates.buildIndexed(args.a, args.out, args.table, source, store, provider, args.token, args.reusable, args.contributions, args.index);
+            try provider.checkpointBatch(result.native.declarations);
+        },
+        .ordered => {
+            result.ordered = try @import("lake_index_native_rows.zig").buildIncremental(args.a, args.out, args.table, source, store, provider, args.token, args.reusable, args.candidates);
+            for (result.ordered) |declaration| try provider.checkpoint(declaration);
+        },
+        .text => {
+            result.text = try @import("lake_index_native_text.zig").buildIncremental(args.a, args.out, args.table, source, args.base, store, provider, args.token, args.reusable, args.candidates);
+            for (result.text) |declaration| try provider.checkpoint(declaration);
+        },
+        .sparse => result.sparse = try @import("lake_index_native_sparse.zig").buildIncremental(args.a, args.out, args.table, source, args.base, store, provider, args.token, args.reusable, args.candidates),
+        .dense => result.dense = try @import("lake_index_native_dense.zig").buildIncremental(args.a, args.out, args.table, source, args.base, store, provider, args.token, args.reusable, args.candidates),
+    }
+    return result;
+}
+fn allowance(slot: usize) usize {
+    return switch (@as(Kind, @fromBackingInt(@intCast(slot)))) {
+        .aggregate, .ordered => 8 * 1024 * 1024,
+        .text => 64 * 1024 * 1024,
+        .sparse, .dense => 256 * 1024 * 1024,
+    };
+}
+fn merge(result: *Result, part: Result, enabled: [Pipeline.width]bool) void {
+    if (enabled[0]) result.native = part.native;
+    if (enabled[1]) result.ordered = part.ordered;
+    if (enabled[2]) result.text = part.text;
+    if (enabled[3]) result.sparse = part.sparse;
+    if (enabled[4]) result.dense = part.dense;
+}
+
+/// Choose the largest admitted cohort, reducing expensive families first.
+/// Failed admission starts no builder; completed cohorts are never repeated.
 pub fn build(args_: Args) !?Result {
-    const replay = args_.provider.replay orelse return null;
-    const io = args_.provider.context.io orelse return null;
+    _ = args_.provider.replay orelse return null;
+    _ = args_.provider.context.io orelse return null;
     var enabled: [Pipeline.width]bool = @splat(false);
     const rebuild = @import("../serverless/build/lake_rebuild.zig");
     var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(args_.a, args_.base, args_.provider.source.inventory, .{ .table_name = args_.table.name, .schema_json = args_.table.schema_json, .indexes_json = args_.table.indexes_json });
@@ -118,22 +137,55 @@ pub fn build(args_: Args) !?Result {
     if (try parsed.relationalIndexDefinitions(planning.allocator())) |definitions| {
         enabled[@backingInt(Kind.ordered)] = definitions.len != 0;
     }
-    var count: usize = 0;
-    for (enabled) |active| count += @intFromBool(active);
-    if (count < 2) return null;
-    // Concurrent construction must fit the same publication working set as
-    // serial construction. Decline before mutating checkpoints when headroom
-    // cannot cover replay plus conservative per-family transient allowances.
-    var workspace: usize = replay.budget.limit;
+    var remaining: usize = 0;
+    for (enabled) |active| remaining += @intFromBool(active);
+    if (remaining < 2) return null;
+    var result: Result = .{};
+    var completed = false;
+    while (remaining >= 2) {
+        var cohort = enabled;
+        var size = remaining;
+        while (size >= 2) {
+            if (try buildCohort(args_, cohort)) |part| {
+                merge(&result, part, cohort);
+                for (cohort, 0..) |active, slot| if (active) {
+                    enabled[slot] = false;
+                };
+                remaining -= size;
+                completed = true;
+                break;
+            }
+            var heaviest: ?usize = null;
+            for (cohort, 0..) |active, slot| if (active and (heaviest == null or allowance(slot) >= allowance(heaviest.?))) {
+                heaviest = slot;
+            };
+            cohort[heaviest.?] = false;
+            size -= 1;
+        }
+        if (size < 2) break;
+    }
+    if (!completed) return null;
     for (enabled, 0..) |active, slot| if (active) {
-        workspace += switch (@as(Kind, @fromBackingInt(@intCast(slot)))) {
-            .aggregate, .ordered => 8 * 1024 * 1024,
-            .text => 64 * 1024 * 1024,
-            .sparse, .dense => 256 * 1024 * 1024,
-        };
+        var single: [Pipeline.width]bool = @splat(false);
+        single[slot] = true;
+        merge(&result, try executeFamily(args_, @fromBackingInt(@intCast(slot)), args_.provider, args_.store), single);
+    };
+    return result;
+}
+fn buildCohort(args_: Args, enabled: [Pipeline.width]bool) !?Result {
+    const replay = args_.provider.replay.?;
+    const io = args_.provider.context.io.?;
+    // One input/decode workspace is shared under the source mutex, including
+    // speculative reads. Scale the replay cache to actual remaining headroom.
+    const decoded = std.math.mul(usize, args_.provider.limits.max_decoded_bytes, 2) catch return null;
+    var workspace = std.math.add(usize, args_.provider.limits.max_input_bytes, decoded) catch return null;
+    for (enabled, 0..) |active, slot| if (active) {
+        workspace = std.math.add(usize, workspace, allowance(slot)) catch return null;
     };
     const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(args_.a) orelse return null;
-    if (workspace > available) return null;
+    if (workspace >= available or available - workspace < 1024 * 1024) return null;
+    const replay_limit = @min(replay.budget.limit, available - workspace);
+    try replay.reset();
     var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = args_.a };
     var outputs: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = args_.out };
     var args = args_;
@@ -143,6 +195,8 @@ pub fn build(args_: Args) !?Result {
     // every worker and borrowed reader has joined, including failed admission.
     const arena_parent = replay.arena.child_allocator;
     const budget_parent = replay.budget.backing;
+    const limit_parent = replay.budget.limit;
+    replay.budget.limit = replay_limit;
     const index_parent = args.index.a;
     const seed_parent = args.index.seed_arena.child_allocator;
     const index_store_parent = args.index.store.allocator;
@@ -152,13 +206,44 @@ pub fn build(args_: Args) !?Result {
     args.index.seed_arena.child_allocator = args.a;
     args.index.store.allocator = args.a;
     defer {
+        // Retained replay buffers cannot outlive this allocator admission.
+        replay.reset() catch unreachable;
         replay.arena.child_allocator = arena_parent;
         replay.budget.backing = budget_parent;
+        replay.budget.limit = limit_parent;
         args.index.a = index_parent;
         args.index.seed_arena.child_allocator = seed_parent;
         args.index.store.allocator = index_store_parent;
     }
-    var pipeline: Pipeline = .{ .replay = replay, .io = io };
+    try args.provider.source.ensureInventory(args.provider.context);
+    try args.provider.source.ensureCanonicalPlan(args.provider.context);
+    // Capture lanes own their mutable reader/version state, just like consumers.
+    // Parent authority stays pinned and quiescent until every task has joined.
+    var capture_source = try args.provider.source.parallelView(args.a);
+    defer capture_source.closeParallelView(args.provider.source);
+    var capture_provider = args.provider.*;
+    capture_provider.source = &capture_source;
+    var ahead_source = try args.provider.source.parallelView(args.a);
+    defer ahead_source.closeParallelView(args.provider.source);
+    var ahead_provider = args.provider.*;
+    ahead_provider.source = &ahead_source;
+    const replay_provider = replay.provider;
+    replay.provider = &capture_provider;
+    defer replay.provider = replay_provider;
+    var ahead = replay_api.Replay.init(args.a, &ahead_provider, replay.columns);
+    defer ahead.deinit();
+    // Two buffers share the original replay memory and disk admission. A large
+    // file can always fall back to the existing ordinary streaming source.
+    const disk_limit = replay.max_spill_bytes;
+    defer replay.max_spill_bytes = disk_limit;
+    replay.max_spill_bytes = disk_limit / 2;
+    replay.budget.limit = replay_limit / 2;
+    ahead.budget.limit = replay_limit / 2;
+    ahead.max_spill_bytes = disk_limit / 2;
+    var pipeline: Pipeline = .{ .replay = replay, .spare = &ahead, .io = io, .scheduler = args.scheduler };
+    ahead.pipeline = &pipeline;
+    defer replay.captures += ahead.captures;
+    defer replay.read_ahead_hits += pipeline.prefetched;
     replay.pipeline = &pipeline;
     defer replay.pipeline = null;
     var start: std.Io.Event = .unset;
@@ -174,8 +259,6 @@ pub fn build(args_: Args) !?Result {
             running.cancel(io) catch {};
         };
     }
-    try args.provider.source.ensureInventory(args.provider.context);
-    try args.provider.source.ensureCanonicalPlan(args.provider.context);
     for (enabled, 0..) |active, slot| if (active) {
         var provider = args.provider.*;
         provider.replay_consumer = slot;
@@ -280,6 +363,7 @@ test "external lake file-first publication shares one decode across five native 
     args.a = a;
     const result = (try build(args)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 3), replay.captures);
+    try std.testing.expect(replay.read_ahead_hits != 0);
     try std.testing.expectEqual(@as(usize, 0), replay.readers);
     try std.testing.expectEqual(@as(usize, 2), result.native.declarations.len);
     try std.testing.expectEqual(@as(usize, 1), result.ordered.len);
@@ -290,6 +374,38 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(u64, 12), ordered.page.?.records);
     const text = try @import("lake_index_native_text.zig").loadRootDirectory(out, store, result.text[0].artifact, .none, null);
     try std.testing.expectEqual(@as(u32, 12), text.collection.?.documents);
+    // Scheduler saturation admits smaller cohorts without repeating completed
+    // families. Five builders share pairs of scans with only two worker slots.
+    var pairs: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 2 };
+    args.scheduler = &pairs;
+    const prior_captures = replay.captures;
+    const paired = (try build(args)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(replay.captures - prior_captures <= 9);
+    try std.testing.expectEqual(@as(usize, 0), pairs.workers);
+    try std.testing.expectEqual(@as(usize, 1), paired.ordered.len);
+    try std.testing.expectEqual(@as(usize, 1), paired.dense.len);
+    args.scheduler = null;
+    // At 128 MiB, lightweight families still share a small admitted replay.
+    var modest = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 128 * 1024 * 1024 });
+    {
+        var limited_replay = replay_api.Replay.init(modest.allocator(), &provider, columns);
+        defer limited_replay.deinit();
+        var limited_index: @import("lake_index_contributions.zig").Index = undefined;
+        try limited_index.init(modest.allocator(), store, null, .none);
+        defer limited_index.deinit();
+        provider.replay = &limited_replay;
+        defer provider.replay = &replay;
+        args.a = modest.allocator();
+        args.index = &limited_index;
+        defer {
+            args.a = a;
+            args.index = &index;
+        }
+        const limited = (try build(args)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), limited.ordered.len);
+        try std.testing.expect(limited_replay.captures < 15);
+    }
+    try std.testing.expectEqual(@as(usize, 0), modest.live_bytes);
     // A file larger than replay admission streams ordinarily. Every consumer
     // still receives all rows and no reader pins the failed temporary replay.
     replay.max_spill_bytes = 1;

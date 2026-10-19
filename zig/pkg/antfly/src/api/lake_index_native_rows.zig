@@ -257,7 +257,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             };
             const retained = try a.alloc(bool, slot_names.items.len);
             errdefer a.free(retained);
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .retired_slots = retired.items, .files = slot_names.items, .fingerprints = slot_hashes.items, .public_navigation = if (input.native_delta) |delta| delta.public_navigation else null } });
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .retired_slots = retired.items, .files = slot_names.items, .fingerprints = slot_hashes.items, .public_navigation = if (input.native_delta) |delta| delta.public_navigation else null, .source_cut = if (input.native_delta) |delta| delta.source_cut else null, .checkpoint_base = if (input.native_delta) |delta| delta.prior_cut else null, .pending_files = if (input.native_delta != null) @intCast(std.mem.count(bool, changed, &.{true})) else 0 } });
             entries.items[entries.items.len - 1].sort.shared_runs = true;
             entries.items[entries.items.len - 1].sort.encoded_bytes = true;
         }
@@ -287,7 +287,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer base_sort.deinit();
             base_sort.encoded_bytes = true;
             base_sort.shared_runs = true;
-            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .public_navigation = entry.delta.public_navigation, .run_only = true, .previous = prior, .keep = entry.delta.keep, .retired_slots = entry.delta.retired_slots, .files = entry.delta.files, .fingerprints = entry.built_hashes });
+            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .source_cut = entry.delta.source_cut, .checkpoint_base = entry.delta.checkpoint_base, .pending_files = entry.delta.pending_files, .public_navigation = entry.delta.public_navigation, .run_only = true, .previous = prior, .keep = entry.delta.keep, .retired_slots = entry.delta.retired_slots, .files = entry.delta.files, .fingerprints = entry.built_hashes });
             entry.published = ref;
             try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
             entry.delta.previous = try ordered.loadRootLazy(entry.root_arena.allocator(), store.*, ref, cancellation, null);
@@ -336,7 +336,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const keep = if (first_checkpoint) try a.dupe(bool, entry.delta.keep) else entry.retained;
                 defer if (first_checkpoint) a.free(keep);
                 if (slot < keep.len) keep[slot] = false;
-                var delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .retired_slots = if (first_checkpoint) entry.delta.retired_slots else &.{slot}, .files = entry.delta.files, .fingerprints = entry.built_hashes, .public_navigation = entry.delta.public_navigation, .dictionary_slots = if (entry.published != null) &.{slot} else null };
+                var delta: ordered.Delta = .{ .source_cut = entry.delta.source_cut, .checkpoint_base = entry.delta.checkpoint_base, .pending_files = if (entry.delta.source_cut != null) entry.delta.pending_files - 1 else 0, .previous = entry.delta.previous, .keep = keep, .retired_slots = if (first_checkpoint) entry.delta.retired_slots else &.{slot}, .files = entry.delta.files, .fingerprints = entry.built_hashes, .public_navigation = entry.delta.public_navigation, .dictionary_slots = if (entry.published != null) &.{slot} else null };
                 if (entry.reverse) |reverse| {
                     delta.built_reverse = try reverse.finish();
                     delta.reverse_built = true;
@@ -363,6 +363,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 entry.delta.keep = entry.retained;
                 entry.delta.dictionary_slots = &.{};
                 entry.delta.retired_slots = &.{};
+                entry.delta.pending_files = delta.pending_files;
                 entry.sort.deinit();
                 entry.sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / entries.items.len);
                 entry.sort.shared_runs = true;
@@ -702,7 +703,7 @@ test "external lake ordered sparse publication preserves covering rows across au
     try client.makeBucket("antfly");
     const bytes = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 1, 2, 3, 4 }, .field_id = 1 }});
     defer a.free(bytes);
-    for (0..8) |index| {
+    for (0..12) |index| {
         const name = try std.fmt.allocPrint(a, "part-{d}.parquet", .{index});
         defer a.free(name);
         var uploaded = try client.putObject("antfly", name, bytes, .{});
@@ -729,18 +730,22 @@ test "external lake ordered sparse publication preserves covering rows across au
         var base: local.storage_object_storage.ObjectStorage = undefined;
         var allowed: []const u8 = "";
         fn get(_: *anyopaque, alloc: A, bucket: []const u8, key: []const u8, options: local.storage_object_storage.GetOptions) !local.storage_object_storage.GetResult {
-            if (!std.mem.eql(u8, key, allowed)) return error.UnexpectedUnchangedParquetRead;
+            if (!std.mem.eql(u8, key, allowed) and !(std.mem.eql(u8, allowed, "new-*") and std.mem.startsWith(u8, key, "new-"))) return error.UnexpectedUnchangedParquetRead;
             var copy = base;
             copy.allocator = alloc;
             return copy.getObject(bucket, key, options);
         }
     };
     const table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = schema_json, .indexes_json = "{}" };
-    for (0..5) |phase| {
-        if (phase == 1 or phase == 4) {
+    for (0..7) |phase| {
+        if (phase == 1 or phase == 4 or phase == 5) {
             if (phase == 4) try client.deleteObject("antfly", "part-2.parquet", .{});
-            var uploaded = try client.putObject("antfly", if (phase == 1) "new.parquet" else "renamed.parquet", bytes, .{});
+            var uploaded = try client.putObject("antfly", if (phase == 1) "new-a.parquet" else if (phase == 5) "later.parquet" else "renamed.parquet", bytes, .{});
             uploaded.deinit(a);
+            if (phase == 1) {
+                var other = try client.putObject("antfly", "new-b.parquet", bytes, .{});
+                other.deinit(a);
+            }
         } else if (phase == 2) {
             try client.deleteObject("antfly", "part-1.parquet", .{});
             const changed = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 100, 101, 102, 103 }, .field_id = 1 }});
@@ -752,10 +757,26 @@ test "external lake ordered sparse publication preserves covering rows across au
         defer source.deinit();
         var denied = source.scanner.object_reader.client.vtable.*;
         Denied.base = source.scanner.object_reader.client;
-        Denied.allowed = if (phase == 1) "new.parquet" else if (phase == 2) "part-0.parquet" else if (phase == 4) "renamed.parquet" else "";
+        Denied.allowed = if (phase == 1) "new-*" else if (phase == 2) "part-0.parquet" else if (phase == 4) "renamed.parquet" else if (phase == 5) "later.parquet" else "";
         denied.get_object = Denied.get;
         if (phase != 0) source.scanner.object_reader.client.vtable = &denied;
         store.upload_scope = .{ .domain = @splat(9), .attempt = @splat(@as(u8, @intCast(phase + 1))) };
+        if (phase == 3) {
+            // Upgrade a dictionary that has a valid census commitment but
+            // predates the persistent free-slot directory. Migration must own
+            // new pages under this publication attempt, including on quiet cuts.
+            var legacy = try ordered.loadRootLazy(ca, store, previous[0].artifact, .none, null);
+            legacy.file_dictionary.?.free = null;
+            legacy.file_dictionary.?.free_complete = false;
+            var upload = store;
+            upload.allocator = ca;
+            const migrated = try upload.put(try std.json.Stringify.valueAlloc(ca, legacy, .{}));
+            const copy = try ca.dupe(Declared, previous);
+            copy[0].artifact.artifact_id = migrated.artifact_id;
+            copy[0].artifact.checksum = migrated.checksum;
+            copy[0].artifact.byte_len = migrated.byte_len;
+            previous = copy;
+        }
         var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
         var navigation = try navigation_api.build(a, ca, &store, &provider, previous_navigation, .none);
         defer navigation.deinit();
@@ -777,15 +798,68 @@ test "external lake ordered sparse publication preserves covering rows across au
             // fails before the builder can transfer either owner into Entry.
             try std.testing.expectError(error.OutOfMemory, @import("lake_index_native_rows_delta.zig").build(failing.allocator(), ca, &provider, &store, runtime_failure, &layout_failure, selected, &.{}, previous, .none, &unopened));
         }
-        const built = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, previous);
+        var candidates = previous;
+        if (phase == 1) {
+            const Interrupted = struct {
+                out: A,
+                declaration: ?Declared = null,
+                fn save(raw: *anyopaque, declaration: Declared) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.declaration = try std.json.parseFromSliceLeaky(Declared, self.out, try std.json.Stringify.valueAlloc(self.out, declaration, .{}), .{ .allocate = .alloc_always });
+                    return error.TestPublicationInterrupted;
+                }
+            };
+            var interrupted: Interrupted = .{ .out = ca };
+            provider.progress = .{ .ptr = &interrupted, .save = Interrupted.save };
+            try std.testing.expectError(error.TestPublicationInterrupted, buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, previous));
+            provider.progress = null;
+            const checkpoint = interrupted.declaration orelse return error.TestUnexpectedResult;
+            const checkpoint_root = try ordered.loadRootLazy(ca, store, checkpoint.artifact, .none, null);
+            try std.testing.expectEqual(@as(u32, 1), checkpoint_root.pending_files);
+            try std.testing.expectEqualDeep(navigation.delta.source_cut, checkpoint_root.source_cut);
+            try std.testing.expectEqualDeep(navigation.delta.prior_cut, checkpoint_root.checkpoint_base);
+            // One changed file completed, one still pending. Probe the exact
+            // fingerprint to forbid reads from the completed file on resume.
+            var reads: u64 = 16 * 1024 * 1024;
+            var writes: u64 = 0;
+            var bridge: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = checkpoint_root.domain, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            var completed_a = false;
+            for (source.inventory.files) |file| if (std.mem.endsWith(u8, file.file_id, "new-a.parquet")) {
+                const slot = (try ordered.file_dictionary.named(ca, bridge.store(), checkpoint_root.file_dictionary.?, file.file_id)).?;
+                const record = try ordered.file_dictionary.file(ca, bridge.store(), checkpoint_root.file_dictionary.?, slot);
+                completed_a = !std.mem.allEqual(u8, &record.fingerprint, 0);
+            };
+            Denied.allowed = if (completed_a) "new-b.parquet" else "new-a.parquet";
+            candidates = try std.mem.concat(ca, Declared, &.{ previous, &.{checkpoint} });
+            const good_cut = provider.native_delta.?.source_cut;
+            provider.native_delta.?.source_cut.?[0] ^= 1;
+            // Identical public names cannot authorize a checkpoint from a
+            // different logical file-content cut. It must reread changed files.
+            try std.testing.expectError(error.UnexpectedUnchangedParquetRead, buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, candidates));
+            provider.native_delta.?.source_cut = good_cut;
+            provider.ordered_delta_plans = 0;
+        }
+        const built = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, candidates);
         if (phase != 0) try std.testing.expectEqual(@as(usize, 1), provider.ordered_delta_plans);
         if (phase == 3) {
             const reused = try build(a, ca, table, &source, &store, &provider, .none, built);
             try std.testing.expectEqualStrings(built[0].artifact.artifact_id, reused[0].artifact.artifact_id);
         }
+        if (phase == 1) {
+            const complete_candidates = try std.mem.concat(ca, Declared, &.{ previous, built });
+            Denied.allowed = "";
+            const resumed = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, complete_candidates);
+            const resumed_root = try ordered.loadRootLazy(ca, store, resumed[0].artifact, .none, null);
+            try std.testing.expectEqual(@as(u64, 56), resumed_root.page.?.records);
+        }
         const root = try ordered.loadRootLazy(ca, store, built[0].artifact, .none, null);
-        try std.testing.expectEqual(@as(usize, if (phase == 0) 8 else 9), root.fileCount());
-        try std.testing.expectEqual(@as(u64, if (phase == 1) 36 else 32), root.page.?.records);
+        try std.testing.expectEqual(@as(u32, 0), root.pending_files);
+        if (phase == 3) {
+            try std.testing.expect(root.file_dictionary.?.free_complete);
+            try std.testing.expectEqualDeep(store.upload_scope.?.attempt, root.file_dictionary.?.free.?.attempt);
+        }
+        try std.testing.expectEqual(@as(usize, if (phase == 0) 12 else 14), root.fileCount());
+        try std.testing.expectEqual(@as(u64, if (phase == 1 or phase >= 5) 56 else if (phase == 0) 48 else 52), root.page.?.records);
         var reader: ordered.Reader = undefined;
         try reader.init(a, &store, root, root.fingerprint, "", null, .none);
         defer reader.deinit();
@@ -800,7 +874,7 @@ test "external lake ordered sparse publication preserves covering rows across au
             if ((try block.cell(cover.row, 0)).value.integer >= 100) fresh += 1;
             rows += 1;
         };
-        try std.testing.expectEqual(@as(usize, if (phase == 1) 36 else 32), rows);
+        try std.testing.expectEqual(@as(usize, if (phase == 1 or phase >= 5) 56 else if (phase == 0) 48 else 52), rows);
         try std.testing.expectEqual(@as(usize, if (phase >= 2) 4 else 0), fresh);
         previous_navigation = try navigation_api.load(ca, store, navigation.ref, .none, null);
         previous = built;

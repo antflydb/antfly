@@ -63,7 +63,11 @@ pub const Root = struct {
     snapshot: []const u8,
     files: []const []const u8 = &.{},
     file_dictionary: ?file_dictionary.Roots = null,
-    /// Build-only borrowed publication directory; its references persist in the dictionary.
+    /// Logical census and predecessor commitments authorize sparse resumption.
+    source_cut: ?[32]u8 = null,
+    checkpoint_base: ?[32]u8 = null,
+    pending_files: u32 = 0,
+    /// Build-only borrowed directory; its references persist in the dictionary.
     public_navigation: ?file_dictionary.Public = null,
     cover: []const []const u8 = &.{},
     file_fingerprints: []const [32]u8 = &.{},
@@ -91,6 +95,7 @@ pub const Root = struct {
         if (self.file_dictionary) |dictionary| {
             if (self.version < 7) return error.InvalidNativeLakeRowIndex;
             try file_dictionary.validate(dictionary);
+            if (self.pending_files > dictionary.public_count) return error.InvalidNativeLakeRowIndex;
             if (dictionary.public_names and self.version < 9) return error.InvalidNativeLakeRowIndex;
             if (self.files.len != 0 and self.files.len != dictionary.count) return error.InvalidNativeLakeRowIndex;
         }
@@ -131,6 +136,9 @@ pub const Delta = struct {
     /// Sorted changed slots replace the archive-sized keep mask on proven cuts.
     sparse_slots: bool = false,
     dictionary_edits: ?[]const file_dictionary.Edit = null,
+    source_cut: ?[32]u8 = null,
+    checkpoint_base: ?[32]u8 = null,
+    pending_files: u32 = 0,
     public_navigation: ?file_dictionary.Public = null,
     run_only: bool = false,
     // Dictionary ownership is independent of a data run's merge ancestry.
@@ -486,7 +494,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         const previous = delta.dictionary_previous orelse delta.previous orelse return error.InvalidNativeLakeRowIndex;
         dictionary = try file_dictionary.updateFingerprints(a, pages.store(), previous.file_dictionary orelse return error.InvalidNativeLakeRowIndex, delta.files, delta.fingerprints, slots);
     }
-    const root: Root = .{ .fingerprint = fingerprint, .domain = scope.domain, .page = page, .reverse = reverse, .ties = ties, .tie_version = if (delta.run_only) 0 else 1, .building = delta.run_only, .predicates = predicate_root, .source = inventory.source_id, .snapshot = inventory.snapshot_id, .files = if (delta.files.len != 0) delta.files else files, .file_fingerprints = delta.fingerprints, .public_navigation = delta.public_navigation, .cover = cover };
+    const root: Root = .{ .fingerprint = fingerprint, .domain = scope.domain, .page = page, .reverse = reverse, .ties = ties, .tie_version = if (delta.run_only) 0 else 1, .building = delta.run_only, .predicates = predicate_root, .source = inventory.source_id, .snapshot = inventory.snapshot_id, .files = if (delta.files.len != 0) delta.files else files, .file_fingerprints = delta.fingerprints, .source_cut = delta.source_cut, .checkpoint_base = delta.checkpoint_base, .pending_files = delta.pending_files, .public_navigation = delta.public_navigation, .cover = cover };
     return persistRoot(a, result_alloc, store, root, name, cancellation, delta.dictionary_previous orelse delta.previous, !delta.run_only, sort.manager, dictionary);
 }
 fn persistRoot(a: A, result_alloc: A, store: *stores.ArtifactStore, root: Root, name: []const u8, cancellation: Cancellation, previous_root: ?Root, register_closure: bool, manager: ?*local.sql_spill.Manager, ready_dictionary: ?file_dictionary.Roots) !Ref {
@@ -597,7 +605,7 @@ pub fn publishRunCheckpoint(a: A, out: A, store: *stores.ArtifactStore, sort: *l
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const ca = scratch.allocator();
-    const fresh_ref = try publishIncremental(a, ca, store, sort, name, fingerprint, inventory, cover, cancellation, .{ .dictionary_previous = delta.previous, .dictionary_slots = delta.dictionary_slots, .run_only = delta.previous != null, .public_navigation = delta.public_navigation, .files = delta.files, .fingerprints = delta.fingerprints, .reverse_built = delta.reverse_built, .built_reverse = delta.built_reverse });
+    const fresh_ref = try publishIncremental(a, ca, store, sort, name, fingerprint, inventory, cover, cancellation, .{ .source_cut = delta.source_cut, .checkpoint_base = delta.checkpoint_base, .pending_files = delta.pending_files, .dictionary_previous = delta.previous, .dictionary_slots = delta.dictionary_slots, .run_only = delta.previous != null, .public_navigation = delta.public_navigation, .files = delta.files, .fingerprints = delta.fingerprints, .reverse_built = delta.reverse_built, .built_reverse = delta.built_reverse });
     var fresh = try loadRootLazy(ca, store.*, fresh_ref, cancellation, null);
     var runs: std.ArrayList(Root.Run) = .empty;
     var incoming: ?tree.Ref = fresh.page;
@@ -819,6 +827,7 @@ fn validateReuseWithCache(a: A, backend: stores.ArtifactStore, root: Root, conte
         try validator.pages(dictionary.slots, false);
         try validator.pages(dictionary.names, false);
         try validator.pages(dictionary.public, false);
+        try validator.pages(dictionary.free, false);
     }
     try validator.certify(root.retained_id);
 }

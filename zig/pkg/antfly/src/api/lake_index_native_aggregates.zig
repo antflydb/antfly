@@ -496,7 +496,20 @@ const LeafResolver = struct {
                 self.provider.only_file = leaf.index;
                 defer self.provider.only_file = null;
                 const file = self.source.inventory.files[leaf.index];
-                if (self.metadata_count and self.source.inventory.format == .iceberg) try partial.addGlobalCount(file.row_count) else try consumeCohort(self.a, self.provider, self.binding, self.recipe, partial, self.budget, self.cancellation);
+                if (self.metadata_count) {
+                    if (self.source.inventory.format == .iceberg) {
+                        try partial.addGlobalCount(file.row_count);
+                    } else {
+                        // Footer discovery qualifies the immutable file version;
+                        // identity-only counting never decodes a value column.
+                        var stream = try local.serverless_query_lake_stream.Stream.init(self.a, self.source, &.{}, &.{}, self.provider.context, self.provider.limits);
+                        defer stream.deinit();
+                        stream.identity_only = true;
+                        stream.schema_contract = self.provider.schema_contract;
+                        try stream.restrictFile(leaf.index);
+                        try partial.addGlobalCount((try stream.countAll()) orelse return error.UnsupportedExternalLakeIndex);
+                    }
+                } else try consumeCohort(self.a, self.provider, self.binding, self.recipe, partial, self.budget, self.cancellation);
             }
             const published = if (self.recipe.keys.len != 0) try artifacts.publishPartitioned(self.a, self.out, self.store, self.names, partial, self.recipe, self.spill, self.cancellation) else try artifacts.publishCohort(self.a, self.out, self.store, self.names, partial, self.recipe, self.cancellation);
             @memcpy(refs, published);
@@ -1046,6 +1059,15 @@ test "external lake native algebraic publication reads real Parquet into exact S
     const result = (try group.nextResult(page.allocator())).?;
     try std.testing.expectEqual(@as(i64, 18014398509481985), result.aggregates[0].value.integer);
     try std.testing.expect((try cursor.next(cursor.ptr, page.allocator(), 32)) == null);
+    // A count-only Parquet publication must not decode a single value row.
+    // The same file's normal aggregate path exceeds this explicit row limit.
+    var count_provider = provider;
+    count_provider.limits.max_examined_rows = 0;
+    var count_table = table;
+    count_table.indexes_json = "{\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]}}";
+    const count_only = try buildIncremental(a, output.allocator(), count_table, &source, &store, &count_provider, .none, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 1), count_only.declarations.len);
+    try std.testing.expectError(error.LakeRowsScanBudgetExceeded, buildIncremental(a, output.allocator(), table, &source, &store, &count_provider, .none, &.{}, &.{}));
     const count_recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = .{ .kind = .count }, .column = null }} };
     const count_identity = try recipeIdentity(a, count_recipe);
     defer a.free(count_identity);
@@ -1064,6 +1086,13 @@ test "external lake native algebraic publication reads real Parquet into exact S
     defer wrong.deinit(a);
     const wrong_reference: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .algebraic_segment, .metadata_version = artifacts.metadata_version, .name = sum_reader.root.name, .artifact_id = wrong.artifact_id, .checksum = wrong.checksum, .byte_len = wrong.byte_len };
     try std.testing.expectError(error.InvalidNativeAggregateArtifact, artifacts.Reader.open(a, store, wrong_reference, recipe, .none));
+    const metadata_reader = try artifacts.Reader.open(a, store, count_only.declarations[0].artifact, count_recipe, .none);
+    const metadata_cursor = metadata_reader.cursor();
+    defer metadata_cursor.close(metadata_cursor.ptr);
+    const metadata_counts = (try metadata_cursor.next(metadata_cursor.ptr, page.allocator(), 32)).?;
+    var metadata_exact = try local.sql_aggregate_partial.decode(page.allocator(), metadata_counts[0].aggregates[0], .{ .kind = .count });
+    defer metadata_exact.deinit();
+    try std.testing.expectEqual(@as(u64, 3), metadata_exact.count);
     const counts = (try count_cursor.next(count_cursor.ptr, page.allocator(), 32)).?;
     var exact = try local.sql_aggregate_partial.decode(page.allocator(), counts[0].aggregates[0], .{ .kind = .count });
     defer exact.deinit();

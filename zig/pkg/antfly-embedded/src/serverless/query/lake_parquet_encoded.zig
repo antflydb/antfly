@@ -265,6 +265,25 @@ pub const DeltaStream = struct {
         try self.finish();
     }
 };
+/// Locate adjacent delta streams by framing alone. Value kernels then decode
+/// each length/prefix once, without building random-access checkpoints.
+pub fn deltaExtent(bytes: []const u8, count: usize, bits: u8) !usize {
+    var stream = try DeltaStream.init(bytes, count, bits);
+    var remaining = count -| 1;
+    while (remaining != 0) {
+        _ = try stream.reader.signed();
+        const widths = try stream.reader.take(stream.minis);
+        for (widths) |width| {
+            if (remaining == 0) break;
+            if (width > bits) return error.InvalidParquetPage;
+            const size = stream.block_size / stream.minis;
+            _ = try stream.reader.take(size * width / 8);
+            remaining -= @min(size, remaining);
+        }
+    }
+    return stream.reader.offset;
+}
+
 /// Delta lengths borrow suffix bytes. Prefix compression reconstructs only
 /// demanded strings and reuses previously demanded immutable prefixes.
 /// Metadata and reconstructed values belong to the caller's arena.

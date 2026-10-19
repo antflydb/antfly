@@ -340,6 +340,132 @@ fn decodeExtendedAlloc(comptime T: type, a: Allocator, header: Header, payload: 
     return .{ .values = values, .nulls = nulls };
 }
 
+/// Page/chunk-owned byte buffers. Native vectors borrow slices; ownership is
+/// explicit so compatibility APIs can retain their per-value free contract.
+pub const PackedByteArrays = struct {
+    values: [][]u8,
+    nulls: []u8,
+    buffers: [][]u8,
+    pub fn deinit(self: *PackedByteArrays, a: Allocator) void {
+        for (self.buffers) |buffer| a.free(buffer);
+        a.free(self.buffers);
+        a.free(self.values);
+        a.free(self.nulls);
+    }
+};
+fn packedBytePage(a: Allocator, original: Header, payload: []const u8, optional: bool) !PackedByteArrays {
+    const flat = if (optional) try flatOptionalPage(original, payload) else FlatOptionalPage{ .header = original, .payload = payload };
+    const header = flat.header;
+    try validatePhysicalHeader(header, .bytes);
+    if (header.repetition_level_bytes != 0 or header.data_payload_offset > flat.payload.len) return error.InvalidParquetPage;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const work = scratch.allocator();
+    const definitions: ?DefinitionIndex = if (optional) defs: {
+        if (header.definition_level_bytes == 0 or header.definition_level_bytes > header.data_payload_offset) return error.InvalidParquetPage;
+        break :defs try DefinitionIndex.init(work, flat.payload[0..header.definition_level_bytes], header.value_count);
+    } else null;
+    const count = if (definitions) |index| index.present else header.value_count;
+    const data = flat.payload[header.data_payload_offset..];
+    const codec = @import("lake_parquet_encoded.zig");
+    const prefixed = header.encoding == .delta_byte_array;
+    const prefix_bytes = if (prefixed) try codec.deltaExtent(data, count, 32) else 0;
+    var prefixes: ?codec.DeltaStream = if (prefixed) try codec.DeltaStream.init(data[0..prefix_bytes], count, 32) else null;
+    const length_bytes = try codec.deltaExtent(data[prefix_bytes..], count, 32);
+    var lengths = try codec.DeltaStream.init(data[prefix_bytes..][0..length_bytes], count, 32);
+    const suffix = data[prefix_bytes + length_bytes ..];
+    const values = try a.alloc([]u8, header.value_count);
+    errdefer a.free(values);
+    const nulls = if (optional) try a.alloc(u8, header.value_count) else @as([]u8, &.{});
+    errdefer a.free(nulls);
+    const sizes = try work.alloc(u32, header.value_count);
+    const offsets = try work.alloc(u32, count + 1);
+    offsets[0] = 0;
+    var present: usize = 0;
+    var previous: usize = 0;
+    var total: usize = 0;
+    for (sizes, 0..) |*size_out, row| {
+        const active = if (definitions) |index| index.position(row) != null else true;
+        if (optional) nulls[row] = @intFromBool(!active);
+        size_out.* = 0;
+        if (!active) continue;
+        const prefix = if (prefixes) |*stream| try stream.next() else 0;
+        const length = try lengths.next();
+        if (prefix < 0 or length < 0 or @as(u64, @intCast(prefix)) > previous or @as(u64, @intCast(length)) > suffix.len - offsets[present]) return error.InvalidParquetPage;
+        const size = @as(usize, @intCast(prefix)) + @as(usize, @intCast(length));
+        if (size + 4 > max_uncompressed_page_bytes -| header.data_payload_offset -| total) return error.ParquetPageTooLarge;
+        total += size + 4;
+        size_out.* = @intCast(size);
+        previous = size;
+        offsets[present + 1] = offsets[present] + @as(u32, @intCast(length));
+        present += 1;
+    }
+    try lengths.finish();
+    if (prefixes) |*stream| try stream.finish();
+    if (offsets[count] != suffix.len) return error.InvalidParquetPage;
+    const bytes = try a.alloc(u8, total - count * 4);
+    errdefer a.free(bytes);
+    var position: usize = 0;
+    present = 0;
+    var prior: []const u8 = &.{};
+    for (values, sizes, 0..) |*value, size, row| {
+        value.* = bytes[position..][0..size];
+        if (optional and nulls[row] != 0) continue;
+        const length = offsets[present + 1] - offsets[present];
+        const prefix = size - length;
+        @memcpy(value.*[0..prefix], prior[0..prefix]);
+        @memcpy(value.*[prefix..], suffix[offsets[present]..offsets[present + 1]]);
+        position += size;
+        prior = value.*;
+        present += 1;
+    }
+    const buffers = try a.dupe([]u8, &.{bytes});
+    return .{ .values = values, .nulls = nulls, .buffers = buffers };
+}
+/// Whole-column compatibility remains available for mixed page encodings.
+/// Compact native columns retain one byte buffer per physical page.
+pub fn scanPackedByteArraysAlloc(a: Allocator, chunk: []const u8, compression: CompressionCodec, optional: bool) !?PackedByteArrays {
+    var values: std.ArrayList([]u8) = .empty;
+    defer values.deinit(a);
+    var nulls: std.ArrayList(u8) = .empty;
+    defer nulls.deinit(a);
+    var buffers: std.ArrayList([]u8) = .empty;
+    defer buffers.deinit(a);
+    var transferred = false;
+    defer if (!transferred) for (buffers.items) |buffer| a.free(buffer);
+    var cursor: usize = 0;
+    while (cursor < chunk.len) {
+        const parsed = try parsePageHeader(chunk[cursor..]);
+        if (parsed.header.encoding != .delta_byte_array and parsed.header.encoding != .delta_length_byte_array) return null;
+        try validatePhysicalHeader(parsed.header, .bytes);
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > chunk.len - cursor) return error.InvalidParquetPage;
+        const payload = try decodePagePayloadAlloc(a, parsed.header, compression, chunk[cursor..][0..parsed.header.compressed_page_size]);
+        defer payload.deinit(a);
+        cursor += parsed.header.compressed_page_size;
+        var page = try packedBytePage(a, parsed.header, payload.bytes, optional);
+        var retained = false;
+        defer if (!retained) page.deinit(a);
+        try values.ensureUnusedCapacity(a, page.values.len);
+        try nulls.ensureUnusedCapacity(a, page.nulls.len);
+        try buffers.ensureUnusedCapacity(a, page.buffers.len);
+        values.appendSliceAssumeCapacity(page.values);
+        nulls.appendSliceAssumeCapacity(page.nulls);
+        buffers.appendSliceAssumeCapacity(page.buffers);
+        a.free(page.values);
+        a.free(page.nulls);
+        a.free(page.buffers);
+        retained = true;
+    }
+    const result_values = try values.toOwnedSlice(a);
+    errdefer a.free(result_values);
+    const result_nulls = try nulls.toOwnedSlice(a);
+    errdefer a.free(result_nulls);
+    const result_buffers = try buffers.toOwnedSlice(a);
+    transferred = true;
+    return .{ .values = result_values, .nulls = result_nulls, .buffers = result_buffers };
+}
+
 pub fn decodePlainI64Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]i64 {
     if (try decodeExtendedAlloc(i64, alloc, original_header, original_payload, .{ .integer = 8 }, false)) |decoded| return decoded.values;
     const header = original_header;
@@ -4794,4 +4920,57 @@ test "parquet compact full decode admits final typed vector without a plain stag
     defer budget.allocator().free(values);
     try std.testing.expectEqualSlices(i64, expected, values);
     try std.testing.expect(budget.peak < expected.len * @sizeOf(i64) * 2);
+}
+
+test "parquet compact strings use page buffers preserve null prefixes and unwind every allocation" {
+    const a = std.testing.allocator;
+    const codec = @import("lake_parquet_encoded.zig");
+    const prefix = try codec.testDelta(a, &.{ 0, 2, 3 });
+    defer a.free(prefix);
+    const length = try codec.testDelta(a, &.{ 3, 1, 0 });
+    defer a.free(length);
+    const payload = try std.mem.concat(a, u8, &.{ &.{ 2, 0, 0, 0, 3, 13 }, prefix, length, "abcx" });
+    defer a.free(payload);
+    const header: Header = .{ .page_type = .data_page, .encoding = .delta_byte_array, .compressed_page_size = @intCast(payload.len), .uncompressed_page_size = @intCast(payload.len), .value_count = 4 };
+    const Check = struct {
+        fn run(alloc: Allocator, h: Header, bytes: []const u8) !void {
+            var decoded = try packedBytePage(alloc, h, bytes, true);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), decoded.buffers.len);
+            try std.testing.expectEqual(@as(usize, 9), decoded.buffers[0].len);
+            try std.testing.expectEqualStrings("abc", decoded.values[0]);
+            try std.testing.expectEqualStrings("", decoded.values[1]);
+            try std.testing.expectEqualStrings("abx", decoded.values[2]);
+            try std.testing.expectEqualStrings("abx", decoded.values[3]);
+            try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, decoded.nulls);
+            try std.testing.expectEqual(@intFromPtr(decoded.values[0].ptr) + 3, @intFromPtr(decoded.values[2].ptr));
+            try std.testing.expectEqual(@intFromPtr(decoded.values[2].ptr) + 3, @intFromPtr(decoded.values[3].ptr));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ header, payload });
+    var physical_header = try buildDataPageHeaderFixtureWithEncoding(a, 4, @intCast(payload.len), 7);
+    defer physical_header.deinit(a);
+    const chunk = try std.mem.concat(a, u8, &.{ physical_header.items, payload, physical_header.items, payload });
+    defer a.free(chunk);
+    const ChunkCheck = struct {
+        fn run(alloc: Allocator, bytes: []const u8) !void {
+            var decoded = (try scanPackedByteArraysAlloc(alloc, bytes, .uncompressed, true)).?;
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), decoded.buffers.len);
+            try std.testing.expectEqual(@as(usize, 8), decoded.values.len);
+            try std.testing.expectEqualStrings("abx", decoded.values[7]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, ChunkCheck.run, .{chunk});
+    const nulls_only: Header = .{ .page_type = .data_page_v2, .encoding = .delta_byte_array, .compressed_page_size = 2, .uncompressed_page_size = 2, .value_count = 8, .definition_level_bytes = 2, .data_payload_offset = 2 };
+    var empty = try packedBytePage(a, nulls_only, &.{ 16, 0 }, true);
+    defer empty.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), empty.buffers[0].len);
+    try std.testing.expect(std.mem.allEqual(u8, empty.nulls, 1));
+    try std.testing.expectError(error.InvalidParquetPage, packedBytePage(a, header, payload[0 .. payload.len - 1], true));
+    const invalid_prefix = try codec.testDelta(a, &.{ 1, 2, 3 });
+    defer a.free(invalid_prefix);
+    const invalid = try std.mem.concat(a, u8, &.{ payload[0..6], invalid_prefix, length, "abcx" });
+    defer a.free(invalid);
+    try std.testing.expectError(error.InvalidParquetPage, packedBytePage(a, header, invalid, true));
 }

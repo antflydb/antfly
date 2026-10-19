@@ -107,6 +107,13 @@ pub const Provider = struct {
             for (schema) |column| try names.append(a, column.name);
             if (names.items.len == 0) return error.InvalidLakeEnrichmentSchema;
         } else try names.appendSlice(a, binding.column_bindings);
+        // Replay has already applied deletes. Its output projection contains
+        // logical/enrichment fields; equality keys are private scan inputs.
+        if (self.replay) |replay| {
+            var projected = binding;
+            projected.column_bindings = names.items;
+            if (try replay.openFor(a, projected, self.only_file, cancellation, self.replay_consumer)) |source| return source;
+        }
         if (self.source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |column| {
             const present = for (names.items) |name| {
                 if (std.mem.eql(u8, name, column)) break true;
@@ -115,14 +122,6 @@ pub const Provider = struct {
         };
         const columns = try names.toOwnedSlice(a);
         errdefer a.free(columns);
-        if (self.replay) |replay| {
-            var projected = binding;
-            projected.column_bindings = columns;
-            if (try replay.openFor(a, projected, self.only_file, cancellation, self.replay_consumer)) |source| {
-                a.free(columns);
-                return source;
-            }
-        }
         const guard = if (self.replay_consumer != null and self.replay != null) self.replay.?.pipeline else null;
         if (guard) |pipeline| try pipeline.source_mutex.lock(self.context.io.?);
         errdefer if (guard) |pipeline| pipeline.source_mutex.unlock(self.context.io.?);
@@ -456,6 +455,21 @@ test "external lake native index input opens one pinned real Parquet scan" {
         try std.testing.expectEqual(@as(usize, 3), x.rowCount());
         try std.testing.expectEqual(null, try first.next(a));
         try std.testing.expectEqual(null, try second.next(a));
+        // Routing regression: equality-delete inputs are internal to capture,
+        // not replay's logical projection. A cached run must stay usable when
+        // the raw scanner needs an auxiliary key absent from output columns.
+        const DeleteFile = @typeInfo(@FieldType(@typeInfo(@FieldType(@TypeOf(source.scanner), "iceberg_delete_plan")).optional.child, "files")).pointer.child;
+        const auxiliary: []u8 = @constCast("unprojected_delete_key");
+        var delete_files = [_]DeleteFile{.{ .content = .equality_deletes, .file_path = @constCast("delete.parquet"), .file_format = @constCast("PARQUET"), .snapshot_id = 1, .data_sequence_number = 1, .file_sequence_number = 1, .record_count = 1, .file_size_in_bytes = 1, .equality_columns = @constCast((&[_][]u8{auxiliary})[0..]) }};
+        source.scanner.iceberg_delete_plan = .{ .files = &delete_files };
+        defer source.scanner.iceberg_delete_plan = null;
+        const calls = replay.captures;
+        var third = try second_provider.provider().open(a, binding);
+        defer third.deinit(a);
+        const z = (try third.next(a)).?;
+        try std.testing.expectEqual(@as(usize, 1), z.columns.len);
+        try std.testing.expectEqual(@as(usize, 3), z.rowCount());
+        try std.testing.expectEqual(calls, replay.captures);
     }
     const verified = try @import("lake_index_coverage.zig").pin(&source, .{});
     try std.testing.expectEqual(coverage, verified);

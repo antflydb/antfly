@@ -36,6 +36,7 @@ const Entry = struct {
     name: []const u8,
     cover: []const []const u8,
     root: ordered.Root,
+    resuming: bool = false,
     sort: spill.Sort,
     reverse: ?*ordered.ReverseBuilder = null,
     slots: std.AutoHashMapUnmanaged(usize, dictionaries.Edit) = .empty,
@@ -51,29 +52,71 @@ const Entry = struct {
         self.tuple.deinit();
     }
 };
-fn seed(a: A, scratch: A, store: *stores.ArtifactStore, binding: local.serverless_segment_source_binding.Binding, name: []const u8, digest: [32]u8, candidates: []const Declared, provider: *Provider, token: Cancellation) !?ordered.Root {
+fn currentSeed(a: A, store: *stores.ArtifactStore, root: ordered.Root, provider: *Provider, token: Cancellation) !bool {
     const delta = provider.native_delta.?;
-    for (candidates) |decl| {
+    const dictionary = root.file_dictionary.?;
+    if (root.source_cut == null or root.checkpoint_base == null or delta.source_cut == null or delta.prior_cut == null or
+        !std.mem.eql(u8, &root.source_cut.?, &delta.source_cut.?) or !std.mem.eql(u8, &root.checkpoint_base.?, &delta.prior_cut.?)) return false;
+    const shared = delta.public_navigation.?;
+    if (!std.mem.eql(u8, root.snapshot, provider.source.inventory.snapshot_id) or dictionary.public_count != shared.count or !std.meta.eql(dictionary.public, shared.root)) return false;
+    var reads: u64 = 256 * 1024 * 1024;
+    var writes: u64 = 0;
+    var bridge: pages.PageStore = .{ .domain = root.domain, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var planning = std.heap.ArenaAllocator.init(a);
+    defer planning.deinit();
+    var plan = try state.Plan.fromDelta(a, planning.allocator(), delta);
+    defer plan.deinit();
+    var iterator = plan.iterator(true);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var pending: u32 = 0;
+    while (try iterator.next()) |item| {
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        const slot = (try dictionaries.named(sa, bridge.store(), dictionary, item.file.id)) orelse return false;
+        const record = try dictionaries.file(sa, bridge.store(), dictionary, slot);
+        // A completed file is exact; a pending file has no old rows and a
+        // zero fingerprint. Same-label predecessor cuts are not checkpoints.
+        if (std.mem.allEqual(u8, &record.fingerprint, 0)) pending += 1 else if (!std.mem.eql(u8, &record.fingerprint, &item.file.digest)) return false;
+    }
+    return pending == root.pending_files;
+}
+const Seed = struct { root: ordered.Root, resuming: bool };
+fn seed(a: A, scratch: A, store: *stores.ArtifactStore, binding: local.serverless_segment_source_binding.Binding, name: []const u8, digest: [32]u8, candidates: []const Declared, provider: *Provider, token: Cancellation) !?Seed {
+    const delta = provider.native_delta.?;
+    // Prefer authenticated work from this cut even when the published
+    // predecessor appears first in the candidate list.
+    for ([_]bool{ true, false }) |is_resume| for (candidates) |decl| {
         if (decl.artifact.kind != .ordered_row_index or !ordered.supportsBuildMetadata(decl.artifact.metadata_version) or !std.mem.eql(u8, decl.name, name)) continue;
         var previous_binding = decl.binding;
         previous_binding.snapshot_id = binding.snapshot_id;
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(binding, previous_binding)) continue;
         const root = try ordered.loadRootLazy(a, store.*, decl.artifact, token, null);
         const dictionary = root.file_dictionary orelse continue;
-        if (root.building or !dictionary.public_names or dictionary.public_count != delta.prior_count or
-            !std.mem.eql(u8, root.source, delta.source) or !std.mem.eql(u8, root.snapshot, delta.prior_snapshot.?) or
+        if (root.building or !dictionary.public_names or !std.mem.eql(u8, root.source, delta.source) or
             !std.mem.eql(u8, root.snapshot, decl.binding.snapshot_id) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain) or !std.mem.eql(u8, &root.fingerprint, &digest)) continue;
+        if (is_resume) {
+            if (!try currentSeed(scratch, store, root, provider, token)) continue;
+        } else {
+            if (root.pending_files != 0 or root.source_cut == null or delta.prior_cut == null or dictionary.public_count != delta.prior_count or !std.mem.eql(u8, root.snapshot, delta.prior_snapshot.?)) continue;
+            if (!std.mem.eql(u8, &root.source_cut.?, &delta.prior_cut.?)) continue;
+        }
         try ordered.validateReuse(scratch, store.*, root, provider.context, token);
-        return root;
-    }
+        return .{ .root = root, .resuming = is_resume };
+    };
     return null;
 }
+
 fn planSlots(a: A, out: A, entry: *Entry, provider: *Provider, store: *stores.ArtifactStore, token: Cancellation) !void {
     const delta = provider.native_delta.?;
-    const roots = entry.root.file_dictionary.?;
+    var roots = entry.root.file_dictionary.?;
     var reads: u64 = 256 * 1024 * 1024;
-    var writes: u64 = 0;
-    var bridge: pages.PageStore = .{ .domain = entry.root.domain, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var writes: u64 = 256 * 1024 * 1024;
+    var bridge: pages.PageStore = .{ .domain = entry.root.domain, .attempt = store.upload_scope.?.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    roots = try dictionaries.ensureFree(a, bridge.store(), roots, .{ .identity_version = roots.public_identity_version, .root = roots.public, .count = roots.public_count, .source = entry.root.source, .snapshot = entry.root.snapshot });
+    entry.root.file_dictionary = roots;
+    var holes = try @import("../serverless/graph_segment/page_tree.zig").Cursor.init(a, bridge.store(), roots.free, "", null);
+    defer holes.deinit();
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     var edits: std.AutoHashMapUnmanaged(u32, dictionaries.Edit) = .empty;
@@ -82,7 +125,7 @@ fn planSlots(a: A, out: A, entry: *Entry, provider: *Provider, store: *stores.Ar
     defer retired.deinit(a);
     var vacant: std.ArrayList(u32) = .empty;
     defer vacant.deinit(a);
-    for (delta.prior_changed) |old| {
+    for (if (entry.resuming) @as([]const state.File, &.{}) else delta.prior_changed) |old| {
         try token.check();
         _ = scratch.reset(.retain_capacity);
         const sa = scratch.allocator();
@@ -101,12 +144,26 @@ fn planSlots(a: A, out: A, entry: *Entry, provider: *Provider, store: *stores.Ar
         try token.check();
         _ = scratch.reset(.retain_capacity);
         const existing = try dictionaries.named(scratch.allocator(), bridge.store(), roots, item.file.id);
+        if (entry.resuming) {
+            const slot = existing orelse return error.InvalidNativeLakeRowIndex;
+            const record = try dictionaries.file(scratch.allocator(), bridge.store(), roots, slot);
+            if (std.mem.eql(u8, &record.fingerprint, &item.file.digest)) continue;
+            if (!std.mem.allEqual(u8, &record.fingerprint, 0)) return error.InvalidNativeLakeRowIndex;
+        }
         const slot = existing orelse if (vacant.pop()) |available| available else allocate: {
+            while (try holes.next()) |hole| {
+                if (hole.key.len != 4) return error.InvalidNativeLakeRowIndex;
+                const candidate = std.mem.readInt(u32, hole.key[0..4], .big);
+                const record = try dictionaries.file(scratch.allocator(), bridge.store(), roots, candidate);
+                // A resurrected name reserves its original slot regardless of
+                // the order in which this refresh visits its changed files.
+                if (!delta.by_id.contains(record.file)) break :allocate candidate;
+            }
             const next = count;
             count = std.math.add(u32, count, 1) catch return error.LakeSidecarBuildLimitExceeded;
             break :allocate next;
         };
-        if (slot < roots.count) try retired.put(a, slot, {});
+        if (!entry.resuming and slot < roots.count) try retired.put(a, slot, {});
         const edit: dictionaries.Edit = .{ .slot = slot, .file = try out.dupe(u8, item.file.id), .fingerprint = item.file.digest };
         try entry.slots.put(a, item.ordinal, edit);
         var pending = edit;
@@ -164,8 +221,9 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
             try result.append(ca, decl);
             continue;
         }
-        const root = (try seed(ca, a, store, binding, name, parent.fingerprint(tuple, predicate, cover), candidates, provider, token)) orelse return null;
-        var entry: Entry = .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .root = root, .sort = spill.Sort.init(a, manager, &.{.{}}, 512 * 1024), .arena = .init(a) };
+        const selected = (try seed(ca, a, store, binding, name, parent.fingerprint(tuple, predicate, cover), candidates, provider, token)) orelse return null;
+        const root = selected.root;
+        var entry: Entry = .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .root = root, .resuming = selected.resuming, .sort = spill.Sort.init(a, manager, &.{.{}}, 512 * 1024), .arena = .init(a) };
         transferred = true;
         errdefer entry.deinit(a);
         try planSlots(a, ca, &entry, provider, store, token);
@@ -207,17 +265,21 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
         var ordinal: u64 = 0;
         while (try iterator.next()) |item| {
             try token.check();
+            const needed = for (cohort) |entry| {
+                if (entry.slots.contains(item.ordinal)) break true;
+            } else false;
+            if (!needed) continue;
             var input = provider.*;
             input.only_files = null;
             input.only_file = item.ordinal;
             const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, token);
             defer rows.deinit(a);
             while (try rows.next(a)) |batch| for (cohort) |*entry| {
-                const edit = entry.slots.get(item.ordinal) orelse return error.InvalidNativeLakeRowIndex;
+                const edit = entry.slots.get(item.ordinal) orelse continue;
                 try parent.consumeBatch(a, entry, batch, item.file.id, edit.slot, &ordinal, provider.context, token);
             };
             for (cohort) |*entry| {
-                const edit = entry.slots.get(item.ordinal).?;
+                const edit = entry.slots.get(item.ordinal) orelse continue;
                 const first_checkpoint = entry.published == null;
                 if (first_checkpoint) for (entry.edits) |*pending| {
                     if (pending.slot == edit.slot) pending.fingerprint = edit.fingerprint;
@@ -229,9 +291,13 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
                     .retired_slots = if (first_checkpoint) entry.retired else &.{},
                     .dictionary_edits = edits,
                     .public_navigation = delta.public_navigation,
+                    .source_cut = delta.source_cut,
+                    .checkpoint_base = delta.prior_cut,
+                    .pending_files = @intCast(entry.slots.count() - 1),
                 });
                 entry.published = ref;
                 try provider.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
+                _ = entry.slots.remove(item.ordinal);
                 _ = entry.arena.reset(.free_all);
                 entry.root = try ordered.loadRootLazy(entry.arena.allocator(), store.*, ref, token, null);
                 entry.sort.deinit();
@@ -247,6 +313,9 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
                 .retired_slots = entry.retired,
                 .dictionary_edits = entry.edits,
                 .public_navigation = delta.public_navigation,
+                .source_cut = delta.source_cut,
+                .checkpoint_base = delta.prior_cut,
+                .pending_files = 0,
             });
             try result.append(ca, .{ .name = entry.name, .binding = entry.binding, .artifact = ref });
         }

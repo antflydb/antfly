@@ -1182,7 +1182,7 @@ The encoding is detected from Parquet metadata and requires no attachment option
 
 
 Small compatible index refreshes use authenticated source deltas for algebraic
-reduction trees and ordered file-slot dictionaries (reader protocol 55). Unchanged
+reduction trees and ordered file-slot dictionaries (reader protocol 56). Unchanged
 branches and file slots survive without rebuilding complete per-index catalogs.
 Older/incomplete seeds reconcile conservatively; dense ordered refreshes retain
 bounded compaction. This changes refresh efficiency without adding SQL options.
@@ -1190,7 +1190,18 @@ bounded compaction. This changes refresh efficiency without adding SQL options.
 Native index publication shares one bounded, delete-aware file replay among
 admitted aggregate, ordered, text and vector builders. Matching file requests
 reuse the typed decode; each builder keeps its own durable checkpoint. Saturated
-scheduling, constrained/opaque allocator chains and oversized replay files retain
-the ordinary bounded construction paths. Full delta integer pages stream directly
+scheduling and constrained memory select smaller admitted cohorts before serial
+fallback. Opaque allocator chains retain ordinary bounded construction. Optional
+next-file read-ahead uses a second private source view; both replay buffers share
+the same total memory/disk allowance. Oversized files stream ordinarily. Full delta integer pages stream directly
 into result vectors with one physical block of scratch; selective reads retain
 random-access navigation.
+
+
+Ordered refreshes persist free slots across publications and reuse authenticated
+current-cut checkpoints, including independently completed changed files. Reader
+protocol 56 protects the added free-slot page references during GC. Equality-delete
+keys stay private to replay capture. Count-only Parquet indexes use qualified
+footer counts, and full delta string columns own one expanded buffer per physical
+page instead of allocating each string independently. These changes require no
+attachment or query options.

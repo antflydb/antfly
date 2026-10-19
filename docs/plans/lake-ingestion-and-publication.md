@@ -2157,10 +2157,21 @@ make additional passes; matching requests in an active cohort share the decode.
 Stored-source and enrichment projections include their full declared dependencies,
 and NUMERIC source contracts preserve exact physical values.
 
-Worker admission completes before any builder starts. Insufficient scheduler or
-known allocator headroom selects ordinary serial construction. Opaque allocator
-chains also retain that path. Oversized replay files use serialized ordinary
-streaming. Workers own independent construction state and source views: mutable version
+Each cohort completes worker admission before starting any builder. When memory
+or scheduler capacity cannot fit every family, the planner reduces the cohort,
+then executes the remaining families in later cohorts or serially. Completed work
+is never restarted. Admission reserves each family's workspace and one physical
+input/decode workspace, then scales the replay memory allowance to remaining
+headroom (at most 256 MiB). Opaque allocator chains retain serial construction.
+
+A second, independent replay buffer can capture the next canonical file while
+consumers read the current one. Together both buffers retain at most the original
+replay memory allowance and 1 GiB spill allowance; each gets half. Source capture
+and ordinary fallback scans share one source-workspace mutex. Read-ahead requires
+shared scheduler admission, owns a private mutable source view, and joins before
+that view is released. Its failures matter only when that exact file is requested;
+divergent plans discard speculative input. Oversized replay files use serialized
+ordinary streaming. Workers own independent construction state and source views: mutable version
 maps and range-reader flights are private while the pinned inventory and delete
 authority remain borrowed. They share synchronized allocation; durable checkpoints serialize through one progress owner. Deadline,
 cancellation and builder failures wake waiting consumers and join workers before
@@ -2204,3 +2215,54 @@ Apache boundary, source/control catalog, generated engine error catalog,
 formatting and whitespace checks passed. Public HTTP E2Es still require
 16.25 GiB of free space and remain pending; archive-scale latency/RSS and live
 cloud qualification remain unmeasured.
+
+
+### Resumable sparse slots and packed full strings (reader protocol 56)
+
+Sparse ordered dictionaries now persist an authenticated free-slot tree. Deletes
+from earlier refreshes remain available to later appends, keeping the coordinate
+space bounded by peak concurrent file membership rather than cumulative churn.
+Public source membership distinguishes a vacant slot from a pending current file
+whose fingerprint is also zero. Older dictionaries without this tree migrate once;
+fresh complete dictionaries avoid a migration scan. GC and closure validation walk
+free-slot pages, and reader protocol 56 fences collectors that do not understand
+those references. Serving queries need no additional options or warmup reads.
+
+Ordered builders prefer a checkpoint bound to the current public navigation root
+before considering the published predecessor. A logical file-census commitment
+binds both the current cut and its predecessor, independent of physical page
+attempts. Pending-file counts keep incomplete checkpoints out of predecessor
+selection. Legacy dictionaries without a cut commitment reconcile once; full
+construction also writes commitments for subsequent sparse refreshes. Each changed
+file must have its
+exact new fingerprint or a pending zero fingerprint. Completed files retain their
+rows and covering blocks; only pending files are scanned. This supports independent
+checkpoint progress across indexes without repeating retired-row removal.
+
+Delete-aware replay coverage checks logical and enrichment dependencies before
+adding auxiliary equality-delete keys to an ordinary scan. Those keys have already
+been applied during capture. Count-only Parquet aggregate leaves qualify the file
+footer and consume its row count without decoding a value column; Iceberg keeps
+using manifest row counts when delete semantics permit that shortcut.
+
+Full DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY materialization now reads framing
+sequentially and decodes each length/prefix once. A physical page owns one exact
+expanded byte buffer plus value slices; NULLs and prefix predecessors preserve
+physical coordinates. Chunk ownership transfers those page buffers without
+per-string allocations. Selective reconstruction and mixed-encoding compatibility
+paths retain their existing contracts. Framing, prefix bounds, expansion limits,
+and allocation-failure cleanup remain validated.
+
+
+Protocol-56 qualification passed 313 native external-lake tests, 175 shared
+external-lake tests, and 273 reader/cursor tests without failures or leaks. Final
+focused navigation, interrupted-resume and free-slot migration checks also passed.
+Seven public HTTP E2Es passed using independent PyArrow/PyIceberg writers: V1/V2
+compact pages with populated and NULL-only data, attachment/query/restart,
+Iceberg snapshot/schema-ID/partition/delete handling, and signed decimal kernels
+and pruning for both formats. The float expectations follow the public SQL JSON
+number representation. The complete stripped Debug server build and installed
+CLI check passed on Zig 0.17.0. License, Apache boundary, source/control catalog,
+generated engine error catalog, formatting and whitespace checks passed.
+`origin/main` is merged through `a37fef34ec`. Live-provider retention qualification
+remains deferred; archive-scale latency/RSS gains remain unmeasured.

@@ -1714,6 +1714,7 @@ const DecodedColumn = union(enum) {
     f64: []f64,
     bool: []bool,
     bytes: [][]u8,
+    packed_bytes: parquet_page.PackedByteArrays,
     dictionary_bytes: rowsource.DictionaryBytes,
     borrowed_dictionary_bytes: rowsource.DictionaryBytes,
     dictionary_i64: rowsource.DictionaryNumeric(i64),
@@ -1726,6 +1727,7 @@ const DecodedColumn = union(enum) {
             .f64 => |values| alloc.free(values),
             .bool => |values| alloc.free(values),
             .bytes => |values| parquet_page.freePlainByteArrays(alloc, values),
+            .packed_bytes => |*values| values.deinit(alloc),
             .dictionary_bytes => |values| values.deinit(alloc),
             .borrowed_dictionary_bytes => |values| alloc.free(values.indices),
             inline .dictionary_i64, .dictionary_f64 => |values| values.deinit(alloc),
@@ -2410,14 +2412,23 @@ fn buildPlainColumnsAlloc(
             },
             .bytes => |byte_mode| switch (byte_mode) {
                 .required => {
-                    decoded_columns[idx] = .{ .bytes = try parquet_page.scanPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression) };
+                    if (try parquet_page.scanPackedByteArraysAlloc(alloc, input.bytes, compression, false)) |byte_block| {
+                        decoded_columns[idx] = .{ .packed_bytes = byte_block };
+                    } else decoded_columns[idx] = .{ .bytes = try parquet_page.scanPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression) };
                     null_bitmaps[idx] = &.{};
                 },
                 .optional => {
-                    var decoded = try parquet_page.scanOptionalPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression);
-                    decoded_columns[idx] = .{ .bytes = decoded.values };
-                    null_bitmaps[idx] = decoded.nulls;
-                    decoded = undefined;
+                    if (try parquet_page.scanPackedByteArraysAlloc(alloc, input.bytes, compression, true)) |packed_| {
+                        var byte_block = packed_;
+                        null_bitmaps[idx] = byte_block.nulls;
+                        byte_block.nulls = &.{};
+                        decoded_columns[idx] = .{ .packed_bytes = byte_block };
+                    } else {
+                        var decoded = try parquet_page.scanOptionalPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression);
+                        decoded_columns[idx] = .{ .bytes = decoded.values };
+                        null_bitmaps[idx] = decoded.nulls;
+                        decoded = undefined;
+                    }
                 },
                 .dictionary_required => {
                     if (limits.preserve_dictionary and input.dictionary != null) {
@@ -2491,6 +2502,10 @@ fn buildPlainColumnsAlloc(
             .dictionary_bytes, .borrowed_dictionary_bytes => |values| blk: {
                 if (values.indices.len != row_count) return error.ParquetRowGroupRowCountMismatch;
                 break :blk .{ .name = column_names[idx], .values = .{ .dictionary_bytes = values }, .nulls = .{ .bytes = null_bitmaps[idx] } };
+            },
+            .packed_bytes => |byte_block| blk: {
+                if (byte_block.values.len != row_count) return error.ParquetRowGroupRowCountMismatch;
+                break :blk .{ .name = column_names[idx], .values = .{ .bytes = byte_block.values }, .nulls = .{ .bytes = null_bitmaps[idx] } };
             },
             .bytes => |values| blk: {
                 if (values.len != row_count) return error.ParquetRowGroupRowCountMismatch;

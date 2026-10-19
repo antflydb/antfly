@@ -14,7 +14,8 @@
 // limitations.
 
 //! One projected, delete-aware scan feeds independent bounded native builders.
-//! Replay retains at most one file. Whole-source consumers stream ordinarily;
+//! Each replay retains at most one file. The publication producer may pair two
+//! independently bounded buffers for read-ahead. Whole-source consumers stream ordinarily;
 //! per-file consumers share a bounded replay without an archive-wide spool.
 const std = @import("std");
 const local = @import("antfly_local_sources");
@@ -240,6 +241,7 @@ pub const Replay = struct {
     range: Range = .{ .begin = .{ .row = 0, .byte = 0 }, .end = 0 },
     ready: bool = false,
     captures: usize = 0,
+    read_ahead_hits: usize = 0,
     pipeline: ?*@import("lake_index_build_pipeline.zig") = null,
     captured_file: ?usize = null,
     readers: usize = 0,
@@ -258,6 +260,18 @@ pub const Replay = struct {
         }
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
+    }
+    /// Discard an unleased optimization buffer before changing its admission.
+    pub fn reset(self: *Replay) !void {
+        if (self.readers != 0) return error.LakeReplayBusy;
+        if (self.run) |*run| {
+            run.close();
+            self.manager.deinit();
+            self.run = null;
+        }
+        _ = self.arena.reset(.free_all);
+        self.ready = false;
+        self.captured_file = null;
     }
     fn check(raw: *anyopaque) !void {
         const self: *Replay = @ptrCast(@alignCast(raw));
@@ -438,7 +452,8 @@ pub const Replay = struct {
         const file_index = only_file orelse return null;
         if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
         if (consumer) |slot| if (self.pipeline) |pipeline| {
-            if (!try pipeline.request(slot, file_index, cancellation)) return null;
+            const chosen = (try pipeline.request(slot, file_index, cancellation)) orelse return null;
+            return try chosen.openPrepared(a, binding, file_index, cancellation);
         };
         const io = self.provider.context.io orelse return null;
         try self.mutex.lock(io);
@@ -449,10 +464,19 @@ pub const Replay = struct {
             if (!needed.contains(file_index)) return null;
         };
         if (!try self.captureAdmitted(a, binding, file_index, cancellation)) return null;
-        const range: Range = if (only_file) |file| blk: {
-            if (file != self.captured_file) return error.SidecarSourceBindingMismatch;
-            break :blk self.range;
-        } else .{ .begin = .{ .row = 0, .byte = 0 }, .end = self.run.?.size };
+        return try self.openCursor(a, binding, cancellation);
+    }
+    /// Producer has already captured and granted this file. Never re-enter the
+    /// rendezvous or apply the serial planner's advisory changed-file mask.
+    fn openPrepared(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation) !rows.Source {
+        const io = self.provider.context.io.?;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (!self.ready or self.captured_file != file_index) return error.SidecarSourceBindingMismatch;
+        return try self.openCursor(a, binding, cancellation);
+    }
+    fn openCursor(self: *Replay, a: A, binding: Binding, cancellation: Cancellation) !rows.Source {
+        const range = self.range;
         const columns = try a.dupe([]const u8, binding.column_bindings);
         errdefer a.free(columns);
         const cursor = try a.create(Cursor);

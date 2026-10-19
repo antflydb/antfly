@@ -22,6 +22,8 @@ const A = std.mem.Allocator;
 pub const Public = struct { identity_version: u8 = 1, root: ?tree.Ref, count: u32, source: []const u8, snapshot: []const u8 };
 pub const Roots = struct {
     slots: ?tree.Ref = null,
+    free: ?tree.Ref = null,
+    free_complete: bool = false,
     names: ?tree.Ref = null,
     public: ?tree.Ref = null,
     count: u32 = 0,
@@ -52,6 +54,10 @@ pub fn validate(roots: Roots) !void {
             try value.validate();
             if (value.records != count) return error.InvalidNativeLakeRowIndex;
         }
+    }
+    if (roots.free) |free| {
+        try free.validate();
+        if (!roots.free_complete or free.records > roots.count) return error.InvalidNativeLakeRowIndex;
     }
     if (!roots.public_names and roots.public_count != 0) return error.InvalidNativeLakeRowIndex;
 }
@@ -145,6 +151,34 @@ pub fn updateFingerprints(a: A, store: tree.Store, roots: Roots, files: []const 
     try validate(result);
     return result;
 }
+fn live(a: A, store: tree.Store, public: Public, name: []const u8) !bool {
+    const key = local.storage_rowsource_identity.navigationDigest(public.identity_version, public.source, public.snapshot, name);
+    const value = (try lookup(a, store, public.root, &key)) orelse return false;
+    defer a.free(value);
+    if (!std.mem.eql(u8, value, name)) return error.InvalidNativeLakeRowIndex;
+    return true;
+}
+/// Migrate a historical dictionary once. Pending current-file fingerprints may
+/// also be zero, so public membership, not the fingerprint alone, proves a hole.
+pub fn ensureFree(a: A, store: tree.Store, roots: Roots, public: Public) !Roots {
+    if (roots.free_complete) return roots;
+    var result = roots;
+    result.free_complete = true;
+    if (roots.count == public.count) return result;
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = store };
+    defer builder.deinit();
+    var cursor = try tree.Cursor.init(a, store, roots.slots, "", null);
+    defer cursor.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    while (try cursor.next()) |item| {
+        _ = scratch.reset(.retain_capacity);
+        const record = try std.json.parseFromSliceLeaky(Record, scratch.allocator(), item.value, .{});
+        if (std.mem.allEqual(u8, &record.fingerprint, 0) and !try live(scratch.allocator(), store, public, record.file)) try builder.add(item.key, "");
+    }
+    result.free = try builder.finish();
+    return result;
+}
 pub const Edit = struct { slot: u32, file: []const u8, fingerprint: [32]u8 };
 /// Path-copy only reached slots. Shared public navigation proves the complete
 /// current source cut; tombstones keep slot coordinates stable across refreshes.
@@ -156,6 +190,8 @@ pub fn applyEdits(a: A, store: tree.Store, roots: Roots, edits: []const Edit, sh
     defer names.arena.deinit();
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
+    var free: Batch = .{ .arena = .init(a) };
+    defer free.arena.deinit();
     var previous: ?u32 = null;
     for (edits) |edit| {
         _ = scratch.reset(.retain_capacity);
@@ -171,13 +207,16 @@ pub fn applyEdits(a: A, store: tree.Store, roots: Roots, edits: []const Edit, sh
             if (old) |record| try names.add(&nameKey(record.file), null);
             try names.add(&nameKey(edit.file), try std.json.Stringify.valueAlloc(sa, .{ .file = edit.file, .slot = edit.slot }, .{}));
         }
-        if (slots.changes.items.len >= 64 or names.changes.items.len >= 64) {
+        if (result.free_complete) try free.add(&slotKey(edit.slot), if (std.mem.allEqual(u8, &edit.fingerprint, 0) and !try live(sa, store, shared, edit.file)) "" else null);
+        if (slots.changes.items.len >= 64 or names.changes.items.len >= 64 or free.changes.items.len >= 64) {
             try slots.flush(store, &result.slots);
             try names.flush(store, &result.names);
+            try free.flush(store, &result.free);
         }
     }
     try slots.flush(store, &result.slots);
     try names.flush(store, &result.names);
+    try free.flush(store, &result.free);
     result.public = shared.root;
     result.public_names = true;
     result.public_count = shared.count;
@@ -243,6 +282,7 @@ pub fn publishWithOptions(a: A, store: tree.Store, source: []const u8, snapshot:
         result.public_names = true;
         result.public_count = shared.count;
     } else if (prior.?.roots.public_names or !prior.?.same_snapshot) result.public = try bulkHashes(a, store, source, snapshot, files, true, options.manager);
+    if (options.shared) |shared| result = try ensureFree(a, store, result, shared);
     try validate(result);
     return result;
 }
@@ -266,6 +306,7 @@ fn bulk(a: A, store: tree.Store, source: []const u8, snapshot: []const u8, files
         result.public_names = true;
         result.public_count = shared.count;
     } else result.public = try bulkHashes(a, store, source, snapshot, files, true, options.manager);
+    if (options.shared) |shared| result = try ensureFree(a, store, result, shared);
     try validate(result);
     return result;
 }

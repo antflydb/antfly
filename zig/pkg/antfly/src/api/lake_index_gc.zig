@@ -416,6 +416,7 @@ pub const Collector = struct {
                     try self.markPages(a, root.domain, dictionary.slots, false);
                     try self.markPages(a, root.domain, dictionary.names, false);
                     try self.markPages(a, root.domain, dictionary.public, false);
+                    try self.markPages(a, root.domain, dictionary.free, false);
                 }
             },
             // These lake producers publish self-contained segments. New paged
@@ -1012,13 +1013,28 @@ test "external lake native GC marks checkpoint forests and their covering blocks
         keep[slot] = true;
         previous = try ordered.loadRoot(ca, store, ref, .none, null);
     }
-    const root = previous.?;
+    var root = previous.?;
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = 16 * 1024 * 1024;
+    var bridge: page_store.PageStore = .{ .domain = domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var free_builder: @import("../serverless/graph_segment/page_tree.zig").SortedBuilder = .{ .alloc = a, .store = bridge.store() };
+    defer free_builder.deinit();
+    try free_builder.add(&ordered.file_dictionary.slotKey(0), "");
+    root.file_dictionary.?.free = try free_builder.finish();
+    root.file_dictionary.?.free_complete = true;
+    const payload = try std.json.Stringify.valueAlloc(ca, root, .{});
+    var updated = try store.put(payload);
+    defer updated.deinit(a);
+    ref.artifact_id = updated.artifact_id;
+    ref.checksum = updated.checksum;
+    ref.byte_len = updated.byte_len;
     try std.testing.expectEqual(ordered.checkpoint_metadata_version, ref.metadata_version);
     try std.testing.expectEqual(@as(usize, 1), root.build_runs.len);
     // This graph-only mark does not read or mutate the catalog authority.
     var collector: Collector = .{ .a = ca, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(7), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 16 * 1024 * 1024 };
     try collector.markArtifact(ca, ref);
     try std.testing.expect(collector.marked.contains(ref.artifact_id));
+    try std.testing.expect(collector.marked.contains(&try page_store.PageStore.identity(domain, root.file_dictionary.?.free.?)));
     var count: usize = 0;
     for ([_]@import("../serverless/graph_segment/page_tree.zig").Ref{ root.page.?, root.build_runs[0].page }) |page| {
         try std.testing.expect(collector.marked.contains(&try page_store.PageStore.identity(domain, page)));

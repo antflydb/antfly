@@ -6346,8 +6346,8 @@ def test_compact_parquet_encodings_attach_query_and_restart(
             [
                 str(i - 150),
                 str(i * 13 - 1000),
-                None if i % 11 == 0 else str(i + 0.25),
-                str(i + 0.5),
+                None if i % 11 == 0 else i + 0.25,
+                i + 0.5,
                 None if i % 13 == 0 else f"prefix-{i:05d}",
                 None if i % 19 == 0 else str(i),
                 f"{Decimal(i - 100) / 100:.2f}",
