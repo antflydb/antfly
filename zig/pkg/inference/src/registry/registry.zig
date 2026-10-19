@@ -35,6 +35,7 @@ pub const pull_diagnostics = @import("pull_diagnostics.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+pub const embedding_gemma2_catalog = @import("embedding_gemma2_catalog.zig");
 pub const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
 pub const ModelKind = enum {
@@ -70,6 +71,7 @@ test {
     _ = download;
     _ = qwen3vl_catalog;
     _ = qwen3_embedding_catalog;
+    _ = embedding_gemma2_catalog;
     _ = qwen3_reranker_catalog;
 }
 
@@ -517,7 +519,8 @@ pub const ModelRegistry = struct {
     }
 
     /// Pull a model from HuggingFace Hub, reporting progress to `progress_sink`
-    /// on the calling thread.
+    /// on the calling thread. Companion pulls recurse through this boundary,
+    /// so its error set must be explicit.
     pub fn pullWithProgress(
         self: *ModelRegistry,
         io: std.Io,
@@ -608,6 +611,18 @@ pub const ModelRegistry = struct {
             );
         } else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
             try download.downloadPinnedQwen3EmbeddingBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (embedding_gemma2_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedEmbeddingGemma2Bundle(
                 self.allocator,
                 io,
                 ref.owner,

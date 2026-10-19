@@ -113,6 +113,37 @@ test "external lake verified immutable file hints feed real Parquet reads" {
     try std.testing.expectEqualStrings(verified.inventory.files[0].etag, source.inventory.files[0].etag);
     try std.testing.expectEqualStrings(verified.inventory.files[0].version_id, source.inventory.files[0].version_id);
     try std.testing.expectEqual(null, try stream.next());
+    const Lazy = struct {
+        files: *const @import("lake_index_coverage.zig").FileMap,
+        reads: usize = 0,
+        closes: usize = 0,
+        fn read(raw: *anyopaque, alloc: std.mem.Allocator, file: local.serverless_external_source_types.FileEntry, context: local.serverless_query_lake_read_context.Context) !local.serverless_query_lake_serving.ServingSource.FileVersions {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            self.reads += 1;
+            const found = self.files.get(file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+            const etag = try alloc.dupe(u8, found.etag);
+            errdefer alloc.free(etag);
+            return .{ .etag = etag, .version_id = try alloc.dupe(u8, found.version_id) };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+    };
+    var lazy: Lazy = .{ .files = &by_id };
+    {
+        var deferred_source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+        defer deferred_source.deinit();
+        deferred_source.lazy_versions = true;
+        deferred_source.verified_selector = .{ .ptr = &lazy, .read = Lazy.read, .close = Lazy.close };
+        var deferred_stream = try local.serverless_query_lake_stream.Stream.init(a, &deferred_source, &.{"n"}, &.{}, .{}, .{});
+        defer deferred_stream.deinit();
+        try std.testing.expectEqual(@as(usize, 2), (try deferred_stream.next()).?.rowCount());
+        try std.testing.expectEqual(null, try deferred_stream.next());
+        try std.testing.expectEqual(@as(usize, 1), lazy.reads);
+    }
+    try std.testing.expectEqual(@as(usize, 1), lazy.closes);
 }
 
 test "external lake overlapping text generations share every physical segment once" {
@@ -474,4 +505,171 @@ test "external lake inventory reclamation preserves live legacy and unfenced att
     try store.reclaimRetiredScopedInventory(domain, 2, 4, .none);
     provider.read_only = true;
     try std.testing.expectError(error.ArtifactStoreReadOnly, store.reclaimRetiredScopedInventory(domain, 2, 4, .none));
+}
+
+test "external lake global frontier compact coverage survives absent inventory and short cursor ownership" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("compact-coverage-owner");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "n", .values = &.{ 7, 11 } }});
+    defer a.free(data);
+    var upload = try client.putObject("antfly", "part.parquet", data, .{});
+    upload.deinit(a);
+    const schema_json = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"object_mutability\":\"immutable\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\"}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"n\":{{\"type\":\"integer\"}}}}}}}}}}}}", .{directory.path()});
+    defer a.free(schema_json);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
+    defer binding.deinit(a);
+    var built_source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer built_source.deinit();
+    // Simulate a freshly discovered immutable metadata plan; real Iceberg
+    // qualification is covered by the independent-writer E2E fixtures.
+    built_source.plan_identity = @splat(9);
+    var store = try @import("lake_index_store.zig").Store.openNative(a, null, null, false, .standalone, directory.path());
+    var store_closed = false;
+    defer if (!store_closed) store.deinit();
+    var artifacts = store.artifactStore();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const publication = @import("lake_index_publication.zig");
+    var table: local.common_topology_records.TableRecord = .{ .table_id = 9, .name = "lake", .schema_json = schema_json, .indexes_json = "{}" };
+    table.lake_index_catalog_json = try publication.begin(ca, std.testing.io, table, &built_source, store.identity, .{}, 100, 20);
+    const Clock = struct {
+        fn now(_: *const anyopaque) !u64 {
+            return 101;
+        }
+    };
+    var dummy: u8 = 0;
+    const published_json = try publication.build(ca, &artifacts, table, &built_source, store.identity, .{ .io = std.testing.io }, .none, .{ .ptr = &dummy, .now_ms = Clock.now });
+    var catalog = try local.metadata_lake_index_catalog.parse(a, published_json);
+    defer catalog.deinit();
+    const published = catalog.value.published.?;
+    const lifecycle = @import("../metadata/lake_index_lifecycle.zig");
+    const Harness = struct {
+        arena: std.heap.ArenaAllocator,
+        state: lifecycle.State,
+        fn read(raw: *anyopaque, alloc: std.mem.Allocator, _: u64, _: local.api_operation.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return lifecycle.encode(alloc, self.state);
+        }
+        fn mutate(raw: *anyopaque, _: u64, revision: u64, mutation: lifecycle.Mutation, _: local.api_operation.RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (revision != self.state.revision) return error.CatalogGenerationChanged;
+            self.state = try mutation.apply(self.arena.allocator(), self.state);
+        }
+    };
+    var harness: Harness = .{ .arena = .init(a), .state = .{} };
+    defer harness.arena.deinit();
+    harness.state = try harness.state.synchronize(harness.arena.allocator(), catalog.value);
+    const leases = @import("lake_index_reader_lease.zig");
+    var pool: leases.Pool = .{};
+    defer pool.deinit(std.testing.io);
+    const lease = try pool.acquire(std.testing.io, .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate }, table.table_id, published.generation, .{});
+    var lease_closed = false;
+    defer if (!lease_closed) lease.deinit();
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer source.deinit();
+    source.plan_identity = @splat(9);
+    source.lazy_versions = true;
+    // Selection must use the authenticated compact root on a cold cache.
+    try artifacts.delete(published.inventory.artifact_id);
+    const sql_table: local.sql_catalog.Table = .{ .id = table.table_id, .physical_name = "lake", .schema_version = 1, .columns = &.{}, .external_base_source = binding, .external_indexes = .{ .catalog_json = published_json, .indexes_json = "{}", .schema_json = schema_json, .desired = published.signature.desired } };
+    var selected = (try @import("lake_index_selection.zig").selectCachedWithLease(a, sql_table, &source, &store, lease.readContext(), .required, &cache, lease)).?;
+    selected.deinit();
+    try std.testing.expect(source.verified_selector != null);
+    try std.testing.expect(source.verified_files == null);
+    lease.deinit();
+    lease_closed = true;
+    store.deinit();
+    store_closed = true;
+    var stream = try local.serverless_query_lake_stream.Stream.init(a, &source, &.{"n"}, &.{}, .{}, .{});
+    defer stream.deinit();
+    try std.testing.expectEqual(@as(usize, 2), (try stream.next()).?.rowCount());
+    try std.testing.expectEqual(null, try stream.next());
+}
+
+test "external lake global frontier retained compacted roots detect v10 and v11 before serving and GC" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("legacy-compact-version");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@import("lake_index_publication.zig").uploadDomainWithNamespace(1, @splat(1), null), 1, std.testing.io);
+    const text = @import("lake_index_native_text.zig");
+    for ([_]u16{ 10, 11 }) |version| {
+        var child: text.Root = .{ .version = version, .domain = store.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .collection = .{ .documents = 0, .fields = &.{} } };
+        var upload = try store.putWithCancellation(try std.json.Stringify.valueAlloc(ca, child, .{}), .none);
+        defer upload.deinit(a);
+        const chunk: @import("lake_index_aggregate_artifact.zig").ChunkRef = .{ .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
+        const decoded = try text.loadRootDirectoryAuto(ca, store, chunk, .none, null);
+        try std.testing.expectEqual(version, decoded.metadata_version);
+        child.version = text.metadata_version;
+        child.compacted = chunk;
+        _ = try text.servingRoot(ca, store, child, .none, null);
+        var parent = try store.putWithCancellation(try std.json.Stringify.valueAlloc(ca, child, .{}), .none);
+        defer parent.deinit(a);
+        var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 1, .authority = undefined, .store = store, .identity = @splat(1), .context = .{}, .audit_only = true, .token = @splat(1), .remaining_reads = 16 * 1024 * 1024 };
+        defer {
+            var keys = collector.marked.keyIterator();
+            while (keys.next()) |key| a.free(key.*);
+            collector.marked.deinit(a);
+        }
+        try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = parent.artifact_id, .checksum = parent.checksum, .byte_len = parent.byte_len });
+        try std.testing.expect(collector.marked.contains(upload.artifact_id));
+    }
+}
+
+test "external lake global frontier GC upgrades maintenance and already marked manifests" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-gc-mode-upgrade");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, namespace);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var child = try store.put("reader-held posting segment");
+    defer child.deinit(a);
+    const text = @import("lake_index_native_text.zig");
+    const group: text.FileGroup = .{ .file = .{ .id = "part", .digest = @splat(7) }, .segments = &.{.{ .artifact_id = child.artifact_id, .checksum = child.checksum, .byte_len = child.byte_len }} };
+    var manifest = try store.put(try std.json.Stringify.valueAlloc(ca, group, .{}));
+    defer manifest.deinit(a);
+    const ref: @import("lake_index_aggregate_artifact.zig").ChunkRef = .{ .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len };
+    // A compacted publication needs only canonical maintenance edges. An older
+    // reader-held publication needs the complete serving graph of the same ID.
+    for ([_]bool{ false, true }) |maintenance_first| {
+        var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(1), .namespace = namespace, .audit_only = true, .remaining_reads = 1024 * 1024 };
+        defer {
+            var keys = collector.marked.keyIterator();
+            while (keys.next()) |key| a.free(key.*);
+            collector.marked.deinit(a);
+        }
+        _ = try collector.mark(ref);
+        if (maintenance_first) {
+            try collector.markTextManifestMode(ca, ref, false, true);
+            try std.testing.expect(!collector.marked.contains(child.artifact_id));
+        }
+        try collector.markTextManifestMode(ca, ref, false, false);
+        try collector.markTextManifestMode(ca, ref, false, true);
+        try std.testing.expect(collector.marked.contains(child.artifact_id));
+        const remaining = collector.remaining_reads;
+        try collector.markTextManifestMode(ca, ref, false, false);
+        try std.testing.expectEqual(remaining, collector.remaining_reads);
+        try std.testing.expectEqual(@as(u32, 2), collector.marked.count());
+    }
 }

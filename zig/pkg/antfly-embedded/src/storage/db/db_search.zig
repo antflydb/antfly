@@ -1579,7 +1579,9 @@ test "db search requests default to current identity generation snapshot" {
 
 test "db query capture retains settled terminal repair debt without acknowledging visibility" {
     const Fixture = struct {
-        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+        fn produce(raw: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const calls: *u8 = @ptrCast(@alignCast(raw));
+            calls.* += 1;
             return error.InvalidExtractorResponse;
         }
     };
@@ -1597,6 +1599,7 @@ test "db query capture retains settled terminal repair debt without acknowledgin
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
     var fixture: u8 = 0;
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
@@ -1623,12 +1626,25 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     runtime.worker_failed = false;
     runtime.retrying = true;
     runtime.next_retry_at_ms = runtime.clock.nowRealtimeMs() + 60_000;
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.captureQueryCut(request, .none));
+    try db.batch(.{ .writes = &.{.{ .key = "pending", .value = "{\"body\":\"awaiting extraction\"}" }}, .sync_level = .write });
+    try std.testing.expect(runtime.stats().applied_sequence < db.core.nextDerivedSequence());
+    const calls_before_capture = fixture;
+    try db.captureQueryCut(request, .none);
+    try std.testing.expectEqual(calls_before_capture, fixture);
+    try std.testing.expect(runtime.stats().retrying);
     runtime.retrying = false;
     runtime.next_retry_at_ms = 0;
 
     var retained = try db.openQueryCut(request, .none);
     defer retained.close();
+    var sorted = try retained.search(alloc, .{ .index_name = "text", .full_text = .{ .match_all = {} }, .order_by = &.{.{ .field = "_id" }}, .limit = 10 });
+    defer sorted.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
+    try std.testing.expectEqualStrings("doc", sorted.hits[0].id);
+    try std.testing.expectEqualStrings("pending", sorted.hits[1].id);
+    const pending = (try retained.get(alloc, "pending")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(pending);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "awaiting extraction") != null);
     var document = (try retained.getDocument(alloc, "doc", .{})) orelse return error.TestUnexpectedResult;
     defer document.deinit(alloc);
     try ant_json.testing.expectSubsetJsonText(alloc, "{\"body\":\"broken input\"}", document.json);

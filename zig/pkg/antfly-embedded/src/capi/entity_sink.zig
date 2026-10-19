@@ -1709,10 +1709,12 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
     api.antfly_buffer_free(&sql_output);
     defer _ = sql_cursor.antfly_db_sql_close_cursor(reader, cursor);
     var state: State = .{};
+    var cursor_snapshot: *h.Handle = undefined;
     const snapshot = blk: {
         const setup = api.enterHandle(reader, .read).?;
         defer setup.leave();
         try std.testing.expectEqual(@as(?h.capi.ErrorCode, null), setup.entry_error);
+        cursor_snapshot = setup.handle.sql_cursors.get(cursor).?.adapter.handle.?;
         const snapshot = setup.handle;
         snapshot.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(snapshot.alloc, snapshot.database().backend_runtime.io().?, .{
             .antfly_provider = managed.AntflyProvider{ .ptr = &state, .owns_invocation_admission = true, .embed_dense_texts = State.embedDense, .embed_sparse_texts = State.embedSparse, .extract = State.extract },
@@ -1751,9 +1753,11 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
         const pinned = api.enterHandle(reader, .read).?;
         defer pinned.leave();
         // resumeQuery collected while this registry was attached to the new root.
-        // The cursor must still pin the original root after both queries finish.
+        // A background publication may have refreshed the root between cursor
+        // creation and query setup. Pinning follows the cursor's actual root,
+        // independently of which root supplied the query producer.
         try std.testing.expectEqual(@as(usize, 1), pinned.connection.?.owner.retired.items.len);
-        try std.testing.expect(pinned.connection.?.owner.retired.items[0] == snapshot);
+        try std.testing.expect(pinned.connection.?.owner.retired.items[0] == cursor_snapshot);
     }
     try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_fetch_cursor_json(reader, cursor, 10, &sql_output));
     try std.testing.expect(std.mem.indexOf(u8, sql_output.ptr.?[0..sql_output.len], "7") != null);

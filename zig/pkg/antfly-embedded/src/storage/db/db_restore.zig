@@ -1273,7 +1273,7 @@ pub fn snapshotInternal(
             .{},
             cancellation,
             maintenance_deadline_ns orelse std.math.maxInt(u64),
-            if (query_cut != null) .settled_requests else .successful_requests,
+            if (query_cut != null) .published_requests else .successful_requests,
         ) catch |err| switch (err) {
             error.Cancelled => return error.Canceled,
             else => return err,

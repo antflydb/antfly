@@ -12768,7 +12768,10 @@ pub const ExternalLakeTableSource = struct {
     kind: []const u8,
     table_id: []const u8,
     format: []const u8,
+    /// Parquet prefix, Iceberg table, or an explicit Parquet snapshot head ending in .parquet-manifest.json. Snapshot heads name immutable checksummed file-list chunks; each query revalidates the head without listing the data prefix.
     uri: []const u8,
+    /// Server-assigned public row identity version, fixed when the source is attached and preserved across index creation and schema updates.
+    row_identity_version: ?i64 = null,
     schema_fingerprint: ?[]const u8 = null,
     /// iceberg_writer authorizes explicit Iceberg catalog commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
     write_policy: ?[]const u8 = null,
@@ -12784,6 +12787,7 @@ pub const ExternalLakeTableSource = struct {
         .{ "table_id", "table_id", false },
         .{ "format", "format", false },
         .{ "uri", "uri", false },
+        .{ "row_identity_version", "row_identity_version", true },
         .{ "schema_fingerprint", "schema_fingerprint", true },
         .{ "write_policy", "write_policy", true },
         .{ "object_mutability", "object_mutability", true },
@@ -12810,6 +12814,10 @@ pub const ExternalLakeTableSource = struct {
         try jw.write(self.format);
         try jw.objectField("uri");
         try jw.write(self.uri);
+        if (self.row_identity_version) |value| {
+            try jw.objectField("row_identity_version");
+            try jw.write(value);
+        }
         if (self.schema_fingerprint) |value| {
             try jw.objectField("schema_fingerprint");
             try jw.write(value);
@@ -24852,13 +24860,13 @@ pub const InferenceEmbedRequest = struct {
     model_identity: ?[]const u8 = null,
     /// Model name to use for embedding generation
     model: []const u8,
-    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding - an array of ordered groups for EmbeddingGemma 2, one vector per group
+    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding - an object with an ordered content array, producing one embedding - an array of ordered content objects, producing one embedding per object Legacy arrays of content parts continue to produce one embedding per part.
     input: std.json.Value,
     /// Encoding format for the embeddings (only "float" supported)
     encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512, 256, or 128 only. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). EmbeddingGemma 2 is trained for 768, 512, 256, and 128 dimensions. Not supported for sparse models.
     dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+    /// Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 applies its official prompt for each of the eight task types to text-bearing inputs and rejects custom instructions. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
     task_type: ?[]const u8 = null,
     /// Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support.
     instruction: ?[]const u8 = null,
@@ -24928,6 +24936,8 @@ pub const InferenceEmbedRequest = struct {
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
 pub const InferenceEmbedResponse = struct {
+    /// Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail if the resident text encoder cannot execute; this field does not describe preprocessing placement.
+    backend: OpenApiOptionalNullable([]const u8) = .absent,
     /// EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and recipe. Dimensions and retrieval roles must also match index configuration.
     model_identity: ?[]const u8 = null,
     /// Object type, always "list"
@@ -24943,6 +24953,7 @@ pub const InferenceEmbedResponse = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "backend", "backend", false },
         .{ "model_identity", "model_identity", true },
         .{ "object", "object", false },
         .{ "data", "data", false },
@@ -24962,6 +24973,17 @@ pub const InferenceEmbedResponse = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.backend) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("backend");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("backend");
+                try jw.write(value);
+            },
+        }
         if (self.model_identity) |value| {
             try jw.objectField("model_identity");
             try jw.write(value);
@@ -24993,7 +25015,39 @@ pub const InferenceEmbeddingBatchSummary = struct {
     failed: i64,
 };
 
-/// EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. Video uses video/mp4, video/quicktime, video/webm or video/mp2t media/attachment parts, 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. The expanded sequence must fit 8192 tokens.
+/// One ordered input producing one combined embedding. Supported by EmbeddingGemma 2. Text, image, and audio parts may be combined in order. On Linux CUDA, a group containing one video/mp4 media part produces one clip embedding using NVDEC; mixed video groups are unsupported. Video requires progressive SDR H.264 MP4, at most 60 seconds and 256 MiB, subject to narrower request limits. Sampling uses 1 FPS capped uniformly to 32 frames, with at most 140 visual tokens per frame. The expanded input, including task prompts, BOS/EOS, and media tokens, must fit within 8192 tokens. Overflow is rejected without truncation.
+pub const InferenceEmbeddingContentInput = struct {
+    /// Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part.
+    title: ?[]const u8 = null,
+    content: []const ContentPart,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "title", "title", true },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.title) |value| {
+            try jw.objectField("title");
+            try jw.write(value);
+        }
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
+};
+
+/// EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. CPU/Metal video accepts video/mp4, video/quicktime, video/webm or video/mp2t, using 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. Linux CUDA video uses NVDEC and requires one standalone progressive SDR H.264 video/mp4 part, without a title or other parts, at most 60 seconds and 256 MiB subject to narrower request limits. The expanded sequence including all media soft tokens must fit 8192 tokens.
 pub const InferenceEmbeddingGroup = struct {
     /// Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part.
     title: ?[]const u8 = null,

@@ -29,6 +29,24 @@ const uuid = @import("../common/uuid.zig");
 /// authenticated row/page ownership. This function does not confer that trust.
 /// Scratch is separately bounded; all work/cancellation belongs to context.
 pub fn order(left: layout.View, right: layout.View, context: *exact.Context, scratch_limit: usize) !std.math.Order {
+    const native = @import("array_native.zig");
+    // This boundary already requires strict ingress or pinned authenticated
+    // ownership. Such views need not carry an optional validation summary.
+    if (left.kind == right.kind and native.primitive(left.kind)) {
+        try context.charge(1);
+        var work: arrays.Budget = .{ .remaining = std.math.maxInt(usize), .shared = context };
+        const compared = try native.orderPrefix(left, right, &work, true);
+        if (compared != .eq) return compared;
+        var ad: [layout.max_rank]arrays.Dimension = undefined;
+        var bd: [layout.max_rank]arrays.Dimension = undefined;
+        for (ad[0..left.rank], 0..) |*axis, i| axis.* = try left.dimension(i);
+        for (bd[0..right.rank], 0..) |*axis, i| axis.* = try right.dimension(i);
+        return arrays.compareShape(left.count, right.count, ad[0..left.rank], bd[0..right.rank], &work);
+    }
+    return orderScalar(left, right, context, scratch_limit);
+}
+
+fn orderScalar(left: layout.View, right: layout.View, context: *exact.Context, scratch_limit: usize) !std.math.Order {
     try context.charge(1);
     if (left.kind != right.kind) return error.SqlTypeMismatch;
     var work: arrays.Budget = .{ .remaining = std.math.maxInt(usize), .shared = context };
@@ -134,6 +152,11 @@ test "SQL borrowed canonical array comparison shares sticky cancellation and wor
     const bytes = try @import("array_storage.zig").encodeAlloc(a, value, .{});
     defer a.free(bytes);
     const view = try @import("array_storage.zig").validateCanonical(a, .text, bytes, .{});
+    // Distinct pinned owners exercise the text walk. Identical storage now
+    // has a constant-time identity path and does not traverse these bytes.
+    const other_bytes = try a.dupe(u8, bytes);
+    defer a.free(other_bytes);
+    const other = try @import("array_storage.zig").validateCanonical(a, .text, other_bytes, .{});
     const Cancel = struct {
         calls: usize = 0,
         fn poll(raw: ?*anyopaque) anyerror!void {
@@ -144,14 +167,14 @@ test "SQL borrowed canonical array comparison shares sticky cancellation and wor
     };
     var cancel: Cancel = .{};
     var context: exact.Context = .{ .alloc = a, .checkpoint = Cancel.poll, .ptr = &cancel };
-    try std.testing.expectError(error.Canceled, order(view, view, &context, 0));
+    try std.testing.expectError(error.Canceled, order(view, other, &context, 0));
     try std.testing.expectEqual(@as(usize, 3), cancel.calls);
     context.checkpoint = null;
-    try std.testing.expectError(error.Canceled, order(view, view, &context, 0));
+    try std.testing.expectError(error.Canceled, order(view, other, &context, 0));
     context = .{ .alloc = a, .remaining = 512 };
-    try std.testing.expectError(error.SqlProgramLimitExceeded, order(view, view, &context, 0));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, order(view, other, &context, 0));
     context.remaining = 8 * 1024 * 1024;
-    try std.testing.expectError(error.SqlProgramLimitExceeded, order(view, view, &context, 0));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, order(view, other, &context, 0));
 }
 
 test "SQL borrowed canonical array JSONB comparison reuses bounded scratch and cleans allocation faults" {
@@ -227,4 +250,77 @@ test "SQL borrowed canonical array primitive comparison scales without decoded c
     try std.testing.expectEqual(@as(usize, 0), decoded_memory.live);
     try std.testing.expect(decoded_memory.peak >= cells.len * @sizeOf(arrays.Element));
     std.debug.print("borrowed primitive array: comparisons=100 cells={d} decoded_allocations=0 elapsed_ns={d}; one-vector decode baseline peak={d} elapsed_ns={d}\n", .{ cells.len, elapsed, decoded_memory.peak, decoded_elapsed });
+}
+
+test "SQL native canonical ordering preserves authenticated views and work" {
+    const a = std.testing.allocator;
+    for ([_]arrays.ElementType{ .boolean, .int16, .int32, .int64, .float32, .float64, .text }) |kind| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const region = arena.allocator();
+        const count = 129;
+        const cells = try region.alloc(arrays.Element, count);
+        for (0..3) |pattern| {
+            for (cells, 0..) |*cell, i| cell.* = if (pattern == 2 or (pattern == 1 and i % 7 != 0)) .{} else .json(switch (kind) {
+                .boolean => .{ .bool = i % 2 == 0 },
+                .int16, .int32, .int64 => .{ .integer = @intCast(i) },
+                .float32, .float64 => .{ .float = if (i % 17 == 0) std.math.nan(f64) else if (i % 13 == 0) -0.0 else @floatFromInt(i) },
+                .text => .{ .string = if (i % 3 == 0) "é☺" else "other" },
+                else => unreachable,
+            });
+            for (0..4) |variant| {
+                const left = try arrays.Value.init(kind, &.{.{ .length = count, .lower = -7 }}, cells, .{});
+                const lb = try @import("array_storage.zig").encodeAlloc(region, left, .{});
+                const copy = try region.dupe(arrays.Element, cells);
+                if (variant == 1) copy[128] = .{};
+                if (variant == 2) copy[128] = .json(switch (kind) {
+                    .boolean => .{ .bool = false },
+                    .float32, .float64 => .{ .float = -99 },
+                    .text => .{ .string = "different" },
+                    else => .{ .integer = -99 },
+                });
+                const right = try arrays.Value.init(kind, &.{.{ .length = count, .lower = if (variant == 3) 1 else -7 }}, copy, .{});
+                const rb = try @import("array_storage.zig").encodeAlloc(region, right, .{});
+                const lv = try layout.View.openAuthenticated(kind, lb, .{});
+                const rv = try layout.View.openAuthenticated(kind, rb, .{});
+                try std.testing.expect(lv.validation == null and rv.validation == null);
+                var fast: exact.Context = .{ .alloc = std.testing.failing_allocator };
+                var slow = fast;
+                const expected = try orderScalar(lv, rv, &slow, 0);
+                try std.testing.expectEqual(expected, try order(lv, rv, &fast, 0));
+                try std.testing.expectEqual(slow.remaining, fast.remaining);
+                var denied: exact.Context = .{ .alloc = std.testing.failing_allocator, .remaining = (exact.Context{ .alloc = a }).remaining - fast.remaining - 1 };
+                try std.testing.expectError(error.SqlProgramLimitExceeded, order(lv, rv, &denied, 0));
+            }
+        }
+    }
+}
+
+test "SQL native canonical ordering measurement uses distinct authenticated owners" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const region = arena.allocator();
+    const count = 16384;
+    const cells = try region.alloc(arrays.Element, count);
+    for (cells, 0..) |*cell, i| cell.* = if (i % 7 != 0) .{} else .json(.{ .integer = @intCast(i) });
+    const value = try arrays.Value.init(.int64, &.{.{ .length = count, .lower = -7 }}, cells, .{});
+    const lb = try @import("array_storage.zig").encodeAlloc(region, value, .{});
+    const rb = try region.dupe(u8, lb);
+    const left = try layout.View.openAuthenticated(.int64, lb, .{});
+    const right = try layout.View.openAuthenticated(.int64, rb, .{});
+    try std.testing.expect(left.bytes.ptr != right.bytes.ptr);
+    for (0..2) |mode| {
+        var elapsed: i96 = 0;
+        var total_work: u64 = 0;
+        for (0..20) |_| {
+            var context: exact.Context = .{ .alloc = std.testing.failing_allocator };
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            const result = if (mode == 0) try orderScalar(left, right, &context, 0) else try order(left, right, &context, 0);
+            elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+            total_work += (exact.Context{ .alloc = a }).remaining - context.remaining;
+            try std.testing.expectEqual(std.math.Order.eq, result);
+        }
+        std.debug.print("SQL_NATIVE_CANONICAL native={} repetitions=20 cells={} elapsed_ns={} work={} allocations=0 distinct_owners=true\n", .{ mode == 1, count, elapsed, total_work });
+    }
 }

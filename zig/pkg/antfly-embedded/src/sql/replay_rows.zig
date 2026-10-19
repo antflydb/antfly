@@ -106,12 +106,27 @@ pub const Replay = struct {
         index: usize = 0,
 
         /// A borrowed row survives other readers, but not this reader's next
-        /// block load or close. Retaining operators copy at their boundary.
+        /// read or close. Retaining operators copy at their boundary.
         pub fn next(self: *Reader) !?[]const Datum {
             if (self.index == self.owner.count) return null;
-            const values = if (self.disk) |*run| (try run.readBorrowed(self.index)).row.values else self.owner.rows.items[self.index];
+            const values = if (self.disk) |*run| (try run.readCurrent(self.index)).row.values else self.owner.rows.items[self.index];
             self.index += 1;
             return values;
+        }
+
+        /// Borrow native columns until this reader loads its next block.
+        pub fn nextBatch(self: *Reader, a: A, maximum: usize) !@import("execution_batch.zig").Batch {
+            if (maximum == 0) return error.InvalidSqlLimit;
+            if (self.index == self.owner.count) return .{ .rows = &.{} };
+            if (self.disk) |*run| {
+                const batch = try run.readBatchCurrent(a, self.index, maximum);
+                self.index = @intCast(batch.following);
+                return batch.values;
+            }
+            const count = @min(maximum, self.owner.count - self.index);
+            const rows = self.owner.rows.items[self.index..][0..count];
+            self.index += count;
+            return .{ .rows = rows };
         }
 
         pub fn rewind(self: *Reader) void {
@@ -224,7 +239,7 @@ test "SQL replay readers own JSON allocators and fail closed on quota cancellati
         const row = (try reader.next()).?;
         const json = row[0].value.array;
         try std.testing.expectEqualStrings("owned", json.items[0].string);
-        const arena = if (reader.disk) |*run| &run.read_arena else &replay.arena;
+        const arena = if (reader.disk) |run| &run.compact.?.arena else &replay.arena;
         try std.testing.expectEqual(@intFromPtr(arena), @intFromPtr(json.allocator.ptr));
     }
     {

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "mirror": "https://storage.googleapis.com/antfly-image-artifacts-zig-dependencies",
+  "packages": [
+    {
+      "hash": "translate_c-2.0.0-Q_BUWltOBwBYABF84EUL208pIFeUIwbBs29FmVBaafN5",
+      "url": "https://codeberg.org/ziglang/translate-c/archive/02ff0c523fb92a38939b04d0145c4a9602a74d56.tar.gz"
+    },
+    {
+      "hash": "aro-0.0.0-JSD1QtuBNwCASyBtNF3pqTl_W3oAJQGEVyFAtrBSE_Pa",
+      "url": "https://codeberg.org/ziglang/arocc/archive/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b.tar.gz",
+      "declared_urls": [
+        "git+https://codeberg.org/ziglang/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
+      ]
+    }
+  ]
+}

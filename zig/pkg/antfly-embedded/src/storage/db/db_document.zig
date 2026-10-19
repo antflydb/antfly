@@ -836,6 +836,7 @@ pub fn indexTextKernelDocuments(
 /// Leadership and root-image gates cover the short publication transaction;
 /// hashing and scanning happen beforehand under a disposable read snapshot.
 pub fn advanceDocumentAuthorityBackfillPage(self: *DB) !bool {
+    if (comptime storage_engine.enabled) return storage_engine.call("advanceDocumentAuthorityBackfillPage", .{self});
     if (openModeRequiresReadOnlyBackends(self.open_mode)) return true;
     if (!replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate)) return false;
     if (!self.document_authority_backfill_mutex.tryLock()) return false;
