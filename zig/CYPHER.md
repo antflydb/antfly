@@ -1652,8 +1652,9 @@ typed renames and transparent CTE projections, so a filter cannot regain a
 certificate merely by moving into a subquery.
 
 SQL summary negotiation carries a bounded disjunction of certificates. Each
-alternative selects one varying integer input and names all inputs that must
-be constant within its bag. A scalar program may be affine relative to `hops`
+single-input alternative selects one varying integer input and names all
+inputs that must be constant within its bag. Joint alternatives prove shared
+marginal lineage for all observed non-invariant columns. A scalar program may be affine relative to `hops`
 while its offset or coefficient depends on an endpoint column; the graph
 producer must prove those invariants before emitting synthetic representatives.
 Certificates retain their separate invariant sets through computed CTE
@@ -1677,7 +1678,7 @@ cursors. It accepts comparisons and conjunctions (including chained and
 reversed comparisons) with checked integer literals or invocation parameters.
 The complete predicate and pattern property expressions must certify:
 eager Boolean siblings or deferred pattern properties that can fail,
-noninteger/null bounds, post-projection filters, multiple segments and shortest
+noninteger/null bounds, unproved projection boundaries, multiple segments and shortest
 selectors remain barriers. Contradictory ranges keep ordinary empty/optional
 semantics, and invocation-local copies leave cached query trees unchanged.
 
@@ -1718,8 +1719,31 @@ correctly.
 Empty lists, observable full paths, heterogeneous marginal inputs and
 length-dependent filters retain their normal semantics.
 
-Length predicates, length grouping keys, non-extremum DISTINCT arguments
-and other distribution-dependent expressions retain exact hop states. Cyclic
+Invocation-local range proofs follow length aliases through transparent WITH
+projections and split conjunctions only when every crossed expression is total.
+Literal Boolean siblings and equality comparisons on known node properties may
+remain as residual filters; arbitrary functions, arithmetic projections, scope
+changes, DISTINCT, ordering, pagination and post-OPTIONAL filters remain barriers.
+Eager error-producing siblings and pattern-property expressions are never
+pruned by a later length guard.
+
+Fixed UNWIND lists also carry endpoint identity and integer property lineage.
+All entity branches must have the same producer origin; scalar branches must
+share an affine marginal. The original list still evaluates with all duplicates,
+NULLs and errors, and opaque rebindings block prior proofs.
+
+SQL joint summary certificates prove that every input to an integer affine
+consumer derives from the same producer marginal or a per-bag invariant.
+GRAPH_TABLE checks each contributing projection against that private marginal;
+columns such as length(p) and 2*length(p) therefore share representatives with
+their correlation intact. CTE projections and positional UNION ALL mappings
+carry this certificate and its invariant obligations. Nonlinear computations,
+filters and grouping keys that observe the marginal decline the certificate
+and retain exact distributions. Original expression evaluation on integer
+extrema preserves checked intermediate arithmetic.
+
+Unproved length predicates, length grouping keys, non-extremum DISTINCT
+arguments and other distribution-dependent expressions retain exact hop states. Cyclic
 trail histories retain ordinary enumeration when uniqueness cannot be proved;
 repeatable bounded walks retain the finite hop recurrence.
 

@@ -67,16 +67,22 @@ fn totalProperties(path: ast.Path, parameters: []const v.Entry) bool {
     for (path.edges) |edge| for (edge.properties) |entry| if (!totalProperty(entry.value, parameters)) return false;
     return true;
 }
-fn length(expression: *const ast.Expr, path: ast.Path) bool {
-    if (expression.value != .variable) return false;
-    const name = expression.value.variable;
-    if (path.execution_summary.length) |slot| if (std.mem.eql(u8, slot, name)) return true;
-    if (path.edges[0].execution_length) |slot| if (std.mem.eql(u8, slot, name)) return true;
-    return false;
+const Origin = enum { length, node, value };
+const Names = std.StringHashMapUnmanaged(Origin);
+fn length(expression: *const ast.Expr, names: Names) bool {
+    return expression.value == .variable and names.get(expression.value.variable) == .length;
 }
-fn comparison(left: *const ast.Expr, op: ast.Binary, right: *const ast.Expr, path: ast.Path, parameters: []const v.Entry, range: *Range) bool {
+fn scalarRead(expression: *const ast.Expr, names: Names, parameters: []const v.Entry) bool {
+    return switch (expression.value) {
+        .literal => true,
+        .parameter => totalProperty(expression, parameters),
+        .property => |property| property.base.value == .variable and names.get(property.base.value.variable) == .node,
+        else => false,
+    };
+}
+fn comparison(left: *const ast.Expr, op: ast.Binary, right: *const ast.Expr, names: Names, parameters: []const v.Entry, range: *Range) bool {
     var operation = op;
-    const bound: i128 = if (length(left, path)) integer(right, parameters) orelse return false else if (length(right, path)) blk: {
+    const bound: i128 = if (length(left, names)) integer(right, parameters) orelse return false else if (length(right, names)) blk: {
         operation = switch (op) {
             .lt => .gt,
             .lte => .gte,
@@ -99,34 +105,93 @@ fn comparison(left: *const ast.Expr, op: ast.Binary, right: *const ast.Expr, pat
     }
     return true;
 }
-fn predicate(expression: *const ast.Expr, path: ast.Path, parameters: []const v.Entry, range: *Range) bool {
-    return switch (expression.value) {
-        .binary => |b| if (b.op == .@"and") predicate(b.left, path, parameters, range) and predicate(b.right, path, parameters, range) else comparison(b.left, b.op, b.right, path, parameters, range),
-        .comparison => |c| blk: {
-            for (c.operators, 0..) |op, i| if (!comparison(c.operands[i], op, c.operands[i + 1], path, parameters, range)) break :blk false;
-            break :blk true;
+const Extracted = struct { residual: ?*const ast.Expr = null, observed: bool = false };
+fn extract(a: A, expression: *const ast.Expr, names: Names, parameters: []const v.Entry, range: *Range) !?Extracted {
+    switch (expression.value) {
+        .binary => |binary| {
+            if (binary.op == .@"and") {
+                const left = (try extract(a, binary.left, names, parameters, range)) orelse return null;
+                const right = (try extract(a, binary.right, names, parameters, range)) orelse return null;
+                var residual = left.residual orelse right.residual;
+                if (left.residual != null and right.residual != null) {
+                    const joined = try a.create(ast.Expr);
+                    joined.* = .{ .span = expression.span, .value = .{ .binary = .{ .op = .@"and", .left = left.residual.?, .right = right.residual.? } } };
+                    residual = joined;
+                }
+                return .{ .residual = residual, .observed = left.observed or right.observed };
+            }
+            if (comparison(binary.left, binary.op, binary.right, names, parameters, range)) return .{ .observed = true };
+            if ((binary.op == .eq or binary.op == .neq) and scalarRead(binary.left, names, parameters) and scalarRead(binary.right, names, parameters)) return .{ .residual = expression };
         },
-        else => false,
-    };
+        .comparison => |chain| {
+            for (chain.operators, 0..) |op, i| if (!comparison(chain.operands[i], op, chain.operands[i + 1], names, parameters, range)) return null;
+            return .{ .observed = true };
+        },
+        .literal => |value| {
+            if (value == .boolean) return .{ .residual = if (value.boolean) null else expression };
+            if (value == .null) return .{ .residual = expression };
+        },
+        else => {},
+    }
+    return null;
+}
+fn project(a: A, projection: ast.Projection, names: Names, parameters: []const v.Entry) !?Names {
+    if (projection.distinct or projection.skip != null or projection.limit != null or projection.order.len != 0) return null;
+    var next: Names = if (projection.wildcard) try names.clone(a) else .empty;
+    for (projection.items) |item| {
+        const expression = item.expression;
+        const origin: Origin = if (expression.value == .variable) names.get(expression.value.variable) orelse return null else if (scalarRead(expression, names, parameters)) .value else return null;
+        const name = item.alias orelse if (expression.value == .variable) expression.value.variable else return null;
+        try next.put(a, name, origin);
+    }
+    return next;
 }
 fn clauses(a: A, input: []const ast.Clause, parameters: []const v.Entry) anyerror![]const ast.Clause {
     const result = try a.dupe(ast.Clause, input);
-    for (result) |*clause| switch (clause.operation) {
+    for (result, 0..) |*clause, index| switch (clause.operation) {
         .subquery => |inner| clause.operation.subquery = try clauses(a, inner, parameters),
         .match => |*operation| {
-            const guard = operation.predicate orelse continue;
             if (operation.paths.len != 1) continue;
             const path = operation.paths[0];
             if (path.selector != .all or path.edges.len != 1 or path.execution_prefix) continue;
-            // Property constraints run before WHERE, including at endpoints
-            // that the guard rejects. Never prune those evaluation boundaries.
+            if (path.execution_summary.length == null and path.edges[0].execution_length == null) continue;
+            // Property constraints precede WHERE, including at rejected endpoints.
+            // Every boundary crossed by a range must be total, not merely pure.
             if (!totalProperties(path, parameters)) continue;
+            var names: Names = .empty;
+            for (path.nodes) |node| if (node.alias) |name| try names.put(a, name, .node);
+            if (path.execution_summary.length) |name| try names.put(a, name, .length);
+            if (path.edges[0].execution_length) |name| try names.put(a, name, .length);
             var range: Range = .{ .low = path.edges[0].min_hops, .high = path.edges[0].max_hops orelse std.math.maxInt(i64) };
-            if (!predicate(guard, path, parameters, &range)) continue;
+            const Pending = struct { index: usize, residual: ?*const ast.Expr };
+            var pending: std.ArrayList(Pending) = .empty;
+            var observed = false;
+            if (operation.predicate) |guard| {
+                const extracted = (try extract(a, guard, names, parameters, &range)) orelse continue;
+                observed = extracted.observed;
+                try pending.append(a, .{ .index = index, .residual = extracted.residual });
+            }
+            for (result[index + 1 ..], index + 1..) |following, position| {
+                if (operation.optional) break;
+                if (following.operation != .project or following.operation.project.final) break;
+                const projection = following.operation.project.value;
+                names = (try project(a, projection, names, parameters)) orelse break;
+                if (projection.predicate) |guard| {
+                    // An unsafe later filter is a barrier, not a reason to
+                    // discard proofs already established before it.
+                    var candidate = range;
+                    const extracted = (try extract(a, guard, names, parameters, &candidate)) orelse break;
+                    range = candidate;
+                    observed = observed or extracted.observed;
+                    try pending.append(a, .{ .index = position, .residual = extracted.residual });
+                }
+            }
+            if (!observed) continue;
             if (range.low > range.high) {
                 const empty = try a.create(ast.Expr);
-                empty.* = .{ .span = guard.span, .value = .{ .literal = .{ .boolean = false } } };
+                empty.* = .{ .span = clause.span, .value = .{ .literal = .{ .boolean = false } } };
                 operation.predicate = empty;
+                // Keep subsequent predicates intact; no rows reach them.
                 continue;
             }
             if (range.low > std.math.maxInt(u32) or (range.high > std.math.maxInt(u32) and range.high != std.math.maxInt(i64))) continue;
@@ -136,7 +201,9 @@ fn clauses(a: A, input: []const ast.Clause, parameters: []const v.Entry) anyerro
             edges[0].max_hops = if (range.high == std.math.maxInt(i64)) null else @intCast(range.high);
             paths[0].edges = edges;
             operation.paths = paths;
-            operation.predicate = null;
+            for (pending.items) |edit| {
+                if (edit.index == index) operation.predicate = edit.residual else result[edit.index].operation.project.value.predicate = edit.residual;
+            }
         },
         else => {},
     };

@@ -3246,6 +3246,9 @@ def test_sql_graph_statistics_use_consumer_certificates(graph_db):
         str(layers * layers),
         pytest.approx(coefficient_average, rel=1e-13),
     ]
+    assert db.sql(f"WITH t AS (SELECT hops*depth AS n FROM {grouped}) SELECT avg(n) FROM t")["rows"] == [
+        [pytest.approx(coefficient_average, rel=1e-13)]
+    ]
     squared_average = (sum(sums[1:]) + sum(depth * depth * counts[depth] for depth in range(1, layers + 1))) / sum(
         counts[1:]
     )
@@ -3255,8 +3258,27 @@ def test_sql_graph_statistics_use_consumer_certificates(graph_db):
         str(layers * layers + layers),
         pytest.approx(squared_average, rel=1e-13),
     ]
-    # Mixed endpoint/length guards remain conservative eager-error barriers.
-    # A length-only GRAPH_TABLE predicate can use the same range certificate.
+    correlated = relation.replace("length(p) AS hops", "length(p) AS hops,2*length(p) AS twice")
+    for statement in (
+        f"SELECT avg(hops+twice) FROM {correlated}",
+        f"WITH t AS (SELECT hops,twice FROM {correlated}) SELECT avg(hops+twice) FROM t",
+        f"WITH t AS (SELECT hops+twice AS total,twice-hops AS n FROM {correlated}) SELECT avg(total+n)-avg(n) FROM t",
+        f"SELECT avg(hops+twice) FROM (SELECT hops,twice FROM {correlated} UNION ALL SELECT hops,twice FROM {correlated}) u",
+    ):
+        assert db.sql(statement)["rows"] == [[pytest.approx(3 * average, rel=1e-13)]]
+    assert db.sql(f"SELECT avg(twice-hops) FROM {correlated}")["rows"] == [[pytest.approx(average, rel=1e-13)]]
+    for tail, expected in (
+        ("WHERE length(p)>=2 AND true RETURN avg(length(p))", average),
+        ("WITH length(p) AS n WHERE n>=2 RETURN avg(n)", average),
+        ("UNWIND [b] AS x RETURN avg(length(p)+x.score)", endpoint_average),
+        ("UNWIND [b.score] AS x RETURN avg(length(p)+x)", endpoint_average),
+    ):
+        result = db.cypher_json("g", {"query": "MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) " + tail})
+        assert result["rows"][0][0]["value"] == pytest.approx(expected, rel=1e-13)
+    # Proved total source comparisons may coexist with the length guard.
+    mixed = relation.replace("s.id='start'", "s.id='start' AND length(p)>=2")
+    assert db.sql(f"SELECT avg(hops) FROM {mixed}")["rows"] == [[pytest.approx(average, rel=1e-13)]]
+    # A length-only GRAPH_TABLE predicate uses the same range certificate.
     db.graph_catalog_json(
         {
             "action": "put",
@@ -3456,3 +3478,74 @@ def test_endpoint_identity_and_length_ranges_keep_moments_compressed(graph_db):
         )
         assert result["rows"] == reference["rows"]
         assert result["stats"]["intermediate_states"] <= reference["stats"]["intermediate_states"] + 100
+
+
+def test_safe_filter_and_unwind_lineage_keep_moments_compressed(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 35000}
+    expected = db.cypher_json("g", {"query": base + "WHERE length(p)>=2 RETURN avg(length(p))", "limits": limits})[
+        "rows"
+    ][0][0]["value"]
+    for tail in (
+        "WHERE length(p)>=2 AND true RETURN avg(length(p))",
+        "WHERE length(p)>=2 AND s.id='start' RETURN avg(length(p))",
+        "WITH length(p) AS n WHERE n>=2 RETURN avg(n)",
+        "WITH length(p) AS n WITH n AS hops WHERE hops>=2 AND true RETURN avg(hops)",
+    ):
+        result = db.cypher_json("g", {"query": base + tail, "limits": limits})
+        assert result["rows"][0][0]["value"] == pytest.approx(expected, rel=1e-13)
+    expected = db.cypher_json("g", {"query": base + "RETURN avg(length(p)+b.score)", "limits": limits})["rows"][0][0][
+        "value"
+    ]
+    for tail in (
+        "UNWIND b AS x RETURN avg(length(p)+x.score)",
+        "UNWIND [b] AS x RETURN avg(length(p)+x.score)",
+        "UNWIND [b,b] AS x RETURN avg(length(p)+x.score)",
+        "UNWIND [b.score] AS x RETURN avg(length(p)+x)",
+        "UNWIND [b.score,b.score+1] AS x RETURN avg(length(p)+x)-0.5",
+    ):
+        result = db.cypher_json("g", {"query": base + tail, "limits": limits})
+        assert result["rows"][0][0]["value"] == pytest.approx(expected, rel=1e-13)
+
+
+def test_sql_shared_path_marginal_certificates_preserve_correlations(graph_db):
+    db = graph_db
+    populate_layered_graph(db, layers=6)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    relation = "GRAPH_TABLE(g MATCH p=(s IS D)-[rs IS R*]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS hops,2*length(p) AS twice,b.score AS depth)) q"
+    # MATERIALIZED is an ordinary complete tuple capture; it must agree with
+    # negotiated representatives, including predicates and nonlinear fallback.
+    for expression in (
+        "avg(hops+twice)",
+        "avg(twice-hops)",
+        "avg(hops*twice)",
+        "min(twice-hops)",
+        "avg(hops+twice+depth)",
+    ):
+        direct = db.sql(f"SELECT {expression} FROM {relation}")["rows"]
+        ordinary = db.sql(f"WITH t AS MATERIALIZED (SELECT * FROM {relation}) SELECT {expression} FROM t")["rows"]
+        assert len(direct) == len(ordinary)
+        for actual, expected in zip(direct, ordinary, strict=True):
+            assert actual == [
+                pytest.approx(value, rel=1e-13) if isinstance(value, float) else value for value in expected
+            ]
+    for predicate in ("hops=3", "twice<7", "hops+twice=9"):
+        direct = db.sql(f"SELECT avg(hops+twice) FROM {relation} WHERE {predicate}")["rows"]
+        ordinary = db.sql(
+            f"WITH t AS MATERIALIZED (SELECT * FROM {relation}) SELECT avg(hops+twice) FROM t WHERE {predicate}"
+        )["rows"]
+        assert len(direct) == len(ordinary)
+        for actual, expected in zip(direct, ordinary, strict=True):
+            assert actual == [
+                pytest.approx(value, rel=1e-13) if isinstance(value, float) else value for value in expected
+            ]
+    assert db.sql(f"SELECT count(hops+twice+$1),avg(hops+twice+$1) FROM {relation}", [None])["rows"] == [["0", None]]
+    with pytest.raises(SQLStateError, match="22003"):
+        db.sql(
+            f"WITH t AS (SELECT hops,twice,(hops+9223372036854775807)-9223372036854775807 AS n FROM {relation}) SELECT avg(n+twice) FROM t"
+        )
+    with pytest.raises(SQLStateError, match="22012"):
+        db.sql(f"WITH t AS (SELECT hops,twice,1/(hops-2) AS unused FROM {relation}) SELECT avg(hops+twice) FROM t")

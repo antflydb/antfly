@@ -584,7 +584,14 @@ pub const ColumnPage = struct {
 /// distribution. Exact integer representative bags may preserve its statistics.
 /// Each alternative names one varying marginal and every dependency that
 /// must be constant inside its bag. Alternatives are disjunctive, never merged.
-pub const SummaryCertificate = struct { field: []const u8, invariants: []const []const u8 = &.{} };
+pub const SummaryCertificate = struct {
+    field: []const u8,
+    invariants: []const []const u8 = &.{},
+    /// All observed non-invariant columns must be affine in one shared private
+    /// marginal. This is a consumer obligation, independently checked by the
+    /// graph producer; it never asserts that arbitrary columns are correlated.
+    joint: bool = false,
+};
 pub const AggregateWeight = struct { fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null, invariants: []const []const u8 = &.{}, summaries: []const SummaryCertificate = &.{} };
 /// Borrowed snapshot-local costing evidence. Providers never perform I/O for
 /// optimizer statistics; absent fields remain unknown. Frequencies and hashes

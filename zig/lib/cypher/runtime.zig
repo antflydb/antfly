@@ -164,6 +164,11 @@ pub const NodeCursor = struct {
     /// Certify a marginal-statistic consumer. Other columns, predicates and
     /// path dimensions must not observe the selected length distribution.
     pub fn planSummaryFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity, field: []const u8, invariants: []const []const u8) !?WeightPlan {
+        return self.planSummaryFieldsJoint(fields, multiplicity, field, invariants, false);
+    }
+    /// Joint certificates permit several affine projections of the same private
+    /// marginal. Invariant observers still cannot read that marginal.
+    pub fn planSummaryFieldsJoint(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity, field: []const u8, invariants: []const []const u8, joint: bool) !?WeightPlan {
         // Endpoint integer columns also receive affine certificates. Reject
         // them before constructing a reduction plan: long fixed-hop patterns
         // otherwise pay for (and retain) the same geometry twice per reducer.
@@ -193,7 +198,12 @@ pub const NodeCursor = struct {
                 const form = self.engine.momentArgument(item.expression, names) orelse return null;
                 if (form.field == null) return null;
                 found = true;
-            } else if (path_summaries.references(item.expression, target)) return null;
+            } else if (path_summaries.references(item.expression, target)) {
+                if (!joint) return null;
+                var names: Engine.MomentNames = .empty;
+                try names.put(self.engine.a, target, .{ .scalar = Engine.Affine.column(0) });
+                if (self.engine.momentArgument(item.expression, names) == null) return null;
+            }
             for (invariants) |invariant| if (std.mem.eql(u8, invariant, name) and path_summaries.references(item.expression, target)) return null;
         }
         if (!found or path_summaries.references(.{ plan.projection.predicate, self.original_match.predicate }, target)) return null;
@@ -4587,21 +4597,36 @@ const Engine = struct {
             .project => |p| names = (try self.momentProjection(p.value, names)) orelse return null,
             .unwind => |u| {
                 var form: ?Affine = null;
-                if (referencesAny(u.expression, names)) {
-                    const items = if (u.expression.value == .list) u.expression.value.list else &.{u.expression};
-                    for (items) |item| {
-                        const candidate = self.momentArgument(item, names) orelse return null;
-                        try self.retainMomentChecks(item, names);
+                var entity: ?[]const u8 = null;
+                var proven = true;
+                const items = if (u.expression.value == .list) u.expression.value.list else &.{u.expression};
+                for (items) |item| {
+                    if (self.momentArgument(item, names)) |candidate| {
+                        if (entity != null) {
+                            proven = false;
+                            break;
+                        }
                         if (form) |prior| {
                             if (prior.symbolic or candidate.symbolic or prior.field != candidate.field or prior.scale != candidate.scale or prior.offset != candidate.offset) {
                                 form = Affine.choice(prior, candidate) orelse return null;
                                 self.moment_representatives = true;
                             }
                         } else form = candidate;
+                    } else if (self.momentEntity(item, names)) |origin| {
+                        if (form != null or (entity != null and !std.mem.eql(u8, entity.?, origin))) {
+                            proven = false;
+                            break;
+                        }
+                        entity = origin;
+                    } else {
+                        proven = false;
+                        break;
                     }
                 }
+                if (!proven and referencesAny(u.expression, names)) return null;
+                if (proven) for (items) |item| try self.retainMomentChecks(item, names);
                 names = try names.clone(self.a);
-                try names.put(self.a, u.alias, if (form) |value| .{ .scalar = value } else .blocked);
+                try names.put(self.a, u.alias, if (!proven) .blocked else if (form) |value| .{ .scalar = value } else if (entity) |origin| .{ .entity = origin } else .blocked);
             },
             .subquery => |inner| {
                 if (inner.len == 0 or inner[inner.len - 1].operation != .project or !inner[inner.len - 1].operation.project.final) return null;

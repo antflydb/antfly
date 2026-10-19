@@ -3035,3 +3035,31 @@ test "endpoint aliases and range certificates release failed allocations" {
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }
+
+test "length guards cross only total conjunctions and transparent projections" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=1 AND true AND a.id='a' RETURN count(*)", "[[2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n WITH n AS hops WHERE hops>=1 AND true RETURN count(*)", "[[2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n,1 AS k WHERE n>=2 RETURN count(*)", "[[0]]");
+    try check("OPTIONAL MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n WHERE n>=2 RETURN count(*)", "[[0]]");
+    try check("OPTIONAL MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=2 RETURN count(*)", "[[1]]");
+    for ([_][]const u8{
+        "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=1 AND 1/length(p)>0 RETURN count(*)",
+        "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n,1/length(p) AS x WHERE n>=1 RETURN count(*)",
+        "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n WHERE n>=1 AND 1/n>0 RETURN count(*)",
+    }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "UNWIND preserves endpoint lineage multiplicity and opaque shadows" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND length(p) AS n RETURN min(n),max(n),sum(n)", "[[0,1,2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND [b,b] AS x RETURN min(length(p)+x.rank),max(length(p)+x.rank),sum(length(p)+x.rank),count(*)", "[[1,3,14,6]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND [b.rank,b.rank+1] AS x RETURN min(length(p)+x),max(length(p)+x),sum(length(p)+x)", "[[1,4,17]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND [b] AS x UNWIND [x] AS y RETURN min(length(p)+y.rank),max(length(p)+y.rank)", "[[1,3]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND [b.id] AS x RETURN min(length(p)+x),max(length(p)+x)", "[[\"0a\",\"1b\"]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) UNWIND [b,b] AS x WITH length(p) AS n,{rank:'x'} AS x RETURN min(n+x.rank),max(n+x.rank)", "[[\"0x\",\"1x\"]]");
+}

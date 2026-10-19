@@ -59,15 +59,18 @@ pub const Plan = struct {
         for (input, result) |certificate, *out| {
             const stable = try a.alloc([]const u8, certificate.invariants.len);
             for (certificate.invariants, stable) |field, *owned| owned.* = try a.dupe(u8, field);
-            out.* = .{ .field = try a.dupe(u8, certificate.field), .invariants = stable };
+            out.* = .{ .field = try a.dupe(u8, certificate.field), .invariants = stable, .joint = certificate.joint };
         }
         return result;
     }
     fn certificates(a: A, request: catalog.AggregateWeight) ![]const catalog.SummaryCertificate {
-        if (request.summaries.len != 0) return request.summaries;
-        const field = request.summary orelse return &.{};
-        const result = try a.alloc(catalog.SummaryCertificate, 1);
-        result[0] = .{ .field = field, .invariants = request.invariants };
+        const field = request.summary orelse return request.summaries;
+        // A joint proof must not hide a legacy single-input alternative. A
+        // projection may be affine in one varying input times an invariant,
+        // while its all-input shared-marginal proof correctly declines.
+        const result = try a.alloc(catalog.SummaryCertificate, request.summaries.len + 1);
+        @memcpy(result[0..request.summaries.len], request.summaries);
+        result[request.summaries.len] = .{ .field = field, .invariants = request.invariants };
         return result;
     }
     fn projectionInputs(a: A, fields: *Names, node: *const binding.Node, ordinal: usize) !void {
@@ -84,6 +87,22 @@ pub const Plan = struct {
         const bound = query.binding.scalars;
         var result: std.ArrayList(catalog.SummaryCertificate) = .empty;
         for (try certificates(a, request)) |certificate| {
+            if (certificate.joint) {
+                var stable: Names = .empty;
+                if (bound.predicate) |predicate| try programFields(a, &stable, predicate, bound.columns);
+                for (certificate.invariants) |field| try projectionInputs(a, &stable, node, columnIndex(node, field) orelse return error.InvalidSqlBackendResponse);
+                var inputs: Names = .empty;
+                for (node.columns, 0..) |column, ordinal| {
+                    if (!wanted.contains(column.internal)) continue;
+                    try projectionInputs(a, &inputs, node, ordinal);
+                    if (ordinal < bound.projections.len) if (bound.projections[ordinal]) |program| {
+                        if (!program.affineTogether()) try programFields(a, &stable, program, bound.columns);
+                    };
+                }
+                var input_keys = inputs.keyIterator();
+                if (inputs.count() != 0 and result.items.len < 256) try result.append(a, .{ .field = input_keys.next().?.*, .invariants = try names(a, stable), .joint = true });
+                continue;
+            }
             const target = columnIndex(node, certificate.field) orelse continue;
             const program = if (target < bound.projections.len) bound.projections[target] else null;
             if (query.binding.columns[target].type != .integer) continue;
@@ -288,7 +307,7 @@ pub const Plan = struct {
             for (request.summaries, summaries) |certificate, *mapped_certificate| {
                 const stable = try a.alloc([]const u8, certificate.invariants.len);
                 for (certificate.invariants, stable) |field, *name| name.* = node.operation.scan.source_columns[columnIndex(node, field) orelse return null];
-                mapped_certificate.* = .{ .field = node.operation.scan.source_columns[columnIndex(node, certificate.field) orelse return null], .invariants = stable };
+                mapped_certificate.* = .{ .field = node.operation.scan.source_columns[columnIndex(node, certificate.field) orelse return null], .invariants = stable, .joint = certificate.joint };
             }
             out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| node.operation.scan.source_columns[columnIndex(node, name) orelse return null] else null, .invariants = invariants, .summaries = summaries };
         }
@@ -311,7 +330,7 @@ pub const Plan = struct {
             for (request.summaries, summaries) |certificate, *mapped_certificate| {
                 const stable = try a.alloc([]const u8, certificate.invariants.len);
                 for (certificate.invariants, stable) |field, *name| name.* = nested.columns[columnIndex(parent, field) orelse return error.InvalidSqlBackendResponse].internal;
-                mapped_certificate.* = .{ .field = nested.columns[columnIndex(parent, certificate.field) orelse return error.InvalidSqlBackendResponse].internal, .invariants = stable };
+                mapped_certificate.* = .{ .field = nested.columns[columnIndex(parent, certificate.field) orelse return error.InvalidSqlBackendResponse].internal, .invariants = stable, .joint = certificate.joint };
             }
             out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| nested.columns[columnIndex(parent, name) orelse return error.InvalidSqlBackendResponse].internal else null, .invariants = invariants, .summaries = summaries };
         }

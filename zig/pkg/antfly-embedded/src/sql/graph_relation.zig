@@ -365,7 +365,9 @@ pub const Cursor = struct {
             const multiplicity = request.multiplicity;
             const summary_plan = selected: {
                 for (request.summaries) |certificate| {
-                    if (try stream.planSummaryFields(request.fields, multiplicity, certificate.field, certificate.invariants)) |plan| break :selected plan;
+                    if (certificate.joint) {
+                        for (request.fields) |field| if (try stream.planSummaryFieldsJoint(request.fields, multiplicity, field, certificate.invariants, true)) |plan| break :selected plan;
+                    } else if (try stream.planSummaryFields(request.fields, multiplicity, certificate.field, certificate.invariants)) |plan| break :selected plan;
                 }
                 if (request.summary) |field| break :selected try stream.planSummaryFields(request.fields, multiplicity, field, request.invariants);
                 break :selected @as(?cypher.runtime.NodeCursor.WeightPlan, null);

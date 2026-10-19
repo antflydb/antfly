@@ -381,6 +381,12 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
             (spec.kind == .count or spec.kind == .sum or spec.kind == .avg or spec.kind == .min or spec.kind == .max))
         {
             if (input) |slot| if (bound.input.projections[slot]) |program| {
+                if (program.required_columns.len != 0 and program.affineTogether()) {
+                    var stable_fields: std.ArrayList([]const u8) = .empty;
+                    var stable_inputs = invariant.keyIterator();
+                    while (stable_inputs.next()) |key| try stable_fields.append(a, key.*);
+                    try summaries.append(a, .{ .field = (try table.column(bound.input.columns[program.required_columns[0]].name)).path, .invariants = stable_fields.items, .joint = true });
+                }
                 if (program.affineColumn()) |column| {
                     summary = (try table.column(bound.input.columns[column].name)).path;
                 } else if (program.required_columns.len <= 256) {
