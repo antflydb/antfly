@@ -1169,6 +1169,21 @@ pub const Membership = struct {
         return index;
     }
 
+    /// The frame registry admits and owns this immutable source before it
+    /// publishes the capability. Resolve it through that owner rather than
+    /// accepting arbitrary Values or treating footprint metadata as proof.
+    /// The frame must outlive the index; allocation and cancellation remain
+    /// independently bounded by this construction's budget.
+    pub fn initFrameOwnedWithBudget(backing: Allocator, source: *const @import("parameter_frame.zig").Frame.ArraySource, index_bytes: usize, work: *Budget) !Membership {
+        try work.consume(1);
+        try work.poll();
+        const value = source.borrowValidated();
+        var index = try initValidated(backing, value, .{ .bytes = index_bytes });
+        errdefer index.deinit();
+        try index.populate(work);
+        return index;
+    }
+
     fn initValidated(backing: Allocator, value: Value, limits: Limits) !Membership {
         const budget = try backing.create(MemoryBudget);
         errdefer backing.destroy(budget);
@@ -1191,9 +1206,11 @@ pub const Membership = struct {
         // Five bytes per bucket, with the geometric sequence of allocations
         // totaling less than twice the final capacity in a monotonic region.
         const table_bytes = std.math.mul(usize, capacity, 10) catch return &.{};
-        const count: usize = @min(n, 8192);
-        const bytes = count * @sizeOf(u64);
-        if (table_bytes > available or bytes > available - table_bytes or bytes > available / 16) return &.{};
+        if (table_bytes >= available) return &.{};
+        // Use the affordable prefix, rather than dropping the entire memo
+        // when a few bytes are missing from the preferred prefix allowance.
+        const count: usize = @min(n, 8192, available / 16 / @sizeOf(u64), (available - table_bytes) / @sizeOf(u64));
+        if (count < 32) return &.{};
         return scratch.alloc(u64, count) catch |err| return allocationError(index.budget, err);
     }
 
@@ -2161,4 +2178,46 @@ test "SQL membership construction bounds native hash prefixes and region ownersh
         try std.testing.expect(parent.footprint() < parent.limit);
     }
     try std.testing.expectEqual(@as(usize, 0), parent.live);
+}
+
+test "SQL membership construction adapts hash prefixes to tight headroom" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const n = 1024;
+    const cells = try arena.allocator().alloc(Element, n);
+    for (cells, 0..) |*cell, i| {
+        const payload = try arena.allocator().alloc(u8, 256);
+        @memset(payload, 'a');
+        _ = try std.fmt.bufPrint(payload[0..8], "{d:0>8}", .{i});
+        cell.* = .json(.{ .string = payload });
+    }
+    const source = try Value.init(.jsonb, &.{.{ .length = n }}, cells, .{ .work = 64 * 1024 * 1024 });
+    var construction: [3]usize = undefined;
+    var peaks: [3]usize = undefined;
+    for ([_]usize{ 64 * 1024, 128 * 1024, 128 * 1024 + 80 }, 0..) |bytes, mode| {
+        var work: Budget = .{ .remaining = 1024 * 1024 };
+        var index = try Membership.initBorrowedWithBudget(a, source, .{}, bytes, &work);
+        defer index.deinit();
+        construction[mode] = 1024 * 1024 - work.remaining;
+        peaks[mode] = index.budget.peak;
+        try std.testing.expectEqual(@as(usize, n), index.count);
+        try std.testing.expectEqual(@as(usize, 10240), index.budget.live);
+        try std.testing.expect(index.budget.peak <= bytes);
+        try std.testing.expectEqual(@as(?i32, n), try index.firstPosition(cells[n - 1], &work));
+        std.debug.print("SQL_HASH_HEADROOM bytes={} work={} peak={} retained={}\n", .{ bytes, construction[mode], peaks[mode], index.budget.live });
+    }
+    // One byte less than the preferred allowance retains a smaller prefix;
+    // the previous implementation rejected the complete memo at 128 KiB.
+    try std.testing.expect(construction[0] > construction[1]);
+    try std.testing.expectEqual(construction[1], construction[2]);
+    try std.testing.expectEqual(@as(usize, 23544), peaks[1]);
+    try std.testing.expectEqual(@as(usize, 23552), peaks[2]);
+    // There is still a scratch-free path when conservative table headroom
+    // cannot also admit a useful hash prefix.
+    var work: Budget = .{ .remaining = 64 * 1024 * 1024 };
+    var tight = try Membership.initBorrowedWithBudget(a, source, .{}, 20 * 1024, &work);
+    defer tight.deinit();
+    try std.testing.expectEqual(@as(usize, 15360), tight.budget.peak);
+    try std.testing.expectEqual(@as(usize, n), tight.count);
 }

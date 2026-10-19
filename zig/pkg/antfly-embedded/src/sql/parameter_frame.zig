@@ -491,11 +491,13 @@ const MembershipCache = struct {
     backing: A,
     memory: MemoryBudget,
     slots: []Slot,
-    source_limits: arrays.Limits,
+    /// Only admission-complete frame storage is registered here. The cache,
+    /// values and payload lease share one execution lifetime.
+    values: []const scalar.Datum,
     remaining: usize,
     mutex: std.atomic.Mutex = .unlocked,
 
-    fn init(backing: A, values: []const scalar.Datum, source_limits: arrays.Limits, work: usize) !?*MembershipCache {
+    fn init(backing: A, values: []const scalar.Datum, work: usize) !?*MembershipCache {
         for (values) |value| {
             if (value.array) |array| if (array.cardinality() >= 32 and array.element_type != .numeric) break;
         } else return null;
@@ -517,10 +519,18 @@ const MembershipCache = struct {
                     slot.build_work = @max(slot.build_work, (try array.retainedBytes()) *| 2);
             }
         }
-        self.* = .{ .backing = backing, .memory = .{ .backing = backing, .limit = @min(2 * 1024 * 1024, available / 4) }, .slots = slots, .source_limits = source_limits, .remaining = @min(work, 1024 * 1024) };
+        self.* = .{ .backing = backing, .memory = .{ .backing = backing, .limit = @min(2 * 1024 * 1024, available / 4) }, .slots = slots, .values = values, .remaining = @min(work, 1024 * 1024) };
         return self;
     }
-    fn get(self: *MembershipCache, ordinal: usize, array: *const arrays.Value, caller: *arrays.Budget) !?*const arrays.Membership {
+    /// Only this admission-complete registry mints array capabilities. The
+    /// opaque pointer needs no additional object or per-element metadata.
+    fn arraySource(self: *const MembershipCache, ordinal: usize) ?*const Frame.ArraySource {
+        if (ordinal >= self.values.len) return null;
+        const value = self.values[ordinal].array orelse return null;
+        return @ptrCast(value);
+    }
+
+    fn get(self: *MembershipCache, ordinal: usize, caller: *arrays.Budget) !?*const arrays.Membership {
         if (ordinal >= self.slots.len) return null;
         const slot = &self.slots[ordinal];
         switch (slot.state.load(.acquire)) {
@@ -562,7 +572,7 @@ const MembershipCache = struct {
             return err;
         };
         errdefer self.memory.allocator().destroy(index);
-        index.* = arrays.Membership.initBorrowedWithBudget(self.memory.allocator(), array.*, self.source_limits, available - @sizeOf(arrays.Membership) - @sizeOf(MemoryBudget), &work_budget) catch |err| {
+        index.* = arrays.Membership.initFrameOwnedWithBudget(self.memory.allocator(), self.arraySource(ordinal).?, available - @sizeOf(arrays.Membership) - @sizeOf(MemoryBudget), &work_budget) catch |err| {
             if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and self.memory.isExhausted())) {
                 self.memory.allocator().destroy(index);
                 slot.state.store(1, .release);
@@ -651,16 +661,30 @@ pub const Frame = struct {
         self.* = undefined;
     }
 
+    /// Opaque capability minted only from admission-complete frame storage.
+    /// The immutable frame and payload lease must outlive the capability and
+    /// any index borrowing it. Casting arbitrary Values to this type violates
+    /// the contract; callers must retain ordinary ingress validation.
+    pub const ArraySource = opaque {
+        pub fn borrowValidated(self: *const ArraySource) arrays.Value {
+            const value: *const arrays.Value = @ptrCast(@alignCast(self));
+            return value.*;
+        }
+    };
+
     /// Borrows stable execution storage, never the movable Frame wrapper.
     pub const Lookup = struct {
         cache: ?*MembershipCache = null,
-        values: []const scalar.Datum = &.{},
         pub fn equalAny(self: Lookup, ordinal: usize, array: *const arrays.Value, values: []const scalar.Datum, element: arrays.Element, work: *arrays.Budget) !?bool {
-            // A copied evaluator can replace its public parameter slice. Do
-            // not consult an older frame's cache after such a rebind.
-            const owner_matches = values.ptr == self.values.ptr and values.len == self.values.len and ordinal < values.len and values[ordinal].array == array;
-            const cache = if (owner_matches and !element.sql_null) self.cache else null;
-            if (cache) |owner| if (try owner.get(ordinal, array, work)) |index| return index.equalAny(element, work);
+            // The cache registry is the sole binding authority. A copied
+            // evaluator with replaced parameters keeps its scan path without
+            // consulting or warming the original frame's indexes.
+            const cache: ?*MembershipCache = if (!element.sql_null) bound: {
+                const owner = self.cache orelse break :bound null;
+                if (values.ptr != owner.values.ptr or values.len != owner.values.len or ordinal >= values.len or values[ordinal].array != array) break :bound null;
+                break :bound owner;
+            } else null;
+            if (cache) |owner| if (try owner.get(ordinal, work)) |index| return index.equalAny(element, work);
             const before = work.remaining;
             const observed = try array.quantifiedObserved(element, .eq, .any, work);
             if (cache) |owner| owner.observe(ordinal, before -| work.remaining, observed.visited);
@@ -668,7 +692,7 @@ pub const Frame = struct {
         }
     };
     pub fn lookup(self: *const Frame) Lookup {
-        return .{ .cache = self.memberships, .values = self.values };
+        return .{ .cache = self.memberships };
     }
     pub fn equalAny(self: *const Frame, ordinal: usize, array: *const arrays.Value, element: arrays.Element, work: *arrays.Budget) !?bool {
         return self.lookup().equalAny(ordinal, array, self.values, element, work);
@@ -690,7 +714,7 @@ pub const Frame = struct {
         arena.* = std.heap.ArenaAllocator.init(budget.allocator());
         errdefer arena.deinit();
         const decoded = prepareLeaky(arena.allocator(), descriptors, inputs, limits) catch |err| return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
-        const memberships = try MembershipCache.init(MemoryBudget.reclaimingAllocator(budget.allocator()), decoded.values, .{ .bytes = limits.bytes, .elements = limits.elements }, limits.work -| decoded.work);
+        const memberships = try MembershipCache.init(MemoryBudget.reclaimingAllocator(budget.allocator()), decoded.values, limits.work -| decoded.work);
         if (limits.payload_owner) |owner| owner.retain();
         return .{ .memberships = memberships, .payload_owner = limits.payload_owner, .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
     }
@@ -747,10 +771,12 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             const value = input.datum;
             const array = value.array orelse return error.SqlTypeMismatch;
             if (array.element_type != kind) return error.ConflictingSqlParameterTypes;
-            if (value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
-            _ = try array.validateWithBudget(.{ .bytes = limits.bytes, .elements = limits.elements }, work);
+            if (value.patterns != null or value.numeric != null or value.value != .null) return error.SqlTypeMismatch;
+            const admitted = try array.validateWithBudget(.{ .bytes = limits.bytes, .elements = limits.elements }, work);
             if (array.stored != null and limits.payload_owner != null) return value;
-            return operators.cloneDatum(a, value);
+            // Clone the admitted header so caller-provided sizing metadata is
+            // refreshed by the existing validation walk before publication.
+            return operators.cloneDatum(a, .typedArray(&admitted));
         }
         const value = try a.create(arrays.Value);
         const value_limits: arrays.Limits = .{ .bytes = limits.bytes, .elements = limits.elements, .work = work.remaining };
@@ -1231,4 +1257,154 @@ test "SQL prepared equality recent admission adapts after long cheap phases and 
         try std.testing.expect(cache.slots[0].build_credit <= cache.slots[0].build_work);
         std.debug.print("SQL_RECENT_ANY antecedent_cheap_rows={} prefix_cells={} timed_rows=2048 first_index_row={} index_live={} elapsed_ns={} row_allocations=0\n", .{ if (phase == 1) @as(usize, 65536) else @as(usize, 0), needle + 1, first_index_row.?, cache.memory.live, elapsed });
     };
+}
+
+test "SQL frame array capabilities reuse admitted JSONB and survive owner moves" {
+    const a = std.testing.allocator;
+    const n = 1024;
+    var frame = admitted: {
+        var input = std.heap.ArenaAllocator.init(a);
+        defer input.deinit();
+        const cells = try input.allocator().alloc(scalar.Datum, n);
+        for (cells, 0..) |*cell, i| {
+            const payload = try input.allocator().alloc(u8, 256);
+            @memset(payload, 'a');
+            _ = try std.fmt.bufPrint(payload[0..8], "{d:0>8}", .{i});
+            cell.* = .json(.{ .string = payload });
+        }
+        const source = try arrays.Value.init(.jsonb, &.{.{ .length = n }}, cells, .{});
+        break :admitted try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&source) }}, .{});
+    };
+    const capability = frame.memberships.?.arraySource(0).?;
+    var moved = frame;
+    frame = undefined;
+    defer moved.deinit();
+    const owned = moved.values[0].array.?;
+    var spent: [2]usize = undefined;
+    for (0..2) |mode| {
+        var elapsed: i96 = 0;
+        var peak: usize = 0;
+        for (0..20) |_| {
+            var work: arrays.Budget = .{ .remaining = 1024 * 1024 };
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            var index = if (mode == 0)
+                try arrays.Membership.initBorrowedWithBudget(a, owned.*, .{}, 128 * 1024, &work)
+            else
+                try arrays.Membership.initFrameOwnedWithBudget(a, capability, 128 * 1024, &work);
+            defer index.deinit();
+            elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+            spent[mode] = 1024 * 1024 - work.remaining;
+            peak = @max(peak, index.budget.peak);
+            try std.testing.expectEqual(@as(usize, n), index.count);
+            try std.testing.expectEqual(@as(?i32, n), try index.firstPosition(owned.flatCell(n - 1), &work));
+            try std.testing.expectEqual(@as(usize, 10240), index.budget.live);
+        }
+        std.debug.print("SQL_FRAME_SOURCE owned={} cells={} repetitions=20 work={} peak={} elapsed_ns={}\n", .{ mode == 1, n, spent[mode], peak, elapsed });
+    }
+    var validation: arrays.Budget = .{ .remaining = 1024 * 1024 };
+    _ = try owned.validateWithBudget(.{}, &validation);
+    try std.testing.expectEqual(spent[0] - (1024 * 1024 - validation.remaining) + 1, spent[1]);
+    // Only the authenticated owner path fits this construction allowance.
+    var limited: arrays.Budget = .{ .remaining = spent[1] };
+    var index = try arrays.Membership.initFrameOwnedWithBudget(a, capability, 128 * 1024, &limited);
+    defer index.deinit();
+    try std.testing.expectEqual(@as(usize, 0), limited.remaining);
+    limited.remaining = spent[1];
+    try std.testing.expectError(error.SqlProgramLimitExceeded, arrays.Membership.initBorrowedWithBudget(a, owned.*, .{}, 128 * 1024, &limited));
+    var denied: arrays.Budget = .{ .remaining = 0 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, arrays.Membership.initFrameOwnedWithBudget(std.testing.failing_allocator, capability, 128 * 1024, &denied));
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check };
+    var interrupted: arrays.Budget = .{ .shared = &context };
+    try std.testing.expectError(error.Canceled, arrays.Membership.initFrameOwnedWithBudget(std.testing.failing_allocator, capability, 128 * 1024, &interrupted));
+    try std.testing.expectError(error.Canceled, interrupted.consume(0));
+
+    // Exercise complete prepared JSONB evaluation and automatic admission.
+    // Numeric probes remain logical JSON without text conversion scratch.
+    const mixed_cells = try a.dupe(scalar.Datum, owned.elements);
+    defer a.free(mixed_cells);
+    mixed_cells[n - 1] = .json(.{ .integer = 42 });
+    const mixed = try arrays.Value.init(.jsonb, &.{.{ .length = n }}, mixed_cells, .{});
+    var evaluation = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&mixed) }}, .{});
+    defer evaluation.deinit();
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .json, .element_type = .jsonb }}, &.{.{ .kind = .array, .element_type = .jsonb }}, .{});
+    defer program.deinit();
+    const prepared = try program.bindParameters(&evaluation);
+    for (0..1000) |i| {
+        const needle: scalar.Datum = .json(.{ .integer = if (i % 2 == 0) 42 else -1 });
+        try std.testing.expectEqual(i % 2 == 0, (try prepared.evaluate(std.testing.failing_allocator, &.{needle}, .{})).value.bool);
+    }
+    try std.testing.expectEqual(@as(u8, 2), evaluation.memberships.?.slots[0].state.load(.acquire));
+    try std.testing.expect(evaluation.memberships.?.remaining < 1024 * 1024);
+}
+
+test "SQL frame array capabilities preserve ingress admission and allocation faults" {
+    const a = std.testing.allocator;
+    var payloads: [64][256]u8 = undefined;
+    var cells: [64]scalar.Datum = undefined;
+    for (&payloads, &cells, 0..) |*payload, *cell, i| {
+        @memset(payload, 'a');
+        _ = try std.fmt.bufPrint(payload[0..8], "{d:0>8}", .{i});
+        cell.* = .json(.{ .string = payload });
+    }
+    const source = try arrays.Value.init(.jsonb, &.{.{ .length = cells.len }}, &cells, .{});
+    const Fixture = struct {
+        fn run(backing: A, value: *const arrays.Value) !void {
+            var frame = try Frame.prepare(backing, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(value) }}, .{});
+            defer frame.deinit();
+            var work: arrays.Budget = .{};
+            var index = try arrays.Membership.initFrameOwnedWithBudget(backing, frame.memberships.?.arraySource(0).?, 128 * 1024, &work);
+            defer index.deinit();
+            try std.testing.expectEqual(@as(usize, 64), index.count);
+            try std.testing.expectEqual(@as(?bool, true), try index.equalAny(frame.values[0].array.?.flatCell(63), &work));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{&source});
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&source) }}, .{ .elements = 63 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&source) }}, .{ .work = 100 }));
+    var stale = source;
+    stale.prepared_footprint = 1;
+    var refreshed = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&stale) }}, .{});
+    defer refreshed.deinit();
+    try std.testing.expectEqual(source.prepared_footprint, refreshed.values[0].array.?.prepared_footprint);
+    var zero: @import("numeric_value.zig").Value = .{};
+    var malformed = scalar.Datum.typedArray(&source);
+    malformed.numeric = &zero;
+    try std.testing.expectError(error.SqlTypeMismatch, Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = malformed }}, .{}));
+    cells[63] = .json(.{ .string = "\xff" });
+    try std.testing.expectError(error.SqlInvalidTextEncoding, Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&source) }}, .{}));
+    var work: arrays.Budget = .{};
+    try std.testing.expectError(error.SqlInvalidTextEncoding, arrays.Membership.initBorrowedWithBudget(a, source, .{}, 128 * 1024, &work));
+}
+
+test "SQL frame array capabilities cannot cross rebound parameter registries" {
+    const a = std.testing.allocator;
+    var cells: [64]scalar.Datum = undefined;
+    var other_cells: [64]scalar.Datum = undefined;
+    for (&cells, &other_cells, 0..) |*cell, *other, i| {
+        cell.* = .json(.{ .integer = @intCast(i) });
+        other.* = .json(.{ .integer = @as(i64, @intCast(i)) + 100 });
+    }
+    const source = try arrays.Value.init(.int64, &.{.{ .length = cells.len }}, &cells, .{});
+    const other = try arrays.Value.init(.int64, &.{.{ .length = other_cells.len }}, &other_cells, .{});
+    var first = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(&source) }}, .{});
+    defer first.deinit();
+    var second = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(&other) }}, .{});
+    defer second.deinit();
+    const rebound = first.lookup();
+    var work: arrays.Budget = .{};
+    for (0..32) |_| try std.testing.expectEqual(@as(?bool, true), try rebound.equalAny(0, second.values[0].array.?, second.values, .json(.{ .integer = 163 }), &work));
+    try std.testing.expectEqual(@as(usize, 0), first.memberships.?.slots[0].recent_scans);
+    try std.testing.expectEqual(@as(usize, 0), first.memberships.?.slots[0].build_credit);
+    for (0..32) |_| _ = try first.equalAny(0, first.values[0].array.?, .json(.{ .integer = 63 }), &work);
+    try std.testing.expect(first.memberships.?.slots[0].index != null);
+    try std.testing.expectEqual(@as(?bool, false), try rebound.equalAny(0, second.values[0].array.?, second.values, .json(.{ .integer = 63 }), &work));
+    try std.testing.expect(first.memberships.?.arraySource(1) == null);
+    std.debug.print("SQL_FRAME_LOOKUP handle_bytes={} registry_bound=true\n", .{@sizeOf(Frame.Lookup)});
 }
