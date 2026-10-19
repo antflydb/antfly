@@ -412,3 +412,52 @@ def test_native_grep_narrow_listing_and_content_projection(stateful_api, tmp_pat
     lexical = run_grep(tmp_path, stateful_api.url, table, "needle")
     assert lexical.returncode == 0, lexical.stderr.decode()
     assert b"FIRST" in lexical.stdout and b"SECRET" not in lexical.stdout
+
+
+def test_native_grep_json_projects_versioned_contract(stateful_api, tmp_path):
+    table = f"grep_json_projection_{time.time_ns()}"
+    stateful_api.create_table(table)
+    item = document("source.py", "needle FIRST\n")
+    item["grep"].update(
+        metadata={"owner": "雪"},
+        regions=[{"start_line": 1, "end_line": 1}],
+        unrelated_blob="x" * 262144,
+    )
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_text")
+    config = tmp_path / "json-projection.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "endpoint": stateful_api.url,
+                "page_size": 1,
+                "max_response_bytes": 8192,
+                "tables": [{"name": table}],
+            }
+        )
+    )
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("ANTFLY_GREP_", "RIPGREP_"))
+    }
+    env.update(HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path))
+    result = subprocess.run(
+        [
+            grep_binary(),
+            "--no-config",
+            "--table-config",
+            str(config),
+            "--json",
+            "needle",
+        ],
+        env=env,
+        capture_output=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    rows = [json.loads(line) for line in result.stdout.splitlines()]
+    match = next(row for row in rows if row["type"] == "match")
+    assert match["source"]["metadata"] == item["grep"]["metadata"]
+    assert match["source"]["source_regions"] == item["grep"]["regions"]
+    assert rows[-1]["stats"]["complete"]

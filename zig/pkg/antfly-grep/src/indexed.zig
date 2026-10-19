@@ -247,24 +247,48 @@ const Fetch = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.job = request;
+        self.failure = null;
         self.complete = false;
         self.ready.signal(self.io);
     }
     fn take(self: *Fetch) !*Page {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        while (!self.complete) self.ready.waitUncancelable(self.io, &self.mutex);
+        while (!self.complete) {
+            if (self.stopped()) return error.Canceled;
+            try self.wait();
+        }
+        if (self.stopped()) return error.Canceled;
         if (self.failure) |err| return err;
         const result = self.result.?;
         self.result = null;
         return result;
     }
+    // Signals keep successful handoffs immediate. Timeouts only observe the
+    // signal handler's atomic cancellation, which cannot signal a condition.
+    fn wait(self: *Fetch) !void {
+        self.ready.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => {},
+            else => return err,
+        };
+    }
+    fn stopPending(self: *Fetch, err: anyerror) void {
+        self.job = null;
+        self.failure = err;
+        self.complete = true;
+        self.ready.broadcast(self.io);
+    }
     fn worker(self: *Fetch) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         while (true) {
+            // Idle producers need no periodic wakeups: take() observes
+            // atomic cancellation and finish() signals and joins this worker.
             while (self.job == null and !self.stopped()) self.ready.waitUncancelable(self.io, &self.mutex);
-            if (self.stopped()) return;
+            if (self.stopped()) {
+                self.stopPending(error.Canceled);
+                return;
+            }
             const request = self.job.?;
             self.job = null;
             self.mutex.unlock(self.io);
@@ -419,10 +443,58 @@ fn metadataListing(o: *const @import("options.zig").Options) bool {
     return o.files and !o.json and !o.stats and o.max_file_bytes == std.math.maxInt(usize) and !o.skip_oversize;
 }
 fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []const u8) ![]const []const u8 {
-    if (o.json or o.ask != null or o.stats) return a.dupe([]const u8, &.{field});
+    // Project the complete v1 contract, not arbitrary sibling payloads. Keep
+    // all logical input/validation/provenance fields for JSON and decision
+    // workflows; candidate pruning cannot preserve their scan totals today.
     var fields: std.ArrayList([]const u8) = .empty;
     for ([_][]const u8{ "version", "path", "uri", "revision", "indexed_at", "permissions", "modified_at", "created_at", "accessed_at" }) |suffix|
         try fields.append(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ field, suffix }));
     if (!metadataListing(o)) try fields.append(a, try std.fmt.allocPrint(a, "{s}.content", .{field}));
+    if (o.json or o.ask != null or o.stats) for ([_][]const u8{ "metadata", "regions" }) |suffix| {
+        try fields.append(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ field, suffix }));
+    };
     return fields.toOwnedSlice(a);
+}
+
+// Unused transport fields remain undefined: pre-cancelled workers must never
+// touch transport, allocator or request storage.
+fn canceledFixture(limits: *Limits) Fetch {
+    return .{ .a = std.testing.allocator, .io = std.testing.io, .options = undefined, .limits = limits, .config = undefined, .url = undefined, .document_field = undefined, .filter = null, .fields = &.{}, .http = undefined };
+}
+test "prefetch cancellation before dequeue publishes terminal completion" {
+    var limits: Limits = .{};
+    var fetch = canceledFixture(&limits);
+    fetch.submit(.{ .cursor = null, .snapshot = null, .page_size = 1 });
+    limits.cancel.store(true, .release);
+    fetch.thread = try std.Thread.spawn(.{}, Fetch.worker, .{&fetch});
+    fetch.thread.?.join();
+    fetch.thread = null;
+    defer fetch.finish();
+    try std.testing.expect(fetch.complete and fetch.job == null);
+    try std.testing.expectError(error.Canceled, fetch.take());
+}
+test "prefetch take observes atomic cancellation without a worker signal" {
+    var limits: Limits = .{};
+    var fetch = canceledFixture(&limits);
+    const Cancel = struct {
+        fn run(value: *Limits) void {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+            value.cancel.store(true, .release);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Cancel.run, .{&limits});
+    defer thread.join();
+    try std.testing.expectError(error.Canceled, fetch.take());
+}
+test "prefetch completion preserves errors and transfers page ownership" {
+    var limits: Limits = .{};
+    var fetch = canceledFixture(&limits);
+    fetch.complete = true;
+    fetch.failure = error.IndexQueryFailed;
+    try std.testing.expectError(error.IndexQueryFailed, fetch.take());
+    fetch.failure = null;
+    var page: Page = undefined;
+    fetch.result = &page;
+    try std.testing.expect(try fetch.take() == &page);
+    try std.testing.expect(fetch.result == null);
 }

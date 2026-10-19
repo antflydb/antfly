@@ -44,7 +44,7 @@ pub fn Registry(comptime Search: type) type {
             delivery_arena: ?std.heap.ArenaAllocator = null,
             delivery: ?Search.Delivery = null,
             incremental_disabled_revision: ?[64]u8 = null,
-            fn create(a: A, io: std.Io, base: *const Options, args: []const []const u8, compact: bool) !*Plan {
+            fn create(a: A, io: std.Io, base: *const Options, args: []const []const u8, compact: bool, batches: bool) !*Plan {
                 const plan = try a.create(Plan);
                 errdefer a.destroy(plan);
                 plan.* = .{ .a = a, .budget = .{ .backing = a, .limit = plan_limit }, .arena = undefined };
@@ -56,6 +56,8 @@ pub fn Registry(comptime Search: type) type {
                 const owned = try scratch.alloc([]const u8, args.len);
                 for (args, owned) |arg, *dest| dest.* = try scratch.dupe(u8, arg);
                 plan.options = try @import("workspace_options.zig").prepare(scratch, base, owned, compact);
+                if (batches and (!compact or plan.options.ask != null or plan.options.max_output_bytes != std.math.maxInt(usize) or plan.options.line_buffered)) return error.InvalidBatchRegistration;
+                plan.options.json_batches = batches;
                 plan.matcher = try Matcher.initForSearch(plan.budget.allocator(), &plan.options);
                 errdefer plan.matcher.deinit();
                 plan.cwd = try std.process.currentPathAlloc(io, scratch);
@@ -113,10 +115,10 @@ pub fn Registry(comptime Search: type) type {
                 slot.* = null;
             };
         }
-        pub fn register(self: *Self, base: *const Options, args: []const []const u8, compact: bool) !*Plan {
+        pub fn register(self: *Self, base: *const Options, args: []const []const u8, compact: bool, batches: bool) !*Plan {
             // Construct before eviction. Up to one additional bounded plan is
             // live during admission; a failed registration preserves all handles.
-            const plan = try Plan.create(self.a, self.io, base, args, compact);
+            const plan = try Plan.create(self.a, self.io, base, args, compact, batches);
             var victim: usize = 0;
             for (self.slots, 0..) |slot, i| {
                 if (slot == null) {

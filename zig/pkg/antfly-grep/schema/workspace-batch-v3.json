@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "antfly-grep opt-in workspace result batch v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["type", "result_schema_version", "file_id", "events"],
+  "properties": {
+    "type": {"const": "batch"},
+    "result_schema_version": {"const": 3},
+    "file_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["type", "data"],
+        "properties": {"type": {"enum": ["match", "context"]}},
+        "not": {"anyOf": [{"required": ["file_id"]}, {"required": ["source"]}, {"required": ["result_schema_version"]}]}
+      }
+    }
+  },
+  "$comment": "Register with compact=true,batches=true. No changes to CLI v1/v2. Only match/context events for the currently open file are batched, with at most 32768 bytes of encoded event body; first row and oversized rows stream individually. Consumers keep original batch bytes and expand only at materialization. A successful complete summary/workspace_end is required before committing a view. Errors, cancellation and response budgets invalidate the transaction. This is a private workspace protocol, not ripgrep JSON."
+}

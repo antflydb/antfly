@@ -31,30 +31,37 @@ pub const Watch = struct {
     limit: usize = 4096,
     generation: u64 = 0,
     epoch: u64 = 0,
-    events: [4096]u16 = undefined,
+    events: std.ArrayList(usize) = .empty,
     event_count: usize = 0,
-    event_seen: [4096]bool = @splat(false),
     handles: std.AutoHashMapUnmanaged(c_int, usize) = .empty,
     identities: std.AutoHashMapUnmanaged(Identity, usize) = .empty,
-    slots: [4096]Slot = @splat(.{}),
-    occupied: [64]u64 = @splat(0),
-    free_groups: u64 = std.math.maxInt(u64),
+    slots: std.ArrayList(Slot) = .empty,
+    free_head: ?usize = null,
     registration_attempts: usize = 0,
     const Identity = struct { device: u64, inode: u64 };
-    const Slot = struct { handle: c_int = -1, users: usize = 0, dirty: bool = true, generation: u64 = 0, sequence: u64 = 0, device: u64 = 0, inode: u64 = 0, mask: u32 = 0 };
+    const Slot = struct { next_free: ?usize = null, event_seen: bool = false, handle: c_int = -1, users: usize = 0, dirty: bool = true, generation: u64 = 0, sequence: u64 = 0, device: u64 = 0, inode: u64 = 0, mask: u32 = 0 };
     pub fn clearEvents(self: *Watch) void {
+        for (self.events.items) |slot| self.slots.items[slot].event_seen = false;
+        self.events.clearRetainingCapacity();
         self.event_count = 0;
-        @memset(&self.event_seen, false);
     }
     fn note(self: *Watch, i: usize) void {
-        if (!self.event_seen[i]) {
-            self.event_seen[i] = true;
-            self.events[self.event_count] = @intCast(i);
-            self.event_count += 1;
+        if (!self.slots.items[i].event_seen) {
+            self.slots.items[i].event_seen = true;
+            self.events.appendAssumeCapacity(i);
+            self.event_count = self.events.items.len;
         }
     }
     pub fn init() Watch {
         var self: Watch = .{};
+        self.open();
+        return self;
+    }
+    /// Source witnesses grow lazily and retain strict per-inode certification.
+    /// Namespace journals keep their independent 4096-route bound. Never use
+    /// advisory asynchronous events as proof of unchanged source contents.
+    pub fn initSources() Watch {
+        var self: Watch = .{ .limit = 65536 };
         self.open();
         return self;
     }
@@ -71,22 +78,26 @@ pub const Watch = struct {
         } else self.fd = std.c.inotify_init1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
     }
     pub fn deinit(self: *Watch) void {
-        if (comptime !supported) return;
-        for (&self.slots) |*slot| {
+        for (self.slots.items) |*slot| {
             if (comptime builtin.os.tag == .macos) if (slot.handle >= 0) {
                 _ = std.c.close(slot.handle);
             };
             slot.* = .{};
         }
-        if (self.fd >= 0) _ = std.c.close(self.fd);
+        if (comptime supported) if (self.fd >= 0) {
+            _ = std.c.close(self.fd);
+        };
         self.fd = -1;
         self.handles.deinit(std.heap.page_allocator);
         self.handles = .empty;
         self.identities.deinit(std.heap.page_allocator);
         self.identities = .empty;
-        self.clearEvents();
-        @memset(&self.occupied, 0);
-        self.free_groups = std.math.maxInt(u64);
+        self.events.deinit(std.heap.page_allocator);
+        self.events = .empty;
+        self.event_count = 0;
+        self.slots.deinit(std.heap.page_allocator);
+        self.slots = .empty;
+        self.free_head = null;
     }
     pub fn reset(self: *Watch) void {
         self.deinit();
@@ -119,19 +130,19 @@ pub const Watch = struct {
     pub fn armDirectory(self: *Watch, dir: std.Io.Dir) ?Token {
         return self.armKind(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } }, true);
     }
-    fn freeSlot(self: *const Watch) ?usize {
-        const limit = @min(self.limit, self.slots.len);
-        if (limit == 0) return null;
-        const groups = std.math.divCeil(usize, limit, 64) catch unreachable;
-        const allowed = if (groups == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(groups)) - 1;
-        const available = self.free_groups & allowed;
-        if (available == 0) return null;
-        const group: usize = @ctz(available);
-        const count = @min(64, limit - group * 64);
-        const mask = if (count == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
-        const bits = ~self.occupied[group] & mask;
-        if (bits == 0) return null;
-        return group * 64 + @as(usize, @ctz(bits));
+    fn freeSlot(self: *Watch) ?usize {
+        if (self.free_head) |i| return if (i < self.limit) i else null;
+        if (self.slots.items.len >= self.limit) return null;
+        const old = self.slots.items.len;
+        const size = @min(self.limit, @max(256, old * 2));
+        // Both allocations finish before any slots are published. Event
+        // delivery and slot recycling never allocate or walk the whole table.
+        self.events.ensureTotalCapacityPrecise(std.heap.page_allocator, size) catch return null;
+        self.slots.ensureTotalCapacityPrecise(std.heap.page_allocator, size) catch return null;
+        self.slots.items.len = size;
+        for (old..size) |i| self.slots.items[i] = .{ .next_free = if (i + 1 < size) i + 1 else null };
+        self.free_head = old;
+        return old;
     }
     fn linuxMask(directory: bool) u32 {
         const IN = std.os.linux.IN;
@@ -157,7 +168,7 @@ pub const Watch = struct {
         if (self.fd < 0 or self.failed) return null;
         const mask = if (comptime builtin.os.tag == .linux) linuxMask(directory) else 0;
         if (self.identities.get(id)) |i| {
-            const slot = &self.slots[i];
+            const slot = &self.slots.items[i];
             if (slot.handle >= 0) {
                 if (comptime builtin.os.tag == .linux) if (mask & ~slot.mask != 0) {
                     const handle = self.linuxArm(file, mask);
@@ -209,21 +220,23 @@ pub const Watch = struct {
             return null;
         };
         self.generation +%= 1;
-        self.slots[free] = .{ .handle = handle, .users = 1, .generation = self.generation, .device = id.device, .inode = id.inode, .mask = mask };
-        const group = free / 64;
-        self.occupied[group] |= @as(u64, 1) << @intCast(free % 64);
-        if (self.occupied[group] == std.math.maxInt(u64)) self.free_groups &= ~(@as(u64, 1) << @intCast(group));
+        self.free_head = self.slots.items[free].next_free;
+        // A retired slot can still be in the current dirty-event list. Its
+        // routing remains conservative until clearEvents at publication.
+        const event_seen = self.slots.items[free].event_seen;
+        self.slots.items[free] = .{ .event_seen = event_seen, .handle = handle, .users = 1, .generation = self.generation, .device = id.device, .inode = id.inode, .mask = mask };
         return .{ .slot = free, .generation = self.generation, .sequence = 0 };
     }
     fn get(self: *Watch, token: Token) ?*Slot {
-        if (self.failed or self.fd < 0) return null;
-        const slot = &self.slots[token.slot];
+        if (self.failed or self.fd < 0 or token.slot >= self.slots.items.len) return null;
+        const slot = &self.slots.items[token.slot];
         return if (slot.users != 0 and slot.handle >= 0 and slot.generation == token.generation) slot else null;
     }
     pub fn release(self: *Watch, token: Token) void {
         if (comptime !supported) return;
-        // Cleanup remains possible after a poll failure.
-        const slot = &self.slots[token.slot];
+        // Cleanup remains possible after a poll failure or a reset.
+        if (token.slot >= self.slots.items.len) return;
+        const slot = &self.slots.items[token.slot];
         if (slot.users == 0 or slot.generation != token.generation) return;
         slot.users -= 1;
         if (slot.users != 0) return;
@@ -236,8 +249,8 @@ pub const Watch = struct {
             _ = std.c.inotify_rm_watch(self.fd, slot.handle);
         }
         slot.handle = -1;
-        self.occupied[token.slot / 64] &= ~(@as(u64, 1) << @intCast(token.slot % 64));
-        self.free_groups |= @as(u64, 1) << @intCast(token.slot / 64);
+        slot.next_free = self.free_head;
+        self.free_head = token.slot;
     }
     pub fn certify(self: *Watch, token: Token) void {
         self.poll();
@@ -313,13 +326,13 @@ pub const Watch = struct {
                 }
                 if (count == 0) return;
                 for (events[0..@intCast(count)]) |event| {
-                    if (event.flags & std.c.EV.ERROR != 0 or event.udata == 0 or event.udata > self.slots.len) {
+                    if (event.flags & std.c.EV.ERROR != 0 or event.udata == 0 or event.udata > self.slots.items.len) {
                         self.failed = true;
                         return;
                     }
                     self.epoch +%= 1;
                     self.note(event.udata - 1);
-                    dirty(&self.slots[event.udata - 1]);
+                    dirty(&self.slots.items[event.udata - 1]);
                 }
             } else {
                 var buffer: [16384]u8 = undefined;
@@ -357,12 +370,12 @@ pub const Watch = struct {
                         // a later read. Unknown handles may be our own removals.
                         if (event.mask & std.os.linux.IN.IGNORED != 0) {
                             _ = self.handles.remove(event.wd);
-                            self.slots[i].handle = -1;
-                            const id: Identity = .{ .device = self.slots[i].device, .inode = self.slots[i].inode };
+                            self.slots.items[i].handle = -1;
+                            const id: Identity = .{ .device = self.slots.items[i].device, .inode = self.slots.items[i].inode };
                             if (self.identities.get(id) == i) _ = self.identities.remove(id);
                         }
                         self.note(i);
-                        dirty(&self.slots[i]);
+                        dirty(&self.slots.items[i]);
                     }
                     const size = @sizeOf(Header) + @as(usize, event.len);
                     if (size > @as(usize, @intCast(count)) - offset) {
@@ -403,7 +416,7 @@ test "kernel witnesses observe writes, bound admission and recover from watch lo
     // certify its own checkpoint, never the older capture's checkpoint.
     try std.testing.expect(!watch.clean(token, file));
     if (comptime builtin.os.tag == .linux) {
-        _ = std.c.inotify_rm_watch(watch.fd, watch.slots[next.slot].handle);
+        _ = std.c.inotify_rm_watch(watch.fd, watch.slots.items[next.slot].handle);
         try std.testing.expect(!watch.clean(next, file));
         watch.certify(next);
         try std.testing.expect(!watch.clean(next, file));
@@ -500,13 +513,13 @@ test "full witness table preserves hard links and Linux directory mask upgrades"
         defer watch.release(directory_token);
         try std.testing.expectEqual(file_token.slot, directory_token.slot);
         try std.testing.expectEqual(before + 1, watch.registration_attempts);
-        const mask = watch.slots[directory_token.slot].mask;
+        const mask = watch.slots.items[directory_token.slot].mask;
         try std.testing.expect(mask & std.os.linux.IN.MODIFY != 0);
         try std.testing.expect(mask & std.os.linux.IN.CREATE != 0);
         watch.certify(directory_token);
         try tmp.dir.writeFile(io, .{ .sub_path = "new", .data = "new" });
         watch.poll();
-        try std.testing.expect(watch.slots[directory_token.slot].dirty);
+        try std.testing.expect(watch.slots.items[directory_token.slot].dirty);
     }
 }
 
@@ -533,4 +546,22 @@ test "deferred certification preserves writes at the publication barrier" {
     try std.testing.expect(!watch.intact(token));
     watch.certifyPending(token);
     try std.testing.expect(!watch.intact(token));
+}
+
+test "witness tables grow lazily beyond legacy capacity and recycle without scans" {
+    var watch: Watch = .{ .limit = 65536 };
+    defer watch.deinit();
+    try std.testing.expectEqual(@as(usize, 0), watch.slots.items.len);
+    for (0..5000) |i| {
+        try std.testing.expectEqual(i, watch.freeSlot().?);
+        watch.free_head = watch.slots.items[i].next_free;
+    }
+    try std.testing.expectEqual(@as(usize, 8192), watch.slots.items.len);
+    watch.note(4097);
+    watch.note(4097);
+    try std.testing.expectEqual(@as(usize, 1), watch.event_count);
+    watch.clearEvents();
+    try std.testing.expect(!watch.slots.items[4097].event_seen);
+    watch.free_head = 4097;
+    try std.testing.expectEqual(@as(usize, 4097), watch.freeSlot().?);
 }

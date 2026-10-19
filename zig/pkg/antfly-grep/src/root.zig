@@ -286,7 +286,7 @@ const WorkspaceReuse = struct {
     // This deliberately includes every option, including auth and policy, so a
     // new option cannot accidentally reuse outcomes from an incompatible query.
     fn presentationField(comptime name: []const u8) bool {
-        inline for (.{ "before", "after", "max_result_files", "max_regions_per_file", "max_columns", "max_columns_preview", "source_excerpt_bytes", "line_numbers", "line_numbers_explicit", "column", "byte_offset", "heading", "filename", "color", "colors", "json_compact", "stats", "suppress_progress", "line_buffered", "block_buffered", "field_match_separator", "field_context_separator", "context_separator", "path_separator", "null_paths", "trim", "hyperlink_format" }) |field| if (std.mem.eql(u8, name, field)) return true;
+        inline for (.{ "before", "after", "max_result_files", "max_regions_per_file", "max_columns", "max_columns_preview", "source_excerpt_bytes", "line_numbers", "line_numbers_explicit", "column", "byte_offset", "heading", "filename", "color", "colors", "json_compact", "json_batches", "stats", "suppress_progress", "line_buffered", "block_buffered", "field_match_separator", "field_context_separator", "context_separator", "path_separator", "null_paths", "trim", "hyperlink_format" }) |field| if (std.mem.eql(u8, name, field)) return true;
         return false;
     }
     pub fn identity(a: Allocator, o: *const Options) ![32]u8 {
@@ -427,6 +427,10 @@ pub const Search = struct {
     source_cache_state: @import("source_cache.zig").State = .{},
     json_started: bool = false,
     compact_file_id: [64]u8 = undefined,
+    batch: std.ArrayList(u8) = .empty,
+    batch_rows: usize = 0,
+    file_rows_emitted: usize = 0,
+    batch_first_flushed: bool = false,
     file_output_start: usize = 0,
     file_started: ?std.Io.Timestamp = null,
     file_elapsed_ns: ?i96 = null,
@@ -560,6 +564,7 @@ pub const Search = struct {
         return result;
     }
     pub fn deinit(self: *Search) void {
+        self.batch.deinit(self.a);
         if (self.render_arena) |*arena| arena.deinit();
         if (self.discovery_decider) |client| {
             client.deinit();
@@ -3974,6 +3979,7 @@ pub const Search = struct {
     }
     fn jsonBegin(self: *Search, path: []const u8) !void {
         if (self.json_started) return;
+        self.file_rows_emitted = 0;
         const encoded_path = try jsonText(self.a, path);
         defer if (encoded_path.bytes) |bytes| self.a.free(bytes);
         if (self.options.json_compact) {
@@ -3988,6 +3994,7 @@ pub const Search = struct {
     }
     fn jsonEnd(self: *Search, path: []const u8, before: Summary) !void {
         if (!self.options.json or !self.json_started) return;
+        try self.flushBatch();
         var stats = self.jsonStats(before);
         stats.bytes_printed = self.output_bytes - self.file_output_start;
         const elapsed = self.file_elapsed_ns orelse if (self.file_started) |start| @max(0, start.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds) else 0;
@@ -4056,6 +4063,7 @@ pub const Search = struct {
             value: @TypeOf(value),
             source: @TypeOf(self.provenance),
             compact: bool,
+            batches: bool,
             bulk_fields: bool,
             file_id: ?[64]u8,
             pub fn jsonStringify(envelope: @This(), json_writer: *std.json.Stringify) !void {
@@ -4077,7 +4085,7 @@ pub const Search = struct {
                 }
                 if (envelope.compact) {
                     try @import("json_fields.zig").field(json_writer, "result_schema_version");
-                    try json_writer.write(@as(u32, 2));
+                    try json_writer.write(if (envelope.batches) @as(u32, 3) else 2);
                     if (envelope.file_id) |id| {
                         try @import("json_fields.zig").field(json_writer, "file_id");
                         // IDs are generated internally as exactly 64 lowercase hex bytes.
@@ -4097,10 +4105,44 @@ pub const Search = struct {
                 try json_writer.endObject();
             }
         };
-        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .bulk_fields = self.output_bytes >= 128 * 1024 or self.lexical_patch != null, .file_id = if (self.options.json_compact and ((std.mem.eql(u8, eventKind(value), "begin") or (self.json_started and !std.mem.eql(u8, eventKind(value), "summary") and !std.mem.eql(u8, eventKind(value), "inventory") and !std.mem.eql(u8, eventKind(value), "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
+        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .batches = self.options.json_batches, .bulk_fields = self.output_bytes >= 128 * 1024 or self.lexical_patch != null, .file_id = if (self.options.json_compact and ((std.mem.eql(u8, eventKind(value), "begin") or (self.json_started and !std.mem.eql(u8, eventKind(value), "summary") and !std.mem.eql(u8, eventKind(value), "inventory") and !std.mem.eql(u8, eventKind(value), "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
         try writer.writeByte('\n');
     }
+    fn flushBatch(self: *Search) !void {
+        if (self.batch_rows == 0) return;
+        self.batch_rows = 0;
+        defer self.batch.clearRetainingCapacity();
+        // The complete frame is bounded: at most 64 rows / 32 KiB body. No
+        // whole-transaction buffering; first row is always published directly.
+        var header: [192]u8 = undefined;
+        const frame_header = try std.fmt.bufPrint(&header, "{{\"type\":\"batch\",\"result_schema_version\":3,\"file_id\":\"{s}\",\"events\":[", .{self.compact_file_id});
+        try self.write(frame_header);
+        try self.write(self.batch.items);
+        try self.write("]}\n");
+    }
     fn json(self: *Search, value: anytype) !void {
+        const kind = eventKind(value);
+        const row = std.mem.eql(u8, kind, "match") or std.mem.eql(u8, kind, "context");
+        if (self.options.json_batches and row and self.json_started and !self.retaining_output) {
+            self.file_rows_emitted += 1;
+            if (self.file_rows_emitted > 1) {
+                // Encode into bounded scratch: oversized rows stream normally.
+                // Allocation and all budget failures occur before publication.
+                var scratch: [32768]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&scratch);
+                if (std.json.Stringify.value(value, .{}, &writer)) |_| {
+                    const encoded = writer.buffered();
+                    if (self.batch.items.len + encoded.len + 1 > scratch.len) try self.flushBatch();
+                    try self.batch.ensureTotalCapacity(self.a, scratch.len);
+                    if (self.batch_rows != 0) self.batch.appendAssumeCapacity(',');
+                    self.batch.appendSliceAssumeCapacity(encoded);
+                    self.batch_rows += 1;
+                    if (self.batch_rows == 64) try self.flushBatch();
+                    return;
+                } else |_| {}
+            }
+        }
+        try self.flushBatch();
         if (self.options.max_output_bytes == std.math.maxInt(usize) and !self.retaining_output) {
             var buffer: [65536]u8 = undefined;
             var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = OutputWriter.drain }, .buffer = &buffer } };
@@ -4125,6 +4167,12 @@ pub const Search = struct {
             self.encodeJson(value, &record.writer) catch |err| return self.recordError(&record, err);
             record.writer.flush() catch |err| return self.recordError(&record, err);
             try self.write(record.bytes.items);
+        }
+        // Publish one early row per foreground request. Later rows use the
+        // bounded batches; do not impose a flush per file on large inventories.
+        if (self.options.json_batches and row and !self.batch_first_flushed and self.sink == null and !self.options.block_buffered) {
+            self.batch_first_flushed = true;
+            try self.flushOutput();
         }
     }
 };
@@ -4186,6 +4234,7 @@ test "line offsets preserve CRLF and unterminated final lines" {
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 test {
+    _ = @import("indexed.zig");
     _ = @import("json_fields.zig");
     _ = @import("evidence.zig");
     _ = @import("source_views.zig");

@@ -148,7 +148,7 @@ pub const Journal = struct {
     }
     pub fn rearmDirectories(self: *Journal) void {
         const count = self.watch.event_count;
-        for (self.watch.events[0..count]) |slot| for (self.routes[slot].items) |path| {
+        for (self.watch.events.items[0..count]) |slot| for (self.routes[slot].items) |path| {
             const prior = self.tokens.getPtr(path) orelse continue;
             if (self.watch.intact(prior.*)) continue;
             var dir = std.Io.Dir.cwd().openDir(self.io, path, .{}) catch continue;
@@ -163,7 +163,7 @@ pub const Journal = struct {
             prior.* = token;
         };
         self.watch.poll();
-        for (self.watch.events[0..self.watch.event_count]) |slot| for (self.routes[slot].items) |path| {
+        for (self.watch.events.items[0..self.watch.event_count]) |slot| for (self.routes[slot].items) |path| {
             if (!self.watch.intact(self.tokens.get(path).?)) return;
         };
         self.dependency_epoch = self.watch.epoch;
@@ -290,7 +290,7 @@ pub const Journal = struct {
         // while scanning names only in affected source directories.
         const namespace_dirty = self.dependency_epoch != self.watch.epoch;
         const count = self.watch.event_count;
-        for (self.watch.events[0..count]) |slot| {
+        for (self.watch.events.items[0..count]) |slot| {
             if (!namespace_dirty) break;
             for (self.routes[slot].items) |path| {
                 const witness = self.tokens.get(path) orelse return self.reject("lost-path-route");

@@ -40,6 +40,28 @@ def path_bytes(value):
     return base64.b64decode(value["bytes"], validate=True)
 
 
+def validate_batch(row, encoded_size):
+    events = row.get("events")
+    if (
+        set(row) != {"type", "result_schema_version", "file_id", "events"}
+        or row.get("result_schema_version") != 3
+        or not isinstance(events, list)
+        or not 1 <= len(events) <= 64
+        or encoded_size > 33000
+    ):
+        raise RuntimeError("invalid batch envelope")
+    if any(
+        not isinstance(event, dict)
+        or event.get("type") not in ("match", "context")
+        or not isinstance(event.get("data"), dict)
+        or "file_id" in event
+        or "result_schema_version" in event
+        or "source" in event
+        for event in events
+    ):
+        raise RuntimeError("invalid batch event")
+
+
 class Payloads:
     """Stage validated original frames without keeping decoded per-match trees."""
 
@@ -59,10 +81,12 @@ class Payloads:
             buffer = self.open[path] = io.BytesIO()
             buffer.write(b"[")
             buffer.write(encoded)
-        elif kind in ("match", "context", "end"):
+        elif kind in ("match", "context", "end", "batch"):
             path = self.identities.get(row["file_id"])
             if path not in self.open:
                 raise RuntimeError("unbound file identity")
+            if kind == "batch":
+                validate_batch(row, len(encoded))
             buffer = self.open[path]
             buffer.write(b",")
             buffer.write(encoded)
@@ -99,7 +123,13 @@ class View:
                 if row["type"] == "begin":
                     row["source"]["snapshot"] = self.revision
                     row["source"]["observed_at"] = self.observed_at
-                rows.append(row)
+                if row["type"] == "batch":
+                    rows.extend(
+                        {**event, "file_id": row["file_id"], "result_schema_version": 3}
+                        for event in row["events"]
+                    )
+                else:
+                    rows.append(row)
         return rows
 
     def apply(self, rows, revision, observed_at, *, payloads=None):
@@ -152,10 +182,19 @@ class View:
                         raise RuntimeError("duplicate file identity")
                     files[identity] = path
                     staged[path] = [row]
-                elif kind in ("match", "context", "end"):
+                elif kind in ("match", "context", "end", "batch"):
                     identity = row["file_id"]
                     if identity not in files or identity in ended:
                         raise RuntimeError("unbound file identity")
+                    if kind == "batch":
+                        validate_batch(
+                            row,
+                            len(
+                                json.dumps(
+                                    row, ensure_ascii=False, separators=(",", ":")
+                                ).encode()
+                            ),
+                        )
                     staged[files[identity]].append(row)
                     if kind == "end":
                         ended.add(identity)
@@ -246,10 +285,9 @@ class RetainedClient(Client):
             raise
         if op == "register":
             row = rows[-1]
-            self.handles[row["query_handle"]] = (
-                row.get("supports_lexical_delta", False)
-                and row["result_schema_version"] == 2
-            )
+            self.handles[row["query_handle"]] = row.get(
+                "supports_lexical_delta", False
+            ) and row["result_schema_version"] in (2, 3)
             if len(self.handles) > 8:
                 self.handles.popitem(last=False)
         if op == "refresh":

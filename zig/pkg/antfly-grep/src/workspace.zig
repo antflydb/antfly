@@ -41,7 +41,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     const Watch = @import("source_watch.zig").Watch;
     const watch: ?*Watch = if (base.workspace_watch) blk: {
         const watcher = try a.create(Watch);
-        watcher.* = Watch.init();
+        watcher.* = Watch.initSources();
         break :blk watcher;
     } else null;
     defer if (watch) |watcher| {
@@ -83,7 +83,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
         // Registrations and generations copy every value they retain.
         defer _ = arena.reset(.{ .retain_with_limit = 16 * 1024 });
         const scratch = arena.allocator();
-        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false, query_handle: ?[]const u8 = null, compact: bool = true, delta: bool = false, acknowledgement: enum { full, minimal } = .full };
+        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false, query_handle: ?[]const u8 = null, compact: bool = true, batches: bool = false, delta: bool = false, acknowledgement: enum { full, minimal } = .full };
         const request = std.json.parseFromSliceLeaky(Request, scratch, line, .{}) catch {
             try emit(a, io, .{ .type = "workspace_error", .id = @as(?u64, null), .message = "InvalidWorkspaceRequest" });
             continue;
@@ -102,6 +102,10 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                 continue;
             }
         }
+        if (request.batches and !std.mem.eql(u8, request.op, "register")) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidBatchRegistration" });
+            continue;
+        }
         if (request.force_rescan and !std.mem.eql(u8, request.op, "refresh")) {
             try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidForceRescanOperation" });
             continue;
@@ -119,11 +123,11 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
             continue;
         }
         if (std.mem.eql(u8, request.op, "register")) {
-            const plan = registrations.register(base, request.args, request.compact) catch |err| {
+            const plan = registrations.register(base, request.args, request.compact, request.batches) catch |err| {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 continue;
             };
-            try emit(a, io, .{ .type = "query_registered", .id = request.id, .query_handle = plan.handle, .result_schema_version = if (plan.options.json_compact) @as(u32, 2) else 1, .supports_lexical_delta = Search.lexicalDeltaEligible(&plan.options) });
+            try emit(a, io, .{ .type = "query_registered", .id = request.id, .query_handle = plan.handle, .result_schema_version = if (plan.options.json_batches) @as(u32, 3) else if (plan.options.json_compact) @as(u32, 2) else 1, .supports_lexical_delta = Search.lexicalDeltaEligible(&plan.options) });
         } else if (std.mem.eql(u8, request.op, "forget")) {
             if (request.query_handle == null or !registrations.forget(request.query_handle.?)) {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnknownQueryHandle" });

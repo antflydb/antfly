@@ -162,6 +162,8 @@ pub const Options = struct {
     binary: bool = false,
     json: bool = false,
     json_compact: bool = false,
+    // Private workspace registration negotiation; never enabled by CLI flags.
+    json_batches: bool = false,
     help: bool = false,
     version: bool = false,
     before: usize = 0,

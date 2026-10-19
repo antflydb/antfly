@@ -1233,7 +1233,10 @@ class CliTests(unittest.TestCase):
         for path, token, body in self.server.index_requests:
             self.assertEqual(path, "/api/v1/tables/source%20files/query")
             self.assertEqual(token, "Bearer independent-table-token")
-            self.assertEqual(body["fields"], ["grep"])
+            self.assertNotIn("grep", body["fields"])
+            self.assertIn("grep.content", body["fields"])
+            self.assertIn("grep.metadata", body["fields"])
+            self.assertIn("grep.regions", body["fields"])
         self.assertEqual(
             self.server.index_requests[1][2]["remote_snapshot"], "fixture-snapshot-v1"
         )
@@ -1247,6 +1250,22 @@ class CliTests(unittest.TestCase):
         for field in ("line_number", "byte_offset", "text", "data"):
             self.assertEqual(local_match[field], matches[0][field])
         self.assertEqual(local_match["source"]["backend"], "local")
+
+    def test_indexed_json_projects_contract_without_unrelated_payloads(self):
+        doc = self.indexed_doc("a.txt", "STOP\n")
+        doc["unused_payload"] = "x" * 100000
+        doc["metadata"] = {"owner": "雪"}
+        doc["regions"] = [{"start_line": 1, "end_line": 1}]
+        config = self.table_config([doc], max_response_bytes=8192)
+        result = self.raw_cli("--table-config", config, "--json", "STOP")
+        rows = [json.loads(row) for row in result.stdout.splitlines()]
+        match = next(row for row in rows if row["type"] == "match")
+        self.assertEqual(match["source"]["metadata"], doc["metadata"])
+        self.assertEqual(match["source"]["source_regions"], doc["regions"])
+        self.assertTrue(rows[-1]["stats"]["complete"])
+        self.assertNotIn(
+            "grep.unused_payload", self.server.index_requests[0][2]["fields"]
+        )
 
     def test_indexed_conservative_candidates_preserve_exact_results(self):
         documents = [
@@ -5869,9 +5888,19 @@ class CliTests(unittest.TestCase):
         self.assertFalse(rows[-1]["stats"]["complete"])
 
     @contextmanager
-    def workspace(self, *args):
+    def workspace(self, *args, descriptor_limit=None):
+        command = [BINARY, "workspace", "serve", *args]
+        if descriptor_limit is not None:
+            # A fresh interpreter avoids unsafe preexec_fn after HTTP threads.
+            command = [
+                sys.executable,
+                "-c",
+                "import os, resource, sys; limit=int(sys.argv[1]); resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limit)); os.execv(sys.argv[2], sys.argv[2:])",
+                str(descriptor_limit),
+                *command,
+            ]
         proc = subprocess.Popen(
-            [BINARY, "workspace", "serve", *args],
+            command,
             cwd=self.root,
             env=self.env,
             stdin=subprocess.PIPE,
@@ -6021,7 +6050,10 @@ class CliTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "kqueue admission is macOS specific")
     def test_workspace_witness_limit_uses_explicit_conservative_source_reads(self):
         paths = [self.write(f"src/f{i:04}.txt", "before\n") for i in range(4352)]
-        with self.workspace("--workspace-watch", "src") as (ready, request):
+        with self.workspace("--workspace-watch", "src", descriptor_limit=16384) as (
+            ready,
+            request,
+        ):
             self.assertTrue(ready["watch_fallback"], ready)
             for i, path in enumerate(paths):
                 path.write_text(f"updated {i}\n")
@@ -7315,6 +7347,121 @@ class CliTests(unittest.TestCase):
                 self.assertFalse(any(r["type"] == "result_token" for r in rows), rows)
 
     @unittest.skipUnless(os.name == "posix", "POSIX descriptor quotas")
+    def test_workspace_v3_batches_are_opt_in_bounded_and_exact(self):
+        self.write("src/dense.txt", "STOP é\n" * 200)
+        with self.workspace("src") as (ready, request):
+            results = []
+            for batches in (False, True):
+                registration = request(
+                    "register", args=["STOP", "--threads=1"], batches=batches
+                )[0]
+                self.assertEqual(
+                    registration["result_schema_version"], 3 if batches else 2
+                )
+                rows = request(
+                    "search",
+                    revision=ready["revision"],
+                    query_handle=registration["query_handle"],
+                )
+                expanded = []
+                for row in rows:
+                    if row["type"] == "batch":
+                        self.assertLessEqual(len(row["events"]), 64)
+                        self.assertLessEqual(len(json.dumps(row).encode()), 40000)
+                        expanded.extend(row["events"])
+                    else:
+                        expanded.append(row)
+                matches = [r["data"] for r in expanded if r["type"] == "match"]
+                self.assertEqual(len(matches), 200)
+                results.append(matches)
+                if batches:
+                    self.assertTrue(any(r["type"] == "batch" for r in rows))
+                    self.assertEqual(rows[2]["type"], "match")
+                else:
+                    self.assertFalse(any(r["type"] == "batch" for r in rows))
+            self.assertEqual(*results)
+            for args, compact in (
+                (["STOP", "--max-output-bytes=1024"], True),
+                (["STOP", "--line-buffered"], True),
+                (["STOP"], False),
+            ):
+                error = request("register", args=args, compact=compact, batches=True)[0]
+                self.assertEqual(error["type"], "workspace_error")
+                self.assertEqual(error["message"], "InvalidBatchRegistration")
+
+    def test_workspace_v3_batches_preserve_context_and_oversized_rows(self):
+        self.write(
+            "src/a.txt",
+            "before\nSTOP small\nSTOP second\nSTOP " + "é" * 40000 + "\nafter\n",
+        )
+        with self.workspace("src") as (ready, request):
+            expected = None
+            for batches in (False, True):
+                handle = request(
+                    "register",
+                    args=["STOP", "--context=1", "--threads=1"],
+                    batches=batches,
+                )[0]["query_handle"]
+                rows = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                expanded = []
+                for row in rows:
+                    expanded.extend(row["events"] if row["type"] == "batch" else [row])
+                values = [
+                    (row["type"], row["data"])
+                    for row in expanded
+                    if row["type"] in ("match", "context")
+                ]
+                if expected is None:
+                    expected = values
+                self.assertEqual(values, expected)
+                self.assertEqual(len(values), 5)
+
+    def test_workspace_source_route_growth_preserves_later_dirty_updates(self):
+        for i in range(250):
+            self.write(f"src/f{i:04}.txt", "original\n")
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            for i in range(250, 270):
+                self.write(f"src/f{i:04}.txt", "added\n")
+            added = request("refresh")[0]
+            self.assertEqual(added["files"], 270)
+            path = self.root / "src/f0269.txt"
+            path.write_text("changed after route growth\n")
+            changed = request("refresh")[0]
+            self.assertEqual(changed["source_bytes_read"], len(path.read_bytes()))
+            self.assertEqual(changed["refresh_entries_visited"], 1)
+            self.assertEqual(
+                request("refresh", force_rescan=True)[0]["revision"],
+                changed["revision"],
+            )
+
+    def test_workspace_strict_source_witnesses_extend_beyond_4096(self):
+        import resource
+
+        if (
+            sys.platform != "darwin"
+            or resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 20000
+        ):
+            self.skipTest(
+                "requires macOS with descriptor headroom for >4096 strict witnesses"
+            )
+        for i in range(4200):
+            self.write(f"src/f{i:05}.txt", "STOP old\n")
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            refreshed = request("refresh")[0]
+            self.assertFalse(refreshed["watch_fallback"])
+            self.assertEqual(refreshed["source_bytes_read"], 0)
+            self.assertEqual(refreshed["refresh_entries_visited"], 0)
+            target = self.root / "src/f04199.txt"
+            target.write_text("STOP changed\n")
+            changed = request("refresh")[0]
+            self.assertEqual(changed["source_bytes_read"], len(target.read_bytes()))
+            token = changed["revision"]
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(forced["revision"], token)
+            self.assertEqual(forced["source_bytes_read"], forced["bytes"])
+
     def test_workspace_parallel_capture_respects_descriptor_headroom(self):
         for i in range(100):
             self.write(f"src/f{i}.txt", "STOP original\n")

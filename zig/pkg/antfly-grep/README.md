@@ -3322,3 +3322,62 @@ Evidence: [source/binary/report/archive qualification](bench/results/bounded-val
 [pre-optimization macOS phases](bench/results/bounded-phases-preopt-macos.json),
 [final diagnostic Linux phases](bench/results/bounded-phases-linux.json), and
 [generated oracle results](bench/results/bounded-differential.json).
+
+### Bounded workspace transport and larger strict witness coverage
+
+Workspace registrations can explicitly negotiate result schema v3:
+
+```json
+{"version":1,"id":1,"op":"register","args":["needle"],"compact":true,"batches":true}
+```
+
+The reply advertises `result_schema_version: 3`. Ordinary CLI JSON and default
+registrations retain their v1/v2 formats. V3 retains ordinary begin/end/source
+identity envelopes and can replace consecutive match/context events with a
+`batch` frame carrying one `file_id` and an `events` array. Bodies contain at
+most 64 events and 32 KiB of encoded event bytes; oversized events stream as
+ordinary v3 rows. The first event is unbatched, and foreground output flushes
+one early row per request unless block buffering was requested. Batches never
+cross file boundaries or control events. This mode rejects decision queries,
+finite output limits and line buffering at registration. Each active encoder
+lazily allocates at most one 32 KiB batch body. Cancellation, failed output and
+incomplete terminal framing cannot certify a complete result.
+
+The reference retained consumer validates envelopes and owns the original bytes
+in its per-file serialized payload. Explicit materialization expands batches;
+ordinary pinned-view reuse still omits requests. Frame decoding uses one cached
+stdlib JSON decoder with explicit UTF-8, matching the JSONL protocol. Invalid
+UTF-8, BOM/UTF-16 input, malformed batches and incomplete file streams fail
+before a view is published. The request and batch schemas are shipped in release
+archives, alongside existing schemas.
+
+Opt-in `--workspace-watch` now uses a source table that grows geometrically on
+demand, up to 65,536 slots and at most one quarter of the process descriptor
+quota. Namespace/configuration journals keep their independent 4,096-slot limit.
+A free-list gives constant-time slot admission/recycling; dirty-event clearing
+visits recorded slots instead of clearing a maximum-sized array. Stable numeric
+tokens survive backing-table growth. Smaller workspaces allocate smaller tables,
+while larger macOS workspaces can retain strict kqueue inode witnesses instead
+of rereading sources above the former 4,096-source ceiling. More admitted
+witnesses consume descriptors, kernel resources and table/map memory; source
+snapshot memory is accounted separately. Allocation failure, low descriptor
+limits, overflow, lost coverage, unsupported platforms and publication races
+retain conservative fallback. This does not change the event visibility contract
+or make kernel-invisible writes observable. Flat-directory membership changes
+still require reading that directory's names; topology and ignore-policy changes
+can require broader discovery.
+
+Indexed retrieval projects every field used by the v1 document contract for
+JSON, statistics and decision search, including metadata and source regions.
+Unrelated sibling blobs are excluded without changing full-scan counters,
+validation, permissions or provenance. Conservative trigram filtering remains
+disabled for JSON/statistics workflows: skipping documents would otherwise
+change their logical totals and diagnostics. Extending pruning to those modes
+requires snapshot-bound, revision-certified input/validation summaries and an
+explicit server contract for accounting skipped documents. Narrowing projection
+is available now without that change in semantics.
+
+Indexed prefetch shutdown publishes terminal cancellation for an undequeued
+request and wakes its consumer. A consumer awaiting a page observes atomic
+signal cancellation through a bounded 10 ms condition timeout. Successful
+handoffs remain signaled immediately; idle producers do not periodically wake.

@@ -35,6 +35,11 @@ from pathlib import Path
 from workspace import signature
 
 
+# The protocol is UTF-8 JSONL; cache the decoder and avoid per-frame encoding
+# detection. Invalid UTF-8 and malformed JSON still fail before publication.
+_decode_frame = json.JSONDecoder().decode
+
+
 class Service:
     def __init__(
         self,
@@ -90,7 +95,7 @@ class Service:
                 self.wire_bytes += end + 1 - self.cursor
                 self.cursor = end + 1
                 self.last_record = line
-                return json.loads(line)
+                return _decode_frame(line.decode("utf-8"))
             if self.cursor:
                 del self.pending[: self.cursor]
                 self.cursor = 0

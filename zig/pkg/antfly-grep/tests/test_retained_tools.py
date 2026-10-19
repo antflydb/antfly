@@ -22,9 +22,104 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
 from retained import Payloads, View
+from session_compare import Service
+
+
+class FrameReaderTests(unittest.TestCase):
+    def read(self, raw):
+        service = Service.__new__(Service)
+        service.pending = bytearray(raw + b"\n")
+        service.cursor = 0
+        service.wire_bytes = 0
+        return service.read()
+
+    def test_utf8_and_byte_paths(self):
+        value = {"type": "match", "text": "é雪", "path": {"bytes": "Yf8="}}
+        self.assertEqual(
+            self.read(json.dumps(value, ensure_ascii=False).encode()), value
+        )
+
+    def test_malformed_json_utf8_and_bom_are_rejected(self):
+        for raw in (b"{", b'{"text":"\xff"}', b"\xef\xbb\xbf{}", b"\xff\xfe{\x00}\x00"):
+            with self.subTest(raw=raw), self.assertRaises((ValueError, UnicodeError)):
+                self.read(raw)
 
 
 class StreamingViewTests(unittest.TestCase):
+    def test_v3_batches_retain_original_frames_and_expand_at_materialization(self):
+        p = Payloads()
+        frames = [
+            {
+                "type": "begin",
+                "file_id": "a",
+                "data": {"path": {"text": "a"}},
+                "source": {},
+            },
+            {
+                "type": "batch",
+                "file_id": "a",
+                "result_schema_version": 3,
+                "events": [
+                    {"type": "match", "data": {"text": "é"}},
+                    {"type": "context", "data": {"text": "snow"}},
+                ],
+            },
+            {"type": "end", "file_id": "a", "data": {}},
+        ]
+        for row in frames:
+            p.consume(row, json.dumps(row).encode())
+        v = View("handle", revision="rev", token="token", files=p.finish())
+        self.assertEqual(
+            [r["type"] for r in v.materialize()], ["begin", "match", "context", "end"]
+        )
+        self.assertEqual(v.materialize()[1]["file_id"], "a")
+        self.assertIn(b'"batch"', v.files[b"a"])
+
+    def test_malformed_batches_are_rejected_before_staging(self):
+        for events in (
+            [],
+            [{}],
+            [{"type": "end"}],
+            [{"type": "match", "file_id": "other"}],
+            [{"type": "match"}] * 65,
+        ):
+            p = Payloads()
+            p.consume(
+                {"type": "begin", "file_id": "a", "data": {"path": {"text": "a"}}},
+                b"{}",
+            )
+            with self.assertRaisesRegex(RuntimeError, "invalid batch"):
+                p.consume(
+                    {
+                        "type": "batch",
+                        "file_id": "a",
+                        "result_schema_version": 3,
+                        "events": events,
+                    },
+                    b"{}",
+                )
+
+    def test_decoded_invalid_batch_cannot_replace_certified_view(self):
+        view = View("h", revision="old", token="token", files={b"p": b"[]"})
+        rows = [
+            {"type": "begin", "file_id": "a", "data": {"path": {"text": "p"}}},
+            {
+                "type": "batch",
+                "result_schema_version": 3,
+                "file_id": "a",
+                "events": [{"type": "end", "data": {}}],
+            },
+            {"type": "end", "file_id": "a"},
+            {"type": "summary", "stats": {"complete": True}},
+            {"type": "result_token", "result_token": "new-token"},
+            {"type": "workspace_end", "revision": "new", "exit_code": 0},
+        ]
+        with self.assertRaisesRegex(RuntimeError, "invalid batch"):
+            view.apply(rows, "new", 1)
+        self.assertEqual(
+            (view.revision, view.token, view.files), ("old", "token", {b"p": b"[]"})
+        )
+
     def test_original_frames_round_trip_unicode_and_byte_paths(self):
         p = Payloads()
         frames = [

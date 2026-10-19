@@ -74,6 +74,11 @@
       ],
       "default": "full",
       "description": "Minimal is opt-in for registered conditional lexical searches. A valid hit is one terminal workspace_not_modified frame, with complete/exit_code and no begin/summary/end; otherwise ordinary output follows."
+    },
+    "batches": {
+      "type": "boolean",
+      "default": false,
+      "description": "Opt-in register-only compact lexical result schema v3. Bounded per-file match/context batches; first row streams immediately. Incompatible with decision search, finite output limits or line buffering."
     }
   },
   "allOf": [
@@ -232,6 +237,28 @@
           },
           "if_result_token": {
             "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "batches"
+        ],
+        "properties": {
+          "batches": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "op": {
+            "const": "register"
+          },
+          "compact": {
+            "const": true
           }
         }
       }

@@ -53,6 +53,7 @@ class Client(Service):
                 rows.append(row)
             if first_event is None and row["type"] in (
                 "match",
+                "batch",
                 "workspace_unchanged",
                 "workspace_lexical_delta",
                 "workspace_not_modified",

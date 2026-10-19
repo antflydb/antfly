@@ -234,7 +234,7 @@ pub const Generation = struct {
         self.revision = inventoryRevision(self.tree);
         if (watcher != null and journal != null) {
             const allocator = self.arena.allocator();
-            self.watch_heads = try allocator.alloc(usize, watcher.?.limit);
+            self.watch_heads = try allocator.alloc(usize, watcher.?.slots.items.len);
             @memset(self.watch_heads, std.math.maxInt(usize));
             for (self.entries.items, 0..) |entry, i| {
                 if (entry.blob.token) |token| self.linkWatch(i, token.slot);
@@ -313,6 +313,13 @@ pub const Generation = struct {
         if (entry.directory_prev == std.math.maxInt(usize)) self.directory_heads.getPtr(std.fs.path.dirname(entry.path) orelse "").?.* = entry.directory_next else self.entries.items[entry.directory_prev].directory_next = entry.directory_next;
         if (entry.directory_next != std.math.maxInt(usize)) self.entries.items[entry.directory_next].directory_prev = entry.directory_prev;
     }
+    fn ensureWatchHeads(self: *Generation, capacity: usize) !void {
+        if (capacity <= self.watch_heads.len) return;
+        const heads = try self.arena.allocator().alloc(usize, capacity);
+        @memcpy(heads[0..self.watch_heads.len], self.watch_heads);
+        @memset(heads[self.watch_heads.len..], std.math.maxInt(usize));
+        self.watch_heads = heads;
+    }
     fn linkWatch(self: *Generation, i: usize, slot: usize) void {
         const prior = self.watch_heads[slot];
         self.entries.items[i].watch_next = prior;
@@ -360,7 +367,10 @@ pub const Generation = struct {
         // Freeze the event suffix; any new event during capture abandons the
         // optimization before publication and uses conservative capture.
         const event_count = w.event_count;
-        for (w.events[0..event_count]) |slot| {
+        for (w.events.items[0..event_count]) |slot| {
+            // A failed staged refresh may have admitted later watch slots;
+            // those have no routes in the still-published generation.
+            if (slot >= old.watch_heads.len) continue;
             var i = old.watch_heads[slot];
             while (i != std.math.maxInt(usize)) : (i = old.entries.items[i].watch_next) {
                 if (old.entries.items[i].touched == old.touch_epoch) continue;
@@ -403,6 +413,7 @@ pub const Generation = struct {
             inventory.release(old.budget.allocator(), tree);
             tree = updated;
         }
+        try old.ensureWatchHeads(w.slots.items.len);
         if (retained + old.budget.live + @sizeOf(Generation) > o.workspace_memory_limit) return null;
         const revision = inventoryRevision(tree);
         w.poll();
@@ -569,7 +580,8 @@ pub const Generation = struct {
         // Include writes outside the directories whose names changed. A single
         // refresh may combine an add/delete with arbitrary source edits.
         const event_count = w.event_count;
-        for (w.events[0..event_count]) |watch_slot| {
+        for (w.events.items[0..event_count]) |watch_slot| {
+            if (watch_slot >= old.watch_heads.len) continue;
             var slot = old.watch_heads[watch_slot];
             while (slot != std.math.maxInt(usize)) : (slot = old.entries.items[slot].watch_next) {
                 const entry = old.entries.items[slot];
@@ -685,6 +697,7 @@ pub const Generation = struct {
             if (!j.watch.intact(token)) return null;
         }
         try old.entries.ensureTotalCapacity(old.budget.allocator(), count);
+        try old.ensureWatchHeads(w.slots.items.len);
         if (retained + old.budget.live + @sizeOf(Generation) > o.workspace_memory_limit) return null;
         w.poll();
         j.watch.poll();
