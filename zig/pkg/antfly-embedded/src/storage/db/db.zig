@@ -37929,7 +37929,7 @@ pub const ImageDecodingPartsEmbedder = struct {
         return vector;
     }
 
-    fn interface(self: *ImageDecodingPartsEmbedder) embedder_mod.DenseEmbedder {
+    pub fn interface(self: *ImageDecodingPartsEmbedder) embedder_mod.DenseEmbedder {
         return .{
             .ptr = self,
             .dense_embed_fn = embedDense,
@@ -38157,7 +38157,7 @@ pub const CountingSparseEmbedder = struct {
         return try embedder_mod.DeterministicSparseEmbedder.embedSparse(&self.deterministic, alloc, embedding_name, text);
     }
 
-    fn interface(self: *CountingSparseEmbedder) embedder_mod.SparseEmbedder {
+    pub fn interface(self: *CountingSparseEmbedder) embedder_mod.SparseEmbedder {
         return .{
             .ptr = self,
             .sparse_embed_fn = embedSparse,
@@ -38184,7 +38184,7 @@ pub const GateSparseEmbedder = struct {
         return try embedder_mod.DeterministicSparseEmbedder.embedSparse(&self.deterministic, alloc, embedding_name, text);
     }
 
-    fn interface(self: *GateSparseEmbedder) embedder_mod.SparseEmbedder {
+    pub fn interface(self: *GateSparseEmbedder) embedder_mod.SparseEmbedder {
         return .{
             .ptr = self,
             .sparse_embed_fn = embedSparse,
@@ -38192,7 +38192,7 @@ pub const GateSparseEmbedder = struct {
         };
     }
 
-    fn allowAll(self: *GateSparseEmbedder) void {
+    pub fn allowAll(self: *GateSparseEmbedder) void {
         self.allowed_successes.store(std.math.maxInt(usize), .release);
     }
 };
@@ -44436,7 +44436,7 @@ pub const FakePromotionSink = struct {
         self.upserts.deinit(self.alloc);
     }
 
-    fn sink(self: *FakePromotionSink) promotion_runtime_mod.EntitySink {
+    pub fn sink(self: *FakePromotionSink) promotion_runtime_mod.EntitySink {
         return .{ .ptr = self, .vtable = &vtable };
     }
     const vtable = promotion_runtime_mod.EntitySink.VTable{ .upsert = upsertFn };
@@ -44464,7 +44464,7 @@ pub const FakePromotionSink = struct {
         return null;
     }
 
-    fn count(self: *FakePromotionSink) usize {
+    pub fn count(self: *FakePromotionSink) usize {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         return self.upserts.items.len;
