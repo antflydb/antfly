@@ -59,7 +59,7 @@ ANTFLY_PROCESS_FIXTURES = frozenset(
         "ha_cluster",
         "multi_metadata_backup_cluster",
         "multi_node_scaling_cluster",
-        "real_clipclap_backup_api",
+        "real_embeddinggemma2_backup_api",
         "resolution_cluster",
         "serverless_api",
         "serverless_runtime",
