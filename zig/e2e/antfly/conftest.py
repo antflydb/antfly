@@ -150,11 +150,23 @@ AUTH_BOOTSTRAP_PASSWORD = "e2e-bootstrap-password"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
 INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
-CLIPCLAP_MODEL = "antflydb/clipclap"
-CLIPCLAP_GGUF_FILES = (
-    "clipclap-clip.Q4_K.gguf",
-    "clipclap-clap.Q4_K.gguf",
-    "antfly_inference_variants.json",
+EMBEDDINGGEMMA2_MODEL = "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
+EMBEDDINGGEMMA2_FILES = (
+    "model.safetensors",
+    "config.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "modules.json",
+    "sentence_bert_config.json",
+    "config_sentence_transformers.json",
+    "1_Pooling/config.json",
+    "2_Normalize/config.json",
+    "model_manifest.json",
+    ".antfly-download-complete.json",
 )
 ALLOW_REAL_MODEL_DOWNLOAD_ENV = "ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD"
 FAILURE_LOG_TAIL_LIMIT = 20_000
@@ -2584,13 +2596,16 @@ def _models_dir() -> Path:
     )
 
 
-def _clipclap_model_dir() -> Path:
-    return _models_dir() / CLIPCLAP_MODEL
+def _embeddinggemma2_model_dir() -> Path:
+    # Match registry.modelInstallDirAlloc: explicit variants have separate installs.
+    repo, variant = EMBEDDINGGEMMA2_MODEL.split(":", 1)
+    suffix = hashlib.sha256(variant.encode()).hexdigest()[:16]
+    return _models_dir() / f"{repo}--antfly-{suffix}"
 
 
-def _clipclap_gguf_available(model_dir: Path) -> bool:
-    return model_dir.exists() and all(
-        (model_dir / name).exists() for name in CLIPCLAP_GGUF_FILES
+def _embeddinggemma2_available(model_dir: Path) -> bool:
+    return not (model_dir / ".antfly-download-in-progress").exists() and all(
+        (model_dir / name).is_file() for name in EMBEDDINGGEMMA2_FILES
     )
 
 
@@ -2931,13 +2946,13 @@ def inference_embedder():
 
 
 @pytest.fixture(scope="session")
-def clipclap_model_available():
-    model_dir = _clipclap_model_dir()
-    if _clipclap_gguf_available(model_dir):
+def embeddinggemma2_model_available():
+    model_dir = _embeddinggemma2_model_dir()
+    if _embeddinggemma2_available(model_dir):
         return model_dir
     if not _env_truthy(ALLOW_REAL_MODEL_DOWNLOAD_ENV):
         pytest.skip(
-            f"ClipClap GGUF files are not present at {model_dir}; set {ALLOW_REAL_MODEL_DOWNLOAD_ENV}=1 to download them"
+            f"EmbeddingGemma2 bundle files are not present at {model_dir}; set {ALLOW_REAL_MODEL_DOWNLOAD_ENV}=1 to download them"
         )
 
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -2949,7 +2964,7 @@ def clipclap_model_available():
             binary,
             "inference",
             "pull",
-            "hf:antflydb/clipclap:gguf:Q4_K",
+            f"hf:{EMBEDDINGGEMMA2_MODEL}",
             "--tasks",
             "embed",
         ],
@@ -2960,14 +2975,14 @@ def clipclap_model_available():
         raise RuntimeError(
             f"antfly inference pull finished but did not create {model_dir}"
         )
-    if not _clipclap_gguf_available(model_dir):
-        raise RuntimeError(f"ClipClap GGUF files are missing from {model_dir}")
+    if not _embeddinggemma2_available(model_dir):
+        raise RuntimeError(f"EmbeddingGemma2 bundle files are missing from {model_dir}")
     return model_dir
 
 
 @pytest.fixture(scope="function")
-def real_clipclap_backup_api(request, clipclap_model_available):
-    _ = clipclap_model_available
+def real_embeddinggemma2_backup_api(request, embeddinggemma2_model_available):
+    _ = embeddinggemma2_model_available
     return request.getfixturevalue("backup_api")
 
 

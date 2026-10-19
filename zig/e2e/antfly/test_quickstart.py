@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 import requests
+from conftest import EMBEDDINGGEMMA2_MODEL
 from helpers import (
     assert_created_index,
     assert_single_top_hit,
@@ -33,9 +34,6 @@ from helpers import (
 )
 
 pytestmark = pytest.mark.reuse_antfly_process
-
-
-CLIPCLAP_MODEL = "antflydb/clipclap"
 
 
 def test_text_quickstart_and_document_artifact(serverless_api):
@@ -1710,7 +1708,7 @@ def test_live_index_activation_preempts_an_active_enrichment_quantum(
                 "execution": {"embedding": {"batch_items": 1}},
                 "embedder": {
                     "provider": "antfly",
-                    "model": CLIPCLAP_MODEL,
+                    "model": EMBEDDINGGEMMA2_MODEL,
                     "api_url": slow_inference_embedder.url,
                 },
             },
@@ -1743,7 +1741,7 @@ def test_live_index_activation_preempts_an_active_enrichment_quantum(
             sync_level="write",
         )["inserted"] == len(documents)
 
-        # This is the real quickstart shape: a ClipClap image projection owns
+        # This is the real quickstart shape: an EmbeddingGemma2 image projection owns
         # an inference request while another embeddings index is created.
         assert slow_inference_embedder.wait_for_embedding_request(20.0), (
             __import__("json").dumps(
@@ -2276,20 +2274,20 @@ def test_public_managed_antfly_chunked_semantic_full_index_pipeline(
 
 
 @pytest.mark.real_model
-def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup_api):
-    backup_api = real_clipclap_backup_api
-    table_name = f"quickstart_antfly_clipclap_semantic_{__import__('time').time_ns()}"
+def test_public_managed_antfly_embeddinggemma2_embedder_smoke(
+    real_embeddinggemma2_backup_api,
+):
+    backup_api = real_embeddinggemma2_backup_api
+    table_name = (
+        f"quickstart_antfly_embeddinggemma2_semantic_{__import__('time').time_ns()}"
+    )
 
-    try:
-        warmup = backup_api.inference_embed(
-            CLIPCLAP_MODEL, "alpha body", timeout_s=120.0
-        )
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code in {400, 404}:
-            pytest.skip(f"Embedded Antfly inference ClipClap model unavailable: {exc}")
-        raise
+    # The fixture checks installation first; inference errors must fail the test.
+    warmup = backup_api.inference_embed(
+        EMBEDDINGGEMMA2_MODEL, "alpha body", timeout_s=120.0
+    )
     warmup_embedding = warmup["data"][0]["embedding"]
-    assert len(warmup_embedding) == 512
+    assert len(warmup_embedding) == 768
 
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -2297,25 +2295,25 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
     assert_created_index(
         backup_api.create_index(
             table_name,
-            "semantic_clipclap_idx",
+            "semantic_embeddinggemma2_idx",
             {
-                "name": "semantic_clipclap_idx",
+                "name": "semantic_embeddinggemma2_idx",
                 "type": "embeddings",
                 "field": "body",
-                "dimension": 512,
+                "dimension": 768,
                 "embedder": {
                     "provider": "antfly",
-                    "model": CLIPCLAP_MODEL,
+                    "model": EMBEDDINGGEMMA2_MODEL,
                 },
             },
         ),
-        "semantic_clipclap_idx",
+        "semantic_embeddinggemma2_idx",
         "embeddings",
     )
 
     backup_api.wait_index_ready(
         table_name,
-        "semantic_clipclap_idx",
+        "semantic_embeddinggemma2_idx",
         timeout_s=60.0,
         interval_s=0.5,
         until="complete",
@@ -2323,22 +2321,20 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
 
 
 @pytest.mark.real_model
-def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
-    real_clipclap_backup_api,
+def test_public_managed_antfly_embeddinggemma2_chunked_full_index_pipeline(
+    real_embeddinggemma2_backup_api,
 ):
-    backup_api = real_clipclap_backup_api
-    table_name = f"quickstart_antfly_clipclap_chunked_{__import__('time').time_ns()}"
+    backup_api = real_embeddinggemma2_backup_api
+    table_name = (
+        f"quickstart_antfly_embeddinggemma2_chunked_{__import__('time').time_ns()}"
+    )
 
-    try:
-        warmup = backup_api.inference_embed(
-            CLIPCLAP_MODEL, "alpha body", timeout_s=120.0
-        )
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code in {400, 404}:
-            pytest.skip(f"Embedded Antfly inference ClipClap model unavailable: {exc}")
-        raise
+    # The fixture checks installation first; inference errors must fail the test.
+    warmup = backup_api.inference_embed(
+        EMBEDDINGGEMMA2_MODEL, "alpha body", timeout_s=120.0
+    )
     warmup_embedding = warmup["data"][0]["embedding"]
-    assert len(warmup_embedding) == 512
+    assert len(warmup_embedding) == 768
 
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -2346,19 +2342,19 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
     assert_created_index(
         backup_api.create_index(
             table_name,
-            "semantic_clipclap_idx",
+            "semantic_embeddinggemma2_idx",
             {
-                "name": "semantic_clipclap_idx",
+                "name": "semantic_embeddinggemma2_idx",
                 "type": "embeddings",
                 "field": "body",
-                "dimension": 512,
+                "dimension": 768,
                 "embedder": {
                     "provider": "antfly",
-                    "model": CLIPCLAP_MODEL,
+                    "model": EMBEDDINGGEMMA2_MODEL,
                 },
                 "chunker": {
                     "provider": "antfly",
-                    "model": CLIPCLAP_MODEL,
+                    "model": EMBEDDINGGEMMA2_MODEL,
                     "store_chunks": True,
                     "text": {
                         "target_tokens": 4,
@@ -2368,13 +2364,13 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
                 },
             },
         ),
-        "semantic_clipclap_idx",
+        "semantic_embeddinggemma2_idx",
         "embeddings",
     )
 
     backup_api.wait_index_ready(
         table_name,
-        "semantic_clipclap_idx",
+        "semantic_embeddinggemma2_idx",
         timeout_s=60.0,
         interval_s=0.5,
         until="complete",
@@ -2407,7 +2403,7 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
     )
     assert len(scan) == 1
     assert scan[0]["title"] == "Alpha in chunks"
-    chunks = scan[0]["_chunks"]["semantic_clipclap_idx_chunks"]
+    chunks = scan[0]["_chunks"]["semantic_embeddinggemma2_idx_chunks"]
     assert len(chunks) >= 2
     assert chunks[0]["body"].startswith("alpha")
     assert any(chunk["body"].startswith("beta") for chunk in chunks)

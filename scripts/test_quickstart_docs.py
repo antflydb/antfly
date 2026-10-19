@@ -162,6 +162,21 @@ def main() -> int:
     go_example = GO_EXAMPLE.read_text(encoding="utf-8")
     quickstart_tape = QUICKSTART_TAPE.read_text(encoding="utf-8")
 
+    embedding_model = "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
+    if f"antfly inference pull hf:{embedding_model}" not in source:
+        fail("the quickstart must install the pinned EmbeddingGemma2 bundle")
+    demo_config = json.loads((REPO / "wikipedia-config.json").read_text())
+    for name, config in demo_config["indexes"].items():
+        if config["embedder"]["model"] != embedding_model:
+            fail(f"the {name} recording index must use the quickstart embedding model")
+        if config.get("dimension", 768) != 768:
+            fail(f"the {name} recording index must match EmbeddingGemma2's dimensions")
+    for label, example in (("quickstart", source), ("Go example", go_example)):
+        if embedding_model not in example:
+            fail(f"{label} must use EmbeddingGemma2")
+        if "clipclap" in example.lower() or "Qwen3-Embedding" in example:
+            fail(f"{label} retains a superseded embedding model")
+
     check_component_balance(source)
     blocks = fenced_blocks(source)
     for index, (language, block) in enumerate(blocks, start=1):

@@ -6,7 +6,7 @@
       "template": "{{title}} {{body}}",
       "embedder": {
         "provider": "antfly",
-        "model": "antflydb/clipclap"
+        "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
       },
       "chunker": {
         "provider": "antfly",
@@ -22,9 +22,9 @@
       "template": "{{media url=thumbnail_url}}",
       "embedder": {
         "provider": "antfly",
-        "model": "antflydb/clipclap"
+        "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
       },
-      "dimension": 512,
+      "dimension": 768,
       "distance_metric": "cosine"
     }
   }
