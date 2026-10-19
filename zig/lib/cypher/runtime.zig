@@ -303,7 +303,7 @@ pub const NodeCursor = struct {
         var arena_moved = false;
         errdefer if (arena_moved) self.arena.deinit() else arena.deinit();
         const a = arena.allocator();
-        const owned_query = try std.json.parseFromSliceLeaky(ast.Query, a, try std.json.Stringify.valueAlloc(a, query, .{}), .{});
+        const owned_query = try @import("path_summaries.zig").lower(a, try std.json.parseFromSliceLeaky(ast.Query, a, try std.json.Stringify.valueAlloc(a, query, .{}), .{}));
         const owned_parameters = try a.alloc(v.Entry, parameters.len);
         for (parameters, owned_parameters) |parameter, *out| out.* = .{ .name = try a.dupe(u8, parameter.name), .value = try parameter.value.clone(a) };
         const engine = try a.create(Engine);
@@ -313,6 +313,8 @@ pub const NodeCursor = struct {
             for (path.nodes) |node| if (node.alias) |alias| try aliases.append(a, alias);
             for (path.edges) |edge| if (edge.alias) |alias| try aliases.append(a, alias);
             if (path.alias) |alias| try aliases.append(a, alias);
+            inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| try aliases.append(a, name);
+            for (path.edges) |edge| if (edge.execution_length) |name| try aliases.append(a, name);
         }
         engine.match_aliases = try aliases.toOwnedSlice(a);
         engine.values = .{ .a = a, .ptr = engine, .charge = Engine.chargeWork };
@@ -637,7 +639,8 @@ pub const NodeCursor = struct {
                         std.mem.reverse(*const v.Relationship, relationships);
                         route = .{ .nodes = nodes, .relationships = relationships };
                     }
-                    break :blk try e.bind(frame.state.row, path.alias, .{ .path = route });
+                    const row = (try e.bind(frame.state.row, path.alias, .{ .path = route })) orelse break :blk null;
+                    break :blk try e.pathSummaryRow(row, path, frame.nodes[0], frame.nodes[frame.nodes.len - 1], frame.relationships.len);
                 };
                 if (completed_row) |row| {
                     const last = frame.path_index + 1 == operation.paths.len;
@@ -678,7 +681,7 @@ pub const NodeCursor = struct {
                         if (self.interior_anchors[frame.path_index] != 0 and frame.edge_index < self.interior_anchors[frame.path_index]) edge_path.execution_reversed = true;
                         const edge_value = try e.routeEdgeValue(edge_path, edge, frame.edge_values, frame.relationships);
                         if (try e.bind(node_row, edge.alias, edge_value)) |edge_row| {
-                            if (try e.constrain(.{ .row = edge_row, .used = frame.state.used, .constraints = frame.state.constraints }, .{ .node = current }, path.nodes[frame.edge_index + 1].properties)) |candidate| {
+                            if (try e.constrain(.{ .row = try e.lengthRow(edge_row, edge.execution_length, frame.hops), .used = frame.state.used, .constraints = frame.state.constraints }, .{ .node = current }, path.nodes[frame.edge_index + 1].properties)) |candidate| {
                                 child.state = candidate;
                                 child.path_index = frame.path_index;
                                 child.nodes = frame.nodes;
@@ -867,10 +870,11 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
         engine.stats.scanned_anchors = initial.scanned_anchors;
         engine.stats.explored_edges = initial.explored_edges;
     };
-    const rows = try engine.run(compiled.query.clauses, &.{&.{}}, compiled.query.explain, false);
+    const query = if (writes) compiled.query else try @import("path_summaries.zig").lower(engine.a, compiled.query);
+    const rows = try engine.run(query.clauses, &.{&.{}}, compiled.query.explain, false);
     var combined: std.ArrayList(Row) = .empty;
     try combined.appendSlice(engine.a, rows);
-    for (compiled.query.unions) |arm| {
+    for (query.unions) |arm| {
         const more = try engine.run(arm.clauses, &.{&.{}}, compiled.query.explain, false);
         for (more) |row| {
             if (row.len != engine.columns.len) return error.CypherUnionColumnMismatch;
@@ -1711,6 +1715,12 @@ const Engine = struct {
         for (path.nodes) |node| if (node.alias) |alias| {
             shape = try self.replace(shape, alias, .{ .boolean = true });
         };
+        inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| {
+            shape = try self.replace(shape, name, .{ .boolean = std.mem.eql(u8, field, "first") or std.mem.eql(u8, field, "last") });
+        };
+        for (path.edges) |edge| if (edge.execution_length) |name| {
+            shape = try self.replace(shape, name, .{ .boolean = false });
+        };
         for (path.edges) |edge| if (edge.alias) |alias| {
             shape = try self.replace(shape, alias, .{ .boolean = false });
         };
@@ -1856,6 +1866,12 @@ const Engine = struct {
             for (path.nodes) |node| if (node.alias) |alias| {
                 shape = try self.replace(shape, alias, .{ .boolean = true });
             };
+            inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| {
+                shape = try self.replace(shape, name, .{ .boolean = std.mem.eql(u8, field, "first") or std.mem.eql(u8, field, "last") });
+            };
+            for (path.edges) |edge| if (edge.execution_length) |name| {
+                shape = try self.replace(shape, name, .{ .boolean = false });
+            };
             for (path.edges) |edge| if (edge.alias) |alias| {
                 shape = try self.replace(shape, alias, .{ .boolean = false });
             };
@@ -1897,6 +1913,12 @@ const Engine = struct {
         for (operation.paths) |path| {
             for (path.nodes) |node| if (node.alias) |alias| {
                 shape = try self.replace(shape, alias, .{ .boolean = true });
+            };
+            inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| {
+                shape = try self.replace(shape, name, .{ .boolean = std.mem.eql(u8, field, "first") or std.mem.eql(u8, field, "last") });
+            };
+            for (path.edges) |edge| if (edge.execution_length) |name| {
+                shape = try self.replace(shape, name, .{ .boolean = false });
             };
             for (path.edges) |edge| if (edge.alias) |alias| {
                 shape = try self.replace(shape, alias, .{ .boolean = false });
@@ -2055,6 +2077,12 @@ const Engine = struct {
                     shape = try self.replace(shape, name, .null);
                 };
                 if (pattern.alias) |name| shape = try self.replace(shape, name, .null);
+                inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(pattern.execution_summary, field)) |name| {
+                    shape = try self.replace(shape, name, .null);
+                };
+                for (pattern.edges) |edge| if (edge.execution_length) |name| {
+                    shape = try self.replace(shape, name, .null);
+                };
             },
             .unwind => |u| shape = try self.replace(shape, u.alias, .null),
             .project => |p| {
@@ -2182,7 +2210,7 @@ const Engine = struct {
         };
         const small_window = if (consumer_goal) |goal| goal <= self.limits.intermediate_states -| self.stats.intermediate_states else false;
         const weighted_top = !grouped and (self.match_weight_demand != null or (projection.limit != null and (projection.order.len != 0 or (self.retain_windows and !small_window) or self.prefixWindow(projection))));
-        const endpoint_local = !count_shortest and operation.paths.len == 1 and path.selector == .all and blk: {
+        const endpoint_local = !count_shortest and operation.paths.len == 1 and blk: {
             // Unordered DISTINCT with a row goal can finish after one route.
             // Preserve that demand rather than capturing the whole closure.
             if (grouped and calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) break :blk false;
@@ -2209,6 +2237,8 @@ const Engine = struct {
             for (pattern.nodes) |node| if (node.alias) |name| try shape.append(self.a, .{ .name = name, .value = .null });
             for (pattern.edges) |edge| if (edge.alias) |name| try shape.append(self.a, .{ .name = name, .value = .null });
             if (pattern.alias) |name| try shape.append(self.a, .{ .name = name, .value = .null });
+            inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(pattern.execution_summary, field)) |name| try shape.append(self.a, .{ .name = name, .value = .null });
+            for (pattern.edges) |edge| if (edge.execution_length) |name| try shape.append(self.a, .{ .name = name, .value = .null });
         }
         var unique_shape: Row = &.{};
         for (shape.items) |entry| unique_shape = try self.replace(unique_shape, entry.name, entry.value);
@@ -2298,6 +2328,8 @@ const Engine = struct {
             for (pattern.nodes) |node| if (node.alias) |alias| try aliases.append(retained, alias);
             for (pattern.edges) |edge| if (edge.alias) |alias| try aliases.append(retained, alias);
             if (pattern.alias) |alias| try aliases.append(retained, alias);
+            inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(pattern.execution_summary, field)) |name| try aliases.append(retained, name);
+            for (pattern.edges) |edge| if (edge.execution_length) |name| try aliases.append(retained, name);
         }
         self.match_aliases = aliases.items;
         self.shortest_fast = true;
@@ -2726,6 +2758,12 @@ const Engine = struct {
             if (operation.optional and rows.items.len == 0) {
                 var extended = input;
                 for (operation.paths) |path| {
+                    inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| {
+                        extended = try self.replace(extended, name, .null);
+                    };
+                    for (path.edges) |edge| if (edge.execution_length) |name| {
+                        extended = try self.replace(extended, name, .null);
+                    };
                     if (path.alias) |alias| if (lookup(extended, alias) == null) {
                         extended = (try self.bind(extended, alias, .null)).?;
                     };
@@ -2752,6 +2790,12 @@ const Engine = struct {
             if (path.alias) |name| {
                 shape = try self.replace(shape, name, .null);
             }
+            inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| {
+                shape = try self.replace(shape, name, .null);
+            };
+            for (path.edges) |edge| if (edge.execution_length) |name| {
+                shape = try self.replace(shape, name, .null);
+            };
         }
         var names: Names = .empty;
         try self.retainQueryReferences(&names, shape, tail);
@@ -3632,6 +3676,7 @@ const Engine = struct {
                     if (!try self.nodeMatches(node, first)) continue;
                     var bound = (try self.bind(rows[0], first.alias, .{ .node = node })) orelse continue;
                     if (path.alias) |alias| bound = (try self.bind(bound, alias, .{ .path = .{ .nodes = try self.a.dupe(*const v.Node, &.{node}), .relationships = &.{} } })) orelse continue;
+                    bound = try self.pathSummaryRow(bound, path, node, node, 0);
                     const candidate = (try self.constrain(.{ .row = bound }, .{ .node = node }, first.properties)) orelse continue;
                     if (!try self.constraintsMatch(candidate.constraints, bound, false)) continue;
                     if (operation.predicate) |predicate| if ((try (try self.eval(predicate, bound, null)).truth()) != true) continue;
@@ -3681,6 +3726,8 @@ const Engine = struct {
             for (path.nodes) |node| if (node.alias) |alias| try aliases.append(self.a, alias);
             for (path.edges) |edge| if (edge.alias) |alias| try aliases.append(self.a, alias);
             if (path.alias) |alias| try aliases.append(self.a, alias);
+            inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| try aliases.append(self.a, name);
+            for (path.edges) |edge| if (edge.execution_length) |name| try aliases.append(self.a, name);
         }
         self.match_aliases = aliases.items;
         var output: std.ArrayList(Row) = .empty;
@@ -3704,6 +3751,12 @@ const Engine = struct {
             if (operation.optional and initial == output.items.len) {
                 var extended = row;
                 for (operation.paths) |path| {
+                    inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| {
+                        extended = try self.replace(extended, name, .null);
+                    };
+                    for (path.edges) |edge| if (edge.execution_length) |name| {
+                        extended = try self.replace(extended, name, .null);
+                    };
                     if (path.alias) |alias| if (lookup(extended, alias) == null) {
                         extended = (try self.bind(extended, alias, .null)).?;
                     };
@@ -4145,6 +4198,7 @@ const Engine = struct {
         return if (@TypeOf(left) == Count) left.multiply(self.a, right) else multiplyPathWays(left, right);
     }
     fn countAllPathsTyped(self: *Engine, comptime W: type, input: MatchState, path: ast.Path, mode: ast.PathMode, starts: []const *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
+        if (starts.len != 1 and (if (path.execution_reversed) path.execution_summary.last != null else path.execution_summary.first != null)) return false;
         if (path.edges.len == 0 or input.used.len != 0 or input.constraints.len != 0 or path.execution_prefix) return false;
         // A bound single-hop endpoint admits a physical pair seek instead of
         // discovering the anchor's complete reachable adjacency.
@@ -4204,6 +4258,10 @@ const Engine = struct {
                 try graph.nodes.append(self.a, .{ .node = start, .depth = 0 });
             }
         }
+        var products: SummaryProducts = .{};
+        if (path.execution_summary.length != null or for (path.edges) |edge| {
+            if (edge.execution_length != null) break true;
+        } else false) graph.products = &products;
         const Counts = std.AutoHashMapUnmanaged(usize, W);
         var current: Counts = .empty;
         var next: Counts = .empty;
@@ -4212,7 +4270,7 @@ const Engine = struct {
         defer next.deinit(self.a);
         defer endpoints.deinit(self.a);
         for (starts) |start| {
-            const entry = try current.getOrPut(self.a, graph.positions.get(start.identity).?);
+            const entry = try current.getOrPut(self.a, if (graph.products != null) try products.intern(self, .{ .node = graph.positions.get(start.identity).? }) else graph.positions.get(start.identity).?);
             entry.value_ptr.* = try self.waysAdd(if (entry.found_existing) entry.value_ptr.* else waysInit(W, 0), waysInit(W, 1));
         }
         var effective_maximum: usize = 0;
@@ -4228,8 +4286,9 @@ const Engine = struct {
                 var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
                 var roots = current.keyIterator();
                 while (roots.next()) |index| {
-                    try seen.put(self.a, index.*, {});
-                    try pending.append(self.a, index.*);
+                    const node = graph.nodeIndex(index.*);
+                    const entry = try seen.getOrPut(self.a, node);
+                    if (!entry.found_existing) try pending.append(self.a, node);
                 }
                 var head: usize = 0;
                 while (head < pending.items.len) : (head += 1) {
@@ -4253,12 +4312,12 @@ const Engine = struct {
                     try self.pathStep(resumed, path, mode, 0, &.{starts[0]}, &.{}, output);
                     return true;
                 }
-                topological = depth.?.order;
+                if (graph.products == null) topological = depth.?.order;
                 break :blk depth.?.maximum;
             };
             effective_maximum = std.math.add(usize, effective_maximum, upper) catch return false;
             if (effective_maximum > self.limits.path_depth) return false;
-            if (topological == null and path.edges.len == 1 and upper > 1 and upper >= starts.len) {
+            if (graph.products == null and topological == null and path.edges.len == 1 and upper > 1 and upper >= starts.len) {
                 // A long-range reduction often covers an entire DAG. Probe
                 // only nodes reachable within the requested upper bound. If
                 // its longest captured route fits, the same linear reduction
@@ -4272,7 +4331,7 @@ const Engine = struct {
                     if (proof.maximum <= upper) topological = proof.order;
                 }
             }
-            if (edge.min_hops == 1 and upper == 1) {
+            if (graph.products == null and edge.min_hops == 1 and upper == 1) {
                 // A fixed transition has no zero-hop acceptance. Apply its
                 // destination admission while transferring weights directly,
                 // without scanning/copying an extra frontier per pattern edge.
@@ -4328,13 +4387,13 @@ const Engine = struct {
                 var candidates = current.iterator();
                 while (candidates.next()) |candidate| {
                     try self.state();
-                    const index = candidate.key_ptr.*;
+                    const index = graph.nodeIndex(candidate.key_ptr.*);
                     const ways = candidate.value_ptr.*;
                     const node = graph.nodes.items[index].node;
                     if (hop >= edge.min_hops and try self.nodeMatches(node, path.nodes[edge_index + 1]) and
                         boundNodeMatches(node, path.nodes[edge_index + 1], input.row) and try self.constantProperties(.{ .node = node }, path.nodes[edge_index + 1].properties, input.row))
                     {
-                        const entry = try endpoints.getOrPut(self.a, index);
+                        const entry = try endpoints.getOrPut(self.a, try graph.acceptedKey(self, candidate.key_ptr.*, path, edge_index, hop));
                         entry.value_ptr.* = try self.waysAdd(if (entry.found_existing) entry.value_ptr.* else waysInit(W, 0), ways);
                     }
                 }
@@ -4346,7 +4405,7 @@ const Engine = struct {
         }
         if (self.component_leaves.len != 0) {
             var final = current.iterator();
-            while (final.next()) |endpoint| endpoint.value_ptr.* = try self.waysMultiply(endpoint.value_ptr.*, try self.branchWays(W, &graph, endpoint.key_ptr.*, path.nodes.len - 1, null, mode));
+            while (final.next()) |endpoint| endpoint.value_ptr.* = try self.waysMultiply(endpoint.value_ptr.*, try self.branchWays(W, &graph, graph.nodeIndex(endpoint.key_ptr.*), path.nodes.len - 1, null, mode));
         }
         // Saturated counts prove COUNT overflow but are not numeric weights.
         // Never approximate SUM/AVG with the overflow sentinel.
@@ -4393,8 +4452,17 @@ const Engine = struct {
             if (self.shortest_count) |count_paths| {
                 count_paths.* = try addPathCount(count_paths.*, waysCap(ways));
             } else {
-                const node = graph.nodes.items[endpoint.key_ptr.*].node;
-                const row = (try self.bind(input.row, path.nodes[path.nodes.len - 1].alias, .{ .node = node })) orelse continue;
+                const node = graph.nodes.items[graph.nodeIndex(endpoint.key_ptr.*)].node;
+                const bound = (try self.bind(input.row, path.nodes[path.nodes.len - 1].alias, .{ .node = node })) orelse continue;
+                var row = try self.pathSummaryRow(bound, path, starts[0], node, if (graph.products != null) products.keys.items[endpoint.key_ptr.*].total else 0);
+                if (graph.products != null) {
+                    var history = products.keys.items[endpoint.key_ptr.*].history;
+                    while (history != 0) {
+                        const entry = products.histories.items[history - 1];
+                        row = try self.lengthRow(row, path.edges[entry.edge].execution_length, entry.hops);
+                        history = entry.parent;
+                    }
+                }
                 if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
                 if (self.weighted_sink) |sink| {
                     // Finite SQL consumers need only the signed-overflow cap;
@@ -4414,6 +4482,17 @@ const Engine = struct {
             }
         }
         return true;
+    }
+    fn lengthRow(self: *Engine, row: Row, alias: ?[]const u8, length: usize) !Row {
+        return if (alias) |name| try self.replace(row, name, .{ .integer = @intCast(length) }) else row;
+    }
+    fn pathSummaryRow(self: *Engine, initial: Row, path: ast.Path, first: *const v.Node, last: *const v.Node, length: usize) !Row {
+        const demand = path.execution_summary;
+        var row = try self.lengthRow(initial, demand.presence, 1);
+        row = try self.lengthRow(row, demand.length, length);
+        if (demand.first) |name| row = try self.replace(row, name, .{ .node = if (path.execution_reversed) last else first });
+        if (demand.last) |name| row = try self.replace(row, name, .{ .node = if (path.execution_reversed) first else last });
+        return row;
     }
     fn sameRelationship(left: *const v.Relationship, right: *const v.Relationship) bool {
         return left.identity.eql(right.identity) and std.mem.eql(u8, left.index, right.index);
@@ -4558,7 +4637,7 @@ const Engine = struct {
         next.clearRetainingCapacity();
         var candidates = current.iterator();
         while (candidates.next()) |candidate| {
-            const index = candidate.key_ptr.*;
+            const index = graph.nodeIndex(candidate.key_ptr.*);
             const ways = candidate.value_ptr.*;
             // Discover adjacency only for reachable product states.
             // In particular, a failed intermediate node predicate must
@@ -4583,7 +4662,7 @@ const Engine = struct {
                     if (!try self.nodeMatches(reached, pattern) or !boundNodeMatches(reached, pattern, graph.input.row) or
                         !try self.constantProperties(.{ .node = reached }, pattern.properties, graph.input.row)) continue;
                 }
-                const entry = try next.getOrPut(self.a, arc.target);
+                const entry = try next.getOrPut(self.a, try graph.movedKey(self, candidate.key_ptr.*, arc.target));
                 const weight = if (source) |pivot| try self.waysMultiply(ways, try self.branchWays(W, graph, index, pivot, relationship, graph.mode)) else ways;
                 entry.value_ptr.* = try self.waysAdd(if (entry.found_existing) entry.value_ptr.* else waysInit(W, 0), weight);
             }
@@ -4594,6 +4673,12 @@ const Engine = struct {
         row: Row,
         include_start: bool = true,
         pub fn permits(self: @This(), name: []const u8) bool {
+            inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(self.path.execution_summary, field)) |alias| {
+                if (std.mem.eql(u8, name, alias)) return true;
+            };
+            for (self.path.edges) |edge| if (edge.execution_length) |alias| {
+                if (std.mem.eql(u8, name, alias)) return true;
+            };
             for ([_]?[]const u8{ if (self.include_start) self.path.nodes[0].alias else null, self.path.nodes[self.path.nodes.len - 1].alias }) |alias|
                 if (alias) |endpoint| if (std.mem.eql(u8, endpoint, name)) return true;
             return lookup(self.row, name) != null;
@@ -4618,6 +4703,12 @@ const Engine = struct {
         for (path.nodes, 0..) |node, index| if (node.alias) |alias| {
             if (lookup(shape, alias) == null) shape = try self.replace(shape, alias, .{ .boolean = index == 0 or index + 1 == path.nodes.len });
         };
+        inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| {
+            shape = try self.replace(shape, name, .{ .boolean = true });
+        };
+        for (path.edges) |edge| if (edge.execution_length) |name| {
+            shape = try self.replace(shape, name, .{ .boolean = true });
+        };
         for (path.edges) |edge| if (edge.alias) |alias| {
             if (lookup(shape, alias) == null) shape = try self.replace(shape, alias, .{ .boolean = false });
         };
@@ -4635,6 +4726,12 @@ const Engine = struct {
                 if (lookup(result, alias)) |known| {
                     if (!known.boolean) return null;
                 } else result = try self.replace(result, alias, .{ .boolean = true });
+            };
+            inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| {
+                result = try self.replace(result, name, .{ .boolean = true });
+            };
+            for (path.edges) |edge| if (edge.execution_length) |name| {
+                result = try self.replace(result, name, .{ .boolean = true });
             };
             for (path.edges) |edge| if (edge.alias) |alias| {
                 if (lookup(result, alias)) |known| {
@@ -4697,6 +4794,12 @@ const Engine = struct {
         for (row) |entry| shape = try self.replace(shape, entry.name, .{ .boolean = true });
         for (path.nodes, 0..) |node, i| if (node.alias) |alias| {
             if (lookup(shape, alias) == null) shape = try self.replace(shape, alias, .{ .boolean = (i == 0 and include_start) or i == path.nodes.len - 1 });
+        };
+        inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| if (@field(path.execution_summary, field)) |name| {
+            shape = try self.replace(shape, name, .{ .boolean = true });
+        };
+        for (path.edges) |edge| if (edge.execution_length) |name| {
+            shape = try self.replace(shape, name, .{ .boolean = true });
         };
         for (path.edges) |edge| if (edge.alias) |alias| {
             if (lookup(shape, alias) == null) shape = try self.replace(shape, alias, .{ .boolean = false });
@@ -4886,7 +4989,7 @@ const Engine = struct {
         return score;
     }
     fn batchEligible(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause) !bool {
-        if (path.selector != .all or path.edges.len == 0 or path.execution_prefix) return false;
+        if (path.selector != .all or path.edges.len == 0 or path.execution_prefix or (if (path.execution_reversed) path.execution_summary.last != null else path.execution_summary.first != null)) return false;
         if (path.nodes[0].alias) |alias| if (lookup(row, alias) != null) return false;
         for (path.nodes) |node| for (node.properties) |entry| if (self.constant(entry.value, row) == null) return false;
         for (path.edges) |edge| for (edge.properties) |entry| if (self.constant(entry.value, row) == null) return false;
@@ -4957,7 +5060,7 @@ const Engine = struct {
         return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
     }
     const RoutePruner = struct {
-        const Key = struct { node: usize, edge: usize, hop: u32 };
+        const Key = struct { node: usize, edge: usize, hop: u32, summary: usize = 0 };
         const Frame = struct { key: Key, children: []const Key, next: usize = 0 };
         const Admission = struct { possible: bool, generation: usize };
         a: A,
@@ -4975,6 +5078,12 @@ const Engine = struct {
         segment_depths: ?[]std.ArrayList(?usize) = null,
         depth_attempted: bool = false,
         frames_built: usize = 0,
+        products: SummaryProducts = .{},
+        fn needsHops(self: *@This()) bool {
+            if (self.path.execution_summary.length != null) return true;
+            for (self.path.edges) |edge| if (edge.execution_length != null) return true;
+            return false;
+        }
         fn activate(self: *@This(), engine: *Engine) anyerror!void {
             if (self.attempted) return;
             self.attempted = true;
@@ -5012,6 +5121,7 @@ const Engine = struct {
         }
         fn prepareDepth(self: *@This(), engine: *Engine) anyerror!void {
             self.depth_attempted = true;
+            if (self.needsHops()) return;
             if (self.path.edges.len != 1) {
                 // Segment domains retain independent geometry. Postorder
                 // completion proves closed acyclic suffixes from captures
@@ -5127,7 +5237,7 @@ const Engine = struct {
             self.path.edges = edges;
             return true;
         }
-        fn admits(self: *@This(), engine: *Engine, identity: v.Identity, edge: usize, hop: u32) anyerror!bool {
+        fn admits(self: *@This(), engine: *Engine, identity: v.Identity, edge: usize, hop: u32, row: Row, total: usize) anyerror!bool {
             const scope = EvalScope.enter(engine, self.a);
             defer scope.leave(engine);
             const node = self.graph.positions.get(identity) orelse blk: {
@@ -5137,7 +5247,19 @@ const Engine = struct {
                 try self.graph.nodes.append(self.a, .{ .node = captured, .depth = 0 });
                 break :blk position;
             };
-            const key: Key = .{ .node = node, .edge = edge, .hop = hop };
+            var summary: usize = 0;
+            if (self.needsHops()) {
+                summary = try self.products.intern(engine, .{ .node = 0 });
+                for (self.path.edges[0..edge], 0..) |segment, index| if (segment.execution_length) |alias| {
+                    const length = lookup(row, alias) orelse return true;
+                    if (length != .integer or length.integer < 0) return true;
+                    summary = try self.products.accepted(engine, summary, self.path, index, @intCast(length.integer));
+                };
+                var prefix = self.products.keys.items[summary];
+                prefix.total = if (self.path.execution_summary.length != null) total - hop else 0;
+                summary = try self.products.intern(engine, prefix);
+            }
+            const key: Key = .{ .node = node, .edge = edge, .hop = hop, .summary = summary };
             if (self.get(key)) |result| return result;
             const previous_graph = engine.lower_graph;
             engine.lower_graph = null;
@@ -5183,7 +5305,17 @@ const Engine = struct {
             var children: std.ArrayList(Key) = .empty;
             if (key.hop >= edge.min_hops and try engine.nodeMatches(node, pattern) and boundNodeMatches(node, pattern, self.row) and try engine.constantProperties(.{ .node = node }, pattern.properties, self.row)) {
                 if (key.edge + 1 == self.path.edges.len) {
-                    const row = (try engine.bind(self.row, pattern.alias, .{ .node = node })) orelse return .{ .key = key, .children = &.{} };
+                    const endpoint_row = (try engine.bind(self.row, pattern.alias, .{ .node = node })) orelse return .{ .key = key, .children = &.{} };
+                    var row = try engine.pathSummaryRow(endpoint_row, self.path, self.start.?, node, if (self.needsHops()) self.products.keys.items[key.summary].total + key.hop else 0);
+                    if (self.needsHops()) {
+                        var history = self.products.keys.items[key.summary].history;
+                        while (history != 0) {
+                            const entry = self.products.histories.items[history - 1];
+                            row = try engine.lengthRow(row, self.path.edges[entry.edge].execution_length, entry.hops);
+                            history = entry.parent;
+                        }
+                        row = try engine.lengthRow(row, edge.execution_length, key.hop);
+                    }
                     // A speculative expression error makes this suffix unknown,
                     // never empty. Its error is observed only if DFS reaches it.
                     const accepted = self.accepts(engine, row) catch |err| switch (err) {
@@ -5194,13 +5326,13 @@ const Engine = struct {
                         try self.put(engine, key, true);
                         return .{ .key = key, .children = &.{} };
                     }
-                } else try children.append(self.a, .{ .node = key.node, .edge = key.edge + 1, .hop = 0 });
+                } else try children.append(self.a, .{ .node = key.node, .edge = key.edge + 1, .hop = 0, .summary = if (self.needsHops()) try self.products.accepted(engine, key.summary, self.path, key.edge, key.hop) else 0 });
             }
             if (key.hop < edge.max_hops.?) {
                 const range = try engine.loadLowerDomain(&self.graph, key.node, key.edge);
                 for (self.graph.nodes.items[key.node].arcs.items[range.first..range.last]) |arc| {
                     try engine.state();
-                    if (try engine.constantProperties(.{ .relationship = arc.relationship }, edge.properties, self.row)) try children.append(self.a, .{ .node = arc.target, .edge = key.edge, .hop = key.hop + 1 });
+                    if (try engine.constantProperties(.{ .relationship = arc.relationship }, edge.properties, self.row)) try children.append(self.a, .{ .node = arc.target, .edge = key.edge, .hop = key.hop + 1, .summary = key.summary });
                 }
             }
             return .{ .key = key, .children = children.items };
@@ -5215,7 +5347,45 @@ const Engine = struct {
     const BranchKey = struct { node: usize, pivot: usize };
     const BranchFactorKey = struct { branch: BranchKey, excluded: u16 };
     const BranchChoices = struct { sets: []const []const *const v.Relationship, eligibility: v.EntityMap(u16) };
+    const SummaryProducts = struct {
+        const Key = struct { node: usize, total: usize = 0, history: usize = 0 };
+        const History = struct { parent: usize, edge: usize, hops: usize };
+        keys: std.ArrayList(Key) = .empty,
+        index: std.AutoHashMapUnmanaged(Key, usize) = .empty,
+        histories: std.ArrayList(History) = .empty,
+        history_index: std.AutoHashMapUnmanaged(History, usize) = .empty,
+        fn intern(self: *@This(), engine: *Engine, key: Key) !usize {
+            const entry = try self.index.getOrPut(engine.a, key);
+            if (!entry.found_existing) {
+                try engine.state();
+                entry.value_ptr.* = self.keys.items.len;
+                try self.keys.append(engine.a, key);
+            }
+            return entry.value_ptr.*;
+        }
+        fn moved(self: *@This(), engine: *Engine, key: usize, node: usize) !usize {
+            var next = self.keys.items[key];
+            next.node = node;
+            return self.intern(engine, next);
+        }
+        fn accepted(self: *@This(), engine: *Engine, key: usize, path: ast.Path, edge: usize, hops: usize) !usize {
+            var next = self.keys.items[key];
+            if (path.execution_summary.length != null) next.total += hops;
+            if (path.edges[edge].execution_length != null) {
+                const history: History = .{ .parent = next.history, .edge = edge, .hops = hops };
+                const entry = try self.history_index.getOrPut(engine.a, history);
+                if (!entry.found_existing) {
+                    try engine.state();
+                    entry.value_ptr.* = self.histories.items.len + 1;
+                    try self.histories.append(engine.a, history);
+                }
+                next.history = entry.value_ptr.*;
+            }
+            return self.intern(engine, next);
+        }
+    };
     const LowerGraph = struct {
+        products: ?*SummaryProducts = null,
         nodes: std.ArrayList(LowerNode) = .empty,
         positions: std.HashMapUnmanaged(v.Identity, usize, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
         input: MatchState,
@@ -5228,6 +5398,15 @@ const Engine = struct {
         probing: bool = false,
         probe_matches: bool = false,
         first_only: bool = false,
+        fn nodeIndex(self: *const @This(), key: usize) usize {
+            return if (self.products) |products| products.keys.items[key].node else key;
+        }
+        fn movedKey(self: *@This(), engine: *Engine, key: usize, node: usize) !usize {
+            return if (self.products) |products| products.moved(engine, key, node) else node;
+        }
+        fn acceptedKey(self: *@This(), engine: *Engine, key: usize, path: ast.Path, edge: usize, hops: usize) !usize {
+            return if (self.products) |products| products.accepted(engine, key, path, edge, hops) else key;
+        }
     };
     fn accountEdges(self: *Engine, page: backend_mod.Page(*const v.Relationship)) !void {
         const examined = page.examined orelse page.items.len;
@@ -5412,7 +5591,7 @@ const Engine = struct {
         @memset(degree, 0);
         @memset(depth, null);
         var initial = starts.keyIterator();
-        while (initial.next()) |index| depth[index.*] = 0;
+        while (initial.next()) |index| depth[graph.nodeIndex(index.*)] = 0;
         for (graph.nodes.items) |node| if (node.domains.get(domain)) |range| {
             for (node.arcs.items[range.first..range.last]) |arc| {
                 try self.state();
@@ -5606,6 +5785,20 @@ const Engine = struct {
             }
         }
     }
+    fn foldShortestSummary(self: *Engine, input: MatchState, path: ast.Path, start: *const v.Node, node: *const v.Node, depth: usize, ways: u64) anyerror!bool {
+        if (!self.count_endpoints or ways == std.math.maxInt(u64)) return false;
+        const bound = (try self.bind(input.row, path.nodes[1].alias, .{ .node = node })) orelse return true;
+        var row = try self.pathSummaryRow(bound, path, start, node, depth);
+        row = try self.lengthRow(row, path.edges[0].execution_length, depth);
+        if (!try self.constraintsMatch(input.constraints, row, false)) return true;
+        if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) return true;
+        const fold = self.stream_fold.?;
+        const weight = fold.weight;
+        defer fold.weight = weight;
+        fold.weight = try weight.multiply(fold.retained, Count.init(if (path.selector == .shortest) 1 else ways));
+        try fold.add(self, row);
+        return true;
+    }
     const BreadthKey = struct {
         identity: v.Identity,
         branch: usize,
@@ -5656,7 +5849,7 @@ const Engine = struct {
                                 const ways: u64 = if (path.selector == .shortest) 1 else current.ways;
                                 count_paths.* = std.math.add(u64, count_paths.*, ways) catch return error.CypherNumericOverflow;
                                 if (count_paths.* > std.math.maxInt(i64)) return error.CypherNumericOverflow;
-                            } else {
+                            } else if (!try self.foldShortestSummary(constrained, path, start, current.node, current.depth, current.ways)) {
                                 var endpoint_arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
                                 defer endpoint_arena.deinit();
                                 const endpoint_scope = if (self.stream_fold != null or self.shortest_count != null) EvalScope.enter(self, endpoint_arena.allocator()) else null;
@@ -5762,7 +5955,7 @@ const Engine = struct {
         const edge_value = try self.routeEdgeValue(path, edge, values, relationships);
         if (try self.bind(input.row, edge.alias, edge_value)) |bound| {
             var completed = input;
-            completed.row = bound;
+            completed.row = try self.lengthRow(bound, edge.execution_length, relationships.len);
             try self.pathStep(completed, path, mode, 1, nodes, relationships, output);
         }
     }
@@ -5785,7 +5978,8 @@ const Engine = struct {
                 std.mem.reverse(*const v.Node, @constCast(matched_path.nodes));
                 std.mem.reverse(*const v.Relationship, @constCast(matched_path.relationships));
             }
-            const row = (try self.bind(input.row, path.alias, .{ .path = matched_path })) orelse return;
+            const path_row = (try self.bind(input.row, path.alias, .{ .path = matched_path })) orelse return;
+            const row = try self.pathSummaryRow(path_row, path, nodes[0], nodes[nodes.len - 1], relationships.len);
             if (!try self.constraintsMatch(input.constraints, row, true)) return;
             var paths = input.paths;
             if (self.collect_match_paths) {
@@ -5835,12 +6029,12 @@ const Engine = struct {
     fn expandPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, edge_index: usize, nodes: []const *const v.Node, relationships: []const *const v.Relationship, hops: u32, edge_values: []const v.Value, output: *std.ArrayList(MatchState)) anyerror!void {
         const edge = path.edges[edge_index];
         const current = nodes[nodes.len - 1];
-        if (self.route_pruner) |pruner| if (pruner.active and pruner.path.nodes.ptr == path.nodes.ptr and !try pruner.admits(self, current.identity, edge_index, hops)) return;
+        if (self.route_pruner) |pruner| if (pruner.active and pruner.path.nodes.ptr == path.nodes.ptr and !try pruner.admits(self, current.identity, edge_index, hops, input.row, relationships.len)) return;
         if (hops >= edge.min_hops and try self.nodeMatches(current, path.nodes[edge_index + 1])) {
             if (try self.bind(input.row, path.nodes[edge_index + 1].alias, .{ .node = current })) |node_row| {
                 const edge_value = try self.routeEdgeValue(path, edge, edge_values, relationships);
                 if (try self.bind(node_row, edge.alias, edge_value)) |edge_row| {
-                    if (try self.constrain(.{ .row = edge_row, .used = input.used, .paths = input.paths, .constraints = input.constraints }, .{ .node = current }, path.nodes[edge_index + 1].properties)) |candidate|
+                    if (try self.constrain(.{ .row = try self.lengthRow(edge_row, edge.execution_length, hops), .used = input.used, .paths = input.paths, .constraints = input.constraints }, .{ .node = current }, path.nodes[edge_index + 1].properties)) |candidate|
                         try self.pathStep(candidate, path, mode, edge_index + 1, nodes, relationships, output);
                 }
             }

@@ -54,6 +54,7 @@ pub const Procedure = struct { name: []const u8, args: []const *const Expr, yiel
 pub const Branch = struct { condition: *const Expr, value: *const Expr };
 pub const Node = struct { span: Span, alias: ?[]const u8, labels: []const []const u8, properties: []const Entry };
 pub const Edge = struct {
+    execution_length: ?[]const u8 = null,
     span: Span,
     alias: ?[]const u8 = null,
     types: []const []const u8 = &.{},
@@ -63,7 +64,8 @@ pub const Edge = struct {
     max_hops: ?u32 = 1,
     variable_length: bool = false,
 };
-pub const Path = struct { span: Span, alias: ?[]const u8, nodes: []const Node, edges: []const Edge, selector: enum { all, shortest, all_shortest } = .all, execution_reversed: bool = false, execution_prefix: bool = false };
+pub const PathSummary = struct { presence: ?[]const u8 = null, length: ?[]const u8 = null, first: ?[]const u8 = null, last: ?[]const u8 = null };
+pub const Path = struct { execution_summary: PathSummary = .{}, span: Span, alias: ?[]const u8, nodes: []const Node, edges: []const Edge, selector: enum { all, shortest, all_shortest } = .all, execution_reversed: bool = false, execution_prefix: bool = false };
 pub const Match = struct { paths: []const Path, optional: bool = false, predicate: ?*const Expr = null, mode: PathMode = .relationship_simple };
 pub const Item = struct { expression: *const Expr, alias: ?[]const u8 = null };
 pub const Order = struct { expression: *const Expr, descending: bool = false };

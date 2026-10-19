@@ -2668,3 +2668,48 @@ test "continuation presence memo and intermediate DISTINCT release allocation fa
     };
     inline for (0..4) |kind| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as(u2, kind)});
 }
+
+test "path summaries preserve zero hop null scope and observable identities" {
+    try check("MATCH p=(a:Document {id:'a'})-[rs:CITES*0..0]->(b) RETURN length(p),size(rs),size(nodes(p)),head(nodes(p)).id,last(nodes(p)).id", "[[0,0,1,\"a\",\"a\"]]");
+    try check("OPTIONAL MATCH p=(a:Document {id:'absent'})-[:CITES]->(b) RETURN count(p),count(*)", "[[0,1]]");
+    try check("OPTIONAL MATCH p=(a:Document {id:'absent'})-[:CITES]->(b) RETURN length(p),head(nodes(p)),last(nodes(p)),size(nodes(p))", "[[null,null,null,null]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN count(DISTINCT p),sum(length(p))", "[[2,2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN [p IN [null] | length(p)],length(p)", "[[[null],1],[[null],1]]");
+    try check("CALL { MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN p AS q } RETURN length(q)", "[[1],[1]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) WITH p AS q RETURN length(q)", "[[1],[1]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN nodes(p)[0].id,nodes(p)[-1].id,length(p)", "[[\"a\",\"b\",1],[\"a\",\"b\",1]]");
+}
+
+test "path summary planning and product states release every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var fixed: FixedAllocation = .{ .backing = backing };
+            const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH REPEATABLE ELEMENTS p=(a:Document {id:'a'})-[rs:CITES*0..3]->(b) WITH p AS q,rs AS xs RETURN length(q),size(xs),count(*) ORDER BY length(q)", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 4), result.rows.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "private path summary bindings never enter wildcard result schemas" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[:CITES]->(b) WITH p AS q RETURN *,length(q) AS n", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.columns.len);
+    try std.testing.expectEqualStrings("q", result.columns[0]);
+    try std.testing.expectEqualStrings("n", result.columns[1]);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    for (result.rows) |row| {
+        try std.testing.expectEqual(@as(usize, 1), row[0].path.relationships.len);
+        try std.testing.expectEqual(@as(i64, 1), row[1].integer);
+    }
+}

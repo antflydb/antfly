@@ -1589,6 +1589,23 @@ a finite bound before quotienting. Speculative predicate errors mark a suffix un
 rather than exposing errors early. Constant residuals, read authority and
 statement budgets remain mandatory; unproved shapes retain
 the ordinary producer. First successful rows keep lazy traversal.
+Path demand analysis lowers scalar consumers before planning read-only statements
+and SQL pull cursors. Non-null path counts need no path identity; length, node
+and relationship cardinality, segment-list sizes and certified first/last node
+accessors use execution-only bindings. WITH aliases carry these bindings, while
+public wildcard projections expand from their original visible scope. Private
+names cannot collide with user names. Full path values, DISTINCT path identity,
+shadowed lexical variables and unsupported nested expressions retain their
+ordinary semantics and full-value dependencies.
+When lengths are observable, traversal products retain total hop counts and
+interned observed segment lengths alongside graph identity. Geometry captures
+remain shared, and unobserved length dimensions do not enter the state key.
+Distance layers cannot be quotiented away when their lengths affect output.
+Adaptive presence probes carry the same summary prefix, preserving finite-window
+DFS order. Proved shortest-path frontiers can fold endpoint/length bags without
+expanding their equivalent route histories; saturated or unproved histories
+retain ordinary execution. These bindings also participate in OPTIONAL null
+extension, profiling scope, quota accounting and allocation-failure cleanup.
 Intermediate ordered projections negotiate a weighted stage plan. DISTINCT
 collapses bindings before sorting and handing the ordered bag to downstream
 stages, without materializing the route multiplicity or removing observable

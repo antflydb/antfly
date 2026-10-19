@@ -2947,3 +2947,71 @@ def test_barrier_calls_and_ordered_distinct_bound_upstream_routes(graph_db):
     ):
         with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
             db.cypher_json("g", {"query": base + tail})
+
+
+def test_path_summaries_keep_route_multiplicity_compressed(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    base = "MATCH p=(s:D {id:'start'})-[rs:R*32..32]->(b:D) "
+    for tail, expected in (
+        ("RETURN count(p)", [[str(2**32)]]),
+        ("RETURN sum(length(p))", [[str(32 * 2**32)]]),
+        ("RETURN DISTINCT length(p)", [["32"]]),
+        ("WHERE length(p)=33 RETURN b.score LIMIT 1", []),
+        ("RETURN DISTINCT last(nodes(p)).score", [["32"]]),
+        ("RETURN DISTINCT nodes(p)[-1].score,head(nodes(p)).score", [["32", "0"]]),
+        ("RETURN DISTINCT size(rs),size(nodes(p)),size(relationships(p))", [["32", "33", "32"]]),
+        ("WITH p AS q RETURN sum(length(q))", [[str(32 * 2**32)]]),
+        ("WITH rs AS xs RETURN sum(size(xs))", [[str(32 * 2**32)]]),
+        ("WITH * RETURN DISTINCT length(p)", [["32"]]),
+    ):
+        result = db.cypher_json(
+            "g", {"query": base + tail, "limits": {"explored_edges": 1000, "intermediate_states": 20000}}
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected, tail
+
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH p=(s:D {id:'start'})-[:R*0..32]->(b:D) RETURN length(p) AS hops,count(p) ORDER BY hops",
+            "limits": {"explored_edges": 1000, "intermediate_states": 30000},
+        },
+    )
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [[str(i), str(2**i)] for i in range(33)]
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH p=(s:D {id:'start'})-[a:R*0..8]->()-[b:R*0..8]->(t:D) RETURN size(a) AS x,size(b) AS y,length(p) AS n,count(*) ORDER BY x,y",
+            "limits": {"explored_edges": 1000, "intermediate_states": 50000},
+        },
+    )
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [
+        [str(x), str(y), str(x + y), str(2 ** (x + y))] for x in range(9) for y in range(9)
+    ]
+    for selector in ("shortestPath", "allShortestPaths"):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH p={selector}((s:D {{id:'start'}})-[:R*32..32]->(b:D)) RETURN sum(length(p))",
+                "limits": {"explored_edges": 1000, "intermediate_states": 20000},
+            },
+        )
+        assert result["rows"][0][0]["value"] == str(64 if selector == "shortestPath" else 32 * 2**32)
+
+    # Reversing an anchor must retain the physical root's identity whenever
+    # that logical endpoint is observed, including across seed batches.
+    prefix = "MATCH p=(a:D)-[:R*1..4]->(b:D) WHERE b.score=32 "
+    for node, accessor in (("a", "head(nodes(p))"), ("b", "last(nodes(p))")):
+        control = db.cypher_json(
+            "g", {"query": prefix + f"RETURN antfly.documentKey({node}) AS id,count(*) ORDER BY id"}
+        )
+        summary = db.cypher_json(
+            "g", {"query": prefix + f"RETURN antfly.documentKey({accessor}) AS id,count(*) ORDER BY id"}
+        )
+        assert summary["rows"] == control["rows"]
+
+    for aggregate, expected in (("count(*)", str(2**32)), ("sum(q.hops)", str(32 * 2**32))):
+        result = db.sql(
+            f"SELECT {aggregate} FROM GRAPH_TABLE(g MATCH p=(s IS D)-[rs IS R*32]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS hops)) q"
+        )
+        assert result["rows"] == [[expected]]
