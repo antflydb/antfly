@@ -2516,7 +2516,7 @@ pub const LoadedModel = struct {
     chunk_planning: ?ChunkPlanningSnapshot = null,
     resolution_revision: ?[32]u8 = null,
     embedding_identity: ?[64]u8 = null,
-    embedding_asset_signature: ?[32]u8 = null,
+    embedding_validation: ?@import("../models/embedding_gemma2_identity.zig").SnapshotValidation = null,
     embedding_identity_mutex: std.atomic.Mutex = .unlocked,
     embedding_execution_lane: execution_control_mod.ExecutionLane = .{},
     manifest: manifest_mod.ModelManifest,
@@ -2631,22 +2631,10 @@ pub const LoadedModel = struct {
 
     pub fn verifyEmbeddingIdentityWithControl(self: *const LoadedModel, control: InferenceExecutionControl) !void {
         const mutable = @constCast(self);
-        try control.lock(&mutable.embedding_identity_mutex);
-        const expected = self.embedding_asset_signature;
-        mutable.embedding_identity_mutex.unlock();
-        const before = expected orelse return;
+        try control.check();
+        const validation = if (mutable.embedding_validation) |*value| value else return;
         const identity = @import("../models/embedding_gemma2_identity.zig");
-        const actual = identity.signature(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?) catch |err| switch (err) {
-            // A directory publication can briefly replace path components.
-            // Keep that race retryable instead of failing a document forever.
-            error.FileNotFound, error.NotDir => return error.ResourceTemporarilyUnavailable,
-            else => return err,
-        };
-        if (std.mem.eql(u8, &before, &actual)) return;
-        // Hard links and atomic publication can change metadata without
-        // changing executable bytes. Revalidate content for the new signature,
-        // then restore the cheap warm check without weakening mutation guards.
-        const snapshot = identity.snapshotCached(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?, control) catch |err| {
+        const snapshot = validation.refresh(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?, control) catch |err| {
             // An unstable filesystem snapshot does not prove this loaded
             // runtime is stale. Preserve it and retry publication instead of
             // forcing a second resident session under backfill memory pressure.
@@ -2660,12 +2648,7 @@ pub const LoadedModel = struct {
             }
         };
         const digest = identity.forBackend(snapshot.digest, self.session.backend());
-        if (self.embedding_identity) |loaded| if (std.mem.eql(u8, &loaded, &digest)) {
-            try control.lock(&mutable.embedding_identity_mutex);
-            mutable.embedding_asset_signature = snapshot.signature;
-            mutable.embedding_identity_mutex.unlock();
-            return;
-        };
+        if (self.embedding_identity) |loaded| if (std.mem.eql(u8, &loaded, &digest)) return;
         // Active handles retain rejected assets until they unwind; later
         // calls reload instead of reusing a permanently stale generation.
         self.model_manager.retireLoadedModel(mutable);
@@ -8052,7 +8035,7 @@ pub const ModelManager = struct {
             .chunk_planning = try chunkPlanningSnapshot(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision),
             .resolution_revision = resolution_revision,
             .embedding_identity = if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
-            .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
+            .embedding_validation = if (embedding_snapshot) |snapshot| .{ .value = snapshot } else null,
             .manifest = man,
             .hf_tok = hf_tok,
             .sp_tok = sp_tok,
@@ -14135,7 +14118,7 @@ test "chunk planning survives metadata-only re-pulls and rejects changed tokeniz
 test "embedding identity validation without asset signatures remains cancellable and performs no discovery" {
     var model: LoadedModel = undefined;
     model.embedding_identity_mutex = .unlocked;
-    model.embedding_asset_signature = null;
+    model.embedding_validation = null;
     // Other fields deliberately have no valid allocator, paths or session:
     // models without an asset signature must stay on the metadata-free path.
     try model.verifyEmbeddingIdentityWithControl(.{});

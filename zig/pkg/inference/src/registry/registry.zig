@@ -576,15 +576,15 @@ pub const ModelRegistry = struct {
         // needlessly invalidates a loaded model's coherency signature.
         if (tasks_csv == null and capabilities_csv == null) {
             const cached = if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, &bundle.artifacts(), progress_sink)
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, &bundle.artifacts(), hub_config, progress_sink)
             else if (qwen3vl_catalog.findGenerationSafetensorsBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, &bundle.artifacts(), progress_sink)
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, &bundle.artifacts(), hub_config, progress_sink)
             else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), progress_sink)
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), hub_config, progress_sink)
             else if (embedding_gemma2_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), progress_sink)
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), hub_config, progress_sink)
             else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
-                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), progress_sink)
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, bundle.artifacts(), hub_config, progress_sink)
             else
                 false;
             if (cached) {
@@ -681,6 +681,7 @@ pub const ModelRegistry = struct {
             );
         }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
+        try download.validateManagedDownloadLimits(self.allocator, io, transaction.staging, hub_config);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
 
         // Gemma4 QAT gguf checkpoints ship a sibling MTP assistant repo that

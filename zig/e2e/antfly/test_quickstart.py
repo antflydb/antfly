@@ -20,6 +20,7 @@ import os
 import subprocess
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -2437,13 +2438,18 @@ def test_embeddinggemma2_quickstart_foreground_and_repull_during_backfill(
     api.create_table(table, num_shards=1)
     api.create_index(table, index, config)
 
+    model_dir = embeddinggemma2_model_available
+    models_dir = str(model_dir.parent.parent)
     env = os.environ.copy()
     env["ANTFLY_URL"] = server.url
     env.pop("ANTFLY_TOKEN", None)
 
     def cli(*args):
+        command = [server.binary, *args]
+        if args[:2] == ("inference", "pull"):
+            command.extend(["--models-dir", models_dir])
         result = subprocess.run(
-            [server.binary, *args], env=env, text=True, capture_output=True, timeout=120
+            command, env=env, text=True, capture_output=True, timeout=120
         )
         assert result.returncode == 0, result.stdout + result.stderr
         return result.stdout
@@ -2524,15 +2530,49 @@ def test_embeddinggemma2_quickstart_foreground_and_repull_during_backfill(
         require_active()
         foreground_query(sequence)
 
-    model_dir = embeddinggemma2_model_available
     watched = [model_dir / "model.safetensors", model_dir / "model_manifest.json"]
     before = [
         (p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in watched
     ]
+    # Cached pulls must enforce the same limits as staged pulls. Use the
+    # actual CLI and pin its cache path so a fallback download cannot hide this.
+    for flag, expected_error in (
+        ("--max-model-bytes", "ModelSizeLimitExceeded"),
+        ("--max-artifact-bytes", "DownloadSizeLimitExceeded"),
+    ):
+        rejected = subprocess.run(
+            [
+                server.binary,
+                "inference",
+                "pull",
+                f"hf:{EMBEDDINGGEMMA2_MODEL}",
+                "--models-dir",
+                models_dir,
+                flag,
+                "1",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        assert rejected.returncode != 0, rejected.stdout + rejected.stderr
+        assert expected_error in rejected.stdout + rejected.stderr
+    assert [
+        (p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in watched
+    ] == before, "rejected cached pull mutated live artifacts"
+
     # The normal pinned re-pull must preserve the live installation, even its
     # metadata: an otherwise harmless hard link used to poison every next call.
     pull = subprocess.Popen(
-        [server.binary, "inference", "pull", f"hf:{EMBEDDINGGEMMA2_MODEL}"],
+        [
+            server.binary,
+            "inference",
+            "pull",
+            f"hf:{EMBEDDINGGEMMA2_MODEL}",
+            "--models-dir",
+            models_dir,
+        ],
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -2563,6 +2603,16 @@ def test_embeddinggemma2_quickstart_foreground_and_repull_during_backfill(
     )
     require_active()
     foreground_query("after-staged-pull")
+    # All requests encounter the same metadata-only invalidation. The native
+    # regression counts snapshot executions; this checks the public path stays
+    # usable concurrently while indexing, without timing-dependent assertions.
+    link = model_dir / f".quickstart-validation-{time.time_ns()}"
+    try:
+        os.link(model_dir / "model.safetensors", link)
+    finally:
+        link.unlink(missing_ok=True)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(foreground_query, (f"revalidation-{i}" for i in range(8))))
     # Omitting dimension forces the live validation probe through the same
     # supervised native worker while the original index is still backfilling.
     image_config = dict(sample["thumbnail"])

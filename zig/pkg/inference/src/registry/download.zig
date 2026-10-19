@@ -1272,6 +1272,23 @@ fn removeTreeIfExists(dir: std.Io.Dir, io: std.Io, path: []const u8) !void {
     try dir.deleteTree(io, path);
 }
 
+/// One policy for selected artifacts, whether newly staged or already cached.
+/// Synthetic descriptors and generated manifests count toward the same limits.
+fn validateArtifactLimits(artifacts: anytype, extra_bytes: u64, config: HubConfig) !void {
+    if (config.max_artifact_bytes == 0 or config.max_model_bytes == 0) return error.InvalidDownloadSizeLimit;
+    var total: u64 = extra_bytes;
+    for (artifacts) |artifact| total = std.math.add(u64, total, artifact.size) catch return error.ModelSizeLimitExceeded;
+    if (total > config.max_model_bytes) return error.ModelSizeLimitExceeded;
+    if (extra_bytes > config.max_artifact_bytes) return error.DownloadSizeLimitExceeded;
+    for (artifacts) |artifact| if (artifact.size > config.max_artifact_bytes) return error.DownloadSizeLimitExceeded;
+}
+
+pub fn validateManagedDownloadLimits(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, config: HubConfig) !void {
+    var plan = try managed_receipt.loadValidatedPlan(allocator, io, directory);
+    defer plan.deinit();
+    try validateArtifactLimits(plan.artifacts, 0, config);
+}
+
 /// Reuse only a fully verified, immutable catalog bundle. Mutable Hub refs
 /// still resolve metadata and go through the publication transaction.
 /// Checking hashes here also repairs same-size local corruption on re-pull.
@@ -1280,6 +1297,7 @@ pub fn installedPinnedBundleMatches(
     io: std.Io,
     directory: []const u8,
     artifacts: []const qwen3vl_catalog.Artifact,
+    config: HubConfig,
     progress: ProgressSink,
 ) !bool {
     var receipt = managed_receipt.loadValidated(allocator, io, directory) catch |err| switch (err) {
@@ -1288,6 +1306,7 @@ pub fn installedPinnedBundleMatches(
     } orelse return false;
     defer receipt.deinit();
     if (receipt.artifacts.len != artifacts.len + 1 or receipt.find("model_manifest.json") == null) return false;
+    try validateArtifactLimits(receipt.artifacts, 0, config);
     for (artifacts) |expected| {
         const actual = receipt.find(expected.path) orelse return false;
         if (actual.size != expected.size) return false;
@@ -1731,17 +1750,7 @@ fn downloadPinnedQwenBundleArtifacts(
     config: HubConfig,
     progress: ProgressSink,
 ) !void {
-    if (config.max_artifact_bytes == 0 or config.max_model_bytes == 0) return error.InvalidDownloadSizeLimit;
-    var installed_bytes: u64 = 0;
-    for (artifacts) |artifact| {
-        installed_bytes = std.math.add(u64, installed_bytes, artifact.size) catch
-            return error.ModelSizeLimitExceeded;
-    }
-    if (generated_bundle_manifest) |manifest| {
-        installed_bytes = std.math.add(u64, installed_bytes, manifest.len) catch
-            return error.ModelSizeLimitExceeded;
-    }
-    if (installed_bytes > config.max_model_bytes) return error.ModelSizeLimitExceeded;
+    try validateArtifactLimits(artifacts, if (generated_bundle_manifest) |manifest| manifest.len else 0, config);
 
     try std.Io.Dir.cwd().createDirPath(io, dest_dir);
     var receipts = std.ArrayListUnmanaged(ManagedArtifactReceipt).empty;
@@ -5467,13 +5476,20 @@ test "pinned bundle re-pull verifies bytes without mutating the live installatio
     const path = try managedPath(a, directory, "model.gguf");
     defer a.free(path);
     const artifacts = [_]qwen3vl_catalog.Artifact{.{ .repo = "owner/model", .revision = "pinned", .path = "model.gguf", .size = 7, .sha256 = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5" }};
+    // Limits apply to the full selected set, including the generated manifest,
+    // on both the staged and cached paths. Rejection must not hash or mutate.
+    const exact = HubConfig{ .max_model_bytes = 9, .max_artifact_bytes = 7 };
+    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, &artifacts, exact, .{}));
+    try std.testing.expectError(error.ModelSizeLimitExceeded, installedPinnedBundleMatches(a, io, directory, &artifacts, .{ .max_model_bytes = 8 }, .{}));
+    try std.testing.expectError(error.DownloadSizeLimitExceeded, installedPinnedBundleMatches(a, io, directory, &artifacts, .{ .max_artifact_bytes = 6 }, .{}));
+    try std.testing.expectError(error.InvalidDownloadSizeLimit, installedPinnedBundleMatches(a, io, directory, &artifacts, .{ .max_model_bytes = 0 }, .{}));
     const before = try std.Io.Dir.cwd().statFile(io, path, .{});
-    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, &artifacts, .{}));
+    try std.testing.expect(try installedPinnedBundleMatches(a, io, directory, &artifacts, .{}, .{}));
     const after = try std.Io.Dir.cwd().statFile(io, path, .{});
     try std.testing.expectEqual(before.inode, after.inode);
     try std.testing.expectEqual(before.ctime.toNanoseconds(), after.ctime.toNanoseconds());
     var cancelled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Canceled, installedPinnedBundleMatches(a, io, directory, &artifacts, .{ .cancelled = &cancelled }));
+    try std.testing.expectError(error.Canceled, installedPinnedBundleMatches(a, io, directory, &artifacts, .{}, .{ .cancelled = &cancelled }));
     const interrupted = try managedSiblingPath(a, directory, managed_download_staging_suffix);
     defer a.free(interrupted);
     const backup = try managedSiblingPath(a, directory, managed_download_backup_suffix);
@@ -5485,7 +5501,7 @@ test "pinned bundle re-pull verifies bytes without mutating the live installatio
     try std.testing.expect(!try pathExists(std.Io.Dir.cwd(), io, backup));
     // A same-size local mutation must repair instead of trusting the receipt.
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "corrupt" });
-    try std.testing.expect(!try installedPinnedBundleMatches(a, io, directory, &artifacts, .{}));
+    try std.testing.expect(!try installedPinnedBundleMatches(a, io, directory, &artifacts, .{}, .{}));
 }
 
 test "managed model transaction preserves unchanged publication and replaces changed content" {
@@ -5534,4 +5550,31 @@ test "managed model transaction preserves unchanged publication and replaces cha
     const actual = try std.Io.Dir.cwd().readFileAlloc(io, weights, a, .limited(64));
     defer a.free(actual);
     try std.testing.expectEqualStrings("updated", actual);
+}
+
+test "managed pull limits include generated artifacts on staged and cached paths" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try testTmpPath(a, tmp, "limits");
+    defer a.free(directory);
+    try beginManagedDownload(a, io, directory);
+    const path = try managedPath(a, directory, "model.gguf");
+    defer a.free(path);
+    try writeFileAtomically(a, io, path, "payload");
+    const plan = try managedPath(a, directory, managed_download_plan_filename);
+    defer a.free(plan);
+    try writeFileAtomically(a, io, plan,
+        \\{"version":1,"artifacts":[{"path":"model.gguf","size":7,"sha256":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}]}
+    );
+    try writeManagedArtifactAndUpdatePlan(a, io, directory, "model_manifest.json", "{}");
+    try validateManagedDownloadLimits(a, io, directory, .{ .max_model_bytes = 9, .max_artifact_bytes = 7 });
+    try std.testing.expectError(error.ModelSizeLimitExceeded, validateManagedDownloadLimits(a, io, directory, .{ .max_model_bytes = 8 }));
+    try std.testing.expectError(error.DownloadSizeLimitExceeded, validateManagedDownloadLimits(a, io, directory, .{ .max_artifact_bytes = 6 }));
+    // A small weight does not exempt a larger generated descriptor.
+    try writeManagedArtifactAndUpdatePlan(a, io, directory, "model_manifest.json", "{\"type\":\"embedder\"}");
+    try std.testing.expectError(error.DownloadSizeLimitExceeded, validateManagedDownloadLimits(a, io, directory, .{ .max_artifact_bytes = 7 }));
+    const sizes = [_]struct { size: u64 }{ .{ .size = std.math.maxInt(u64) }, .{ .size = 1 } };
+    try std.testing.expectError(error.ModelSizeLimitExceeded, validateArtifactLimits(&sizes, 0, .{ .max_model_bytes = std.math.maxInt(u64), .max_artifact_bytes = std.math.maxInt(u64) }));
 }
