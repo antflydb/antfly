@@ -2583,6 +2583,16 @@ pub fn embeddingGemma2PreparedScratch(images: []const PreparedImage, limit: usiz
     return @min(sum, limit);
 }
 
+/// Shared header/execution estimate for a uniform geometry. Includes all
+/// retained projections and the largest bounded tower cohort, never a dense
+/// score matrix. Header planners may use maximum axes/count conservatively.
+pub fn embeddingGemma2GeometryPlanScratch(patches: usize, tokens: usize, count: usize) !usize {
+    if (count == 0 or count > 8) return error.InvalidImageBatch;
+    const take = @import("../ops/embedding_vision_plan.zig").capacity(patches, @min(count, 4));
+    if (take == 0) return error.PreparedVisionUnavailable;
+    return try std.math.add(usize, try @import("../ops/embedding_vision_plan.zig").transientBytes(take * patches), try std.math.mul(usize, try std.math.mul(usize, count, tokens), 512 * 4));
+}
+
 pub fn embeddingGemma2PreparedPlanScratch(images: []const PreparedImage) !usize {
     var peak: usize = 0;
     var output: usize = 0;
@@ -2832,6 +2842,14 @@ fn prepareDeviceBatchPatches(cb: *const ComputeBackend, a: std.mem.Allocator, cf
     };
     const destination = (try cb.allocUninitF32Shape(&.{ @intCast(prepared.len * sequence), @intCast(dim) })) orelse return error.ResidentImageOperationUnavailable;
     errdefer cb.free(destination);
+    if (cb.kind() == .metal and prepared.len > 1) async_batch: {
+        var views: [8]image.ImageU8 = undefined;
+        for (prepared, 0..) |item, index| {
+            if (!std.meta.eql(geometry, item.geometry)) return error.IncompatibleImageBatch;
+            views[index] = item.source orelse break :async_batch;
+        }
+        if (try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingImageBatchInto(cb, views[0..prepared.len], @intCast(geometry.width), @intCast(geometry.height), destination)) return destination;
+    }
     for (prepared, 0..) |item, index| {
         try cb.checkExecutionControl();
         if (!std.meta.eql(geometry, item.geometry)) return error.IncompatibleImageBatch;

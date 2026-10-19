@@ -837,12 +837,26 @@ pub const Session = struct {
     /// use ordinary admission; a rejected supplement leaves the base untouched.
     /// Both owners must outlive every allocation covered by their union.
     pub fn admitSupplement(self: Session, base: *const RunPermit, target: memory.AdmissionAmounts) !RunPermit {
+        return self.admitSupplementPair(base, null, target);
+    }
+
+    /// Credit two independent live owners without merging external lease
+    /// tokens. Only acquire the component-wise deficit beyond both owners.
+    pub fn admitSupplementPair(self: Session, base: *const RunPermit, other: ?*const RunPermit, target: memory.AdmissionAmounts) !RunPermit {
         if (base.session.ptr != self.ptr or base.session.vtable != self.vtable or base.execution_yielded) return error.InvalidAdmissionLeaseReduction;
         const admission = self.run_admission orelse return .{ .session = self, .lease = null };
         const lease = base.lease orelse return error.InvalidAdmissionLeaseReduction;
         if (lease.controller != admission.controller or lease.retain_backend_class != admission.backend_class) return error.InvalidAdmissionLeaseReduction;
+        var owned = lease.amounts;
+        if (other) |peer| {
+            if (peer == base or peer.session.ptr != self.ptr or peer.session.vtable != self.vtable or peer.execution_yielded) return error.InvalidAdmissionLeaseReduction;
+            if (peer.lease) |credit| {
+                if (credit.controller != admission.controller or credit.retain_backend_class != admission.backend_class or (credit.external_lease != null and credit.external_lease == lease.external_lease)) return error.InvalidAdmissionLeaseReduction;
+                owned = try owned.merge(credit.amounts);
+            }
+        }
         var extra = memory.AdmissionAmounts{};
-        inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| @field(extra, name) = @field(target, name) -| @field(lease.amounts, name);
+        inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| @field(extra, name) = @field(target, name) -| @field(owned, name);
         if (std.meta.eql(extra, memory.AdmissionAmounts{})) return .{ .session = self, .lease = null };
         return .{ .session = self, .lease = try admission.acquireAmounts(extra) };
     }
@@ -1319,6 +1333,29 @@ pub const RunPermit = struct {
     /// Reduce an execution peak after preprocessing/vision has completed.
     /// Re-estimate with the session profile and retained inputs; a phase may
     /// never borrow capacity from its predecessor or another concurrent run.
+    /// Reduce two independently owned leases without merging their external
+    /// process-owner tokens. All required capacity must already be admitted.
+    pub fn retainForRunWithSupplement(self: *RunPermit, extra: *RunPermit, request: RunRequest) !void {
+        if (extra.session.ptr != self.session.ptr or extra.session.vtable != self.session.vtable or self.execution_yielded or extra.execution_yielded) return error.InvalidAdmissionLeaseReduction;
+        const admission = self.session.run_admission orelse {
+            self.request = request;
+            return;
+        };
+        const base = if (self.lease) |*lease| lease else return error.InvalidAdmissionLeaseReduction;
+        const needed = try admission.estimateRequest(request, self.session.outputInfo());
+        const available = try base.amounts.merge(if (extra.lease) |lease| lease.amounts else .{});
+        var base_keep = needed;
+        var extra_keep = needed;
+        inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| {
+            if (@field(needed, name) > @field(available, name)) return error.InvalidAdmissionLeaseReduction;
+            @field(base_keep, name) = @min(@field(needed, name), @field(base.amounts, name));
+            @field(extra_keep, name) = @field(needed, name) - @field(base_keep, name);
+        }
+        try base.retain(base_keep);
+        if (extra.lease) |*lease| try lease.retain(extra_keep);
+        self.request = request;
+    }
+
     pub fn retainForRun(self: *RunPermit, request: RunRequest) !void {
         if (self.execution_yielded) return error.InvalidAdmissionLeaseReduction;
         if (self.lease) |*lease| {
@@ -2075,4 +2112,33 @@ test "embeddinggemma2 physical backend inputs do not charge retained host raster
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), after.backend_scratch_bytes);
     try std.testing.expect(before.backend_scratch_bytes > after.backend_scratch_bytes + 600 * 1024 * 1024);
     try std.testing.expectError(error.ResourceLimitExceeded, admission.estimateRequest(.{ .input_bytes = 128, .backend_input_bytes = 0, .pre_admitted_host_bytes = 129 }, &.{}));
+}
+
+test "embeddinggemma2 stage admission reduces independent supplements without borrowing or merging tokens" {
+    const Mock = struct {
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+    };
+    var marker: u8 = 0;
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const session = Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = Mock.info, .outputInfo = Mock.info, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    const mb = 1024 * 1024;
+    var base = try session.admit(.{ .workspace_bytes = 16 * mb, .output_bytes = 0 });
+    defer base.deinit();
+    var extra = try session.admitSupplement(&base, try session.run_admission.?.estimateRequest(.{ .workspace_bytes = 64 * mb, .output_bytes = 0 }, &.{}));
+    defer extra.deinit();
+    var covered = try session.admitSupplementPair(&base, &extra, try session.run_admission.?.estimateRequest(.{ .workspace_bytes = 64 * mb, .output_bytes = 0 }, &.{}));
+    defer covered.deinit();
+    try std.testing.expect(covered.lease == null);
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, session.admitSupplementPair(&base, &base, .{}));
+    try base.retainForRunWithSupplement(&extra, .{ .workspace_bytes = 40 * mb, .output_bytes = 0 });
+    try std.testing.expectEqual(@as(usize, 40 * mb), controller.snapshot().backend_scratch_bytes);
+    const before = controller.snapshot();
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, base.retainForRunWithSupplement(&extra, .{ .workspace_bytes = 41 * mb, .output_bytes = 0 }));
+    try std.testing.expectEqual(before, controller.snapshot());
+    extra.deinit();
+    base.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().scratchTotalBytes());
 }

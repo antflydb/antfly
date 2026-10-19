@@ -28,6 +28,7 @@ extern fn av_coefficients_destroy(*anyopaque) void;
 extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
 extern fn av_prepare_native_submit(*anyopaque, *anyopaque, ?*anyopaque, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
 extern fn av_prepare_host_submit(*anyopaque, [*]const u8, usize, [*]const u8, usize, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
+extern fn av_prepare_rgba_into_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *anyopaque, usize, *?*anyopaque) i32;
 extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepared_gpu_seconds(*anyopaque) f64;
 extern fn av_preparer_device_bytes(*anyopaque) u64;
@@ -777,6 +778,14 @@ pub const Metal = struct {
     /// RGB/RGBA with explicit byte stride. Alpha and padding are ignored; only
     /// the validated last-row span is staged. No host color expansion occurs.
     pub fn submitImageView(self: *Metal, allocator: std.mem.Allocator, view: image.ImageU8, options: Options, control: media.source.Control) !Prepared {
+        return self.submitImageViewTarget(allocator, view, options, control, null, 0);
+    }
+    /// Writes one disjoint final patch span. Caller retains destination until
+    /// completion; commands also retain it. No intermediate patch copy.
+    pub fn submitImageViewInto(self: *Metal, allocator: std.mem.Allocator, view: image.ImageU8, options: Options, control: media.source.Control, destination: *anyopaque, offset: usize) !Prepared {
+        return self.submitImageViewTarget(allocator, view, options, control, destination, offset);
+    }
+    fn submitImageViewTarget(self: *Metal, allocator: std.mem.Allocator, view: image.ImageU8, options: Options, control: media.source.Control, destination: ?*anyopaque, offset: usize) !Prepared {
         if (!supported) return error.UnsupportedVideoBackend;
         try control.check();
         try view.validate();
@@ -794,8 +803,9 @@ pub const Metal = struct {
         // for channel count/byte stride; YUV commands retain their ABI.
         const params = [_]u32{ view.width, view.height, g.width, g.height, @backingInt(options.rotation), @intCast(view.channels()), @intCast(stride), @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0, 0, options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
-        if (av_prepare_rgba_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .rgba_staging_bytes = size, .coefficient_staging_bytes = uploaded };
+        const rc = if (destination) |target| av_prepare_rgba_into_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, target, offset, &out) else av_prepare_rgba_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, &out);
+        if (rc != 0) return error.MetalPreparationFailed;
+        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = offset, .rgba_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
 };
 /// Owns input import/staging, GPU command, and patch buffer. Destroy fences in-flight
@@ -804,6 +814,9 @@ pub const Prepared = struct {
     reservation: media.admission.Token = .{},
     handle: *anyopaque,
     geometry: Geometry,
+    /// Nonzero only when submitImageViewInto targets a final destination span.
+    /// Add to buffer() when binding that span; readback() applies it internally.
+    output_byte_offset: usize = 0,
     /// Logical bytes copied by newBufferWithBytes, not physical PCIe/DMA bytes.
     rgba_staging_bytes: usize = 0,
     native_staging_bytes: usize = 0,

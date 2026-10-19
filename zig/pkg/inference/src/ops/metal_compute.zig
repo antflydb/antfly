@@ -1152,6 +1152,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     allocator: std.mem.Allocator,
     require_f32_linears: bool = false,
     require_prepared_vision: bool = false,
+    embedding_stage_suspended: bool = false,
     audio_execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     audio_capture: ?*audio_tape.Capture = null,
     embedding_bindings_enabled: bool = false,
@@ -1861,6 +1862,43 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return metal_runtime.termite_metal_decode_runtime_device(self.provider_impl.raw_decode_runtime) orelse error.MetalRuntimeUnavailable;
     }
 
+    /// Retire request-local bindings before releasing the shared provider.
+    /// Escaping stage tensors own independent buffers; model caches may be
+    /// reclaimed or replaced by a peer while this wrapper is suspended.
+    pub fn embeddingStageLease(cb: *const ops.ComputeBackend, acquire: bool) !void {
+        if (cb.kind() != .metal) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (acquire) {
+            if (!self.embedding_stage_suspended) return;
+            const io = try lockSharedMetalData(self.data, self.io);
+            self.shared_provider_lease_io = io;
+            self.embedding_stage_suspended = false;
+            self.captureRuntimeFrameBaselines();
+            metal_runtime.termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(self.provider_impl.raw_decode_runtime, 1);
+        } else {
+            if (self.embedding_stage_suspended) return;
+            if (!self.require_f32_linears or self.owned_native_provider or self.shared_provider_lease_io == null or self.decoderWorkspaceBusy()) return error.EmbeddingStageBusy;
+            const allocator = self.allocator;
+            const data = self.data;
+            const provider = self.provider_impl;
+            const io = self.io;
+            self.deinit();
+            self.* = .{ .allocator = allocator, .data = data, .provider_impl = provider, .provider = if (false) null else {}, .io = io, .require_f32_linears = true, .embedding_stage_suspended = true };
+        }
+    }
+    pub fn escapeEmbeddingStage(cb: *const ops.ComputeBackend, tensor: CT) !CT {
+        if (cb.kind() != .metal or cb.embedding_stage == null) return error.UnsupportedEmbeddingStage;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.embedding_stage_suspended or self.decoderWorkspaceBusy()) return error.EmbeddingStageBusy;
+        const source = denseDeviceF32(tensor) orelse return error.InvalidTensorShape;
+        const copy = try source.copiedView(0, source.deviceByteLen(), source.shape());
+        return self.ctFromOwnedMetalTensor(copy) catch |err| {
+            var owned = copy;
+            owned.deinit();
+            return err;
+        };
+    }
+
     pub fn requireEmbeddingVisionPlan(cb: *const ops.ComputeBackend, require: bool) bool {
         if (cb.kind() != .metal) return false;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -1878,20 +1916,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// Shared provider ownership amortizes shader setup and exact torchvision
     /// coefficients. Optional cache admission failure declines to CPU preparation;
     /// cancellation and submitted GPU failures propagate after fencing staging.
-    pub fn prepareEmbeddingImagePatches(cb: *const ops.ComputeBackend, view: @import("antfly_image").processing.ImageU8, width: u32, height: u32) !?CT {
-        if (comptime !build_options.enable_metal) return null;
-        if (cb.kind() != .metal or @import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION")) return null;
-        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        const io = self.io orelse return null;
+    fn imagePreparer(self: *MetalCompute) !?*@import("antfly_video").preparation.Metal {
         const p = self.provider_impl;
-        if (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return null;
-        try cb.checkExecutionControl();
         const preparation = @import("antfly_video").preparation;
         if (p.embedding_image_preparer == null) {
             const cache = if (self.data.tier_cache) |*v| v else return null;
             if (p.embeddinggemma2_cache_admission) |bound| if (bound != cache) return null;
             const budget = @TypeOf(p.*).image_coefficient_budget;
-            const device = try videoDevice(cb);
+            const cb = self.computeBackend();
+            const device = try videoDevice(&cb);
             self.data.prefetch.lock();
             cache.reserve(.host, @sizeOf(preparation.Metal)) catch {
                 self.data.prefetch.unlock();
@@ -1913,6 +1946,68 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             p.embedding_image_preparer = preparer;
             p.embeddinggemma2_cache_admission = cache;
         }
+        return &p.embedding_image_preparer.?;
+    }
+
+    /// Bounded asynchronous preparation into final disjoint destination spans.
+    /// Submit the entire cohort before waiting on the ordered preparation queue;
+    /// all error/cancellation paths fence every command before returning.
+    pub fn prepareEmbeddingImageBatchInto(cb: *const ops.ComputeBackend, views: []const @import("antfly_image").processing.ImageU8, width: u32, height: u32, destination: CT) !bool {
+        if (cb.kind() != .metal or views.len < 2 or views.len > 8 or @import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_ASYNC_IMAGE_PREPARATION") or @import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION")) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const io = self.io orelse return false;
+        if (self.decoderWorkspaceBusy()) return false;
+        const target = denseDeviceF32(destination) orelse return false;
+        const span = try std.math.mul(usize, try std.math.mul(usize, width, height), 3 * 4);
+        if (target.deviceByteLen() != try std.math.mul(usize, span, views.len)) return error.InvalidTensorShape;
+        var staging: usize = 0;
+        for (views) |view| {
+            try view.validate();
+            const stride = try view.rowStride();
+            staging = try std.math.add(usize, staging, try std.math.add(usize, try std.math.mul(usize, stride, view.height - 1), try std.math.mul(usize, view.width, view.channels())));
+        }
+        // Preserve the admitted transient envelope for very large source rasters.
+        const preparation = @import("antfly_video").preparation;
+        var peak = staging;
+        for (views) |view| peak = try std.math.add(usize, peak, (try preparation.geometry(view.width, view.height, .{ .width = width, .height = height, .matrix = .bt601, .torchvision = true, .max_soft_tokens = 280, .max_scratch_bytes = 256 * 1024 * 1024 })).scratch_bytes);
+        if (peak > try std.math.add(usize, 64 * 1024 * 1024, try std.math.mul(usize, target.deviceByteLen(), 8))) return false;
+        toBuf(destination).metal_tensor.?.invalidateHostMirror();
+        const preparer = (try self.imagePreparer()) orelse return false;
+        const Context = struct {
+            backend: *const ops.ComputeBackend,
+            fn check(raw: ?*const anyopaque) anyerror!void {
+                const context: *const @This() = @ptrCast(@alignCast(raw.?));
+                try context.backend.checkExecutionControl();
+            }
+        };
+        var context = Context{ .backend = cb };
+        const control = @import("antfly_media").source.Control{ .context = &context, .check_fn = Context.check };
+        var pending: [8]@import("antfly_video").preparation.Prepared = undefined;
+        var count: usize = 0;
+        defer for (pending[0..count]) |*job| job.deinit();
+        for (views, 0..) |view, index| {
+            pending[count] = preparer.submitImageViewInto(self.allocator, view, .{ .width = width, .height = height, .matrix = .bt601, .torchvision = true, .max_soft_tokens = 280, .max_scratch_bytes = 256 * 1024 * 1024 }, control, target.deviceHandle().?, target.deviceByteOffset() + index * span) catch |err| switch (err) {
+                error.ResourceLimitExceeded => return false,
+                else => return err,
+            };
+            count += 1;
+        }
+        try pending[count - 1].wait(io, control);
+        for (pending[0..count]) |*job| {
+            try job.wait(io, control); // Also attest every command's status.
+            try job.releaseSource();
+        }
+        return true;
+    }
+
+    pub fn prepareEmbeddingImagePatches(cb: *const ops.ComputeBackend, view: @import("antfly_image").processing.ImageU8, width: u32, height: u32) !?CT {
+        if (comptime !build_options.enable_metal) return null;
+        if (cb.kind() != .metal or @import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION")) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const io = self.io orelse return null;
+        if (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return null;
+        try cb.checkExecutionControl();
+        const preparer = (try self.imagePreparer()) orelse return null;
         var context = struct {
             backend: *const ops.ComputeBackend,
             fn check(raw: ?*const anyopaque) anyerror!void {
@@ -1921,7 +2016,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }{ .backend = cb };
         const control = @import("antfly_media").source.Control{ .context = &context, .check_fn = @TypeOf(context).check };
-        var prepared = p.embedding_image_preparer.?.submitImageView(self.allocator, view, .{
+        var prepared = preparer.submitImageView(self.allocator, view, .{
             .width = width,
             .height = height,
             .matrix = .bt601,
@@ -4644,6 +4739,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const SegmentControlCache = struct { raw: []i32, batch: u32, seq_len: u32, apply_dropout: bool, dropout_seed: u64, device: CT };
 
     pub fn deinit(self: *MetalCompute) void {
+        if (self.embedding_stage_suspended) return;
         if (self.segment_control_cache) |cached| {
             freeOp(self, cached.device);
             self.allocator.free(cached.raw);
@@ -35887,10 +35983,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
 
+    pub fn videoDevice(_: *const ops.ComputeBackend) !*anyopaque {
+        return error.UnsupportedVideoBackend;
+    }
+    pub fn embeddingStageLease(_: *const ops.ComputeBackend, _: bool) !void {}
+    pub fn escapeEmbeddingStage(_: *const ops.ComputeBackend, _: CT) !CT {
+        return error.UnsupportedEmbeddingStage;
+    }
+
     pub fn requireEmbeddingVisionPlan(_: *const ops.ComputeBackend, _: bool) bool {
         return false;
     }
     pub fn prepareEmbeddingVisionPlan(_: *const ops.ComputeBackend, _: ops.EmbeddingVisionSpec) !bool {
+        return false;
+    }
+
+    pub fn prepareEmbeddingImageBatchInto(_: *const ops.ComputeBackend, _: []const @import("antfly_image").processing.ImageU8, _: u32, _: u32, _: CT) !bool {
         return false;
     }
 
@@ -47289,4 +47397,115 @@ test "embeddinggemma2 Metal rotary tables preserve precise heads warm reuse boun
     _ = try compute.provider_impl.reclaimEmbeddingGemma2Weights(.language);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+}
+
+test "embeddinggemma2 Metal asynchronous image spans preserve RGB RGBA parity and fence partial cancellation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{});
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const Image = @import("antfly_image").processing.ImageU8;
+    var pixels: [4][13 * 7 * 4]u8 = undefined;
+    var views: [4]Image = undefined;
+    for (&pixels, &views, 0..) |*bytes, *view, index| {
+        for (bytes, 0..) |*v, i| v.* = @truncate(i * 19 + index * 73);
+        view.* = .{ .data = bytes, .width = 13, .height = 7, .format = if (index % 2 == 0) .rgb8 else .rgba8, .row_stride_bytes = 13 * 4 };
+    }
+    const span = 48 * 48 * 3;
+    const destination = (try cb.allocUninitF32Shape(&.{ 4 * 9, 768 })).?;
+    defer cb.free(destination);
+    try std.testing.expect(try MetalCompute.prepareEmbeddingImageBatchInto(&cb, &views, 48, 48, destination));
+    const values = try cb.toFloat32(destination, a);
+    defer a.free(values);
+    for (views, 0..) |view, index| {
+        const tensor = (try MetalCompute.prepareEmbeddingImagePatches(&cb, view, 48, 48)).?;
+        defer cb.free(tensor);
+        const expected = try cb.toFloat32(tensor, a);
+        defer a.free(expected);
+        for (expected, values[index * span ..][0..span]) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    }
+    {
+        const target = MetalCompute.denseDeviceF32(destination).?;
+        var prepared = try compute.provider_impl.embedding_image_preparer.?.submitImageViewInto(a, views[3], .{ .width = 48, .height = 48, .matrix = .bt601, .torchvision = true }, .{}, target.deviceHandle().?, target.deviceByteOffset() + 3 * span * 4);
+        defer prepared.deinit();
+        try prepared.wait(std.testing.io, .{});
+        try std.testing.expectEqual(target.deviceByteOffset() + 3 * span * 4, prepared.output_byte_offset);
+        const readback = try prepared.readback(a);
+        defer a.free(readback);
+        for (readback, values[3 * span ..][0..span]) |got, want| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    }
+    const Cancel = struct {
+        fn check(raw: ?*const anyopaque) !void {
+            const checks: *usize = @ptrCast(@alignCast(@constCast(raw.?)));
+            checks.* += 1;
+            if (checks.* >= 4) return error.Cancelled;
+        }
+    };
+    var checks: usize = 0;
+    cb.execution_control = .{ .ptr = &checks, .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, MetalCompute.prepareEmbeddingImageBatchInto(&cb, &views, 48, 48, destination));
+    cb.execution_control = null;
+    try std.testing.expect(try MetalCompute.prepareEmbeddingImageBatchInto(&cb, &views, 48, 48, destination));
+    const retried = try cb.toFloat32(destination, a);
+    defer a.free(retried);
+    for (values, retried) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    const invalid = (try cb.allocUninitF32Shape(&.{ 9, 768 })).?;
+    defer cb.free(invalid);
+    try std.testing.expectError(error.InvalidTensorShape, MetalCompute.prepareEmbeddingImageBatchInto(&cb, &views, 48, 48, invalid));
+}
+
+test "embeddinggemma2 Metal stage handoff preserves independent tensors across peer cache pressure" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{});
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    compute.require_f32_linears = true;
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var hook: ops.EmbeddingStageControl = undefined;
+    cb.embedding_stage = &hook; // Escape only checks that a stage owner exists.
+    const original = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 }));
+    defer cb.free(original);
+    const escaped = try MetalCompute.escapeEmbeddingStage(&cb, original);
+    defer cb.free(escaped);
+    try cb.vtable.embeddingRotaryPrepare.?(cb.ptr, .{ .vision = true, .dim = 64, .x = 4, .y = 4, .theta = 10000 });
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    try std.testing.expectError(error.EmbeddingStageBusy, MetalCompute.embeddingStageLease(&cb, false));
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    try MetalCompute.embeddingStageLease(&cb, false);
+    try std.testing.expect(compute.embedding_stage_suspended);
+    {
+        var peer = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+        defer peer.deinit();
+        peer.require_f32_linears = true;
+        const other = peer.computeBackend();
+        try std.testing.expect(try peer.provider_impl.reclaimEmbeddingGemma2Weights(.vision) > 0);
+        const zeros = try other.ensureDeviceResidentOwned(try other.fromFloat32Shape(&.{ 0, 0, 0, 0, 0, 0, 0, 0 }, &.{ 2, 4 }));
+        defer other.free(zeros);
+        try std.testing.expect(try other.copyRows2D(a, original, 0, zeros, 0, 2, 4));
+    }
+    try MetalCompute.embeddingStageLease(&cb, true);
+    try std.testing.expect(!compute.embedding_stage_suspended);
+    const result = try cb.toFloat32(escaped, a);
+    defer a.free(result);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, result);
+    const changed = try cb.toFloat32(original, a);
+    defer a.free(changed);
+    for (changed) |value| try std.testing.expectEqual(@as(f32, 0), value);
 }

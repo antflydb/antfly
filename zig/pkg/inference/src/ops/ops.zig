@@ -1640,6 +1640,25 @@ pub const LayaActionFeaturesRequest = struct {
 };
 
 /// Abstract compute backend for tensor operations.
+/// Borrowed from a synchronous media pipeline. Only completed, independently
+/// owned projections may cross a yield. Cleanup restores ownership even after
+/// cancellation; no queue/provider lease escapes its loaded model handle.
+pub const EmbeddingStageControl = struct {
+    ptr: *anyopaque,
+    pause_fn: *const fn (*anyopaque) anyerror!void,
+    resume_fn: *const fn (*anyopaque) anyerror!void,
+    cleanup_fn: *const fn (*anyopaque) void,
+    pub fn pause(self: *const @This()) !void {
+        try self.pause_fn(self.ptr);
+    }
+    pub fn acquire(self: *const @This()) !void {
+        try self.resume_fn(self.ptr);
+    }
+    pub fn cleanup(self: *const @This()) void {
+        self.cleanup_fn(self.ptr);
+    }
+};
+
 pub const ComputeBackend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -1648,6 +1667,7 @@ pub const ComputeBackend = struct {
     /// universal bounded checkpoint even for architectures without a bespoke
     /// `forwardWithControl` entry point.
     execution_control: ?InferenceExecutionControl = null,
+    embedding_stage: ?*const EmbeddingStageControl = null,
 
     pub fn checkExecutionControl(self: *const ComputeBackend) !void {
         if (self.execution_control) |control| try control.check();

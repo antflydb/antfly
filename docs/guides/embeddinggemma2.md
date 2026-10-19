@@ -1653,11 +1653,65 @@ parity, verifies no optimized plan fallback, exercises dedicated raster/image
 routes, and forces a workspace decline to qualify separately admitted fallback.
 
 A completed ReleaseFast four-full-size-image comparison on the shared M4 Max
-host measured 947.551 ms with the previous cohort/admission policy versus
-737.255 ms with the bounded plan (seven samples per route after two warmups,
+host measured 1092.352 ms with the previous cohort/admission policy versus
+880.750 ms with the bounded plan (seven samples per route after two warmups,
 alternating order). Both routes retained precise rotary caching and device image
 preparation. Every vector passed parity, and the optimized route reported zero
-plan fallbacks. This roughly 22% improvement qualifies these fixtures, without
+plan fallbacks. This roughly 19% improvement qualifies these fixtures, without
 establishing broad PyTorch parity or a clean-host throughput result. Forced
 workspace decline passed separately admitted fallback parity; active-frame
 cancellation completed 32 checks and a successful retry.
+
+Broker capacity planning uses the same bounded vision scratch, retained
+projections, physical model inputs and encoder geometry as execution. Queue
+planning grants no preprocessing lease credit; encoded-image RGB decoding has
+an explicit host estimate. The portable/CUDA qualification policies remain
+unchanged. The broker can select four logical images while execution splits a
+large uniform geometry into arena-sized tower cohorts.
+
+Mixed groups and standalone Metal media groups share prepared image execution.
+Borrowed rasters enter the device preparer directly; encoded-image preparation
+bounds decoded RGB from inspected headers. Invalid media retain indexed error
+slots. Image tower phases require the prepared plan under its bounded estimate;
+capability decline fences partial work and replaces the phase supplement with
+separately admitted conservative fallback. Source residency remains charged to
+host memory throughout the request.
+
+Metal preparation submits compatible image cohorts into disjoint spans of the
+final patch matrix, with no intermediate patch-buffer copy. A bounded staging
+window covers source uploads and preparation scratch. All submissions precede
+the completion wait on the ordered preparation queue; every command's status
+is checked. Cancellation and partial submission fence all outstanding commands
+before the destination is released. Oversized staging windows or unsupported
+capabilities retain sequential preparation. Destination spans expose their byte
+offset; explicit debug readback supports both shared and private buffers.
+
+Mixed and video pipelines release the model gate and provider lease between
+ready stages, including CPU decode/preparation queue waits. Retained projections
+cross handoff in independent device buffers, preventing aliasing with a peer's
+activation arenas or cache reclamation. Suspending retires request-local backend
+bindings; reacquisition rebuilds them from the current model-owned caches. Idle
+GPU execution scratch is reduced while decoder buffers, source bytes and
+projected rows retain admission. Stage supplements reacquire compute capacity
+before dispatch. Multiple live leases receive combined credit without merging
+external process-owner tokens, and reductions cannot borrow from a peer.
+Cancellation restores ownership for cleanup without requiring another compute
+peak. Each submitted GPU cohort remains nonpreemptive.
+
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_ASYNC_IMAGE_PREPARATION=1` selects sequential
+image preparation. `ANTFLY_EMBEDDINGGEMMA2_DISABLE_STAGE_SCHEDULING=1` retains
+one execution turn for mixed/video calls. The checkpoint qualifier
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_STAGE_FOLLOWUP=1` exercises the server image
+broker, mixed raster/audio reference parity, stage handoff counters, and a
+completed alternating broker comparison of sequential/asynchronous preparation.
+
+The completed serving-broker comparison measured 840.621 ms with sequential
+preparation and 837.125 ms with asynchronous final-span preparation (seven
+samples after two warmups, alternating order, identical bounded tower/encoder
+policies). This roughly 0.4% difference is modest on the shared host. The
+qualification also passed brokered-vector parity, mixed raster/audio reference
+parity with four stage handoffs and zero plan fallbacks, and all six pinned video
+cases plus their HTTP response check. The preceding bounded-plan comparison
+encountered one live-memory admission retry on its legacy route; these results
+are fixture measurements under shared-host conditions, not a production latency
+or sustained-throughput guarantee.

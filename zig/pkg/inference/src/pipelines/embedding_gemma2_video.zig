@@ -90,6 +90,9 @@ pub const WebmDecoderContinuation = struct {
     }
 };
 pub const Configuration = struct {
+    /// Explicit pipeline handoff; generic container/preflight callers never
+    /// inspect a model backend before their metadata admission succeeds.
+    stage: ?*const @import("../ops/ops.zig").EmbeddingStageControl = null,
     webm: ?WebmInput = null,
     sampling: Sampling = .reference,
     pool: ?*media.admission.Pool = null,
@@ -1004,7 +1007,12 @@ pub const Prefetch = struct {
         return self.encodeAlloc(self.a, cb);
     }
     pub fn encodeAlloc(self: *Prefetch, a: std.mem.Allocator, cb: *const ComputeBackend) !Encoded {
+        return self.encodeAllocStaged(a, cb, null);
+    }
+    pub fn encodeAllocStaged(self: *Prefetch, a: std.mem.Allocator, cb: *const ComputeBackend, stage_control: ?*const @import("../ops/ops.zig").EmbeddingStageControl) !Encoded {
         try self.control.check();
+        defer if (stage_control) |stage| stage.cleanup();
+        if (stage_control) |stage| try stage.pause();
         var header: [1]Job = undefined;
         _ = self.header_queue.getUncancelable(self.io, &header, 1) catch {
             self.join();
@@ -1017,6 +1025,7 @@ pub const Prefetch = struct {
                 return error.InvalidTensorShape;
             },
         };
+        if (stage_control) |stage| try stage.acquire();
         const frame_tokens = try a.alloc(usize, selected.len);
         errdefer a.free(frame_tokens);
         @memset(frame_tokens, 0);
@@ -1031,14 +1040,20 @@ pub const Prefetch = struct {
         const adapter = self.control.imageWorkControl();
         var capture = Capture{ .reader_selection = self.reader_selection, .a = a, .cb = cb, .track = undefined, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .output = output, .resident = resident, .frame_tokens = frame_tokens, .selected = selected, .io = self.io, .native_batching = cb.kind() == .native, .cache = self.cache, .clip_hash = self.clip_hash, .decoder = self.decoder };
         defer capture.discardNativePending();
+        defer if (cb.embedding_stage) |stage| stage.cleanup();
         var jobs: [8]Job = undefined;
         while (true) {
+            if (cb.embedding_stage) |stage| try stage.pause();
             const count = self.queue.getUncancelable(self.io, &jobs, 1) catch break;
             var owned: [8]bool = @splat(true);
             defer for (jobs[0..count], 0..) |*job, i| if (owned[i]) {
                 self.discard(job);
             };
             try self.control.check();
+            // A queued preparation is submitted, not necessarily complete.
+            // Wait on its independent queue before taking the model lane.
+            for (jobs[0..count]) |job| if (job == .metal) try job.metal.prepared.wait(self.io, capture.control);
+            if (cb.embedding_stage) |stage| try stage.acquire();
             var cursor: usize = 0;
             while (cursor < count) {
                 if (jobs[cursor] == .metal) {
@@ -1066,6 +1081,7 @@ pub const Prefetch = struct {
         self.join();
         if (self.failure) |err| return err;
         self.releasePreparer();
+        if (cb.embedding_stage) |stage| try stage.acquire();
         try capture.flushNativePending();
         try capture.finishDuplicates();
         if (resident) |tensors| {
@@ -1095,7 +1111,7 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
     return encodeCached(a, cb, bytes, control, sampling, pool, null);
 }
 pub fn encodeCached(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !Encoded {
-    return encodeInput(a, cb, bytes, null, control, sampling, pool, cache, null, .{}, null);
+    return encodeInput(a, cb, bytes, null, control, sampling, pool, cache, null, .{}, null, null);
 }
 pub fn encodeReader(a: std.mem.Allocator, cb: *const ComputeBackend, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !Encoded {
     return encodeReaderWithSelection(a, cb, reader, control, sampling, pool, null);
@@ -1104,13 +1120,23 @@ pub fn encodeReaderWithSelection(a: std.mem.Allocator, cb: *const ComputeBackend
     return encodeReaderCachedWithSelection(a, cb, reader, control, sampling, pool, selection, null);
 }
 pub fn encodeReaderCachedWithSelection(a: std.mem.Allocator, cb: *const ComputeBackend, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection, cache: ?*FrameCache) !Encoded {
-    return encodeInput(a, cb, try packetBytes(reader), reader, control, sampling, pool, cache, selection, .{}, null);
+    return encodeInput(a, cb, try packetBytes(reader), reader, control, sampling, pool, cache, selection, .{}, null, null);
 }
 pub fn encodeConfigured(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration) !Encoded {
-    return encodeInput(a, cb, if (reader) |r| try packetBytes(r) else bytes, reader, control, configuration.sampling, configuration.pool, configuration.cache, configuration.selection, configuration.decoder, configuration.webm);
+    return encodeInput(a, cb, if (reader) |r| try packetBytes(r) else bytes, reader, control, configuration.sampling, configuration.pool, configuration.cache, configuration.selection, configuration.decoder, configuration.webm, configuration.stage);
 }
-fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection, decoder: video.decoding.Options, webm_input: ?WebmInput) !Encoded {
+fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection, decoder: video.decoding.Options, webm_input: ?WebmInput, stage_control: ?*const @import("../ops/ops.zig").EmbeddingStageControl) !Encoded {
+    try control.check();
     if (webm_input == null and borrowed == null and (bytes.len == 0 or bytes.len > 64 * 1024 * 1024)) return error.ResourceLimitExceeded;
+    if (stage_control) |stage| if (control.io orelse cb.getIo()) |io| {
+        const device = if (cb.kind() == .metal) try MetalCompute.videoDevice(cb) else null;
+        try stage.pause();
+        defer stage.cleanup();
+        const producer = try Prefetch.startConfigured(a, io, device, bytes, borrowed, control, .{ .sampling = sampling, .pool = pool, .cache = cache, .selection = selection, .decoder = decoder, .webm = webm_input });
+        defer producer.deinit();
+        try stage.acquire();
+        return producer.encodeAllocStaged(a, cb, stage);
+    };
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     if (webm_input) |input| {
@@ -1598,6 +1624,10 @@ const Capture = struct {
             while (stop < jobs.len and stop - first < capacity and jobs[stop].options.width == options.width and jobs[stop].options.height == options.height) : (stop += 1) {}
             consumed = stop; // Cohort consumes all its leases, including on failure.
             if (stop - first == 1) try self.projectGpuNow(jobs[first].slot, jobs[first].prepared, options) else try self.projectGpuCohort(jobs[first..stop]);
+            if (stop < jobs.len) if (self.cb.embedding_stage) |stage| {
+                try stage.pause();
+                try stage.acquire();
+            };
         }
     }
     fn projectGpuCohort(self: *Capture, jobs: []ProjectionJob) !void {
@@ -1637,6 +1667,11 @@ const Capture = struct {
             for (0..jobs.len) |i| {
                 outputs[i] = try self.cb.primSlice(encoded.tensor, &.{ @intCast(i * per_frame), 0 }, &.{ @intCast((i + 1) * per_frame), 512 }, &.{ 1, 1 }, &shape);
                 sliced += 1;
+                if (self.cb.embedding_stage != null) {
+                    const old = outputs[i];
+                    outputs[i] = try MetalCompute.escapeEmbeddingStage(self.cb, old);
+                    self.cb.free(old);
+                }
             }
             const tensors = self.resident orelse return error.UnsupportedVideoBackend;
             for (jobs, 0..) |job, i| {
@@ -1662,9 +1697,14 @@ const Capture = struct {
             const started = batch_clock.monotonicNs();
             const encoded = try projector.encodeEmbeddingGemma2VideoTensorResident(self.cb, self.a, input, options.width, options.height);
             if (self.resident) |tensors| {
-                tensors[slot] = encoded.tensor;
+                const tensor = if (self.cb.embedding_stage != null) MetalCompute.escapeEmbeddingStage(self.cb, encoded.tensor) catch |err| {
+                    self.cb.free(encoded.tensor);
+                    return err;
+                } else encoded.tensor;
+                if (self.cb.embedding_stage != null) self.cb.free(encoded.tensor);
+                tensors[slot] = tensor;
                 self.frame_tokens[slot] = encoded.tokens;
-                self.storeDevice(slot, encoded.tensor, encoded.tokens);
+                self.storeDevice(slot, tensor, encoded.tokens);
             } else {
                 defer self.cb.free(encoded.tensor);
                 const embeddings = try self.cb.toFloat32(encoded.tensor, self.a);

@@ -37617,6 +37617,56 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         defer freeDirectDenseVectors(a, encoded.vectors);
         for (encoded.vectors, batched.vectors[0..2]) |vector, original| for (vector, original) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
     }
+    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_STAGE_FOLLOWUP")) {
+        const pages: [4]readers_api.RasterImage = @splat(rasters[0]);
+        const brokered = (try node.tryEmbedImagesViaBroker(a, std.testing.io, loaded, &.{}, &pages, node.extractionExecutionControl(null), .RETRIEVAL_DOCUMENT, null)) orelse return error.ExpectedImageBroker;
+        defer freeDirectDenseVectors(a, brokered);
+        for (brokered) |vector| for (vector, batched.vectors[0]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+        const mixed_parts = [_]grouped.Part{ .{ .text = "Describe these inputs." }, .{ .audio = audio_bytes }, .{ .raster = rasters[0] } };
+        const mixed_groups: [2]grouped.Group = @splat(.{ .content = &mixed_parts });
+        var timings = grouped.MediaTimings{};
+        var errors: [2]?anyerror = @splat(null);
+        const mixed = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &mixed_groups, .{ .timings = &timings }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &errors);
+        defer {
+            freeDirectDenseVectors(a, mixed.vectors);
+            a.free(mixed.input_tokens);
+        }
+        try std.testing.expectEqual(@as(usize, 0), timings.vision_plan_fallbacks);
+        try std.testing.expect(timings.prepared_vision_attempts > 0 and timings.stage_yields >= 3 and timings.stage_acquisitions >= 2);
+        for (mixed.vectors, errors) |vector, failure| {
+            try std.testing.expectEqual(@as(?anyerror, null), failure);
+            const expected = parsed.value.object.get("cases").?.array.items[4].object.get("embedding").?.array.items;
+            for (vector, expected) |actual, value| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(value.float)), actual, 1e-3);
+        }
+        std.debug.print("embeddinggemma2 stage_followup broker_parity=true mixed_parity=true stage_yields={d} stage_acquisitions={d} prepared_attempts={d} fallbacks={d}\n", .{ timings.stage_yields, timings.stage_acquisitions, timings.prepared_vision_attempts, timings.vision_plan_fallbacks });
+        const Env = struct {
+            extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+            extern "c" fn unsetenv([*:0]const u8) c_int;
+        };
+        const flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_ASYNC_IMAGE_PREPARATION";
+        const saved = if (platform.env.getenv(flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
+        defer if (saved) |old| a.free(old);
+        defer {
+            if (saved) |old| {
+                _ = Env.setenv(flag, old, 1);
+            } else {
+                _ = Env.unsetenv(flag);
+            }
+        }
+        var samples: [2][7]u64 = undefined;
+        for (0..9) |iteration| for (0..2) |phase| {
+            const route = phase ^ (iteration & 1);
+            try std.testing.expect(Env.setenv(flag, if (route == 0) "1" else "0", 1) == 0);
+            const started = platform.time.monotonicNs();
+            const result = (try node.tryEmbedImagesViaBroker(a, std.testing.io, loaded, &.{}, &pages, node.extractionExecutionControl(null), .RETRIEVAL_DOCUMENT, null)) orelse return error.ExpectedImageBroker;
+            defer freeDirectDenseVectors(a, result);
+            const elapsed = platform.time.monotonicNs() -| started;
+            for (result, brokered) |vector, expected| for (vector, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+            if (iteration >= 2) samples[route][iteration - 2] = elapsed;
+        };
+        for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
+        std.debug.print("embeddinggemma2 broker_async_preparation reference_ns={d} optimized_ns={d} samples=7 parity=true\n", .{ samples[0][3], samples[1][3] });
+    }
     const equal_pages: [5]readers_api.RasterImage = @splat(rasters[0]);
     const native_batch = try pipeline.embedBorrowedRastersReported(&equal_pages);
     defer freeDirectDenseVectors(a, native_batch.vectors);

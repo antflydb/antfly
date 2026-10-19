@@ -51,6 +51,7 @@ int32_t av_prepare_rgba_submit(void *, const uint8_t *, size_t, const uint32_t *
 // Native integer planes are retained until prepared output is released.
 int32_t av_prepare_native_submit(void *, void *, void *, const uint32_t *, void *, void *, void **);
 int32_t av_prepare_host_submit(void *, const uint8_t *, size_t, const uint8_t *, size_t, const uint32_t *, void *, void *, void **);
+int32_t av_prepare_rgba_into_submit(void *, const uint8_t *, size_t, const uint32_t *, void *, void *, size_t, void **);
 int av_prepared_poll(void *);
 void *av_prepared_buffer(void *);
 int32_t av_prepared_copy(void *, float *, size_t);
