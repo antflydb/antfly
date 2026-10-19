@@ -179,6 +179,10 @@ def main():
             (root / "src" / f"f{n:05}.txt").write_text("ordinary noise\n" * 8)
         (root / "src/f00000.txt").write_text("STOP stable\n")
         clients, handles = {}, {}
+        oracle = Client(binaries["current"], root, "src", [], env)
+        report["freshness_oracle"] = (
+            "Independent conservative process; no forced capture mutates either timed client's generation or caches."
+        )
         trials = report["trials"]["refresh_and_search"] = []
         try:
             for mode, binary in binaries.items():
@@ -230,13 +234,14 @@ def main():
                     views["current"].materialize()
                 )
                 # Forced reads are an untimed oracle for witness correctness.
-                _, rows = clients["current"].exchange("refresh", force_rescan=True)
+                _, rows = oracle.exchange("refresh", force_rescan=True)
                 assert rows[0]["revision"] == trial["current"]["ready"]["revision"]
                 if n >= 0:
                     trials.append(trial)
         finally:
             for client in clients.values():
                 client.close()
+            oracle.close()
     report["median"] = {
         workload: {
             mode: {
