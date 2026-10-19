@@ -216,6 +216,33 @@ fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
     return out;
 }
 
+/// Partitions may schedule independent branches in a different order from
+/// graph node IDs. Keep values whose graph-order last consumer runs early
+/// until request cleanup; executor fusion checks also compare these IDs, so
+/// using a backwards scheduled ID as a lifetime would be unsafe.
+fn partitionLastUses(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    plan: *const PartitionPlan,
+    reachable: []const bool,
+    graph_last_use: []const u32,
+) ![]u32 {
+    const result = try allocator.alloc(u32, graph.nodeCount());
+    @memset(result, std.math.maxInt(u32));
+    for (plan.partitions) |part| {
+        for (part.node_ids) |node_id| {
+            if (!reachable[node_id]) continue;
+            for (graph.node(node_id).getInputs()) |input_id| {
+                if (input_id != null_node and input_id < result.len) result[input_id] = node_id;
+            }
+        }
+    }
+    for (result, graph_last_use) |*scheduled, original| {
+        if (scheduled.* != original) scheduled.* = std.math.maxInt(u32);
+    }
+    return result;
+}
+
 /// Execute a partitioned graph across a device mesh.
 ///
 /// Each partition runs on its assigned device. Cross-partition edges
@@ -281,8 +308,10 @@ pub fn executeMultiDevice(
     const have_cache = options.cached_analysis != null;
     const reachable = if (options.cached_analysis) |ca| ca.reachable else try interpreter.computeReachable(allocator, graph);
     defer if (!have_cache) allocator.free(reachable);
-    const last_use = if (options.cached_analysis) |ca| ca.last_use else try interpreter.computeLastUse(allocator, graph, reachable);
-    defer if (!have_cache) allocator.free(last_use);
+    const graph_last_use = if (options.cached_analysis) |ca| ca.last_use else try interpreter.computeLastUse(allocator, graph, reachable);
+    defer if (!have_cache) allocator.free(graph_last_use);
+    const last_use = try partitionLastUses(allocator, graph, &plan.base, reachable, graph_last_use);
+    defer allocator.free(last_use);
 
     var runtime_shape_tracker = try interpreter.RuntimeShapeTracker.init(allocator, graph, options.cached_analysis);
     defer runtime_shape_tracker.deinit();
@@ -1041,4 +1070,46 @@ test "multi-executor metal graph outputs survive plan-slot reuse across executio
         const expected = input_value / (1.0 + @exp(-input_value));
         try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
     }
+}
+
+test "multi-executor retains inputs when partitions reorder independent consumers" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.tensorConst(&.{ 1, 2, 3, 4 }, Shape.init(.f32, &.{4}));
+    const negative = try b.neg(x);
+    const square = try b.mul(x, x);
+    try g.markOutput(negative);
+    try g.markOutput(square);
+    try std.testing.expectEqual(@as(usize, 3), g.nodeCount());
+    var parts = [_]Partition{
+        .{ .backend = .native, .node_ids = &.{ x, square }, .external_inputs = &.{} },
+        .{ .backend = .native, .node_ids = &.{negative}, .external_inputs = &.{.{ .node_id = x, .source_partition = 0 }} },
+    };
+    const assignments = [_]u32{ 0, 1, 0 };
+    const operators: [3]?@import("operator_plan.zig").OperatorPlan = @splat(null);
+    const devices: [2]DeviceId = @splat(0);
+    const plan = DevicePartitionPlan{
+        .base = .{ .partitions = &parts, .node_assignment = &assignments, .node_operator_plans = &operators, .allocator = a, .owns_executors = false },
+        .device_assignment = &devices,
+        .allocator = a,
+    };
+    var store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&store, a);
+    var compute = native_compute.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var mesh = try DeviceMesh.init(a, &.{.{ .id = 0, .backend = &cb, .kind = .native }});
+    defer mesh.deinit();
+    var analysis = try CachedAnalysis.compute(a, &g);
+    defer analysis.deinit(a);
+    var result = try executeMultiDevice(a, &g, &plan, &mesh, .{ .cached_analysis = analysis });
+    defer result.deinit(&mesh);
+    const neg_values = try cb.toFloat32(result.outputs[0], a);
+    defer a.free(neg_values);
+    const square_values = try cb.toFloat32(result.outputs[1], a);
+    defer a.free(square_values);
+    try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4 }, neg_values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 4, 9, 16 }, square_values);
 }

@@ -191,6 +191,9 @@ pub const ScatterReduction = enum { serial_v1, pytorch_gather_v1, pytorch_embedd
 pub const GatherAttrs = struct {
     axis: u8 = 0,
     elements: bool = false,
+    /// ONNX GatherND indexes coordinate tuples rather than one axis.
+    nd: bool = false,
+    batch_dims: u8 = 0,
     backward_reduction: ScatterReduction = .serial_v1,
     /// Embedding lookup leaves the padding row readable in forward, but
     /// suppresses its weight gradient. Only the embedding profile consumes it.
