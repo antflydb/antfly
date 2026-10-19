@@ -169,27 +169,33 @@ pub const Journal = struct {
     pub fn rearmDirectories(self: *Journal) void {
         if (!self.coverage) return;
         const count = self.watch.event_count;
-        for (self.watch.events.items[0..count]) |slot| for (self.routing.items[slot].paths.items) |path| {
-            const prior = self.tokens.getPtr(path) orelse continue;
-            if (self.watch.intact(prior.*)) continue;
-            var dir = std.Io.Dir.cwd().openDir(self.io, path, .{}) catch continue;
-            defer dir.close(self.io);
-            const token = self.watch.armDirectory(dir) orelse continue;
-            // A racing replacement can admit a new slot while rearming. Its
-            // event route must exist before any subsequent poll can expose it.
-            self.ensureRouting() catch {
-                self.watch.release(token);
-                self.failMetadata();
-                return;
-            };
-            if (token.slot >= self.routing.items.len or token.generation != prior.generation or token.generation != self.routing.items[token.slot].generation or token.sequence != self.routing.items[token.slot].sequence) {
-                self.watch.release(token);
-                continue;
+        var event_index: usize = 0;
+        // Rearming can grow Watch.events along with its slots. Reload from the
+        // owner instead of retaining a slice across a possible reallocation.
+        while (event_index < count) : (event_index += 1) {
+            const slot = self.watch.events.items[event_index];
+            for (self.routing.items[slot].paths.items) |path| {
+                const prior = self.tokens.getPtr(path) orelse continue;
+                if (self.watch.intact(prior.*)) continue;
+                var dir = std.Io.Dir.cwd().openDir(self.io, path, .{}) catch continue;
+                defer dir.close(self.io);
+                const token = self.watch.armDirectory(dir) orelse continue;
+                // A racing replacement can admit a new slot while rearming. Its
+                // event route must exist before any subsequent poll can expose it.
+                self.ensureRouting() catch {
+                    self.watch.release(token);
+                    self.failMetadata();
+                    return;
+                };
+                if (token.slot >= self.routing.items.len or token.generation != prior.generation or token.generation != self.routing.items[token.slot].generation or token.sequence != self.routing.items[token.slot].sequence) {
+                    self.watch.release(token);
+                    continue;
+                }
+                self.watch.certify(token);
+                self.watch.release(prior.*);
+                prior.* = token;
             }
-            self.watch.certify(token);
-            self.watch.release(prior.*);
-            prior.* = token;
-        };
+        }
         self.watch.poll();
         for (self.watch.events.items[0..self.watch.event_count]) |slot| for (self.routing.items[slot].paths.items) |path| {
             if (!self.watch.intact(self.tokens.get(path).?)) return;
@@ -660,7 +666,9 @@ test "racing directory rearm grows routing before publishing new watch slots" {
     defer a.free(relative);
     const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, a);
     defer a.free(root);
-    var journal = Journal.init(a, io);
+    // Refuse in-place growth so stale event-buffer slices fail reliably.
+    var moving = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    var journal = Journal.init(moving.allocator(), io);
     defer journal.deinit();
     if (journal.watch.fd < 0 or journal.watch.limit < 512) return error.SkipZigTest;
     var i: usize = 0;
@@ -672,17 +680,26 @@ test "racing directory rearm grows routing before publishing new watch slots" {
         if (!journal.coverage) return error.SkipZigTest;
     }
     const old_size = journal.routing.items.len;
+    const old_events = journal.watch.events.items.ptr;
     const target = try std.fmt.allocPrint(a, "{s}/d0", .{root});
     defer a.free(target);
     const token = journal.tokens.get(target).?;
     journal.watch.clearEvents();
-    journal.watch.events.appendAssumeCapacity(token.slot);
-    journal.watch.event_count = 1;
-    journal.watch.slots.items[token.slot].event_seen = true;
+    // More than one queued event catches an iterator retaining the old event
+    // allocation after the first replacement grows the table.
+    for (0..16) |n| {
+        const path = try std.fmt.allocPrint(a, "{s}/d{d}", .{ root, n });
+        defer a.free(path);
+        const pending = journal.tokens.get(path).?;
+        journal.watch.events.appendAssumeCapacity(pending.slot);
+        journal.watch.slots.items[pending.slot].event_seen = true;
+    }
+    journal.watch.event_count = journal.watch.events.items.len;
     try tmp.dir.rename("d0", tmp.dir, "old", io);
     try tmp.dir.createDir(io, "d0", .default_dir);
     journal.rearmDirectories();
     try std.testing.expect(journal.routing.items.len > old_size);
+    try std.testing.expect(old_events != journal.watch.events.items.ptr);
     try std.testing.expectEqual(journal.watch.slots.items.len, journal.routing.items.len);
     try std.testing.expect(!journal.watch.intact(token));
 }

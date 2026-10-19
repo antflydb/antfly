@@ -191,14 +191,19 @@ class StreamingViewTests(unittest.TestCase):
         ):
             p.consume(row, json.dumps(row).encode())
         v = View("h", revision="rev", token="token", files=p.finish())
-        tracemalloc.start()
+        already_tracing = tracemalloc.is_tracing()
+        if not already_tracing:
+            tracemalloc.start()
+        before = tracemalloc.get_traced_memory()[0]
+        tracemalloc.reset_peak()
         try:
             rows = v.iter_file(b"a")
             self.assertEqual(next(rows)["type"], "begin")
-            self.assertLess(tracemalloc.get_traced_memory()[1], 128 * 1024)
+            self.assertLess(tracemalloc.get_traced_memory()[1] - before, 128 * 1024)
             rows.close()
         finally:
-            tracemalloc.stop()
+            if not already_tracing:
+                tracemalloc.stop()
         # Older serialized array views still expand through the same API.
         v.files[b"legacy"] = b'[{"type":"end","file_id":"old"}]'
         self.assertEqual(v.materialize_file(b"legacy")[0]["file_id"], "old")
