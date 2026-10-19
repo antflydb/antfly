@@ -139,3 +139,14 @@ pub const CompactGeometry = struct {
         std.heap.c_allocator.free(self.storage);
     }
 };
+
+/// Model-owned vision arena. Encoded consumers share a serial device queue;
+/// no host upload writes these ranges while either frame is live.
+pub const VisionWorkspace = struct {
+    owner: tape.Plan = .{ .host_bytes = @sizeOf(VisionWorkspace), .metadata_bytes = @sizeOf(VisionWorkspace) },
+    spec: ops.EmbeddingVisionSpec,
+    stamp: u64,
+    tile: usize,
+    views: [107]?ops.CT = @splat(null),
+    slots: [16][3]?usize = @splat(@splat(null)),
+};

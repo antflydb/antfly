@@ -37531,12 +37531,13 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         defer freeDirectDenseVectors(a, single.vectors);
         for (vector, single.vectors[0]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, @as(f32, if (metal) 1e-3 else 1e-4));
     }
-    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_PIPELINED_VISION")) {
+    if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_PIPELINED_VISION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP"))) {
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
             extern "c" fn unsetenv([*:0]const u8) c_int;
         };
-        const flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION";
+        const followup = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP");
+        const flag = if (followup) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP" else "ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION";
         const saved = if (platform.env.getenv(flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
         defer if (saved) |old| a.free(old);
         defer {
@@ -37561,7 +37562,20 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
             } else reference = result.vectors;
         };
         for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
-        std.debug.print("embeddinggemma2 vision_pipeline serial_ns={d} pipeline_ns={d} samples=7 parity=true\n", .{ samples[0][3], samples[1][3] });
+        std.debug.print("embeddinggemma2 vision_{s} reference_ns={d} optimized_ns={d} samples=7 parity=true\n", .{ if (followup) "followup" else "pipeline", samples[0][3], samples[1][3] });
+    }
+    if (comptime @import("build_options").enable_metal) {
+        if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP")) {
+            var permit = try loaded.session.admit(.{ .batch = 1, .sequence = 8192, .host_preprocess_bytes = 64 * 1024 * 1024, .workspace_bytes = 2 * 1024 * 1024 * 1024, .output_bytes = 8192 * 512 * 4 });
+            defer permit.deinit();
+            const control = node.extractionExecutionControl(null);
+            const gate = loaded.embeddingExecutionLock();
+            if (gate) |mutex| try control.lock(mutex);
+            defer if (gate) |mutex| mutex.unlock();
+            var managed = try session_factory.getManagedComputeBackend(loaded.session, a, null, control);
+            defer managed.deinit();
+            try @import("../architectures/gemma4_projector.zig").qualifyEmbeddingGemma2VisionCancellation(&managed.backend, a, rasters[0]);
+        }
     }
     const equal_pages: [5]readers_api.RasterImage = @splat(rasters[0]);
     const native_batch = try pipeline.embedBorrowedRastersReported(&equal_pages);

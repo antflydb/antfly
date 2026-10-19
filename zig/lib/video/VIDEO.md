@@ -816,3 +816,22 @@ Cancellation drains or cancels both owned frame slots before freeing views.
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_FFN=1` selects the product-only FFN path,
 and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN=1` also disables that candidate.
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_CACHE=1` bypasses retained mask metadata.
+
+Metal vision retains up to two admitted activation layouts per model. Each uses
+bounded 512-row FFN tiles, snapshots immutable norm coefficients and reuses
+separate norm, residual, alternating hidden and prepared-head ranges. Activation
+storage is capped at 256 MiB per layout; normalization coefficients and tensor-view
+metadata are admitted separately. Layout replacement occurs only with no active
+or submitted frame, and vision pressure releases all retained layouts.
+
+Packed QKV is normalized directly from its projection strides: Q/K retain their
+2D RoPE and Q scale; V uses unweighted RMSNorm without rotation. FFNs stream
+packed projection, GELU and down projection into final hidden rows. Residual
+normalization/addition uses one dispatch. Position gathering/addition and the
+spatial projector each have an owned frame, respecting external frame owners.
+Cancellation drains both layer slots before clearing the request's layout view.
+
+MPS linear slots retain four immutable multiplication shapes and their matrix
+descriptors, including full tiles and tails. Activation-bound matrix views keep
+the existing frame ownership and release boundaries. Slot replacement and model
+unload invalidate all cached shapes.

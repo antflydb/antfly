@@ -808,7 +808,12 @@ pub const VisionNormRopeParams = extern struct {
     eps: f32,
     theta: f32,
     scale: f32,
+    stride: u32 = 0,
+    start: u32 = 0,
+    rotate: u32 = 1,
+    weighted: u32 = 1,
 };
+pub const EmbeddingVisionSpec = struct { rows: usize, hidden: usize, intermediate: usize };
 pub const Gemma4AudioLocalAttentionParams = struct {
     rows: usize,
     hidden: usize,
@@ -2060,6 +2065,10 @@ pub const ComputeBackend = struct {
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
         rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
         clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
+        embeddingVisionWorkspace: ?*const fn (ctx: *anyopaque, spec: ?EmbeddingVisionSpec) anyerror!void = null,
+        embeddingVisionNorm: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: ?CT, eps: f32, slot: usize) anyerror!?CT = null,
+        embeddingVisionQKV: ?*const fn (ctx: *anyopaque, input: CT, layer: usize, params: VisionNormRopeParams) anyerror!?SplitLastDim3Result = null,
+        embeddingVisionFFN: ?*const fn (ctx: *anyopaque, input: CT, layer: usize) anyerror!?CT = null,
         embeddingCompactVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingCompactVisibility = null,
         embeddingModelVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingModelVisibility = null,
         embeddingWorkspacePrepare: ?*const fn (ctx: *anyopaque, spec: EmbeddingWorkspaceSpec) anyerror!void = null,
@@ -5006,6 +5015,21 @@ pub const ComputeBackend = struct {
     pub fn mrope(self: *const ComputeBackend, input: CT, token_count: usize, head_dim: usize, theta: f32, freq_scale: f32, positions: []const u32, sections: [3]u32) !?CT {
         const op = self.vtable.mrope orelse return null;
         return op(self.ptr, input, token_count, head_dim, theta, freq_scale, positions, sections);
+    }
+
+    pub fn runEmbeddingVisionFFN(self: *const ComputeBackend, input: CT, layer: usize) !?CT {
+        const run = self.vtable.embeddingVisionFFN orelse return null;
+        try self.checkExecutionControl();
+        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.audioSetControl) |set| {
+            _ = set(self.ptr, previous);
+        };
+        const output = try run(self.ptr, input, layer);
+        self.checkExecutionControl() catch |err| {
+            if (output) |ct| self.free(ct);
+            return err;
+        };
+        return output;
     }
 
     pub fn visionNormRope(self: *const ComputeBackend, input: CT, weight: CT, params: VisionNormRopeParams) !?CT {

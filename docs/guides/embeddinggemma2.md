@@ -1447,43 +1447,43 @@ Diagnostic controls are `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_WORKSPACE`,
 participates in audio schedule identity. Controls are restored after qualification.
 
 On an M4 Max, completed ReleaseFast checkpoint measurements gave these median
-latencies in the first qualification run. Full encoder measurements include all 24 layers, pooling,
+latencies. Full encoder measurements include all 24 layers, pooling,
 normalization and output readback; the vision comparison uses the public raster
 embedding API with two real image fixtures.
 
 | Fixture | Reference | Optimized |
 |---|---:|---:|
-| Full encoder, 2560 rows | 267.742 ms | 214.426 ms |
-| Full encoder, 3000 rows, partial final tile | 305.461 ms | 259.392 ms |
-| Full encoder, 4096 rows | 459.970 ms | 380.611 ms |
-| Public raster embeddings, synchronous / overlapping vision | 560.638 ms | 544.330 ms |
-| Masked backbone, 512 rectangular / 448 active rows | 33.276 ms | 31.405 ms |
-| Masked backbone, 512 rectangular / 511 active rows | 33.781 ms | 34.316 ms |
+| Full encoder, 2560 rows | 262.507 ms | 218.903 ms |
+| Full encoder, 3000 rows, partial final tile | 307.159 ms | 260.519 ms |
+| Full encoder, 4096 rows | 423.597 ms | 363.938 ms |
+| Public raster embeddings, previous / optimized vision | 537.062 ms | 416.280 ms |
+| Masked backbone, 512 rectangular / 448 active rows | 33.925 ms | 29.868 ms |
+| Masked backbone, 512 rectangular / 511 active rows | 35.430 ms | 32.822 ms |
 
 The full encoder compares dense FFNs, product-only tiling and streamed down
 projection, rotating route order with two warmups and five measured samples.
-Product-only medians were 225.384, 267.617 and 396.398 ms respectively; streamed
-down projection remains the default for eligible long layouts, avoiding the
-full intermediate product as well as the full packed projection. A separate
-active-frame cancellation/retry run measured dense/product-only/streamed medians
-of 278.705/246.027/241.570 ms at 2560 rows, 369.557/304.552/301.633 ms at 3000
-rows, and 500.061/444.959/453.036 ms at 4096 rows. Across both runs streaming
-reduced full encoder latency by 9–20% versus dense execution; its difference
-versus product-only tiling ranged from about 2% slower to 5% faster. The bounded
-memory reduction is consistent; the latency advantage over product-only tiling
-is workload-dependent. The compact and vision comparisons use seven samples after
-two warmups, with alternating route order. Vision overlap reduced the measured
-public-path latency about 3%, within the existing two-layer scratch envelope.
-Removing only one masked row was slightly slower; compact execution does not
-promise a latency gain for almost-full masks. All comparisons complete GPU work
-and check output parity. These fixtures do not establish broad workload speedups
-or parity with PyTorch.
+Product-only medians were 225.952, 269.174 and 368.678 ms respectively. Streamed
+down projection reduced these full encoder latencies by 14–17% versus dense
+execution and 1–3% versus product-only tiling, while avoiding the full packed
+projection and full intermediate product. The product-only latency difference
+varies with geometry and contention; the memory reduction is consistent.
 
-Qualification includes 312 passing optimized Metal checks (51 skipped), 39
-portable checks from a CUDA-enabled Linux build, and the pretrained ordered-media
-oracle. The full encoder checks 2560, 3000 and 4096 rows, output parity and
-active-frame cancellation, cleanup and retry. Debug reference checks also cover audio replay and
-public audio waves. Linux CUDA device execution was not exercised.
+Compact and vision comparisons use seven samples after two warmups, with
+alternating route order. The vision comparison keeps layer overlap and MPS shape
+caching enabled on both routes, isolating the new arena, packed heads, streamed
+vision FFN, residual fusion and boundary frames. The completed public-path
+latency decreased about 22.5%. All comparisons complete GPU work and check output
+parity. These fixtures do not establish broad workload speedups or parity with
+PyTorch, and near-full masks do not guarantee a latency improvement.
+
+Qualification includes 316 passing checks in both Debug and optimized Metal
+builds (51 skipped), 40 portable checks from a CUDA-enabled Linux build, and
+pretrained ordered-media reference parity. Full encoder checks cover 2560, 3000
+and 4096 rows, active-frame cancellation, cleanup and retry; vision also checks
+active-frame interruption and retry. Focused tests cover strided Q/K/V on CPU
+and Metal, admitted layout reuse/replacement/pressure cleanup, and four warm MPS
+shapes with slot-replacement invalidation. Linux CUDA device execution was not
+exercised.
 
 Metal pooled inference compacts masked rows before backbone execution. Explicit
 original positions preserve RoPE and sliding windows across holes; per-item
@@ -1541,3 +1541,33 @@ Cancellation drains or cancels both owned frame slots before freeing views.
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_FFN=1` selects the product-only FFN path,
 and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN=1` also disables that candidate.
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_CACHE=1` bypasses retained mask metadata.
+
+Metal vision retains up to two admitted activation layouts per model. Each uses
+bounded 512-row FFN tiles, snapshots immutable norm coefficients and reuses
+separate norm, residual, alternating hidden and prepared-head ranges. Activation
+storage is capped at 256 MiB per layout; normalization coefficients and tensor-view
+metadata are admitted separately. Layout replacement occurs only with no active
+or submitted frame, and vision pressure releases all retained layouts.
+
+Packed QKV is normalized directly from its projection strides: Q/K retain their
+2D RoPE and Q scale; V uses unweighted RMSNorm without rotation. FFNs stream
+packed projection, GELU and down projection into final hidden rows. Residual
+normalization/addition uses one dispatch. Position gathering/addition and the
+spatial projector each have an owned frame, respecting external frame owners.
+Cancellation drains both layer slots before clearing the request's layout view.
+
+MPS linear slots retain four immutable multiplication shapes and their matrix
+descriptors, including full tiles and tails. Activation-bound matrix views keep
+the existing frame ownership and release boundaries. Slot replacement and model
+unload invalidate all cached shapes.
+
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP=1` selects the previous vision
+execution policy. Individual diagnostics are
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_WORKSPACE`,
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_PACKED_VISION_HEADS`,
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_VISION_FFN`,
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES`, and
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_MPS_SHAPE_CACHE` (all set to `1` to disable).
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP=1` adds an alternating completed
+public-raster comparison to the ordered-media checkpoint oracle, plus active
+vision-frame cancellation and retry parity.

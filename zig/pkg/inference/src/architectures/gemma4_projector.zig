@@ -2850,6 +2850,12 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
 
+    if (visionFollowup(cb, store, cfg)) if (cb.vtable.embeddingVisionWorkspace) |prepare|
+        try prepare(cb.ptr, .{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
+    defer if (cb.vtable.embeddingVisionWorkspace) |prepare| {
+        prepare(cb.ptr, null) catch {};
+    };
+
     // Group only our own frames. External frame owners keep their lifetime
     // boundary; stage diagnostics keep their synchronized per-layer behavior.
     const can_group = cb.kind() == .metal and cfg.embedding_gemma2_f32_attention and
@@ -2917,6 +2923,8 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
         }
     }
     if (can_group and !pipeline) policy.layerCompleted(@intCast(geometry.width), @intCast(geometry.height), batch, group, cfg.block_count, platform.time.monotonicNs() - started);
+    var projector_frame = try beginVisionBoundary(cb, store, cfg);
+    defer if (projector_frame) cb.decoderRuntimeCancelFrame() catch {};
     const standardized = try prepareSpatialProjector(cb, allocator, store, hidden, cfg, geometry, batch);
     cb.free(hidden);
     hidden_live = false;
@@ -2927,6 +2935,11 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
     const projection_w = try projectorLinearWeightCt(cb, allocator, store, "mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     const projected = try cb.linearNoBias(normed_pooled, projection_w, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
     errdefer cb.free(projected);
+    if (projector_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        projector_frame = false;
+        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+    }
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
 
     return .{
@@ -4861,6 +4874,11 @@ test "embeddinggemma2 resident position rows preserve asymmetric x y order" {
 
 /// HF positions are axis-first. Gather only the x/y rows needed by this
 /// frame and add their sum on device, preserving the host addition order.
+fn beginVisionBoundary(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: Config) !bool {
+    if (!visionFollowup(cb, store, cfg) or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES") or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return false;
+    return cb.decoderRuntimeBeginFrame();
+}
+
 fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.Allocator, patches: CT, positions: CT, hidden: usize, geometry: Geometry) !CT {
     const shape = try cb.tensorShape(positions, allocator);
     defer allocator.free(shape);
@@ -4877,13 +4895,22 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
         x[i] = @intCast(i % geometry.grid_x);
         y[i] = std.math.cast(i64, per_axis + (i / geometry.grid_x) % geometry.grid_y) orelse return error.InvalidPositionEmbeddingShape;
     }
+    var frame = if (cb.kind() == .metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES") and !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame()) try cb.decoderRuntimeBeginFrame() else false;
+    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
     const xp = try cb.embeddingLookup(positions, x, rows, hidden);
     defer cb.free(xp);
     const yp = try cb.embeddingLookup(positions, y, rows, hidden);
     defer cb.free(yp);
     const offsets = try cb.add(xp, yp);
     defer cb.free(offsets);
-    return cb.add(patches, offsets);
+    const result = try cb.add(patches, offsets);
+    errdefer cb.free(result);
+    if (frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame = false;
+        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+    }
+    return result;
 }
 
 fn addPositionEmbeddings(
@@ -5067,6 +5094,23 @@ const VisionProfile = struct {
     }
 };
 
+fn visionFollowup(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: Config) bool {
+    return cb.kind() == .metal and store.gguf == null and cfg.embedding_gemma2_f32_attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP");
+}
+
+fn visionNorm(cb: *const ComputeBackend, cfg: Config, store: *const ProjectorWeights, input: CT, weight: CT, residual: ?CT, index: usize) !CT {
+    if (visionFollowup(cb, store, cfg)) {
+        if (cb.vtable.embeddingVisionNorm) |run| if (try run(cb.ptr, input, weight, residual, cfg.layer_norm_eps, index)) |out| return out;
+        if (residual) |res| if (try cb.rmsNormResidual(input, weight, res, cfg.vision_hidden, cfg.layer_norm_eps, 1, 1)) |out| return out;
+    }
+    const normalized = try cb.rmsNorm(input, weight, cfg.vision_hidden, cfg.layer_norm_eps);
+    if (residual) |res| {
+        defer cb.free(normalized);
+        return cb.add(res, normalized);
+    }
+    return normalized;
+}
+
 fn encoderBlockBatch(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -5089,20 +5133,18 @@ fn encoderBlockBatch(
     var profile = VisionProfile.init(cb, layer);
 
     const ln1 = try store.cachedWeightCt(try fmt(&buf, "v.blk.{d}.ln1.weight", .{layer}));
-    const normed1 = try cb.rmsNorm(input, ln1, cfg.vision_hidden, cfg.layer_norm_eps);
+    const normed1 = try visionNorm(cb, cfg, store, input, ln1, null, layer * 4);
     defer cb.free(normed1);
 
     try profile.phase(cb, "attention_pre_norm");
     const attn = try selfAttentionBatch(cb, allocator, store, cfg, normed1, geometry, layer, &buf, batch, &profile);
     defer cb.free(attn);
     const attn_post = try store.cachedWeightCt(try fmt(&buf, "v.blk.{d}.attn_post_norm.weight", .{layer}));
-    const attn_normed = try cb.rmsNorm(attn, attn_post, cfg.vision_hidden, cfg.layer_norm_eps);
-    defer cb.free(attn_normed);
-    const res1 = try cb.add(input, attn_normed);
+    const res1 = try visionNorm(cb, cfg, store, attn, attn_post, input, layer * 4 + 1);
     errdefer cb.free(res1);
 
     const ln2 = try store.cachedWeightCt(try fmt(&buf, "v.blk.{d}.ln2.weight", .{layer}));
-    const normed2 = try cb.rmsNorm(res1, ln2, cfg.vision_hidden, cfg.layer_norm_eps);
+    const normed2 = try visionNorm(cb, cfg, store, res1, ln2, null, layer * 4 + 2);
     defer cb.free(normed2);
 
     try profile.phase(cb, "attention_post_norm_residual");
@@ -5110,10 +5152,7 @@ fn encoderBlockBatch(
     defer cb.free(ffn);
     try profile.phase(cb, "ffn");
     const ffn_post = try store.cachedWeightCt(try fmt(&buf, "v.blk.{d}.ffn_post_norm.weight", .{layer}));
-    const ffn_normed = try cb.rmsNorm(ffn, ffn_post, cfg.vision_hidden, cfg.layer_norm_eps);
-    defer cb.free(ffn_normed);
-
-    const res2 = try cb.add(res1, ffn_normed);
+    const res2 = try visionNorm(cb, cfg, store, ffn, ffn_post, res1, layer * 4 + 3);
     errdefer cb.free(res2);
     try profile.phase(cb, "ffn_post_norm_residual");
     if (frame) {
@@ -5146,8 +5185,12 @@ fn selfAttentionBatch(
 
     // EmbeddingGemma2 vision linears have no clipping or biases. The backend
     // may cache one admitted packed QKV projection for this immutable model.
-    var packed_qkv: ?@import("../ops/ops.zig").LinearTripleResult = null;
-    if (cfg.embedding_gemma2_f32_attention and store.gguf == null) {
+    const direct_heads = if (visionFollowup(cb, store, cfg) and cb.vtable.embeddingVisionQKV != null) blk: {
+        const params = visionNormRopeParams(total, cfg.vision_hidden, head_dim, geometry, cfg.layer_norm_eps, cfg.rope_theta, true) orelse break :blk null;
+        break :blk try cb.vtable.embeddingVisionQKV.?(cb.ptr, input, layer, params);
+    } else null;
+    var packed_qkv: ?@import("../ops/ops.zig").LinearTripleResult = if (direct_heads) |heads| .{ .first = heads.first, .second = heads.second, .third = heads.third } else null;
+    if (direct_heads == null and cfg.embedding_gemma2_f32_attention and store.gguf == null) {
         var names: [3][128]u8 = undefined;
         const q_name = try std.fmt.bufPrint(&names[0], "vision_tower.encoder.layers.{d}.self_attn.q_proj.linear.weight", .{layer});
         const k_name = try std.fmt.bufPrint(&names[1], "vision_tower.encoder.layers.{d}.self_attn.k_proj.linear.weight", .{layer});
@@ -5160,7 +5203,7 @@ fn selfAttentionBatch(
     defer if (remaining_v) |tensor| cb.free(tensor);
     var q = if (packed_qkv) |triple| triple.first else try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_q", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     defer cb.free(q);
-    {
+    if (direct_heads == null) {
         const q_norm_w = try store.cachedWeightCt(try fmt(buf, "v.blk.{d}.attn_q_norm.weight", .{layer}));
         const normed = try rmsNormHeadChunksAnd2dRope(cb, allocator, q, q_norm_w, total, cfg.vision_hidden, head_dim, geometry, cfg.layer_norm_eps, cfg.rope_theta, true);
         cb.free(q);
@@ -5171,7 +5214,7 @@ fn selfAttentionBatch(
     var k = remaining_k orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_k", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     remaining_k = null;
     defer cb.free(k);
-    {
+    if (direct_heads == null) {
         const k_norm_w = try store.cachedWeightCt(try fmt(buf, "v.blk.{d}.attn_k_norm.weight", .{layer}));
         const normed = try rmsNormHeadChunksAnd2dRope(cb, allocator, k, k_norm_w, total, cfg.vision_hidden, head_dim, geometry, cfg.layer_norm_eps, cfg.rope_theta, false);
         cb.free(k);
@@ -5182,7 +5225,7 @@ fn selfAttentionBatch(
     var v = remaining_v orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_v", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     remaining_v = null;
     defer cb.free(v);
-    {
+    if (direct_heads == null) {
         const normed = try rmsNormHeadChunksNoScale(cb, allocator, v, total, cfg.vision_hidden, head_dim, cfg.layer_norm_eps);
         cb.free(v);
         v = normed;
@@ -5355,6 +5398,7 @@ fn feedForward(
     layer: usize,
     buf: *[128]u8,
 ) !CT {
+    if (visionFollowup(cb, store, cfg)) if (try cb.runEmbeddingVisionFFN(input, layer)) |out| return out;
     if (cfg.embedding_gemma2_f32_attention and store.gguf == null) {
         var names: [2][128]u8 = undefined;
         if (try cb.linearPackedNamed(input, &.{
@@ -8953,4 +8997,79 @@ fn checkNormClamp(cb: ComputeBackend, reference: ComputeBackend) !void {
 }
 test "embeddinggemma2 Metal RMS input-clamp fusion preserves weighted normalization and bound semantics" {
     try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkNormClamp);
+}
+
+fn checkPackedVisionHeads(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const rows = 12;
+    const hidden = 128;
+    const dim = 64;
+    var values: [rows * hidden * 3]f32 = undefined;
+    var weights: [dim]f32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.13);
+    for (&weights, 0..) |*value, i| value.* = 0.5 + @as(f32, @floatFromInt(i)) / 64;
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&values, &.{ rows, hidden * 3 }));
+    defer cb.free(input);
+    const weight = try cb.fromFloat32Shape(&weights, &.{dim});
+    defer cb.free(weight);
+    const geometry = Geometry{ .width = 48, .height = 32, .grid_x = 3, .grid_y = 2, .pooled_x = 3, .pooled_y = 2 };
+    for (0..3) |part| {
+        var expected: [rows * hidden]f32 = undefined;
+        for (0..rows) |row| @memcpy(expected[row * hidden ..][0..hidden], values[row * hidden * 3 + part * hidden ..][0..hidden]);
+        var ones: [dim]f32 = @splat(1);
+        activations.rmsNorm(&expected, if (part == 2) &ones else &weights, dim, 1e-6);
+        if (part < 2) apply2dRope(&expected, rows, hidden, dim, geometry, 10000, part == 0);
+        var params = visionNormRopeParams(rows, hidden, dim, geometry, 1e-6, 10000, part == 0).?;
+        params.stride = hidden * 3;
+        params.start = @intCast(part * hidden);
+        params.rotate = @intFromBool(part < 2);
+        params.weighted = @intFromBool(part < 2);
+        const output = (try cb.visionNormRope(input, weight, params)).?;
+        defer cb.free(output);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 5e-6);
+        params.start = hidden * 3;
+        try std.testing.expectError(error.InvalidTensorShape, cb.visionNormRope(input, weight, params));
+    }
+}
+test "embeddinggemma2 packed vision heads preserve strided Q K V normalization rotation and batches on native" {
+    try @import("../ops/media_residency_test.zig").onNative(@import("../ops/media_residency_test.zig").noWeights, checkPackedVisionHeads);
+}
+test "embeddinggemma2 packed vision heads preserve strided Q K V normalization rotation and batches on Metal" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkPackedVisionHeads);
+}
+
+/// Offline real-checkpoint ownership qualification. Interrupt an encoded layer,
+/// drain both pipeline slots, then compare the retried projection with a warm run.
+pub fn qualifyEmbeddingGemma2VisionCancellation(cb: *const ComputeBackend, a: std.mem.Allocator, raster: antfly_image.BorrowedRasterAttachment) !void {
+    var prepared = try prepareEmbeddingGemma2Raster(a, raster);
+    defer prepared.deinit();
+    var expected = try encodePreparedEmbeddingGemma2ImagesResident(cb, a, &.{prepared}, .{});
+    defer expected.deinit();
+    const values = try cb.toFloat32(expected.embeddings, a);
+    defer a.free(values);
+    const Stop = struct {
+        backend: *const ComputeBackend,
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.backend.decoderRuntimeHasActiveFrame()) {
+                self.checks += 1;
+                if (self.checks >= 32) return error.Cancelled;
+            }
+        }
+    };
+    var stop = Stop{ .backend = cb };
+    var cancelled = cb.*;
+    cancelled.execution_control = .{ .ptr = &stop, .check_fn = Stop.check };
+    try std.testing.expectError(error.Cancelled, encodePreparedEmbeddingGemma2ImagesResident(&cancelled, a, &.{prepared}, .{}));
+    try std.testing.expect(stop.checks >= 32);
+    try std.testing.expect(!cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame());
+    var retry = try encodePreparedEmbeddingGemma2ImagesResident(cb, a, &.{prepared}, .{});
+    defer retry.deinit();
+    const actual = try cb.toFloat32(retry.embeddings, a);
+    defer a.free(actual);
+    for (values, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
+    std.debug.print("embeddinggemma2 vision_active_cancellation checks={d} retry_parity=true\n", .{stop.checks});
 }

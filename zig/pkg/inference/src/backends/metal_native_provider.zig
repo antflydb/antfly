@@ -105,6 +105,9 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_linear_cache_bytes: usize = 0,
     embeddinggemma2_vision_linear_cache_bytes: usize = 0,
     embeddinggemma2_audio_linear_cache_bytes: usize = 0,
+    embedding_vision_workspaces: [2]?*@import("../ops/metal_embedding_bindings.zig").VisionWorkspace = @splat(null),
+    embedding_vision_clock: u64 = 0,
+    embedding_vision_retry: u64 = 0,
     embedding_bindings: ?*@import("../ops/metal_embedding_bindings.zig").State = null,
     embedding_binding_retry: u64 = 0,
     embedding_binding_clock: u64 = 0,
@@ -203,6 +206,21 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         self.releaseEmbeddingWorkspaceLeases();
     }
 
+    fn clearVisionWorkspaces(self: *MetalNativeProvider) usize {
+        var bytes: usize = 0;
+        for (&self.embedding_vision_workspaces) |*entry| if (entry.*) |workspace| {
+            bytes += workspace.owner.host_bytes + workspace.owner.backend_bytes;
+            workspace.owner.deinit();
+            if (self.embeddinggemma2_cache_admission) |cache| {
+                cache.noteRelease(.host, workspace.owner.host_bytes);
+                cache.noteRelease(.backend, workspace.owner.backend_bytes);
+            }
+            std.heap.c_allocator.destroy(workspace);
+            entry.* = null;
+        };
+        self.embedding_vision_retry = 0;
+        return bytes;
+    }
     fn clearEmbeddingBindings(self: *MetalNativeProvider) usize {
         const state = self.embedding_bindings orelse return 0;
         const bytes = state.owner.host_bytes + state.owner.backend_bytes;
@@ -240,6 +258,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         const policy = @import("../models/embedding_gemma2_weight_cache.zig");
         var reclaimed: usize = 0;
         if (cache_class == .language) reclaimed += self.clearEmbeddingBindings();
+        if (cache_class == .vision) reclaimed += self.clearVisionWorkspaces();
         if (cache_class == .audio) {
             if (metal_runtime.antfly_metal_audio_storage_clear(self.raw_decode_runtime) != 0) return error.MetalWorkspaceBusy;
             reclaimed += self.clearAudioSchedules();
@@ -369,6 +388,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         }
         metal_runtime.resetGatheredSpans(self);
         _ = self.clearEmbeddingBindings();
+        _ = self.clearVisionWorkspaces();
         _ = self.clearAudioSchedules();
         if (self.embeddinggemma2_audio_storage_bytes != 0) {
             _ = metal_runtime.antfly_metal_audio_storage_clear(self.raw_decode_runtime);
