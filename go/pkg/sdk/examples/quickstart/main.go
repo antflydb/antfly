@@ -36,7 +36,7 @@ func main() {
 	}
 
 	embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
-		Model: "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+		Model: "google/embeddinggemma-2:bf16-safetensors-bundle-v1",
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -112,7 +112,7 @@ func main() {
 		CoveragePolicy: antfly.DerivedCoveragePolicyPartial,
 		Template:       "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
 		Embedder:       *embedder,
-		Dimension:      512,
+		Dimension:      768,
 		DistanceMetric: antfly.DistanceMetricCosine,
 	})
 	if err != nil {
