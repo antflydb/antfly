@@ -576,7 +576,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -633,7 +633,7 @@ jobs:
           grep -q 'run python3 success' "$RUNNER_TEMP/platform-musl.log"
 
       - name: Set up Node for generated source checks
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
 
@@ -790,7 +790,7 @@ jobs:
 
       - name: Retain unit test progress
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
           path: |
@@ -802,7 +802,7 @@ jobs:
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -816,7 +816,7 @@ jobs:
 
       - name: Retain TLA trace evidence
         if: always() && !cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/antfly-tla-traces/
@@ -869,7 +869,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -896,7 +896,7 @@ jobs:
         run: zig version
 
       - name: Set up Node for WASM tests
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
 
@@ -965,7 +965,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -1043,7 +1043,7 @@ jobs:
 
       - name: Upload real-model extraction evaluation
         if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lite-extraction-evaluation
           path: ${{ runner.temp }}/lite-extraction-eval.json
@@ -1099,10 +1099,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1259,7 +1259,7 @@ jobs:
 
       - name: Upload real-model extraction evaluation
         if: always() && !cancelled() && steps.lite_extraction_report.outputs.exists == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lite-extraction-evaluation
           path: ${{ runner.temp }}/lite-extraction-eval.json
@@ -1276,7 +1276,7 @@ jobs:
 
       - name: Retain unit test progress
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
           path: |
@@ -1308,7 +1308,7 @@ jobs:
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Set up Java for TLA+
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -1321,7 +1321,7 @@ jobs:
 
       - name: Retain TLA trace evidence
         if: always() && !cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/antfly-tla-traces/
@@ -1360,7 +1360,7 @@ jobs:
       - name: Retain VOPR qualification diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-qualification-diagnostics
           path: |
@@ -1465,10 +1465,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1516,7 +1516,7 @@ jobs:
 
       - name: Upload storage compilation measurements
         if: ${{ always() && matrix.shard == 'storage-ownership' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: storage-compilation
           path: zig/storage-compilation.json
@@ -1682,7 +1682,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-grep
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base.tar.gz
@@ -1694,7 +1694,7 @@ jobs:
         run: tar -C zig/zig-out -czf "${RUNNER_TEMP}/libantfly-e2e-base.tar.gz" lib include
 
       - name: Upload native SDK library installation
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: libantfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-base.tar.gz
@@ -1734,7 +1734,7 @@ jobs:
       - name: Install native test tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
       - name: Download native SDK library installation
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: libantfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/native-sdk-artifact
@@ -1760,10 +1760,10 @@ jobs:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
         if: matrix.sdk == 'python'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Set up Node
         if: matrix.sdk == 'typescript'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
       - name: Set up pnpm
@@ -1798,7 +1798,7 @@ jobs:
       - name: Install driver build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
       - name: Download candidate E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/pgwire-driver-artifact
@@ -1810,7 +1810,7 @@ jobs:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: false
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
       - name: Set up Rust
@@ -1822,7 +1822,7 @@ jobs:
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Test standard PostgreSQL drivers against candidate runtime
         run: >-
           uv run --no-project --with requests --with pytest
@@ -1849,7 +1849,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
       - name: Restore common E2E duration history
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -1869,7 +1869,7 @@ jobs:
           uv run --project e2e/antfly pytest --collect-only -q -p zig_e2e_shard \
             --antfly-ci-plan-output "${RUNNER_TEMP}/e2e-plan/plan.json" \
             -m "$(python3 ../scripts/ci/zig_e2e_shard.py base-marker)" e2e/antfly
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/e2e-plan
@@ -1968,7 +1968,7 @@ jobs:
           ln -s "$cache_root/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -1978,7 +1978,7 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Download E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
@@ -1987,7 +1987,7 @@ jobs:
         run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-base/antfly-e2e-base.tar.gz" -C zig
 
       - name: Download common E2E plan and timing baseline
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/e2e-plan
@@ -2053,7 +2053,7 @@ jobs:
           >> "$GITHUB_STEP_SUMMARY"
       - name: Retain E2E timings and per-test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-e2e-timings-${{ matrix.suite }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/e2e-reports
@@ -2062,7 +2062,7 @@ jobs:
 
       - name: Retain failed E2E server logs and cluster diagnostics
         if: failure() && startsWith(matrix.suite, 'antfly')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: |
@@ -2148,7 +2148,7 @@ jobs:
           ln -s "$cache_root/home-antfly-low-fd" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2158,7 +2158,7 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Download E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
@@ -2188,7 +2188,7 @@ jobs:
 
       - name: Retain low-FD regression results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-low-fd-results-${{ github.run_attempt }}
           path: ${{ runner.temp }}/low-fd-reports
@@ -2197,7 +2197,7 @@ jobs:
 
       - name: Retain failed low-FD server logs and cluster diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-low-fd-server-logs-${{ github.run_attempt }}
           path: |
@@ -2246,11 +2246,11 @@ jobs:
           test "$NATIVE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/e2e-plan
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: antfly-e2e-timings-*
           path: ${{ runner.temp }}/e2e-observations
@@ -2345,7 +2345,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full.tar.gz
@@ -2357,7 +2357,7 @@ jobs:
         run: tar -C zig/zig-out -czf "${RUNNER_TEMP}/libantfly-e2e-full.tar.gz" lib include
 
       - name: Upload native SDK library installation
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: libantfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-full.tar.gz
@@ -2447,7 +2447,7 @@ jobs:
           ln -s "$home_cache_root/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2468,7 +2468,7 @@ jobs:
         run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
 
       - name: Download E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full
@@ -2480,7 +2480,7 @@ jobs:
       # C ABI artifact produced by the same build as the server under test.
       - name: Download ingestion native library
         if: matrix.suite == 'antfly'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-full
@@ -2589,7 +2589,7 @@ jobs:
 
       - name: Retain full inference server logs
         if: always() && startsWith(matrix.suite, 'inference-')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-inference-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/inference-server-logs/*.log
@@ -2598,7 +2598,7 @@ jobs:
 
       - name: Retain failed full E2E server logs and cluster diagnostics
         if: failure() && matrix.suite == 'antfly'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: |
@@ -2614,7 +2614,7 @@ jobs:
 
       - name: Retain inference timings
         if: always() && startsWith(matrix.suite, 'inference-')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: inference-timings-${{ matrix.suite }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/inference-reports
