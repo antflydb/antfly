@@ -87,11 +87,17 @@ pub const Form = struct {
     }
 };
 pub const Request = struct { form: Form, kind: Kind };
+/// A row in a negotiated summary stream contributes to exactly one reducer.
+/// The producer assigns a request ordinal; relation adapters map it to the
+/// owning aggregate slot. It never denotes an ordinary SQL column.
+pub const Input = struct { slot: usize, value: i64 };
 pub const Plan = struct {
     requests: []const Request,
     dimensions: usize,
     moments: bool,
     quadratic: bool,
+    extrema: bool = false,
+    supports: bool = false,
     ptr: ?*anyopaque = null,
     charge: ?*const fn (*anyopaque, usize) anyerror!void = null,
     pub fn init(requests: []const Request) Plan {
@@ -99,11 +105,48 @@ pub const Plan = struct {
         for (requests) |r| {
             result.moments = result.moments or r.kind == .avg or r.kind == .sum or r.kind == .count;
             result.quadratic = result.quadratic or r.form.quadratic();
+            result.extrema = result.extrema or r.kind == .min or r.kind == .max;
+            result.supports = result.supports or r.kind == .distinct;
         }
         return result;
     }
     fn work(self: Plan, amount: usize) !void {
         if (self.charge) |f| try f(self.ptr.?, amount);
+    }
+    fn directions(self: Plan) usize {
+        return if (self.extrema or self.supports) self.requests.len else 0;
+    }
+};
+
+/// Sparse aligned words keep grouped supports compact even when correlated
+/// offsets are far apart. Inserting a support costs words, not distinct values.
+pub const SupportSet = struct {
+    words: std.AutoHashMapUnmanaged(i64, u64) = .empty,
+    pub fn deinit(self: *SupportSet, a: A) void {
+        self.words.deinit(a);
+    }
+    fn putWord(self: *SupportSet, a: A, index: i64, bits: u64) !u64 {
+        if (bits == 0) return 0;
+        const entry = try self.words.getOrPut(a, index);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        const added: u64 = @popCount(bits & ~entry.value_ptr.*);
+        entry.value_ptr.* |= bits;
+        return added;
+    }
+    pub fn insert(self: *SupportSet, a: A, value: i64) !bool {
+        return try self.putWord(a, @divFloor(value, 64), @as(u64, 1) << @as(u6, @intCast(@mod(value, 64)))) != 0;
+    }
+    pub fn add(self: *SupportSet, a: A, support: Support, offset: i64) !u64 {
+        const base = @as(i128, support.low) + offset;
+        const first: i64 = @intCast(@divFloor(base, 64));
+        const shift: u6 = @intCast(@mod(base, 64));
+        var added: u64 = 0;
+        for (support.words, 0..) |word, i| {
+            const index = first + @as(i64, @intCast(i));
+            added += try self.putWord(a, index, word << shift);
+            if (shift != 0) added += try self.putWord(a, index + 1, word >> @as(u6, @intCast(64 - @as(u7, shift))));
+        }
+        return added;
     }
 };
 pub const Signed = struct {
@@ -169,7 +212,7 @@ pub const Value = struct {
     pub fn add(l: Value, a: A, r: Value, plan: Plan) !Value {
         if (l.count.cap(1) == 0) return r;
         if (r.count.cap(1) == 0) return l;
-        try plan.work(plan.dimensions + plan.requests.len + @max(l.crosses.len, r.crosses.len));
+        try plan.work(plan.dimensions + plan.directions() + @max(l.crosses.len, r.crosses.len));
         var out = init(if (plan.moments) try l.count.add(a, r.count) else Count.one);
         const sums = try a.alloc(Count, @max(l.sums.len, r.sums.len));
         for (sums, 0..) |*v, i| v.* = try l.sum(i).add(a, r.sum(i));
@@ -177,14 +220,16 @@ pub const Value = struct {
         const crosses = try a.alloc(Count, @max(l.crosses.len, r.crosses.len));
         for (crosses, 0..) |*v, i| v.* = try l.cross(i).add(a, r.cross(i));
         out.crosses = crosses;
-        const ext = try a.alloc(Extrema, plan.requests.len);
-        const supports = try a.alloc(Support, plan.requests.len);
-        for (plan.requests, ext, supports, 0..) |request, *e, *s, i| {
-            const le = l.extreme(i);
-            const re = r.extreme(i);
-            e.* = .{ .min = @min(le.min, re.min), .max = @max(le.max, re.max) };
-            s.* = if (request.kind == .distinct) try Support.merge(l.support(i), a, r.support(i), plan) else .{};
-        }
+        const ext = try a.alloc(Extrema, if (plan.extrema) plan.requests.len else 0);
+        const supports = try a.alloc(Support, if (plan.supports) plan.requests.len else 0);
+        if (plan.extrema or plan.supports) for (plan.requests, 0..) |request, i| {
+            if (plan.extrema) {
+                const le = l.extreme(i);
+                const re = r.extreme(i);
+                ext[i] = .{ .min = @min(le.min, re.min), .max = @max(le.max, re.max) };
+            }
+            if (plan.supports) supports[i] = if (request.kind == .distinct) try Support.merge(l.support(i), a, r.support(i), plan) else .{};
+        };
         out.extrema = ext;
         out.supports = supports;
         return out;
@@ -193,7 +238,7 @@ pub const Value = struct {
         if (l.count.cap(1) == 0 or r.count.cap(1) == 0) return init(Count.init(0));
         if (r.sums.len == 0 and r.crosses.len == 0 and r.extrema.len == 0 and r.supports.len == 0 and r.count.exact() == 1) return l;
         if (l.sums.len == 0 and l.crosses.len == 0 and l.extrema.len == 0 and l.supports.len == 0 and l.count.exact() == 1) return r;
-        try plan.work(plan.dimensions + plan.requests.len + @max(l.crosses.len, r.crosses.len));
+        try plan.work(plan.dimensions + plan.directions() + @max(l.crosses.len, r.crosses.len));
         var out = init(if (plan.moments) try l.count.multiply(a, r.count) else Count.one);
         const sums = try a.alloc(Count, @max(l.sums.len, r.sums.len));
         for (sums, 0..) |*v, i| v.* = try (try l.sum(i).multiply(a, r.count)).add(a, try r.sum(i).multiply(a, l.count));
@@ -206,13 +251,15 @@ pub const Value = struct {
             };
             out.crosses = crosses;
         }
-        const ext = try a.alloc(Extrema, plan.requests.len);
-        const supports = try a.alloc(Support, plan.requests.len);
-        for (plan.requests, ext, supports, 0..) |request, *e, *s, index| {
-            const le = l.extreme(index);
-            const re = r.extreme(index);
-            e.* = .{ .min = std.math.add(i128, le.min, re.min) catch return error.CypherStatisticDeclined, .max = std.math.add(i128, le.max, re.max) catch return error.CypherStatisticDeclined };
-            s.* = .{};
+        const ext = try a.alloc(Extrema, if (plan.extrema) plan.requests.len else 0);
+        const supports = try a.alloc(Support, if (plan.supports) plan.requests.len else 0);
+        if (plan.extrema or plan.supports) for (plan.requests, 0..) |request, index| {
+            if (plan.extrema) {
+                const le = l.extreme(index);
+                const re = r.extreme(index);
+                ext[index] = .{ .min = std.math.add(i128, le.min, re.min) catch return error.CypherStatisticDeclined, .max = std.math.add(i128, le.max, re.max) catch return error.CypherStatisticDeclined };
+            }
+            if (plan.supports) supports[index] = .{};
             if (request.kind == .distinct) {
                 const ls = l.support(index);
                 const rs = r.support(index);
@@ -226,15 +273,15 @@ pub const Value = struct {
                         result = if (result) |prior| try Support.merge(prior, a, shifted, plan) else shifted;
                     }
                 }
-                s.* = result.?;
+                supports[index] = result.?;
             }
-        }
+        };
         out.extrema = ext;
         out.supports = supports;
         return out;
     }
     pub fn advance(self: Value, a: A, edge: usize, plan: Plan) !Value {
-        try plan.work(plan.dimensions + plan.requests.len + if (plan.quadratic) plan.dimensions * (plan.dimensions + 1) / 2 else @as(usize, 0));
+        try plan.work(plan.dimensions + plan.directions() + if (plan.quadratic) plan.dimensions * (plan.dimensions + 1) / 2 else @as(usize, 0));
         var out = self;
         if (plan.moments) {
             const sums = try a.alloc(Count, plan.dimensions);
@@ -253,15 +300,19 @@ pub const Value = struct {
                 out.crosses = crosses;
             }
         }
-        const ext = try a.alloc(Extrema, plan.requests.len);
-        const supports = try a.alloc(Support, plan.requests.len);
-        for (plan.requests, ext, supports, 0..) |request, *e, *s, i| {
+        const ext = try a.alloc(Extrema, if (plan.extrema) plan.requests.len else 0);
+        const supports = try a.alloc(Support, if (plan.supports) plan.requests.len else 0);
+        if (plan.extrema or plan.supports) for (plan.requests, 0..) |request, i| {
             const cost = request.form.coefficients[1 + edge];
-            const prior = self.extreme(i);
-            e.* = .{ .min = std.math.add(i128, prior.min, cost) catch return error.CypherStatisticDeclined, .max = std.math.add(i128, prior.max, cost) catch return error.CypherStatisticDeclined };
-            s.* = self.support(i);
-            if (request.kind == .distinct) s.low = std.math.add(i64, s.low, cost) catch return error.CypherStatisticDeclined;
-        }
+            if (plan.extrema) {
+                const prior = self.extreme(i);
+                ext[i] = .{ .min = std.math.add(i128, prior.min, cost) catch return error.CypherStatisticDeclined, .max = std.math.add(i128, prior.max, cost) catch return error.CypherStatisticDeclined };
+            }
+            if (plan.supports) {
+                supports[i] = self.support(i);
+                if (request.kind == .distinct) supports[i].low = std.math.add(i64, supports[i].low, cost) catch return error.CypherStatisticDeclined;
+            }
+        };
         out.extrema = ext;
         out.supports = supports;
         return out;
@@ -303,4 +354,20 @@ test "statistics retain cross moments, signed costs and holes through compositio
     try std.testing.expect((try Form.combine(xx, x, a, .multiply)) == null);
     const max = try Form.literal(a, std.math.maxInt(i64), 2);
     try std.testing.expect((try Form.combine(max, x, a, .add)) == null);
+}
+
+test "sparse supports preserve holes, overlaps and distant signed offsets" {
+    var set: SupportSet = .{};
+    defer set.deinit(std.testing.allocator);
+    const a = std.testing.allocator;
+    const support: Support = .{ .low = -1, .words = &.{0b10101} };
+    try std.testing.expectEqual(@as(u64, 3), try set.add(a, support, 0));
+    try std.testing.expectEqual(@as(u64, 0), try set.add(a, support, 0));
+    try std.testing.expect(!try set.insert(a, -1));
+    try std.testing.expect(try set.insert(a, 0));
+    try std.testing.expectEqual(@as(u64, 3), try set.add(a, support, 10000000000));
+    try std.testing.expectEqual(@as(u64, 3), try set.add(a, support, -10000000000));
+    try std.testing.expectEqual(@as(u64, 1), try set.add(a, .{ .low = 0, .words = &.{1} }, std.math.maxInt(i64)));
+    try std.testing.expectEqual(@as(u64, 1), try set.add(a, .{ .low = 0, .words = &.{1} }, std.math.minInt(i64)));
+    try std.testing.expect(set.words.count() < 12);
 }

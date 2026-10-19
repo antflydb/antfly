@@ -121,19 +121,19 @@ pub const NodeCursor = struct {
     summary: ?[]const u8 = null,
     linear_summary: bool = false,
     total_axis: bool = false,
-    statistic: ?@import("statistic.zig").Request = null,
+    statistic: ?[]const @import("statistic.zig").Request = null,
     statistic_global: bool = false,
     weighted_seeds: ?Engine.AnchorBatch = null,
     fallback_seed: ?usize = null,
     weighted_arena: std.heap.ArenaAllocator,
     adjacency_cache: Engine.AdjacencyCache,
-    pending: std.ArrayList(struct { row: Row, weight: Count, statistic_input: ?i64 = null }) = .empty,
+    pending: std.ArrayList(struct { row: Row, weight: Count, statistic_input: ?@import("statistic.zig").Input = null }) = .empty,
     pending_position: usize = 0,
     /// Compact prefix counts; exact consumers must read last_counts.
     last_weights: std.ArrayList(u64) = .empty,
     last_counts: std.ArrayList(Count) = .empty,
-    last_statistic_inputs: std.ArrayList(?i64) = .empty,
-    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity, summary: ?[]const u8 = null, linear: bool = false, total_axis: bool = false, statistic: ?@import("statistic.zig").Request = null, statistic_global: bool = false };
+    last_statistic_inputs: std.ArrayList(?@import("statistic.zig").Input) = .empty,
+    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity, summary: ?[]const u8 = null, linear: bool = false, total_axis: bool = false, statistic: ?[]const @import("statistic.zig").Request = null, statistic_global: bool = false };
     /// Plan a projected endpoint bag without advancing or rebinding the read
     /// cut. Plans and their AST storage belong to this cursor.
     pub fn planWeightFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity) !?WeightPlan {
@@ -256,9 +256,34 @@ pub const NodeCursor = struct {
         const form = (try check.statisticProof(self.engine.a, fields.items)) orelse return null;
         if (!form.eligible(check.statistic_kind)) return null;
         if (!Engine.statisticBenefit(form, check.statistic_kind, plan.path)) return null;
-        plan.statistic = .{ .form = form, .kind = check.statistic_kind };
+        plan.statistic = try self.engine.a.dupe(Engine.Statistic.Request, &.{.{ .form = form, .kind = check.statistic_kind }});
         plan.statistic_global = check.statistic_global and invariants.len == 0;
         return plan;
+    }
+    /// Combine certified consumers over the same oriented geometry. Replan
+    /// their union of projections so pruning cannot remove another reducer's
+    /// private length bindings.
+    pub fn mergeStatisticPlans(self: *NodeCursor, left: WeightPlan, right: WeightPlan) !?WeightPlan {
+        const l = left.statistic orelse return null;
+        const r = right.statistic orelse return null;
+        if (left.path.execution_reversed != right.path.execution_reversed or left.path.edges.len != right.path.edges.len) return null;
+        var fields: std.ArrayList([]const u8) = .empty;
+        for ([_]ast.Projection{ left.projection, right.projection }) |projection| for (projection.items) |item| {
+            const name = item.alias orelse try self.engine.expressionName(item.expression);
+            const present = for (fields.items) |field| {
+                if (std.mem.eql(u8, field, name)) break true;
+            } else false;
+            if (!present) try fields.append(self.engine.a, name);
+        };
+        const multiplicity: Multiplicity = if (left.multiplicity == .exact or right.multiplicity == .exact) .exact else if (left.multiplicity == .capped or right.multiplicity == .capped) .capped else .presence;
+        var merged = (try self.planWeightFields(fields.items, multiplicity)) orelse return null;
+        if (merged.path.execution_reversed != left.path.execution_reversed or merged.path.edges.len != left.path.edges.len) return null;
+        const requests = try self.engine.a.alloc(Engine.Statistic.Request, l.len + r.len);
+        @memcpy(requests[0..l.len], l);
+        @memcpy(requests[l.len..], r);
+        merged.statistic = requests;
+        merged.statistic_global = left.statistic_global and right.statistic_global;
+        return merged;
     }
     // Ordinary pull fallback traverses the accepted normalized path. Admit
     // only MATCH-wide relationship histories whose depth bound remains valid
@@ -386,13 +411,29 @@ pub const NodeCursor = struct {
             self.fallback_seed = 0;
         }
     }
+    fn appendWeighted(self: *NodeCursor, projected: Row, weight: Count, input: ?@import("statistic.zig").Input) !void {
+        const a = self.weighted_arena.allocator();
+        try self.pending.append(a, .{ .row = (try (v.Value{ .map = projected }).clone(a)).map, .weight = try weight.clone(a), .statistic_input = input });
+    }
     fn emitWeighted(ptr: *anyopaque, row: Row, weight: Count) !void {
         const self: *NodeCursor = @ptrCast(@alignCast(ptr));
         const e = self.engine;
         for (try e.projectUnordered(&.{row}, self.query.clauses[1].operation.project.value, false)) |projected| {
             try e.values.output(.{ .map = projected });
-            const a = self.weighted_arena.allocator();
-            try self.pending.append(a, .{ .row = (try (v.Value{ .map = projected }).clone(a)).map, .weight = try weight.clone(a), .statistic_input = if (e.statistic_bin) |bin| bin.input else null });
+            if (e.statistic_bin) |bin| {
+                if (bin.support) |support| {
+                    for (support.value.words, 0..) |word, wi| {
+                        var bits = word;
+                        while (bits != 0) : (bits &= bits - 1) {
+                            try e.state();
+                            const input = std.math.cast(i64, @as(i128, support.offset) + support.value.low + @as(i128, wi * 64 + @ctz(bits))) orelse return error.CypherStatisticDeclined;
+                            try self.appendWeighted(projected, weight, .{ .slot = bin.slot, .value = input });
+                        }
+                    }
+                    continue;
+                }
+                try self.appendWeighted(projected, weight, .{ .slot = bin.slot, .value = bin.input });
+            } else try self.appendWeighted(projected, weight, null);
         }
     }
 
@@ -1088,9 +1129,9 @@ const Engine = struct {
     moment_total_axis: bool = false,
     statistic_plan: ?StatisticPlan = null,
     statistic_targets: []const SummaryTarget = &.{},
-    external_statistic: ?Statistic.Request = null,
+    external_statistic: ?[]const Statistic.Request = null,
     external_statistic_global: bool = false,
-    statistic_bin: ?struct { call: ?*const ast.Expr, input: i64 } = null,
+    statistic_bin: ?struct { call: ?*const ast.Expr, slot: usize, input: i64 = 0, support: ?StatisticSupport = null } = null,
     moment_input: Row = &.{},
     moment_endpoint: ?[]const u8 = null,
     moment_invariants: std.ArrayList(*const ast.Expr) = .empty,
@@ -1196,6 +1237,7 @@ const Engine = struct {
         distinct_arena: std.heap.ArenaAllocator,
         distinct_values: std.ArrayList(v.Value) = .empty,
         distinct_index: value_work.Index = .{},
+        distinct_support: ?*Statistic.SupportSet = null,
         count: u64 = 0,
         sum: v.Value = .{ .integer = 0 },
         sum_sign: enum { zero, positive, negative } = .zero,
@@ -1209,6 +1251,29 @@ const Engine = struct {
         fn add(self: *StreamingAggregate, engine: *Engine, row: Row) !void {
             return self.addWeighted(engine, row, Count.one);
         }
+        fn supportInteger(value: v.Value) ?i64 {
+            return switch (value) {
+                .integer => |n| n,
+                .number => |n| if (std.math.isFinite(n) and @trunc(n) == n and n >= -0x1p63 and n < 0x1p63) @intFromFloat(n) else null,
+                else => null,
+            };
+        }
+        fn addSupport(self: *StreamingAggregate, engine: *Engine, support: StatisticSupport) !void {
+            const a = self.distinct_arena.allocator();
+            if (self.distinct_support == null) {
+                const set = try a.create(Statistic.SupportSet);
+                set.* = .{};
+                // A previous anchor may have used ordinary enumeration. Import
+                // its integral keys without counting those values twice.
+                try Engine.chargeWork(engine, self.distinct_values.items.len);
+                for (self.distinct_values.items) |value| if (supportInteger(value)) |integer| {
+                    _ = try set.insert(a, integer);
+                };
+                self.distinct_support = set;
+            }
+            try Engine.chargeWork(engine, support.value.words.len * 2);
+            self.count = try addPathCount(self.count, try self.distinct_support.?.add(a, support.value, support.offset));
+        }
         fn addWeighted(self: *StreamingAggregate, engine: *Engine, row: Row, multiplicity: Count) !void {
             const value = if (self.function.star) v.Value{ .integer = 1 } else try engine.eval(self.function.args[0], row, null);
             if (value == .null) return;
@@ -1216,17 +1281,22 @@ const Engine = struct {
             // Other DISTINCT reducers retain only unique arguments, using the
             // same equality and hashing as GROUP BY.
             if (self.function.distinct and !std.ascii.eqlIgnoreCase(self.function.name, "min") and !std.ascii.eqlIgnoreCase(self.function.name, "max")) {
-                const hash = (try engine.values.info(value)).hash;
-                var candidate = self.distinct_index.head(hash);
-                while (candidate) |position| {
-                    const link = self.distinct_index.links.items[position];
-                    if (try engine.values.eql(self.distinct_values.items[link.index], value)) return;
-                    candidate = link.next;
+                const integer = supportInteger(value);
+                if (self.distinct_support != null and integer != null) {
+                    if (!try self.distinct_support.?.insert(self.distinct_arena.allocator(), integer.?)) return;
+                } else {
+                    const hash = (try engine.values.info(value)).hash;
+                    var candidate = self.distinct_index.head(hash);
+                    while (candidate) |position| {
+                        const link = self.distinct_index.links.items[position];
+                        if (try engine.values.eql(self.distinct_values.items[link.index], value)) return;
+                        candidate = link.next;
+                    }
+                    const retained = self.distinct_arena.allocator();
+                    const owned = try value.clone(retained);
+                    try self.distinct_index.insert(retained, hash, self.distinct_values.items.len);
+                    try self.distinct_values.append(retained, owned);
                 }
-                const retained = self.distinct_arena.allocator();
-                const owned = try value.clone(retained);
-                try self.distinct_index.insert(retained, hash, self.distinct_values.items.len);
-                try self.distinct_values.append(retained, owned);
             }
             const weight = if (self.function.distinct or std.ascii.eqlIgnoreCase(self.function.name, "min") or std.ascii.eqlIgnoreCase(self.function.name, "max")) Count.one else multiplicity;
             const prior_count = self.count;
@@ -1658,6 +1728,10 @@ const Engine = struct {
                 if (fold.active_calls) |active| if (!active[i]) continue;
                 if (engine.statistic_bin) |bin| {
                     if (bin.call != fold.calls[i]) continue;
+                    if (bin.support) |support| {
+                        try accumulator.addSupport(engine, support);
+                        continue;
+                    }
                     const literal: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = bin.input } } };
                     const saved = accumulator.function;
                     accumulator.function.args = &.{&literal};
@@ -2203,42 +2277,74 @@ const Engine = struct {
         return output;
     }
     const ReductionPass = struct { projection: ast.Projection, active_calls: ?[]const bool = null };
-    /// Partition independent aggregate calls by their efficient orientation.
-    /// Every pass consumes the same immutable bag; the original expressions
-    /// are evaluated once over the completed states. Never rewrite SUM(a+b),
-    /// combine arithmetic states, or divide an aggregate across passes.
+    /// Partition reducers by both traversal orientation and certificate family.
+    /// Incompatible numeric consumers retain their own exact plan, without
+    /// forcing polynomial consumers to retain a length distribution. All
+    /// passes share the statement's read cut, adjacency and quotas.
     fn reductionPasses(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, calls: []const *const ast.Expr) ![]const ReductionPass {
         const ordinary = try self.a.dupe(ReductionPass, &.{.{ .projection = projection }});
         if (calls.len < 2 or input.len == 0) return ordinary;
-        for (projection.items) |item| if (!aggregates(item.expression)) return ordinary;
+        const fold = self.stream_fold orelse return ordinary;
+        if (fold.continuation != null) return ordinary;
+        const prior_active = fold.active_calls;
+        const prior_input = self.moment_input;
+        const prior_endpoint = self.moment_endpoint;
+        defer {
+            fold.active_calls = prior_active;
+            self.moment_input = prior_input;
+            self.moment_endpoint = prior_endpoint;
+        }
+        const single_active = try self.a.alloc(bool, calls.len);
+        var proof_arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer proof_arena.deinit();
+        var keys: std.ArrayList(ast.Item) = .empty;
+        for (projection.items) |item| if (!aggregates(item.expression)) try keys.append(self.a, item);
         const path = operation.paths[0];
-        var items: [2]std.ArrayList(ast.Item) = .{ .empty, .empty };
-        var active: [2][]bool = undefined;
+        var items: [4]std.ArrayList(ast.Item) = @splat(.empty);
+        var active: [4][]bool = undefined;
         for (&active) |*mask| {
             mask.* = try self.a.alloc(bool, calls.len);
             @memset(mask.*, false);
         }
         for (calls, 0..) |expression, index| {
-            const single: ast.Projection = .{ .items = &.{.{ .expression = expression }} };
-            var direction: ?usize = null;
+            var observed: std.ArrayList(ast.Item) = .empty;
+            try observed.appendSlice(self.a, keys.items);
+            try observed.append(self.a, .{ .expression = expression });
+            const single: ast.Projection = .{ .items = observed.items };
+            @memset(single_active, false);
+            single_active[index] = true;
+            fold.active_calls = single_active;
+            var cohort: ?usize = null;
             for (input) |row| {
-                // Planning correlated input rows is statement work too, and
-                // must remain cancellable before opening either pass.
                 try self.state();
                 const planned = try self.reductionPath(path, row, operation, single, middle);
                 if (!try self.batchEligible(planned, row, operation, single, middle)) return ordinary;
-                const next: usize = if (planned.execution_reversed == path.execution_reversed) 0 else 1;
-                if (direction) |prior| if (prior != next) return ordinary;
-                direction = next;
+                self.moment_input = row;
+                self.moment_endpoint = planned.nodes[planned.nodes.len - 1].alias;
+                const polynomial = proof: {
+                    // Classification retains only a boolean. Keep temporary
+                    // coefficient arrays bounded across correlated inputs.
+                    _ = proof_arena.reset(.free_all);
+                    const scope = EvalScope.enter(self, proof_arena.allocator());
+                    defer scope.leave(self);
+                    break :proof (try self.planStatistics(planned, false)) != null;
+                };
+                const direction: usize = @intFromBool(planned.execution_reversed != path.execution_reversed);
+                const next = direction * 2 + @intFromBool(polynomial);
+                if (cohort) |prior| if (prior != next) return ordinary;
+                cohort = next;
             }
-            const selected = direction.?;
+            const selected = cohort.?;
+            if (items[selected].items.len == 0) try items[selected].appendSlice(self.a, keys.items);
             try items[selected].append(self.a, .{ .expression = expression });
             active[selected][index] = true;
         }
-        if (items[0].items.len == 0 or items[1].items.len == 0) return ordinary;
-        const passes = try self.a.alloc(ReductionPass, 2);
-        for (passes, items, active) |*pass, group, mask| pass.* = .{ .projection = .{ .items = group.items }, .active_calls = mask };
-        return passes;
+        var passes: std.ArrayList(ReductionPass) = .empty;
+        for (items, active) |group, mask| {
+            if (std.mem.indexOfScalar(bool, mask, true) == null) continue;
+            try passes.append(self.a, .{ .projection = .{ .items = group.items }, .active_calls = mask });
+        }
+        return if (passes.items.len > 1) passes.items else ordinary;
     }
     fn prefixWindow(self: *Engine, projection: ast.Projection) bool {
         const skip_expression = projection.skip orelse return false;
@@ -4405,7 +4511,7 @@ const Engine = struct {
             self.moment_representatives = prior_representatives;
             self.moment_total_axis = prior_axis;
         }
-        if (try self.planStatistics(path)) |plan| {
+        if (try self.planStatistics(path, true)) |plan| {
             const saved_plan = self.statistic_plan;
             const saved_targets = self.statistic_targets;
             self.statistic_plan = plan;
@@ -4447,6 +4553,7 @@ const Engine = struct {
         return false;
     }
     const Statistic = @import("statistic.zig");
+    const StatisticSupport = struct { value: Statistic.Support, offset: i64 };
     const StatisticNames = std.StringHashMapUnmanaged(Statistic.Form);
     const StatisticPlan = struct { kernel: Statistic.Plan, calls: []const *const ast.Expr = &.{}, global: bool = false };
     fn statisticReferences(value: anytype, names: StatisticNames) bool {
@@ -4531,7 +4638,7 @@ const Engine = struct {
         // Independent single-marginal extrema already have a cheaper plan.
         return different and nonzero > 1;
     }
-    fn planStatistics(self: *Engine, path: ast.Path) !?StatisticPlan {
+    fn planStatistics(self: *Engine, path: ast.Path, require_benefit: bool) !?StatisticPlan {
         if (path.edges.len == 0 or path.edges.len > 32 or self.component_leaves.len != 0 or path.selector != .all or self.shortest_count != null) return null;
         const targets = try self.summaryTargets(path);
         if (targets.len == 0) return null;
@@ -4539,8 +4646,7 @@ const Engine = struct {
         var names: StatisticNames = .empty;
         for (targets) |target| try names.put(self.a, target.name, try Statistic.Form.column(self.a, path.edges.len, target.edge, statistic_depth));
         if (statisticReferences(self.stream_predicate, names)) return null;
-        if (self.external_statistic) |request| {
-            const requests = try self.a.dupe(Statistic.Request, &.{request});
+        if (self.external_statistic) |requests| {
             var kernel = Statistic.Plan.init(requests);
             kernel.ptr = self;
             kernel.charge = chargeWork;
@@ -4553,9 +4659,11 @@ const Engine = struct {
         names = (try self.statisticMiddle(fold.middle, names, path.edges.len, &global)) orelse return null;
         for (fold.projection.items) |item| if (!aggregates(item.expression) and statisticReferences(item.expression, names)) return null;
         if (statisticReferences(fold.projection.predicate, names) or statisticReferences(fold.projection.order, names)) return null;
-        const requests = try self.a.alloc(Statistic.Request, fold.calls.len);
+        var requests: std.ArrayList(Statistic.Request) = .empty;
+        var calls: std.ArrayList(*const ast.Expr) = .empty;
         var benefit = false;
-        for (fold.calls, requests) |expression, *request| {
+        for (fold.calls, 0..) |expression, index| {
+            if (fold.active_calls) |active| if (!active[index]) continue;
             const f = expression.value.call;
             if (!f.star and f.args.len != 1) return null;
             const kind: Statistic.Kind = if (f.distinct) (if (std.ascii.eqlIgnoreCase(f.name, "count")) .distinct else return null) else kind: {
@@ -4566,21 +4674,25 @@ const Engine = struct {
             };
             const form = if (f.star and kind == .count) try Statistic.Form.literal(self.a, 0, path.edges.len) else (try self.statisticArgument(f.args[0], names, path.edges.len)) orelse return null;
             if (!form.eligible(kind)) return null;
-            request.* = .{ .form = form, .kind = kind };
+            try requests.append(self.a, .{ .form = form, .kind = kind });
+            try calls.append(self.a, expression);
             benefit = benefit or statisticBenefit(form, kind, path);
         }
-        if (!benefit) return null;
-        var kernel = Statistic.Plan.init(requests);
+        if (requests.items.len == 0 or (require_benefit and !benefit)) return null;
+        var kernel = Statistic.Plan.init(requests.items);
         kernel.ptr = self;
         kernel.charge = chargeWork;
-        return .{ .kernel = kernel, .calls = fold.calls, .global = !fold.has_keys and global };
+        return .{ .kernel = kernel, .calls = calls.items, .global = !fold.has_keys and global };
     }
     fn emitStatisticBin(self: *Engine, row: Row, index: usize, input: i64, weight: Count) !void {
+        return self.emitStatisticInput(row, index, input, null, weight);
+    }
+    fn emitStatisticInput(self: *Engine, row: Row, index: usize, input: i64, support: ?StatisticSupport, weight: Count) !void {
         if (weight.cap(1) == 0) return;
         try self.state();
         const plan = self.statistic_plan.?;
         const prior = self.statistic_bin;
-        self.statistic_bin = .{ .call = if (plan.calls.len == 0) null else plan.calls[index], .input = input };
+        self.statistic_bin = .{ .call = if (plan.calls.len == 0) null else plan.calls[index], .slot = index, .input = input, .support = support };
         defer self.statistic_bin = prior;
         if (self.weighted_sink) |sink| return sink.emit(sink.ptr, row, weight);
         const fold = self.stream_fold.?;
@@ -4600,16 +4712,7 @@ const Engine = struct {
                 const input = std.math.cast(i64, @as(i128, request.form.coefficients[0]) + (if (request.kind == .min) e.min else e.max)) orelse return error.CypherStatisticDeclined;
                 try self.emitStatisticBin(row, i, input, Count.one);
             },
-            .distinct => {
-                const support = value.support(i);
-                for (support.words, 0..) |word, wi| {
-                    var bits = word;
-                    while (bits != 0) : (bits &= bits - 1) {
-                        const input = std.math.add(i64, request.form.coefficients[0], support.low + @as(i64, @intCast(wi * 64 + @ctz(bits)))) catch return error.CypherStatisticDeclined;
-                        try self.emitStatisticBin(row, i, input, Count.one);
-                    }
-                }
-            },
+            .distinct => try self.emitStatisticInput(row, i, 0, .{ .value = value.support(i), .offset = request.form.coefficients[0] }, Count.one),
             .sum, .avg => {
                 const total = try (try value.total(self.a, request.form)).magnitude(self.a);
                 const divided = try total.amount.divRem(self.a, value.count);
@@ -4878,7 +4981,12 @@ const Engine = struct {
         }
         switch (@typeInfo(T)) {
             .pointer => |p| {
-                if (p.size == .one and p.child == ast.Expr) return self.momentSafe(value.*, names);
+                if (p.size == .one and p.child == ast.Expr) {
+                    if (self.stream_fold) |fold| if (fold.active_calls) |active| {
+                        for (fold.calls, active) |call_value, enabled| if (!enabled and call_value == value) return true;
+                    };
+                    return self.momentSafe(value.*, names);
+                }
                 if (p.size == .slice and p.child != u8) for (value) |child| {
                     if (!try self.momentSafe(child, names)) return false;
                 };
@@ -5077,7 +5185,11 @@ const Engine = struct {
                     if (!try self.momentSafe(fold.projection, names)) return null;
                     if (fold == self.stream_fold.? and self.momentLocal(fold.middle)) {
                         const calls = try self.a.alloc(?DirectMoment, fold.calls.len);
-                        for (fold.calls, calls) |expression, *call_input| {
+                        for (fold.calls, calls, 0..) |expression, *call_input, i| {
+                            if (fold.active_calls) |active| if (!active[i]) {
+                                call_input.* = null;
+                                continue;
+                            };
                             const invocation = expression.value.call;
                             call_input.* = if (try self.momentKind(invocation, names)) |kind| .{ .kind = kind, .form = (try self.momentArgument(invocation.args[0], names)).?, .expression = invocation.args[0] } else null;
                             if (call_input.* != null) try self.retainMomentChecks(invocation.args[0], names);

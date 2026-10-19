@@ -426,6 +426,7 @@ pub const Row = struct {
         return result;
     }
 };
+pub const AggregateInput = @import("cypher").statistic.Input;
 pub const Page = struct {
     rows: []const Row,
     /// Optional bag weights, negotiated by aggregate consumers before pulling.
@@ -436,9 +437,10 @@ pub const Page = struct {
     /// Only after enable_aggregate_weights: this page contributes to these
     /// reducer slots, not to an ordinary logical SQL row stream.
     aggregate_slots: ?[]const usize = null,
-    /// Certified arguments aligned with rows, only on single-reducer summary
-    /// streams. Ordinary pages allocate no argument vector or row metadata.
-    aggregate_inputs: ?[]const ?i64 = null,
+    /// Certified arguments aligned with rows, each tagged with its reducer slot.
+    /// Slots must belong to the negotiated aggregate_slots for this page.
+    /// Ordinary pages allocate no argument vector or row metadata.
+    aggregate_inputs: ?[]const ?AggregateInput = null,
     owned_arena: ?std.heap.ArenaAllocator = null,
     storage_page: ?@import("../storage/relational_read_view.zig").View.Page = null,
     /// Exclusive native continuation; null proves exhaustion. Implementations
@@ -457,7 +459,10 @@ pub const Page = struct {
     }
     pub fn validateWeights(self: Page) !void {
         if (self.aggregate_inputs) |inputs| {
-            if (inputs.len != self.rows.len or self.aggregate_slots == null or self.aggregate_slots.?.len != 1 or self.multiplicities == null) return error.InvalidSqlBackendResponse;
+            if (inputs.len != self.rows.len or self.aggregate_slots == null or self.multiplicities == null) return error.InvalidSqlBackendResponse;
+            for (inputs) |input| if (input) |argument| {
+                if (std.mem.indexOfScalar(usize, self.aggregate_slots.?, argument.slot) == null) return error.InvalidSqlBackendResponse;
+            };
         }
         if (self.multiplicities) |weights| {
             if (weights.len != self.rows.len) return error.InvalidSqlBackendResponse;
@@ -472,8 +477,8 @@ pub const Page = struct {
     pub fn weight(self: Page, index: usize) Count {
         return if (self.exact_multiplicities) |weights| weights[index] else Count.init(if (self.multiplicities) |weights| weights[index] else 1);
     }
-    pub fn cloneAggregateInputs(self: Page, a: std.mem.Allocator) !?[]const ?i64 {
-        return if (self.aggregate_inputs) |inputs| try a.dupe(?i64, inputs) else null;
+    pub fn cloneAggregateInputs(self: Page, a: std.mem.Allocator) !?[]const ?AggregateInput {
+        return if (self.aggregate_inputs) |inputs| try a.dupe(?AggregateInput, inputs) else null;
     }
     pub fn cloneWeights(self: Page, a: std.mem.Allocator) !?[]const Count {
         const counts = self.exact_multiplicities orelse return null;
@@ -1108,17 +1113,19 @@ test "SQL durable planner sketches merge duplicate keys nulls widths and bounded
     try std.testing.expectError(error.InvalidSqlBackendResponse, StatisticsSketch.decode(&malformed));
 }
 
-test "SQL certified aggregate arguments require aligned single-slot pages" {
+test "SQL certified aggregate arguments require aligned negotiated reducer slots" {
     const rows = [_]Row{.{ .id = "r", .version = 0, .value = .null }};
-    const inputs = [_]?i64{7};
+    const inputs = [_]?AggregateInput{.{ .slot = 0, .value = 7 }};
     var page: Page = .{ .rows = &rows, .multiplicities = &.{1}, .aggregate_slots = &.{0}, .aggregate_inputs = &inputs };
     try page.validateWeights();
     const cloned = (try page.cloneAggregateInputs(std.testing.allocator)).?;
     defer std.testing.allocator.free(cloned);
-    try std.testing.expectEqualSlices(?i64, &inputs, cloned);
+    try std.testing.expectEqualDeep(inputs[0], cloned[0]);
     page.aggregate_slots = null;
     try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
     page.aggregate_slots = &.{ 0, 1 };
+    try page.validateWeights();
+    page.aggregate_slots = &.{1};
     try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
     page.aggregate_slots = &.{0};
     page.aggregate_inputs = &.{};

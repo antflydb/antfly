@@ -3187,3 +3187,59 @@ test "directional extrema retain safe offsets across wide internal costs" {
     try std.testing.expectEqual(@as(i64, -9223372036854775806), result.rows[0][0].integer);
     try std.testing.expectEqual(@as(i64, 1537228672809129301), result.rows[0][1].integer);
 }
+
+test "mixed statistic cohorts and grouped supports agree with observable histories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "MATCH REPEATABLE ELEMENTS p=(a:Document {id:'a'})-[:CITES*0..3]->(b) ";
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    var reference = try c.compile(a, base ++ "RETURN b.rank,length(p)", .{}, &diagnostic);
+    defer reference.deinit();
+    var rows = try runtime.execute(a, fixture.backend(), graph, &reference, &.{}, .{});
+    defer rows.deinit();
+    var compiled = try c.compile(a, base ++ "RETURN b.rank AS rank,avg(length(p)*length(p)),avg(length(p)/2.0),count(DISTINCT length(p)) ORDER BY rank", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    for (result.rows) |row| {
+        var count: usize = 0;
+        var first: i64 = 0;
+        var second: i64 = 0;
+        var support: u8 = 0;
+        for (rows.rows) |observed| if (observed[0].integer == row[0].integer) {
+            const n = observed[1].integer;
+            count += 1;
+            first += n;
+            second += n * n;
+            support |= @as(u8, 1) << @as(u3, @intCast(n));
+        };
+        try std.testing.expectApproxEqAbs(@as(f64, @floatFromInt(second)) / @as(f64, @floatFromInt(count)), row[1].number, 1e-12);
+        try std.testing.expectApproxEqAbs(@as(f64, @floatFromInt(first)) / @as(f64, @floatFromInt(count)) / 2, row[2].number, 1e-12);
+        try std.testing.expectEqual(@as(i64, @popCount(support)), row[3].integer);
+    }
+}
+
+test "grouped sparse supports and certificate cohorts release every allocation failure" {
+    const Campaign = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "UNWIND [-10000000000,0,10000000000] AS k MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN b.rank AS rank,count(DISTINCT length(p)+k),avg(length(p)*length(p)),avg(0.5*length(p)) ORDER BY rank", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+            for (result.rows) |row| try std.testing.expectEqual(@as(i64, 3), row[1].integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "compressed DISTINCT supports merge with ordinary numeric contributions in either order" {
+    try check("UNWIND [['c',0],['a',0]] AS pair WITH pair[0] AS id,pair[1] AS k MATCH p=(s:Document {id:id})-[:CITES*0..2]->(b) RETURN count(DISTINCT length(p)+k)", "[[3]]");
+    try check("UNWIND [['a',0],['c',0]] AS pair WITH pair[0] AS id,pair[1] AS k MATCH p=(s:Document {id:id})-[:CITES*0..2]->(b) RETURN count(DISTINCT length(p)+k)", "[[3]]");
+    try check("UNWIND [['c',0],['a',0.0]] AS pair WITH pair[0] AS id,pair[1] AS k MATCH p=(s:Document {id:id})-[:CITES*0..2]->(b) RETURN count(DISTINCT length(p)+k)", "[[3]]");
+    try check("UNWIND [['a',0.0],['c',0]] AS pair WITH pair[0] AS id,pair[1] AS k MATCH p=(s:Document {id:id})-[:CITES*0..2]->(b) RETURN count(DISTINCT length(p)+k)", "[[3]]");
+}

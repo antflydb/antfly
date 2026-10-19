@@ -39,22 +39,26 @@ fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, all
 fn addCellsMasked(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: catalog.Count, active: ?[]const usize) !void {
     return addCellsOverridden(context, bound, grouped, alloc, cells, weight, active, null);
 }
-fn addCellsOverridden(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: catalog.Count, active: ?[]const usize, input: ?i64) !void {
-    if (input != null and (active == null or active.?.len != 1)) return error.InvalidSqlBackendResponse;
+fn addCellsOverridden(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: catalog.Count, active: ?[]const usize, input: ?catalog.AggregateInput) !void {
+    if (input) |argument| {
+        if (argument.slot >= bound.inputs.len or active == null or std.mem.indexOfScalar(usize, active.?, argument.slot) == null) return error.InvalidSqlBackendResponse;
+    }
     if (!try bound.input.matchesWithLimits(alloc, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) return;
     const values = try alloc.alloc(Datum, bound.group_count);
     for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
     const inputs = try alloc.alloc(Datum, bound.inputs.len);
     for (bound.inputs, bound.filters, inputs, 0..) |index, filter, *value, aggregate_index| {
         value.* = .{};
-        if (active) |slots| if (std.mem.indexOfScalar(usize, slots, aggregate_index) == null) continue;
+        if (input) |argument| {
+            if (argument.slot != aggregate_index) continue;
+        } else if (active) |slots| if (std.mem.indexOfScalar(usize, slots, aggregate_index) == null) continue;
         if (filter) |slot| {
             const test_value = try context.evaluate(alloc, bound.input.projections[slot].?, cells);
             if (test_value.sql_null) continue;
             if (test_value.value != .bool) return error.SqlTypeMismatch;
             if (!test_value.value.bool) continue;
         }
-        value.* = if (input) |value_input| Datum.json(.{ .integer = value_input }) else if (index) |slot| try context.evaluate(alloc, bound.input.projections[slot].?, cells) else Datum.json(.{ .integer = 1 });
+        value.* = if (input) |value_input| Datum.json(.{ .integer = value_input.value }) else if (index) |slot| try context.evaluate(alloc, bound.input.projections[slot].?, cells) else Datum.json(.{ .integer = 1 });
     }
     try grouped.addCount(values, inputs, weight);
 }

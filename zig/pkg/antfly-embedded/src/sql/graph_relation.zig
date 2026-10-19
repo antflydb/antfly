@@ -375,7 +375,15 @@ pub const Cursor = struct {
             {
                 if (summary_plan) |plan| {
                     var selected: ?usize = null;
-                    for (candidates.items, 0..) |candidate, position| {
+                    for (candidates.items, 0..) |*candidate, position| {
+                        if (plan.statistic != null and candidate.plan.statistic != null) {
+                            if (try stream.mergeStatisticPlans(candidate.plan, plan)) |merged| {
+                                candidate.plan = merged;
+                                selected = position;
+                                break;
+                            }
+                            continue;
+                        }
                         if (plan.statistic != null or candidate.plan.statistic != null or candidate.plan.summary == null or !std.mem.eql(u8, candidate.plan.summary.?, plan.summary.?) or
                             candidate.plan.linear != plan.linear or candidate.plan.total_axis != plan.total_axis or candidate.plan.path.execution_reversed != plan.path.execution_reversed or candidate.plan.projection.items.len != plan.projection.items.len) continue;
                         const same_fields = for (plan.projection.items) |item| {
@@ -451,7 +459,7 @@ pub const Cursor = struct {
         const page_limit: u32 = @intCast(@max(1, @min(limit, self.request.row_goal orelse limit)));
         var output: std.ArrayList(catalog.Row) = .empty;
         var weights: std.ArrayList(u64) = .empty;
-        var aggregate_inputs: std.ArrayList(?i64) = .empty;
+        var aggregate_inputs: std.ArrayList(?catalog.AggregateInput) = .empty;
         var counts: std.ArrayList(catalog.Count) = .empty;
         const names = try owned.alloc([]const u8, self.request.fields.len);
         for (self.request.fields, names) |name, *out| out.* = try owned.dupe(u8, name);
@@ -520,7 +528,12 @@ pub const Cursor = struct {
                 if (self.stream) |stream| if (stream.weighted) {
                     try weights.append(owned, stream.last_weights.items[row_index]);
                     try counts.append(owned, try stream.last_counts.items[row_index].clone(owned));
-                    if (self.weight_passes.len != 0 and self.weight_passes[self.weight_pass].plan.statistic != null) try aggregate_inputs.append(owned, stream.last_statistic_inputs.items[row_index]);
+                    if (self.weight_passes.len != 0 and self.weight_passes[self.weight_pass].plan.statistic != null) {
+                        const input = stream.last_statistic_inputs.items[row_index];
+                        const active_slots = self.weight_passes[self.weight_pass].slots;
+                        if (input) |argument| if (argument.slot >= active_slots.len) return error.InvalidSqlBackendResponse;
+                        try aggregate_inputs.append(owned, if (input) |argument| .{ .slot = active_slots[argument.slot], .value = argument.value } else null);
+                    }
                 };
             }
         }

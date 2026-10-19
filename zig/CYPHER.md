@@ -1826,8 +1826,18 @@ unproved shapes use the existing executor rather than changing query semantics.
 Consumers receive tagged aggregate arguments, never fabricated ordinary graph
 rows. First-moment consumers receive at most two integral bins with exact bag
 weights; extrema receive their exact value, and DISTINCT receives supported
-values once. SQL tags are confined to negotiated single-reducer streams and
-follow projection and positional UNION mappings. Original grouping keys,
+values once. SQL tags identify one negotiated reducer per contribution and
+follow projection and positional UNION mappings. Compatible SQL polynomial
+reducers share one traversal and one count/first/cross-moment basis; only cost
+directions and DISTINCT supports add traversal state. Merged projections are
+replanned together and retain their original orientation and totality proofs.
+Native reducers negotiate certificate families independently, so a floating
+first-moment consumer cannot force an integer second moment onto a full length
+distribution. These passes share the read cut, adjacency cache and quotas.
+Native grouped COUNT(DISTINCT) merges sparse aligned bitmap words directly into
+its group state. Sparse words preserve holes and widely separated correlated
+offsets without expanding the support into scalar rows; ordinary fallback
+contributions deduplicate against the same support. Original grouping keys,
 filters and observed arithmetic retain independent invariance/totality
 obligations. Global endpoint merging is allowed only when those observations
 and row expansion are independent of the endpoint; otherwise statistics stay

@@ -3001,7 +3001,7 @@ fn Engine(comptime Context: type) type {
                 try page.validateWeights();
                 var rows: std.ArrayList(catalog.Row) = .empty;
                 var weights: std.ArrayList(catalog.Count) = .empty;
-                var inputs: std.ArrayList(?i64) = .empty;
+                var inputs: std.ArrayList(?catalog.AggregateInput) = .empty;
                 const slots = page.aggregate_slots orelse return error.InvalidSqlBackendResponse;
                 const multiplicities = page.multiplicities orelse return error.InvalidSqlBackendResponse;
                 if (page.rows.len != multiplicities.len or page.rows.len > limit) return error.InvalidSqlBackendResponse;

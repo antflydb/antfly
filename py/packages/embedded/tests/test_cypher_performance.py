@@ -3992,3 +3992,147 @@ def test_richer_statistics_preserve_support_holes_filters_and_errors(graph_db):
         db.sql(
             f"WITH t AS (SELECT (a+9223372036854775807)-9223372036854775807 AS x,b FROM {relation}) SELECT avg(x*x+b) FROM t"
         )
+
+
+def test_statistic_cohorts_and_grouped_supports_stay_compressed(graph_db):
+    db = graph_db
+    layers = 512
+    documents = {"start": {"id": "start", "score": 0}}
+    documents.update({f"v{i}_{j}": {"id": f"v{i}_{j}", "score": i + 1} for i in range(layers) for j in range(2)})
+    pairs = [("start", f"v{i}_{j}") for i in range(2) for j in range(2)]
+    pairs += [
+        (f"v{i}_{j}", f"v{i + step}_{k}")
+        for step in (1, 2)
+        for i in range(layers - step)
+        for j in range(2)
+        for k in range(2)
+    ]
+    with db.open_table("docs") as table:
+        table.batch_json({"inserts": documents, "sync_level": "full_index"})
+        for i in range(0, len(pairs), 256):
+            table.batch_json(
+                {
+                    "graph_writes": [
+                        {"index_name": "links", "source": a, "target": b, "edge_type": "link"}
+                        for a, b in pairs[i : i + 256]
+                    ],
+                    "sync_level": "full_index",
+                }
+            )
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    counts, first, second, third = layered_length_moments(layers)
+    base = "MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) "
+    limits = {"explored_edges": 5000, "intermediate_states": 200000}
+    mixed = db.cypher_json(
+        "g", {"query": base + "RETURN avg(length(p)*length(p)),avg(1.0*length(p))", "limits": limits}
+    )
+    assert [cell["value"] for cell in mixed["rows"][0]] == pytest.approx([second / counts, first / counts])
+    grouped = db.cypher_json(
+        "g",
+        {
+            "query": base + "RETURN b.score AS depth,count(DISTINCT length(p)) AS lengths ORDER BY depth LIMIT 10",
+            "limits": limits,
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in grouped["rows"]] == [
+        [depth, depth // 2 + 1] for depth in range(1, 11)
+    ]
+    relation = "GRAPH_TABLE(g MATCH p=(s IS D)-[xs IS R*]->()-[ys IS R*]->(b IS D) WHERE s.id='start' COLUMNS(size(xs) AS a,size(ys) AS b,length(p) AS n)) q"
+    reducers = ",".join(f"avg(n*n+{k}*n) AS a{k}" for k in range(12))
+    expected = [(third - second + k * (second - first)) / (first - counts) for k in range(12)]
+    native = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH p=(s:D {id:'start'})-[xs:R*1..]->()-[ys:R*1..]->(b:D) RETURN "
+            + ",".join(f"avg(length(p)*length(p)+{k}*length(p))" for k in range(12)),
+            "limits": limits,
+        },
+    )
+    assert [cell["value"] for cell in native["rows"][0]] == pytest.approx(expected, rel=1e-13)
+    # One shared moment basis, including through projected relation adapters.
+    for source in (relation, f"(SELECT n FROM {relation}) t"):
+        result = db.sql(f"SELECT {reducers} FROM {source}")
+        assert result["rows"][0] == pytest.approx(expected, rel=1e-13)
+    # Scalar tags must stay aligned across page boundaries and reducer kinds.
+    result = db.sql(f"SELECT avg(n*n),min(2*a+b),max(2*a+b),count(DISTINCT n) FROM {relation}")
+    assert [float(value) for value in result["rows"][0]] == pytest.approx(
+        [(third - second) / (first - counts), 3, 2 * layers - 1, layers - 1], rel=1e-13
+    )
+
+
+def test_statistic_cohorts_preserve_scopes_filters_and_sparse_offsets(graph_db):
+    db = graph_db
+    populate_layered_graph(db, layers=6)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[:R*0..4]->(b:D) "
+    exact = db.cypher_json("g", {"query": base + "RETURN length(p),b.score"})["rows"]
+    rows = [(int(row[0]["value"]), int(row[1]["value"])) for row in exact]
+    expected = []
+    for depth in sorted({depth for _, depth in rows}):
+        lengths = [n for n, d in rows if d == depth]
+        expected.append(
+            [depth, sum(n * n for n in lengths) / len(lengths), sum(lengths) / len(lengths) / 2, len(set(lengths))]
+        )
+    query = (
+        base
+        + "RETURN b.score AS depth,avg(length(p)*length(p)),avg(length(p)/2.0),count(DISTINCT length(p)) ORDER BY depth"
+    )
+    actual = db.cypher_json("g", {"query": query})
+    for row, wanted in zip(actual["rows"], expected, strict=True):
+        assert [float(cell["value"]) for cell in row] == pytest.approx(wanted)
+    # The same group sees disjoint supports from separate correlated inputs.
+    shifted = db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND [0,10000000000,-10000000000] AS k "
+            + base
+            + "RETURN b.score AS depth,count(DISTINCT length(p)+k) AS total ORDER BY depth"
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in shifted["rows"]] == [
+        [int(row[0]), 3 * int(row[3])] for row in expected
+    ]
+    middle = db.cypher_json(
+        "g",
+        {
+            "query": base
+            + "WITH length(p) AS n,b.score AS depth WHERE depth>2 UNWIND [0,1] AS k RETURN depth,avg(n*n)+avg(n/2.0),count(DISTINCT n) ORDER BY depth"
+        },
+    )
+    wanted = [[row[0], row[1] + row[2], row[3]] for row in expected if row[0] > 2]
+    for row, reference in zip(middle["rows"], wanted, strict=True):
+        assert [float(cell["value"]) for cell in row] == pytest.approx(reference)
+    relation = "GRAPH_TABLE(g MATCH p=(s IS D)-[r IS R*]->(b IS D) WHERE s.id='start' AND length(p)<=4 COLUMNS(length(p) AS n,b.score AS depth)) q"
+    sql_rows = [(n, depth) for n, depth in rows if n > 0]
+    sql_expected = [
+        sum(n * n for n, depth in sql_rows if depth > 2) / sum(depth > 2 for _, depth in sql_rows),
+        sum(n * n + n for n, depth in sql_rows if depth <= 3) / sum(depth <= 3 for _, depth in sql_rows),
+        len({n for n, depth in sql_rows if depth > 1}),
+    ]
+    source = f"(SELECT n,depth FROM {relation} UNION ALL SELECT n,depth FROM {relation}) t"
+    actual = db.sql(
+        f"SELECT avg(n*n) FILTER(WHERE depth>2),avg(n*n+n) FILTER(WHERE depth<=3),count(DISTINCT n) FILTER(WHERE depth>1) FROM {source}"
+    )
+    assert [float(value) for value in actual["rows"][0]] == pytest.approx(sql_expected)
+
+
+def test_statistic_supports_deduplicate_ordinary_fallback_contributions(graph_db):
+    db = graph_db
+    db.cypher_json(
+        "g",
+        {"query": "CREATE (a:D {id:'cycle'}),(b:D {id:'target'}),(:D {id:'empty'}),(a)-[:R]->(b),(b)-[:R]->(a)"},
+    )
+    for inputs in (
+        "[['empty',0],['cycle',0]]",
+        "[['cycle',0],['empty',0]]",
+        "[['empty',0],['cycle',0.0]]",
+        "[['cycle',0.0],['empty',0]]",
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"UNWIND {inputs} AS pair WITH pair[0] AS id,pair[1] AS shift "
+                "MATCH p=(s:D {id:id})-[:R*0..3]->(b:D) RETURN count(DISTINCT length(p)+shift)"
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "3"}]]
