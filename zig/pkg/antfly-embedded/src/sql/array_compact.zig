@@ -1034,8 +1034,8 @@ test "SQL native span construction preserves mixed layouts offsets ownership and
                     defer slow_wire.deinit();
                     // Reference text payloads borrow sources; decode the owned oracle.
                     const decoded = try @import("array_storage.zig").borrowLeaky(region, kind, expected, .{});
-                    try @import("array_binary.zig").encode(decoded, &slow_wire.writer, .{});
-                    try @import("array_binary.zig").encode(result, &fast_wire.writer, .{});
+                    try @import("array_binary.zig").encode(a, decoded, &slow_wire.writer, .{});
+                    try @import("array_binary.zig").encode(a, result, &fast_wire.writer, .{});
                     try std.testing.expectEqualSlices(u8, slow_wire.written(), fast_wire.written());
                 }
             }
