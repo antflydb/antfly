@@ -1322,7 +1322,7 @@ const Collector = struct {
                 return;
             }
         };
-        const token = if (self.watcher) |w| w.arm(file_handle) else null;
+        const token = if (self.watcher) |w| w.armCaptured(file_handle) else null;
         var token_owned = true;
         defer if (token_owned) if (token) |value| self.watcher.?.release(value);
         const length = std.math.cast(usize, before.size) orelse return error.StreamTooLong;

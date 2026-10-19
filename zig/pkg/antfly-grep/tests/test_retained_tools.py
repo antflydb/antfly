@@ -18,6 +18,7 @@
 import json
 import sys
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
@@ -26,6 +27,50 @@ from session_compare import Service
 
 
 class FrameReaderTests(unittest.TestCase):
+    def test_fragmented_record_still_enforces_response_allowance(self):
+        service = Service.__new__(Service)
+        service.pending = bytearray(b'{}\n{"text":"')
+        service.cursor = service.wire_bytes = service.response_start = 3
+        service.max_response_bytes = 16
+        service.process = Mock()
+        service.process.stdout.fileno.return_value = 17
+        with (
+            patch("session_compare.select.select", return_value=([17], [], [])),
+            patch("session_compare.os.read", return_value=b"x" * 32),
+            self.assertRaisesRegex(RuntimeError, "response budget exceeded"),
+        ):
+            service.read()
+        service.process.kill.assert_called_once()
+        service.process.wait.assert_called_once_with(timeout=5)
+
+    def test_fragmented_records_search_each_byte_once_after_compaction(self):
+        class CountedBuffer(bytearray):
+            searched = 0
+
+            def find(self, needle, start=0):
+                self.searched += len(self) - start
+                return super().find(needle, start)
+
+        class Output:
+            def fileno(self):
+                return 17
+
+        service = Service.__new__(Service)
+        service.pending = CountedBuffer(b'{}\n{"text":"')
+        service.cursor = 3
+        service.wire_bytes = 3
+        service.process = type("Process", (), {"stdout": Output()})()
+        chunks = iter([b"x" * 1024] * 1024 + [b'"}\n{}\n'])
+        with (
+            patch("session_compare.select.select", return_value=([17], [], [])),
+            patch("session_compare.os.read", side_effect=lambda *_: next(chunks)),
+        ):
+            self.assertEqual(service.read(), {"text": "x" * (1024 * 1024)})
+            self.assertEqual(service.read(), {})
+        # Includes the bounded suffix of the final read containing two records.
+        self.assertLessEqual(service.pending.searched, 1024 * 1024 + 32)
+        self.assertEqual(service.wire_bytes, 1024 * 1024 + 18)
+
     def read(self, raw):
         service = Service.__new__(Service)
         service.pending = bytearray(raw + b"\n")
@@ -40,9 +85,21 @@ class FrameReaderTests(unittest.TestCase):
         )
 
     def test_malformed_json_utf8_and_bom_are_rejected(self):
-        for raw in (b"{", b'{"text":"\xff"}', b"\xef\xbb\xbf{}", b"\xff\xfe{\x00}\x00"):
+        for raw in (
+            b"{",
+            b'{"text":"\xff"}',
+            b"\xef\xbb\xbf{}",
+            b"\xff\xfe{\x00}\x00",
+            b"{}{}",
+            b"{} {}",
+            b"{} trailing}",
+        ):
             with self.subTest(raw=raw), self.assertRaises((ValueError, UnicodeError)):
                 self.read(raw)
+
+    def test_legal_json_whitespace_is_preserved(self):
+        for raw in (b"{}", b" {}", b"\t{}\r", b"{} ", b'{ "text": "} {" }'):
+            self.assertEqual(self.read(raw), json.loads(raw))
 
 
 class StreamingViewTests(unittest.TestCase):

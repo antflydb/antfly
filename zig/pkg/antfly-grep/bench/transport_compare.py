@@ -27,8 +27,10 @@ import hashlib
 import json
 import os
 import platform
+import pstats
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -36,6 +38,20 @@ from pathlib import Path
 from lexical_reuse import signature
 from retained import Payloads, View
 from registered import Client
+from session_compare import cpu_seconds
+
+
+def new_profile():
+    # This directory also has the existing regex driver profile.py. Do not let
+    # it shadow the stdlib profile module imported internally by cProfile.
+    paths = sys.path[:]
+    try:
+        directory = Path(__file__).resolve().parent
+        sys.path[:] = [p for p in paths if Path(p).resolve() != directory]
+        import cProfile
+    finally:
+        sys.path[:] = paths
+    return cProfile.Profile()
 
 
 def delivery(client, handle):
@@ -94,8 +110,24 @@ def main():
     parser.add_argument("--rounds", type=int, default=9)
     parser.add_argument("--files", type=int, default=6000)
     parser.add_argument("--dense-lines", type=int, default=20000)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Untimed consumer profiles and amortized producer CPU controls",
+    )
+    parser.add_argument("--cpu-rounds", type=int, default=32)
+    parser.add_argument(
+        "--capture-rounds",
+        type=int,
+        default=0,
+        help="Additional paired cold-process captures (filesystem cache stays warm)",
+    )
     args = parser.parse_args()
-    if args.rounds < 3 or min(args.files, args.dense_lines) < 1:
+    if (
+        args.rounds < 3
+        or min(args.files, args.dense_lines, args.cpu_rounds) < 1
+        or args.capture_rounds < 0
+    ):
         parser.error("at least three rounds and positive sizes required")
     binaries = {"current": args.current.resolve(), "baseline": args.baseline.resolve()}
     report = {
@@ -130,7 +162,7 @@ def main():
         for name, count in (("tiny", 1), ("dense", args.dense_lines)):
             (root / "src/dense.txt").write_text("STOP é original\n" * count)
             clients, handles = {}, {}
-            modes = ("baseline_v2", "current_v2", "current_v3")
+            modes = ("baseline_v2", "current_v2", "baseline_v3", "current_v3")
             trials = report["trials"][name] = []
             try:
                 for mode in modes:
@@ -146,7 +178,7 @@ def main():
                 for n in range(-1, args.rounds):
                     gc.collect()
                     views, trial = {}, {}
-                    for mode in modes[n % 3 :] + modes[: n % 3]:
+                    for mode in modes[n % len(modes) :] + modes[: n % len(modes)]:
                         cpu, start = time.process_time(), time.monotonic()
                         result, view = delivery(clients[mode], handles[mode])
                         trial[mode] = {
@@ -171,6 +203,57 @@ def main():
                     )
                     if n >= 0:
                         trials.append(trial)
+                if args.profile and name == "dense":
+                    controls = report["dense_cpu_trials"] = []
+                    for batch in range(3):
+                        trial = {}
+                        for mode in modes[batch:] + modes[:batch]:
+                            client = clients[mode]
+                            before = cpu_seconds(client.process.pid)
+                            cpu, start = time.process_time(), time.monotonic()
+                            for _ in range(args.cpu_rounds):
+                                delivery(client, handles[mode])
+                            elapsed, consumer = (
+                                time.monotonic() - start,
+                                time.process_time() - cpu,
+                            )
+                            after = cpu_seconds(client.process.pid)
+                            trial[mode] = {
+                                "seconds_per_request": elapsed / args.cpu_rounds,
+                                "consumer_cpu_per_request": consumer / args.cpu_rounds,
+                                "producer_cpu_per_request": None
+                                if before is None
+                                else (after - before) / args.cpu_rounds,
+                            }
+                        controls.append(trial)
+                    report["dense_cpu_controls"] = {
+                        mode: {
+                            key: statistics.median(t[mode][key] for t in controls)
+                            if controls[0][mode][key] is not None
+                            else None
+                            for key in controls[0][mode]
+                        }
+                        for mode in modes
+                    }
+                    report["consumer_profiles"] = {}
+                    for mode in modes:
+                        client = clients[mode]
+                        profile = new_profile()
+                        profile.runcall(delivery, client, handles[mode])
+                        stats = pstats.Stats(profile)
+                        report["consumer_profiles"][mode] = [
+                            {
+                                "function": f"{Path(key[0]).name}:{key[1]}:{key[2]}",
+                                "calls": value[1],
+                                "self_seconds": value[2],
+                                "cumulative_seconds": value[3],
+                            }
+                            for key, value in sorted(
+                                stats.stats.items(),
+                                key=lambda entry: entry[1][2],
+                                reverse=True,
+                            )[:20]
+                        ]
             finally:
                 for client in clients.values():
                     client.close()
@@ -178,6 +261,27 @@ def main():
         for n in range(args.files):
             (root / "src" / f"f{n:05}.txt").write_text("ordinary noise\n" * 8)
         (root / "src/f00000.txt").write_text("STOP stable\n")
+        if args.capture_rounds:
+            report["capture_trials"] = []
+            for n in range(args.capture_rounds):
+                trial = {}
+                for mode in (
+                    ("baseline", "current") if n % 2 else ("current", "baseline")
+                ):
+                    client = Client(
+                        binaries[mode], root, "src", [], env, ("--workspace-watch",)
+                    )
+                    try:
+                        trial[mode] = {
+                            "seconds": client.capture_seconds,
+                            "producer_cpu_seconds": cpu_seconds(client.process.pid),
+                            "resident_kib": resident_kib(client),
+                            "revision": client.ready["revision"],
+                        }
+                    finally:
+                        client.close()
+                assert trial["baseline"]["revision"] == trial["current"]["revision"]
+                report["capture_trials"].append(trial)
         clients, handles = {}, {}
         oracle = Client(binaries["current"], root, "src", [], env)
         report["freshness_oracle"] = (

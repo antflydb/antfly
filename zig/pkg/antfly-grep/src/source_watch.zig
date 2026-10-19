@@ -127,10 +127,17 @@ pub const Watch = struct {
         return .{ .device = if (comptime builtin.os.tag == .macos) @as(u32, @bitCast(stat.dev)) else @intCast(stat.dev), .inode = @intCast(stat.ino) };
     }
     pub fn arm(self: *Watch, file: std.Io.File) ?Token {
-        return self.armKind(file, false);
+        return self.armKind(file, false, false);
+    }
+    /// Capture drains events at its final publication barrier. On macOS a
+    /// never-used slot has no retired events to drain before registration;
+    /// amortize these empty polls, but still poll before identity reuse or slot
+    /// recycling. Linux keeps its descriptor-reuse/IN_IGNORED drain unchanged.
+    pub fn armCaptured(self: *Watch, file: std.Io.File) ?Token {
+        return self.armKind(file, false, true);
     }
     pub fn armDirectory(self: *Watch, dir: std.Io.Dir) ?Token {
-        return self.armKind(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } }, true);
+        return self.armKind(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } }, true, false);
     }
     fn freeSlot(self: *Watch) ?usize {
         if (self.free_head) |i| return if (i < self.limit) i else null;
@@ -157,7 +164,7 @@ pub const Watch = struct {
         self.registration_attempts += 1;
         return std.c.inotify_add_watch(self.fd, name, mask | std.os.linux.IN.MASK_ADD);
     }
-    fn armKind(self: *Watch, file: std.Io.File, directory: bool) ?Token {
+    fn armKind(self: *Watch, file: std.Io.File, directory: bool, capture: bool) ?Token {
         if (comptime !supported) return null;
         if (self.fd < 0 or self.failed) return null;
         const id = identity(file.handle) orelse return null;
@@ -165,8 +172,10 @@ pub const Watch = struct {
         // queue for each of the remaining files in a large cold capture. Keep
         // identity reuse (including hard links) and poll before slot recycling.
         // Capture/refresh still performs its final publication barrier.
-        if (!self.identities.contains(id) and self.freeSlot() == null) return null;
-        self.poll();
+        const known = self.identities.contains(id);
+        if (!known and self.freeSlot() == null) return null;
+        const fresh = !known and self.slots.items[self.free_head.?].generation == 0;
+        if (!capture or builtin.os.tag != .macos or !fresh or self.registration_attempts % 64 == 0) self.poll();
         if (self.fd < 0 or self.failed) return null;
         const mask = if (comptime builtin.os.tag == .linux) linuxMask(directory) else 0;
         if (self.identities.get(id)) |i| {
@@ -393,6 +402,31 @@ pub const Watch = struct {
         self.failed = true;
     }
 };
+
+test "capture admission preserves pending writes and recycled-slot barriers" {
+    if (comptime !supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "before" });
+    var file = try tmp.dir.openFile(io, "a", .{});
+    defer file.close(io);
+    var watch = Watch.init();
+    defer watch.deinit();
+    const first = watch.armCaptured(file) orelse return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "during capture" });
+    watch.certifyPending(first);
+    watch.poll(); // Required capture publication barrier.
+    try std.testing.expect(!watch.intact(first));
+    watch.release(first);
+    const next = watch.armCaptured(file) orelse return error.SkipZigTest;
+    defer watch.release(next);
+    try std.testing.expect(next.generation != first.generation);
+    watch.certifyPending(next);
+    watch.poll();
+    try std.testing.expect(watch.intact(next));
+    try std.testing.expect(!watch.intact(first));
+}
 
 test "kernel witnesses observe writes, bound admission and recover from watch loss" {
     if (comptime !supported) return error.SkipZigTest;

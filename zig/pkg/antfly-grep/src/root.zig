@@ -4126,20 +4126,26 @@ pub const Search = struct {
         if (self.options.json_batches and row and self.json_started and !self.retaining_output) {
             self.file_rows_emitted += 1;
             if (self.file_rows_emitted > 1) {
-                // Encode into bounded scratch: oversized rows stream normally.
-                // Allocation and all budget failures occur before publication.
-                var scratch: [32768]u8 = undefined;
-                var writer: std.Io.Writer = .fixed(&scratch);
-                if (std.json.Stringify.value(value, .{}, &writer)) |_| {
-                    const encoded = writer.buffered();
-                    if (self.batch.items.len + encoded.len + 1 > scratch.len) try self.flushBatch();
-                    try self.batch.ensureTotalCapacity(self.a, scratch.len);
-                    if (self.batch_rows != 0) self.batch.appendAssumeCapacity(',');
-                    self.batch.appendSliceAssumeCapacity(encoded);
-                    self.batch_rows += 1;
-                    if (self.batch_rows == 64) try self.flushBatch();
-                    return;
-                } else |_| {}
+                // Encode directly into the bounded reusable body. Failed rows
+                // only touch its unpublished suffix; flush the complete prefix
+                // and retry once before streaming an oversized ordinary row.
+                try self.batch.ensureTotalCapacityPrecise(self.a, 32768);
+                for (0..2) |_| {
+                    if (self.batch.items.len >= 32767) try self.flushBatch();
+                    const start = self.batch.items.len + @intFromBool(self.batch_rows != 0);
+                    var writer: std.Io.Writer = .fixed(self.batch.allocatedSlice()[start..32768]);
+                    var json_writer: std.json.Stringify = .{ .writer = &writer, .options = .{} };
+                    if (@import("json_fields.zig").write(&json_writer, value)) |_| {
+                        if (self.batch_rows != 0) self.batch.allocatedSlice()[self.batch.items.len] = ',';
+                        self.batch.items.len = start + writer.buffered().len;
+                        self.batch_rows += 1;
+                        if (self.batch_rows == 64) try self.flushBatch();
+                        return;
+                    } else |_| {
+                        if (self.batch_rows == 0) break;
+                        try self.flushBatch();
+                    }
+                }
             }
         }
         try self.flushBatch();

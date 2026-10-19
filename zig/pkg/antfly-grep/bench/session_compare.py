@@ -37,7 +37,20 @@ from workspace import signature
 
 # The protocol is UTF-8 JSONL; cache the decoder and avoid per-frame encoding
 # detection. Invalid UTF-8 and malformed JSON still fail before publication.
-_decode_frame = json.JSONDecoder().decode
+_decoder = json.JSONDecoder()
+_raw_decode = _decoder.raw_decode
+
+
+def _decode_frame(line):
+    # Canonical producer objects have no surrounding whitespace. Skip decode's
+    # two whitespace regex calls for those frames, while still checking the
+    # entire input and retaining stdlib behavior for other legal JSON spacing.
+    if line and line[0] == "{" and line[-1] == "}":
+        value, end = _raw_decode(line)
+        if end == len(line):
+            return value
+        raise json.JSONDecodeError("Extra data", line, end)
+    return _decoder.decode(line)
 
 
 class Service:
@@ -82,8 +95,12 @@ class Service:
         response_start = getattr(self, "response_start", 0)
 
         deadline = time.monotonic() + 120
+        # A record may span many reads (oversized rows bypass v3 batching).
+        # Keep the consumed-record cursor separate from the newline watermark:
+        # every input byte is searched once, even across short reads.
+        scan = self.cursor
         while True:
-            end = self.pending.find(b"\n", self.cursor)
+            end = self.pending.find(b"\n", scan)
             if end >= 0:
                 if (
                     response_limit is not None
@@ -91,12 +108,18 @@ class Service:
                     > response_limit
                 ):
                     self._response_too_large()
-                line = bytes(self.pending[self.cursor : end])
+                line = (
+                    bytes(self.pending[self.cursor : end])
+                    if end - self.cursor < 4096
+                    else bytes(memoryview(self.pending)[self.cursor : end])
+                )
                 self.wire_bytes += end + 1 - self.cursor
                 self.cursor = end + 1
                 self.last_record = line
                 return _decode_frame(line.decode("utf-8"))
+            scan = len(self.pending)
             if self.cursor:
+                scan -= self.cursor
                 del self.pending[: self.cursor]
                 self.cursor = 0
             remaining = deadline - time.monotonic()

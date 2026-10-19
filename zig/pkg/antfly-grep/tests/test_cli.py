@@ -7418,6 +7418,40 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(values, expected)
                 self.assertEqual(len(values), 5)
 
+    def test_workspace_v3_direct_encoding_preserves_full_and_failed_suffixes(self):
+        # Cross the fixed body boundary both with escaping expansion and with
+        # ordinary rows that need a flush-and-retry or oversized fallback.
+        text = "".join(
+            "STOP " + char * width + "\n"
+            for _ in range(3)
+            for char in ("x", '"', "\\", "é")
+            for width in (8, 16200, 32600, 32768)
+        )
+        self.write("src/a.txt", text)
+        with self.workspace("src") as (ready, request):
+            expected = None
+            for batches in (False, True):
+                handle = request(
+                    "register", args=["STOP", "--threads=1"], batches=batches
+                )[0]["query_handle"]
+                rows = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                values = []
+                for row in rows:
+                    if row["type"] == "batch":
+                        body = json.dumps(
+                            row["events"], ensure_ascii=False, separators=(",", ":")
+                        ).encode()
+                        self.assertLessEqual(len(body) - 2, 32768)
+                        values.extend(event["data"] for event in row["events"])
+                    elif row["type"] == "match":
+                        values.append(row["data"])
+                self.assertEqual(len(values), 48)
+                if expected is None:
+                    expected = values
+                self.assertEqual(values, expected)
+
     def test_workspace_source_route_growth_preserves_later_dirty_updates(self):
         for i in range(250):
             self.write(f"src/f{i:04}.txt", "original\n")
