@@ -422,6 +422,12 @@ const LeafResolver = struct {
             count += @intFromBool(needed[i]);
         }
         if (count < 2) return leaves;
+        // Independent streams retain compressed input, decoded vectors and a
+        // partial group. Concurrency must fit the publication allocator too;
+        // scheduler leases account for CPU workspace, not decoder ownership.
+        const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.a) orelse return leaves;
+        const per_job = self.provider.limits.max_input_bytes +| self.provider.limits.max_decoded_bytes *| 2 +| (8 * 1024 * 1024);
+        if (count > available / @max(per_job, 1)) return leaves;
         var locked: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = self.a };
         var jobs: [8]Job = undefined;
         var tasks: [8]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
@@ -1150,7 +1156,9 @@ test "external lake aggregate radix reductions reuse unchanged subtrees across a
             try std.testing.expectEqual(@as(usize, if (phase == 1) 1 else 0), count);
         }
         const built = try buildIncremental(a, output.allocator(), table, &source, &store, &provider, .none, &.{}, previous.contributions);
-        if (phase == 0) try std.testing.expect(replay.ready);
+        // Fresh 16-file leaves execute through independent parallel streams;
+        // the prior null-file replay hook could never admit this work.
+        if (phase == 0) try std.testing.expectEqual(@as(usize, 0), replay.captures);
         try std.testing.expectEqual(@as(usize, 4), built.declarations.len);
         try std.testing.expectEqual((2 * source.inventory.files.len - 1) * 4, built.contributions.len);
         if (phase != 0) {

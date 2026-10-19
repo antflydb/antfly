@@ -2160,15 +2160,18 @@ and NUMERIC source contracts preserve exact physical values.
 Worker admission completes before any builder starts. Insufficient scheduler or
 known allocator headroom selects ordinary serial construction. Opaque allocator
 chains also retain that path. Oversized replay files use serialized ordinary
-streaming. Workers own independent construction state and share synchronized
-allocation; durable checkpoints serialize through one progress owner. Deadline,
+streaming. Workers own independent construction state and source views: mutable version
+maps and range-reader flights are private while the pinned inventory and delete
+authority remain borrowed. They share synchronized allocation; durable checkpoints serialize through one progress owner. Deadline,
 cancellation and builder failures wake waiting consumers and join workers before
 releasing replay or request memory. The existing publication lease and source cut
 remain authoritative throughout construction and final publication.
 
 Outside a publication cohort, native aggregate leaves run in bounded batches of
 up to eight through the shared scheduler. Each job owns its source stream and exact
-partial state; the coordinator publishes artifacts and changes contribution
+partial state. Admission checks input, decoded-vector and group workspace
+against known allocator headroom; opaque or tight budgets retain serial scans.
+The coordinator publishes artifacts and changes contribution
 ownership after joining. Both full reconciliation and authenticated deltas use this
 boundary. Within publication, the file producer shares each current run across
 families rather than spawning consumers against conflicting files.
@@ -2183,7 +2186,7 @@ zero-value and terminal-miniblock framing retain the same validation rules.
 Sparse ordered-index construction registers tuple ownership before predicate
 initialization. Its allocation-failure regression fails the first predicate
 allocation after tuple creation and requires leak-free cleanup. Publication
-regressions cover real Parquet files shared by aggregate/ordered/text families,
+regressions cover real Parquet files shared by all five native families,
 partial scheduler admission, working-set admission, oversized-file fallback,
 deadline propagation and concurrent checkpoint persistence. Public HTTP E2Es and
 archive-scale latency/RSS measurements remain subject to their existing
