@@ -2191,3 +2191,16 @@ partial scheduler admission, working-set admission, oversized-file fallback,
 deadline propagation and concurrent checkpoint persistence. Public HTTP E2Es and
 archive-scale latency/RSS measurements remain subject to their existing
 qualification requirements.
+
+
+Final qualification for file-first native publication passed 312 native
+external-lake tests without failures or leaks, including all five families,
+allocation-failure cleanup, authenticated covering-row churn and the updated
+parallel aggregate append/removal regression. After merging `origin/main`
+through `bf975b4b7b`, 175 shared external-lake tests also passed. The reader/cursor
+suite passed 272 tests without leaks. A complete stripped Debug server build,
+final rebuild and installed CLI version check passed on Zig 0.17.0. License,
+Apache boundary, source/control catalog, generated engine error catalog,
+formatting and whitespace checks passed. Public HTTP E2Es still require
+16.25 GiB of free space and remain pending; archive-scale latency/RSS and live
+cloud qualification remain unmeasured.
