@@ -89,6 +89,7 @@ const Options = struct {
     prompt: []const u8,
     image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
+    video_path: ?[]const u8 = null,
     audio_paths: [8][]const u8 = @splat(""),
     audio_count: usize = 0,
     backend: BackendChoice = .auto,
@@ -290,14 +291,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
     const opts = try parseArgs(args);
+    try validateVideoOptions(opts);
     const jit_config = try validateKernelJitOptions(io, opts);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
     try native_backend_choice.validate(opts.backend);
-    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
+    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null)) return error.RawDecodeBenchRequiresTextOnly;
     if (opts.raw_decode_bench and opts.draft_model != null and opts.speculation_policy != .off) return error.RawDecodeBenchSpeculationUnsupported;
     if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
     const require_server = requireWarmServer(opts);
     if (selectedServerUrl(opts, platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL"))) |server_url| {
+        if (opts.video_path != null) return error.VideoRequiresLocalBackend;
         if (opts.raw_decode_bench) return error.RawDecodeBenchRequiresLocalBackend;
         var server_opts = opts;
         server_opts.server_url = server_url;
@@ -327,6 +330,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer preflight_manifest.deinit();
     try preflightModelLoadBudget(allocator, &preflight_manifest, opts);
 
+    const loaded_video = if (opts.video_path) |path| try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024 * 1024)) else null;
+    defer if (loaded_video) |bytes| allocator.free(bytes);
     var loaded_images = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (loaded_images.items) |image_bytes| allocator.free(image_bytes);
@@ -381,6 +386,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             .role = "user",
             .content = opts.prompt,
             .image_bytes = message_image_slice,
+            .video_bytes = loaded_video,
             .audio_bytes = message_audio_slice,
             .content_parts = content_part_slice,
         },
@@ -445,7 +451,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var draft_model_manager = model_manager_mod.ModelManager.init(allocator, draft_session_manager);
     defer draft_model_manager.deinit();
 
-    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
         var artifact_arena = std.heap.ArenaAllocator.init(allocator);
         defer artifact_arena.deinit();
         const artifact_allocator = artifact_arena.allocator();
@@ -481,7 +487,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         gpt_config.disable_token_embedding_scale = true;
     }
     const tokenizer = model.getTokenizer();
-    if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0)) {
+    if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
     }
     var draft_gpt_config = preflight_draft_gpt_config;
@@ -547,7 +553,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         prompt_media_allowance,
     ) catch return error.PromptTooLong;
 
-    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
         if (try tryRunArtifactForPromptShape(
             allocator,
             io,
@@ -605,7 +611,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         explicit_partition_backend == .metal and
         compiled_attachment_target == .whole_model and
         effective_draft_model == null and
-        opts.image_count == 0 and
+        opts.video_path == null and opts.image_count == 0 and
         opts.audio_count == 0 and
         graph_mod.metal_executor.supportsSession(model.session))
     {
@@ -699,7 +705,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
         config.draft_model == null and
         !config.speculation_requested and
-        opts.image_count == 0 and
+        opts.video_path == null and opts.image_count == 0 and
         opts.audio_count == 0;
     const kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
         if (compiled_whole_model_route or live_whole_model_route)
@@ -6486,7 +6492,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     if (!liveWholeModelExecutorRequested(opts, gpt_config)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
     if (config.draft_model != null or config.speculation_requested) return false;
-    if (opts.image_count > 0 or opts.audio_count > 0) return false;
+    if (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null) return false;
 
     gpt_arch.resetDebugTimingStats();
 
@@ -7462,7 +7468,7 @@ fn stripDefaultModelsDir(home: []const u8, model_dir: []const u8) ?[]const u8 {
 }
 
 fn serverGenerateSupportsOptions(opts: Options) bool {
-    return opts.image_count == 0 and
+    return opts.video_path == null and opts.image_count == 0 and
         opts.audio_count == 0 and
         !opts.raw_prompt and
         !opts.no_bos and
@@ -7626,6 +7632,11 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             opts.speculation_calibration = generation.parseSpeculationCalibration(args[i]) orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--video")) {
+            i += 1;
+            if (i >= args.len) return error.MissingVideoPath;
+            if (opts.video_path != null) return error.VideoLimitExceeded;
+            opts.video_path = args[i];
         } else if (std.mem.eql(u8, arg, "--image")) {
             i += 1;
             if (i >= args.len) return error.MissingImagePath;
@@ -8217,12 +8228,37 @@ fn metalEagerDenseMaxBytes() u64 {
     return mb * 1024 * 1024;
 }
 
+fn validateVideoOptions(opts: Options) !void {
+    if (opts.video_path == null) return;
+    if (opts.image_count > 0 or opts.audio_count > 0) return error.UnsupportedMixedVideoInput;
+    if (opts.raw_prompt or opts.draft_model != null) return error.UnsupportedVideoGenerationOption;
+}
+
+test "video CLI accepts one clip and rejects conflicting inputs" {
+    const opts = try parseArgs(&.{ "model", "describe", "--video", "clip.mp4", "--backend", "cuda" });
+    try std.testing.expectEqualStrings("clip.mp4", opts.video_path.?);
+    try validateVideoOptions(opts);
+    try std.testing.expect(!serverGenerateSupportsOptions(opts));
+    try std.testing.expectError(error.MissingVideoPath, parseArgs(&.{ "model", "describe", "--video" }));
+    try std.testing.expectError(error.VideoLimitExceeded, parseArgs(&.{ "model", "describe", "--video", "a.mp4", "--video", "b.mp4" }));
+    for ([_][]const u8{ "--image", "--audio" }) |flag| {
+        const mixed = try parseArgs(&.{ "model", "describe", "--video", "clip.mp4", flag, "media" });
+        try std.testing.expectError(error.UnsupportedMixedVideoInput, validateVideoOptions(mixed));
+    }
+    const raw = try parseArgs(&.{ "model", "describe", "--video", "clip.mp4", "--raw-prompt" });
+    try std.testing.expectError(error.UnsupportedVideoGenerationOption, validateVideoOptions(raw));
+    const draft = try parseArgs(&.{ "model", "describe", "--video", "clip.mp4", "--draft-model", "draft" });
+    try std.testing.expectError(error.UnsupportedVideoGenerationOption, validateVideoOptions(draft));
+}
+
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
+        \\  --video accepts one progressive 8-bit H.264 MP4 clip on local CUDA Gemma4 (up to 60s, sampled at 1 FPS).
+        \\  Video currently excludes audio, mixed image inputs, HDR, rotation, and non-square pixels.
         \\  --require-server or ANTFLY_INFERENCE_REQUIRE_WARM_SERVER=1 fails unless a server URL is configured.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  speculation-calibration defaults to none; Gemma4 MTP auto mode requires probe or positive to run the drafter.

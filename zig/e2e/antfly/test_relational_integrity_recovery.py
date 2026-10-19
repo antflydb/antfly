@@ -67,6 +67,21 @@ def test_constraint_probe_requires_exact_constraint_reason(expected, reason, sha
         (409, "batch transaction conflicted", True),
         (503, "write unavailable", True),
         (
+            503,
+            '{"code":"transaction_precommit_read_unavailable","retryable":true,"retry_after_ms":1000}',
+            True,
+        ),
+        (
+            503,
+            '{"code":"transaction_precommit_aborted","retryable":true}',
+            True,
+        ),
+        (
+            503,
+            '{"code":"constraint_activation_pending","retryable":true}',
+            True,
+        ),
+        (
             409,
             '{"status":"aborted","conflict":{"kind":"participant_unavailable","retryable":true}}',
             True,
@@ -91,6 +106,23 @@ def test_constraint_probe_requires_exact_constraint_reason(expected, reason, sha
             False,
         ),
         (503, '{"retryable":true,"message":"service unavailable"}', False),
+        (503, '{"code":[],"retryable":true}', False),
+        (503, '{"code":{},"retryable":true}', False),
+        (
+            503,
+            '{"code":"transaction_precommit_read_unavailable","retryable":true,"transaction_id":"opaque"}',
+            False,
+        ),
+        (
+            503,
+            '{"code":"transaction_precommit_read_unavailable","retryable":true,"status":"committed_pending"}',
+            False,
+        ),
+        (
+            503,
+            '{"code":"transaction_precommit_read_unavailable","retryable":false}',
+            False,
+        ),
         (504, "request deadline exceeded", False),
         (201, '{"inserted":1}', False),
         (202, '{"status":"committed_pending"}', False),
@@ -120,6 +152,68 @@ def test_constraint_probe_never_accepts_or_retries_uncertain_outcomes(
     else:
         with pytest.raises(AssertionError):
             backups._constraint_probe_outcome(response, "UniqueConstraintViolation")
+
+
+@pytest.mark.parametrize("retry_after_ms", [1250, 5000])
+def test_constraint_probe_honors_precommit_backoff_and_original_deadline(
+    monkeypatch, retry_after_ms
+):
+    from types import SimpleNamespace
+
+    clock = [0.0]
+    sleeps = []
+    attempts = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(backups.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(backups.time, "sleep", sleep)
+    unavailable = requests.Response()
+    unavailable.status_code = 503
+    unavailable._content = json.dumps(
+        {
+            "code": "transaction_precommit_read_unavailable",
+            "retryable": True,
+            "retry_after_ms": retry_after_ms,
+        }
+    ).encode()
+    rejected = requests.Response()
+    rejected.status_code = 409
+    rejected._content = b"ForeignKeyParentMissing"
+
+    def post(url, **kwargs):
+        attempts.append((url, kwargs))
+        return unavailable if len(attempts) == 1 else rejected
+
+    cluster = SimpleNamespace(
+        data_api_urls=["http://fixture"],
+        assert_processes_alive=lambda: None,
+        debug_logs=lambda: "fixture logs",
+    )
+
+    def invoke():
+        backups._assert_constraint_rejected(
+            cluster,
+            SimpleNamespace(post=post),
+            "children",
+            {"orphan": {"id": 999}},
+            "ForeignKeyParentMissing",
+            timeout_s=2.0,
+        )
+
+    if retry_after_ms == 1250:
+        invoke()
+        assert len(attempts) == 2
+        assert attempts[0][1]["json"] == attempts[1][1]["json"]
+        assert [attempt[1]["timeout"] for attempt in attempts] == [2.0, 0.75]
+        assert sleeps == [1.25]
+    else:
+        with pytest.raises(AssertionError, match="constraint did not return"):
+            invoke()
+        assert len(attempts) == 1
+        assert sleeps == [2.0]
 
 
 @pytest.mark.parametrize(

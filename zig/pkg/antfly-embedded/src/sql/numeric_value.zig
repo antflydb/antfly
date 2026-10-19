@@ -58,12 +58,27 @@ pub const Context = struct {
         }
         self.remaining -= count;
         if (count >= 256 -| self.since_poll) {
-            self.since_poll = 0;
-            if (self.checkpoint) |poll| poll(self.ptr) catch |err| {
+            try self.poll();
+        } else self.since_poll += @intCast(count);
+    }
+
+    /// Check cancellation even when work was prepaid or the current operation
+    /// only moves already-validated bytes. Preserve the enclosing owner and
+    /// sticky failure without spending another work unit.
+    pub fn poll(self: *Context) !void {
+        if (self.failure) |err| return err;
+        if (self.parent) |parent| {
+            parent.poll() catch |err| {
                 self.failure = err;
                 return err;
             };
-        } else self.since_poll += @intCast(count);
+            return;
+        }
+        self.since_poll = 0;
+        if (self.checkpoint) |check| check(self.ptr) catch |err| {
+            self.failure = err;
+            return err;
+        };
     }
 
     /// Poll an already charged scan without charging its work a second time.
@@ -1695,6 +1710,28 @@ test "SQL exact NUMERIC multiplication benchmark retains one bounded output allo
         try std.testing.expectEqual(operand.value.digits.len * 2, result.value.digits.len);
         std.debug.print("NUMERIC multiply: decimal_digits={d} groups={d} allocations={d} work={d} elapsed_ns={d}\n", .{ digits, operand.value.digits.len, tracked.alloc_index, 8 * 1024 * 1024 - ctx.remaining, elapsed });
     }
+}
+
+test "SQL explicit cancellation polls preserve parent work and sticky failures" {
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.Canceled;
+        }
+    };
+    var control: Control = .{};
+    var parent: Context = .{ .alloc = std.testing.failing_allocator, .remaining = 10, .checkpoint = Control.check, .ptr = &control, .since_poll = 0 };
+    var child: Context = .{ .alloc = std.testing.failing_allocator, .remaining = 7, .parent = &parent };
+    try child.poll();
+    try std.testing.expectEqual(@as(u64, 10), parent.remaining);
+    try std.testing.expectEqual(@as(u64, 7), child.remaining);
+    try std.testing.expectError(error.Canceled, child.poll());
+    parent.checkpoint = null;
+    try std.testing.expectError(error.Canceled, parent.poll());
+    try std.testing.expectError(error.Canceled, child.charge(0));
+    try std.testing.expectEqual(@as(usize, 2), control.calls);
 }
 
 test "SQL scaled integer conversion preserves exact decimal128 coefficients without text" {

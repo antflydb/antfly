@@ -22,7 +22,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Routed writers and Raft batchers now carry their owning error-domain
+// Cancellation and inference checkpoints carry their owning error-domain
 // dispatcher. Reject older native handles before reading the added field.
 // Execution leases and recurring handles carry a shared-services capability.
 // Reject older native layouts before interpreting those added fields.
@@ -65,7 +65,9 @@ const builtin = @import("builtin");
 // Transaction resolution carries its accepted decoded-effect owner.
 // Sealed frames retain their catalog definitions through resolution.
 // Reject older native owners that publish through that durable lease.
-pub const abi_version: u32 = 33;
+// Merged inference callback dispatch and CUDA allocation ownership require
+// the combined native contract, beyond either pre-merge owner layout.
+pub const abi_version: u32 = 34;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

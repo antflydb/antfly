@@ -541,7 +541,7 @@ fn decodeBytesImpl(a: A, kind: arrays.ElementType, input: []const u8, options: O
                     .string, .number_string => |text| try work.consume(text.len),
                     else => {},
                 };
-                const cell = try readElement(kind, value, flag);
+                const cell = try readElement(kind, value, flag, options.context);
                 if (fixed) try fixed_builder.appendChecked(cell, kind, options.values, &work) else _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{cell}, options.values, &work);
                 bytes = std.math.add(usize, bytes, try operators.datumBytes(cell)) catch return options.limit();
                 if (!flag and kind == .text) text_bytes += cell.value.string.len;
@@ -570,8 +570,8 @@ fn decodeBytesImpl(a: A, kind: arrays.ElementType, input: []const u8, options: O
         try work.consume(0);
         const flag = try nullFlag((try nulls.next()).?);
         const value = try elementJson(temporary.allocator(), kind, raw);
-        if (compact) try builder.append(try readElement(kind, value, flag)) else {
-            cells[index] = if (kind == .numeric and !flag) try @import("scalar.zig").numericTextLeaky(a, value.string, &work) else try operators.cloneDatum(a, try readElement(kind, value, flag));
+        if (compact) try builder.append(try readElement(kind, value, flag, options.context)) else {
+            cells[index] = if (kind == .numeric and !flag) try @import("scalar.zig").numericTextLeaky(a, value.string, &work) else try operators.cloneDatum(a, try readElement(kind, value, flag, options.context));
         }
     }
     var result = if (compact) try builder.finish(a, options.values) else arrays.Value{ .element_type = kind, .dimensions = try a.dupe(arrays.Dimension, dimensions[0..rank]), .elements = cells, .prepared_footprint = if (kind == .numeric) null else bytes };

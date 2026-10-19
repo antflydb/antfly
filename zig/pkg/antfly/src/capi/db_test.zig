@@ -6194,18 +6194,24 @@ test "capi native replacement wait observes its background owner without rebuild
 }
 
 test "capi native idle maintenance discovers resolver debt after producer checkpoint" {
-    try testNativeIdleResolverDebt(false, false);
+    try testNativeIdleResolverDebt(false, false, null);
 }
 
 test "capi native idle maintenance discovers persisted enrichment target beyond journal" {
-    try testNativeIdleResolverDebt(true, false);
+    try testNativeIdleResolverDebt(true, false, null);
 }
 
 test "capi native idle maintenance continues resolver replay after TTL failure" {
-    try testNativeIdleResolverDebt(false, true);
+    try testNativeIdleResolverDebt(false, true, null);
 }
 
-fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool) !void {
+test "capi native idle maintenance discovers cursor-only resolver debt" {
+    const catalog = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
+    for ([_][]const u8{ catalog.reresolve_resume_key, catalog.reresolve_repair_resume_key }) |cursor|
+        try testNativeIdleResolverDebt(false, false, cursor);
+}
+
+fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[]const u8) !void {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("native-resolver-durable-debt");
@@ -6270,6 +6276,25 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool) !void {
         const stats = database.pendingWorkStats();
         try std.testing.expect(stats.enrichment.applied_sequence >= database.core.nextDerivedSequence());
         try std.testing.expect(stats.resolution.catch_up_required);
+        if (cursor) |key| {
+            try database.runUntilIdle();
+            const settled = database.pendingWorkStats();
+            try std.testing.expect(!settled.resolution.catch_up_required);
+            try std.testing.expect(!settled.promotion.catch_up_required);
+            // Leave no harmless generated/derived tail that could admit a
+            // maintenance turn independently of the backfill cursor.
+            const target = database.core.nextDerivedSequence();
+            for ([_][]const u8{ "generated", "resolution", "promotion" }) |scope| {
+                var checkpoint = try db_mod.enrichment_state.loadProjectionCheckpoint(a, database.core.store, scope);
+                checkpoint.applied_sequence = target;
+                try db_mod.enrichment_state.saveProjectionCheckpoint(database.core.store, scope, checkpoint);
+            }
+            // A durable backfill can be admitted without appending replay
+            // records. Equal watermarks must not make the owner skip it.
+            try database.core.store.putBatch(&.{.{ .key = key, .value = "" }}, &.{});
+            if (database.resolution_runtime) |runtime| runtime.notifyBackfill();
+            try std.testing.expect(database.pendingWorkStats().resolution.catch_up_required);
+        }
         if (notified_tail) {
             const target = database.core.nextDerivedSequence() + 1;
             database.enrichment_runtime.?.notifySequence(target);
@@ -6292,6 +6317,18 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool) !void {
     handle = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
     owner = try Pause.run(handle);
+    if (cursor != null) {
+        const guard = public.enterHandle(handle, .read).?;
+        defer guard.leave();
+        const pending = guard.handle.db.pendingWorkStats();
+        const target = guard.handle.db.core.nextDerivedSequence();
+        try std.testing.expect(pending.enrichment.applied_sequence >= target);
+        try std.testing.expect(pending.resolution.applied_sequence >= target);
+        try std.testing.expect(pending.promotion.applied_sequence >= target);
+        try std.testing.expect(pending.resolution.catch_up_required);
+        owner.maintenance_pending = false;
+        owner.maintenance_round_pending = false;
+    }
     var ttl_failures: usize = 0;
     for (0..64) |_| {
         const pending = owner.maintenanceTurnForTest() catch |err| {
@@ -6308,6 +6345,11 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool) !void {
     try std.testing.expect(stats.enrichment.applied_sequence >= stats.enrichment.target_sequence);
     try std.testing.expect(!stats.resolution.catch_up_required);
     try std.testing.expect(!stats.promotion.catch_up_required);
+    if (cursor) |key| {
+        var probe = try guard.handle.db.core.store.beginProbeTxn();
+        defer probe.abort();
+        try std.testing.expectError(error.NotFound, probe.get(key));
+    }
     if (ttl_failure) {
         var ttl = guard.handle.db.ttl_runtime.?.stats();
         owner.overlayTtlStats(&guard.handle.db, &ttl);

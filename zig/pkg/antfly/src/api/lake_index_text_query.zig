@@ -48,7 +48,10 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
 pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery) !?local.api_query.QueryResponse {
     return executePinned(a, server, table, req, request, delivery, false) catch |err| switch (err) {
         error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable => error.IndexRebuilding,
-        error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => error.CatalogGenerationChanged,
+        error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => changed: {
+            try server.requestLakePublication(table.name);
+            break :changed error.CatalogGenerationChanged;
+        },
         error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy, error.LakeSnapshotReadLeaseExpired, error.LakeSnapshotRetired, error.LakeOverlayCoverageUnavailable => error.StorageReadTemporarilyUnavailable,
         error.NativeLakeTextCorpusTooLarge, error.LakeOverlayTooLarge, error.ArtifactReadBudgetExceeded => error.QueryCandidateBudgetExceeded,
         error.IndexNotFound => error.InvalidQueryRequest,

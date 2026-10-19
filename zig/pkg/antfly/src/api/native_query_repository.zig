@@ -22,6 +22,7 @@ const cut = local.storage_db_native_query_cut;
 const port = local.storage_db_native_query_cut_repository;
 const objectstore = @import("objectstore");
 const Store = @import("lake_index_store.zig").Store;
+const linked_gc = @import("native_query_link_gc.zig");
 const artifacts = @import("../serverless/artifacts/store.zig");
 const fs = @import("antfly_runtime_fs").fs_paths;
 const A = std.mem.Allocator;
@@ -85,8 +86,31 @@ pub const Repository = struct {
     a: A,
     store: Store,
     limits: cut.Limits = .{},
+    owned_collection: CollectionState,
     owned_config: ?local.common_config.Config = null,
     owned_base_dir: ?[]u8 = null,
+    /// The maintenance owner retains this across short-lived provider adapters.
+    /// At most one namespace iterator and one tree reaper are open at a time.
+    pub const CollectionState = struct {
+        a: A,
+        io: ?std.Io = null,
+        mutex: std.atomic.Mutex = .unlocked,
+        collector: ?linked_gc.Collector = null,
+        namespace: ?Namespace = null,
+        pending: std.atomic.Value(bool) = .init(false),
+        pub fn init(a: A, io: std.Io) CollectionState {
+            return .{ .a = a, .io = io };
+        }
+        pub fn deinit(self: *CollectionState) void {
+            if (self.collector) |*value| value.deinit();
+            self.collector = null;
+            self.namespace = null;
+            self.pending.store(false, .release);
+        }
+        pub fn hasPending(self: *const CollectionState) bool {
+            return self.pending.load(.acquire);
+        }
+    };
     const Setup = struct { config_json: []const u8, deployment: local.common_config.DeploymentMode, base_dir: ?[]const u8 = null };
     pub fn setupJsonAlloc(a: A, config: ?*const local.common_config.Config, deployment: local.common_config.DeploymentMode, base_dir: ?[]const u8) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -145,16 +169,243 @@ pub const Repository = struct {
         return repository;
     }
     pub fn init(a: A, config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, deployment: local.common_config.DeploymentMode, base_dir: ?[]const u8) !Repository {
-        return .{ .a = a, .store = try Store.openNative(a, config, secrets, false, deployment, base_dir), .limits = if (config) |value| .{ .max_cuts = value.lake_indexes.query_cursors.max_native_cuts, .max_bytes = value.lake_indexes.query_cursors.max_native_retained_bytes } else .{} };
+        return .{ .a = a, .owned_collection = .{ .a = a }, .store = try Store.openNative(a, config, secrets, false, deployment, base_dir), .limits = if (config) |value| .{ .max_cuts = value.lake_indexes.query_cursors.max_native_cuts, .max_bytes = value.lake_indexes.query_cursors.max_native_retained_bytes } else .{} };
     }
     pub fn deinit(self: *Repository) void {
+        self.owned_collection.deinit();
         self.store.deinit();
         if (self.owned_config) |*value| value.deinit();
         if (self.owned_base_dir) |value| self.a.free(value);
     }
     pub fn capability(self: *Repository) port.Port {
+        if (self.store.opened.fs_client == null) return self.chunkedCapability();
+        const vtable: port.VTable = .{ .publish = publishLinked, .recover = recoverLinked, .open_read = openReadLinked, .warm = warmLinked, .reference = reference, .publish_with_proof = publishLinkedWithProof, .warm_with_proof = warmLinkedWithProof, .reuse = reuse, .can_evict = canEvictLinked };
+        return .{ .limits = self.limits, .ptr = self, .vtable = &vtable };
+    }
+    fn chunkedCapability(self: *Repository) port.Port {
         const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead, .warm = warm, .reference = reference, .publish_with_proof = publishWithProof, .warm_with_proof = warmWithProof, .reuse = reuse, .can_evict = canEvict };
         return .{ .limits = self.limits, .ptr = self, .vtable = &vtable, .dispatch = @import("antfly_local_sources").runtime_callback_abi.Boundary(port.VTable).local_dispatch };
+    }
+    /// Filesystem repositories retain sealed files by inode, without hashing or
+    /// copying the corpus on the query path. This is a second durable owner,
+    /// independent of the evictable per-DB query-pin directory.
+    fn linkedNamespace(self: *Repository, a: A, namespace: Namespace) ![]u8 {
+        const filesystem = self.store.opened.fs_client orelse return error.Unsupported;
+        const dirs = try filesystem.artifactDirectoriesAlloc(a, self.store.opened.bucket);
+        defer a.free(dirs.objects);
+        defer a.free(dirs.inventory);
+        const identity = try self.domain(a, namespace);
+        return std.fmt.allocPrint(a, "{s}/native-query-links/{s}", .{ dirs.inventory, std.fmt.bytesToHex(&identity, .lower) });
+    }
+    fn linkedRoot(self: *Repository, a: A, request: cut.Request, namespace: Namespace) ![]u8 {
+        try request.validate(cut.nowMs());
+        _ = try request.namespace(namespace);
+        const parent = try self.linkedNamespace(a, namespace);
+        defer a.free(parent);
+        return std.fmt.allocPrint(a, "{s}/{d:0>20}/{s}", .{ parent, request.expires_ms, request.id });
+    }
+    fn linkedLock(a: A, io: std.Io, parent: []const u8, cancellation: Cancellation) !cut.Guard {
+        try fs.createDirPathPortable(io, parent);
+        const path = try std.fs.path.join(a, &.{ parent, ".lock" });
+        defer a.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+        errdefer file.close(io);
+        while (!try file.tryLock(io, .exclusive)) {
+            try cancellation.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        return .{ .io = io, .file = file };
+    }
+    fn linkGeneration(a: A, io: std.Io, source: []const u8, target: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        try cut.validate(a, io, source, request, namespace, cancellation);
+        const manifest_path = try std.fs.path.join(a, &.{ source, "query-cut.json" });
+        defer a.free(manifest_path);
+        const bytes = try local.storage_db_native_backup.readFileAlloc(a, io, manifest_path, max_manifest_bytes);
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(cut.Manifest, a, bytes, .{});
+        defer parsed.deinit();
+        const staging = try std.fmt.allocPrint(a, "{s}.staging", .{target});
+        defer a.free(staging);
+        try std.Io.Dir.cwd().deleteTree(io, staging);
+        try fs.createDirPathPortable(io, staging);
+        errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+        for (parsed.value.files) |file| {
+            try cancellation.check();
+            const from_path = try std.fs.path.join(a, &.{ source, file.path });
+            defer a.free(from_path);
+            const to_path = try std.fs.path.join(a, &.{ staging, file.path });
+            defer a.free(to_path);
+            if (std.fs.path.dirname(to_path)) |parent| try fs.createDirPathPortable(io, parent);
+            try std.Io.Dir.hardLink(.cwd(), from_path, .cwd(), to_path, io, .{});
+        }
+        // The manifest binds the exact linked inode/size/mtime inventory. No
+        // payload reads are needed, including for very large immutable files.
+        const to_manifest = try std.fs.path.join(a, &.{ staging, "query-cut.json" });
+        defer a.free(to_manifest);
+        try cut.validate(a, io, source, request, namespace, cancellation);
+        _ = try local.storage_db_native_backup.writeFileDurable(io, to_manifest, bytes);
+        try cut.validate(a, io, staging, request, namespace, cancellation);
+        // Sync nested link directories before publishing their parent.
+        var inventory_arena = std.heap.ArenaAllocator.init(a);
+        defer inventory_arena.deinit();
+        _ = try local.storage_db_native_backup_seal.inventoryAlloc(inventory_arena.allocator(), io, staging, cancellation);
+        try fs.syncDirPortable(io, staging);
+        try cancellation.check();
+        try std.Io.Dir.rename(.cwd(), staging, .cwd(), target, io);
+        try fs.syncDirPortable(io, std.fs.path.dirname(target).?);
+    }
+    fn publishLinked(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        _ = try publishLinkedLimited(raw, executor, root, request, namespace, cancellation, std.math.maxInt(u64), null);
+    }
+    fn publishLinkedWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.ReuseProof {
+        var proof: ?port.ReuseProof = null;
+        _ = try publishLinkedLimited(raw, executor, root, request, namespace, cancellation, std.math.maxInt(u64), &proof);
+        return proof;
+    }
+    fn warmLinked(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
+        return (try warmLinkedWithProof(raw, executor, root, request, namespace, cancellation, max_bytes)).complete;
+    }
+    fn warmLinkedWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !port.WarmResult {
+        if (max_bytes < chunk_bytes or max_bytes > 32 * 1024 * 1024) return error.InvalidQueryRequest;
+        var proof: ?port.ReuseProof = null;
+        const complete = try publishLinkedLimited(raw, executor, root, request, namespace, cancellation, max_bytes, &proof);
+        return .{ .complete = complete, .proof = proof };
+    }
+    fn publishLinkedLimited(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64, proof: ?*?port.ReuseProof) !bool {
+        var receiver = try executor.receive();
+        const io = receiver.io();
+        const self = from(raw);
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try cut.validate(a, io, root, request, namespace, cancellation);
+        const parent = try self.linkedNamespace(a, namespace);
+        var guard = try linkedLock(a, io, parent, cancellation);
+        var guarded = true;
+        defer if (guarded) guard.deinit();
+        try self.register(a, namespace, cancellation);
+        const target = try self.linkedRoot(a, request, namespace);
+        var durable: objectstore.durable_directory.Cache = .{};
+        defer durable.deinit(a);
+        try durable.ensure(a, io, std.fs.path.dirname(target).?);
+        cut.validate(a, io, target, request, namespace, cancellation) catch |err| switch (err) {
+            error.CatalogGenerationChanged => {
+                linkGeneration(a, io, root, target, request, namespace, cancellation) catch |link_err| switch (link_err) {
+                    // A separately mounted filesystem artifact root retains
+                    // the chunked transport rather than failing valid queries.
+                    error.CrossDevice, error.OperationUnsupported, error.LinkQuotaExceeded => {
+                        // Chunk publication has its own immutable commit. Do
+                        // not serialize unrelated cursors behind payload I/O.
+                        guard.deinit();
+                        guarded = false;
+                        return publishLimitedImpl(raw, io, root, request, namespace, cancellation, max_bytes, proof);
+                    },
+                    else => return link_err,
+                };
+                return true;
+            },
+            else => return err,
+        };
+        const source_manifest = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fs.path.join(a, &.{ root, "query-cut.json" }), max_manifest_bytes);
+        const retained_manifest = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fs.path.join(a, &.{ target, "query-cut.json" }), max_manifest_bytes);
+        if (!std.mem.eql(u8, source_manifest, retained_manifest)) return error.CatalogGenerationChanged;
+        return true;
+    }
+    // Missing caches read retained files in place, even across filesystems.
+    // A shared expiry lease protects lazy reads and any escaped page sources.
+    fn openReadLinked(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.StorageLease {
+        var receiver = try executor.receive();
+        const io = receiver.io();
+        const self = from(raw);
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const now = @import("antfly_platform").time.monotonicNs();
+        const expiry = now +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(expiry, now +| value *| std.time.ns_per_ms) else expiry };
+        var guard = try linkedLock(a, io, try self.linkedNamespace(a, namespace), control.token());
+        var guarded = true;
+        defer if (guarded) guard.deinit();
+        const physical = try self.linkedRoot(a, request, namespace);
+        cut.validate(a, io, physical, request, namespace, control.token()) catch |err| switch (err) {
+            error.CatalogGenerationChanged => {
+                guard.deinit();
+                guarded = false;
+                return openRead(raw, executor, root, request, namespace, cancellation);
+            },
+            else => return err,
+        };
+        const lease_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(physical).?, ".lease" });
+        const lease_file = try std.Io.Dir.cwd().createFile(io, lease_path, .{ .truncate = false });
+        errdefer lease_file.close(io);
+        if (!try lease_file.tryLock(io, .shared)) return error.QueryCandidateBudgetExceeded;
+        const bytes = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fs.path.join(a, &.{ physical, "query-cut.json" }), max_manifest_bytes);
+        const manifest = try std.json.parseFromSliceLeaky(cut.Manifest, a, bytes, .{});
+        const reader = try port.remote_storage.Reader.createLinkedWithExecutor(self.a, executor, root, physical, manifest.files, lease_file, control);
+        return reader.lease();
+    }
+    fn recoverLinked(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        var receiver = try executor.receive();
+        const io = receiver.io();
+        const self = from(raw);
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var guard = try linkedLock(a, io, try self.linkedNamespace(a, namespace), cancellation);
+        var guarded = true;
+        defer if (guarded) guard.deinit();
+        const source = try self.linkedRoot(a, request, namespace);
+        cut.validate(a, io, source, request, namespace, cancellation) catch |err| switch (err) {
+            error.CatalogGenerationChanged => {
+                guard.deinit();
+                guarded = false;
+                return recover(raw, executor, root, request, namespace, cancellation);
+            },
+            else => return err,
+        };
+        try linkGeneration(a, io, source, root, request, namespace, cancellation);
+    }
+    fn canEvictLinked(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
+        var receiver = try executor.receive();
+        const self = from(raw);
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const path = try self.linkedRoot(a, request, namespace);
+        cut.validate(a, receiver.io(), path, request, namespace, cancellation) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return canEvict(raw, executor, root, request, namespace, sequence, cancellation),
+            else => return err,
+        };
+        const bytes = try local.storage_db_native_backup.readFileAlloc(a, receiver.io(), try std.fs.path.join(a, &.{ path, "query-cut.json" }), max_manifest_bytes);
+        const manifest = try std.json.parseFromSliceLeaky(cut.Manifest, a, bytes, .{});
+        return manifest.sequence == sequence;
+    }
+    fn collectLinked(self: *Repository, state: *CollectionState, namespace: Namespace, now: u64, budget: usize, cancellation: Cancellation) !linked_gc.Page {
+        if (self.store.opened.fs_client == null) return .{ .complete = true };
+        try cancellation.check();
+        const parent = try self.linkedNamespace(state.a, namespace);
+        defer state.a.free(parent);
+        if (state.collector) |value| if (!state.namespace.?.eql(namespace) or !std.mem.eql(u8, value.root, parent)) state.deinit();
+        errdefer state.deinit();
+        if (state.collector == null) {
+            const io = state.io orelse self.store.opened.fs_client.?.io;
+            try fs.createDirPathPortable(io, parent);
+            state.collector = try linked_gc.Collector.init(state.a, io, parent);
+            if (state.collector == null) return .{ .complete = true }; // Another collector owns this namespace.
+            state.namespace = namespace;
+        }
+        const page = state.collector.?.step(now, budget, cancellation) catch |err| switch (err) {
+            // Another collector may have advanced the durable trash between
+            // our pages. Reopen discovery; no private cursor is authority.
+            error.FileNotFound => {
+                state.deinit();
+                state.pending.store(true, .release);
+                return .{ .complete = false };
+            },
+            else => return err,
+        };
+        state.pending.store(!page.complete or page.visited == budget, .release);
+        return page;
     }
     fn from(raw: *anyopaque) *Repository {
         return @ptrCast(@alignCast(raw));
@@ -220,10 +471,19 @@ pub const Repository = struct {
         }
     }
     pub fn collect(self: *Repository, namespace: Namespace, now: u64, cancellation: Cancellation) !void {
-        return self.collectBounded(namespace, now, 128, cancellation);
+        _ = try self.collectBounded(&self.owned_collection, namespace, now, 128, cancellation);
     }
-    fn collectBounded(self: *Repository, namespace: Namespace, now: u64, budget: usize, cancellation: Cancellation) !void {
-        if (budget == 0) return;
+    fn collectBounded(self: *Repository, state: *CollectionState, namespace: Namespace, now: u64, budget: usize, cancellation: Cancellation) !bool {
+        if (!state.mutex.tryLock()) return false;
+        defer state.mutex.unlock();
+        if (budget == 0) {
+            state.deinit();
+            return true;
+        }
+        const links = try self.collectLinked(state, namespace, now, budget, cancellation);
+        if (!links.complete or links.visited == budget) return false;
+        defer state.deinit();
+        const remaining_budget = budget - links.visited;
         const Visitor = struct {
             store: *artifacts.ArtifactStore,
             deleted: usize = 0,
@@ -235,15 +495,15 @@ pub const Repository = struct {
         };
         var store = self.store.artifactStore();
         const cut_identity = try @import("native_retained_cut.zig").storeIdentity(self.a, self.store.locator);
-        const descriptors = try @import("native_retained_cut.zig").collectBounded(&store, namespace.table_id, cut_identity, now, budget, cancellation);
-        if (descriptors == budget) return;
+        const descriptors = try @import("native_retained_cut.zig").collectBounded(&store, namespace.table_id, cut_identity, now, remaining_budget, cancellation);
+        if (descriptors == remaining_budget) return true;
         var visitor: Visitor = .{ .store = &store, .deleted = descriptors };
-        store.visitScopedUploads(try self.domain(self.a, namespace), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = budget - descriptors }, cancellation) catch |err| switch (err) {
+        store.visitScopedUploads(try self.domain(self.a, namespace), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = remaining_budget - descriptors }, cancellation) catch |err| switch (err) {
             error.ArtifactEnumerationPaused => {},
             else => return err,
         };
-        if (visitor.deleted >= budget) return;
-        const remaining = budget - visitor.deleted;
+        if (visitor.deleted >= remaining_budget) return true;
+        const remaining = remaining_budget - visitor.deleted;
         const prefix = try std.fmt.allocPrint(self.a, "{s}{s}native-query-generations/{d}/{d}/{d}/", .{ self.store.opened.prefix, if (self.store.opened.prefix.len == 0) "" else "/", namespace.table_id, namespace.shard_id, namespace.range_id });
         defer self.a.free(prefix);
         const bridge: TokenBridge = .{ .token = cancellation };
@@ -267,6 +527,7 @@ pub const Repository = struct {
             };
         }
         try cancellation.check();
+        return true;
     }
     fn ownerPrefix(self: *Repository, a: A) ![]u8 {
         return std.fmt.allocPrint(a, "{s}{s}native-query-owners/", .{ self.store.opened.prefix, if (self.store.opened.prefix.len == 0) "" else "/" });
@@ -276,7 +537,14 @@ pub const Repository = struct {
     }
     /// One namespace per supervised pass. The caller owns the returned cursor;
     /// registry witnesses survive failed upload, owner loss and table drop.
+    pub fn collectNextWithState(self: *Repository, a: A, state: *CollectionState, after: ?[]const u8, now: u64, budget: usize, cancellation: Cancellation) !?[]u8 {
+        std.debug.assert(state.io != null); // Borrowed state outlives this adapter's executor.
+        return self.collectNextImpl(a, state, after, now, budget, cancellation);
+    }
     pub fn collectNext(self: *Repository, a: A, after: ?[]const u8, now: u64, budget: usize, cancellation: Cancellation) !?[]u8 {
+        return self.collectNextImpl(a, &self.owned_collection, after, now, budget, cancellation);
+    }
+    fn collectNextImpl(self: *Repository, a: A, state: *CollectionState, after: ?[]const u8, now: u64, budget: usize, cancellation: Cancellation) !?[]u8 {
         const prefix = try self.ownerPrefix(a);
         defer a.free(prefix);
         const bridge: TokenBridge = .{ .token = cancellation };
@@ -285,7 +553,13 @@ pub const Repository = struct {
             return err;
         };
         defer page.deinit(self.store.opened.client.allocator);
-        if (page.entries.len == 0) return null;
+        if (page.entries.len == 0) {
+            if (state.mutex.tryLock()) {
+                defer state.mutex.unlock();
+                state.deinit();
+            }
+            return null;
+        }
         const key_bytes = page.entries[0].key;
         if (!std.mem.startsWith(u8, key_bytes, prefix) or !std.mem.endsWith(u8, key_bytes, ".json")) return error.CatalogGenerationChanged;
         var parts = std.mem.splitScalar(u8, key_bytes[prefix.len .. key_bytes.len - 5], '/');
@@ -293,7 +567,8 @@ pub const Repository = struct {
         const shard = std.fmt.parseInt(u64, parts.next() orelse return error.CatalogGenerationChanged, 10) catch return error.CatalogGenerationChanged;
         const range = std.fmt.parseInt(u64, parts.next() orelse return error.CatalogGenerationChanged, 10) catch return error.CatalogGenerationChanged;
         if (parts.next() != null or table == 0) return error.CatalogGenerationChanged;
-        try self.collectBounded(.{ .table_id = table, .shard_id = shard, .range_id = range }, now, budget, cancellation);
+        if (!try self.collectBounded(state, .{ .table_id = table, .shard_id = shard, .range_id = range }, now, budget, cancellation))
+            return if (after) |previous| try a.dupe(u8, previous) else null;
         try cancellation.check();
         return if (page.next_continuation_token != null) try a.dupe(u8, key_bytes) else null;
     }
@@ -672,7 +947,7 @@ pub const Repository = struct {
         };
         return expected_domain;
     }
-    fn openRead(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
+    fn openRead(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.StorageLease {
         const self: *Repository = @ptrCast(@alignCast(raw));
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -764,7 +1039,7 @@ test "external lake native reuse avoids capture and invalidates writes metadata 
     defer repository.deinit();
     var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
     defer runtime.deinit();
-    runtime.ptr().query_cut_repository = repository.capability();
+    runtime.ptr().query_cut_repository = repository.chunkedCapability();
     const root = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
     defer a.free(root);
     const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
@@ -803,11 +1078,11 @@ test "external lake native reuse avoids capture and invalidates writes metadata 
     try std.testing.expectEqualStrings(before.files[0].chunks[0].artifact_id, reused.files[0].chunks[0].artifact_id);
     var wrong = db.local_execution.native_query_reuse.?.proof();
     wrong.sequence += 1;
-    try std.testing.expect(try repository.capability().reuse(io, second, first, namespace, wrong, .none) == null);
+    try std.testing.expect(try repository.chunkedCapability().reuse(io, second, first, namespace, wrong, .none) == null);
     wrong.sequence -= 1;
     wrong.manifest_checksum = @splat(0);
-    try std.testing.expect(try repository.capability().reuse(io, second, first, namespace, wrong, .none) == null);
-    try std.testing.expect(try repository.capability().reuse(io, first, second, .{ .table_id = 7, .shard_id = 2, .range_id = 2 }, wrong, .none) == null);
+    try std.testing.expect(try repository.chunkedCapability().reuse(io, second, first, namespace, wrong, .none) == null);
+    try std.testing.expect(try repository.chunkedCapability().reuse(io, first, second, .{ .table_id = 7, .shard_id = 2, .range_id = 2 }, wrong, .none) == null);
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2,\"body\":\"replacement\"}" }} });
     const third_id: [64]u8 = @splat('c');
     const third: cut.Request = .{ .id = &third_id, .table_id = 7, .expires_ms = first.expires_ms + 2000, .create = true };
@@ -884,10 +1159,10 @@ test "external lake native reuse validates physical retention before extending c
     var committed = try repository.store.opened.client.putObject(repository.store.opened.bucket, try repository.key(scratch, previous, namespace), bytes, .{ .if_none_match = true });
     committed.deinit(repository.store.opened.client.allocator);
     const proof: port.ReuseProof = .{ .sequence = 123, .digest = @splat(42), .manifest_checksum = Repository.manifestChecksum(bytes) };
-    try std.testing.expect(try repository.capability().reuse(io, previous, next, namespace, proof, .none) == null);
+    try std.testing.expect(try repository.chunkedCapability().reuse(io, previous, next, namespace, proof, .none) == null);
     try std.testing.expectError(error.CatalogGenerationChanged, repository.readManifest(scratch, next, namespace, .none));
     next.expires_ms = now + 9 * std.time.ms_per_min;
-    const rebound = (try repository.capability().reuse(io, previous, next, namespace, proof, .none)).?;
+    const rebound = (try repository.chunkedCapability().reuse(io, previous, next, namespace, proof, .none)).?;
     const result = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, next, namespace, .none), next, namespace);
     try std.testing.expectEqual(@as(u64, 123), rebound.sequence);
     try std.testing.expectEqualStrings(object.artifact_id, result.files[0].chunks[0].artifact_id);
@@ -926,7 +1201,7 @@ test "external lake native repository opens retained vector storage after local 
     defer repository.deinit();
     var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
     defer runtime.deinit();
-    runtime.ptr().query_cut_repository = repository.capability();
+    runtime.ptr().query_cut_repository = repository.chunkedCapability();
     const root = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
     defer a.free(root);
     const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
@@ -1056,20 +1331,20 @@ test "external lake native repository reuses immutable extents and collects expi
     try std.Io.Dir.hardLink(.cwd(), first_file, .cwd(), second_file, io, .{});
     try cut.finish(a, io, first_root, first, namespace, 1, .none);
     try cut.finish(a, io, second_root, second, namespace, 1, .none);
-    try repository.capability().publish(io, first_root, first, namespace, .none);
+    try repository.chunkedCapability().publish(io, first_root, first, namespace, .none);
     // Reboot/loss of all local hints must reuse the durable checkpoint.
     try std.Io.Dir.cwd().deleteTree(io, try std.fmt.allocPrint(scratch, "{s}/.chunk-cache", .{directory.path()}));
-    try repository.capability().publish(io, second_root, second, namespace, .none);
+    try repository.chunkedCapability().publish(io, second_root, second, namespace, .none);
     // Local commit evidence is private cache metadata, never snapshot data.
     try std.testing.expect(try repository.localCommit(scratch, io, first_root, first, namespace));
     try cut.finish(a, io, first_root, first, namespace, 1, .none);
-    try repository.capability().publish(io, first_root, first, namespace, .none);
+    try repository.chunkedCapability().publish(io, first_root, first, namespace, .none);
     const first_manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, first, namespace, .none), first, namespace);
     const second_manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, second, namespace, .none), second, namespace);
     try std.testing.expectEqual(@as(usize, 1), first_manifest.files.len);
     try std.testing.expectEqualStrings(first_manifest.files[0].chunks[0].artifact_id, second_manifest.files[0].chunks[0].artifact_id);
     const recovered = try std.fmt.allocPrint(scratch, "{s}/recovered", .{directory.path()});
-    try repository.capability().recover(io, recovered, first, namespace, .none);
+    try repository.chunkedCapability().recover(io, recovered, first, namespace, .none);
     const recovered_bytes = try local.storage_db_native_backup.readFileAlloc(scratch, io, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{recovered}), 1024);
     try std.testing.expectEqualStrings("original immutable extent", recovered_bytes);
     const replacement_id: [64]u8 = @splat('c');
@@ -1083,7 +1358,7 @@ test "external lake native repository reuses immutable extents and collects expi
     try std.testing.expectEqualStrings(first_manifest.files[0].chunks[0].artifact_id, replacement_manifest.files[0].chunks[0].artifact_id);
     // A virtual reader needs only the manifest, never a recovered directory.
     const virtual_root = try std.fmt.allocPrint(scratch, "{s}/virtual", .{directory.path()});
-    var remote = (try repository.capability().openRead(io, virtual_root, first, namespace, .none)).?;
+    var remote = (try repository.chunkedCapability().openRead(io, virtual_root, first, namespace, .none)).?;
     defer remote.deinit();
     const virtual_file = try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{virtual_root});
     const remote_bytes = try remote.view.readFileRangeAlloc(a, virtual_file, 9, 9);
@@ -1095,19 +1370,19 @@ test "external lake native repository reuses immutable extents and collects expi
     // by reference, with neither a host checkpoint nor an extent transfer.
     const alias_id: [64]u8 = @splat('d');
     const alias: cut.Request = .{ .id = &alias_id, .table_id = 7, .expires_ms = expires, .create = true };
-    try std.testing.expect(try repository.capability().reference(io, alias, namespace, remote.view, .none));
-    try std.testing.expect(try repository.capability().reference(io, alias, namespace, remote.view, .none));
+    try std.testing.expect(try repository.chunkedCapability().reference(io, alias, namespace, remote.view, .none));
+    try std.testing.expect(try repository.chunkedCapability().reference(io, alias, namespace, remote.view, .none));
     const alias_manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, alias, namespace, .none), alias, namespace);
     try std.testing.expectEqualStrings(first_manifest.files[0].chunks[0].artifact_id, alias_manifest.files[0].chunks[0].artifact_id);
-    var alias_reader = (try repository.capability().openRead(io, virtual_root, alias, namespace, .none)).?;
+    var alias_reader = (try repository.chunkedCapability().openRead(io, virtual_root, alias, namespace, .none)).?;
     defer alias_reader.deinit();
     const alias_bytes = try alias_reader.view.readFileRangeAlloc(a, virtual_file, 9, 9);
     defer a.free(alias_bytes);
     try std.testing.expectEqualStrings("immutable", alias_bytes);
     var invalid_alias = alias;
     invalid_alias.expires_ms += 4 * cache_window_ms;
-    try std.testing.expectError(error.CatalogGenerationChanged, repository.capability().reference(io, invalid_alias, namespace, remote.view, .none));
-    try std.testing.expectError(error.CatalogGenerationChanged, repository.capability().reference(io, alias, .{ .table_id = 7, .shard_id = 2, .range_id = 2 }, remote.view, .none));
+    try std.testing.expectError(error.CatalogGenerationChanged, repository.chunkedCapability().reference(io, invalid_alias, namespace, remote.view, .none));
+    try std.testing.expectError(error.CatalogGenerationChanged, repository.chunkedCapability().reference(io, alias, .{ .table_id = 7, .shard_id = 2, .range_id = 2 }, remote.view, .none));
     var store = repository.store.artifactStore();
     const retained = @import("native_retained_cut.zig");
     const table = .{ .table_id = @as(u64, 7), .schema_json = "{}", .read_schema_json = "{}", .indexes_json = "{}" };
@@ -1117,11 +1392,11 @@ test "external lake native repository reuses immutable extents and collects expi
     try store.delete(first_manifest.files[0].chunks[0].artifact_id);
     // An uncached reader detects authoritative loss when it reads a page.
     // Open itself only authenticates the manifest and chunk references.
-    var lost = (try repository.capability().openRead(io, virtual_root, second, namespace, .none)).?;
+    var lost = (try repository.chunkedCapability().openRead(io, virtual_root, second, namespace, .none)).?;
     defer lost.deinit();
     try std.testing.expectError(error.CatalogGenerationChanged, lost.view.readFileRangeAlloc(a, virtual_file, 0, 1));
     const missing = try std.fmt.allocPrint(scratch, "{s}/missing", .{directory.path()});
-    try std.testing.expectError(error.CatalogGenerationChanged, repository.capability().recover(io, missing, second, namespace, .none));
+    try std.testing.expectError(error.CatalogGenerationChanged, repository.chunkedCapability().recover(io, missing, second, namespace, .none));
     // A complete transfer remains scoped until both logical cuts and their
     // shared physical retention horizon are safely beyond every reader.
     // Registry discovery must still find the owner after all local pins vanish.
@@ -1152,14 +1427,14 @@ test "external lake native repository warming resumes bounded uploads after rest
     @memset(bytes, 42);
     _ = try local.storage_db_native_backup.writeFileDurable(io, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{root}), bytes);
     try cut.finish(a, io, root, request, namespace, 1, .none);
-    try std.testing.expectError(error.InvalidQueryRequest, repository.capability().warm(io, root, request, namespace, .none, chunk_bytes - 1));
-    try std.testing.expect(!try repository.capability().warm(io, root, request, namespace, .none, chunk_bytes));
+    try std.testing.expectError(error.InvalidQueryRequest, repository.chunkedCapability().warm(io, root, request, namespace, .none, chunk_bytes - 1));
+    try std.testing.expect(!try repository.chunkedCapability().warm(io, root, request, namespace, .none, chunk_bytes));
     try std.testing.expectError(error.CatalogGenerationChanged, repository.readManifest(scratch, request, namespace, .none));
     repository.deinit();
     repository = try Repository.init(a, null, null, .standalone, directory.path());
-    try std.testing.expect(!try repository.capability().warm(io, root, request, namespace, .none, chunk_bytes));
+    try std.testing.expect(!try repository.chunkedCapability().warm(io, root, request, namespace, .none, chunk_bytes));
     try std.testing.expectError(error.CatalogGenerationChanged, repository.readManifest(scratch, request, namespace, .none));
-    try std.testing.expect(try repository.capability().warm(io, root, request, namespace, .none, chunk_bytes));
+    try std.testing.expect(try repository.chunkedCapability().warm(io, root, request, namespace, .none, chunk_bytes));
     const manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, request, namespace, .none), request, namespace);
     try std.testing.expectEqual(@as(usize, 3), manifest.files[0].chunks.len);
     // A shorter foreground cut reuses the warmer's different retention epoch.
@@ -1172,22 +1447,22 @@ test "external lake native repository warming resumes bounded uploads after rest
     try std.Io.Dir.hardLink(.cwd(), try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{root}), .cwd(), try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{short_root}), io, .{});
     try cut.finish(a, io, short_root, short_request, namespace, 1, .none);
     // One turn cannot upload this file: completing proves cross-epoch reuse.
-    try std.testing.expect(try repository.capability().warm(io, short_root, short_request, namespace, .none, chunk_bytes));
+    try std.testing.expect(try repository.chunkedCapability().warm(io, short_root, short_request, namespace, .none, chunk_bytes));
     const short_manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, short_request, namespace, .none), short_request, namespace);
     try std.testing.expectEqualStrings(manifest.files[0].chunks[0].artifact_id, short_manifest.files[0].chunks[0].artifact_id);
     // The neighboring warmer epoch can extend beyond the foreground cut's
     // two-window horizon. Both virtual reads and fallback recovery must accept
     // this authenticated reuse without weakening namespace or expiry checks.
     const short_remote_path = try std.fmt.allocPrint(scratch, "{s}/short-remote", .{directory.path()});
-    var short_remote = (try repository.capability().openRead(io, short_remote_path, short_request, namespace, .none)).?;
+    var short_remote = (try repository.chunkedCapability().openRead(io, short_remote_path, short_request, namespace, .none)).?;
     defer short_remote.deinit();
     const short_tail = try short_remote.view.readFileRangeAlloc(a, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{short_remote_path}), 2 * chunk_bytes, 17);
     defer a.free(short_tail);
     try std.testing.expectEqualSlices(u8, bytes[2 * chunk_bytes ..][0..17], short_tail);
     const short_recovered = try std.fmt.allocPrint(scratch, "{s}/short-recovered", .{directory.path()});
-    try repository.capability().recover(io, short_recovered, short_request, namespace, .none);
-    try repository.capability().publish(io, root, request, namespace, .none);
-    var remote = (try repository.capability().openRead(io, try std.fmt.allocPrint(scratch, "{s}/remote", .{directory.path()}), request, namespace, .none)).?;
+    try repository.chunkedCapability().recover(io, short_recovered, short_request, namespace, .none);
+    try repository.chunkedCapability().publish(io, root, request, namespace, .none);
+    var remote = (try repository.chunkedCapability().openRead(io, try std.fmt.allocPrint(scratch, "{s}/remote", .{directory.path()}), request, namespace, .none)).?;
     defer remote.deinit();
     const tail = try remote.view.readFileRangeAlloc(a, try std.fmt.allocPrint(scratch, "{s}/remote/immutable.sst", .{directory.path()}), 2 * chunk_bytes, 17);
     defer a.free(tail);
@@ -1209,11 +1484,11 @@ test "external lake native repository honors check-only cancellation tokens" {
     const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000 };
     const stopped: u8 = 0;
     const token: Cancellation = .{ .ptr = &stopped, .check_fn = Stop.check };
-    try std.testing.expectError(error.Canceled, repository.capability().publish(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
-    try std.testing.expectError(error.Canceled, repository.capability().recover(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
-    try std.testing.expectError(error.Canceled, repository.capability().openRead(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
-    try std.testing.expectError(error.Canceled, repository.capability().publishReusable(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
-    try std.testing.expectError(error.Canceled, repository.capability().reuse(std.testing.io, request, request, .{ .table_id = 7, .shard_id = 1 }, .{ .sequence = 1, .digest = @splat(0), .manifest_checksum = @splat(0) }, token));
+    try std.testing.expectError(error.Canceled, repository.chunkedCapability().publish(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
+    try std.testing.expectError(error.Canceled, repository.chunkedCapability().recover(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
+    try std.testing.expectError(error.Canceled, repository.chunkedCapability().openRead(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
+    try std.testing.expectError(error.Canceled, repository.chunkedCapability().publishReusable(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
+    try std.testing.expectError(error.Canceled, repository.chunkedCapability().reuse(std.testing.io, request, request, .{ .table_id = 7, .shard_id = 1 }, .{ .sequence = 1, .digest = @splat(0), .manifest_checksum = @splat(0) }, token));
 }
 
 test "external lake native cut admission counts shared extents and rejects existing over-budget cuts" {
@@ -1249,6 +1524,14 @@ test "external lake native cut admission counts shared extents and rejects exist
 }
 
 test "external lake native cache evicts durable idle generations and recovers retained cursors" {
+    try testNativeCacheEviction(false);
+}
+
+test "external lake native filesystem cache evicts idle generations and recovers retained cursors" {
+    try testNativeCacheEviction(true);
+}
+
+fn testNativeCacheEviction(linked: bool) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var directory = try local.common_test_directory.TestDirectory.init("native-durable-cache-eviction");
@@ -1258,7 +1541,7 @@ test "external lake native cache evicts durable idle generations and recovers re
     repository.limits.max_cuts = 1;
     var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
     defer runtime.deinit();
-    runtime.ptr().query_cut_repository = repository.capability();
+    runtime.ptr().query_cut_repository = if (linked) repository.capability() else repository.chunkedCapability();
     const root = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
     defer a.free(root);
     const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
@@ -1296,11 +1579,339 @@ test "external lake native cache evicts durable idle generations and recovers re
         try std.testing.expectEqualStrings("{\"amount\":1}", value);
     }
     // Missing durable authority must protect the only surviving local copy.
-    const key = try repository.key(a, next, namespace);
-    defer a.free(key);
-    try repository.store.opened.client.deleteObject(repository.store.opened.bucket, key, .{});
+    if (linked) {
+        const retained_root = try repository.linkedRoot(a, next, namespace);
+        defer a.free(retained_root);
+        try std.Io.Dir.cwd().deleteTree(io, retained_root);
+    } else {
+        const key = try repository.key(a, next, namespace);
+        defer a.free(key);
+        try repository.store.opened.client.deleteObject(repository.store.opened.bucket, key, .{});
+    }
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, db.openQueryCut(.{ .id = &last_id, .table_id = 7, .expires_ms = expires, .create = true }, .none));
     const current_root = try cut.pathAlloc(a, root, &new_id);
     defer a.free(current_root);
     try std.Io.Dir.accessAbsolute(io, current_root, .{});
+}
+
+test "external lake native filesystem publication links a 24 GiB generation and recovers after pin loss" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Probe = struct {
+        var read_bytes: usize = 0;
+        fn link(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.HardLinkOptions) std.Io.Dir.HardLinkError!void {
+            return error.CrossDevice;
+        }
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const bytes = try std.testing.io.vtable.fileReadPositional(raw, file, data, offset);
+            read_bytes += bytes;
+            // Opening and reading a few tail bytes must never scan/copy the
+            // sparse 24 GiB payload, even when hardlinks are unavailable.
+            if (read_bytes > 128 * 1024) return error.Unexpected;
+            return bytes;
+        }
+    };
+    Probe.read_bytes = 0;
+    var measured_vtable = io.vtable.*;
+    measured_vtable.dirHardLink = Probe.link;
+    measured_vtable.fileReadPositional = Probe.read;
+    const measured: std.Io = .{ .userdata = io.userdata, .vtable = &measured_vtable };
+    var directory = try local.common_test_directory.TestDirectory.init("native-query-linked-large");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    const source = try std.fs.path.join(scratch, &.{ directory.path(), "source" });
+    try fs.createDirPathPortable(io, source);
+    const payload_path = try std.fs.path.join(scratch, &.{ source, "large.tbl" });
+    const logical_size: u64 = 24 * 1024 * 1024 * 1024;
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, payload_path, .{});
+        defer file.close(io);
+        // Sparse fixture: a corpus scan/copy would process 24 GiB; hardlink
+        // publication touches only metadata and two data pages.
+        try file.setLength(io, logical_size);
+        try file.writePositionalAll(io, "begin", 0);
+        try file.writePositionalAll(io, "end", logical_size - 3);
+        try file.sync(io);
+    }
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const id: [64]u8 = @splat('a');
+    const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    try cut.finish(a, io, source, request, namespace, 42, .none);
+    const warmed = try repository.capability().warmReusable(io, source, request, namespace, .none, chunk_bytes);
+    try std.testing.expect(warmed.complete);
+    try std.testing.expect(warmed.proof == null);
+    const virtual = try std.fs.path.join(scratch, &.{ directory.path(), "virtual" });
+    var lazy = (try repository.capability().openRead(measured, virtual, request, namespace, .none)).?;
+    var lazy_open = true;
+    defer if (lazy_open) lazy.deinit();
+    var page = try lazy.view.openLeasedImmutableSource(a, try std.fmt.allocPrint(scratch, "{s}/large.tbl", .{virtual}));
+    var page_open = true;
+    defer if (page_open) page.close();
+    const page_bytes = try lazy.view.readFileRangeAlloc(a, try std.fmt.allocPrint(scratch, "{s}/large.tbl", .{virtual}), logical_size - 3, 3);
+    defer a.free(page_bytes);
+    try std.testing.expectEqualStrings("end", page_bytes);
+    {
+        // The lazy view retains only its shared expiry lease, never the
+        // publication lock while its caller performs payload I/O.
+        const lock_path = try std.fs.path.join(scratch, &.{ try repository.linkedNamespace(scratch, namespace), ".lock" });
+        const publication = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+        defer publication.close(io);
+        try std.testing.expect(try publication.tryLock(io, .exclusive));
+        publication.unlock(io);
+    }
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, virtual, .{}));
+    try repository.capability().publish(io, source, request, namespace, .none);
+    try cut.finish(a, io, source, request, namespace, 43, .none);
+    try std.testing.expectError(error.CatalogGenerationChanged, repository.capability().publish(io, source, request, namespace, .none));
+    try cut.finish(a, io, source, request, namespace, 42, .none);
+    const retained = try repository.linkedRoot(scratch, request, namespace);
+    const linked_path = try std.fs.path.join(scratch, &.{ retained, "large.tbl" });
+    const original_stat = try local.storage_db_native_backup.statRegularFile(io, payload_path);
+    const linked_stat = try local.storage_db_native_backup.statRegularFile(io, linked_path);
+    try std.testing.expectEqual(original_stat.inode, linked_stat.inode);
+    try std.testing.expectEqual(logical_size, linked_stat.size);
+    try std.testing.expect(try repository.capability().canEvict(io, source, request, namespace, 42, .none));
+    try std.testing.expect(!try repository.capability().canEvict(io, source, request, namespace, 43, .none));
+    try std.Io.Dir.cwd().deleteTree(io, source);
+    const recovered = try std.fs.path.join(scratch, &.{ directory.path(), "recovered" });
+    try repository.capability().recover(io, recovered, request, namespace, .none);
+    try cut.validate(a, io, recovered, request, namespace, .none);
+    const recovered_path = try std.fs.path.join(scratch, &.{ recovered, "large.tbl" });
+    try std.testing.expectEqual(original_stat.inode, (try local.storage_db_native_backup.statRegularFile(io, recovered_path)).inode);
+    const file = try std.Io.Dir.cwd().openFile(io, recovered_path, .{});
+    defer file.close(io);
+    var tail: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try file.readPositionalAll(io, &tail, logical_size - 3));
+    try std.testing.expectEqualStrings("end", &tail);
+    try repository.collect(namespace, request.expires_ms + 30_001, .none);
+    try cut.validate(a, io, retained, request, namespace, .none);
+    lazy.deinit();
+    lazy_open = false;
+    try repository.collect(namespace, request.expires_ms + 30_001, .none);
+    try cut.validate(a, io, retained, request, namespace, .none);
+    const reads_before_hit = Probe.read_bytes;
+    try page.readInto(logical_size - 3, &tail);
+    try std.testing.expectEqualStrings("end", &tail);
+    try std.testing.expectEqual(reads_before_hit, Probe.read_bytes);
+    page.close();
+    page_open = false;
+    var gc_turns: usize = 0;
+    while (!(try repository.collectLinked(&repository.owned_collection, namespace, request.expires_ms + 30_001, 1, .none)).complete) : (gc_turns += 1) {
+        try std.testing.expect(gc_turns < 1000);
+    }
+    try std.testing.expectError(error.CatalogGenerationChanged, cut.validate(a, io, retained, request, namespace, .none));
+    try cut.validate(a, io, recovered, request, namespace, .none);
+}
+
+test "external lake native filesystem falls back to chunks across devices and reads linked recovery without copies" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const CrossDevice = struct {
+        fn link(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.HardLinkOptions) std.Io.Dir.HardLinkError!void {
+            return error.CrossDevice;
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.dirHardLink = CrossDevice.link;
+    const cross_device_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    var directory = try local.common_test_directory.TestDirectory.init("native-query-cross-device");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    const source = try std.fs.path.join(scratch, &.{ directory.path(), "source" });
+    try fs.createDirPathPortable(io, source);
+    _ = try local.storage_db_native_backup.writeFileDurable(io, try std.fs.path.join(scratch, &.{ source, "data.tbl" }), "original");
+    const large_path = try std.fs.path.join(scratch, &.{ source, "large.tbl" });
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, large_path, .{});
+        defer file.close(io);
+        const block = try a.alloc(u8, chunk_bytes);
+        defer a.free(block);
+        for (0..3) |i| {
+            @memset(block, @intCast(i));
+            try file.writePositionalAll(io, block, i * chunk_bytes);
+        }
+        try file.sync(io);
+    }
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const id: [64]u8 = @splat('a');
+    const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    try cut.finishWithReuseDigest(a, io, source, request, namespace, 42, @splat(7), .none);
+    const capability = repository.capability();
+    var warmed = try capability.warmReusable(cross_device_io, source, request, namespace, .none, chunk_bytes);
+    try std.testing.expect(!warmed.complete);
+    var turns: usize = 1;
+    while (!warmed.complete and turns < 10) : (turns += 1) {
+        warmed = try capability.warmReusable(cross_device_io, source, request, namespace, .none, chunk_bytes);
+    }
+    try std.testing.expect(warmed.complete);
+    try std.testing.expect(warmed.proof != null);
+    const alias_id: [64]u8 = @splat('b');
+    var alias = request;
+    alias.id = &alias_id;
+    try std.testing.expect(try capability.reuse(io, request, alias, namespace, warmed.proof.?, .none) != null);
+    const virtual = try std.fs.path.join(scratch, &.{ directory.path(), "not-materialized" });
+    var lazy = (try capability.openRead(io, virtual, request, namespace, .none)).?;
+    defer lazy.deinit();
+    const lazy_bytes = try lazy.view.readFileAlloc(a, try std.fs.path.join(scratch, &.{ virtual, "data.tbl" }), 64);
+    defer a.free(lazy_bytes);
+    try std.testing.expectEqualStrings("original", lazy_bytes);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, virtual, .{}));
+    const restored = try std.fs.path.join(scratch, &.{ directory.path(), "chunk-restored" });
+    try repository.capability().recover(io, restored, request, namespace, .none);
+    try cut.validate(a, io, restored, request, namespace, .none);
+    // A linked generation stays lazy when the new cache cannot hardlink it.
+    try repository.capability().publish(io, source, request, namespace, .none);
+    const copied = try std.fs.path.join(scratch, &.{ directory.path(), "copy-restored" });
+    try std.testing.expectError(error.CrossDevice, repository.capability().recover(cross_device_io, copied, request, namespace, .none));
+    var linked_reader = (try repository.capability().openRead(cross_device_io, copied, request, namespace, .none)).?;
+    defer linked_reader.deinit();
+    const bytes = try linked_reader.view.readFileAlloc(a, try std.fmt.allocPrint(scratch, "{s}/data.tbl", .{copied}), 64);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("original", bytes);
+}
+
+test "external lake native linked recovery bypasses partial caches without replacing active readers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-linked-partial-cache");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
+    defer runtime.deinit();
+    runtime.ptr().query_cut_repository = repository.capability();
+    const root = try std.fs.path.join(a, &.{ directory.path(), "db" });
+    defer a.free(root);
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    var db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1}" }}, .sync_level = .write });
+    const id: [64]u8 = @splat('a');
+    var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true };
+    var reader = try db.openQueryCut(request, .none);
+    var reader_open = true;
+    defer if (reader_open) reader.close();
+    request.create = false;
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2}" }}, .sync_level = .write });
+    const pinned = try cut.pathAlloc(a, root, &id);
+    defer a.free(pinned);
+    const manifest_path = try std.fs.path.join(a, &.{ pinned, "query-cut.json" });
+    defer a.free(manifest_path);
+    const manifest_bytes = try local.storage_db_native_backup.readFileAlloc(a, io, manifest_path, max_manifest_bytes);
+    defer a.free(manifest_bytes);
+    try std.Io.Dir.cwd().deleteFile(io, manifest_path);
+    {
+        var parallel = try db.openQueryCut(request, .none);
+        defer parallel.close();
+        const value = (try parallel.get(a, "doc")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("{\"amount\":1}", value);
+    }
+    const still_readable = (try reader.get(a, "doc")).?;
+    defer a.free(still_readable);
+    try std.testing.expectEqualStrings("{\"amount\":1}", still_readable);
+    reader.close();
+    reader_open = false;
+    for (0..3) |loss| {
+        if (loss == 1) _ = try local.storage_db_native_backup.writeFileDurable(io, manifest_path, "{invalid");
+        if (loss == 2) {
+            _ = try local.storage_db_native_backup.writeFileDurable(io, manifest_path, manifest_bytes);
+            var manifest = try std.json.parseFromSlice(cut.Manifest, a, manifest_bytes, .{});
+            defer manifest.deinit();
+            const file = try std.fs.path.join(a, &.{ pinned, manifest.value.files[0].path });
+            defer a.free(file);
+            try std.Io.Dir.cwd().deleteFile(io, file);
+        }
+        var recovered = try db.openQueryCut(request, .none);
+        defer recovered.close();
+        const original = (try recovered.get(a, "doc")).?;
+        defer a.free(original);
+        try std.testing.expectEqualStrings("{\"amount\":1}", original);
+        try std.testing.expectError(error.CatalogGenerationChanged, cut.validate(a, io, pinned, request, namespace, .none));
+    }
+    const retained = try repository.linkedRoot(a, request, namespace);
+    defer a.free(retained);
+    try std.Io.Dir.cwd().deleteTree(io, retained);
+    try std.Io.Dir.cwd().deleteFile(io, manifest_path);
+    try std.testing.expectError(error.CatalogGenerationChanged, db.openQueryCut(request, .none));
+    try std.Io.Dir.accessAbsolute(io, pinned, .{});
+}
+
+test "external lake native linked collection resumes across short lived repository adapters" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("linked-gc-adapters");
+    defer directory.cleanup();
+    const source = try std.fs.path.join(a, &.{ directory.path(), "source" });
+    defer a.free(source);
+    try fs.createDirPathPortable(io, source);
+    const payload = try std.fs.path.join(a, &.{ source, "file" });
+    defer a.free(payload);
+    _ = try local.storage_db_native_backup.writeFileDurable(io, payload, "immutable");
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const id: [64]u8 = @splat('a');
+    const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true };
+    try cut.finish(a, io, source, request, namespace, 1, .none);
+    {
+        var repository = try Repository.init(a, null, null, .standalone, directory.path());
+        defer repository.deinit();
+        try repository.capability().publish(io, source, request, namespace, .none);
+    }
+    var state: Repository.CollectionState = .init(a, io);
+    defer state.deinit();
+    var turns: usize = 0;
+    while (true) : (turns += 1) {
+        try std.testing.expect(turns < 1000);
+        var repository = try Repository.init(a, null, null, .standalone, directory.path());
+        defer repository.deinit();
+        const next = try repository.collectNextWithState(a, &state, null, request.expires_ms + 30001, 1, .none);
+        defer if (next) |value| a.free(value);
+        if (!state.hasPending()) {
+            const retained = try repository.linkedRoot(a, request, namespace);
+            defer a.free(retained);
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, retained, .{}));
+            break;
+        }
+    }
+    try std.testing.expect(turns > 7);
+    try cut.validate(a, io, source, request, namespace, .none);
+}
+
+test "external lake native linked reader releases partial metadata ownership" {
+    const Reader = port.remote_storage.Reader;
+    const Fixture = struct {
+        fn check(a: A, lease_path: []const u8) !void {
+            const io = std.testing.io;
+            const lease_file = try std.Io.Dir.cwd().createFile(io, lease_path, .{ .truncate = false });
+            var transferred = false;
+            defer if (!transferred) lease_file.close(io);
+            try std.testing.expect(try lease_file.tryLock(io, .shared));
+            const executor = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
+            const reader = try Reader.createLinkedWithExecutor(a, executor, "/logical", "/physical", &.{
+                .{ .path = "runs/1.sst", .size = 5, .inode = 1, .mtime_ns = 0 },
+                .{ .path = "runs/2.sst", .size = 7, .inode = 2, .mtime_ns = 0 },
+            }, lease_file, .{ .parent = .none, .deadline_ns = std.math.maxInt(u64) });
+            transferred = true;
+            defer reader.release();
+            reader.control.deadline_ns = 0;
+            try std.testing.expectEqual(@as(u64, 7), try reader.view().fileSize("/logical/runs/2.sst"));
+            try std.testing.expectError(error.FileNotFound, reader.view().fileSize("/logical-other/runs/1.sst"));
+            try std.testing.expectError(error.ReadOnly, reader.view().writeFileAbsolute("/logical/runs/1.sst", "mutation"));
+            try std.testing.expectError(error.DeadlineExceeded, reader.view().readFileRangeAlloc(std.testing.allocator, "/logical/runs/1.sst", 0, 1));
+        }
+    };
+    var directory = try local.common_test_directory.TestDirectory.init("linked-reader-allocations");
+    defer directory.cleanup();
+    try fs.createDirPathPortable(std.testing.io, directory.path());
+    const path = try std.fs.path.join(std.testing.allocator, &.{ directory.path(), ".lease" });
+    defer std.testing.allocator.free(path);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{path});
 }

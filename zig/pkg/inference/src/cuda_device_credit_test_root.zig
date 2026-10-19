@@ -169,3 +169,27 @@ test "CUDA failed physical retirement preserves shared credit and descriptor for
     buffer.free(&ctx);
     try std.testing.expectEqual(@as(usize, 2), Fake.frees);
 }
+
+test "CUDA physical borrowed views retain both allocation and shared admission owners" {
+    var probe: Probe = .{};
+    var ctx = Fake.init();
+    const budget = try probe.port();
+    defer budget.deinit();
+    var owner = try buffers.DeviceBuffer.allocAdmitted(&ctx, 32, budget);
+    defer owner.free(&ctx);
+    // Graph suballocations borrow the allocation. Even a copied credit token
+    // cannot refund its owner while the backing allocation is still live.
+    var view = owner;
+    view.borrowed = true;
+    view.len = 8;
+    view.free(&ctx);
+    view.free(&ctx);
+    try std.testing.expectEqual(@as(usize, 0), Fake.frees);
+    try std.testing.expectEqual(@as(usize, 32), probe.used);
+    try std.testing.expectEqual(@as(usize, 32), ctx.device_allocations.snapshot().live);
+    owner.len = 1;
+    owner.free(&ctx);
+    try std.testing.expectEqual(@as(usize, 1), Fake.frees);
+    try std.testing.expectEqual(@as(usize, 0), probe.used);
+    try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
+}

@@ -52,6 +52,7 @@ pub const SharedModules = struct {
     json: ?*std.Build.Module = null,
     httpx: ?*std.Build.Module = null,
     platform: ?*std.Build.Module = null,
+    runtime_abi: ?*std.Build.Module = null,
     fst: ?*std.Build.Module = null,
     scraping: ?*std.Build.Module = null,
     google: ?*std.Build.Module = null,
@@ -95,6 +96,7 @@ pub const Config = struct {
 };
 
 pub const Graph = struct {
+    runtime_abi_mod: *std.Build.Module,
     build_info_mod: *std.Build.Module,
     build_info_object: *std.Build.Step.Compile,
     identities: jit_identity.Modules,
@@ -173,6 +175,12 @@ pub fn create(config: Config) Graph {
         break :blk mod;
     };
     const platform_mod = shared.platform orelse @panic("inference runtime requires a configured antfly_platform module");
+    const runtime_abi_mod = shared.runtime_abi orelse blk: {
+        const mod = createSharedModule(config, "lib/runtime/src/root.zig");
+        mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_platform", platform_mod);
+        break :blk mod;
+    };
     const fst_mod = shared.fst orelse createSharedModule(config, "lib/fst/src/mod.zig");
     const google_mod = shared.google orelse blk: {
         const mod = createSharedModule(config, "lib/google/src/root.zig");
@@ -354,6 +362,7 @@ pub fn create(config: Config) Graph {
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/decisions/root.zig")),
     });
     inference_mod.addImport("antfly_decisions", decisions_mod);
+    inference_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     addInferenceRootImports(inference_mod, .{
         .build_info_mod = shared.build_info_mod,
         .identities = identities,
@@ -439,6 +448,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_linalg", inference_linalg_mod);
     inference_internal_mod.addImport("protobuf", protobuf_mod);
     inference_internal_mod.addImport("antfly_platform", platform_mod);
+    inference_internal_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     inference_internal_mod.addImport("onnx_graph", onnx.graph);
     inference_internal_mod.addImport("onnx_data", onnx.data);
     configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
@@ -448,6 +458,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_internal", inference_internal_mod);
 
     return .{
+        .runtime_abi_mod = runtime_abi_mod,
         .build_info_mod = shared.build_info_mod,
         .build_info_object = shared.build_info_object,
         .identities = identities,
@@ -781,6 +792,12 @@ pub fn configureRuntimeLinks(
         configureSystemBlas(b, module, target, backend.blas_root);
     }
     configureMetal(b, module, target, backend.enable_metal, paths);
+    configureCudaVideo(b, module, target, backend.enable_cuda, paths);
+}
+
+pub fn configureCudaVideo(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, enabled: bool, paths: Paths) void {
+    if (!enabled or target.result.os.tag != .linux) return;
+    module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/ops/cuda/video_decode.c")), .flags = &.{"-std=c11"} });
 }
 
 pub fn configureSystemBlas(

@@ -124,7 +124,8 @@ fn allocatorExhausted(a: std.mem.Allocator) bool {
     if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return allocatorExhausted(parent);
     if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return false;
     const parent: *Budget = @ptrCast(@alignCast(a.ptr));
-    return parent.isExhausted();
+    const backing = if (a.vtable.alloc == scratchAlloc) reclaimingAllocator(parent.backing) else parent.backing;
+    return parent.isLocallyExhausted() or allocatorExhausted(backing);
 }
 /// Conservative region footprint, including intermediate buffers retained by
 /// an enclosing arena. Ordinary reclaiming owners retain peak-live accounting.
@@ -144,7 +145,10 @@ pub fn headroom(a: std.mem.Allocator) ?usize {
     const available = self.limit -| if (self.monotonic) self.spent else self.live;
     const backing = self.backing;
     self.mutex.unlock();
-    return if (headroom(backing)) |parent| @min(available, parent) else available;
+    // Scratch forwards through reclaimed arena backings; admission introspection
+    // must follow that same allocator path rather than stopping at the region.
+    const actual = if (a.vtable.alloc == scratchAlloc) reclaimingAllocator(backing) else backing;
+    return if (headroom(actual)) |parent| @min(available, parent) else available;
 }
 /// Optional acceleration must not speculate through an opaque quota wrapper.
 /// Recognize only our complete budget chain and standard unbounded backings;
@@ -472,4 +476,21 @@ test "SQL memory budget checked scratch creation preserves genuine allocation fa
     try std.testing.expectError(error.OutOfMemory, child.create([16]u8));
     try std.testing.expectEqual(@as(usize, 0), parent.live);
     try std.testing.expectEqual(@as(usize, 0), child.live);
+}
+
+test "SQL reclaimable scratch headroom follows quota owners behind regions" {
+    var parent: Budget = .{ .backing = std.testing.allocator, .limit = 8192 };
+    var arena = std.heap.ArenaAllocator.init(parent.allocator());
+    defer arena.deinit();
+    var child: Budget = .{ .backing = arena.allocator(), .limit = 4096 };
+    const scratch = reclaimingAllocator(child.allocator());
+    var nested: Budget = .{ .backing = scratch, .limit = 8192 };
+    const bytes = try nested.allocator().alloc(u8, 512);
+    defer nested.allocator().free(bytes);
+    parent.limit = parent.live + 64;
+    try std.testing.expectEqual(@as(?usize, 64), headroom(scratch));
+    try std.testing.expectEqual(@as(?usize, 64), headroom(nested.allocator()));
+    try std.testing.expectError(error.OutOfMemory, nested.allocator().alloc(u8, 65));
+    try std.testing.expect(nested.isExhausted());
+    try std.testing.expectEqual(@as(usize, 512), parent.live);
 }

@@ -816,9 +816,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
         .link_libc = true,
     });
+    cuda_credit_root.addImport("antfly_platform", antfly_imports.platform);
     const cuda_credit_tests = b.addTest(.{
         .name = "inference-cuda-physical-credit-tests",
         .root_module = cuda_credit_root,
+        .filters = &.{ "CUDA physical", "CUDA failed physical", "CUDA graph suballocation" },
         .max_rss = 2 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -3770,6 +3772,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-sql-compiler-preparation-test", "Verify SQL preparation semantics, bounded checkpoints and partial allocation cleanup")
         .dependOn(&b.addRunArtifact(sql_compiler_preparation_tests).step);
+
+    const sql_memory_budget_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/sql_memory_budget_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sql_memory_budget_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    sql_memory_budget_root.addImport("antfly_platform", antfly_imports.platform);
+    const sql_memory_budget_tests = b.addTest(.{
+        .name = "sql-memory-budget-tests",
+        .root_module = sql_memory_budget_root,
+        .filters = &.{"sql.memory_budget."},
+        .max_rss = 1024 * 1024 * 1024,
+    });
+    b.step("antfly-sql-memory-budget-test", "Verify SQL allocation causes, arena headroom and exact quota release")
+        .dependOn(&b.addRunArtifact(sql_memory_budget_tests).step);
 
     const sql_controlled_array_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/sql_controlled_array_test_root.zig"),

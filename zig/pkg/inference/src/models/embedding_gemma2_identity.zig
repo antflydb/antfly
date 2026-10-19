@@ -20,6 +20,43 @@ const file = @import("../util/c_file.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const receipt = @import("../registry/managed_receipt.zig");
 pub const recipe = "embeddinggemma2-f32-mean-v6-webm-presentation";
+/// CUDA also uses BF16-specific token scaling and media preparation. Version
+/// this complete execution recipe independently of the qualified F32 route.
+pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v2-audio-frontend";
+
+pub fn forBackend(artifact_identity: [64]u8, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
+    if (backend != .cuda) return artifact_identity;
+    return forCudaPolicy(artifact_identity, @import("../ops/cuda/embedding_gemma2_policy.zig").configured());
+}
+
+pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/embedding_gemma2_policy.zig").Policy) [64]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(cuda_recipe);
+    if (policy.arithmeticBits() != 0) {
+        hash.update("\x00optimized-v1");
+        const bits = policy.arithmeticBits();
+        hash.update(&.{@as(u8, @truncate(bits))});
+        if (bits > 255) hash.update(&.{@as(u8, @intCast(bits >> 8))});
+    }
+    if (policy.extended_flash) hash.update("\x00extended-dispatch-v3");
+    if (policy.packed_projections) hash.update("\x00packed-consumers-v3");
+    if (policy.fused_backbone) hash.update("\x00vision-residual-v2");
+    if (policy.audio_conv_gemm) hash.update("\x00audio-conv-tiled-f32-v1");
+    if (policy.audio_conv_bf16) hash.update("\x00audio-conv-bf16-wmma-v1");
+    if (policy.audio_graph) hash.update("\x00audio-conformer-graph-v1");
+    if (policy.audio_frontend_fused) hash.update("\x00audio-frontend-fused-v1");
+    if (policy.audio_fft) hash.update("\x00audio-fft512-v1");
+    if (policy.spatial_pool) hash.update("\x00spatial-pool-v1");
+    if (policy.tuned_gemm) hash.update("\x00tuned-bf16-output-v1");
+    if (policy.image_batch or policy.media_batch) hash.update("\x00batched-patches-v2");
+    if (policy.media_batch) hash.update("\x00audio-subsample-batch-v2");
+    if (policy.graph_replay) hash.update("\x00media-graphs-v3");
+    if (policy.native_vision) hash.update("\x00native-vision-bf16-v2");
+    hash.update(&.{0});
+    hash.update(&artifact_identity);
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+
 pub const sidecars = [_][]const u8{ "config.json", "tokenizer.json", "tokenizer_config.json", "processor_config.json", "config_sentence_transformers.json", "1_Pooling/config.json" };
 pub const Snapshot = struct { digest: [64]u8, signature: [32]u8 };
 
@@ -76,6 +113,7 @@ pub fn validateTokenizer(a: std.mem.Allocator, bytes: []const u8) !void {
         .{ .id = 0, .token = "<pad>" },          .{ .id = 1, .token = "<eos>" },         .{ .id = 2, .token = "<bos>" },
         .{ .id = 255999, .token = "<|image>" },  .{ .id = 256000, .token = "<|audio>" }, .{ .id = 258880, .token = "<|image|>" },
         .{ .id = 258881, .token = "<|audio|>" }, .{ .id = 258882, .token = "<image|>" }, .{ .id = 258883, .token = "<audio|>" },
+        .{ .id = 258884, .token = "<|video|>" },
     };
     for (required) |want| {
         var found = false;
@@ -152,6 +190,55 @@ pub fn snapshot(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights
     return .{ .digest = fromDigests(digests), .signature = before };
 }
 
+/// One loaded model owns its validated snapshot and slow-path lane. Metadata
+/// checks stay cheap; concurrent misses recheck after acquiring the lane so
+/// only one caller hashes a changed publication. The caller's cancellation
+/// releases ownership, allowing another live request to finish validation.
+pub const SnapshotValidation = struct {
+    value: Snapshot,
+    mutex: std.atomic.Mutex = .unlocked,
+    lane: @import("../execution_control.zig").ExecutionLane = .{},
+
+    fn cached(self: *SnapshotValidation, current: [32]u8, control: Control) !?Snapshot {
+        try control.lock(&self.mutex);
+        defer self.mutex.unlock();
+        return if (std.mem.eql(u8, &self.value.signature, &current)) self.value else null;
+    }
+
+    fn refreshWith(self: *SnapshotValidation, loader: anytype, control: Control) !Snapshot {
+        try control.check();
+        if (try self.cached(try loader.signature(), control)) |value| return value;
+        const lease = try self.lane.acquire(control);
+        defer lease.release();
+        // Both the published files and the winner's cached snapshot can have
+        // changed while this request waited. Never hash a stale observation.
+        if (try self.cached(try loader.signature(), control)) |value| return value;
+        const value = try loader.snapshot(control);
+        try control.lock(&self.mutex);
+        self.value = value;
+        self.mutex.unlock();
+        return value;
+    }
+
+    pub fn refresh(self: *SnapshotValidation, a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8, control: Control) !Snapshot {
+        const Loader = struct {
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            directory: []const u8,
+            weights: []const u8,
+            fn signature(loader: @This()) ![32]u8 {
+                return @import("embedding_gemma2_identity.zig").signature(loader.allocator, loader.io, loader.directory, loader.weights);
+            }
+            fn snapshot(loader: @This(), active: Control) !Snapshot {
+                return snapshotCached(loader.allocator, loader.io, loader.directory, loader.weights, active);
+            }
+        };
+        var active = control;
+        if (active.io == null) active.io = io;
+        return self.refreshWith(Loader{ .allocator = a, .io = io, .directory = directory, .weights = weights }, active);
+    }
+};
+
 /// Cache only fully verified digests, guarded by the same before/after file
 /// signature as execution. Warm planning does not touch checkpoint pages.
 pub fn snapshotCached(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8, control: Control) !Snapshot {
@@ -184,4 +271,124 @@ test "embeddinggemma2 processor changes fail closed" {
     const index = std.mem.indexOf(u8, changed, "\"fft_length\": 512").?;
     changed[index + "\"fft_length\": ".len] = '6';
     try std.testing.expectError(error.InvalidEmbeddingGemma2Processor, validateProcessor(a, changed));
+}
+
+test "embeddinggemma2 video processor sampling and token budgets fail closed" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("embedding_gemma2_processor.json"), .{});
+    defer parsed.deinit();
+    const processor = parsed.value.object.getPtr("video_processor").?;
+    for ([_][]const u8{ "fps", "max_frames", "max_soft_tokens" }) |key| {
+        const value = processor.object.getPtr(key).?;
+        const original = value.*;
+        value.* = .{ .integer = 0 };
+        const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+        defer a.free(changed);
+        try std.testing.expectError(error.InvalidEmbeddingGemma2Processor, validateProcessor(a, changed));
+        value.* = original;
+    }
+}
+
+test "embeddinggemma2 precision identities preserve F32 pins and isolate CUDA recipes" {
+    const artifacts = fromDigests(@splat(@splat(7)));
+    try std.testing.expectEqual(artifacts, forBackend(artifacts, .native));
+    try std.testing.expectEqual(artifacts, forBackend(artifacts, .metal));
+    const cuda = forBackend(artifacts, .cuda);
+    try std.testing.expect(!std.mem.eql(u8, &artifacts, &cuda));
+    try std.testing.expectEqual(cuda, forBackend(artifacts, .cuda));
+    try std.testing.expect(!std.mem.eql(u8, &cuda, &forBackend(fromDigests(@splat(@splat(8))), .cuda)));
+}
+
+test "embeddinggemma2 CUDA optimized identities isolate every arithmetic profile" {
+    const Policy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
+    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true }, .{ .fused_backbone = true }, .{ .tuned_gemm = true }, .{ .spatial_pool = true }, .{ .audio_conv_gemm = true }, .{ .audio_conv_bf16 = true }, .{ .audio_fft = true }, .{ .audio_frontend_fused = true }, .{ .audio_graph = true }, .{ .tuned_gemm = true, .packed_projections = true }, .{ .tuned_gemm = true, .fused_backbone = true, .graph_replay = true } };
+    const artifacts = fromDigests(@splat(@splat(7)));
+    for (profiles, 0..) |left, i| for (profiles[i + 1 ..]) |right| try std.testing.expect(!std.mem.eql(u8, &forCudaPolicy(artifacts, left), &forCudaPolicy(artifacts, right)));
+}
+
+const RevalidationProbe = struct {
+    signatures: std.atomic.Value(usize) = .init(0),
+    snapshots: std.atomic.Value(usize) = .init(0),
+    released: std.atomic.Value(bool) = .init(false),
+
+    const initial = Snapshot{ .digest = @splat('1'), .signature = @splat(1) };
+    const updated = Snapshot{ .digest = @splat('2'), .signature = @splat(2) };
+
+    fn signature(self: *@This()) ![32]u8 {
+        _ = self.signatures.fetchAdd(1, .seq_cst);
+        return updated.signature;
+    }
+    fn snapshot(self: *@This(), control: Control) !Snapshot {
+        _ = self.snapshots.fetchAdd(1, .seq_cst);
+        while (!self.released.load(.seq_cst)) {
+            try control.check();
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try control.check();
+        return updated;
+    }
+    fn run(validation: *SnapshotValidation, probe: *@This(), control: Control) !Snapshot {
+        return validation.refreshWith(probe, control);
+    }
+    fn waitFor(counter: *std.atomic.Value(usize), minimum: usize) !void {
+        const time = @import("antfly_platform").time;
+        const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (counter.load(.seq_cst) < minimum) {
+            if (time.monotonicNs() >= deadline) return error.Timeout;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    fn cancelled(raw: ?*anyopaque) bool {
+        const value: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+        return value.load(.seq_cst);
+    }
+};
+
+test "embedding identity revalidation shares hashing and permits independent models and waiter cancellation" {
+    const Probe = RevalidationProbe;
+    var validation = SnapshotValidation{ .value = Probe.initial };
+    var probe = Probe{};
+    var owner = try std.testing.io.concurrent(Probe.run, .{ &validation, &probe, Control{ .io = std.testing.io } });
+    defer _ = owner.cancel(std.testing.io) catch Probe.initial;
+    try Probe.waitFor(&probe.snapshots, 1);
+    var followers: [6]@TypeOf(owner) = undefined;
+    var initialized: usize = 0;
+    defer for (followers[0..initialized]) |*follower| {
+        _ = follower.cancel(std.testing.io) catch Probe.initial;
+    };
+    for (&followers) |*follower| {
+        follower.* = try std.testing.io.concurrent(Probe.run, .{ &validation, &probe, Control{ .io = std.testing.io } });
+        initialized += 1;
+    }
+    try Probe.waitFor(&probe.signatures, 8);
+    try std.testing.expectError(error.Timeout, validation.refreshWith(&probe, .{ .io = std.testing.io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_ms }));
+    // A slow model cannot hold a process-global validation gate.
+    var independent = SnapshotValidation{ .value = Probe.initial };
+    var other = Probe{ .released = .init(true) };
+    try std.testing.expectEqualDeep(Probe.updated, try independent.refreshWith(&other, .{ .io = std.testing.io }));
+    probe.released.store(true, .seq_cst);
+    try std.testing.expectEqualDeep(Probe.updated, try owner.await(std.testing.io));
+    for (&followers) |*follower| try std.testing.expectEqualDeep(Probe.updated, try follower.await(std.testing.io));
+    try std.testing.expectEqualDeep(Probe.updated, try validation.refreshWith(&probe, .{ .io = std.testing.io }));
+    try std.testing.expectEqual(@as(usize, 1), probe.snapshots.load(.seq_cst));
+}
+
+test "embedding identity revalidation transfers ownership after cancelled hashing" {
+    const Probe = RevalidationProbe;
+    var validation = SnapshotValidation{ .value = Probe.initial };
+    var probe = Probe{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    var owner = try std.testing.io.concurrent(Probe.run, .{ &validation, &probe, Control{ .io = std.testing.io, .cancellation = .{ .ptr = &cancelled, .is_cancelled_fn = Probe.cancelled } } });
+    defer _ = owner.cancel(std.testing.io) catch Probe.initial;
+    try Probe.waitFor(&probe.snapshots, 1);
+    var follower = try std.testing.io.concurrent(Probe.run, .{ &validation, &probe, Control{ .io = std.testing.io } });
+    defer _ = follower.cancel(std.testing.io) catch Probe.initial;
+    try Probe.waitFor(&probe.signatures, 3);
+    cancelled.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, owner.await(std.testing.io));
+    try Probe.waitFor(&probe.snapshots, 2);
+    probe.released.store(true, .seq_cst);
+    try std.testing.expectEqualDeep(Probe.updated, try follower.await(std.testing.io));
+    try std.testing.expectEqualDeep(Probe.updated, try validation.refreshWith(&probe, .{ .io = std.testing.io }));
+    try std.testing.expectEqual(@as(usize, 2), probe.snapshots.load(.seq_cst));
 }
