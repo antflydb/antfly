@@ -424,6 +424,18 @@ pub fn readSnapshot(a: A, txn: anytype, group: Group, partition: index.Partition
     }
     return snapshot;
 }
+/// Compare published unit guards with the partition's desired context before
+/// staging a replacement. Source changes and context changes can coalesce;
+/// neither the source flag nor payload equality proves that a unit is reusable.
+pub fn unitContextChanged(a: A, txn: anytype, group: Group, partition: index.Partition, unit: []const u8) !bool {
+    const epoch = try load(ContextEpoch, a, txn, try contextEpochKey(a, group, partition));
+    const existing = txn.get(try identity.unitContextEpochKey(a, unit)) catch |err| if (err == error.NotFound) null else return err;
+    if (epoch) |value| {
+        const desired = try std.json.Stringify.valueAlloc(a, .{ .revision = value.revision }, .{});
+        return existing == null or !std.mem.eql(u8, existing.?, desired);
+    }
+    return existing != null;
+}
 pub fn stageSnapshot(a: A, txn: anytype, group: Group, partition: index.Partition, lease: Lease, now_ms: u64, snapshot: Snapshot) !void {
     var pending = try verify(a, txn, group, partition, lease, now_ms);
     if (snapshot.revision != lease.revision or (snapshot.identities.len != 0 and snapshot.identities.len != snapshot.units.len) or snapshot.units.len > 128 or snapshot.retired.len > 256 or (snapshot.units.len > 0 and snapshot.sequence == 0) or std.mem.allEqual(u8, &snapshot.input_digest, 0)) return error.InvalidGroupedSourceCommand;

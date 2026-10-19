@@ -71,28 +71,44 @@ pub fn advanceHorizons(a: A, txn: anytype, owner: state.Owner, event: index.Inva
         if (value == 0 or value > 128) return error.InvalidGroupedPriorContext;
         horizon = @max(horizon, value);
     }
-    const revision = try state.invalidate(a, txn, owner, event);
     const group = state.Group{ .definition = event.definition, .key = event.partition.group };
     const selected = try selectedKey(a, group, owner, event);
     const digest = try fingerprint(a, event);
     var progress = (try state.readRecord(Progress, a, txn, selected)) orelse Progress{ .source_revision = event.source_revision, .event_digest = digest };
     if (progress.source_revision > event.source_revision) return;
+    const before = try state.readSnapshot(a, txn, group, event.partition);
+    const published = progress.anchors_bound or (before != null and before.?.revision >= progress.enrollment);
+    if (progress.source_revision < event.source_revision and progress.causal_version == 1 and !progress.done and published) {
+        // Drain published neighborhoods before replacing their cursor. An
+        // unmaterialized event can coalesce immediately: no intermediate
+        // position became visible, and deferring its newer delivery could
+        // block the fan-in needed to materialize the original event itself.
+        var original = event;
+        original.repair = false;
+        try advanceProgress(a, txn, owner, original, horizons, horizon, group, selected, &progress);
+        return;
+    }
+    const revision = try state.invalidate(a, txn, owner, event);
     if (progress.source_revision < event.source_revision) progress = .{ .source_revision = event.source_revision, .event_digest = digest };
     if (!std.mem.eql(u8, &progress.event_digest, &digest)) return error.GroupedSourceCorrupt;
     if (progress.enrollment != revision or progress.causal_version != 1) progress = .{ .source_revision = event.source_revision, .event_digest = digest, .enrollment = revision, .causal_version = 1 };
+    if (progress.ordinal == null) {
+        // Queue ordinals are scheduling lower bounds and can retain much older
+        // moves. Propagation needs the actual last published position instead.
+        progress.ordinal = if (before) |snapshot| (if (snapshot.units.len > 0) snapshot.ordinal else event.ordinal) else event.ordinal;
+    }
+    try advanceProgress(a, txn, owner, event, horizons, horizon, group, selected, &progress);
+}
+fn advanceProgress(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation, horizons: []const u16, horizon: u16, group: state.Group, selected: []const u8, progress: *Progress) !void {
+    const revision = progress.enrollment;
     const cause = try causeId(a, owner, event);
     if (progress.done) return causes.retirePage(a, txn, group, cause);
     try causes.enroll(a, txn, group, cause, revision, event.partition, revision, &.{});
     progress.frontier = @max(progress.frontier, revision); // Diagnostic only.
-    if (progress.ordinal == null) {
-        // Capture the old partition minimum before publishing the afterimage.
-        const pending = try state.pendingFor(a, txn, group, event.partition);
-        progress.ordinal = if (pending) |value| value.ordinal else event.ordinal;
-    }
     if (horizon != 0 and !event.repair and !progress.anchors_bound) {
         const snapshot = try state.readSnapshot(a, txn, group, event.partition);
         if (snapshot == null or snapshot.?.revision < revision) {
-            try state.writeRecord(a, txn, selected, progress);
+            try state.writeRecord(a, txn, selected, progress.*);
             return;
         }
         progress.new_ordinal = if (snapshot.?.units.len > 0) snapshot.?.ordinal else null;
@@ -166,5 +182,5 @@ pub fn advanceHorizons(a: A, txn: anytype, owner: state.Owner, event: index.Inva
             progress.done = false;
         }
     }
-    try state.writeRecord(a, txn, selected, progress);
+    try state.writeRecord(a, txn, selected, progress.*);
 }

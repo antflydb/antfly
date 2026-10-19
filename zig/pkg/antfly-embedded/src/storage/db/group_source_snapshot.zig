@@ -127,7 +127,7 @@ pub fn stage(comptime Keys: type, a: A, txn: anytype, prepared: *const Prepared,
             try txn.put(source_key, unit.payload);
             try txn.put(try Keys.ttlKeyAlloc(a, unit.document), &timestamp);
             try changed.append(a, try a.dupe(u8, unit.document));
-        } else if (!pending.source_changed) {
+        } else if (!pending.source_changed or try state.unitContextChanged(a, txn, command.held.group, command.held.partition, unit.document)) {
             // Context changes replay prior-aware producers without changing the
             // source revision, preserving independent unit producers' receipts.
             try changed.append(a, try a.dupe(u8, unit.document));
@@ -160,6 +160,15 @@ pub fn stage(comptime Keys: type, a: A, txn: anytype, prepared: *const Prepared,
 }
 
 test "group unit publication changes only affected units replays context and retires bounded partitions" {
+    try exercisePublication(.source_only);
+}
+
+test "group unit publication replays unchanged units when source and context invalidations coalesce" {
+    try exercisePublication(.context_first);
+    try exercisePublication(.source_first);
+}
+
+fn exercisePublication(coalescing: enum { source_only, context_first, source_first }) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -228,7 +237,9 @@ test "group unit publication changes only affected units replays context and ret
     const unchanged_payload = try txn.get(unchanged_key);
     try state.finish(a, &txn, group, partition, lease, 102, groups.digest("published-first"));
     event.source_revision = 2;
+    if (coalescing == .context_first) try state.invalidateContext(a, &txn, group, &.{.{ .partition = partition, .ordinal = 1 }}, 1);
     _ = try state.invalidate(a, &txn, source, event);
+    if (coalescing == .source_first) try state.invalidateContext(a, &txn, group, &.{.{ .partition = partition, .ordinal = 1 }}, 1);
     command.held.lease = try state.claim(a, &txn, group, (try state.nextPending(a, &txn, group)).?, groups.digest("worker"), 200, 1000);
     command.held.now_ms = 201;
     members[1].text = "two!";
@@ -237,7 +248,10 @@ test "group unit publication changes only affected units replays context and ret
     var updated = try Prepared.init(a, "turns", command, try state.readSnapshot(a, &txn, group, partition));
     defer updated.deinit();
     const second = try stage(Keys, a, &txn, &updated, command, 11);
-    try std.testing.expectEqual(@as(usize, 1), second.changed.len);
+    // Context debt survives either arrival order. The unchanged unit must
+    // replay without rewriting its source payload or source revision.
+    try std.testing.expectEqual(@as(usize, if (coalescing == .source_only) 1 else 2), second.changed.len);
+    if (coalescing != .source_only) try std.testing.expect(!try state.unitContextChanged(a, &txn, group, partition, prepared.units[0].document));
     try std.testing.expectEqualStrings(unchanged_payload, try txn.get(unchanged_key));
     try state.finish(a, &txn, group, partition, command.held.lease, 202, groups.digest("published-second"));
     try state.invalidateContext(a, &txn, group, &.{.{ .partition = partition, .ordinal = 1 }}, 1);

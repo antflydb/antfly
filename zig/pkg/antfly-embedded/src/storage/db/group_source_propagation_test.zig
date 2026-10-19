@@ -397,3 +397,109 @@ test "correction coalescing retains older owned dependencies while excluding for
     try std.testing.expect((try propagation.status(a, &txn, owner, newer)).?.settled);
     try std.testing.expect((try state.pendingFor(a, &txn, group, future.partition)) != null);
 }
+
+test "coalesced move uses the published position rather than the oldest outbox ordinal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var txn = Txn{ .a = a };
+    const definition = index.Definition{ .table_incarnation = 5, .configuration = groups.digest("turns") };
+    const group = state.Group{ .definition = definition, .key = "thread" };
+    const owner = state.Owner{ .namespace = @splat(1), .incarnation = 8 };
+    const partitions = [_]index.Partition{
+        .{ .group = group.key, .segment = "a", .cell = 0 },
+        .{ .group = group.key, .segment = "b", .cell = 0 },
+        .{ .group = group.key, .segment = "c", .cell = 0 },
+        .{ .group = group.key, .segment = "d", .cell = 0 },
+    };
+    try CorrectionFixture.seed(a, &txn, group, &partitions, &.{ 40, 2, 41, 81 });
+    // A previous move 1 -> 40 was accepted before outbox acknowledgement.
+    // The next 40 -> 80 move retains ordinal=1 in the coalesced source outbox.
+    const event = index.Invalidation{ .definition = definition, .partition = partitions[0], .document = "row", .source_revision = 8, .ordinal = 1 };
+    try propagation.advance(a, &txn, owner, event, 1);
+    try std.testing.expectEqual(@as(?i64, 40), (try propagation.currentProgress(a, &txn, owner, event)).?.ordinal);
+    _ = try CorrectionFixture.publish(a, &txn, group, partitions[0], 80);
+    for (0..4) |_| try propagation.advance(a, &txn, owner, event, 1);
+    try std.testing.expect((try propagation.status(a, &txn, owner, event)).?.propagated);
+    try std.testing.expect(try state.pendingFor(a, &txn, group, partitions[2]) != null);
+    try std.testing.expect(try state.pendingFor(a, &txn, group, partitions[3]) != null);
+    try std.testing.expect(try state.pendingFor(a, &txn, group, partitions[1]) == null);
+}
+
+test "superseding moves drain persisted neighborhoods before enrolling the newest correction" {
+    for ([_]bool{ false, true }) |between_scans| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = Txn{ .a = a };
+        const definition = index.Definition{ .table_incarnation = 5, .configuration = groups.digest("turns") };
+        const group = state.Group{ .definition = definition, .key = "thread" };
+        const owner = state.Owner{ .namespace = @splat(1), .incarnation = 8 };
+        const partitions = [_]index.Partition{
+            .{ .group = group.key, .segment = "a", .cell = 0 },
+            .{ .group = group.key, .segment = "b", .cell = 0 },
+            .{ .group = group.key, .segment = "c", .cell = 0 },
+            .{ .group = group.key, .segment = "d", .cell = 0 },
+        };
+        try CorrectionFixture.seed(a, &txn, group, &partitions, &.{ 1, 2, 41, 81 });
+        const first = index.Invalidation{ .definition = definition, .partition = partitions[0], .document = "row", .source_revision = 7, .ordinal = 1 };
+        try propagation.advance(a, &txn, owner, first, 1);
+        const first_lease = try CorrectionFixture.publish(a, &txn, group, partitions[0], 40);
+        try state.finish(a, &txn, group, partitions[0], first_lease, 102, groups.digest("first accepted"));
+        if (between_scans) try propagation.advance(a, &txn, owner, first, 1);
+        var latest = first;
+        latest.source_revision = 8;
+        // Simulate another append superseding it again during the drain.
+        while (!(try propagation.status(a, &txn, owner, first)).?.propagated) {
+            latest.source_revision += 1;
+            try propagation.advance(a, &txn, owner, latest, 1);
+            try std.testing.expect(try propagation.currentProgress(a, &txn, owner, latest) == null);
+            try std.testing.expect(try state.pendingFor(a, &txn, group, partitions[0]) == null);
+        }
+        // The original two neighborhoods survived without a growing anchor list.
+        for (partitions[1..3]) |partition| {
+            try std.testing.expect(try state.pendingFor(a, &txn, group, partition) != null);
+            const lease = try CorrectionFixture.publish(a, &txn, group, partition, if (std.mem.eql(u8, partition.segment, "b")) 2 else 41);
+            try state.finish(a, &txn, group, partition, lease, 102, groups.digest("neighbor accepted"));
+        }
+        try propagation.advance(a, &txn, owner, latest, 1);
+        try std.testing.expectEqual(@as(?i64, 40), (try propagation.currentProgress(a, &txn, owner, latest)).?.ordinal);
+        const latest_lease = try CorrectionFixture.publish(a, &txn, group, partitions[0], 80);
+        try state.finish(a, &txn, group, partitions[0], latest_lease, 102, groups.digest("latest accepted"));
+        for (0..4) |_| try propagation.advance(a, &txn, owner, latest, 1);
+        try std.testing.expect((try propagation.status(a, &txn, owner, latest)).?.propagated);
+        try std.testing.expect(try state.pendingFor(a, &txn, group, partitions[2]) != null);
+        try std.testing.expect(try state.pendingFor(a, &txn, group, partitions[3]) != null);
+    }
+}
+
+test "unmaterialized corrections coalesce without waiting for an obsolete source delivery" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var txn = Txn{ .a = a };
+    const definition = index.Definition{ .table_incarnation = 5, .configuration = groups.digest("turns") };
+    const group = state.Group{ .definition = definition, .key = "thread" };
+    const owner = state.Owner{ .namespace = @splat(1), .incarnation = 8 };
+    const partitions = [_]index.Partition{
+        .{ .group = group.key, .segment = "a", .cell = 0 },
+        .{ .group = group.key, .segment = "b", .cell = 0 },
+        .{ .group = group.key, .segment = "c", .cell = 0 },
+    };
+    try CorrectionFixture.seed(a, &txn, group, &partitions, &.{ 40, 2, 41 });
+    var event = index.Invalidation{ .definition = definition, .partition = partitions[0], .document = "row", .source_revision = 7, .ordinal = 40 };
+    try propagation.advance(a, &txn, owner, event, 1);
+    const obsolete = (try state.pendingFor(a, &txn, group, partitions[0])).?.revision;
+    event.source_revision += 1;
+    event.ordinal = 1;
+    // The newer, earlier delivery must enroll immediately; waiting for the
+    // old snapshot here could fence its own fan-in on an undelivered event.
+    try propagation.advance(a, &txn, owner, event, 1);
+    const progress = (try propagation.currentProgress(a, &txn, owner, event)).?;
+    try std.testing.expect(progress.enrollment > obsolete);
+    try std.testing.expectEqual(@as(?i64, 40), progress.ordinal);
+    _ = try CorrectionFixture.publish(a, &txn, group, partitions[0], 1);
+    for (0..4) |_| try propagation.advance(a, &txn, owner, event, 1);
+    try std.testing.expect((try propagation.status(a, &txn, owner, event)).?.propagated);
+    for (partitions[1..]) |partition| try std.testing.expect(try state.pendingFor(a, &txn, group, partition) != null);
+}

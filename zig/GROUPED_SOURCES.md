@@ -137,10 +137,17 @@ barrier. `enrichments` and `full_index` wait for affected grouped work.
 Each original correction owns bounded dependency rows for the partitions it
 invalidates. Completion retires those rows against accepted partition revisions,
 so a later source outside the correction's horizon cannot extend its barrier.
-Moves scan the old and new neighborhoods independently. Context invalidation
+Moves scan the last published and replacement positions independently; queue
+ordinals remain scheduling lower bounds. If another edit supersedes a correction
+mid-scan, its persisted cursor drains before enrollment of the newest event.
+Events with unpublished replacements still coalesce immediately, avoiding a
+self-dependency on their newer source delivery. This preserves published
+neighborhoods with bounded metadata even under repeated moves. Context invalidation
 records pending partition work immediately; unit guards become visible with
 the replacement snapshot in group order, keeping later producers from blocking
-the replay that materializes their predecessors.
+the replay that materializes their predecessors. Publication compares each unit's
+context guard even when a source edit coalesces with context invalidation, so
+unchanged source payloads still replay affected producers.
 Grouped producer readiness replaces the shared enrichment replay watermark for
 group-rooted DAGs; producers rooted in primary documents retain their ordinary
 fence. After grouped acceptance, `full_index` captures one publication cut and
