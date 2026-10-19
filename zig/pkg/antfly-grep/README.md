@@ -3051,3 +3051,59 @@ These changes avoid repeated work; they do not make freshness, cold reads,
 changed results, full output or retained RAM free. No additional regex JIT path is
 justified by the output/capture profiles. Independent native Linux hardware and
 cold-storage qualification remain separate from the warm controls below.
+
+Qualification against `7a19e40c9a` uses nine alternating trials of 256 dense
+full deliveries per trial and 8,192 acknowledgements per variant, with exact
+result comparisons outside timing. CPU counters cover the server process and
+its workers; their 10 ms precision is amortized over each batch. They are separate
+from producer wall time, which includes output backpressure. Capture controls
+use seven alternating fresh-process trials on warm filesystem data. Delta
+controls use 31 edits, each checked against the complete materialized view.
+
+| Control | macOS before → after | Linux VM before → after |
+|---|---:|---:|
+| Dense 1K-file JSON, server CPU per request | 5.273 → 4.766 ms | 7.813 → 6.758 ms |
+| Same full delivery, client elapsed | 10.123 → 10.131 ms | 10.588 → 10.500 ms |
+| Full acknowledgement → opt-in minimal, same final binary | 28.24 → 13.93 µs | 51.49 → 38.92 µs |
+| Acknowledgement bytes, same final binary | about 1,510 → 256 | about 1,510 → 256 |
+| Capture 100K tiny files | 3.979 → 3.240 s | 715.5 → 675.6 ms |
+| One-file delta in 10K-file inventory, client elapsed | 124.0 → 128.0 µs | 140.2 → 218.4 µs |
+
+The retained reference client sends **zero requests and zero response bytes** for
+an already materialized pinned revision. Its local call still uses CPU and the
+view occupies RAM. The default full-output controls are essentially flat in
+client elapsed time while using less server CPU. Small-source and delta controls
+remain mixed; the Linux delta regression is retained explicitly. The optional
+`bench/lexical_delta.py --cpu-schedstat` samples Linux main-thread CPU/runqueue
+counters outside request timing. Its separate probe records about 97.8 versus
+66.8 µs of main-thread CPU per delta, so the remaining fixed overhead should not
+be attributed solely to scheduler noise. The execution path still visits and
+evaluates exactly one changed file and makes no provider requests.
+
+An earlier macOS capture control had large timing spikes in both binaries:
+separate medians were 8.206→11.444 s, although six of seven paired trials favored
+the implementation. A repeat recorded 3.911→2.450 s. The preceding qualified controls
+remain under `overhead-pre-adaptive-*`, including regressions; the qualification
+record identifies their earlier binary/source revision separately. Those raw trials and their limitations remain available.
+Ready retained capture allocations are effectively unchanged at roughly 50.46 MB
+for 100K files; entries remain 120 bytes. No zero-RAM or universal speed claim is
+made, and source freshness/capture is outside query timing.
+
+Final qualification passes **242 CLI cases each on macOS/Linux** (two expected
+skips each), **96/97 package cases each** (one expected skip), ReleaseSafe native
+conformance/hardening, another **1,000 generated oracle comparisons** without
+mismatches/timeouts, Windows x86_64 cross-compilation, release-license/toolchain/
+format/compatibility checks and verified release contents. Providers remain local
+fixtures. Independent native Linux hardware, cold storage, Windows runtime and
+live-provider quality/billing remain unqualified; full PR CI requires admission.
+
+Evidence: [macOS CPU/output](bench/results/overhead-macos.json),
+[Linux CPU/output](bench/results/overhead-linux.json),
+[macOS capture](bench/results/overhead-capture-macos.json),
+[Linux capture](bench/results/overhead-capture-linux.json),
+[macOS deltas](bench/results/overhead-delta-macos.json),
+[Linux deltas](bench/results/overhead-delta-linux.json),
+[Linux delta CPU probe](bench/results/overhead-delta-scheduler-linux.json),
+[large-file reuse](bench/results/overhead-lexical-linux.json),
+[oracle results](bench/results/overhead-differential.json), and
+[source/binary/report/archive identities](bench/results/overhead-validation.json).
