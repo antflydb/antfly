@@ -40650,6 +40650,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ResolverGroupProgress'
+        observation_error:
+          type: string
+          description: Progress observation failure after acceptance; the metadata commit remains valid
+            and applied is false.
     ResolverSummary:
       type: object
       required:

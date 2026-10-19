@@ -108,6 +108,9 @@ components:
       properties:
         applied: {type: boolean}
         shards: {type: array, items: {$ref: '#/components/schemas/ResolverGroupProgress'}}
+        observation_error:
+          type: string
+          description: Progress observation failure after acceptance; the metadata commit remains valid and applied is false.
     ResolverSummary:
       type: object
       required: [name, source_table, entity_table, declaring_indexes, retired, revision, redirects, curation]

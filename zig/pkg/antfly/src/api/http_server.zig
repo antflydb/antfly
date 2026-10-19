@@ -58103,6 +58103,11 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         expire_wait: bool = false,
         narrow_reads: usize = 0,
         forbid_snapshot: bool = false,
+        observation_failure: ?anyerror = null,
+        fail_after_commit: ?anyerror = null,
+        stress_pages: usize = 0,
+        stress_reads: usize = 0,
+        incompatible_last_page: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -58114,6 +58119,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
                 try std.testing.io.sleep(.fromMilliseconds(@as(i64, remaining) + 1), .awake);
                 try context.ensureActive();
             }
+            if (self.observation_failure) |err| return err;
             const tables = try std.testing.allocator.dupe(metadata_table_manager.TableRecord, &self.tables);
             for (tables) |*table| table.indexes_json = try std.testing.allocator.dupe(u8, table.indexes_json);
             return .{ .status = try status(ptr), .tables = tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
@@ -58131,6 +58137,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             self.owned[slot] = bytes;
             self.tables[slot].indexes_json = bytes;
             self.commits += 1;
+            self.observation_failure = self.fail_after_commit;
             return .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .term = 1, .index = self.commits };
         }
         fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
@@ -58140,6 +58147,29 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             self.narrow_reads += 1;
             const input = call.resolver_catalog_read;
             const wire = @import("../metadata/resolver_catalog_read.zig");
+            if (input.mode == .table and std.mem.eql(u8, input.table_name, "source")) {
+                if (self.observation_failure) |err| return err;
+            }
+            if (input.mode == .consumers and self.stress_pages > 0) {
+                const page_index = if (input.cursor) |cursor| try std.fmt.parseInt(usize, cursor, 10) else 0;
+                try std.testing.expectEqual(@as(?u64, self.commits), input.expected_revision);
+                self.stress_reads += 1;
+                var consumer = self.tables[0];
+                consumer.table_id = 100 + page_index;
+                if (self.incompatible_last_page and page_index + 1 == self.stress_pages) consumer.indexes_json =
+                    \\{"knowledge":{"name":"knowledge","type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","promote":false,"aliases":[{"key":"concept/cycle-target","target":"concept/cycle-source"}]}]}}
+                ;
+                consumer.schema_json = try a.alloc(u8, 512 * 1024);
+                @memset(@constCast(consumer.schema_json), 'x');
+                return std.json.Stringify.valueAlloc(a, wire.Page{
+                    .version = 1,
+                    .revision = self.commits,
+                    .table = self.tables[1],
+                    .consumers = &.{.{ .table = consumer, .names = &.{"concepts"} }},
+                    .next_cursor = if (page_index + 1 < self.stress_pages) try std.fmt.allocPrint(a, "{d}", .{page_index + 1}) else null,
+                    .indexed = true,
+                }, .{});
+            }
             const table = if (std.mem.eql(u8, input.table_name, "entities")) self.tables[1] else self.tables[0];
             return std.json.Stringify.valueAlloc(a, wire.Page{
                 .version = 1,
@@ -58180,8 +58210,24 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try std.testing.expectEqual(@as(u64, 1), source.commits);
     try Run.call(&server, .unmerge, "source", "concepts", "concept/a", "{\"pin_distinct\":true}", 202);
     try Run.call(&server, .suppress, "source", "concepts", "", "{\"texts\":[\"private source text\"]}", 202);
+    source.fail_after_commit = error.TableNotFound;
+    const before_source_failure = source.commits;
+    var accepted_source = try resources.handle(&server, alloc, .suppress, "source", "concepts", "", "{\"texts\":[\"post-commit source failure\"]}", "", .{});
+    defer accepted_source.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), accepted_source.status);
+    try std.testing.expectEqual(before_source_failure + 1, source.commits);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_source.body, "metadata_commit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_source.body, "TableNotFound") != null);
+    source.fail_after_commit = null;
+    source.observation_failure = null;
+    // Initial adoption folds borrowed legacy policy from independent page arenas.
+    server.source = source.narrowIface();
+    source.stress_pages = 2;
     try Run.call(&server, .entity_merge, "entities", "", "concept/a", "{\"into\":\"concept/b\"}", 400);
     try Run.call(&server, .entity_suppress, "entities", "", "concept/noise", "{}", 202);
+    source.stress_pages = 0;
+    source.stress_reads = 0;
+    server.source = source.iface();
     const Denied = struct {
         fn allows(_: *const anyopaque, _: []const u8) bool {
             return false;
@@ -58219,6 +58265,75 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try Run.call(&server, .entity_suppress, "entities", "", "concept/scoped", "{}", 202);
     try Run.call(&server, .entity_redirects, "entities", "", "concept/scoped", "", 200);
     try std.testing.expect(source.narrow_reads >= 7);
+    // Every admitted mutation keeps its commit receipt even if observation
+    // sees a deleted consumer, a new catalog cut, or request cancellation.
+    for ([_]anyerror{ error.TableNotFound, error.CatalogGenerationChanged, error.Canceled, error.DeadlineExceeded }) |failure| {
+        source.fail_after_commit = failure;
+        const before_failure = source.commits;
+        const key = try std.fmt.allocPrint(alloc, "concept/observation-{s}", .{@errorName(failure)});
+        defer alloc.free(key);
+        var accepted = try resources.handle(&server, alloc, .entity_suppress, "entities", "", key, "{}", "", .{});
+        defer accepted.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), accepted.status);
+        try std.testing.expectEqual(before_failure + 1, source.commits);
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, key) != null);
+        const receipt = try std.json.parseFromSlice(std.json.Value, alloc, accepted.body, .{});
+        defer receipt.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(source.commits)), receipt.value.object.get("metadata_commit").?.object.get("index").?.integer);
+        const result = receipt.value.object.get("results").?.array.items[0].object;
+        try std.testing.expect(result.get("accepted").?.bool);
+        try std.testing.expect(!result.get("applied").?.bool);
+        try std.testing.expectEqualStrings(@errorName(failure), result.get("error").?.string);
+        source.fail_after_commit = null;
+        source.observation_failure = null;
+    }
+    // 32 MiB of schemas traversed twice must fit a 16 MiB request budget.
+    // Only compact progress identities may grow with the consumer count.
+    const Budget = struct {
+        live: usize = 0,
+        peak: usize = 0,
+        fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (len > 16 * 1024 * 1024 -| self.live) return null;
+            const result = std.testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+            self.live += len;
+            self.peak = @max(self.peak, self.live);
+            return result;
+        }
+        fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.live -= bytes.len;
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+    };
+    var budget: Budget = .{};
+    source.stress_pages = 64;
+    var bounded = try resources.handle(&server, budget.allocator(), .entity_suppress, "entities", "", "concept/bounded", "{}", "", .{});
+    try std.testing.expectEqual(@as(u16, 202), bounded.status);
+    try std.testing.expectEqual(@as(usize, 128), source.stress_reads);
+    const bounded_result = try std.json.parseFromSlice(std.json.Value, alloc, bounded.body, .{});
+    defer bounded_result.deinit();
+    try std.testing.expectEqual(@as(usize, 64), bounded_result.value.object.get("results").?.array.items.len);
+    bounded.deinit(budget.allocator());
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    var bounded_get = try resources.handle(&server, budget.allocator(), .entity_redirects, "entities", "", "concept/bounded", "", "", .{});
+    try std.testing.expectEqual(@as(u16, 200), bounded_get.status);
+    bounded_get.deinit(budget.allocator());
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    // A policy conflict in the final page must be found by the validation pass
+    // before any authoritative namespace CAS, even when earlier pages are valid.
+    source.stress_pages = 2;
+    source.incompatible_last_page = true;
+    const before_cycle = source.commits;
+    var cycle = try resources.handle(&server, alloc, .entity_merge, "entities", "", "concept/cycle-source", "{\"into\":\"concept/cycle-target\"}", "", .{});
+    defer cycle.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), cycle.status);
+    try std.testing.expectEqual(before_cycle, source.commits);
+    source.incompatible_last_page = false;
+    source.stress_pages = 0;
     server.source = source.iface();
     source.forbid_snapshot = false;
     // The authoritative CAS succeeds before the clipped observation expires.

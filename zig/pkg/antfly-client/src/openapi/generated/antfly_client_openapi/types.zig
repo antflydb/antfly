@@ -39736,6 +39736,36 @@ pub const ResolverRenderResponse = struct {
 pub const ResolverReplayProgress = struct {
     applied: bool,
     shards: []const ResolverGroupProgress,
+    /// Progress observation failure after acceptance; the metadata commit remains valid and applied is false.
+    observation_error: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "applied", "applied", false },
+        .{ "shards", "shards", false },
+        .{ "observation_error", "observation_error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("applied");
+        try jw.write(self.applied);
+        try jw.objectField("shards");
+        try jw.write(self.shards);
+        if (self.observation_error) |value| {
+            try jw.objectField("observation_error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ResolverReplayStage = struct {

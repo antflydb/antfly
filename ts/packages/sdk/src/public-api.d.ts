@@ -20205,6 +20205,8 @@ export interface components {
         ResolverReplayProgress: {
             applied: boolean;
             shards: components["schemas"]["ResolverGroupProgress"][];
+            /** @description Progress observation failure after acceptance; the metadata commit remains valid and applied is false. */
+            observation_error?: string;
         };
         ResolverSummary: {
             name: string;

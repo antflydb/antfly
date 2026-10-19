@@ -1684,8 +1684,11 @@ A mutation returns the accepted revision and replay sequence immediately (HTTP
 202 while pending). `replay_sequence_kind` distinguishes a resolver revision
 from a source-journal review decision. `wait:{timeout_ms:...}` bounds observation
 of detached replay; a timeout leaves the accepted mutation intact. The remaining
-observation budget bounds metadata reads and remote owner RPC timeouts; client
-cancellation and an earlier overall request deadline retain their own semantics.
+observation budget bounds metadata reads and remote owner RPC timeouts. Before
+admission, cancellation and deadlines reject the request normally. After acceptance,
+an unavailable progress read (including deletion, cancellation or deadline expiry)
+returns HTTP 202 with the accepted commit receipt, `applied:false`, and
+`progress.observation_error`. Observation failures never retry the mutation.
 Resolver GET
 reports per-group revision, freshness, durable backfill and resolution/promotion
 watermarks. An idle watermark alone does not prove the new revision is applied.
@@ -1754,6 +1757,12 @@ to 8 MiB). Cursors bind the destination identity, entity key, and catalog revisi
 Declared-target edges retain qualified logical names independently of physical
 owner IDs, so destination recreation does not hide existing consumers. Legacy
 catalog discovery uses bounded table pages until the v2 bootstrap is durable.
+Each page owns a scratch arena that is released before the next read. Discovery
+retains only compact consumer identities and the folded namespace policy; GET
+does not retain observation identities. Legacy folds replace and free the prior
+aggregate. Mutations validate full consumer policies in a second pass over the
+same revision-fenced cut before CAS, so memory does not accumulate source schemas
+or unrelated index declarations across pages.
 Every changed namespace fences its validated consumer cut, including local alias
 edits. Incompatible alias cycles, distinct pins, and suppressed redirect targets
 are rejected before proposal and rechecked before any apply writes. A rejected

@@ -128,12 +128,20 @@ pub const GroupProgress = struct {
         try jw.endObject();
     }
 };
-pub const Progress = struct { applied: bool, shards: []const GroupProgress };
+const ObservationTarget = struct {
+    name: []const u8,
+    config_generation: u64,
+    promote: bool,
+    fn fromConfig(cfg: Config) ObservationTarget {
+        return .{ .name = cfg.name, .config_generation = cfg.config_generation, .promote = cfg.promote };
+    }
+};
+pub const Progress = struct { applied: bool, shards: []const GroupProgress, observation_error: []const u8 = "" };
 const Sample = struct {
     groups: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
     observations: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(u64, GroupProgress)) = .empty,
 
-    fn progress(self: Sample, a: std.mem.Allocator, cfg: Config, revision: u64) !Progress {
+    fn progress(self: Sample, a: std.mem.Allocator, cfg: ObservationTarget, revision: u64) !Progress {
         const rows = try a.alloc(GroupProgress, self.groups.count());
         var applied = rows.len > 0;
         for (self.groups.keys(), rows) |id, *row| {
@@ -331,7 +339,7 @@ fn summary(a: std.mem.Allocator, table: anytype, cfg: Config, observation: Sampl
         .namespace_generation = cfg.namespace_generation,
         .redirects = try cfg.effectiveAliasesAlloc(a),
         .curation = state,
-        .progress = try observation.progress(a, cfg, cfg.curation_revision),
+        .progress = try observation.progress(a, ObservationTarget.fromConfig(cfg), cfg.curation_revision),
     });
 }
 
@@ -460,9 +468,9 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
             const sealed = try grants.sealIndexesJsonForPrincipalAlloc(a, plan.indexes_json, table.name, request.destination_authorization_principal, .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled });
             var replacement = table.*;
             replacement.indexes_json = sealed;
-            const stamp = try server.source.replaceTableDefinitionStamped(table.*, replacement);
             const next = try findConfig(try configs(a, sealed), resolver_name);
-            const progress = try observeUntil(server, a, table.name, next, plan.revision, intent.wait, request);
+            const stamp = try server.source.replaceTableDefinitionStamped(table.*, replacement);
+            const progress = try observeAccepted(server, a, table.name, ObservationTarget.fromConfig(next), plan.revision, intent.wait, request);
             return response(alloc, if (progress.applied) 200 else 202, .{ .resolver = resolver_name, .changed = true, .revision = plan.revision, .replay_sequence = plan.revision, .replay_sequence_kind = "resolver_revision", .metadata_commit = stamp, .applied = progress.applied, .progress = progress });
         },
         .merge, .unmerge, .suppress, .unsuppress => {
@@ -487,49 +495,117 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
                 try request.ensureActive();
                 break :committed try server.source.replaceTableDefinitionStamped(table.*, replacement);
             } else null;
-            const progress = try observeUntil(server, a, table.name, cfg, plan.revision, intent.wait, request);
+            const progress = try observeAccepted(server, a, table.name, ObservationTarget.fromConfig(cfg), plan.revision, intent.wait, request);
             return response(alloc, if (progress.applied) 200 else 202, .{ .resolver = resolver_name, .changed = plan.changed, .revision = plan.revision, .replay_sequence = plan.revision, .replay_sequence_kind = "resolver_revision", .metadata_commit = stamp, .applied = progress.applied, .progress = progress });
         },
         else => return error.UnsupportedOperation,
     }
 }
 
-/// One destination-table CAS owns every matching exact-template namespace.
-/// Sources are observations of asynchronous replay, never curation authorities.
-fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, entity_table: anytype, op: Operation, key: []const u8, body: []const u8, request: operation.RequestContext, adoption_revision: ?u64) !@import("public_table_http.zig").OwnedResponse {
-    if (op == .entity_redirects) {
-        try server.authorizeTableReads(a, request, &.{entity_table.name});
-    } else try server.authorizeIntegrityMutations(request, &.{.{ .table_name = entity_table.name, .deletes = &.{key} }});
-    const Input = struct { into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null };
-    const input = try std.json.parseFromSliceLeaky(Input, a, if (body.len == 0) "{}" else body, .{});
-    if (key.len == 0 or (op == .entity_merge and input.into == null)) return error.InvalidResolverCurationRequest;
-    if (input.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
-    var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (entity_table.indexes_json.len == 0) "{}" else entity_table.indexes_json, .{});
-    const stored = try curation.namespacesFromValue(a, root);
-    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
-    for (stored.namespaces) |namespace| if (curation.keyInNamespace(namespace.key_template, key)) try namespaces.put(a, namespace.key_template, namespace);
-    const Table = @TypeOf(snapshot.tables[0]);
-    const Consumer = struct { table: Table, cfg: Config };
-    var consumers: std.ArrayListUnmanaged(Consumer) = .empty;
-    var selected: std.ArrayListUnmanaged(Consumer) = .empty;
+// Only the compact observation identity survives a catalog page. Full source
+// definitions and parsed policies are released before the next page is read.
+const EntityConsumer = struct { table_name: []const u8, key_template: []const u8, target: ObservationTarget };
+const LocalTarget = struct { target: []const u8, conflict: bool = false };
+const EntityDiscovery = struct {
+    a: std.mem.Allocator,
+    owner: std.mem.Allocator,
+    namespaces: *std.StringArrayHashMapUnmanaged(curation.Namespace),
+    stored: curation.Namespaces,
+    adoption_revision: ?u64,
+    standalone: bool,
+    key: []const u8,
+    observations: bool,
+    aliases: bool,
+    consumers: std.ArrayListUnmanaged(EntityConsumer) = .empty,
+    folded: std.StringHashMapUnmanaged(std.json.Parsed(curation.Namespace)) = .empty,
+    local_targets: std.StringHashMapUnmanaged(LocalTarget) = .empty,
+
+    fn deinit(self: *EntityDiscovery) void {
+        var values = self.folded.valueIterator();
+        while (values.next()) |value| value.deinit();
+        self.folded.deinit(self.owner);
+    }
+
+    fn consume(self: *EntityDiscovery, scratch: std.mem.Allocator, table_name: []const u8, cfg: Config) !void {
+        const entry = try self.namespaces.getOrPut(self.a, cfg.key_template);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = try self.a.dupe(u8, cfg.key_template);
+            entry.value_ptr.* = .{ .key_template = entry.key_ptr.*, .adoption_revision = self.adoption_revision, .adoption_standalone = self.standalone };
+        }
+        const template = entry.key_ptr.*;
+        const authoritative = for (self.stored.namespaces) |item| {
+            if (std.mem.eql(u8, item.key_template, template)) break true;
+        } else false;
+        if (!authoritative) {
+            // Folding may borrow policy strings from this page. Own the new
+            // aggregate, and release its predecessor instead of retaining every
+            // intermediate union in the request arena.
+            const next = try curation.foldNamespace(scratch, entry.value_ptr.*, cfg);
+            const bytes = try std.json.Stringify.valueAlloc(scratch, next, .{});
+            const owned = try std.json.parseFromSlice(curation.Namespace, self.owner, bytes, .{ .allocate = .alloc_always });
+            errdefer owned.deinit();
+            const prior = try self.folded.getOrPut(self.owner, template);
+            if (prior.found_existing) prior.value_ptr.deinit();
+            prior.value_ptr.* = owned;
+            entry.value_ptr.* = owned.value;
+        }
+        if (self.aliases) for (try cfg.effectiveAliasesAlloc(scratch)) |alias| {
+            if (!std.mem.eql(u8, alias.key, self.key)) continue;
+            const prior = try self.local_targets.getOrPut(self.a, template);
+            if (!prior.found_existing) prior.value_ptr.* = .{ .target = try self.a.dupe(u8, alias.target) } else if (!std.mem.eql(u8, prior.value_ptr.target, alias.target)) prior.value_ptr.conflict = true;
+        };
+        if (!self.observations) return;
+        try self.consumers.append(self.a, .{ .table_name = try self.a.dupe(u8, table_name), .key_template = template, .target = .{
+            .name = try self.a.dupe(u8, cfg.name),
+            .config_generation = cfg.config_generation,
+            .promote = cfg.promote,
+        } });
+    }
+};
+const EntityValidation = struct {
+    namespaces: *std.StringArrayHashMapUnmanaged(curation.Namespace),
+    fn consume(self: *EntityValidation, scratch: std.mem.Allocator, _: []const u8, cfg: Config) !void {
+        const namespace = self.namespaces.get(cfg.key_template) orelse return error.InvalidCatalogRecord;
+        var projected = cfg;
+        projected.merges = namespace.merges;
+        projected.curation_json = try std.json.Stringify.valueAlloc(scratch, namespace.state, .{});
+        try projected.validate();
+    }
+};
+
+/// Both passes read the same revision-fenced catalog cut. A page arena owns
+/// transport bytes, table schemas and parsed configs; callbacks retain only
+/// output identities or the folded namespace policy.
+fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anytype, entity_table: anytype, key: []const u8, request: operation.RequestContext, adoption_revision: ?u64, context: anytype) !void {
     if (server.source.vtable.supports_resolver_catalog_read) {
         var cursor: ?[]const u8 = null;
+        defer if (cursor) |value| owner.free(value);
         var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer seen.deinit(owner);
         while (true) {
-            const page = try readResolverCatalog(server, a, .{ .table_name = entity_table.name, .mode = .consumers, .key = key, .expected_revision = adoption_revision, .cursor = cursor }, request);
+            var arena = std.heap.ArenaAllocator.init(owner);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const page = try readResolverCatalog(server, scratch, .{ .table_name = entity_table.name, .mode = .consumers, .key = key, .expected_revision = adoption_revision, .cursor = cursor }, request);
             for (page.consumers) |consumer| {
-                if ((try seen.getOrPut(a, consumer.table.table_id)).found_existing) continue;
-                for (try configs(a, consumer.table.indexes_json)) |cfg| {
+                if ((try seen.getOrPut(owner, consumer.table.table_id)).found_existing) continue;
+                for (try configs(scratch, consumer.table.indexes_json)) |cfg| {
                     for (consumer.names) |name| if (std.mem.eql(u8, cfg.name, name)) {
-                        try selected.append(a, .{ .table = consumer.table, .cfg = cfg });
+                        try context.consume(scratch, consumer.table.name, cfg);
                         break;
                     };
                 }
             }
-            cursor = page.next_cursor;
+            const next = if (page.next_cursor) |value| try owner.dupe(u8, value) else null;
+            if (cursor) |value| owner.free(value);
+            cursor = next;
             if (cursor == null) break;
         }
     } else {
+        // Compatibility path for sources without the scoped catalog capability.
+        var arena = std.heap.ArenaAllocator.init(owner);
+        defer arena.deinit();
+        const a = arena.allocator();
         var destinations: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
         const source_configs = try a.alloc([]const Config, snapshot.tables.len);
         for (snapshot.tables, source_configs) |source, *all| {
@@ -554,24 +630,28 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         }
         for (snapshot.tables, source_configs) |source, all| for (all) |cfg| {
             if (!std.mem.eql(u8, destinations.get(cfg.table).?, entity_table.name) or !curation.keyInNamespace(cfg.key_template, key)) continue;
-            try selected.append(a, .{ .table = source, .cfg = cfg });
+            try context.consume(a, source.name, cfg);
         };
     }
-    for (selected.items) |consumer| {
-        const source = consumer.table;
-        const cfg = consumer.cfg;
-        try consumers.append(a, .{ .table = source, .cfg = cfg });
-        if (!namespaces.contains(cfg.key_template)) try namespaces.put(a, cfg.key_template, .{ .key_template = cfg.key_template, .adoption_revision = adoption_revision, .adoption_standalone = server.cfg.deployment_mode == .standalone });
-        // Fold legacy state only once. After adoption, source records are
-        // derived projections and must never resurrect an undone correction.
-        const authoritative = for (stored.namespaces) |item| {
-            if (std.mem.eql(u8, item.key_template, cfg.key_template)) break true;
-        } else false;
-        if (!authoritative) {
-            const current = namespaces.getPtr(cfg.key_template).?;
-            current.* = try curation.foldNamespace(a, current.*, cfg);
-        }
-    }
+}
+
+/// One destination-table CAS owns every matching exact-template namespace.
+/// Sources are observations of asynchronous replay, never curation authorities.
+fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, entity_table: anytype, op: Operation, key: []const u8, body: []const u8, request: operation.RequestContext, adoption_revision: ?u64) !@import("public_table_http.zig").OwnedResponse {
+    if (op == .entity_redirects) {
+        try server.authorizeTableReads(a, request, &.{entity_table.name});
+    } else try server.authorizeIntegrityMutations(request, &.{.{ .table_name = entity_table.name, .deletes = &.{key} }});
+    const Input = struct { into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null };
+    const input = try std.json.parseFromSliceLeaky(Input, a, if (body.len == 0) "{}" else body, .{});
+    if (key.len == 0 or (op == .entity_merge and input.into == null)) return error.InvalidResolverCurationRequest;
+    if (input.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (entity_table.indexes_json.len == 0) "{}" else entity_table.indexes_json, .{});
+    const stored = try curation.namespacesFromValue(a, root);
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    for (stored.namespaces) |namespace| if (curation.keyInNamespace(namespace.key_template, key)) try namespaces.put(a, namespace.key_template, namespace);
+    var discovery: EntityDiscovery = .{ .a = a, .owner = alloc, .namespaces = &namespaces, .stored = stored, .adoption_revision = adoption_revision, .standalone = server.cfg.deployment_mode == .standalone, .key = key, .observations = op != .entity_redirects, .aliases = op == .entity_merge or op == .entity_unmerge };
+    defer discovery.deinit();
+    try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, &discovery);
     if (namespaces.count() == 0) return error.ResolverNotFound;
     if (op == .entity_redirects) {
         var states = std.json.Array.init(a);
@@ -599,28 +679,14 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             if (std.mem.eql(u8, alias.key, key)) break true;
         } else false;
         if (!redirected and (action == .merge or action == .unmerge)) {
-            var local_target: ?[]const u8 = null;
-            for (consumers.items) |consumer| {
-                if (!std.mem.eql(u8, consumer.cfg.key_template, namespace.key_template)) continue;
-                for (try consumer.cfg.effectiveAliasesAlloc(a)) |alias| {
-                    if (!std.mem.eql(u8, alias.key, key)) continue;
-                    if (local_target) |target| {
-                        if (!std.mem.eql(u8, target, alias.target)) return error.ResolverNamespaceMigrationConflict;
-                    } else local_target = alias.target;
-                }
+            if (discovery.local_targets.get(namespace.key_template)) |local_target| {
+                if (local_target.conflict) return error.ResolverNamespaceMigrationConflict;
+                try effective.append(a, .{ .key = key, .target = local_target.target });
             }
-            if (local_target) |target| try effective.append(a, .{ .key = key, .target = target });
         }
         const plan = try resolver.curation.plan(a, try std.json.Stringify.valueAlloc(a, namespace.state, .{}), namespace.merges, effective.items, intent);
         const check: Config = .{ .name = "namespace", .table = entity_table.name, .source_artifact = "metadata", .resolution_artifact = "resolved", .key_template = namespace.key_template, .merges = plan.merges, .curation_json = try std.json.Stringify.valueAlloc(a, plan.state, .{}) };
         try check.validate();
-        for (consumers.items) |consumer| {
-            if (!std.mem.eql(u8, consumer.cfg.key_template, namespace.key_template)) continue;
-            var projected = consumer.cfg;
-            projected.merges = plan.merges;
-            projected.curation_json = check.curation_json;
-            try projected.validate();
-        }
         if (plan.changed or namespace.revision == 0) {
             namespace.adoption_revision = adoption_revision;
             namespace.adoption_standalone = server.cfg.deployment_mode == .standalone;
@@ -631,6 +697,8 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             changed = true;
         }
     }
+    var validation: EntityValidation = .{ .namespaces = &namespaces };
+    try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, &validation);
     var replacement = entity_table.*;
     replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
     try request.ensureActive();
@@ -638,23 +706,31 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     var results = std.json.Array.init(a);
     var applied = true;
     const deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, if (input.wait) |wait| wait.timeout_ms else 0) * std.time.ns_per_ms;
-    for (consumers.items) |consumer| {
-        const namespace = namespaces.get(consumer.cfg.key_template).?;
+    for (discovery.consumers.items) |consumer| {
+        const namespace = namespaces.get(consumer.key_template).?;
         const remaining = (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
-        const progress = try observeUntil(server, a, consumer.table.name, consumer.cfg, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
+        const progress = try observeAccepted(server, a, consumer.table_name, consumer.target, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
         applied = applied and progress.applied;
-        try results.append(try json(a, .{ .source_table = consumer.table.name, .resolver = consumer.cfg.name, .changed = changed, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = "", .applied = progress.applied, .progress = progress }));
+        try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .changed = changed, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
     }
     return response(alloc, if (applied) 200 else 202, .{ .entity_table = entity_table.name, .key = key, .atomicity = "namespace", .complete = true, .changed = changed, .metadata_commit = stamp, .applied = applied, .results = std.json.Value{ .array = results } });
 }
 
 /// Waiting observes detached workers and yields between samples; it never
 /// executes extraction, model inference or promotion on the request worker.
-fn observeUntil(server: anytype, a: std.mem.Allocator, table_name: []const u8, cfg: Config, revision: u64, wait: ?resolver.curation.Wait, request: operation.RequestContext) !Progress {
-    return observeReplayUntil(server, a, table_name, cfg, revision, wait, request, null);
+/// Admission has finished. Observation failures cannot turn a committed write
+/// into an admission error or cause executeWithRetry to repeat the mutation.
+fn observeAccepted(server: anytype, a: std.mem.Allocator, table_name: []const u8, cfg: ObservationTarget, revision: u64, wait: ?resolver.curation.Wait, request: operation.RequestContext) !Progress {
+    return observeReplayAccepted(server, a, table_name, cfg, revision, wait, request, null);
+}
+fn observeReplayAccepted(server: anytype, a: std.mem.Allocator, table_name: []const u8, cfg: ObservationTarget, revision: u64, wait: ?resolver.curation.Wait, request: operation.RequestContext, floor: ?ReplayFloor) !Progress {
+    return observeReplayUntil(server, a, table_name, cfg, revision, wait, request, floor) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) },
+    };
 }
 const ReplayFloor = struct { group: u64, sequence: u64 };
-fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const u8, cfg: Config, revision: u64, wait: ?resolver.curation.Wait, request: operation.RequestContext, floor: ?ReplayFloor) !Progress {
+fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const u8, cfg: ObservationTarget, revision: u64, wait: ?resolver.curation.Wait, request: operation.RequestContext, floor: ?ReplayFloor) !Progress {
     const clock = @import("antfly_platform").time;
     const deadline = clock.monotonicNs() +| @as(u64, if (wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
     while (true) {
@@ -667,12 +743,12 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
         const scoped = server.source.vtable.supports_resolver_catalog_read;
         const page: ?catalog_read.Page = if (scoped) readResolverCatalog(server, scratch, .{ .table_name = table_name }, observation_request) catch |err| {
             try request.ensureActive();
-            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{} };
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
             return err;
         } else null;
         var snapshot = if (page) |*value| value.snapshot() else (server.source.linearizableSnapshot(observation_request) catch |err| {
             try request.ensureActive();
-            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{} };
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
             return err;
         }) orelse return error.TableNotFound;
         const table = tableByName(&snapshot, table_name) catch |err| {
@@ -682,7 +758,7 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
         const observation = sample(server, scratch, &snapshot, table, observation_request, wait != null) catch |err| {
             if (!scoped) server.source.freeAdminSnapshot(&snapshot);
             try request.ensureActive();
-            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{} };
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
             return err;
         };
         if (!scoped) server.source.freeAdminSnapshot(&snapshot);
@@ -727,7 +803,7 @@ fn reviewsOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloca
         const reply = try server.executeResolverOperation(a, table.name, token.group, bytes, request);
         var value = try std.json.parseFromSliceLeaky(std.json.Value, a, reply, .{});
         const sequence = value.object.get("replay_sequence").?.integer;
-        const progress = try observeReplayUntil(server, a, table.name, cfg, cfg.curation_revision, input.wait, request, .{ .group = token.group, .sequence = @intCast(sequence) });
+        const progress = try observeReplayAccepted(server, a, table.name, ObservationTarget.fromConfig(cfg), cfg.curation_revision, input.wait, request, .{ .group = token.group, .sequence = @intCast(sequence) });
         try value.object.put(a, "applied", .{ .bool = progress.applied });
         try value.object.put(a, "progress", try json(a, progress));
         return response(alloc, if (progress.applied) 200 else 202, value);
@@ -950,12 +1026,12 @@ test "resolver curation progress requires the revision and complete bounded back
     try by_group.put(a, 1, .{ .group_id = 1, .available = true, .fresh = true, .curation_revision = 2, .config_generation = 3, .backfill_pending = true, .resolution = .{ .enabled = true, .target_sequence = 5, .applied_sequence = 5 } });
     try observation.observations.put(a, "concepts", by_group);
     const cfg: Config = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .promote = false, .config_generation = 3 };
-    try std.testing.expect(!(try observation.progress(a, cfg, 2)).applied);
+    try std.testing.expect(!(try observation.progress(a, ObservationTarget.fromConfig(cfg), 2)).applied);
     observation.observations.getPtr("concepts").?.getPtr(1).?.backfill_pending = false;
-    try std.testing.expect((try observation.progress(a, cfg, 2)).applied);
-    try std.testing.expect(!(try observation.progress(a, cfg, 3)).applied);
+    try std.testing.expect((try observation.progress(a, ObservationTarget.fromConfig(cfg), 2)).applied);
+    try std.testing.expect(!(try observation.progress(a, ObservationTarget.fromConfig(cfg), 3)).applied);
     observation.observations.getPtr("concepts").?.getPtr(1).?.fresh = false;
-    try std.testing.expect(!(try observation.progress(a, cfg, 2)).applied);
+    try std.testing.expect(!(try observation.progress(a, ObservationTarget.fromConfig(cfg), 2)).applied);
 }
 
 test "resolver curation progress obtains missing diagnostics from the current owner" {
@@ -965,11 +1041,11 @@ test "resolver curation progress obtains missing diagnostics from the current ow
     var observation: Sample = .{};
     try observation.groups.put(a, 7, {});
     const cfg: Config = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .promote = false };
-    try std.testing.expect(!(try observation.progress(a, cfg, 4)).applied);
+    try std.testing.expect(!(try observation.progress(a, ObservationTarget.fromConfig(cfg), 4)).applied);
     const row: curation.ProgressRow = .{ .name = "concepts", .config_generation = 0, .effective_generation = 4, .curation_revision = 4, .backfill_pending = false, .resolution = .{ .enabled = true, .target_sequence = 9, .applied_sequence = 9 }, .promotion = .{} };
     try mergeOwnerProgress(a, &observation, 7, .{ .resolvers = &.{row} });
-    try std.testing.expect((try observation.progress(a, cfg, 4)).applied);
-    try std.testing.expect(!(try observation.progress(a, cfg, 5)).applied);
+    try std.testing.expect((try observation.progress(a, ObservationTarget.fromConfig(cfg), 4)).applied);
+    try std.testing.expect(!(try observation.progress(a, ObservationTarget.fromConfig(cfg), 5)).applied);
 }
 
 test "resolver curation progress completes a proven empty owner without invented workers" {
@@ -981,8 +1057,8 @@ test "resolver curation progress completes a proven empty owner without invented
     const cfg: Config = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .promote = false };
     var row: curation.ProgressRow = .{ .name = "concepts", .config_generation = 0, .effective_generation = 4, .curation_revision = 4, .backfill_pending = false, .empty = true, .resolution = .{}, .promotion = .{} };
     try mergeOwnerProgress(a, &observation, 1, .{ .resolvers = &.{row} });
-    try std.testing.expect((try observation.progress(a, cfg, 4)).applied);
+    try std.testing.expect((try observation.progress(a, ObservationTarget.fromConfig(cfg), 4)).applied);
     row.resolution.target_sequence = 1;
     try mergeOwnerProgress(a, &observation, 1, .{ .resolvers = &.{row} });
-    try std.testing.expect(!(try observation.progress(a, cfg, 4)).applied);
+    try std.testing.expect(!(try observation.progress(a, ObservationTarget.fromConfig(cfg), 4)).applied);
 }

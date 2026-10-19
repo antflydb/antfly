@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.resolver_group_progress import ResolverGroupProgress
 
@@ -19,10 +21,13 @@ class ResolverReplayProgress:
     Attributes:
         applied (bool):
         shards (list[ResolverGroupProgress]):
+        observation_error (str | Unset): Progress observation failure after acceptance; the metadata commit remains
+            valid and applied is false.
     """
 
     applied: bool
     shards: list[ResolverGroupProgress]
+    observation_error: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -33,6 +38,8 @@ class ResolverReplayProgress:
             shards_item = shards_item_data.to_dict()
             shards.append(shards_item)
 
+        observation_error = self.observation_error
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -41,6 +48,8 @@ class ResolverReplayProgress:
                 "shards": shards,
             }
         )
+        if observation_error is not UNSET:
+            field_dict["observation_error"] = observation_error
 
         return field_dict
 
@@ -58,9 +67,12 @@ class ResolverReplayProgress:
 
             shards.append(shards_item)
 
+        observation_error = d.pop("observation_error", UNSET)
+
         resolver_replay_progress = cls(
             applied=applied,
             shards=shards,
+            observation_error=observation_error,
         )
 
         resolver_replay_progress.additional_properties = d
