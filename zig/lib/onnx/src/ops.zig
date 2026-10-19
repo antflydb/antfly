@@ -4180,11 +4180,29 @@ fn convertArgMin(builder: *Builder, node: *const NodeProto, input: NodeId) Conve
 
 fn convertGatherND(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
     if (inputs.len < 2) return error.MissingInput;
-    _ = node;
     const data_shape = builder.graph.node(inputs[0]).output_shape;
+    const indices_shape = builder.graph.node(inputs[1]).output_shape;
+    const batch_dims_raw = getInt(node.attributes, "batch_dims", 0);
+    if (data_shape.rank() == 0 or indices_shape.rank() == 0 or batch_dims_raw < 0 or
+        batch_dims_raw >= @min(data_shape.rank(), indices_shape.rank())) return error.InvalidAttribute;
+    const batch_dims: u8 = @intCast(batch_dims_raw);
+    const depth = indices_shape.dim(indices_shape.rank() - 1);
+    if (depth < 1 or depth > data_shape.rank() - batch_dims) return error.InvalidAttribute;
+    const suffix_start: usize = batch_dims + @as(usize, @intCast(depth));
+    const out_rank = indices_shape.rank() - 1 + data_shape.rank() - suffix_start;
+    if (out_rank > 8) return error.TooManyDimensions;
+    for (0..batch_dims) |d| {
+        const data_dim = data_shape.dims[d];
+        const index_dim = indices_shape.dims[d];
+        if (data_dim >= 0 and index_dim >= 0 and data_dim != index_dim) return error.ShapeMismatch;
+    }
+    var out_dims: [8]i64 = @splat(0);
+    const prefix_rank = indices_shape.rank() - 1;
+    @memcpy(out_dims[0..prefix_rank], indices_shape.dims[0..prefix_rank]);
+    @memcpy(out_dims[prefix_rank..][0 .. data_shape.rank() - suffix_start], data_shape.dims[suffix_start..data_shape.rank()]);
     return builder.graph.addNode(.{
-        .op = .{ .gather = .{ .axis = 0 } },
-        .output_shape = data_shape,
+        .op = .{ .gather = .{ .nd = true, .batch_dims = batch_dims } },
+        .output_shape = Shape.init(data_shape.dtype, out_dims[0..out_rank]),
         .inputs = .{ inputs[0], inputs[1], null_node, null_node },
         .num_inputs = 2,
     });
@@ -8900,4 +8918,26 @@ test "concrete deep ONNX projections retain static planning shapes" {
     try std.testing.expect(!nodeHasRuntimeDependentShape(&b, mm, 0));
     const shape = try convertShape(&b, &.{ .op_type = "Shape" }, mm);
     try std.testing.expectEqual(.constant, std.meta.activeTag(g.node(shape).op));
+}
+
+test "convertNode GatherND infers coordinate slices and validates batch dimensions" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const data = try b.parameter("data", Shape.init(.f32, &.{ 2, 3, 4 }));
+    const coords = try b.parameter("coords", Shape.init(.i64, &.{ 2, 5, 1 }));
+    var attributes = [_]AttributeProto{.{ .name = "batch_dims", .i = 1 }};
+    const node = NodeProto{ .op_type = "GatherND", .attributes = &attributes };
+    const result = try convertNode(a, &b, &node, &.{ data, coords }, null);
+    try std.testing.expect(g.node(result).op.gather.nd);
+    try std.testing.expectEqual(@as(u8, 1), g.node(result).op.gather.batch_dims);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 5, 4 }, g.node(result).output_shape.dims[0..3]);
+    const bad_batch = try b.parameter("bad_batch", Shape.init(.i64, &.{ 3, 5, 1 }));
+    try std.testing.expectError(error.ShapeMismatch, convertNode(a, &b, &node, &.{ data, bad_batch }, null));
+    attributes[0].i = -1;
+    try std.testing.expectError(error.InvalidAttribute, convertNode(a, &b, &node, &.{ data, coords }, null));
+    const bad_depth = try b.parameter("bad_depth", Shape.init(.i64, &.{ 5, 4 }));
+    const unbatched = NodeProto{ .op_type = "GatherND" };
+    try std.testing.expectError(error.InvalidAttribute, convertNode(a, &b, &unbatched, &.{ data, bad_depth }, null));
 }
