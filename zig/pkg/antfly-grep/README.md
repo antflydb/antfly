@@ -3603,8 +3603,8 @@ Malformed proofs fail explicitly. Invalid documents retain their bodies and
 ordinary errors. NUL-containing content, UTF-8 BOMs and unsupported encodings or
 modes retain full content. Finite source-byte budgets, multiline, decision,
 inverted, count/list, zero-count, sorted and early-stop searches do not request
-this optimization. Missing proof support retains ordinary full-body scanning;
-snapshot loss/expiry retains the existing explicit error behavior. The feature
+this optimization. Missing proofs with complete bodies retain ordinary scanning;
+unsupported-control errors and snapshot loss/expiry remain explicit. The feature
 is opt-in for server-version compatibility.
 
 Caller-provided trigram markers remain insufficient for exact JSON pruning.
@@ -3613,3 +3613,43 @@ server content reads too, but must preserve the same logical validation,
 authorization, ordering and accounting contract. This implementation establishes
 the response contract without trusting caller-maintained certificates or adding
 a new persistent cache.
+
+### Qualification of namespace and tuple changes
+
+The final-artifact controls compare code at `8f1a78f679` with the preceding
+`687cf045a2` binary; the retained consumer is at `95126ee24a`. Each report records
+binary hashes, all trials and verification outside the timed interval. Namespace
+mutations compare revisions against forced rescans. Tuple delivery compares
+expanded match/context data, provenance and logical statistics against v2/v3.
+
+| Workload | macOS | Two-CPU Linux VM |
+| --- | ---: | ---: |
+| Unchanged refresh, 5,000 directories | 410.23 → 0.089 ms | 81.56 → 0.087 ms |
+| One-file edit, 5,000 directories | 405.81 → 0.310 ms | 81.27 → 0.161 ms |
+| Dense v3 → v4 consumer CPU/request, 20K lines | 28.13 → 23.24 ms | 27.82 → 20.19 ms |
+| Dense v3 → v4 producer CPU/request | 7.031 → 5.391 ms | 8.437 → 5.781 ms |
+
+The wide-repository gain removes conservative full discovery above the old
+coverage ceiling; unchanged refresh visits zero source entries and a regular
+one-file edit visits one. It is conditional on intact native-event coverage,
+not a zero-cost filesystem guarantee. Forced rescans and membership/policy
+changes retain their explicit work. The retained reader's memory regression
+checks that consuming a small first frame does not materialize a later 2 MiB
+line, with less than 128 KiB of additional traced Python heap in that control.
+
+These are shared-host, warm-cache measurements. Linux runs in an ARM64 Docker VM
+with namespace fixtures on tmpfs, not independent native Linux hardware or cold
+storage. Raw v2 encoding repeats vary with contention and do not establish a
+general default-v2 speedup. A nine-round Linux repeat did not reproduce the
+earlier v2 CPU gap: median producer CPU was 8.438 → 8.359 ms, with paired
+per-round ratios of 0.965–1.048. Both reports are retained. No additional
+regex/JIT path was justified. Native
+Windows runtime and independent storage/CPU qualification remain future work.
+
+Evidence: [macOS namespace](bench/results/namespace-macos.json),
+[Linux namespace](bench/results/namespace-linux.json),
+[macOS tuple delivery/profiles](bench/results/tuple-macos.json),
+[Linux tuple delivery/profiles](bench/results/tuple-linux.json),
+[macOS native encoding control](bench/results/namespace-encoding-macos.json),
+[Linux native encoding control](bench/results/namespace-encoding-linux.json),
+[Linux nine-round repeat](bench/results/namespace-encoding-linux-repeat.json).
