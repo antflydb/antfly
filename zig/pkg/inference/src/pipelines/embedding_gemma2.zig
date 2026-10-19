@@ -362,6 +362,7 @@ pub const MediaTimings = struct {
     device_owned_peak_bytes: ?u64 = null,
 };
 pub const Options = struct {
+    video_inspection_scope: ?*@import("embedding_gemma2_video.zig").InspectionScope = null,
     video_cache_pins: ?*@import("embedding_gemma2_video.zig").CachePins = null,
     video_decoder: @import("antfly_video").decoding.Options = .{},
     video_ahead: ?*VideoAhead = null,
@@ -407,6 +408,8 @@ pub const VideoAhead = struct {
     permit: @import("../backends/session.zig").RunPermit,
     guard: @import("../execution_control.zig").UninterruptibleGuard,
     pins: *@import("embedding_gemma2_video.zig").CachePins,
+    inspection_scope: *@import("embedding_gemma2_video.zig").InspectionScope,
+    inspection_allocator: *@import("../runtime/bounded_allocator.zig").BoundedAllocator,
     producer: ?*@import("embedding_gemma2_video.zig").Prefetch = null,
     released: bool = false,
     pub fn start(session: Session, movie: SampledVideo, control: Control, cache: ?*FrameCache, request_pool: *media_admission.Pool, decoder: @import("antfly_video").decoding.Options) !?*VideoAhead {
@@ -425,24 +428,35 @@ pub const VideoAhead = struct {
             a.destroy(pins);
         }
 
+        const inspection_allocator = try a.create(@import("../runtime/bounded_allocator.zig").BoundedAllocator);
+        errdefer a.destroy(inspection_allocator);
+        inspection_allocator.* = .{ .backing = a, .limit = host };
+        const inspection_scope = try a.create(@import("embedding_gemma2_video.zig").InspectionScope);
+        errdefer a.destroy(inspection_scope);
+        inspection_scope.* = .{ .allocator = inspection_allocator.allocator(), .limit = host };
+        errdefer inspection_scope.deinit();
         var request_reservation = try request_pool.acquire(.{ .host_bytes = host });
         errdefer request_reservation.deinit();
         const plan = blk: {
             var preflight = try session.admitHostPreprocess(host);
             defer preflight.deinit();
-            var inspection = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = host };
-            defer std.debug.assert(inspection.live == 0);
-            break :blk try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(inspection.allocator(), movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = decoder, .cache_pins = pins }, session.backend() == .metal);
+            errdefer inspection_scope.deinit();
+            const plan = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(inspection_allocator.allocator(), movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = decoder, .cache_pins = pins, .inspection_scope = inspection_scope }, session.backend() == .metal);
+            try inspection_scope.retainPreflight(&preflight);
+            break :blk plan;
         };
+        const runtime_host = try plan.hostBytes();
+        try request_reservation.resize(.{ .host_bytes = try std.math.add(usize, runtime_host, inspection_scope.retainedBytes()) });
+        inspection_allocator.limit = inspection_allocator.live;
         const device = if (session.backend() == .metal) try plan.deviceBytes() else 0;
-        var permit = try session.admitRetainedMedia(host, device);
+        var permit = try session.admitRetainedMedia(runtime_host, device);
         errdefer permit.deinit();
         var guard = try control.enterUninterruptible(session.interruption());
         errdefer guard.deinit();
         const self = try a.create(VideoAhead);
         errdefer a.destroy(self);
-        self.* = .{ .allocator = a, .plan = plan, .movie = movie, .cache = cache, .pins = pins, .decoder = decoder, .bounded = .{ .backing = a, .limit = host }, .pool = .{ .limits = .{ .host_bytes = host, .device_bytes = device, .commands = plan.commands } }, .request_reservation = request_reservation, .permit = permit, .guard = guard };
-        self.producer = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(self.bounded.allocator(), io, context.device, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .cache = cache, .pool = &self.pool, .decoder = decoder, .cache_pins = pins });
+        self.* = .{ .allocator = a, .plan = plan, .movie = movie, .cache = cache, .pins = pins, .inspection_scope = inspection_scope, .inspection_allocator = inspection_allocator, .decoder = decoder, .bounded = .{ .backing = a, .limit = runtime_host }, .pool = .{ .limits = .{ .host_bytes = runtime_host, .device_bytes = device, .commands = plan.commands } }, .request_reservation = request_reservation, .permit = permit, .guard = guard };
+        self.producer = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(self.bounded.allocator(), io, context.device, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .cache = cache, .pool = &self.pool, .decoder = decoder, .cache_pins = pins, .inspection_scope = inspection_scope });
         return self;
     }
     pub fn matches(self: *const VideoAhead, movie: SampledVideo, decoder: @import("antfly_video").decoding.Options, session: Session, cache: ?*FrameCache) bool {
@@ -452,6 +466,10 @@ pub const VideoAhead = struct {
         if (self.released) return;
         if (self.producer) |producer| producer.deinit();
         self.producer = null;
+        self.inspection_scope.deinit();
+        std.debug.assert(self.inspection_allocator.live == 0);
+        self.allocator.destroy(self.inspection_scope);
+        self.allocator.destroy(self.inspection_allocator);
         self.pins.deinit();
         self.allocator.destroy(self.pins);
         std.debug.assert(self.bounded.live == 0);
@@ -697,16 +715,18 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
         },
     };
     if (options.video_ahead) |ahead| {
-        device_bytes = if (session.backend() == .metal) try ahead.plan.deviceBytes() else 0;
-        command_slots = ahead.plan.commands;
+        device_bytes = 0;
+        command_slots = 0;
         sequence_bound = try std.math.add(usize, sequence_bound, ahead.plan.sequence_tokens);
-        preparation_bound = try ahead.plan.hostBytes();
+        preparation_bound = 0;
         vision_bound = ahead.plan.vision_workspace_bytes;
     } else if (has_video) {
         const preflight_bytes = try preflightHostBytes(group);
         bounded.limit = preflight_bytes;
+        if (options.video_inspection_scope) |scope| scope.limit = preflight_bytes;
         var preflight = session.admitHostPreprocess(preflight_bytes) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
         defer preflight.deinit();
+        errdefer if (options.video_inspection_scope) |scope| scope.deinit();
         var host_budget = media_admission.Pool{ .limits = .{ .host_bytes = preflight_bytes } };
         defer std.debug.assert(std.meta.eql(host_budget.snapshot(), media_admission.Resources{}));
         for (group.content) |part| switch (part) {
@@ -716,7 +736,7 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
                 const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
                 const selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null;
                 if (selection != null and packet_reader == null) return error.InvalidVideoReaderSelection;
-                const plan = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &host_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins }, session.backend() == .metal);
+                const plan = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &host_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope }, session.backend() == .metal);
                 device_bytes = @max(device_bytes, try plan.deviceBytes());
                 command_slots = @max(command_slots, plan.commands);
                 sequence_bound = try std.math.add(usize, sequence_bound, plan.sequence_tokens);
@@ -725,15 +745,18 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
             },
             else => {},
         };
+        if (options.video_inspection_scope) |scope| try scope.retainPreflight(&preflight);
     }
     const legacy_workspace = if (session.backend() == .metal)
         try std.math.add(usize, (if (has_video) @as(usize, 1536) else 768) * 1024 * 1024, device_bytes)
     else
         512 * 1024 * 1024;
-    const bounds = if (shape_known and boundedVision(session.backend()) and !has_video)
+    var bounds = if (shape_known and boundedVision(session.backend()))
         try metalGroupBounds(sequence_bound, preparation_bound, vision_bound)
     else
         try executionBounds(shape_known, sequence_bound, preparation_bound, vision_bound, device_bytes, legacy_workspace);
+    if (shape_known and boundedVision(session.backend()) and has_video) bounds.workspace = try std.math.add(usize, bounds.workspace, device_bytes);
+    if (options.video_inspection_scope) |scope| bounds.host = @min(@as(usize, 512 * 1024 * 1024), try std.math.add(usize, bounds.host, scope.retainedBytes()));
     return .{ .bounds = bounds, .input_bytes = input_bytes, .has_video = has_video, .device_bytes = device_bytes, .commands = command_slots };
 }
 
@@ -744,6 +767,9 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     options.video_cache_pins = &pins;
     bounded.limit = 512 * 1024 * 1024;
     const a = bounded.allocator();
+    var inspection_scope = @import("embedding_gemma2_video.zig").InspectionScope{ .allocator = a };
+    defer inspection_scope.deinit();
+    options.video_inspection_scope = &inspection_scope;
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     try validateGroupContent(group, options, session.backend() == .cuda);
     if (session.backend() == .cuda) {
@@ -767,7 +793,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     bounded.limit = bounds.host;
     const video_phases = has_video and videoPhaseAdmission(session.backend(), lock);
     const idle_backend = device_bytes + bounds.sequence * 512 * 4 + 64 * 1024 * 1024;
-    const execution_request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = bounds.sequence, .input_bytes = input_bytes, .host_preprocess_bytes = bounds.host, .workspace_bytes = bounds.workspace, .output_bytes = options.dimensions * @sizeOf(f32) };
+    const execution_request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = bounds.sequence, .input_bytes = input_bytes, .host_preprocess_bytes = bounds.host, .pre_admitted_host_bytes = inspection_scope.retainedBytes(), .workspace_bytes = bounds.workspace, .output_bytes = options.dimensions * @sizeOf(f32) };
     var permit = admitWithVisionCacheReclaim(session, if (video_phases) queuedVideoRequest(execution_request, idle_backend) else execution_request, effective) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
     defer permit.deinit();
     // Video parts execute sequentially; their transient preparation shares use
@@ -790,7 +816,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
                     const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
                     const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
                     const selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null;
-                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(a, io, context.device, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &video_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins });
+                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(a, io, context.device, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &video_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope });
                     break;
                 },
                 else => {},
@@ -851,11 +877,15 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     // The rendered sequence is now known for every media type. Projection has
     // drained preparation; keep its live host owners and projected input while
     // returning idle vision/decode headroom before admitting the next window.
+    if (options.video_ahead) |ahead| ahead.release() else if (prefetched) |producer| {
+        producer.deinit();
+        prefetched = null;
+    }
+    inspection_scope.deinit();
     const phase = try videoBackboneBounds(session.backend() == .metal, count, bounds.workspace);
     const phase_host = @min(bounds.host, @max(bounded.live, phase.host));
     try lane.retain(.{ .batch = 1, .sequence = count, .input_bytes = input_bytes, .backend_input_bytes = if (session.backend() == .metal) count * 512 * 4 else null, .preprocessing_complete = session.backend() == .metal, .workspace_planned = session.backend() == .metal, .host_preprocess_bytes = phase_host, .workspace_bytes = phase.workspace, .output_bytes = options.dimensions * @sizeOf(f32) });
     bounded.limit = phase_host;
-    if (options.video_ahead) |ahead| ahead.release();
     if (options.video_prepared) |hook| try hook.ready(hook.context);
     const mask = prepared.mask;
     if (prepared.embeddings == null and prepared.tensor == null) {
@@ -888,10 +918,14 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = workspaceBackingAllocator(session.backend()), .limit = 64 * 1024 * 1024 };
     const a = bounded.allocator();
+    var inspection_scope = @import("embedding_gemma2_video.zig").InspectionScope{ .allocator = a };
     defer std.debug.assert(bounded.live == 0);
+    defer inspection_scope.deinit();
+    options.video_inspection_scope = &inspection_scope;
     var preflight = try session.admitHostPreprocess(64 * 1024 * 1024);
     var preflight_live = true;
     defer if (preflight_live) preflight.deinit();
+    errdefer inspection_scope.deinit();
     const running_ahead = for (items) |item| {
         if (item.ahead != null) break true;
     } else false;
@@ -904,18 +938,22 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     var device: usize = 0;
     var commands: u64 = 0;
     var host: usize = 64 * 1024 * 1024;
+    var vision_workspace: usize = 0;
     for (items) |item| {
         const movie = item.movie;
         try control.check();
         if (item.ahead) |ahead| if (ahead.released or !ahead.matches(movie, options.video_decoder, session, cache)) return error.InvalidVideoReaderSelection;
-        const plan = if (item.ahead) |ahead| ahead.plan else if (item.plan) |plan| try @import("embedding_gemma2_video.zig").pinCachedPlan(plan.*, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins }) else try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins }, session.backend() == .metal);
+        const plan = if (item.ahead) |ahead| ahead.plan else if (item.plan) |plan| try @import("embedding_gemma2_video.zig").pinCachedPlan(plan.*, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins }) else try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope }, session.backend() == .metal);
         const sequence = try std.math.add(usize, plan.sequence_tokens, 128);
         longest = @max(longest, sequence);
         raw_longest = @max(raw_longest, plan.sequence_tokens);
         total = try std.math.add(usize, total, plan.sequence_tokens);
-        device = @max(device, try plan.deviceBytes());
-        commands = @max(commands, plan.commands);
-        host = @max(host, try plan.hostBytes());
+        if (item.ahead == null) {
+            device = @max(device, try plan.deviceBytes());
+            commands = @max(commands, plan.commands);
+            host = @max(host, try plan.hostBytes());
+        }
+        vision_workspace = @max(vision_workspace, plan.vision_workspace_bytes);
     }
     // Avoid padding-heavy cohorts. The runner falls back to independent calls.
     const compact_policy = encoder.compactRowsEnabled(session.backend() == .metal);
@@ -925,14 +963,16 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         if (longest > 2048 or raw_longest * items.len * 4 > total * 5) return error.BatchIncompatible;
         if (session.backend() == .metal and encoder.metalBatchCapacity(raw_longest, items.len) < items.len) return error.BatchIncompatible;
     }
+    try inspection_scope.retainPreflight(&preflight);
     preflight.deinit();
     preflight_live = false;
-    bounded.limit = 512 * 1024 * 1024;
+    const metal_bounds = if (boundedVision(session.backend())) try metalGroupBounds(total + items.len * 128, host, vision_workspace) else null;
+    bounded.limit = if (metal_bounds) |bounds| @min(@as(usize, 512 * 1024 * 1024), try std.math.add(usize, bounds.host, inspection_scope.retainedBytes())) else 512 * 1024 * 1024;
     if (host > bounded.limit) return error.MemoryBudgetExceeded;
-    const workspace = try std.math.add(usize, (if (session.backend() == .metal) @as(usize, 1536) else 512) * 1024 * 1024, if (session.backend() == .metal) device else 0);
+    const workspace = try std.math.add(usize, if (metal_bounds) |bounds| bounds.workspace else (if (session.backend() == .metal) @as(usize, 1536) else 512) * 1024 * 1024, if (session.backend() == .metal) device else 0);
     const video_phases = videoPhaseAdmission(session.backend(), lock);
     const idle_backend = device + total * 512 * 4 + 64 * 1024 * 1024;
-    const execution_request: @import("../backends/session.zig").RunRequest = .{ .batch = if (compact_policy) 1 else items.len, .sequence = if (compact_policy) total + items.len * 128 else longest, .host_preprocess_bytes = bounded.limit, .workspace_bytes = workspace, .output_bytes = items.len * options.dimensions * 4 };
+    const execution_request: @import("../backends/session.zig").RunRequest = .{ .batch = if (compact_policy) 1 else items.len, .sequence = if (compact_policy) total + items.len * 128 else longest, .host_preprocess_bytes = bounded.limit, .pre_admitted_host_bytes = inspection_scope.retainedBytes(), .workspace_bytes = workspace, .output_bytes = items.len * options.dimensions * 4 };
     var permit = try admitWithVisionCacheReclaim(session, if (video_phases) queuedVideoRequest(execution_request, idle_backend) else execution_request, control);
     defer permit.deinit();
     var pool = media_admission.Pool{ .limits = .{ .host_bytes = host, .device_bytes = if (session.backend() == .metal) device else 0, .commands = if (session.backend() == .metal) commands else 0 } };
@@ -970,6 +1010,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         }
     }
     for (rows[0..initialized]) |row| if (row.ids.len > longest) return error.MemoryBudgetExceeded;
+    inspection_scope.deinit();
     const batch_inputs = try packVideoRows(a, cb, rows[0..initialized]);
     defer batch_inputs.deinit(a, cb);
     // Use the established activation/attention envelope over all padded rows.
@@ -2018,7 +2059,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                 const encoded = if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encodeAllocStaged(a, cb, cb.embedding_stage);
-                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins });
+                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope });
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
                 errdefer if (owned) {
@@ -5044,4 +5085,52 @@ test "embeddinggemma2 nonvideo Metal fallback admits larger actual backbone with
     try std.testing.expectEqual(peer_before, peer.lease.?.amounts);
     try std.testing.expectEqual(phase.workspace + peer_before.backend_scratch_bytes, controller.snapshot().backend_scratch_bytes);
     try std.testing.expect(lane.extra != null);
+}
+
+test "embeddinggemma2 ahead preparation is charged once under a tight shared device limit" {
+    const a = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 512 * 1024 * 1024, .backend_limit_bytes = 320 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var ahead: VideoAhead = undefined;
+    ahead.plan = .{ .pictures = 32, .sequence_tokens = 3000, .commands = 17, .device_preparation_bytes = 12 * 1024 * 1024 };
+    const device = try ahead.plan.deviceBytes();
+    var owner = try session.admitRetainedMedia(32 * 1024 * 1024, device);
+    defer owner.deinit();
+    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 512 * 1024 * 1024 };
+    const group = Group{ .content = &.{.{ .sampled_video = .{ .sampling = .reference } }} };
+    const view = try inspectGroup(&bounded, session, .{ .vision = true }, group, .{ .video_ahead = &ahead }, .{});
+    try std.testing.expectEqual(@as(usize, 0), view.device_bytes);
+    try std.testing.expectEqual(@as(u64, 0), view.commands);
+    try std.testing.expect(view.bounds.host < 256 * 1024 * 1024);
+    const idle = view.device_bytes + view.bounds.sequence * 512 * 4 + 64 * 1024 * 1024;
+    var consumer = try session.admit(queuedVideoRequest(.{ .batch = 1, .sequence = view.bounds.sequence, .host_preprocess_bytes = view.bounds.host, .workspace_bytes = view.bounds.workspace, .output_bytes = 768 * 4 }, idle));
+    defer consumer.deinit();
+    try std.testing.expectEqual(device + idle, controller.snapshot().backend_scratch_bytes);
+}
+
+test "embeddinggemma2 inspection host lease transfers before preflight ends and is credited once" {
+    const a = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .backend_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var preflight = try session.admitHostPreprocess(64 * 1024 * 1024);
+    defer preflight.deinit();
+    var scope = @import("embedding_gemma2_video.zig").InspectionScope{ .allocator = a, .limit = 64 * 1024 * 1024 };
+    defer scope.deinit();
+    _ = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, @embedFile("../testdata/video/mjpeg.mov"), null, .{}, .{ .inspection_scope = &scope }, true);
+    const retained = scope.retainedBytes();
+    try scope.retainPreflight(&preflight);
+    try std.testing.expectEqual(retained, controller.snapshot().host_scratch_bytes);
+    preflight.deinit();
+    try std.testing.expectEqual(retained, controller.snapshot().host_scratch_bytes);
+    var consumer = try session.admit(.{ .input_bytes = 0, .host_preprocess_bytes = retained + 8 * 1024 * 1024, .pre_admitted_host_bytes = retained, .backend_input_bytes = 0, .workspace_planned = true, .workspace_bytes = 1, .output_bytes = 0 });
+    defer consumer.deinit();
+    try std.testing.expectEqual(retained + 8 * 1024 * 1024, controller.snapshot().host_scratch_bytes);
+    scope.deinit();
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), controller.snapshot().host_scratch_bytes);
 }

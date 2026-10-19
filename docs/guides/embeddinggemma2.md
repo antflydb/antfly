@@ -1824,6 +1824,18 @@ coefficient upload or preparer creation. All decoder/reference slots remain
 reserved whenever any selected picture needs decoding; only selected-output
 surface counts shrink.
 
+Validated video inspection metadata survives preflight under its own reduced
+host lease. Preparation borrows the selected pictures, container/index metadata
+and AVC configuration epochs instead of repeating those scans. Decoder replay
+keeps its IO and allocations separate from immutable metadata. Ahead producers
+retain their own preparation leases; consumers reserve only their new buffers,
+and drained producer metadata retires before backbone admission grows.
+
+Qualified Metal host bounds describe metadata, one decoder/preparation producer,
+queued CPU patches when applicable, and token composition. GPU activations stay
+in the backend plan. Cached video avoids decoder/conversion allowances as well
+as device preparation, and retained inspection metadata receives explicit credit.
+
 Metal preparation uses buffer-layout estimates independent of CPU RGB/repacking
 scratch. Uploads, chroma reconstruction and independent outputs are included;
 slab or external destinations exclude duplicate command output credit. Immutable

@@ -255,6 +255,13 @@ and context remain immutable while a range is borrowed. Video selection/cache
 bindings combine this proof with track, packet and sampling metadata without
 fetching every payload. Ordinary borrowed bytes and unverified range providers
 retain full content validation; a display identity alone never enables reuse.
+Video execution can also retain the validated packet/index metadata and selected
+picture list in a request inspection scope. The reduced preflight host lease
+stays live until producer cleanup; decoder allocation and IO counters belong to
+the executing worker. Runtime admission credits this metadata exactly once and
+excludes independently admitted ahead-producer buffers. Inputs, indexes and
+range-provider configuration remain immutable through worker shutdown.
+
 A request may reuse its validated binding while its borrowed bytes, provider
 configuration and packet metadata remain immutable and owned through worker
 shutdown. This memo is discarded with the admission scope, so a new request

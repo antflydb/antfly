@@ -971,6 +971,28 @@ output from command credit. Page/row rounding and a fixed command allowance are
 included; CPU conversion/repacking bounds remain separate. The planner allows
 independent output as a conservative fallback when a slab cannot fit.
 
+A request inspection scope retains validated container metadata, the selected
+picture list, WebM indexes and dynamic AVC parameter epochs. Preflight reduces
+and transfers its host lease before execution admission; workers borrow the
+metadata with independent IO counters and decoder allocations. Borrowed inputs
+and provider configuration stay immutable until the worker joins. Cached work
+can publish its selected pictures without repeating indexing or parameter scans.
+Dynamic AVC replay uses a temporary registry view whose allocations belong to
+the executing decoder, leaving the retained registry unchanged.
+
+Ahead producers keep their preparation resources on independent leases. A
+consumer reserves only preparation it actually owns, plus its projected inputs
+and compute work. Drained producer/inspection owners retire before backbone
+admission grows. Metadata residency receives explicit host credit until release;
+producer request pools cover metadata and runtime storage together.
+
+Host preparation bounds cover one decoder and one active RGB/resize producer.
+CPU queues retain final patches; Metal queues retain device buffers. Configured
+decoder allowances remain explicit, and fully cached selections need neither
+decoder nor active conversion scratch. Qualified Metal groups/cohorts use host
+composition bounds instead of charging GPU language/vision activations to host
+memory; unsupported planning policies retain their conservative envelopes.
+
 The six immutable preparation PSOs share a synchronized, single-device cache.
 Replacing that bounded entry leaves active preparers' strong references valid.
 Queues, CoreVideo imports, slabs, geometry coefficients and tone LUTs remain

@@ -38,7 +38,7 @@ pub const Pins = struct {
     keys: [128]Key = undefined,
     // Valid only within this immutable borrowed-input scope, never a global
     // shortcut around validating mutable/unverified sources on a new request.
-    bindings: [32]struct { input: [32]u8, clip: [32]u8 } = undefined,
+    bindings: [128]struct { input: [32]u8, clip: [32]u8 } = undefined,
     binding_count: usize = 0,
     pub fn binding(self: *const Pins, input: [32]u8) ?[32]u8 {
         for (self.bindings[0..self.binding_count]) |value| if (std.mem.eql(u8, &input, &value.input)) return value.clip;

@@ -427,6 +427,19 @@ pub const Session = struct {
         for (self.epochs.items) |epoch| if (index >= epoch.start and index < epoch.end) return epoch;
         return error.MissingVideoParameterSet;
     }
+    /// Replay an immutable registry with request-local IO, cancellation counters
+    /// and decoder allocation ownership. Only metadata slices are shared; this
+    /// temporary view is never deinitialized as a registry owner.
+    pub fn decodeSelectedBorrowed(self: *const Session, allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, context: *anyopaque, callback: h264.SelectionCallback) !h264.Statistics {
+        if (reader.packets.ptr != self.reader.packets.ptr or reader.packets.len != self.reader.packets.len) return error.InvalidPacketIndex;
+        var borrowed = self.*;
+        borrowed.reader = reader;
+        borrowed.backing = allocator;
+        borrowed.budget.backing = allocator;
+        const live = borrowed.budget.live;
+        defer std.debug.assert(borrowed.budget.live == live);
+        return borrowed.decodeSelected(indexes, context, callback);
+    }
     pub fn decodeSelected(self: *Session, indexes: []const usize, context: *anyopaque, callback: h264.SelectionCallback) !h264.Statistics {
         if (indexes.len == 0 or indexes.len > self.options.max_dependency_packets) return error.ResourceLimitExceeded;
         for (indexes) |index| if (index >= self.reader.packets.len) return error.InvalidPacketIndex;
