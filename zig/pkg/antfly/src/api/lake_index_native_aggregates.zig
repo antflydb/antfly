@@ -619,10 +619,15 @@ const Reduction = struct {
                 if (try lookup.lookup(self.out, lookup_key)) |value| refs[slot] = value.artifact else complete = false;
             } else complete = false;
         }
-        const alias_start = self.contributions.items.len;
+        const aliases = try self.out.alloc(std.ArrayList([32]u8), self.names.len);
+        @memset(aliases, .empty);
+        defer {
+            for (aliases) |*list| list.deinit(self.out);
+            self.out.free(aliases);
+        }
         const was_complete = complete;
-        if (!complete and self.recipe.keys.len != 0 and left.refs[0].metadata_version == 3 and right.refs[0].metadata_version == 3) {
-            const published = try self.mergePartitions(left, right, null);
+        if (!complete and self.recipe.keys.len != 0 and artifacts.isPartitioned(left.refs[0].metadata_version) and artifacts.isPartitioned(right.refs[0].metadata_version)) {
+            const published = try self.mergePartitions(left, right, null, aliases, 0);
             @memcpy(refs, published);
             self.out.free(published);
             complete = true;
@@ -637,8 +642,8 @@ const Reduction = struct {
             @memcpy(refs, published);
             self.out.free(published);
         }
-        if (was_complete and self.recipe.keys.len != 0 and left.refs[0].metadata_version == 3 and right.refs[0].metadata_version == 3) {
-            self.out.free(try self.mergePartitions(left, right, refs));
+        if (was_complete and self.recipe.keys.len != 0 and artifacts.isPartitioned(left.refs[0].metadata_version) and artifacts.isPartitioned(right.refs[0].metadata_version)) {
+            self.out.free(try self.mergePartitions(left, right, refs, aliases, 0));
         }
         for (self.names, refs, 0..) |name, ref, slot| {
             const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
@@ -647,7 +652,7 @@ const Reduction = struct {
             try owned.append(self.out, contributionKey(right.key, single.fingerprint(), name));
             // Range aliases are recipe-local; child ownership handles all
             // descendants. Each record stays bounded independently of files.
-            for (self.contributions.items[alias_start..]) |alias| if (std.mem.eql(u8, alias.name, name) and std.mem.eql(u8, &alias.recipe, &single.fingerprint())) try owned.append(self.out, contributionKey(alias.file, alias.recipe, alias.name));
+            try owned.appendSlice(self.out, aliases[slot].items);
             try self.contributions.append(self.out, .{ .file = key, .recipe = single.fingerprint(), .name = name, .artifact = ref, .owned = try owned.toOwnedSlice(self.out), .radix = range });
         }
         return .{ .key = key, .range = range, .refs = refs };
@@ -775,7 +780,14 @@ const Reduction = struct {
         index.delta_reductions += 1;
         return root;
     }
-    fn mergePartitions(self: *@This(), left: Leaf, right: Leaf, known: ?[]const local.serverless_manifest_artifact_ref.ArtifactRef) ![]local.serverless_manifest_artifact_ref.ArtifactRef {
+    fn splitRefs(self: *@This(), refs: []const local.serverless_manifest_artifact_ref.ArtifactRef, depth: u8) ![]const local.serverless_manifest_artifact_ref.ArtifactRef {
+        if (artifacts.isPartitioned(refs[0].metadata_version)) return refs;
+        const group = try operators.Grouped.create(self.a, self.specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
+        defer group.deinit();
+        try importContributions(self.a, self.store, refs, self.recipe, group, self.cancellation);
+        return artifacts.publishPartitionedAt(self.a, self.out, self.store, self.names, group, self.recipe, self.spill, self.cancellation, depth);
+    }
+    fn mergePartitions(self: *@This(), left: Leaf, right: Leaf, known: ?[]const local.serverless_manifest_artifact_ref.ArtifactRef, ownership: []std.ArrayList([32]u8), depth: u8) anyerror![]local.serverless_manifest_artifact_ref.ArtifactRef {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
@@ -787,11 +799,12 @@ const Reduction = struct {
         const current = try a.alloc([]const Part, self.names.len);
         for (self.names, 0..) |_, slot| {
             const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
+            if (try artifacts.partitionDepth(a, self.store.*, left.refs[slot], single, self.cancellation) != depth or try artifacts.partitionDepth(a, self.store.*, right.refs[slot], single, self.cancellation) != depth) return error.InvalidNativeAggregateArtifact;
             lparts[slot] = try artifacts.loadPartitions(a, self.store.*, left.refs[slot], single, self.cancellation);
             rparts[slot] = try artifacts.loadPartitions(a, self.store.*, right.refs[slot], single, self.cancellation);
             if (known) |roots| current[slot] = try artifacts.loadPartitions(a, self.store.*, roots[slot], single, self.cancellation);
         }
-        for (0..64) |bucket| {
+        for (0..artifacts.partitionFanout(depth)) |bucket| {
             const occupied_left = for (lparts[0]) |part| {
                 if (part.bucket == bucket) break true;
             } else false;
@@ -810,6 +823,11 @@ const Reduction = struct {
             var right_present = false;
             var count: u64 = 0;
             var complete = true;
+            const child_aliases = try pa.alloc(std.ArrayList([32]u8), self.names.len);
+            @memset(child_aliases, .empty);
+            defer for (child_aliases) |*list| list.deinit(self.out);
+            const prior_records = try pa.alloc(?local.metadata_lake_index_catalog.FileContribution, self.names.len);
+            @memset(prior_records, null);
             for (self.names, 0..) |name, slot| {
                 const lp = for (lparts[slot]) |part| {
                     if (part.bucket == bucket) break part;
@@ -824,39 +842,52 @@ const Reduction = struct {
                 if (left_present != (lp != null) or right_present != (rp != null)) return error.InvalidNativeAggregateArtifact;
                 if (lp) |part| {
                     lrefs[slot] = part.artifact;
-                    count = part.groups;
+                    if (slot == 0) count = part.groups;
                 }
                 if (rp) |part| {
                     rrefs[slot] = part.artifact;
-                    count = part.groups;
+                    if (slot == 0) count += part.groups;
                 }
                 if (!left_present or !right_present) continue;
                 var hash = std.crypto.hash.sha2.Sha256.init(.{});
-                hash.update("native-group-partition-v1");
-                hash.update(&.{@intCast(bucket)});
+                hash.update("native-group-partition-v2");
+                hash.update(&.{ @intCast(bucket), depth });
                 hash.update(lrefs[slot].artifact_id);
                 hash.update(rrefs[slot].artifact_id);
                 keys[slot] = hash.finalResult();
                 const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
                 const key = contributionKey(keys[slot], single.fingerprint(), name);
+                if (self.old.get(key)) |old| prior_records[slot] = self.previous[old] else if (self.index) |index| prior_records[slot] = try index.lookup(pa, key);
                 if (known != null) {
                     const part = for (current[slot]) |part| {
                         if (part.bucket == bucket) break part;
                     } else return error.InvalidNativeAggregateArtifact;
                     refs[slot] = part.artifact;
                     count = part.groups;
-                } else if (self.old.get(key)) |old| refs[slot] = self.previous[old].artifact else if (self.index) |index| {
-                    if (try index.lookup(pa, key)) |value| refs[slot] = value.artifact else complete = false;
-                } else complete = false;
+                } else if (prior_records[slot]) |record| refs[slot] = record.artifact else complete = false;
             }
             if (!left_present and !right_present) continue;
             if (left_present and right_present) {
-                if (!complete) {
+                const nested = artifacts.isPartitioned(lrefs[0].metadata_version) or artifacts.isPartitioned(rrefs[0].metadata_version);
+                const missing_ownership = for (prior_records) |record| {
+                    if (record == null) break true;
+                } else false;
+                if (nested and (!complete or missing_ownership)) {
+                    if (depth == artifacts.max_partition_depth) return error.InvalidNativeAggregateArtifact;
+                    const lsplit = try self.splitRefs(lrefs, depth + 1);
+                    const rsplit = try self.splitRefs(rrefs, depth + 1);
+                    const merged = try self.mergePartitions(.{ .key = @splat(0), .refs = lsplit }, .{ .key = @splat(0), .refs = rsplit }, if (complete) refs else null, child_aliases, depth + 1);
+                    if (!complete) @memcpy(refs, merged);
+                    self.out.free(merged);
+                } else if (!complete) {
                     const group = try operators.Grouped.create(self.a, self.specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
                     defer group.deinit();
                     try importContributions(self.a, self.store, lrefs, self.recipe, group, self.cancellation);
                     try importContributions(self.a, self.store, rrefs, self.recipe, group, self.cancellation);
-                    const published = try artifacts.publishCohort(self.a, pa, self.store, self.names, group, self.recipe, self.cancellation);
+                    const published = if (depth < artifacts.max_partition_depth and count > artifacts.partition_leaf_groups)
+                        try artifacts.publishPartitionedAt(self.a, pa, self.store, self.names, group, self.recipe, self.spill, self.cancellation, depth + 1)
+                    else
+                        try artifacts.publishCohort(self.a, pa, self.store, self.names, group, self.recipe, self.cancellation);
                     @memcpy(refs, published);
                     pa.free(published);
                 }
@@ -867,7 +898,10 @@ const Reduction = struct {
                 for (refs, keys, self.names, 0..) |ref, key, name, slot| {
                     const one: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
                     // Lookup metadata must outlive the scratch reader arena.
-                    const bytes = try std.json.Stringify.valueAlloc(self.out, local.metadata_lake_index_catalog.FileContribution{ .file = key, .recipe = one.fingerprint(), .name = name, .artifact = ref }, .{});
+                    const alias = contributionKey(key, one.fingerprint(), name);
+                    try ownership[slot].append(self.out, alias);
+                    const held: ?[]const [32]u8 = if (prior_records[slot]) |record| record.owned else if (child_aliases[slot].items.len != 0) child_aliases[slot].items else null;
+                    const bytes = try std.json.Stringify.valueAlloc(self.out, local.metadata_lake_index_catalog.FileContribution{ .file = key, .recipe = one.fingerprint(), .name = name, .artifact = ref, .owned = held }, .{});
                     defer self.out.free(bytes);
                     try self.contributions.append(self.out, try std.json.parseFromSliceLeaky(local.metadata_lake_index_catalog.FileContribution, self.out, bytes, .{ .allocate = .alloc_always }));
                 }
@@ -882,7 +916,7 @@ const Reduction = struct {
             }
         }
         if (known != null) return self.out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, 0);
-        return artifacts.publishPartitionRoots(self.a, self.out, self.store, self.names, self.recipe, lists, self.cancellation);
+        return artifacts.publishPartitionRootsAt(self.a, self.out, self.store, self.names, self.recipe, lists, self.cancellation, depth);
     }
     fn bitAt(key: [32]u8, bit: usize) bool {
         return (key[bit / 8] & (@as(u8, 128) >> @as(u3, @intCast(bit % 8)))) != 0;
@@ -1367,7 +1401,7 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
             const recipe = try artifacts.loadRecipe(output.allocator(), store, declaration.artifact, .none);
             const reader = try artifacts.Reader.open(a, store, declaration.artifact, recipe, .none);
             defer reader.cursor().close(reader);
-            try std.testing.expectEqual(@as(u16, 3), declaration.artifact.metadata_version);
+            try std.testing.expectEqual(@as(u16, 4), declaration.artifact.metadata_version);
             if (phase == 1) {
                 const before = try artifacts.loadPartitions(output.allocator(), store, previous.declarations[slot].artifact, recipe, .none);
                 const after = try artifacts.loadPartitions(output.allocator(), store, declaration.artifact, recipe, .none);
@@ -1395,4 +1429,94 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
         }
         previous = built;
     }
+}
+
+test "external lake recursive group partitions retain sibling artifacts on a single group update" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("recursive-group-delta");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @import("lake_index_publication.zig").uploadDomain(4, @splat(9)), .attempt = @splat(1) };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } };
+    const recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "id", .type = .integer, .nullable = false }}, .inputs = &.{ .{ .spec = specs[0], .column = null }, .{ .spec = specs[1], .column = .{ .path = "amount", .type = .integer, .nullable = false } } } };
+    const base = try operators.Grouped.create(a, &specs, .{});
+    defer base.deinit();
+    var first: i64 = -1;
+    var candidate: i64 = 0;
+    var count: usize = 0;
+    while (count < 1400) : (candidate += 1) {
+        var bytes: [9]u8 = @splat(0);
+        std.mem.writeInt(u64, bytes[1..9], try local.sql_scalar.semanticHash(.{ .integer = candidate }), .little);
+        var hash = std.hash.Wyhash.init(0);
+        hash.update(&bytes);
+        if (hash.final() % 64 != 0) continue;
+        if (first < 0) first = candidate;
+        try base.add(&.{local.sql_scalar.Datum.fromJson(.{ .integer = candidate })}, &.{ local.sql_scalar.Datum.fromJson(.{ .integer = 1 }), local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 }) });
+        count += 1;
+    }
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const names = &.{ "stats.rows", "stats.sum" };
+    const single: recipes.Recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] };
+    const prior = try artifacts.publishPartitioned(a, out, &store, names, base, recipe, &manager, .none);
+    const delta = try operators.Grouped.create(a, &specs, .{});
+    defer delta.deinit();
+    try delta.add(&.{local.sql_scalar.Datum.fromJson(.{ .integer = first })}, &.{ local.sql_scalar.Datum.fromJson(.{ .integer = 1 }), local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 }) });
+    const fresh = try artifacts.publishPartitioned(a, out, &store, names, delta, recipe, &manager, .none);
+    var old: ContributionIndex = .empty;
+    defer old.deinit(a);
+    var contributions: std.ArrayList(local.metadata_lake_index_catalog.FileContribution) = .empty;
+    var reduction: Reduction = .{ .a = a, .out = out, .store = &store, .recipe = recipe, .specs = &specs, .names = names, .old = &old, .previous = &.{}, .contributions = &contributions, .spill = &manager, .cancellation = .none };
+    var ownership = [_]std.ArrayList([32]u8){ .empty, .empty };
+    defer for (&ownership) |*list| list.deinit(out);
+    const merged = try reduction.mergePartitions(.{ .key = @splat(1), .refs = prior }, .{ .key = @splat(2), .refs = fresh }, null, &ownership, 0);
+    const before_root = try artifacts.loadPartitions(out, store, prior[0], single, .none);
+    const after_root = try artifacts.loadPartitions(out, store, merged[0], single, .none);
+    try std.testing.expectEqual(@as(usize, 1), before_root.len);
+    try std.testing.expectEqual(@as(u16, 4), before_root[0].artifact.metadata_version);
+    const before = try artifacts.loadPartitions(out, store, before_root[0].artifact, single, .none);
+    const after = try artifacts.loadPartitions(out, store, after_root[0].artifact, single, .none);
+    var reused: usize = 0;
+    for (before) |l| for (after) |r| {
+        if (std.mem.eql(u8, l.artifact.artifact_id, r.artifact.artifact_id)) reused += 1;
+    };
+    try std.testing.expect(before.len > 1);
+    try std.testing.expectEqual(before.len - 1, reused);
+    var collector: @import("lake_index_gc.zig").Collector = .{ .a = out, .table = 4, .authority = undefined, .store = store, .identity = @splat(9), .context = .{}, .token = @splat(7), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 16 * 1024 * 1024 };
+    try collector.markArtifact(out, merged[0]);
+    try std.testing.expect(collector.marked.contains(merged[0].artifact_id));
+    for (after) |part| try std.testing.expect(collector.marked.contains(part.artifact.artifact_id));
+    var index: @import("lake_index_contributions.zig").Index = undefined;
+    try index.init(a, store, null, .none);
+    defer index.deinit();
+    index.counted = true;
+    for (ownership) |list| for (list.items) |key| try index.includeRoot(key);
+    _ = try index.update(contributions.items);
+    for (contributions.items) |value| if (value.owned) |owned| {
+        try std.testing.expect(owned.len <= 64);
+    };
+    const reader = try artifacts.Reader.open(a, store, merged[0], single, .none);
+    defer reader.cursor().close(reader);
+    const sum_reader = try artifacts.Reader.open(a, store, merged[1], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none);
+    defer sum_reader.cursor().close(sum_reader);
+    try reader.setOutputSlot(0);
+    try std.testing.expect(try reader.fuse(sum_reader, 1));
+    const grouped = try operators.Grouped.create(a, &specs, .{});
+    defer grouped.deinit();
+    while (try reader.cursor().next(reader, out, 71)) |rows| for (rows) |row| try grouped.importPartialMapped(row.keys, row.aggregates, row.aggregate_slots, row.ordinal);
+    count = 0;
+    while (try grouped.nextResult(out)) |row| {
+        try std.testing.expectEqual(@as(i64, if (row.keys[0].value.integer == first) 2 else 1), row.aggregates[0].value.integer);
+        try std.testing.expectEqual(@as(i64, if (row.keys[0].value.integer == first) 18014398509481986 else 9007199254740993), row.aggregates[1].value.integer);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1400), count);
 }

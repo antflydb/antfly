@@ -226,6 +226,9 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         fresh.files = &.{};
         fresh.file_fingerprints = &.{};
         fresh.cover = cover;
+        fresh.source_cut = delta.source_cut;
+        fresh.checkpoint_base = delta.checkpoint_base;
+        fresh.pending_files = delta.pending_files;
         return persistRoot(a, result_alloc, store, fresh, name, cancellation, previous, true, sort.manager, dictionary);
     }
     var reverse_storage = pages.store();
@@ -2101,4 +2104,80 @@ test "external lake ordered retirement planning visits explicit changed slots on
     try std.testing.expectEqual(@as(?u32, null), try legacy.next());
     var invalid: Retirements = .{ .keep = keep, .slots = &.{0} };
     try std.testing.expectError(error.InvalidNativeLakeRowIndex, invalid.next());
+}
+
+test "external lake sparse empty publication advances logical commitments" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("empty-native-cut");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(5), .attempt = @splat(1) };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 512 * 1024);
+    defer sort.deinit();
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &.{} };
+    const ref = try publish(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{}, .none);
+    const root = try loadRootLazy(ca, store, ref, .none, null);
+    const next = try publishIncremental(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{}, .none, .{
+        .previous = root,
+        .sparse_slots = true,
+        .dictionary_edits = &.{},
+        .retired_slots = &.{},
+        .public_navigation = .{ .root = null, .count = 0, .source = inventory.source_id, .snapshot = inventory.snapshot_id },
+        .source_cut = @splat(7),
+        .checkpoint_base = @splat(8),
+        .pending_files = 0,
+    });
+    const fresh = try loadRootLazy(ca, store, next, .none, null);
+    try std.testing.expectEqualDeep(@as(?[32]u8, @splat(7)), fresh.source_cut);
+    try std.testing.expectEqualDeep(@as(?[32]u8, @splat(8)), fresh.checkpoint_base);
+    try std.testing.expectEqual(@as(u32, 0), fresh.pending_files);
+    const Public = struct {
+        fn make(alloc: A, backend: *stores.ArtifactStore, names: []const []const u8) !file_dictionary.Public {
+            var reads: u64 = 16 * 1024 * 1024;
+            var writes: u64 = 16 * 1024 * 1024;
+            var pages: page_store.PageStore = .{ .domain = backend.upload_scope.?.domain, .attempt = backend.upload_scope.?.attempt, .artifacts = backend, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            const Item = struct { key: [32]u8, name: []const u8 };
+            const items = try alloc.alloc(Item, names.len);
+            for (items, names) |*item, name| item.* = .{ .key = local.storage_rowsource_identity.navigationDigest(1, "lake", "snapshot", name), .name = name };
+            std.mem.sort(Item, items, {}, struct {
+                fn less(_: void, l: Item, r: Item) bool {
+                    return std.mem.lessThan(u8, &l.key, &r.key);
+                }
+            }.less);
+            var builder: tree.SortedBuilder = .{ .alloc = alloc, .store = pages.store() };
+            defer builder.deinit();
+            for (items) |item| try builder.add(&item.key, item.name);
+            return .{ .root = try builder.finish(), .count = @intCast(names.len), .source = "lake", .snapshot = "snapshot" };
+        }
+    };
+    const files = [_]local.serverless_external_source_types.FileEntry{
+        .{ .file_id = @constCast("f1"), .object_uri = @constCast("file://f1"), .byte_len = 1, .row_count = 0, .row_groups = &.{} },
+        .{ .file_id = @constCast("f2"), .object_uri = @constCast("file://f2"), .byte_len = 1, .row_count = 0, .row_groups = &.{} },
+        .{ .file_id = @constCast("f3"), .object_uri = @constCast("file://f3"), .byte_len = 1, .row_count = 0, .row_groups = &.{} },
+    };
+    var census = inventory;
+    census.files = @constCast(files[0..1]);
+    const prior_ref = try publishIncremental(a, ca, &store, &sort, "ordered", @splat(3), census, &.{}, .none, .{ .public_navigation = try Public.make(ca, &store, &.{"f1"}), .files = &.{"f1"}, .fingerprints = &.{@splat(1)}, .source_cut = @splat(3), .checkpoint_base = @splat(4) });
+    const prior = try loadRootLazy(ca, store, prior_ref, .none, null);
+    census.files = @constCast(&files);
+    const shared = try Public.make(ca, &store, &.{ "f1", "f2", "f3" });
+    const partial_ref = try publishIncremental(a, ca, &store, &sort, "ordered", @splat(3), census, &.{}, .none, .{ .previous = prior, .sparse_slots = true, .retired_slots = &.{}, .dictionary_edits = &.{ .{ .slot = 1, .file = "f2", .fingerprint = @splat(2) }, .{ .slot = 2, .file = "f3", .fingerprint = @splat(0) } }, .public_navigation = shared, .source_cut = @splat(7), .checkpoint_base = @splat(8), .pending_files = 1 });
+    const partial = try loadRootLazy(ca, store, partial_ref, .none, null);
+    try std.testing.expectEqual(@as(u32, 1), partial.pending_files);
+    try std.testing.expectEqualDeep(@as(?[32]u8, @splat(7)), partial.source_cut);
+    try std.testing.expectEqualDeep(@as(?[32]u8, @splat(8)), partial.checkpoint_base);
+    const completed_ref = try publishIncremental(a, ca, &store, &sort, "ordered", @splat(3), census, &.{}, .none, .{ .previous = partial, .sparse_slots = true, .retired_slots = &.{}, .dictionary_edits = &.{.{ .slot = 2, .file = "f3", .fingerprint = @splat(3) }}, .public_navigation = shared, .source_cut = @splat(7), .checkpoint_base = @splat(8), .pending_files = 0 });
+    const completed = try loadRootLazy(ca, store, completed_ref, .none, null);
+    try std.testing.expectEqual(@as(u32, 0), completed.pending_files);
 }

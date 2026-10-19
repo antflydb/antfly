@@ -1205,3 +1205,13 @@ keys stay private to replay capture. Count-only Parquet indexes use qualified
 footer counts, and full delta string columns own one expanded buffer per physical
 page instead of allocating each string independently. These changes require no
 attachment or query options.
+
+
+Reader protocol 57 adds recursive native aggregate directories. High-cardinality
+group buckets subdivide into bounded hash directories so small updates preserve
+sibling artifacts. Readers retain exact aggregate semantics and older flat formats;
+GC follows each recursive reference. Admitted publication cohorts share a live
+immutable source batch with backpressure, using a projection limited to their
+families. Streaming avoids a whole-file replay spool; serial/repeated passes retain
+bounded spill replay. Logical checkpoint commitments survive upload-attempt page
+rewrites, and zero-row updates preserve pending-file progress.

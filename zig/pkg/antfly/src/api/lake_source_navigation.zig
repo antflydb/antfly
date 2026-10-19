@@ -249,7 +249,7 @@ const Record = struct { file: local.serverless_external_source_types.FileEntry, 
 /// Logical census commitment stays stable across attempt-scoped page rewrites.
 /// Include the predecessor separately when authorizing a partial checkpoint.
 fn cutIdentity(a: A, root: Root) ![32]u8 {
-    const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u8, 1), .domain = root.domain, .source = root.source, .schema = root.schema, .snapshot = root.snapshot, .count = root.count, .summary = root.file_summary, .legacy_files = if (root.file_summary == null and root.count != 0) root.files else null }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u8, 2), .identity = root.public_identity_version, .domain = root.domain, .source = root.source, .schema = root.schema, .snapshot = root.snapshot, .count = root.count, .summary = root.file_summary, .legacy_files = if (root.file_summary == null and root.count != 0) root.files else null }, .{});
     defer a.free(bytes);
     var hash: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(bytes, &hash, .{});

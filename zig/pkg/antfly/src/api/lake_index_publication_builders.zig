@@ -168,9 +168,24 @@ pub fn build(args_: Args) !?Result {
     for (enabled, 0..) |active, slot| if (active) {
         var single: [Pipeline.width]bool = @splat(false);
         single[slot] = true;
-        merge(&result, try executeFamily(args_, @fromBackingInt(@intCast(slot)), args_.provider, args_.store), single);
+        merge(&result, try executeProjected(args_, @fromBackingInt(@intCast(slot)), single), single);
     };
     return result;
+}
+fn executeProjected(args: Args, kind: Kind, enabled: [Pipeline.width]bool) !Result {
+    const replay = args.provider.replay.?;
+    var arena = std.heap.ArenaAllocator.init(args.a);
+    defer arena.deinit();
+    var provider = args.provider.*;
+    const columns = try replay_api.columnsForFamilies(args.a, arena.allocator(), args.table, &provider, args.base, enabled);
+    try replay.reset();
+    const original = replay.columns;
+    replay.columns = columns;
+    defer {
+        replay.reset() catch unreachable;
+        replay.columns = original;
+    }
+    return executeFamily(args, kind, args.provider, args.store);
 }
 fn buildCohort(args_: Args, enabled: [Pipeline.width]bool) !?Result {
     const replay = args_.provider.replay.?;
@@ -185,7 +200,14 @@ fn buildCohort(args_: Args, enabled: [Pipeline.width]bool) !?Result {
     const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(args_.a) orelse return null;
     if (workspace >= available or available - workspace < 1024 * 1024) return null;
     const replay_limit = @min(replay.budget.limit, available - workspace);
+    var projection_arena = std.heap.ArenaAllocator.init(args_.a);
+    defer projection_arena.deinit();
+    var projection_provider = args_.provider.*;
+    const projection = try replay_api.columnsForFamilies(args_.a, projection_arena.allocator(), args_.table, &projection_provider, args_.base, enabled);
     try replay.reset();
+    const original_columns = replay.columns;
+    replay.columns = projection;
+    defer replay.columns = original_columns;
     var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = args_.a };
     var outputs: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = args_.out };
     var args = args_;
@@ -240,10 +262,13 @@ fn buildCohort(args_: Args, enabled: [Pipeline.width]bool) !?Result {
     replay.budget.limit = replay_limit / 2;
     ahead.budget.limit = replay_limit / 2;
     ahead.max_spill_bytes = disk_limit / 2;
-    var pipeline: Pipeline = .{ .replay = replay, .spare = &ahead, .io = io, .scheduler = args.scheduler };
+    var pipeline: Pipeline = .{ .replay = replay, .spare = &ahead, .io = io, .scheduler = args.scheduler, .streaming = true };
+    defer pipeline.deinit();
+    defer replay.reset() catch unreachable;
     ahead.pipeline = &pipeline;
     defer replay.captures += ahead.captures;
     defer replay.read_ahead_hits += pipeline.prefetched;
+    defer replay.streamed_batches += pipeline.stream_batches;
     replay.pipeline = &pipeline;
     defer replay.pipeline = null;
     var start: std.Io.Event = .unset;
@@ -339,6 +364,10 @@ test "external lake file-first publication shares one decode across five native 
         \\{"dense":{"type":"embeddings","external":true,"dimension":2},"sparse":{"type":"embeddings","external":true,"sparse":true},"words":{"type":"full_text","field":"body"},"stats":{"type":"algebraic","materializations":[{"name":"total","op":"sum","measure":"amount"},{"name":"rows","op":"count"}]}}
     };
     const columns = try replay_api.columnsForBuild(a, out, table, &provider, base);
+    const light = try replay_api.columnsForFamilies(a, out, table, &provider, base, .{ true, true, true, false, false });
+    try std.testing.expectEqual(@as(usize, 2), light.len);
+    try std.testing.expectEqualStrings("amount", light[0]);
+    try std.testing.expectEqualStrings("body", light[1]);
     var replay = replay_api.Replay.init(a, &provider, columns);
     defer replay.deinit();
     provider.replay = &replay;
@@ -363,7 +392,7 @@ test "external lake file-first publication shares one decode across five native 
     args.a = a;
     const result = (try build(args)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 3), replay.captures);
-    try std.testing.expect(replay.read_ahead_hits != 0);
+    try std.testing.expect(replay.streamed_batches != 0);
     try std.testing.expectEqual(@as(usize, 0), replay.readers);
     try std.testing.expectEqual(@as(usize, 2), result.native.declarations.len);
     try std.testing.expectEqual(@as(usize, 1), result.ordered.len);

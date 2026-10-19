@@ -58,7 +58,7 @@ fn currentSeed(a: A, store: *stores.ArtifactStore, root: ordered.Root, provider:
     if (root.source_cut == null or root.checkpoint_base == null or delta.source_cut == null or delta.prior_cut == null or
         !std.mem.eql(u8, &root.source_cut.?, &delta.source_cut.?) or !std.mem.eql(u8, &root.checkpoint_base.?, &delta.prior_cut.?)) return false;
     const shared = delta.public_navigation.?;
-    if (!std.mem.eql(u8, root.snapshot, provider.source.inventory.snapshot_id) or dictionary.public_count != shared.count or !std.meta.eql(dictionary.public, shared.root)) return false;
+    if (!std.mem.eql(u8, root.snapshot, provider.source.inventory.snapshot_id) or dictionary.public_count != shared.count or dictionary.public_identity_version != shared.identity_version) return false;
     var reads: u64 = 256 * 1024 * 1024;
     var writes: u64 = 0;
     var bridge: pages.PageStore = .{ .domain = root.domain, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };

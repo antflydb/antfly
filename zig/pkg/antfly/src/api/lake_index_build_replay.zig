@@ -28,6 +28,9 @@ const A = std.mem.Allocator;
 /// Plan the shared projection once. Unsupported expression dependencies remain
 /// safe through Provider's ordinary-scan fallback when a column is not covered.
 pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableRecord, provider: *Provider, base: local.serverless_manifest_base_source.BaseSourceDescriptor) ![]const []const u8 {
+    return columnsForFamilies(a, out, table, provider, base, .{ true, true, true, true, true });
+}
+pub fn columnsForFamilies(a: A, out: A, table: local.common_topology_records.TableRecord, provider: *Provider, base: local.serverless_manifest_base_source.BaseSourceDescriptor, enabled: [5]bool) ![]const []const u8 {
     const rebuild = @import("../serverless/build/lake_rebuild.zig");
     var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, provider.source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
     defer desired.deinit(a);
@@ -45,6 +48,14 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
     const configs = try std.json.parseFromSliceLeaky(std.json.Value, ca, table.indexes_json, .{});
     var consumers: usize = 0;
     for (desired.artifacts) |artifact| {
+        const family: usize = switch (artifact.kind) {
+            .algebraic_segment => 0,
+            .text_segment => 2,
+            .sparse_segment => 3,
+            .vector_segment => 4,
+            else => continue,
+        };
+        if (!enabled[family]) continue;
         consumers += 1;
         if (artifact.kind == .text_segment) {
             const config = try std.json.parseFromSliceLeaky(std.json.Value, ca, artifact.build_spec.?.text.config_json, .{});
@@ -59,7 +70,7 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
         };
         for (artifact.binding.column_bindings) |column| try names.put(a, column, {});
     }
-    if (try parsed.relationalIndexDefinitions(ca)) |indexes| for (indexes) |index| {
+    if (enabled[1]) if (try parsed.relationalIndexDefinitions(ca)) |indexes| for (indexes) |index| {
         consumers += 1;
         var tuple = try local.storage_db_relational_index_keys.TuplePlan.init(a, schema, &layout, index.keys);
         defer tuple.deinit();
@@ -240,8 +251,11 @@ pub const Replay = struct {
     kinds: []rows.ColumnKind = &.{},
     range: Range = .{ .begin = .{ .row = 0, .byte = 0 }, .end = 0 },
     ready: bool = false,
+    live: ?rows.Source = null,
+    live_allocator: A = undefined,
     captures: usize = 0,
     read_ahead_hits: usize = 0,
+    streamed_batches: usize = 0,
     pipeline: ?*@import("lake_index_build_pipeline.zig") = null,
     captured_file: ?usize = null,
     readers: usize = 0,
@@ -253,17 +267,16 @@ pub const Replay = struct {
         return .{ .provider = provider, .columns = columns, .arena = .init(a), .budget = .{ .backing = a, .limit = 256 * 1024 * 1024 } };
     }
     pub fn deinit(self: *Replay) void {
+        self.reset() catch unreachable;
         if (self.only_files) |*needed| needed.deinit();
-        if (self.run) |*run| {
-            run.close();
-            self.manager.deinit();
-        }
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
     }
     /// Discard an unleased optimization buffer before changing its admission.
     pub fn reset(self: *Replay) !void {
         if (self.readers != 0) return error.LakeReplayBusy;
+        if (self.live) |source| source.deinit(self.live_allocator);
+        self.live = null;
         if (self.run) |*run| {
             run.close();
             self.manager.deinit();
@@ -282,6 +295,21 @@ pub const Replay = struct {
         const self: *Replay = @ptrCast(@alignCast(raw));
         if (self.provider.context.additional_checkpoint) |hook| try hook.check(hook.ptr);
         if (self.pipeline) |pipeline| try pipeline.check();
+    }
+    pub fn beginStream(self: *Replay, a: A, binding: Binding, file: usize, token: Cancellation) !void {
+        try self.reset();
+        var input = self.provider.*;
+        input.replay = null;
+        input.replay_consumer = null;
+        input.only_file = file;
+        input.only_files = null;
+        input.only_plan = null;
+        input.context.additional_checkpoint = .{ .ptr = self, .check = captureCheckpoint };
+        self.live = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, token);
+        self.live_allocator = a;
+        self.ready = true;
+        self.captured_file = file;
+        self.captures += 1;
     }
     fn capture(self: *Replay, a: A, original: Binding, file_index: usize, cancellation: Cancellation) !void {
         if (self.ready and self.captured_file == file_index) return;
@@ -453,7 +481,7 @@ pub const Replay = struct {
         if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
         if (consumer) |slot| if (self.pipeline) |pipeline| {
             const chosen = (try pipeline.request(slot, file_index, cancellation)) orelse return null;
-            return try chosen.openPrepared(a, binding, file_index, cancellation);
+            return try chosen.openPrepared(a, binding, file_index, cancellation, slot);
         };
         const io = self.provider.context.io orelse return null;
         try self.mutex.lock(io);
@@ -468,34 +496,39 @@ pub const Replay = struct {
     }
     /// Producer has already captured and granted this file. Never re-enter the
     /// rendezvous or apply the serial planner's advisory changed-file mask.
-    fn openPrepared(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation) !rows.Source {
+    fn openPrepared(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation, slot: usize) !rows.Source {
         const io = self.provider.context.io.?;
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         if (!self.ready or self.captured_file != file_index) return error.SidecarSourceBindingMismatch;
-        return try self.openCursor(a, binding, cancellation);
+        return try self.openCursorFor(a, binding, cancellation, slot);
     }
     fn openCursor(self: *Replay, a: A, binding: Binding, cancellation: Cancellation) !rows.Source {
+        return self.openCursorFor(a, binding, cancellation, null);
+    }
+    fn openCursorFor(self: *Replay, a: A, binding: Binding, cancellation: Cancellation, slot: ?usize) !rows.Source {
         const range = self.range;
         const columns = try a.dupe([]const u8, binding.column_bindings);
         errdefer a.free(columns);
         const cursor = try a.create(Cursor);
         errdefer a.destroy(cursor);
-        cursor.* = .{ .owner = self, .reader = try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = columns, .cancellation = cancellation };
+        cursor.* = .{ .owner = self, .slot = slot, .reader = if (self.live != null) null else try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = columns, .cancellation = cancellation };
         self.readers += 1;
         return .{ .kind = binding.source_kind, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
     }
     const Cursor = struct {
         block: ?*spill.Sequential.OwnedBlock = null,
         owner: *Replay,
-        reader: spill.Sequential.Reader,
+        reader: ?spill.Sequential.Reader,
+        slot: ?usize = null,
+        generation: u64 = 0,
         arena: std.heap.ArenaAllocator,
         columns: []const []const u8,
         cancellation: Cancellation,
         fn deinit(raw: *anyopaque, a: A) void {
             const self: *Cursor = @ptrCast(@alignCast(raw));
             if (self.block) |block| block.release();
-            self.reader.deinit();
+            if (self.reader) |*reader| reader.deinit() else self.owner.pipeline.?.leaveStream(self.slot.?);
             const io = self.owner.provider.context.io.?;
             self.owner.mutex.lockUncancelable(io);
             self.owner.readers -= 1;
@@ -512,7 +545,15 @@ pub const Replay = struct {
             self.block = null;
             _ = self.arena.reset(.retain_capacity);
             const a = self.arena.allocator();
-            const block = try self.reader.nextOwned() orelse return null;
+            if (self.reader == null) {
+                const input = try self.owner.pipeline.?.readStream(self.slot.?, &self.generation, self.cancellation) orelse return null;
+                const columns = try a.alloc(rows.ColumnVector, self.columns.len);
+                for (columns, self.columns) |*column, name| column.* = input.findColumn(name) orelse return error.RowSourceColumnKindMismatch;
+                var result = input;
+                result.columns = columns;
+                return result;
+            }
+            const block = try self.reader.?.nextOwned() orelse return null;
             self.block = block;
             const refs = try a.alloc(rows.RowRef, block.count());
             const inventory = self.owner.provider.source.inventory;

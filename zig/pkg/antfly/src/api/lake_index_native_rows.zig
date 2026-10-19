@@ -838,6 +838,14 @@ test "external lake ordered sparse publication preserves covering rows across au
             try std.testing.expectError(error.UnexpectedUnchangedParquetRead, buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, candidates));
             provider.native_delta.?.source_cut = good_cut;
             provider.ordered_delta_plans = 0;
+            // A durable retry owns a new upload attempt and physical directory,
+            // while both authenticated logical census commitments stay exact.
+            store.upload_scope.?.attempt = @splat(77);
+            var retried_navigation = try navigation_api.build(a, ca, &store, &provider, previous_navigation, .none);
+            defer retried_navigation.deinit();
+            try std.testing.expectEqualDeep(navigation.delta.source_cut, retried_navigation.delta.source_cut);
+            provider.native_delta = retried_navigation.delta;
+            candidates = &.{checkpoint};
         }
         const built = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, candidates);
         if (phase != 0) try std.testing.expectEqual(@as(usize, 1), provider.ordered_delta_plans);

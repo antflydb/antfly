@@ -65,7 +65,18 @@ pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cance
 
 pub const metadata_version: u16 = 2;
 pub fn supportsMetadataVersion(version: u16) bool {
-    return version == 1 or version == metadata_version or version == 3;
+    return version == 1 or version == metadata_version or isPartitioned(version);
+}
+pub fn isPartitioned(version: u16) bool {
+    return version == 3 or version == 4;
+}
+pub const partition_leaf_groups: u64 = 1024;
+pub const max_partition_depth: u8 = 9;
+pub fn partitionFanout(depth: u8) usize {
+    return if (depth == 0) 64 else 4;
+}
+fn partitionShift(depth: u8) u6 {
+    return if (depth == 0) 0 else @intCast(6 + (depth - 1) * 2);
 }
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_block_bytes = 4 * 1024 * 1024;
@@ -80,6 +91,7 @@ const Root = struct {
     groups: u64,
     blocks: []const Block = &.{},
     partitions: []const Partition = &.{},
+    radix_depth: u8 = 0,
     state_recipe: ?recipes.Recipe = null,
     state_slot: ?u16 = null,
 };
@@ -185,7 +197,7 @@ fn loadRoot(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Canc
     const bytes = try readArtifact(a, store, .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, cancellation, cached);
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
-    if (!std.mem.eql(u8, root.format, if (artifact.metadata_version == 1) "native-sql-aggregate-v1" else if (artifact.metadata_version == 3) "native-sql-aggregate-v3" else "native-sql-aggregate-v2") or !std.mem.eql(u8, root.name, artifact.name) or root.blocks.len > max_blocks) return error.InvalidNativeAggregateArtifact;
+    if (!std.mem.eql(u8, root.format, if (artifact.metadata_version == 1) "native-sql-aggregate-v1" else if (artifact.metadata_version == 3) "native-sql-aggregate-v3" else if (artifact.metadata_version == 4) "native-sql-aggregate-v4" else "native-sql-aggregate-v2") or !std.mem.eql(u8, root.name, artifact.name) or root.blocks.len > max_blocks) return error.InvalidNativeAggregateArtifact;
     if (artifact.metadata_version == 1) {
         if (root.state_recipe != null or root.state_slot != null) return error.InvalidNativeAggregateArtifact;
     } else {
@@ -193,11 +205,11 @@ fn loadRoot(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Canc
         const slot = root.state_slot orelse return error.InvalidNativeAggregateArtifact;
         if (state_recipe.inputs.len > 256 or slot >= state_recipe.inputs.len or !root.recipe.eql(.{ .keys = state_recipe.keys, .inputs = state_recipe.inputs[slot .. slot + 1] })) return error.InvalidNativeAggregateArtifact;
     }
-    if (artifact.metadata_version != 3 and root.partitions.len != 0) return error.InvalidNativeAggregateArtifact;
-    if (artifact.metadata_version == 3 and (root.blocks.len != 0 or root.partitions.len > 64)) return error.InvalidNativeAggregateArtifact;
+    if (!isPartitioned(artifact.metadata_version) and root.partitions.len != 0) return error.InvalidNativeAggregateArtifact;
+    if (isPartitioned(artifact.metadata_version) and (root.blocks.len != 0 or root.partitions.len > 64 or root.radix_depth > max_partition_depth)) return error.InvalidNativeAggregateArtifact;
     var count: u64 = 0;
     for (root.partitions, 0..) |part, i| {
-        if (part.bucket >= 64 or (i != 0 and root.partitions[i - 1].bucket >= part.bucket) or part.artifact.kind != .algebraic_segment or part.artifact.metadata_version != 2 or !std.mem.eql(u8, part.artifact.name, root.name) or part.artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
+        if (part.bucket >= partitionFanout(root.radix_depth) or (i != 0 and root.partitions[i - 1].bucket >= part.bucket) or part.artifact.kind != .algebraic_segment or (part.artifact.metadata_version != 2 and !(artifact.metadata_version == 4 and part.artifact.metadata_version == 4 and root.radix_depth < max_partition_depth)) or !std.mem.eql(u8, part.artifact.name, root.name) or part.artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
         try stores.validateSha256ArtifactIdentity(part.artifact.artifact_id, part.artifact.checksum);
         count = std.math.add(u64, count, part.groups) catch return error.InvalidNativeAggregateArtifact;
     }
@@ -211,6 +223,7 @@ fn loadRoot(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Canc
 }
 
 pub const Reader = struct {
+    const PartitionMap = struct { states: []const u16, children: ?[]const PartitionMap = null };
     a: A,
     store: stores.ArtifactStore,
     cancellation: Cancellation,
@@ -227,7 +240,7 @@ pub const Reader = struct {
     state_slots: ?[]const u16 = null,
     child: ?*Reader = null,
     partition_index: usize = 0,
-    partition_states: ?[]const []const u16 = null,
+    partition_states: ?[]const PartitionMap = null,
     blocks_decoded: usize = 0,
 
     /// The caller selects an authorized publication first. Errors after that
@@ -287,41 +300,58 @@ pub const Reader = struct {
         const part = self.root.partitions[index];
         const reader = try Reader.openWithCache(self.a, self.store, part.artifact, self.root.recipe, self.cancellation, self.cached);
         errdefer reader.cursor().close(reader);
+        if (part.artifact.metadata_version == 4 and reader.root.radix_depth != self.root.radix_depth + 1) return error.InvalidNativeAggregateArtifact;
         if (reader.root.groups != part.groups) return error.InvalidNativeAggregateArtifact;
         if (self.output_slots) |slots| {
             if (self.partition_states) |maps| {
                 reader.output_slots = try reader.control.allocator().dupe(u16, slots);
-                reader.state_slots = try reader.control.allocator().dupe(u16, maps[index]);
+                const owned = try clonePartitionMap(reader.control.allocator(), maps[index]);
+                reader.state_slots = owned.states;
+                reader.partition_states = owned.children;
             } else try reader.setOutputSlot(slots[0]);
         }
         return reader;
     }
+    fn clonePartitionMap(a: A, map: PartitionMap) anyerror!PartitionMap {
+        var result: PartitionMap = .{ .states = try a.dupe(u16, map.states) };
+        if (map.children) |children| {
+            const owned = try a.alloc(PartitionMap, children.len);
+            for (owned, children) |*child, value| child.* = try clonePartitionMap(a, value);
+            result.children = owned;
+        }
+        return result;
+    }
+    /// Build the complete slot proof before mutating the caller. Each recursive
+    /// directory may borrow flat cohorts with different physical slot orders.
+    fn mergePartitionMap(a: A, left: *const Reader, right: *const Reader, prior: ?PartitionMap) anyerror!?PartitionMap {
+        const state = left.root.state_recipe orelse return null;
+        const incoming = right.root.state_recipe orelse return null;
+        if (!state.eql(incoming) or left.root.groups != right.root.groups or left.root.partitions.len != right.root.partitions.len or left.root.radix_depth != right.root.radix_depth) return null;
+        const previous = if (prior) |map| map.states else &.{left.root.state_slot.?};
+        const slots = try a.alloc(u16, previous.len + 1);
+        @memcpy(slots[0..previous.len], previous);
+        slots[previous.len] = right.root.state_slot.?;
+        if (left.root.partitions.len == 0) return if (sameFlatCohort(left, right)) .{ .states = slots } else null;
+        const children = try a.alloc(PartitionMap, left.root.partitions.len);
+        for (left.root.partitions, right.root.partitions, children, 0..) |l, r, *child, index| {
+            if (l.bucket != r.bucket or l.groups != r.groups) return null;
+            const lreader = try Reader.openWithCache(left.a, left.store, l.artifact, left.root.recipe, left.cancellation, left.cached);
+            defer lreader.cursor().close(lreader);
+            const rreader = try Reader.openWithCache(right.a, right.store, r.artifact, right.root.recipe, right.cancellation, right.cached);
+            defer rreader.cursor().close(rreader);
+            child.* = (try mergePartitionMap(a, lreader, rreader, if (prior) |map| (if (map.children) |maps| maps[index] else null) else null)) orelse return null;
+        }
+        return .{ .states = slots, .children = children };
+    }
     fn fusePartitions(self: *Reader, other: *const Reader, output_slot: u16) !bool {
-        const state = self.root.state_recipe orelse return false;
-        const incoming = other.root.state_recipe orelse return false;
-        if (self.partition_index != 0 or self.emitted != 0 or !state.eql(incoming) or self.root.groups != other.root.groups or self.root.partitions.len != other.root.partitions.len or self.root.partitions.len == 0) return false;
-        // Validate every child before changing any slot map. Keep only one
-        // pair of directories resident, regardless of partition count.
+        if (self.partition_index != 0 or self.emitted != 0 or self.root.partitions.len == 0) return false;
+        if (self.state_slots == null or self.output_slots == null) return error.InvalidNativeAggregateArtifact;
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
-        const maps = try scratch.allocator().alloc([]const u16, self.root.partitions.len);
-        for (self.root.partitions, other.root.partitions, 0..) |left, right, index| {
-            if (left.bucket != right.bucket or left.groups != right.groups) return false;
-            const current = try Reader.openWithCache(self.a, self.store, left.artifact, self.root.recipe, self.cancellation, self.cached);
-            defer current.cursor().close(current);
-            const candidate = try Reader.openWithCache(self.a, other.store, right.artifact, other.root.recipe, other.cancellation, other.cached);
-            defer candidate.cursor().close(candidate);
-            if (current.root.groups != left.groups or candidate.root.groups != right.groups or !sameFlatCohort(current, candidate)) return false;
-            const prior = if (self.partition_states) |existing| existing[index] else &.{current.root.state_slot.?};
-            const map = try scratch.allocator().alloc(u16, prior.len + 1);
-            @memcpy(map[0..prior.len], prior);
-            map[prior.len] = candidate.root.state_slot.?;
-            maps[index] = map;
-        }
-        const owned = try self.control.allocator().alloc([]const u16, maps.len);
-        for (owned, maps) |*target, map| target.* = try self.control.allocator().dupe(u16, map);
+        const plan = (try mergePartitionMap(scratch.allocator(), self, other, .{ .states = self.state_slots.?, .children = self.partition_states })) orelse return false;
+        const owned = try clonePartitionMap(self.control.allocator(), plan);
         try self.appendSlot(other, output_slot);
-        self.partition_states = owned;
+        self.partition_states = owned.children;
         return true;
     }
     pub fn groupCount(self: *const Reader) u64 {
@@ -557,28 +587,30 @@ test "external lake cohort readers decode shared keys and all selected slots onc
 /// Fixed hash partitions keep unchanged group ranges immutable across file
 /// reduction branches. Exact typed reducers still own every affected range.
 pub fn publishPartitioned(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, group: *operators.Grouped, recipe: recipes.Recipe, manager: *spill.Manager, cancellation: Cancellation) ![]Ref {
-    var runs: [64]?spill.Sequential = @splat(null);
-    defer for (&runs) |*run| if (run.*) |*file| file.close();
+    return publishPartitionedAt(a, out, store, names, group, recipe, manager, cancellation, 0);
+}
+pub fn publishPartitionedAt(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, group: *operators.Grouped, recipe: recipes.Recipe, manager: *spill.Manager, cancellation: Cancellation, depth: u8) anyerror![]Ref {
+    if (depth > max_partition_depth) return error.InvalidNativeAggregateArtifact;
+    // One shared-run sort bounds descriptors independently of radix depth.
+    var sort = spill.Sort.init(a, manager, &.{.{}}, 512 * 1024);
+    defer sort.deinit();
+    sort.shared_runs = true;
     while (true) {
         try cancellation.check();
         var page = std.heap.ArenaAllocator.init(a);
         defer page.deinit();
         const pa = page.allocator();
-        var consumed: usize = 0;
-        while (consumed < 256) : (consumed += 1) {
-            const row = try group.nextPartialResult(pa) orelse break;
-            var hasher = std.hash.Wyhash.init(0);
-            for (row.keys) |key| {
-                var bytes: [9]u8 = undefined;
-                bytes[0] = @intFromBool(key.sql_null);
-                std.mem.writeInt(u64, bytes[1..9], if (key.sql_null) 0 else try local.sql_scalar.semanticHash(key.value), .little);
-                hasher.update(&bytes);
-            }
-            const bucket = hasher.final() % 64;
-            if (runs[bucket] == null) runs[bucket] = try spill.Sequential.init(manager, 16 * 1024);
-            _ = try runs[bucket].?.append(.{ .keys = row.keys, .values = row.aggregates, .ordinal = row.ordinal }, spill.none);
+        const row = try group.nextPartialResult(pa) orelse break;
+        var hasher = std.hash.Wyhash.init(0);
+        for (row.keys) |key| {
+            var bytes: [9]u8 = undefined;
+            bytes[0] = @intFromBool(key.sql_null);
+            std.mem.writeInt(u64, bytes[1..9], if (key.sql_null) 0 else try local.sql_scalar.semanticHash(key.value), .little);
+            hasher.update(&bytes);
         }
-        if (consumed < 256) break;
+        const bucket = (hasher.final() >> partitionShift(depth)) % partitionFanout(depth);
+        const values = try std.mem.concat(pa, local.sql_scalar.Datum, &.{ row.keys, row.aggregates });
+        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .integer = @intCast(bucket) })}, .values = values, .ordinal = row.ordinal });
     }
     const lists = try a.alloc(std.ArrayList(Partition), names.len);
     defer a.free(lists);
@@ -593,26 +625,39 @@ pub fn publishPartitioned(a: A, out: A, store: *stores.ArtifactStore, names: []c
     const specs = try a.alloc(operators.AggregateSpec, recipe.inputs.len);
     defer a.free(specs);
     for (specs, recipe.inputs) |*spec, input| spec.* = input.spec;
-    for (&runs, 0..) |*run, bucket| if (run.*) |*file| {
-        const partial = try operators.Grouped.create(a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = manager });
-        defer partial.deinit();
-        try file.seal();
-        var offset: u64 = 0;
-        while (offset < file.size) {
-            try cancellation.check();
-            const batch = try file.readBatchBorrowed(offset, 256);
-            for (batch.rows) |row| try partial.importPartial(row.keys, row.values, row.ordinal);
-            offset = batch.following;
+    var partial: ?*operators.Grouped = null;
+    defer if (partial) |value| value.deinit();
+    var bucket: i64 = -1;
+    var count: u64 = 0;
+    while (true) {
+        try cancellation.check();
+        var page = std.heap.ArenaAllocator.init(a);
+        defer page.deinit();
+        const row = try sort.next(page.allocator());
+        const next = if (row) |value| value.keys[0].value.integer else -1;
+        if (partial != null and (row == null or next != bucket)) {
+            const refs = if (count > partition_leaf_groups and depth < max_partition_depth)
+                try publishPartitionedAt(a, a, store, names, partial.?, recipe, manager, cancellation, depth + 1)
+            else
+                try publishCohort(a, a, store, names, partial.?, recipe, cancellation);
+            defer a.free(refs);
+            for (refs, lists) |ref, *list| try list.append(a, .{ .bucket = @intCast(bucket), .artifact = ref, .groups = count });
+            partial.?.deinit();
+            partial = null;
+            count = 0;
         }
-        const refs = try publishCohort(a, a, store, names, partial, recipe, cancellation);
-        defer a.free(refs);
-        for (refs, lists) |ref, *list| try list.append(a, .{ .bucket = @intCast(bucket), .artifact = ref, .groups = file.size });
-        file.close();
-        run.* = null;
-    };
-    return publishPartitionRoots(a, out, store, names, recipe, lists, cancellation);
+        const value = row orelse break;
+        if (partial == null) partial = try operators.Grouped.create(a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = manager });
+        bucket = next;
+        try partial.?.importPartial(value.values[0..recipe.keys.len], value.values[recipe.keys.len..], value.ordinal);
+        count += 1;
+    }
+    return publishPartitionRootsAt(a, out, store, names, recipe, lists, cancellation, depth);
 }
 pub fn publishPartitionRoots(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, recipe: recipes.Recipe, lists: []const std.ArrayList(Partition), cancellation: Cancellation) ![]Ref {
+    return publishPartitionRootsAt(a, out, store, names, recipe, lists, cancellation, 0);
+}
+pub fn publishPartitionRootsAt(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, recipe: recipes.Recipe, lists: []const std.ArrayList(Partition), cancellation: Cancellation, depth: u8) ![]Ref {
     if (names.len == 0 or names.len != recipe.inputs.len or lists.len != names.len or names.len > 256) return error.InvalidNativeAggregateArtifact;
     const refs = try out.alloc(Ref, names.len);
     var initialized: usize = 0;
@@ -626,25 +671,30 @@ pub fn publishPartitionRoots(a: A, out: A, store: *stores.ArtifactStore, names: 
     for (refs, names, lists, 0..) |*ref, name, list, slot| {
         var count: u64 = 0;
         for (list.items) |part| count = try std.math.add(u64, count, part.groups);
-        const bytes = try std.json.Stringify.valueAlloc(a, Root{ .format = "native-sql-aggregate-v3", .name = name, .recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[slot..][0..1] }, .state_recipe = recipe, .state_slot = @intCast(slot), .groups = count, .partitions = list.items }, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, Root{ .format = "native-sql-aggregate-v4", .radix_depth = depth, .name = name, .recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[slot..][0..1] }, .state_recipe = recipe, .state_slot = @intCast(slot), .groups = count, .partitions = list.items }, .{});
         defer a.free(bytes);
         if (bytes.len > max_root_bytes) return error.NativeAggregateArtifactTooLarge;
         var upload = store.*;
         upload.allocator = out;
         const artifact = try upload.putWithCancellation(bytes, cancellation);
         defer if (artifact.provider_version) |version| upload.allocator.free(version);
-        ref.* = .{ .kind = .algebraic_segment, .name = name, .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len, .metadata_version = 3 };
+        ref.* = .{ .kind = .algebraic_segment, .name = name, .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len, .metadata_version = 4 };
         initialized += 1;
     }
     return refs;
 }
 pub fn loadPartitions(a: A, store: stores.ArtifactStore, ref: Ref, recipe: recipes.Recipe, cancellation: Cancellation) ![]const Partition {
-    if (ref.metadata_version != 3) return error.InvalidNativeAggregateArtifact;
+    if (!isPartitioned(ref.metadata_version)) return error.InvalidNativeAggregateArtifact;
     const reader = try Reader.open(a, store, ref, recipe, cancellation);
     defer reader.cursor().close(reader);
     const bytes = try std.json.Stringify.valueAlloc(a, reader.root.partitions, .{});
     defer a.free(bytes);
     return std.json.parseFromSliceLeaky([]const Partition, a, bytes, .{ .allocate = .alloc_always });
+}
+pub fn partitionDepth(a: A, store: stores.ArtifactStore, ref: Ref, recipe: recipes.Recipe, token: Cancellation) !u8 {
+    const reader = try Reader.open(a, store, ref, recipe, token);
+    defer reader.cursor().close(reader);
+    return reader.root.radix_depth;
 }
 pub fn partitionChildren(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation) ![]const Ref {
     const recipe = try loadRecipe(a, store, ref, cancellation);

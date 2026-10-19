@@ -2266,3 +2266,67 @@ CLI check passed on Zig 0.17.0. License, Apache boundary, source/control catalog
 generated engine error catalog, formatting and whitespace checks passed.
 `origin/main` is merged through `a37fef34ec`. Live-provider retention qualification
 remains deferred; archive-scale latency/RSS gains remain unmeasured.
+
+
+### Shared batch publication and recursive grouped reductions (protocol 57)
+
+Admitted native builder cohorts now consume one live delete-aware source cursor.
+The source owns an immutable typed batch until every granted consumer acknowledges
+it. Consumers borrow the same primitive, dictionary, decimal and payload vectors;
+only projection descriptors are private. Lazy encoded evidence is materialized
+once under producer ownership before its mutable decoder can be shared. A fast consumer waits for slower readers
+before advancing the cursor. This bounds shared ownership by one source batch and
+allows builders to start before the file finishes, without writing and independently
+decoding a complete replay. File size no longer determines cohort replay admission.
+The established bounded spill replay remains available for serial/repeated passes.
+Existing scan-level I/O prefetch remains in the reader; file replay read-ahead is
+reserved for sealed replay mode. Streaming and prefetch counters are distinct.
+
+Cohorts derive their input projection from admitted families, including partial
+index predicates, covering columns, stored source and enrichment dependencies.
+Serial remainder families also use their own projections. Sparse sealed-replay
+read-ahead sorts only required file candidates and seeks their canonical keys;
+dense requests retain the constant-space full census cursor. A two-file selection
+from 10,000 files visits two candidates. Request authority and cancellation remain
+checked while planning and while consumers wait.
+
+Ordered checkpoint reuse authenticates logical current/predecessor census cuts
+rather than requiring attempt-scoped public page references to be identical.
+Commitments include the public row-identity epoch; epoch changes cannot resume a
+checkpoint from a different identity contract.
+Empty-result path-copy publications propagate both commitments and pending counts.
+Tests exercise a changed upload attempt, rejection of a changed logical cut, and
+zero-row publication.
+
+Grouped aggregate directories use metadata version 4 with 64 initial hash buckets
+and four-way recursive subdivisions. Buckets exceeding 1,024 groups subdivide using
+subsequent hash bits, avoiding dozens of tiny leaves on the first split;
+depth is bounded at nine. A shared-run native sort partitions each level without
+holding 64 files open at every recursion depth. Merges descend only into overlapping
+branches and preserve sibling artifact references. Memoized branch reductions own
+at most 64 child aliases; file-reduction nodes keep their two children plus at most
+64 aliases. Small flat legacy buckets split when first merged with a subdivided
+branch. Readers validate increasing depth and exact group counts, preserve existing
+exact aggregate states, and continue reading versions 1–3. Recursive physical-slot
+maps preserve fused COUNT/SUM payload reads; incompatible late branches decline
+fusion before changing the reader. GC walks recursive
+children, and protocol 57 excludes collectors unaware of their durable references.
+
+These changes require no new attachment options or SQL syntax. Regression coverage
+checks early shared delivery, immutable borrowing with a slow consumer, cross-attempt
+resume, sparse planning work, excluded cohort columns, recursive exact results and
+unchanged sibling retention. Archive-scale latency/RSS and live-provider retention
+qualification remain separate from functional qualification.
+
+
+Protocol-57 qualification passed 318 native and 175 shared external-lake tests
+without failures or leaks. Final focused streaming, sparse-planning, zero-row
+progress, cross-attempt resume, GC and recursive fused-cohort regressions passed.
+Eleven real-file HTTP E2Es passed against the rebuilt server, covering compact
+Parquet V1/V2 and NULL-only attachment/restart, Iceberg snapshots/schema IDs/
+partitions/deletes, signed decimal pruning, and exact NUMERIC materializations.
+A complete stripped Debug server build and CLI version check passed on Zig 0.17.0.
+Formatting, whitespace, license, Apache boundary, source/control catalog and pinned
+compiler engine-error checks passed. `origin/main` is merged through `bdd7bc0113`.
+Archive-scale latency/RSS measurements and live-provider retention qualification
+remain outstanding.
