@@ -644,8 +644,6 @@ pub fn consumeBatch(a: A, entry: anytype, batch: anytype, file_id: []const u8, s
     defer key.deinit(a);
     var condition_key: std.ArrayList(u8) = .empty;
     defer condition_key.deinit(a);
-    var row_scratch = std.heap.ArenaAllocator.init(a);
-    defer row_scratch.deinit();
     var bound = try entry.tuple.bindExternalBatch(a, batch);
     defer bound.deinit();
     var condition_batches: std.ArrayList(tuples.BatchKeys) = .empty;
@@ -658,40 +656,85 @@ pub fn consumeBatch(a: A, entry: anytype, batch: anytype, file_id: []const u8, s
         errdefer selected.deinit();
         try condition_batches.append(a, selected);
     };
-    for (0..batch.rowCount()) |row| {
-        const ref = batch.rowRef(row);
-        if (row % 128 == 0) {
-            try cancellation.check();
-            try context.ensureActive();
+    var begin: usize = 0;
+    while (begin < batch.rowCount()) {
+        try cancellation.check();
+        try context.ensureActive();
+        var window = std.heap.ArenaAllocator.init(a);
+        defer window.deinit();
+        const pa = window.allocator();
+        var positions: [64]usize = undefined;
+        var key_values: [64][1]local.sql_scalar.Datum = undefined;
+        var key_rows: [64][]const local.sql_scalar.Datum = undefined;
+        var ordinals: [64]u64 = undefined;
+        var count: usize = 0;
+        const end = @min(begin + 64, batch.rowCount());
+        for (begin..end) |row| {
+            var live = true;
+            if (entry.predicate) |plan| for (plan.conditions, condition_batches.items) |condition, *selected| {
+                condition_key.clearRetainingCapacity();
+                const is_null = try selected.append(a, &condition_key, row);
+                if (!condition.evaluateEncoded(condition_key.items, is_null).matches()) {
+                    live = false;
+                    break;
+                }
+            };
+            if (!live) continue;
+            const ref = batch.rowRef(row);
+            if (ref != .external or !std.mem.eql(u8, ref.external.file_id, file_id)) return error.InvalidNativeLakeRowIndex;
+            key.clearRetainingCapacity();
+            _ = try bound.append(a, &key, row);
+            try key.appendSlice(a, &ordered.coordinate(slot, ref.external));
+            if (entry.reverse) |reverse| try reverse.add(key.items);
+            positions[count] = row;
+            key_values[count][0] = local.sql_scalar.Datum.json(.{ .string = try pa.dupe(u8, key.items) });
+            key_rows[count] = &key_values[count];
+            ordinals[count] = std.math.add(u64, ordinal.*, count) catch return error.LakeSidecarBuildLimitExceeded;
+            count += 1;
         }
-        var live = true;
-        if (entry.predicate) |plan| for (plan.conditions, condition_batches.items) |condition, *selected| {
-            condition_key.clearRetainingCapacity();
-            const is_null = try selected.append(a, &condition_key, row);
-            if (!condition.evaluateEncoded(condition_key.items, is_null).matches()) {
-                live = false;
-                break;
-            }
-        };
-        if (!live) continue;
-        if (ref != .external) return error.InvalidNativeLakeRowIndex;
-        if (!std.mem.eql(u8, ref.external.file_id, file_id)) return error.InvalidNativeLakeRowIndex;
-        key.clearRetainingCapacity();
-        _ = try bound.append(a, &key, row);
-        try key.appendSlice(a, &ordered.coordinate(slot, ref.external));
-        _ = row_scratch.reset(.retain_capacity);
-        const values = try a.alloc(local.sql_scalar.Datum, entry.cover.len);
-        defer a.free(values);
-        const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{row} };
-        for (values, entry.cover) |*value, column| {
-            const cell = try page.cell(row_scratch.allocator(), 0, column);
-            value.* = .{ .value = cell.value, .sql_null = cell.sql_null };
+        const next_ordinal = std.math.add(u64, ordinal.*, count) catch return error.LakeSidecarBuildLimitExceeded;
+        if (count != 0) {
+            var cover: CoverBatch = .{ .page = .{ .batch = batch, .selection = positions[0..count] }, .names = entry.cover };
+            const borrowed: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &cover, .read = CoverBatch.cell, .read_physical = CoverBatch.physical, .read_frozen = CoverBatch.frozen, .read_json = CoverBatch.json, .count = count, .width = entry.cover.len } };
+            const values = try borrowed.preparePhysical(pa);
+            try entry.sort.addBatch(values, key_rows[0..count], ordinals[0..count]);
         }
-        if (entry.reverse) |reverse| try reverse.add(key.items);
-        try entry.sort.add(.{ .values = values, .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key.items })}, .ordinal = ordinal.* });
-        ordinal.* = std.math.add(u64, ordinal.*, 1) catch return error.LakeSidecarBuildLimitExceeded;
+        ordinal.* = next_ordinal;
+        begin = end;
     }
 }
+
+/// Preserve the raw covering-cell contract while forwarding native scalar and
+/// JSON payloads directly into the sort's typed store. Decimal text and encoded
+/// interpretations use the same lazy cell accessor as ordinary row ingestion.
+const CoverBatch = struct {
+    page: local.sql_catalog.ColumnPage,
+    names: []const []const u8,
+    fn cell(raw: *anyopaque, a: A, row: usize, column: usize) !local.sql_scalar.Datum {
+        const self: *CoverBatch = @ptrCast(@alignCast(raw));
+        return self.page.cell(a, row, self.names[column]);
+    }
+    fn physical(raw: *anyopaque, _: A, column: usize) !?local.sql_execution_batch.PhysicalColumn {
+        const self: *CoverBatch = @ptrCast(@alignCast(raw));
+        const vector = self.page.batch.findColumn(self.names[column]) orelse return null;
+        const kind: local.sql_ast.ColumnType = switch (vector.values) {
+            .i64, .dictionary_i64 => .integer,
+            .f64, .dictionary_f64 => .number,
+            .bool => .boolean,
+            .bytes, .dictionary_bytes => .string,
+            else => return null,
+        };
+        return .{ .vector = vector, .selection = self.page.selection, .kind = kind, .element = if (kind == .number) .float64 else null };
+    }
+    fn frozen(raw: *anyopaque, row: usize, column: usize) !?local.sql_execution_batch.FrozenJson {
+        const self: *CoverBatch = @ptrCast(@alignCast(raw));
+        return self.page.frozenJson(row, self.names[column]);
+    }
+    fn json(raw: *anyopaque, row: usize, column: usize) !?[]const u8 {
+        const self: *CoverBatch = @ptrCast(@alignCast(raw));
+        return self.page.encodedJson(row, self.names[column]);
+    }
+};
 
 test "external lake ordered sparse publication preserves covering rows across authenticated file churn" {
     const a = std.testing.allocator;
@@ -887,4 +930,60 @@ test "external lake ordered sparse publication preserves covering rows across au
         previous_navigation = try navigation_api.load(ca, store, navigation.ref, .none, null);
         previous = built;
     }
+}
+
+test "external lake ordered batches preserve covering nulls dictionaries JSON decimals and spill ownership" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    var integers = [_]i64{ 9007199254740993, -9007199254740993, 0, 4 };
+    var floating = [_]f64{ -0.0, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) };
+    var coefficients = [_]i128{ 123, -999, 0, 42 };
+    var dictionary = [_][]const u8{ "alpha", "beta" };
+    const ids = [_]u32{ 1, 999999, 0, 1 };
+    const batch: local.storage_rowsource_types.ColumnBatch = .{ .snapshot = .{ .table_id = "lake", .snapshot_id = "snapshot" }, .external_span = .{ .first = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 4 }, .columns = &.{
+        .{ .name = "n", .values = .{ .i64 = &integers } },
+        .{ .name = "f", .values = .{ .f64 = &floating } },
+        .{ .name = "label", .values = .{ .dictionary_bytes = .{ .values = &dictionary, .indices = &ids } }, .nulls = .{ .bytes = &.{ 0, 1, 0, 0 } } },
+        .{ .name = "exact", .values = .{ .decimal128 = .{ .values = &coefficients, .precision = 12, .scale = 2 } } },
+        .{ .name = "doc", .values = .{ .json = &.{ "{ \"a\": 1 }", "null", "[1,2]", "\"text\"" } } },
+    } };
+    try batch.validate();
+    const selection = [_]usize{ 3, 1, 0, 2 };
+    const names = &.{ "n", "f", "label", "exact", "doc", "_id" };
+    var cover: CoverBatch = .{ .page = .{ .batch = batch, .selection = &selection }, .names = names };
+    const input: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &cover, .read = CoverBatch.cell, .read_physical = CoverBatch.physical, .read_frozen = CoverBatch.frozen, .read_json = CoverBatch.json, .count = 4, .width = 6 } };
+    const expected = try pa.alloc([]const local.sql_scalar.Datum, 4);
+    for (expected, 0..) |*row, index| row.* = try input.row(pa, index);
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check, .async_writes = false };
+    defer manager.deinit();
+    var sort = spill.Sort.init(a, &manager, &.{.{}}, 1024);
+    defer sort.deinit();
+    sort.shared_runs = true;
+    const keys = [_][]const local.sql_scalar.Datum{ &.{local.sql_scalar.Datum.json(.{ .integer = 3 })}, &.{local.sql_scalar.Datum.json(.{ .integer = 2 })}, &.{local.sql_scalar.Datum.json(.{ .integer = 1 })}, &.{local.sql_scalar.Datum.json(.{ .integer = 0 })} };
+    try sort.addBatch(try input.preparePhysical(pa), &keys, &.{ 0, 1, 2, 3 });
+    // The producer page may disappear as soon as addBatch returns.
+    @memset(&integers, 0);
+    @memset(&floating, 0);
+    @memset(&coefficients, 0);
+    @memset(&dictionary, "changed");
+    var count: usize = 0;
+    while (try sort.next(pa)) |row| {
+        try std.testing.expectEqual(@as(i64, @intCast(count)), row.keys[0].value.integer);
+        for (row.values, expected[@intCast(row.ordinal)]) |actual, wanted| {
+            try std.testing.expectEqual(wanted.sql_null, actual.sql_null);
+            if (!wanted.sql_null) {
+                try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(actual, wanted));
+                if (wanted.value == .float) try std.testing.expectEqual(@as(u64, @bitCast(wanted.value.float)), @as(u64, @bitCast(actual.value.float)));
+            }
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expect(manager.written_bytes > 0);
 }

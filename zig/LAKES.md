@@ -1257,3 +1257,19 @@ leaves a small cache hint and uses encoded state on subsequent reads. Transient
 allocator/loading pressure remains retryable. Scope, physical recipe/slot,
 logical-directory and current reader checks still apply. These optimizations
 retain metadata v5 and reader protocol 58 and require no new public options.
+
+
+Publication admits required retained state against shared capacity before sizing
+optional buffers or read-ahead. Shared pressure reduces optional work before
+splitting configurations into additional source passes. Exact NUMERIC group keys
+and SUM/AVG/MIN/MAX use per-file incremental contribution trees; widened sums and
+counts merge before finalization, preserving scale equivalence and special values.
+Binary floating reductions and DISTINCT retain conservative rebuild eligibility.
+
+Finished grouped partials route directly through bounded columnar radix streams
+in one shared extent file, without a sort or another reducer import. Consumed
+parent streams retire before recursive processing, and small resident groups
+publish without spill I/O. Output pages coalesce at most 256 rows. Ordered indexes
+gather 64 keys at a time and pass covering scalar/JSON columns to native batch
+sorting, retaining payload ownership before advancing source pages. The durable
+metadata and attachment/query UX remain unchanged.

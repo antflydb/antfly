@@ -2301,8 +2301,9 @@ zero-row publication.
 Grouped aggregate directories use metadata version 4 with 64 initial hash buckets
 and four-way recursive subdivisions. Buckets exceeding 1,024 groups subdivide using
 subsequent hash bits, avoiding dozens of tiny leaves on the first split;
-depth is bounded at nine. A shared-run native sort partitions each level without
-holding 64 files open at every recursion depth. Merges descend only into overlapping
+depth is bounded at nine. Finished columnar partial streams partition each level
+in one shared extent file, without sorting or importing states into another
+reducer. Up to 256 resident groups publish directly without a spill file. Merges descend only into overlapping
 branches and preserve sibling artifact references. Memoized branch reductions own
 at most 64 child aliases; file-reduction nodes keep their two children plus at most
 64 aliases. Small flat legacy buckets split when first merged with a subdivided
@@ -2540,3 +2541,58 @@ storage, covering real Iceberg evolution/deletes, compact nullable Parquet V1/V2
 NUMERIC materializations and source-unavailable aggregate reads after restart.
 The stripped Debug build, CLI, formatting, license/Apache boundary and source/error
 catalog checks passed with Zig 0.17.0. Main is merged through `f173b597ee`.
+
+
+### Adaptive retained admission and direct aggregate publication
+
+Publication first reserves the required input/reducer allowance atomically against
+both statement headroom and the node's remaining pull allowance. The admitted
+allowance then selects optional frame buffering, next-file reads and replay size.
+Only an inability to admit required state or consumer descriptors reduces cohort
+width. Optional work therefore cannot force another archive pass when the same
+consumers fit without that work. The nine-configuration real-Parquet regression
+retains three file opens under a 1,200 MiB shared allowance; the former ordering
+of these decisions opened those files six times.
+
+Exact NUMERIC grouping keys and SUM, AVG, MIN and MAX now use the existing
+per-file contribution tree. SUM/AVG retain widened base-10000 state and count;
+partial values are never finalized before merging. Semantic numeric hashes
+identify scale-equivalent keys and special values. Append and removal preserve
+unchanged file contributions, including NaN/infinity reducers. Binary floating
+keys/reductions and DISTINCT keep their existing conservative rebuild path.
+Changing eligibility does not change recipes or the durable reader contract;
+older publications without contribution coverage rebuild those states once.
+
+Grouped publication routes finished, unique partials directly into bounded
+columnar spill streams. All recursive streams share reusable 64 KiB extents in
+one anonymous file under the existing disk quota. There is no comparison sort or
+second hash reducer at any directory level. Counting scatter visits each page
+linearly instead of rescanning rows for each directory bucket. State checkpoints remain opaque
+while routing; only group keys are hashed. Output coalesces scatter records into
+pages of at most 256 rows. A consumed parent stream retires before descending,
+so its buffers and extents cannot accumulate across recursion. Small resident
+reductions of at most 256 groups publish directly without opening a spill file.
+Cancellation, disk denial and allocation faults release every stream and extent.
+
+Ordered index ingestion gathers at most 64 normalized keys and source positions
+per window. Covering columns enter the native sort as borrowed physical or lazy
+JSON views; unsupported interpretations retain their existing cell conversion.
+The sort owns retained values before the source page can advance. Tests cover
+signed integers beyond binary64 precision, IEEE NaN/infinities/signed zero,
+reordered selections, null dictionary IDs, JSON null, exact decimal text, external
+row IDs and spilled output ownership.
+
+These changes retain metadata v5 and reader protocol 58. Attachment/index options
+and SQL syntax are unchanged. Live-provider retention qualification remains
+separate from local native and independently generated Parquet/Iceberg E2Es.
+
+
+Qualification passed 331 native and 195 shared external-lake/scheduler/codec tests
+without failures or leaks. Final focused qualification passed six native and three
+shared regressions, plus two ordered-covering/spill checks, including the complete
+counting-scatter and IEEE preservation changes. All 16 selected HTTP/pgwire E2Es
+passed against the final rebuilt server, including real Iceberg evolution/deletes
+and exact NUMERIC AVG after restart with source payloads unavailable. The stripped
+Debug server, CLI, formatting, license/Apache boundary, source/control catalog,
+engine-error catalog and quickstart documentation checks passed with Zig 0.17.0.
+A fresh fetch confirmed `origin/main` through `f173b597ee` is already merged.

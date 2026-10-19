@@ -305,8 +305,19 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
 }
 
 pub fn incrementalRecipe(recipe: recipes.Recipe) bool {
-    for (recipe.keys) |key| if (key.type == .number) return false;
-    for (recipe.inputs) |input| if (input.spec.distinct or !(input.spec.kind == .count or input.spec.kind == .bool_and or input.spec.kind == .bool_or or (input.spec.kind == .sum and input.spec.input_type == .integer) or ((input.spec.kind == .min or input.spec.kind == .max) and input.spec.input_type != .number))) return false;
+    for (recipe.keys) |key| if (key.type == .number and key.element_type != .numeric) return false;
+    for (recipe.inputs) |input| {
+        const spec = input.spec;
+        if (spec.distinct) return false;
+        const exact = spec.input_type == .number and spec.input_element == .numeric;
+        if (!switch (spec.kind) {
+            .count, .bool_and, .bool_or => true,
+            .sum => spec.input_type == .integer or exact,
+            .avg => exact,
+            .min, .max => spec.input_type != .number or exact,
+            else => false,
+        }) return false;
+    }
     return true;
 }
 pub fn fileIdentity(source: *local.serverless_query_lake_serving.ServingSource, file: local.serverless_external_source_types.FileEntry) [32]u8 {
@@ -1490,6 +1501,9 @@ test "external lake recursive group partitions retain sibling artifacts on a sin
     const names = &.{ "stats.rows", "stats.sum" };
     const single: recipes.Recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] };
     const prior = try artifacts.publishPartitioned(a, out, &store, names, base, recipe, &manager, .none);
+    try std.testing.expectEqual(@as(usize, 1), manager.peak_files);
+    try std.testing.expectEqual(@as(usize, 0), manager.merges);
+
     const delta = try operators.Grouped.create(a, &specs, .{});
     defer delta.deinit();
     try delta.add(&.{local.sql_scalar.Datum.fromJson(.{ .integer = first })}, &.{ local.sql_scalar.Datum.fromJson(.{ .integer = 1 }), local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 }) });
@@ -1546,4 +1560,146 @@ test "external lake recursive group partitions retain sibling artifacts on a sin
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1400), count);
+}
+
+test "external lake exact numeric incremental recipes preserve floating fallback" {
+    const key: recipes.Key = .{ .path = "k", .type = .number, .nullable = true, .element_type = .numeric };
+    for ([_]operators.Aggregate.Kind{ .count, .sum, .avg, .min, .max }) |kind| {
+        const input: recipes.Input = .{ .spec = .{ .kind = kind, .input_type = .number, .input_element = .numeric }, .column = key };
+        try std.testing.expect(incrementalRecipe(.{ .keys = &.{key}, .inputs = &.{input} }));
+        var floating = input;
+        floating.spec.input_element = .float64;
+        if (kind != .count) try std.testing.expect(!incrementalRecipe(.{ .keys = &.{}, .inputs = &.{floating} }));
+        var distinct = input;
+        distinct.spec.distinct = true;
+        try std.testing.expect(!incrementalRecipe(.{ .keys = &.{}, .inputs = &.{distinct} }));
+    }
+    var floating_key = key;
+    floating_key.element_type = .float64;
+    try std.testing.expect(!incrementalRecipe(.{ .keys = &.{floating_key}, .inputs = &.{.{ .spec = .{ .kind = .count }, .column = null }} }));
+}
+
+test "external lake exact numeric radix updates reuse unchanged Parquet through append and removal" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("numeric-incremental-radix");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
+        .{ .column_id = "k", .field_id = 1, .converted_type = 0, .values = &.{ "1.0", "1.00", "2.000", "NaN", "NaN" } },
+        .{ .column_id = "amount", .field_id = 2, .converted_type = 0, .values = &.{ "9007199254740993.1", "-9007199254740993.0", "0.01", "Infinity", "-Infinity" } },
+    });
+    defer a.free(data);
+    for (0..4) |index| {
+        const key = try std.fmt.allocPrint(a, "part-{d}.parquet", .{index});
+        defer a.free(key);
+        var uploaded = try client.putObject("antfly", key, data, .{});
+        uploaded.deinit(a);
+    }
+    const schema = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"k":{{"type":"number","x-antfly-sql-type":"numeric"}},"amount":{{"type":"number","x-antfly-sql-type":"numeric"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer binding.deinit(a);
+    const path = try std.fs.path.join(a, &.{ directory.path(), "artifacts" });
+    defer a.free(path);
+    var artifact_fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, path);
+    defer artifact_fs.deinit();
+    var store = artifact_fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(4), .attempt = @splat(1) };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = schema, .indexes_json =
+        \\{"stats":{"type":"algebraic","materializations":[{"name":"count","op":"count","group_by":["k"]},{"name":"sum","op":"sum","measure":"amount","group_by":["k"]},{"name":"avg","op":"avg","measure":"amount","group_by":["k"]},{"name":"min","op":"min","measure":"amount","group_by":["k"]},{"name":"max","op":"max","measure":"amount","group_by":["k"]}]}}
+    };
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    const out = output.allocator();
+    const Denied = struct {
+        var base: local.storage_object_storage.ObjectStorage = undefined;
+        var append: bool = false;
+        fn get(_: *anyopaque, alloc: A, bucket: []const u8, key: []const u8, options: local.storage_object_storage.GetOptions) !local.storage_object_storage.GetResult {
+            if (!append or !std.mem.eql(u8, key, "part-4.parquet")) return error.UnexpectedUnchangedParquetRead;
+            var copy = base;
+            copy.allocator = alloc;
+            return copy.getObject(bucket, key, options);
+        }
+        fn number(alloc: A, text: []const u8) !local.sql_scalar.Datum {
+            var work: local.sql_array_value.Budget = .{};
+            return local.sql_scalar.numericTextLeaky(alloc, text, &work);
+        }
+    };
+    var previous: BuildResult = .{ .declarations = &.{}, .contributions = &.{} };
+    for (0..3) |phase| {
+        if (phase == 1) {
+            var uploaded = try client.putObject("antfly", "part-4.parquet", data, .{});
+            uploaded.deinit(a);
+        } else if (phase == 2) try client.deleteObject("antfly", "part-0.parquet", .{});
+        var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+        defer source.deinit();
+        var denied = source.scanner.object_reader.client.vtable.*;
+        Denied.base = source.scanner.object_reader.client;
+        Denied.append = phase == 1;
+        denied.get_object = Denied.get;
+        if (phase != 0) source.scanner.object_reader.client.vtable = &denied;
+        var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+        var replay = @import("lake_index_build_replay.zig").Replay.init(a, &provider, &.{ "k", "amount" });
+        defer replay.deinit();
+        provider.replay = &replay;
+        if (phase != 0) {
+            replay.only_files = (try @import("lake_index_build_replay.zig").changedFiles(a, out, &provider, store, previous.declarations, previous.contributions, .none)).?;
+            try std.testing.expectEqual(@as(usize, if (phase == 1) 1 else 0), replay.only_files.?.files.cardinality());
+        }
+        const built = try buildIncremental(a, out, table, &source, &store, &provider, .none, &.{}, previous.contributions);
+        const files = source.inventory.files.len;
+        try std.testing.expectEqual(@as(usize, 5), built.declarations.len);
+        try std.testing.expect(built.contributions.len >= files * 5);
+        if (phase != 0) {
+            var reused_leaves: usize = 0;
+            for (built.contributions) |current| {
+                const leaf = for (source.inventory.files) |file| {
+                    if (std.mem.eql(u8, &current.file, &fileIdentity(&source, file))) break true;
+                } else false;
+                if (!leaf) continue;
+                for (previous.contributions) |old| if (std.mem.eql(u8, &current.file, &old.file) and std.mem.eql(u8, current.artifact.artifact_id, old.artifact.artifact_id)) {
+                    reused_leaves += 1;
+                    break;
+                };
+            }
+            try std.testing.expectEqual(@as(usize, 20), reused_leaves);
+        }
+        for (built.declarations, 0..) |declaration, slot| {
+            const recipe = try artifacts.loadRecipe(out, store, declaration.artifact, .none);
+            try std.testing.expect(incrementalRecipe(recipe));
+            const reader = try artifacts.Reader.open(a, store, declaration.artifact, recipe, .none);
+            defer reader.cursor().close(reader);
+            const group = try operators.Grouped.create(a, &.{recipe.inputs[0].spec}, .{});
+            defer group.deinit();
+            while (try reader.cursor().next(reader, out, 8)) |rows| try group.importPartialBatch(rows);
+            var groups: usize = 0;
+            while (try group.nextResult(out)) |row| {
+                groups += 1;
+                const nan = row.keys[0].numeric.?.kind == .nan;
+                const one = !nan and (try local.sql_scalar.compareDatums(row.keys[0], try Denied.number(out, "1"))) == .eq;
+                if (slot == 0) {
+                    try std.testing.expectEqual(@as(i64, @intCast(files * if (one or nan) @as(usize, 2) else 1)), row.aggregates[0].value.integer);
+                } else {
+                    const expected = if (nan) switch (slot) {
+                        3 => "-Infinity",
+                        4 => "Infinity",
+                        else => "NaN",
+                    } else if (one) switch (slot) {
+                        1 => try std.fmt.allocPrint(out, "0.{d}", .{files}),
+                        2 => "0.05",
+                        3 => "-9007199254740993.0",
+                        else => "9007199254740993.1",
+                    } else if (slot == 1) try std.fmt.allocPrint(out, "0.0{d}", .{files}) else "0.01";
+                    try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(row.aggregates[0], try Denied.number(out, expected)));
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 3), groups);
+        }
+        previous = built;
+    }
 }

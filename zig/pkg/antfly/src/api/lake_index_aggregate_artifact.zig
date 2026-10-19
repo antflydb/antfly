@@ -259,6 +259,69 @@ pub fn publishCohortProven(a: A, result_alloc: A, store: *stores.ArtifactStore, 
     if (proofs) |values| if (values.len != names.len) return error.InvalidNativeAggregateArtifact;
     if (names.len == 0 or names.len != recipe.inputs.len or names.len > 256 or group.specs.len != names.len) return error.InvalidNativeAggregateArtifact;
     for (names, group.specs, recipe.inputs) |name, spec, input| if (name.len == 0 or !std.meta.eql(spec, input.spec)) return error.InvalidNativeAggregateArtifact;
+    var input: PartialStream = .{ .group = group };
+    return publishPartialStream(a, result_alloc, store, names, &input, recipe, cancellation, proofs);
+}
+
+/// Finished unique partials cross publication boundaries without another hash
+/// reducer. State checkpoints remain opaque until serving imports them.
+const PartialStream = struct {
+    group: ?*operators.Grouped = null,
+    rows: ?[]const operators.Row = null,
+    file: ?*spill.Sequential = null,
+    retirement: ?struct { pool: *spill.Partitions, index: usize } = null,
+    offset: u64 = 0,
+    finished: bool = false,
+    fn finish(self: *PartialStream) void {
+        if (self.retirement) |owner| owner.pool.close(owner.index);
+        self.retirement = null;
+        self.file = null;
+        self.finished = true;
+    }
+    fn next(self: *PartialStream, a: A) ![]const operators.Row {
+        if (self.finished) return &.{};
+        if (self.rows) |rows| {
+            const begin: usize = @intCast(self.offset);
+            const end = @min(rows.len, begin + 256);
+            self.offset = end;
+            return rows[begin..end];
+        }
+        if (self.file) |file| {
+            if (self.offset == file.size) return &.{};
+            // Coalesce small scatter records into full output pages. Clone
+            // payloads only across the spill read-buffer ownership boundary.
+            const maximum: usize = @intCast(@min(256, file.size - self.offset));
+            const rows = try a.alloc(operators.Row, maximum);
+            const first = try file.readBatchBorrowed(self.offset, maximum);
+            const width = first.rows[0].values.len;
+            const key_width = first.rows[0].keys.len;
+            const values = try a.alloc(local.sql_scalar.Datum, maximum * width);
+            const keys = try a.alloc(local.sql_scalar.Datum, maximum * key_width);
+            var count: usize = 0;
+            while (count < maximum) {
+                const batch = try file.readBatchBorrowed(self.offset, maximum - count);
+                for (batch.rows) |row| {
+                    if (row.values.len != width or row.keys.len != key_width) return error.InvalidSqlSpill;
+                    const value_cells = values[count * width ..][0..width];
+                    const key_cells = keys[count * key_width ..][0..key_width];
+                    for (value_cells, row.values) |*cell, value| cell.* = try operators.cloneDatum(a, value);
+                    for (key_cells, row.keys) |*cell, value| cell.* = try operators.cloneDatum(a, value);
+                    rows[count] = .{ .values = value_cells, .keys = key_cells, .ordinal = row.ordinal };
+                    count += 1;
+                }
+                self.offset = batch.following;
+            }
+            return rows;
+        }
+        var rows: std.ArrayList(operators.Row) = .empty;
+        while (rows.items.len < 256) {
+            const partial = try self.group.?.nextPartialResult(a) orelse break;
+            try rows.append(a, .{ .keys = partial.keys, .values = partial.aggregates, .ordinal = partial.ordinal });
+        }
+        return rows.items;
+    }
+};
+fn publishPartialStream(a: A, result_alloc: A, store: *stores.ArtifactStore, names: []const []const u8, input: *PartialStream, recipe: recipes.Recipe, cancellation: Cancellation, proofs: ?[]StateProof) ![]Ref {
     var control = std.heap.ArenaAllocator.init(a);
     defer control.deinit();
     const ca = control.allocator();
@@ -270,24 +333,21 @@ pub fn publishCohortProven(a: A, result_alloc: A, store: *stores.ArtifactStore, 
         var page = std.heap.ArenaAllocator.init(a);
         defer page.deinit();
         const pa = page.allocator();
-        var rows: std.ArrayList(operators.Row) = .empty;
-        while (rows.items.len < 256) {
-            const partial = try group.nextPartialResult(pa) orelse break;
-            if (partial.keys.len != recipe.keys.len or partial.aggregates.len != recipe.inputs.len) return error.InvalidSqlBackendResponse;
-            try rows.append(pa, .{ .keys = partial.keys, .values = partial.aggregates, .ordinal = partial.ordinal });
-        }
-        if (rows.items.len == 0) break;
+        const rows = try input.next(pa);
+        if (rows.len == 0) break;
+        for (rows) |row| if (row.keys.len != recipe.keys.len or row.values.len != recipe.inputs.len) return error.InvalidSqlBackendResponse;
         if (blocks.items.len == max_blocks) return error.NativeAggregateArtifactTooLarge;
-        const encoded = try spill.encodeColumnarBlockAlloc(pa, rows.items, max_block_bytes);
+        const encoded = try spill.encodeColumnarBlockAlloc(pa, rows, max_block_bytes);
         var upload = store.*;
         upload.allocator = ca;
         output_bytes = std.math.add(u64, output_bytes, encoded.len) catch return error.NativeAggregateArtifactTooLarge;
         if (output_bytes > 512 * 1024 * 1024) return error.NativeAggregateArtifactTooLarge;
         const artifact = try upload.putWithCancellation(encoded, cancellation);
         defer if (artifact.provider_version) |version| upload.allocator.free(version);
-        try blocks.append(ca, .{ .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, .rows = @intCast(rows.items.len) });
-        groups = std.math.add(u64, groups, rows.items.len) catch return error.NativeAggregateArtifactTooLarge;
+        try blocks.append(ca, .{ .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, .rows = @intCast(rows.len) });
+        groups = std.math.add(u64, groups, rows.len) catch return error.NativeAggregateArtifactTooLarge;
     }
+    input.finish();
     const references = try result_alloc.alloc(Ref, names.len);
     var initialized: usize = 0;
     errdefer {
@@ -839,28 +899,110 @@ pub fn publishPartitionedAt(a: A, out: A, store: *stores.ArtifactStore, names: [
     return publishPartitionedAtProven(a, out, store, names, group, recipe, manager, cancellation, depth, null);
 }
 pub fn publishPartitionedAtProven(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, group: *operators.Grouped, recipe: recipes.Recipe, manager: *spill.Manager, cancellation: Cancellation, depth: u8, proofs: ?[]StateProof) anyerror![]Ref {
-    if (depth > max_partition_depth) return error.InvalidNativeAggregateArtifact;
-    // One shared-run sort bounds descriptors independently of radix depth.
-    var sort = spill.Sort.init(a, manager, &.{.{}}, 512 * 1024);
-    defer sort.deinit();
-    sort.shared_runs = true;
+    if (depth > max_partition_depth or names.len == 0 or names.len != recipe.inputs.len or names.len > 256 or group.specs.len != names.len) return error.InvalidNativeAggregateArtifact;
+    if (proofs) |values| if (values.len != names.len) return error.InvalidNativeAggregateArtifact;
+    for (names, group.specs, recipe.inputs) |name, spec, input| if (name.len == 0 or !std.meta.eql(spec, input.spec)) return error.InvalidNativeAggregateArtifact;
+    try cancellation.check();
+    var input: PartialStream = .{ .group = group };
+    if (group.external == null and group.groups.items.len - group.result_cursor <= 256)
+        return publishSmallRadix(a, out, store, names, &input, recipe, cancellation, depth, proofs);
+    var pool = try spill.Partitions.init(manager);
+    defer pool.deinit();
+    return publishRadixStream(a, out, store, names, &input, recipe, &pool, cancellation, depth, proofs);
+}
+fn groupHash(keys: []const local.sql_scalar.Datum) !u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (keys) |key| {
+        var bytes: [9]u8 = undefined;
+        bytes[0] = @intFromBool(key.sql_null);
+        std.mem.writeInt(u64, bytes[1..9], try local.sql_scalar.semanticHashDatum(key), .little);
+        hasher.update(&bytes);
+    }
+    return hasher.final();
+}
+/// Counting scatter visits each row once, independent of directory fanout.
+const RadixSelection = struct {
+    positions: [256]usize = undefined,
+    ranges: [65]usize = @splat(0),
+    fn init(rows: []const operators.Row, recipe: recipes.Recipe, depth: u8) !RadixSelection {
+        if (rows.len > 256) return error.InvalidNativeAggregateArtifact;
+        var result: RadixSelection = .{};
+        var counts: [64]usize = @splat(0);
+        var buckets: [256]u8 = undefined;
+        for (rows, 0..) |row, index| {
+            if (row.keys.len != recipe.keys.len or row.values.len != recipe.inputs.len) return error.InvalidSqlBackendResponse;
+            const bucket: u8 = @intCast((try groupHash(row.keys) >> partitionShift(depth)) % partitionFanout(depth));
+            buckets[index] = bucket;
+            counts[bucket] += 1;
+        }
+        for (counts, 0..) |count, index| result.ranges[index + 1] = result.ranges[index] + count;
+        var next = result.ranges[0..64].*;
+        for (buckets[0..rows.len], 0..) |bucket, index| {
+            result.positions[next[bucket]] = index;
+            next[bucket] += 1;
+        }
+        return result;
+    }
+    fn indices(self: *const RadixSelection, bucket: usize) []const usize {
+        return self.positions[self.ranges[bucket]..self.ranges[bucket + 1]];
+    }
+};
+/// Small categorical reductions remain entirely resident. Partitioning copies
+/// only bounded row descriptors and writes each finished checkpoint once.
+fn publishSmallRadix(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, input: *PartialStream, recipe: recipes.Recipe, cancellation: Cancellation, depth: u8, proofs: ?[]StateProof) ![]Ref {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const rows = try input.next(pa);
+    input.finish();
+    const selection = try RadixSelection.init(rows, recipe, depth);
+    const lists = try pa.alloc(std.ArrayList(Partition), names.len);
+    @memset(lists, .empty);
+    const child_proofs = try pa.alloc(StateProof, names.len);
+    var selected: [256]operators.Row = undefined;
+    for (0..partitionFanout(depth)) |bucket| {
+        try cancellation.check();
+        const positions = selection.indices(bucket);
+        const count = positions.len;
+        if (count == 0) continue;
+        for (positions, 0..) |index, lane| selected[lane] = rows[index];
+        var child: PartialStream = .{ .rows = selected[0..count] };
+        const refs = try publishPartialStream(a, pa, store, names, &child, recipe, cancellation, child_proofs);
+        for (refs, lists, child_proofs) |ref, *list, proof| try list.append(pa, .{ .bucket = @intCast(bucket), .artifact = ref, .groups = count, .proof = proof });
+    }
+    return publishPartitionRootsAtProven(a, out, store, names, recipe, lists, cancellation, depth, proofs);
+}
+fn publishRadixStream(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, input: *PartialStream, recipe: recipes.Recipe, pool: *spill.Partitions, cancellation: Cancellation, depth: u8, proofs: ?[]StateProof) anyerror![]Ref {
+    var partitions = pool.child();
+    defer partitions.deinit();
     while (true) {
         try cancellation.check();
         var page = std.heap.ArenaAllocator.init(a);
         defer page.deinit();
         const pa = page.allocator();
-        const row = try group.nextPartialResult(pa) orelse break;
-        var hasher = std.hash.Wyhash.init(0);
-        for (row.keys) |key| {
-            var bytes: [9]u8 = undefined;
-            bytes[0] = @intFromBool(key.sql_null);
-            std.mem.writeInt(u64, bytes[1..9], if (key.sql_null) 0 else try local.sql_scalar.semanticHash(key.value), .little);
-            hasher.update(&bytes);
+        const rows = try input.next(pa);
+        if (rows.len == 0) break;
+        const selection = try RadixSelection.init(rows, recipe, depth);
+        for (0..partitionFanout(depth)) |bucket| {
+            const positions = selection.indices(bucket);
+            const count = positions.len;
+            if (count == 0) continue;
+            // Gather descriptors only. Payloads borrow the page until the
+            // synchronous columnar write ends; no state decoding is needed.
+            var values: [256][]const local.sql_scalar.Datum = undefined;
+            var keys: [256][]const local.sql_scalar.Datum = undefined;
+            var ordinals: [256]u64 = undefined;
+            for (positions, 0..) |index, lane| {
+                values[lane] = rows[index].values;
+                keys[lane] = rows[index].keys;
+                ordinals[lane] = rows[index].ordinal;
+            }
+            try partitions.appendBatch(bucket, .{ .rows = values[0..count] }, .{ .rows = keys[0..count] }, ordinals[0..count]);
         }
-        const bucket = (hasher.final() >> partitionShift(depth)) % partitionFanout(depth);
-        const values = try std.mem.concat(pa, local.sql_scalar.Datum, &.{ row.keys, row.aggregates });
-        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .integer = @intCast(bucket) })}, .values = values, .ordinal = row.ordinal });
     }
+    // Retire the parent extent stream before recursively opening children.
+    input.finish();
+    try partitions.seal();
     const lists = try a.alloc(std.ArrayList(Partition), names.len);
     defer a.free(lists);
     @memset(lists, .empty);
@@ -871,37 +1013,27 @@ pub fn publishPartitionedAtProven(a: A, out: A, store: *stores.ArtifactStore, na
         }
         list.deinit(a);
     };
-    const specs = try a.alloc(operators.AggregateSpec, recipe.inputs.len);
-    defer a.free(specs);
-    for (specs, recipe.inputs) |*spec, input| spec.* = input.spec;
     const child_proofs = try a.alloc(StateProof, names.len);
     defer a.free(child_proofs);
-    var partial: ?*operators.Grouped = null;
-    defer if (partial) |value| value.deinit();
-    var bucket: i64 = -1;
-    var count: u64 = 0;
-    while (true) {
-        try cancellation.check();
-        var page = std.heap.ArenaAllocator.init(a);
-        defer page.deinit();
-        const row = try sort.next(page.allocator());
-        const next = if (row) |value| value.keys[0].value.integer else -1;
-        if (partial != null and (row == null or next != bucket)) {
-            const refs = if (count > partition_leaf_groups and depth < max_partition_depth)
-                try publishPartitionedAtProven(a, a, store, names, partial.?, recipe, manager, cancellation, depth + 1, child_proofs)
-            else
-                try publishCohortProven(a, a, store, names, partial.?, recipe, cancellation, child_proofs);
-            defer a.free(refs);
-            for (refs, lists, child_proofs) |ref, *list, proof| try list.append(a, .{ .bucket = @intCast(bucket), .artifact = ref, .groups = count, .proof = proof });
-            partial.?.deinit();
-            partial = null;
-            count = 0;
+    for (0..partitionFanout(depth)) |bucket| {
+        const file = if (partitions.streams[bucket]) |*stream| stream else continue;
+        const count = file.size;
+        var child: PartialStream = .{ .file = file, .retirement = .{ .pool = &partitions, .index = bucket } };
+        const refs = if (count > partition_leaf_groups and depth < max_partition_depth)
+            try publishRadixStream(a, a, store, names, &child, recipe, pool, cancellation, depth + 1, child_proofs)
+        else
+            try publishPartialStream(a, a, store, names, &child, recipe, cancellation, child_proofs);
+        defer a.free(refs);
+        var transferred: usize = 0;
+        defer for (refs[transferred..]) |ref| {
+            a.free(ref.artifact_id);
+            a.free(ref.checksum);
+        };
+        for (refs, lists, child_proofs) |ref, *list, proof| {
+            try list.append(a, .{ .bucket = @intCast(bucket), .artifact = ref, .groups = count, .proof = proof });
+            transferred += 1;
         }
-        const value = row orelse break;
-        if (partial == null) partial = try operators.Grouped.create(a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = manager });
-        bucket = next;
-        try partial.?.importPartial(value.values[0..recipe.keys.len], value.values[recipe.keys.len..], value.ordinal);
-        count += 1;
+        partitions.close(bucket);
     }
     return publishPartitionRootsAtProven(a, out, store, names, recipe, lists, cancellation, depth, proofs);
 }
@@ -1250,6 +1382,10 @@ test "external lake aggregate publishers carry authenticated proofs without chil
     var dummy: u8 = 0;
     var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
     defer manager.deinit();
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, publishPartitioned(a, out, &store, &names, group, recipe, &manager, Cancellation.fromAtomic(&canceled)));
+    try std.testing.expectEqual(@as(usize, 0), group.result_cursor);
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
     const original = store.vtable;
     var denied = original.*;
     denied.get_bounded_alloc_with_cancellation = Check.denied;
@@ -1257,6 +1393,7 @@ test "external lake aggregate publishers carry authenticated proofs without chil
     // Fresh partitions provide their physical identity and logical slot at the
     // upload boundary. Even a completely cold store needs no child-root GETs.
     const refs = try publishPartitioned(a, out, &store, &names, group, recipe, &manager, .none);
+    try std.testing.expectEqual(@as(usize, 0), manager.peak_files);
     store.vtable = original;
     var lists = [_]std.ArrayList(Partition){ .empty, .empty };
     for (&lists, refs, 0..) |*list, ref, slot| try list.appendSlice(out, try loadPartitions(out, store, ref, .{ .keys = recipe.keys, .inputs = recipe.inputs[slot..][0..1] }, .none));

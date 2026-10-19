@@ -223,18 +223,21 @@ fn buildCohort(args_: Args, units: []const Unit) !?Result {
     if (workspace >= available or available - workspace < 1024 * 1024) return null;
     const frame_limit = std.math.mul(usize, args_.provider.limits.max_decoded_bytes, 2) catch return null;
     const queue_bytes = std.math.mul(usize, frame_limit, 2) catch return null;
-    const buffered = queue_bytes < available - workspace;
+    const scan_workspace = std.math.add(usize, args_.provider.limits.max_input_bytes, decoded) catch return null;
+    const desired = @min(available, workspace +| queue_bytes +| scan_workspace +| replay.budget.limit);
+    var retained_bytes = scheduler.reservePullUpTo(units.len, workspace + 1024 * 1024, desired) orelse return null;
+    defer scheduler.releasePull(units.len, retained_bytes);
+    const buffered = queue_bytes < retained_bytes - workspace;
     if (buffered) workspace += queue_bytes;
     // A second private cursor pins one first batch, its compressed input and
     // decoder state. Admission covers its entire lifetime, including uploads
     // by consumers of the current file. No speculative archive spool is used.
-    const scan_workspace = std.math.add(usize, args_.provider.limits.max_input_bytes, decoded) catch return null;
-    const stream_read_ahead = scan_workspace < available - workspace;
+    const stream_read_ahead = scan_workspace < retained_bytes - workspace;
     if (stream_read_ahead) workspace += scan_workspace;
-    const replay_limit = @min(replay.budget.limit, available - workspace);
-    const retained_bytes = std.math.add(usize, workspace, replay_limit) catch return null;
-    if (!scheduler.reservePull(units.len, retained_bytes)) return null;
-    defer scheduler.releasePull(units.len, retained_bytes);
+    const replay_limit = @min(replay.budget.limit, retained_bytes - workspace);
+    const used = workspace + replay_limit;
+    scheduler.releasePull(0, retained_bytes - used);
+    retained_bytes = used;
     var projection_arena = std.heap.ArenaAllocator.init(args_.a);
     defer projection_arena.deinit();
     const projection = try projectionForUnits(args_, projection_arena.allocator(), units);
@@ -569,4 +572,14 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().pull_workers);
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().pull_bytes);
     try std.testing.expect(local.sql_parallel_scheduler.global().peak_cpu_workers <= local.sql_parallel_scheduler.global().max_workers);
+    // Shared retention pressure must trim optional buffers before splitting a
+    // file rendezvous. This previously opened the same three files six times.
+    var constrained: local.sql_parallel_scheduler.Scheduler = .{ .max_pull_bytes = 1200 * 1024 * 1024 };
+    args.scheduler = &constrained;
+    const captures_before_constrained = replay.captures;
+    const constrained_result = (try build(args)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 4), constrained_result.text.len);
+    try std.testing.expectEqual(@as(usize, 3), replay.captures - captures_before_constrained);
+    try std.testing.expectEqual(@as(usize, 0), constrained.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), constrained.pull_workers);
 }

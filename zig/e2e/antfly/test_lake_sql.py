@@ -4631,7 +4631,7 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
                                     "measure": "k",
                                     "group_by": ["k"],
                                 }
-                                for op in ("sum", "min", "max")
+                                for op in ("sum", "avg", "min", "max")
                             ],
                         ],
                     }
@@ -4651,6 +4651,16 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
         statement = "SELECT k, COUNT(*), SUM(k), MIN(k), MAX(k) FROM numeric_groups GROUP BY k ORDER BY k"
         expected = [[k, "1", k, k, k] for k in keys] + [[None, "1", None, None, None]]
         assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        averages = call(
+            "POST",
+            "/sql",
+            {"statement": "SELECT k, AVG(k) FROM numeric_groups GROUP BY k ORDER BY k"},
+        )["rows"]
+        assert [
+            [None if cell is None else Decimal(cell) for cell in row]
+            for row in averages
+        ] == [[Decimal(k), Decimal(k)] for k in keys] + [[None, None]]
+
         residual = (
             statement.replace("GROUP BY k", "GROUP BY k+CAST('0' AS NUMERIC)")
             .replace("SELECT k,", "SELECT k+CAST('0' AS NUMERIC),")
@@ -4667,6 +4677,16 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
                 shutil.rmtree(cached)
         server.resume()
         assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        averages = call(
+            "POST",
+            "/sql",
+            {"statement": "SELECT k, AVG(k) FROM numeric_groups GROUP BY k ORDER BY k"},
+        )["rows"]
+        assert [
+            [None if cell is None else Decimal(cell) for cell in row]
+            for row in averages
+        ] == [[Decimal(k), Decimal(k)] for k in keys] + [[None, None]]
+
         failed = False
     finally:
         server.stop(test_failed=failed)

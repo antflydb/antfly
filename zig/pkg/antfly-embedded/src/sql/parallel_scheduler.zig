@@ -91,12 +91,18 @@ pub const Scheduler = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
     pub fn reservePull(self: *Scheduler, count: usize, bytes: usize) bool {
+        return self.reservePullUpTo(count, bytes, bytes) != null;
+    }
+    /// Reserve required retained state before choosing optional pipeline buffers.
+    /// The returned allowance is atomic with respect to competing publications.
+    pub fn reservePullUpTo(self: *Scheduler, count: usize, required: usize, desired: usize) ?usize {
         self.lock();
         defer self.mutex.unlock();
-        if (count > self.max_pull_workers -| self.pull_workers or bytes > self.max_pull_bytes -| self.pull_bytes) return false;
+        const bytes = @min(desired, self.max_pull_bytes -| self.pull_bytes);
+        if (desired < required or count > self.max_pull_workers -| self.pull_workers or bytes < required) return null;
         self.pull_workers += count;
         self.pull_bytes += bytes;
-        return true;
+        return bytes;
     }
     pub fn releasePull(self: *Scheduler, count: usize, bytes: usize) void {
         self.lock();
@@ -555,4 +561,17 @@ test "SQL cooperative CPU admission wakes waiters and cancels without leaking pe
     }
     try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
     try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+}
+
+test "SQL shared retained admission reserves required work before optional buffers" {
+    var scheduler: Scheduler = .{ .max_pull_bytes = 512, .max_pull_workers = 4 };
+    try std.testing.expectEqual(@as(?usize, 400), scheduler.reservePullUpTo(2, 256, 400));
+    try std.testing.expectEqual(@as(?usize, 112), scheduler.reservePullUpTo(1, 64, 256));
+    try std.testing.expectEqual(@as(?usize, null), scheduler.reservePullUpTo(1, 1, 32));
+    try std.testing.expectEqual(@as(usize, 512), scheduler.pull_bytes);
+    scheduler.releasePull(1, 112);
+    try std.testing.expectEqual(@as(?usize, null), scheduler.reservePullUpTo(3, 1, 64));
+    scheduler.releasePull(2, 400);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
 }
