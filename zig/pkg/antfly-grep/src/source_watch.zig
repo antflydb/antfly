@@ -61,7 +61,9 @@ pub const Watch = struct {
     /// Namespace journals keep their independent 4096-route bound. Never use
     /// advisory asynchronous events as proof of unchanged source contents.
     pub fn initSources() Watch {
-        var self: Watch = .{ .limit = 65536 };
+        // Synchronous Linux directory queues already extend regular-file
+        // coverage beyond this table; keep their smaller kernel/memory budget.
+        var self: Watch = .{ .limit = if (builtin.os.tag == .macos) 65536 else 4096 };
         self.open();
         return self;
     }

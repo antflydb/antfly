@@ -3352,8 +3352,9 @@ before a view is published. The request and batch schemas are shipped in release
 archives, alongside existing schemas.
 
 Opt-in `--workspace-watch` now uses a source table that grows geometrically on
-demand, up to 65,536 slots and at most one quarter of the process descriptor
-quota. Namespace/configuration journals keep their independent 4,096-slot limit.
+demand, up to 65,536 slots on macOS and at most one quarter of the process
+descriptor quota. Linux keeps its 4,096-slot ceiling because synchronous
+directory queues already extend regular-file coverage beyond that table. Namespace/configuration journals keep their independent 4,096-slot limit.
 A free-list gives constant-time slot admission/recycling; dirty-event clearing
 visits recorded slots instead of clearing a maximum-sized array. Stable numeric
 tokens survive backing-table growth. Smaller workspaces allocate smaller tables,
@@ -3381,3 +3382,35 @@ Indexed prefetch shutdown publishes terminal cancellation for an undequeued
 request and wakes its consumer. A consumer awaiting a page observes atomic
 signal cancellation through a bounded 10 ms condition timeout. Successful
 handoffs remain signaled immediately; idle producers do not periodically wake.
+
+The paired transport qualification uses the preceding PR binary (`ecde7aa255`)
+and the new product binaries, with the same optimized reference consumer for
+all modes. Nine rotated warm trials verify complete logical summaries, exact
+match/context data, provenance and file statistics outside timing. Every mixed
+refresh trial also checks its revision against an untimed forced rescan. The
+fixtures contain either one matching line, 20,000 matching lines, or 6,000 small
+files in one flat directory with rotating edits/additions/deletions.
+
+| macOS control | Previous v2 → current v3 |
+|---|---:|
+| Dense complete delivery | 54.71 → 33.13 ms |
+| Dense consumer CPU | 53.81 → 31.94 ms |
+| Dense response bytes | 6,084,767 → 4,065,873 |
+| Dense first row | 0.353 → 0.115 ms |
+| One-line complete delivery | 0.101 → 0.107 ms |
+
+Default v2 dense delivery remains similar (56.30 ms and 54.14 ms consumer CPU
+in the current binary). Small timings vary with the shared host; the current
+v2 one-line control measured 0.141 ms, while producer time remained about 16–17
+microseconds across all one-line modes. These measurements establish a dense
+transport benefit, not a universal startup or tiny-request speedup.
+
+For watched macOS refresh plus full result delivery, the mixed 6,000-file median
+falls from 74.25 to 44.02 ms. Content-only edits fall from 49.59 to 5.89 ms;
+additions and deletions still scan directory names (80.09→44.52 and
+94.41→49.21 ms). Current refreshes read only 14–27 changed source bytes, versus
+more than 228 KiB of unwitnessed source reads in the baseline. One untimed
+startup sample costs 307 ms versus 196 ms when admitting the additional strict
+witnesses; its resident-set sample is 9,568 versus 10,080 KiB. These are single
+setup/RSS observations, not cold-cache or peak-memory measurements. More witness
+coverage trades setup and kernel resources for cheaper repeated freshness checks.
