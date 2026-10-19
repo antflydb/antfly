@@ -1822,19 +1822,37 @@ pub const Grouped = struct {
     }
     pub fn addEncodedColumnsIdentified(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: ?InputIdentity) !void {
         if (try self.addEncodedWindow(keys, inputs, count, identity)) return;
+        // Batch evidence is immutable for this call. Reconstructing a physical
+        // view of the whole source for every singleton retry is quadratic.
+        // Validate once before consuming fallback rows; row access remains
+        // checked and optional view admission stays bounded per column.
+        try self.validateEncodedColumns(keys, inputs);
         var begin: usize = 0;
         var length = @max(@as(usize, 1), count / 2);
         while (begin < count) {
             length = @min(length, count - begin);
-            if (try self.retryEncodedWindow(keys, inputs, begin, length, identity)) {
+            if (try self.retryEncodedWindow(keys, inputs, begin, length, identity, false)) {
                 begin += length;
                 length *|= 2;
             } else length = @max(@as(usize, 1), length / 2);
         }
     }
+    fn validateEncodedColumns(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch) !void {
+        for ([_][]const @import("execution_batch.zig").Batch{ keys, inputs }) |columns| for (columns) |column| {
+            var admission: MemoryBudget = .{ .backing = self.backing, .limit = (MemoryBudget.headroom(self.backing) orelse 4 * 1024 * 1024) / 2 };
+            var validation = std.heap.ArenaAllocator.init(admission.allocator());
+            defer validation.deinit();
+            const view = column.physicalColumn(validation.allocator(), 0) catch |err| {
+                if (err == error.OutOfMemory and admission.isLocallyExhausted()) continue;
+                return err;
+            };
+            if (view) |physical| try physical.validate();
+        };
+    }
+
     /// Selection construction is optional admission too. Release the whole
     /// retry view before reducing its size; never pin a failed large prefix.
-    fn retryEncodedWindow(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, begin: usize, length: usize, identity: ?InputIdentity) !bool {
+    fn retryEncodedWindow(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, begin: usize, length: usize, identity: ?InputIdentity, validate_singleton: bool) !bool {
         // Shrinking rows cannot shrink per-column view metadata. A singleton
         // reads the original lane directly, without optional selection/views.
         if (length == 1) {
@@ -1843,18 +1861,7 @@ pub const Grouped = struct {
             const a = scratch.allocator();
             var key_cells: [256]Datum = undefined;
             const input_cells = try a.alloc(Datum, inputs.len);
-            // Validate optional provider evidence one column at a time. Its
-            // metadata must not accumulate with the grouping-key width.
-            for ([_][]const @import("execution_batch.zig").Batch{ keys, inputs }) |columns| for (columns) |column| {
-                var admission: MemoryBudget = .{ .backing = self.backing, .limit = (MemoryBudget.headroom(self.backing) orelse 4 * 1024 * 1024) / 2 };
-                var validation = std.heap.ArenaAllocator.init(admission.allocator());
-                defer validation.deinit();
-                const view = column.physicalColumn(validation.allocator(), 0) catch |err| {
-                    if (err == error.OutOfMemory and admission.isLocallyExhausted()) continue;
-                    return err;
-                };
-                if (view) |physical| try physical.validate();
-            };
+            if (validate_singleton) try self.validateEncodedColumns(keys, inputs);
             for (keys, key_cells[0..keys.len]) |column, *cell| cell.* = try column.cell(a, begin, 0);
             for (inputs, input_cells) |column, *cell| cell.* = try column.cell(a, begin, 0);
             if (identity) |ids| try self.addOrdered(key_cells[0..keys.len], input_cells, ids.ordinals[begin]) else try self.add(key_cells[0..keys.len], input_cells);
@@ -2016,7 +2023,7 @@ pub const Grouped = struct {
         for (inputs) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
         if (count == 0) return true;
         self.key_count = keys.len;
-        if (count == 1) return self.retryEncodedWindow(keys, inputs, 0, 1, identity);
+        if (count == 1) return self.retryEncodedWindow(keys, inputs, 0, 1, identity, true);
         var scratch = std.heap.ArenaAllocator.init(self.backing);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -4227,9 +4234,25 @@ test "SQL wide encoded grouping falls back without optional views under parent p
     var store = @import("typed_store.zig").Store.init(a);
     defer store.deinit();
     for (0..4096) |_| _ = try store.append(&.{Datum.json(.{ .integer = 7 })});
-    for ([_]usize{ 32, 64 }) |width| for ([_]usize{ 1, 4096 }) |row_count| {
+    for ([_]usize{ 32, 64 }) |width| for ([_]usize{ 1, 4096 }) |row_count| for ([_]bool{ false, true }) |probe_case| {
         const key: Batch = .{ .retained = .{ .store = &store, .count = row_count } };
-        const columns: [64]Batch = @splat(key);
+        const Probe = struct {
+            source: Batch,
+            physical_calls: usize = 0,
+            limit: usize,
+            fn cell(raw: *anyopaque, alloc: Allocator, row: usize, column: usize) !Datum {
+                return @as(*@This(), @ptrCast(@alignCast(raw))).source.cell(alloc, row, column);
+            }
+            fn physical(raw: *anyopaque, alloc: Allocator, column: usize) !?@import("execution_batch.zig").PhysicalColumn {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.physical_calls += 1;
+                if (self.physical_calls > self.limit) return error.TestUnexpectedResult;
+                return self.source.physicalColumn(alloc, column);
+            }
+        };
+        var probe = Probe{ .source = key, .limit = width * 64 };
+        const observed: Batch = .{ .reader = .{ .ptr = &probe, .read = Probe.cell, .read_physical = Probe.physical, .count = row_count, .width = 1 } };
+        const columns: [64]Batch = @splat(if (probe_case) observed else key);
         var parent: MemoryBudget = .{ .backing = a, .limit = 1024 * 1024 };
         const alloc = parent.allocator();
         const occupied = try alloc.alloc(u8, (if (width == 32) @as(usize, 992) else 960) * 1024);
@@ -4243,6 +4266,9 @@ test "SQL wide encoded grouping falls back without optional views under parent p
         try std.testing.expectEqual(@as(u64, @intCast(row_count)), group.rows_seen);
         try std.testing.expectEqual(@as(i64, @intCast(row_count)), row.aggregates[0].value.integer);
         try std.testing.expect(group.source_ordinal == null);
+        // Whole-source metadata probes must not scale with every fallback row.
+        try std.testing.expect(probe.physical_calls <= width * 64);
+        std.debug.print("GROUP_FALLBACK rows={d} width={d} physical_probes={d}\n", .{ row_count, width, probe.physical_calls });
     };
 }
 

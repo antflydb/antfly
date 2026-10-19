@@ -3042,12 +3042,9 @@ const DocumentPrimaryReadWindow = struct {
         if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         self.retire();
         self.scope = try txn.openReadScope(self.arena.allocator());
-        try readMany(&self.scope.?, physical, output);
-        for (output) |value| if (value) |raw| {
-            self.bytes +|= raw.len;
-        };
+        self.bytes = try readMany(&self.scope.?, physical, output);
     }
-    fn readMany(scope: *@import("../backend_erased.zig").ReadScope, physical: []const []const u8, output: []?[]const u8) !void {
+    fn readMany(scope: *@import("../backend_erased.zig").ReadScope, physical: []const []const u8, output: []?[]const u8) !usize {
         if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         const Entry = struct {
             key: []const u8,
@@ -3072,6 +3069,13 @@ const DocumentPrimaryReadWindow = struct {
         }
         try scope.getManySorted(keys[0..count], values[0..count]);
         for (entries[0..physical.len]) |entry| output[entry.row] = values[entry.value_index];
+        // Duplicate keys borrow the same retained value. Account actual scope
+        // payload once, independently of caller order or repeated rows.
+        var bytes: usize = 0;
+        for (values[0..count]) |value| if (value) |raw| {
+            bytes +|= raw.len;
+        };
+        return bytes;
     }
 
     fn finishRow(self: *@This(), uncached: bool) void {
@@ -40385,7 +40389,7 @@ pub const DB = struct {
                 // one-row byte limit must not re-read all remaining directories.
                 errdefer self.retireDirectories();
                 if (self.directory_scope == null) self.directory_scope = try self.read.openReadScope(self.directory_arena.allocator());
-                try DocumentPrimaryReadWindow.readMany(&self.directory_scope.?, keys[0..pending_count], fetched[0..pending_count]);
+                _ = try DocumentPrimaryReadWindow.readMany(&self.directory_scope.?, keys[0..pending_count], fetched[0..pending_count]);
                 for (pending[0..pending_count], fetched[0..pending_count]) |index, raw| {
                     self.directories[index] = raw;
                     self.directories_loaded[index] = true;

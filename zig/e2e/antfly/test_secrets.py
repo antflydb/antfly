@@ -165,7 +165,7 @@ class TableObjectStorage:
                 parsed = urlsplit(self.path)
                 path = unquote(parsed.path).lstrip("/")
                 bucket, _, key = path.partition("/")
-                query = parse_qs(parsed.query)
+                query = parse_qs(parsed.query, keep_blank_values=True)
                 size = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(size) if size else b""
                 status, response, headers = 200, b"", {}
@@ -198,15 +198,26 @@ class TableObjectStorage:
                         outer.content_types.pop(path, None)
                         status = 204
                     elif self.command in ("GET", "HEAD") and not key:
-                        root = ET.Element("ListBucketResult")
+                        versions = "versions" in query
+                        # This fixture is an unversioned S3 bucket. Its current
+                        # objects have the S3 null version; version listing is
+                        # a distinct protocol from ListObjectsV2.
+                        root = ET.Element(
+                            "ListVersionsResult" if versions else "ListBucketResult"
+                        )
                         ET.SubElement(root, "Name").text = bucket
                         ET.SubElement(root, "IsTruncated").text = "false"
                         prefix = query.get("prefix", [""])[0]
                         for name, value in sorted(outer.objects.items()):
                             if not name.startswith(bucket + "/" + prefix):
                                 continue
-                            entry = ET.SubElement(root, "Contents")
+                            entry = ET.SubElement(
+                                root, "Version" if versions else "Contents"
+                            )
                             ET.SubElement(entry, "Key").text = name[len(bucket) + 1 :]
+                            if versions:
+                                ET.SubElement(entry, "VersionId").text = "null"
+                                ET.SubElement(entry, "IsLatest").text = "true"
                             ET.SubElement(entry, "Size").text = str(len(value))
                             ET.SubElement(
                                 entry, "LastModified"
@@ -214,7 +225,7 @@ class TableObjectStorage:
                             ET.SubElement(entry, "ETag").text = (
                                 '"' + hashlib.sha256(value).hexdigest() + '"'
                             )
-                        response = ET.tostring(root)
+                        response = ET.tostring(root, short_empty_elements=False)
                         headers["Content-Type"] = "application/xml"
                     elif self.command in ("GET", "HEAD") and current is not None:
                         response = current
@@ -253,6 +264,39 @@ class TableObjectStorage:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+
+
+def test_table_object_storage_lists_unversioned_objects_and_versions():
+    storage = TableObjectStorage()
+    try:
+        url = f"http://{storage.endpoint}/tables"
+        response = requests.put(f"{url}/prefix/a&b", data=b"payload", timeout=5)
+        response.raise_for_status()
+        for parameters, root_name, entry_name in (
+            ({"list-type": "2", "prefix": "prefix/"}, "ListBucketResult", "Contents"),
+            ({"versions": "", "prefix": "prefix/"}, "ListVersionsResult", "Version"),
+        ):
+            response = requests.get(url, params=parameters, timeout=5)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            assert root.tag == root_name
+            assert root.findtext("IsTruncated") == "false"
+            entries = root.findall(entry_name)
+            assert len(entries) == 1
+            assert entries[0].findtext("Key") == "prefix/a&b"
+            assert entries[0].findtext("Size") == "7"
+            if entry_name == "Version":
+                assert entries[0].findtext("VersionId") == "null"
+                assert entries[0].findtext("IsLatest") == "true"
+        requests.delete(f"{url}/prefix/a&b", timeout=5).raise_for_status()
+        response = requests.get(url, params={"versions": ""}, timeout=5)
+        root = ET.fromstring(response.content)
+        assert root.tag == "ListVersionsResult"
+        assert root.findtext("IsTruncated") == "false"
+        assert root.findall("Version") == []
+        assert b"</ListVersionsResult>" in response.content
+    finally:
+        storage.close()
 
 
 class SecretDeployment:
