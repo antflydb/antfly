@@ -471,11 +471,12 @@ def test_native_grep_json_projects_versioned_contract(stateful_api, tmp_path):
     assert rows[-1]["stats"]["complete"]
 
 
+@pytest.mark.parametrize("num_shards", [1, 3])
 def test_native_grep_accounted_misses_preserve_snapshot_stats_and_validation(
-    stateful_api, tmp_path
+    stateful_api, tmp_path, num_shards
 ):
     table = f"grep_accounted_{time.time_ns()}"
-    stateful_api.create_table(table)
+    stateful_api.create_table(table, num_shards=num_shards)
     denied = document("private.py", "private ordinary text\n")
     denied["grep"]["permissions"] = {"public": False, "readers": ["other"]}
     rows = {

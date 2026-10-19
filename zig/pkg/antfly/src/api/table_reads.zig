@@ -15826,7 +15826,7 @@ fn queryResponseRemote(
     const body = if (vector_body) |owned_vector_body|
         owned_vector_body
     else
-        try encodeQueryRequest(alloc, req);
+        try local_query_contract.encodeFinalizedQueryRequest(alloc, req);
     defer alloc.free(body);
     var result = if (vector_body != null)
         try client.fetchGroupVectorWorkerWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr)

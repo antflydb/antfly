@@ -168,3 +168,32 @@ test "decision functions graph evaluation preserves vector hit offset restrictio
         \\{"limit":1,"offset":1,"embeddings":{"vector":[0.1,0.2]},"graph_queries":{"customers":{"index":"graph","match":{"anchor":"customer","nodes":{"customer":{}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"limit":1}}},"evaluate":{"graph_query":"customers","scope":"candidates","candidate_count":20,"compute":{"x":{"literal":1}}}}
     ));
 }
+
+test "api query contract grep response controls survive owner hops without reaching raw workers" {
+    const std = @import("std");
+    const query = @import("antfly_local_sources").api_query_contract;
+    const wire = @import("antfly_local_sources").api_local_query_contract;
+    const a = std.testing.allocator;
+    var original = try query.parsePublicQueryRequest(a, null, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"_id","desc":false}],"grep_scan":{"version":1,"document_field":"grep","alternatives":["needle"],"max_content_bytes":1024}}
+    );
+    defer original.deinit(a);
+    const complete = try wire.encodeStorageKernelQueryRequestForExecution(a, original.req, false);
+    defer a.free(complete);
+    const remote = try wire.encodeFinalizedQueryRequest(a, original.req);
+    defer a.free(remote);
+    const shard = try wire.encodeQueryRequest(a, original.req);
+    defer a.free(shard);
+    const raw = try wire.encodeStorageKernelQueryRequestForExecution(a, original.req, true);
+    defer a.free(raw);
+    for ([_][]const u8{ complete, remote }) |body| {
+        var owner = try query.parseQueryRequest(a, null, "docs", body);
+        defer owner.deinit(a);
+        try std.testing.expectEqualStrings(original.req.grep_scan_json, owner.req.grep_scan_json);
+    }
+    for ([_][]const u8{ shard, raw }) |body| {
+        var worker = try query.parseQueryRequest(a, null, "docs", body);
+        defer worker.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), worker.req.grep_scan_json.len);
+    }
+}
