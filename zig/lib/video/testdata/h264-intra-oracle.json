@@ -1,0 +1,255 @@
+{
+  "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "cases": [
+    {
+      "packets": [
+        {
+          "pts": 0,
+          "dts": 0,
+          "duration": 300000,
+          "size": "2112",
+          "pos": "48",
+          "flags": "K__"
+        },
+        {
+          "pts": 300000,
+          "dts": 300000,
+          "duration": 300000,
+          "size": "1551",
+          "pos": "2160",
+          "flags": "K__"
+        },
+        {
+          "pts": 600000,
+          "dts": 600000,
+          "duration": 300000,
+          "size": "1549",
+          "pos": "3711",
+          "flags": "K__"
+        },
+        {
+          "pts": 900000,
+          "dts": 900000,
+          "duration": 300000,
+          "size": "1578",
+          "pos": "5260",
+          "flags": "K__"
+        },
+        {
+          "pts": 1200000,
+          "dts": 1200000,
+          "duration": 300000,
+          "size": "1580",
+          "pos": "6838",
+          "flags": "K__"
+        },
+        {
+          "pts": 1500000,
+          "dts": 1500000,
+          "duration": 300000,
+          "size": "1577",
+          "pos": "8418",
+          "flags": "K__"
+        },
+        {
+          "pts": 1800000,
+          "dts": 1800000,
+          "duration": 300000,
+          "size": "1601",
+          "pos": "9995",
+          "flags": "K__"
+        },
+        {
+          "pts": 2100000,
+          "dts": 2100000,
+          "duration": 300000,
+          "size": "1616",
+          "pos": "11596",
+          "flags": "K__"
+        }
+      ],
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "width": 64,
+          "height": 48,
+          "time_base": "1/1200000"
+        }
+      ],
+      "name": "h264-intra",
+      "qp": 23,
+      "full_range": false,
+      "filtered": false,
+      "mp4_sha256": "a92193773dd430c70841649c2af90d17c083e8cfcef0c0a3588446161a929762",
+      "nv12_sha256": "4c4ad39d20efdb805cfa54f0184ac5dbdb03822bb756ffb7c7d104f6626ada59"
+    },
+    {
+      "packets": [
+        {
+          "pts": 0,
+          "dts": 0,
+          "duration": 300000,
+          "size": "3633",
+          "pos": "48",
+          "flags": "K__"
+        },
+        {
+          "pts": 300000,
+          "dts": 300000,
+          "duration": 300000,
+          "size": "3073",
+          "pos": "3681",
+          "flags": "K__"
+        }
+      ],
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "width": 64,
+          "height": 48,
+          "time_base": "1/1200000"
+        }
+      ],
+      "name": "h264-intra-qp3",
+      "qp": 3,
+      "full_range": false,
+      "filtered": false,
+      "mp4_sha256": "acd0e725073a81a0e9b9053495fd5d3f37acdc8e06094eb64a17e6b8dfda4749",
+      "nv12_sha256": "b7d1d2a65a9d109bb86345eb48c74073f7912a30a5c49295a44202309c832445"
+    },
+    {
+      "packets": [
+        {
+          "pts": 0,
+          "dts": 0,
+          "duration": 300000,
+          "size": "990",
+          "pos": "48",
+          "flags": "K__"
+        },
+        {
+          "pts": 300000,
+          "dts": 300000,
+          "duration": 300000,
+          "size": "430",
+          "pos": "1038",
+          "flags": "K__"
+        }
+      ],
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "width": 62,
+          "height": 46,
+          "time_base": "1/1200000"
+        }
+      ],
+      "name": "h264-intra-crop",
+      "qp": 45,
+      "full_range": false,
+      "filtered": false,
+      "mp4_sha256": "cad24f44e4d8b94bfc291a579dd3d430685434094a83ff4816f83d39318abfe1",
+      "nv12_sha256": "14ca6aceb7dbf8ce67bbf6cccb23bf7ffff309a6559e1c93a89d01bde13b69b8"
+    },
+    {
+      "packets": [
+        {
+          "pts": 0,
+          "dts": 0,
+          "duration": 300000,
+          "size": "2938",
+          "pos": "48",
+          "flags": "K__"
+        },
+        {
+          "pts": 300000,
+          "dts": 300000,
+          "duration": 300000,
+          "size": "2379",
+          "pos": "2986",
+          "flags": "K__"
+        }
+      ],
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "width": 64,
+          "height": 48,
+          "color_range": "pc",
+          "time_base": "1/1200000"
+        }
+      ],
+      "name": "h264-intra-full",
+      "qp": 12,
+      "full_range": true,
+      "filtered": false,
+      "mp4_sha256": "4fab9470bc7fdd77cd144d821e71f7155185053282c04291dc5a7a488250990c",
+      "nv12_sha256": "dc25ed8067ba92558aa058cc82b2de2679a66a4b2425ef8b76dc04f5b6a7c51b"
+    },
+    {
+      "packets": [
+        {
+          "pts": 0,
+          "dts": 0,
+          "duration": 300000,
+          "size": "745",
+          "pos": "48",
+          "flags": "K__"
+        }
+      ],
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "width": 64,
+          "height": 48,
+          "time_base": "1/1200000"
+        }
+      ],
+      "name": "h264-intra-plane",
+      "qp": 23,
+      "full_range": false,
+      "filtered": false,
+      "mp4_sha256": "a91083a1d5157b1d8a5e15ed57b28d8cfb32eb49319f30a54d19c065369d182d",
+      "nv12_sha256": "5c6ea1ef89262f41b0c92ea5c1a802109daa7c1448f0a3d03cad3dc7bd6b6de7"
+    },
+    {
+      "packets": [
+        {
+          "pts": 0,
+          "dts": 0,
+          "duration": 300000,
+          "size": "2112",
+          "pos": "48",
+          "flags": "K__"
+        }
+      ],
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "width": 64,
+          "height": 48,
+          "time_base": "1/1200000"
+        }
+      ],
+      "name": "h264-intra-filtered",
+      "qp": 23,
+      "full_range": false,
+      "filtered": true,
+      "mp4_sha256": "2fd11d40c6f66a9a8761f4dc15c2cb0c30455c67eb121edbcb49d6d3a999898b",
+      "nv12_sha256": "a29651c43e5641860750fd67fd99dad3693c3b072dce218876a641418fc0c8e5"
+    },
+    {
+      "name": "h264-pcm",
+      "mp4_sha256": "6419ab51dafb45000c542ee04e9ed08ea1220e7e0ab2018c6387883bd93040da",
+      "nv12_sha256": "8d083cafa8a28bdd85bb9e4883f802b8e918eb6b6cb2bf6ddf05f3dd62ba5928",
+      "full_range": false,
+      "filtered": false
+    }
+  ]
+}

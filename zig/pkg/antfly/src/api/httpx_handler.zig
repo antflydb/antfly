@@ -3413,21 +3413,21 @@ pub const AntflyApiHandler = struct {
         var principal: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(identity.credential_principal, &principal, .{});
         const runtime = self.api_server.retainedReadRuntime() catch return textResponse(ctx, 503, "retained read owner unavailable");
-        const encoded = rpc.execute(ctx.allocator, .{ .registry = &runtime.registry, .source = source }, .{
+        const encoded = rpc.executeWithCodec(ctx.allocator, .{ .registry = &runtime.registry, .source = source }, .{
             .principal = principal,
             .authorization_revision = 1,
             .table_id = route.table_id,
             .group_id = route.route.group_id,
             .topology_revision = route.topology_epoch,
             .schema_version = parsed.value.schema_version,
-        }, params.table_name, parsed.value) catch |err| return textResponse(ctx, switch (err) {
+        }, params.table_name, parsed.value, @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse "")) catch |err| return textResponse(ctx, switch (err) {
             error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
             error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
             error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
             else => 503,
         }, @errorName(err));
         defer ctx.allocator.free(encoded);
-        try ctx.setHeader("content-type", "application/json");
+        try ctx.setHeader("content-type", if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").compact_magic)) @import("retained_read_page.zig").compact_media_type else if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").magic)) @import("retained_read_page.zig").media_type else "application/json");
         return ctx.response.body(try ctx.allocator.dupe(u8, encoded)).build();
     }
 
@@ -15540,24 +15540,25 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expect(description.columns[0].element_type != null);
             var result = try wire_backend.vtable.execute(wire_backend.context, array_alloc, credential, array_request);
             defer result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            try std.testing.expectEqual(@as(usize, 1), result.rowCount());
             const column = result.columns[0];
             try std.testing.expectEqual(description.columns[0].element_type, column.element_type);
             try std.testing.expectEqual(try @import("../pgwire/values.zig").columnOid(description.columns[0]), try @import("../pgwire/values.zig").columnOid(column));
-            if (result.sql_nulls.?[0][0]) {
-                try std.testing.expect(result.rows[0][0] == .null);
+            const cell = try result.cell(array_alloc, 0, 0);
+            try std.testing.expect(cell.value == .null);
+            if (cell.sql_null) {
+                try std.testing.expect(cell.array == null);
                 continue;
             }
+            const expected = cell.array orelse return error.ExpectedNativeArrayCell;
             for ([_]u16{ 0, 1 }) |format| {
                 var output: std.Io.Writer.Allocating = .init(alloc);
                 defer output.deinit();
-                try @import("../pgwire/values.zig").encodeColumnInto(alloc, &output.writer, column, format, result.rows[0][0], 8 * 1024 * 1024);
+                try @import("../pgwire/values.zig").encodeCellInto(alloc, &output.writer, column, format, cell, 8 * 1024 * 1024);
                 var decoded = if (format == 0) try @import("antfly_local_sources").sql_array_text.decode(alloc, column.element_type.?, output.written(), .{}) else try @import("antfly_local_sources").sql_array_binary.decode(alloc, column.element_type.?, output.written(), .{});
                 defer decoded.deinit();
-                var expected = try @import("antfly_local_sources").sql_array_wire.decode(alloc, column.element_type.?, result.rows[0][0], .{});
-                defer expected.deinit();
                 var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
-                try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(decoded.value, &work));
+                try std.testing.expectEqual(std.math.Order.eq, try expected.compare(decoded.value, &work));
             }
         }
         // Exercise the real authenticated adapter, not only a protocol mock:
@@ -15586,11 +15587,12 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             array_request.parameters = &.{try wire_values.decode(array_alloc, 1016, format, encoded.written())};
             var result = try wire_backend.vtable.execute(wire_backend.context, array_alloc, credential, array_request);
             defer result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
-            var actual = try sources.sql_array_wire.decode(alloc, .int64, result.rows[0][0], .{});
-            defer actual.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rowCount());
+            const actual_cell = try result.cell(array_alloc, 0, 0);
+            try std.testing.expect(!actual_cell.sql_null and actual_cell.value == .null);
+            const actual = actual_cell.array orelse return error.ExpectedNativeArrayCell;
             var work: sources.sql_array_value.Budget = .{};
-            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(actual.value, &work));
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(actual.*, &work));
             const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, array_alloc, credential, array_request)).?;
             defer stream.close(stream.context);
             var page = try stream.next(stream.context, array_alloc, array_request, 1);
@@ -15624,8 +15626,12 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer result_arena.deinit();
         var result = try wire_backend.vtable.execute(wire_backend.context, result_arena.allocator(), credential, request);
         defer result.deinit();
-        try std.testing.expectEqual(@as(usize, 9), result.rows.len);
-        for ([_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "9007199254740993" }, result.rows) |expected, row| try std.testing.expectEqualStrings(expected, row[0].string);
+        try std.testing.expectEqual(@as(usize, 9), result.rowCount());
+        for ([_]i64{ 2, 3, 4, 5, 6, 7, 8, 9, 9007199254740993 }, 0..) |expected, row| {
+            const cell = try result.cell(result_arena.allocator(), row, 0);
+            try std.testing.expect(!cell.sql_null);
+            try std.testing.expectEqual(expected, cell.value.integer);
+        }
 
         const Wire = struct {
             fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {

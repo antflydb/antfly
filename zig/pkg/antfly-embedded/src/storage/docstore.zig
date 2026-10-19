@@ -5966,7 +5966,7 @@ test "graph endpoint cleanup byte admission releases partial page allocations" {
             try std.testing.expectEqual(@as(usize, 2), page.deletes.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&store});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{&store});
 }
 
 test "graph relationship bulk ingestion preserves direct append and retirement during migration" {
@@ -6216,7 +6216,7 @@ test "graph owner revival planning releases every partial allocation" {
             defer page.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Case.plan, .{&store});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Case.plan, .{&store});
 }
 
 test "graph qualified directory upgrade removes stale foreign membership and preserves revived artifacts" {

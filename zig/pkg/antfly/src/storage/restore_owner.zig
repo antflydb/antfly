@@ -1029,7 +1029,18 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     try std.testing.expectEqual(staging.Phase.imported, last.phase);
     try std.testing.expectEqual(@as(u64, 3), last.rows);
     _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .validate }, .{});
-    const published = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .publish }, .{});
+    // Publication advances a bounded replay window per call. Portable imports
+    // can require several windows; a slow host may also exhaust a turn's time
+    // slice. Resume the same durable scope until coverage is complete.
+    const published = publish: {
+        for (0..128) |_| {
+            break :publish executeResident(alloc, &target, env, .{ .scope = scope, .action = .publish }, .{}) catch |err| switch (err) {
+                error.RestoreValidationPending => continue,
+                else => return err,
+            };
+        }
+        return error.TestUnexpectedResult;
+    };
     try std.testing.expectEqual(staging.Phase.published, published.phase);
     try std.testing.expect(target.restore_decoder_cache.decoder == null);
     try std.testing.expect(!try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));

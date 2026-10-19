@@ -1171,7 +1171,9 @@ in-memory and durable generation ownership before retiring anything; a foreign
 publication returns `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH` without mutation. A separate baseline preserves permanent resolver-feature
 requirements: a plain completed replacement returns to version 1, while actual
 authoritative resolver features retain version 2, and inline resolver handoffs
-or graph producer ownership metadata require version 3.
+or graph producer ownership metadata require version 3. Graph TTL expiry
+namespace migration requires permanent version 4; cancelling a shadow cannot
+remove that format fence.
 Deadline Busy means registration
 was accepted and the shadow continues in the background. Without wait, Busy is
 limited to bounded registration admission. Drain with `run_until_idle` to await
@@ -1196,7 +1198,8 @@ resolver owner. Index deletion only retires last-owner identities.
 The capabilities/status JSON reports the effective `minimum_reader_version`
 compatibility guard independently of package release: 1 for the baseline catalog,
 2 for extended identity/ownership/cache-policy fields such as `inline_managed`
-or `retired`, and 3 for inline resolver handoffs or graph producer ownership.
+or `retired`, 3 for inline resolver handoffs or graph producer ownership, and
+4 for the separate graph-expiry namespace.
 Producer-replay reservations also temporarily require epoch 3, even with explicit
 producers and no staged resolver; plain field-backed reservations require epoch 2. The authoritative feature epoch is monotonic;
 a pending replacement can temporarily raise its effective guard as described

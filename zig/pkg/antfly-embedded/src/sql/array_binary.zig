@@ -21,7 +21,7 @@ const arrays = @import("array_value.zig");
 const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
-pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
+pub const Options = struct { compact: bool = false, values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
 
 fn jsonSize(value: std.json.Value) !usize {
     var counter: std.Io.Writer.Discarding = .init(&.{});
@@ -51,12 +51,26 @@ fn elementSize(kind: arrays.ElementType, element: arrays.Element) !usize {
 /// directly; JSONB uses a counting pass for its required length prefix, not a
 /// per-element temporary allocation. Writer failure remains a writer failure.
 pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
-    const validated = try arrays.Value.init(value.element_type, value.dimensions, value.elements, options.values);
+    return encodeInternal(value, writer, options, true);
+}
+
+/// Scalar codec for adapters without native views and a byte-for-byte oracle
+/// for the native emitter. Both paths share admission and wire-size preflight.
+pub fn encodeGeneric(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
+    return encodeInternal(value, writer, options, false);
+}
+
+fn encodeInternal(value: arrays.Value, writer: *std.Io.Writer, options: Options, comptime native_blocks: bool) !void {
+    const validated = try value.validate(options.values);
     if (validated.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     for (value.dimensions) |dimension| if (dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
     var size: usize = 12 + value.dimensions.len * 8;
     var has_null = false;
-    for (value.elements) |element| {
+    if (if (value.stored) |view| view.validation else null) |proof| {
+        size = proof.binary_wire_bytes;
+        has_null = proof.non_null != value.cardinality();
+    } else for (0..value.cardinality()) |array_cell_0| {
+        const element = value.flatCell(array_cell_0);
         has_null = has_null or element.sql_null;
         const length = try elementSize(value.element_type, element);
         if (length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
@@ -71,7 +85,17 @@ pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !vo
         try writer.writeInt(i32, @intCast(dimension.length), .big);
         try writer.writeInt(i32, dimension.lower, .big);
     }
-    for (value.elements) |element| {
+    if (native_blocks) if (value.stored) |view| if (view.validation != null) {
+        switch (value.element_type) {
+            .boolean => return encodeStoredFixed(1, view.*, writer),
+            .int16 => return encodeStoredFixed(2, view.*, writer),
+            .int32, .float32 => return encodeStoredFixed(4, view.*, writer),
+            .int64, .float64 => return encodeStoredFixed(8, view.*, writer),
+            else => {},
+        }
+    };
+    for (0..value.cardinality()) |array_cell_0| {
+        const element = value.flatCell(array_cell_0);
         if (element.sql_null) {
             try writer.writeInt(i32, -1, .big);
             continue;
@@ -100,6 +124,36 @@ pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !vo
             },
         }
     }
+}
+
+/// Walk canonical slots once in physical order. Compact NULLs consume no
+/// slot, dense NULLs consume a zero slot. Fixed-size buffers interleave PG
+/// lengths and big-endian payloads without constructing scalar Datums.
+fn encodeStoredFixed(comptime width: usize, view: @import("../common/sql_array_layout.zig").View, writer: *std.Io.Writer) !void {
+    var buffer: [4096]u8 = undefined;
+    var used: usize = 0;
+    var physical = view.payload_start;
+    var nulls: u8 = 0;
+    for (0..view.count) |index| {
+        if (buffer.len - used < 4 + width) {
+            try writer.writeAll(buffer[0..used]);
+            used = 0;
+        }
+        if (index % 8 == 0) nulls = view.bytes[view.bitmap_start + index / 8];
+        const sql_null = nulls & 1 != 0;
+        nulls >>= 1;
+        std.mem.writeInt(i32, buffer[used..][0..4], if (sql_null) -1 else width, .big);
+        used += 4;
+        if (sql_null) {
+            if (!view.compact) physical += width;
+            continue;
+        }
+        const Integer = @Int(.unsigned, width * 8);
+        std.mem.writeInt(Integer, buffer[used..][0..width], std.mem.readInt(Integer, view.bytes[physical..][0..width], .little), .big);
+        physical += width;
+        used += width;
+    }
+    try writer.writeAll(buffer[0..used]);
 }
 
 const Reader = struct {
@@ -205,6 +259,37 @@ fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u
     // Each cell requires at least its signed length prefix. Reject impossible
     // shapes before attempting a count-sized allocation.
     if (count > (bytes.len - reader.position) / 4) return error.InvalidSqlBinaryRepresentation;
+    if (options.compact and @import("array_compact.zig").supported(expected)) {
+        var probe = reader;
+        var non_null: usize = 0;
+        var payload: usize = 0;
+        for (0..count) |_| {
+            const length = try probe.int(i32);
+            if (length == -1) continue;
+            if (length < -1) return error.InvalidSqlBinaryRepresentation;
+            const raw = try probe.take(@intCast(length));
+            non_null += 1;
+            payload = try std.math.add(usize, payload, raw.len);
+        }
+        if (probe.position != bytes.len) return error.InvalidSqlBinaryRepresentation;
+        var builder = try @import("array_compact.zig").Builder.init(a, expected, dimensions[0..@intCast(rank)], count, non_null, payload, options.values);
+        for (0..count) |_| {
+            const length = try reader.int(i32);
+            if (length == -1) {
+                try builder.append(.{});
+                continue;
+            }
+            const raw = try reader.take(@intCast(length));
+            if (expected == .text) {
+                try work.consume(raw.len);
+                if (!std.unicode.utf8ValidateSlice(raw)) return error.SqlInvalidTextEncoding;
+                if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.SqlUntranslatableCharacter;
+                try builder.append(.json(.{ .string = raw }));
+            } else try builder.append(try decodeElementLeaky(a, expected, raw, &work));
+        }
+        try work.consume(builder.bytes.len + count);
+        return .{ .value = try builder.finish(a, options.values), .work = options.values.work - work.remaining };
+    }
     const cells = try a.alloc(arrays.Element, count);
     for (cells) |*cell| {
         const length = try reader.int(i32);
@@ -318,11 +403,11 @@ test "SQL PostgreSQL array binary boundaries match receive normalization and dia
     const bool_bytes = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 2 };
     var boolean = try decode(a, .boolean, &bool_bytes, .{});
     defer boolean.deinit();
-    try std.testing.expect(boolean.value.elements[0].value.bool);
+    try std.testing.expect(boolean.value.flatCell(0).value.bool);
     var integers = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 1, 0, 0, 0, 1, 255, 255, 255, 255 };
     var nullable = try decode(a, .int32, &integers, .{});
     defer nullable.deinit();
-    try std.testing.expect(nullable.value.elements[0].sql_null);
+    try std.testing.expect(nullable.value.flatCell(0).sql_null);
     std.mem.writeInt(i32, integers[16..20], std.math.maxInt(i32), .big);
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .int32, &integers, .{}));
     std.mem.writeInt(i32, integers[16..20], std.math.maxInt(i32) - 1, .big);
@@ -343,4 +428,60 @@ test "SQL PostgreSQL array binary boundaries match receive normalization and dia
     var short: [4]u8 = undefined;
     var writer = std.Io.Writer.fixed(&short);
     try std.testing.expectError(error.WriteFailed, encode(boolean.value, &writer, .{}));
+}
+
+test "SQL native binary array blocks preserve scalar bytes null slots and writer failures" {
+    const a = std.testing.allocator;
+    for ([_]arrays.ElementType{ .boolean, .int16, .int32, .int64, .float32, .float64 }) |kind| {
+        for ([_]usize{ 0, 1, 7, 8, 63, 64, 65, 511, 512, 513, 1025 }) |count| {
+            for (0..3) |null_pattern| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const aa = arena.allocator();
+                const cells = try aa.alloc(arrays.Element, count);
+                for (cells, 0..) |*cell, index| {
+                    const sql_null = switch (null_pattern) {
+                        0 => false,
+                        1 => index % 17 == 0,
+                        else => index % 17 != 0,
+                    };
+                    cell.* = if (sql_null) .{} else arrays.Element.json(switch (kind) {
+                        .boolean => .{ .bool = index % 3 == 0 },
+                        .int16, .int32 => .{ .integer = @as(i64, @intCast(index)) - 512 },
+                        .int64 => .{ .integer = 9007199254740993 + @as(i64, @intCast(index)) },
+                        .float32, .float64 => .{ .float = switch (index % 5) {
+                            0 => std.math.nan(f64),
+                            1 => std.math.inf(f64),
+                            2 => -std.math.inf(f64),
+                            3 => -0.0,
+                            else => 1.25,
+                        } },
+                        else => unreachable,
+                    });
+                }
+                const expanded = try arrays.Value.init(kind, &.{.{ .length = @intCast(count), .lower = -3 }}, cells, .{});
+                const stored = try @import("array_storage.zig").encodeAlloc(aa, expanded, .{});
+                const compact = try @import("array_storage.zig").borrowLeaky(aa, kind, stored, .{});
+                var native: std.Io.Writer.Allocating = .init(a);
+                defer native.deinit();
+                var scalar: std.Io.Writer.Allocating = .init(a);
+                defer scalar.deinit();
+                try encode(compact, &native.writer, .{});
+                try encodeGeneric(compact, &scalar.writer, .{});
+                try std.testing.expectEqualSlices(u8, scalar.written(), native.written());
+                const decoded = try decodeLeaky(aa, kind, native.written(), .{ .compact = true });
+                var work: arrays.Budget = .{};
+                try std.testing.expectEqual(std.math.Order.eq, try compact.compare(decoded.value, &work));
+                const out = try aa.alloc(u8, native.written().len);
+                var exact: std.Io.Writer = .fixed(out);
+                try encode(compact, &exact, .{});
+                try std.testing.expectEqualSlices(u8, native.written(), out);
+                var short: std.Io.Writer = .fixed(out[0 .. out.len - 1]);
+                try std.testing.expectError(error.WriteFailed, encode(compact, &short, .{}));
+                var preflight: std.Io.Writer = .fixed(out);
+                try std.testing.expectError(error.SqlProgramLimitExceeded, encode(compact, &preflight, .{ .wire_bytes = out.len - 1 }));
+                try std.testing.expectEqual(@as(usize, 0), preflight.end);
+            }
+        }
+    }
 }

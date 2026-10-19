@@ -116,9 +116,6 @@ fn openInference(options: ?*const capi.InferenceOptions) !*anyopaque {
     // which the runtime resolves on its own.
     const created = try inference_provider.createEmbeddedInferenceNode(".", io_impl.io(), resolved.node);
     errdefer inference_provider.destroyEmbeddedInferenceNode(created.handle, created.resource_owner);
-    // Unlike a Lite handle, which still serves storage without inference, a
-    // handle that cannot run inference is useless: fail the open instead.
-    if (created.configure_error != null) return error.InferenceRuntimeStartupFailed;
     handle.* = .{
         .io = io_impl,
         .lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner },

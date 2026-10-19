@@ -109,7 +109,29 @@ from .chat_tool_name import ChatToolName
 from .chat_tools_config import ChatToolsConfig
 from .choice_decision_question import ChoiceDecisionQuestion
 from .choice_decision_question_type import ChoiceDecisionQuestionType
+from .chunk_coordinates import ChunkCoordinates
+from .chunk_coordinates_kind import ChunkCoordinatesKind
+from .chunk_coordinates_picture_basis import ChunkCoordinatesPictureBasis
+from .chunk_descriptor import ChunkDescriptor
+from .chunk_embedding_context import ChunkEmbeddingContext
+from .chunk_embedding_error import ChunkEmbeddingError
+from .chunk_embedding_event import ChunkEmbeddingEvent
+from .chunk_embedding_event_object import ChunkEmbeddingEventObject
+from .chunk_embedding_initialization_error_event import ChunkEmbeddingInitializationErrorEvent
+from .chunk_embedding_initialization_error_event_object import ChunkEmbeddingInitializationErrorEventObject
+from .chunk_embedding_object import ChunkEmbeddingObject
+from .chunk_embedding_response import ChunkEmbeddingResponse
+from .chunk_embedding_response_object import ChunkEmbeddingResponseObject
+from .chunk_embedding_response_status import ChunkEmbeddingResponseStatus
+from .chunk_embedding_start_event import ChunkEmbeddingStartEvent
+from .chunk_embedding_start_event_object import ChunkEmbeddingStartEventObject
+from .chunk_embedding_target import ChunkEmbeddingTarget
+from .chunk_embedding_terminal_event import ChunkEmbeddingTerminalEvent
+from .chunk_embedding_terminal_event_object import ChunkEmbeddingTerminalEventObject
 from .chunk_options import ChunkOptions
+from .chunk_source_reference import ChunkSourceReference
+from .chunk_source_reference_type import ChunkSourceReferenceType
+from .chunk_source_reference_version_kind import ChunkSourceReferenceVersionKind
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
 from .chunker_provider import ChunkerProvider
@@ -346,6 +368,7 @@ from .external_lake_table_source import ExternalLakeTableSource
 from .external_lake_table_source_format import ExternalLakeTableSourceFormat
 from .external_lake_table_source_kind import ExternalLakeTableSourceKind
 from .external_lake_table_source_object_mutability import ExternalLakeTableSourceObjectMutability
+from .external_lake_table_source_row_identity_version import ExternalLakeTableSourceRowIdentityVersion
 from .external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from .extraction_attribute_group import ExtractionAttributeGroup
 from .extraction_attribute_label import ExtractionAttributeLabel
@@ -778,6 +801,9 @@ from .inference_capacity_error_reason import InferenceCapacityErrorReason
 from .inference_chat_message import InferenceChatMessage
 from .inference_chunk import InferenceChunk
 from .inference_chunk_config import InferenceChunkConfig
+from .inference_chunk_embedding_response import InferenceChunkEmbeddingResponse
+from .inference_chunk_embedding_response_object import InferenceChunkEmbeddingResponseObject
+from .inference_chunk_embedding_response_status import InferenceChunkEmbeddingResponseStatus
 from .inference_chunk_object import InferenceChunkObject
 from .inference_chunk_object_object import InferenceChunkObjectObject
 from .inference_chunk_request import InferenceChunkRequest
@@ -809,6 +835,7 @@ from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
 from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+from .inference_embedding_content_input import InferenceEmbeddingContentInput
 from .inference_embedding_group import InferenceEmbeddingGroup
 from .inference_embedding_item_error import InferenceEmbeddingItemError
 from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
@@ -860,6 +887,7 @@ from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
+from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
@@ -1023,6 +1051,7 @@ from .match_none_query import MatchNoneQuery
 from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
+from .media_chunk_policy import MediaChunkPolicy
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
 from .merge_config import MergeConfig
@@ -1505,6 +1534,9 @@ from .vertex_reranker_config_provider import VertexRerankerConfigProvider
 from .vertex_search_config import VertexSearchConfig
 from .vertex_search_config_provider import VertexSearchConfigProvider
 from .vertex_search_config_service import VertexSearchConfigService
+from .video_sampling_policy import VideoSamplingPolicy
+from .video_sampling_policy_overflow import VideoSamplingPolicyOverflow
+from .video_sampling_policy_policy import VideoSamplingPolicyPolicy
 from .web_search_config import WebSearchConfig
 from .web_search_connection import WebSearchConnection
 from .web_search_provider import WebSearchProvider
@@ -1622,10 +1654,32 @@ __all__ = (
     "ChatToolsConfig",
     "ChoiceDecisionQuestion",
     "ChoiceDecisionQuestionType",
+    "ChunkCoordinates",
+    "ChunkCoordinatesKind",
+    "ChunkCoordinatesPictureBasis",
+    "ChunkDescriptor",
+    "ChunkEmbeddingContext",
+    "ChunkEmbeddingError",
+    "ChunkEmbeddingEvent",
+    "ChunkEmbeddingEventObject",
+    "ChunkEmbeddingInitializationErrorEvent",
+    "ChunkEmbeddingInitializationErrorEventObject",
+    "ChunkEmbeddingObject",
+    "ChunkEmbeddingResponse",
+    "ChunkEmbeddingResponseObject",
+    "ChunkEmbeddingResponseStatus",
+    "ChunkEmbeddingStartEvent",
+    "ChunkEmbeddingStartEventObject",
+    "ChunkEmbeddingTarget",
+    "ChunkEmbeddingTerminalEvent",
+    "ChunkEmbeddingTerminalEventObject",
     "ChunkerConfig",
     "ChunkerConfigFullTextIndex",
     "ChunkerProvider",
     "ChunkOptions",
+    "ChunkSourceReference",
+    "ChunkSourceReferenceType",
+    "ChunkSourceReferenceVersionKind",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
@@ -1857,6 +1911,7 @@ __all__ = (
     "ExternalLakeTableSourceFormat",
     "ExternalLakeTableSourceKind",
     "ExternalLakeTableSourceObjectMutability",
+    "ExternalLakeTableSourceRowIdentityVersion",
     "ExternalLakeTableSourceWritePolicy",
     "ExtractionAttributeGroup",
     "ExtractionAttributeLabel",
@@ -2283,6 +2338,9 @@ __all__ = (
     "InferenceChatMessage",
     "InferenceChunk",
     "InferenceChunkConfig",
+    "InferenceChunkEmbeddingResponse",
+    "InferenceChunkEmbeddingResponseObject",
+    "InferenceChunkEmbeddingResponseStatus",
     "InferenceChunkObject",
     "InferenceChunkObjectObject",
     "InferenceChunkRequest",
@@ -2307,6 +2365,7 @@ __all__ = (
     "InferenceDictationTranscript",
     "InferenceDictationWord",
     "InferenceEmbeddingBatchSummary",
+    "InferenceEmbeddingContentInput",
     "InferenceEmbeddingGroup",
     "InferenceEmbeddingItemError",
     "InferenceEmbeddingItemErrorStage",
@@ -2365,6 +2424,7 @@ __all__ = (
     "InferenceModelBackend",
     "InferenceModelFormat",
     "InferenceModelInfo",
+    "InferenceModelInfoChunkingLimits",
     "InferenceModelInfoQualifiedLimits",
     "InferenceModelKind",
     "InferenceModelQuantization",
@@ -2526,6 +2586,7 @@ __all__ = (
     "MatchNoneQueryMatchNone",
     "MatchPhraseQuery",
     "MatchQuery",
+    "MediaChunkPolicy",
     "MediaContentPart",
     "MediaContentPartType",
     "MergeConfig",
@@ -3004,6 +3065,9 @@ __all__ = (
     "VertexSearchConfig",
     "VertexSearchConfigProvider",
     "VertexSearchConfigService",
+    "VideoSamplingPolicy",
+    "VideoSamplingPolicyOverflow",
+    "VideoSamplingPolicyPolicy",
     "WebSearchConfig",
     "WebSearchConnection",
     "WebSearchProvider",

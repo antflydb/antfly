@@ -770,6 +770,63 @@ pub const Detail = enum(c_int) {
     read_snapshot_fork_unsupported,
     file_busy,
     would_block,
+    // Keep released main identities; append branch-only details below them.
+    inference_worker_executable_not_configured = 674,
+    inference_worker_unavailable = 675,
+    model_chunk_audio_too_large,
+    model_chunk_chunk_output_too_large,
+    model_chunk_chunk_request_failed,
+    model_chunk_chunk_unit_too_large,
+    model_chunk_embedding_identity_mismatch,
+    model_chunk_empty_embedding_input,
+    model_chunk_empty_response,
+    model_chunk_empty_source,
+    model_chunk_empty_video,
+    model_chunk_immutable_version_required,
+    model_chunk_incompatible_chunk_embedding_target,
+    model_chunk_incomplete_chunk_coverage,
+    model_chunk_incomplete_video_picture,
+    model_chunk_inference_admission_queue_full,
+    model_chunk_inference_capabilities_stale,
+    model_chunk_invalid_audio_window,
+    model_chunk_invalid_chunk_continuation,
+    model_chunk_invalid_chunk_coordinates,
+    model_chunk_invalid_chunk_geometry,
+    model_chunk_invalid_chunk_model,
+    model_chunk_invalid_chunk_policy,
+    model_chunk_invalid_chunk_provider,
+    model_chunk_invalid_chunk_replay,
+    model_chunk_invalid_chunk_source,
+    model_chunk_invalid_chunker_config,
+    model_chunk_invalid_chunker_response,
+    model_chunk_invalid_embedding_output,
+    model_chunk_invalid_input_shape,
+    model_chunk_invalid_sampling_policy,
+    model_chunk_invalid_source_reference,
+    model_chunk_invalid_utf8,
+    model_chunk_memory_budget_exceeded,
+    model_chunk_missing_attachment_envelope,
+    model_chunk_missing_chunk_stream_context,
+    model_chunk_model_aware_chunk_provider_required,
+    model_chunk_shared_admission_exceeded,
+    model_chunk_source_version_changed,
+    model_chunk_stale_chunk_continuation,
+    model_chunk_stream_too_long,
+    model_chunk_timestamp_overflow,
+    model_chunk_unknown_video_duration,
+    model_chunk_unresolved_chunk_source,
+    model_chunk_unsupported_audio_format,
+    model_chunk_unsupported_chunk_media_type,
+    model_chunk_working_budget,
+    model_chunk_dependency_budget,
+    model_chunk_coded_window_budget,
+    model_chunk_event_budget,
+    model_chunk_remote_bytes_budget,
+    model_chunk_remote_requests_budget,
+    model_chunk_invalid_limits,
+    model_chunk_streaming_profile,
+    model_chunk_incomplete_audio_stream,
+    decision_limit_exceeded,
 };
 
 pub const Status = extern struct {
@@ -787,6 +844,60 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.ChunkWorkingBudgetExceeded => status(.invalid_argument, .model_chunk_working_budget),
+        error.ChunkDependencyBudgetExceeded => status(.invalid_argument, .model_chunk_dependency_budget),
+        error.ChunkCodedWindowBudgetExceeded => status(.invalid_argument, .model_chunk_coded_window_budget),
+        error.ChunkEventBudgetExceeded => status(.invalid_argument, .model_chunk_event_budget),
+        error.RemoteReadBudgetExceeded => status(.invalid_argument, .model_chunk_remote_bytes_budget),
+        error.RemoteRequestBudgetExceeded => status(.invalid_argument, .model_chunk_remote_requests_budget),
+        error.InvalidChunkLimits => status(.invalid_argument, .model_chunk_invalid_limits),
+        error.UnsupportedStreamingAudioProfile => status(.unsupported, .model_chunk_streaming_profile),
+        error.IncompleteAudioStream => status(.unavailable, .model_chunk_incomplete_audio_stream),
+
+        error.AudioTooLarge => status(.invalid_argument, .model_chunk_audio_too_large),
+        error.ChunkOutputTooLarge => status(.invalid_argument, .model_chunk_chunk_output_too_large),
+        error.ChunkRequestFailed => status(.unavailable, .model_chunk_chunk_request_failed),
+        error.ChunkUnitTooLarge => status(.invalid_argument, .model_chunk_chunk_unit_too_large),
+        error.EmbeddingIdentityMismatch => status(.conflict, .model_chunk_embedding_identity_mismatch),
+        error.EmptyEmbeddingInput => status(.invalid_argument, .model_chunk_empty_embedding_input),
+        error.EmptyResponse => status(.unavailable, .model_chunk_empty_response),
+        error.EmptySource => status(.invalid_argument, .model_chunk_empty_source),
+        error.EmptyVideo => status(.invalid_argument, .model_chunk_empty_video),
+        error.ImmutableVersionRequired => status(.invalid_argument, .model_chunk_immutable_version_required),
+        error.IncompatibleChunkEmbeddingTarget => status(.invalid_argument, .model_chunk_incompatible_chunk_embedding_target),
+        error.IncompleteChunkCoverage => status(.invalid_argument, .model_chunk_incomplete_chunk_coverage),
+        error.IncompleteVideoPicture => status(.corrupt, .model_chunk_incomplete_video_picture),
+        error.InferenceAdmissionQueueFull => status(.retryable, .model_chunk_inference_admission_queue_full),
+        error.InferenceCapabilitiesStale => status(.conflict, .model_chunk_inference_capabilities_stale),
+        error.InvalidAudioWindow => status(.invalid_argument, .model_chunk_invalid_audio_window),
+        error.InvalidChunkContinuation => status(.invalid_argument, .model_chunk_invalid_chunk_continuation),
+        error.InvalidChunkCoordinates => status(.invalid_argument, .model_chunk_invalid_chunk_coordinates),
+        error.InvalidChunkGeometry => status(.invalid_argument, .model_chunk_invalid_chunk_geometry),
+        error.InvalidChunkModel => status(.invalid_argument, .model_chunk_invalid_chunk_model),
+        error.InvalidChunkPolicy => status(.invalid_argument, .model_chunk_invalid_chunk_policy),
+        error.InvalidChunkProvider => status(.invalid_argument, .model_chunk_invalid_chunk_provider),
+        error.InvalidChunkReplay => status(.conflict, .model_chunk_invalid_chunk_replay),
+        error.InvalidChunkSource => status(.invalid_argument, .model_chunk_invalid_chunk_source),
+        error.InvalidChunkerConfig => status(.invalid_argument, .model_chunk_invalid_chunker_config),
+        error.InvalidChunkerResponse => status(.invalid_argument, .model_chunk_invalid_chunker_response),
+        error.InvalidEmbeddingOutput => status(.internal, .model_chunk_invalid_embedding_output),
+        error.InvalidInputShape => status(.invalid_argument, .model_chunk_invalid_input_shape),
+        error.InvalidSamplingPolicy => status(.invalid_argument, .model_chunk_invalid_sampling_policy),
+        error.InvalidSourceReference => status(.invalid_argument, .model_chunk_invalid_source_reference),
+        error.InvalidUtf8 => status(.invalid_argument, .model_chunk_invalid_utf8),
+        error.MemoryBudgetExceeded => status(.retryable, .model_chunk_memory_budget_exceeded),
+        error.MissingAttachmentEnvelope => status(.invalid_argument, .model_chunk_missing_attachment_envelope),
+        error.MissingChunkStreamContext => status(.internal, .model_chunk_missing_chunk_stream_context),
+        error.ModelAwareChunkProviderRequired => status(.invalid_argument, .model_chunk_model_aware_chunk_provider_required),
+        error.SharedAdmissionExceeded => status(.retryable, .model_chunk_shared_admission_exceeded),
+        error.SourceVersionChanged => status(.conflict, .model_chunk_source_version_changed),
+        error.StaleChunkContinuation => status(.conflict, .model_chunk_stale_chunk_continuation),
+        error.StreamTooLong => status(.unavailable, .model_chunk_stream_too_long),
+        error.TimestampOverflow => status(.invalid_argument, .model_chunk_timestamp_overflow),
+        error.UnknownVideoDuration => status(.invalid_argument, .model_chunk_unknown_video_duration),
+        error.UnresolvedChunkSource => status(.invalid_argument, .model_chunk_unresolved_chunk_source),
+        error.UnsupportedAudioFormat => status(.unsupported, .model_chunk_unsupported_audio_format),
+        error.UnsupportedChunkMediaType => status(.unsupported, .model_chunk_unsupported_chunk_media_type),
         error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
@@ -1202,6 +1313,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.DecisionLimitExceeded => status(.invalid_argument, .decision_limit_exceeded),
         error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
         error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
         error.GraphMaxWeightDomainViolation => status(.invalid_argument, .graph_max_weight_domain_violation),
@@ -1328,6 +1440,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.BodyCapacityExceeded => status(.retryable, .body_capacity_exceeded),
         error.BodyReadFailed => status(.unavailable, .body_read_failed),
         error.InferenceProviderFailure => status(.internal, .inference_provider_failure),
+        error.InferenceWorkerExecutableNotConfigured => status(.invalid_argument, .inference_worker_executable_not_configured),
+        error.InferenceWorkerUnavailable => status(.retryable, .inference_worker_unavailable),
         error.KernelJitRequiredDynamicLoad => status(.unsupported, .kernel_jit_required_dynamic_load),
         error.UnexpectedToken => status(.internal, .unexpected_token),
         error.EnrichmentWaitCanceled => status(.cancelled, .enrichment_wait_canceled),
@@ -1518,6 +1632,60 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .model_chunk_audio_too_large => "AudioTooLarge",
+        .model_chunk_chunk_output_too_large => "ChunkOutputTooLarge",
+        .model_chunk_chunk_request_failed => "ChunkRequestFailed",
+        .model_chunk_chunk_unit_too_large => "ChunkUnitTooLarge",
+        .model_chunk_embedding_identity_mismatch => "EmbeddingIdentityMismatch",
+        .model_chunk_empty_embedding_input => "EmptyEmbeddingInput",
+        .model_chunk_empty_response => "EmptyResponse",
+        .model_chunk_empty_source => "EmptySource",
+        .model_chunk_empty_video => "EmptyVideo",
+        .model_chunk_immutable_version_required => "ImmutableVersionRequired",
+        .model_chunk_incompatible_chunk_embedding_target => "IncompatibleChunkEmbeddingTarget",
+        .model_chunk_incomplete_chunk_coverage => "IncompleteChunkCoverage",
+        .model_chunk_incomplete_video_picture => "IncompleteVideoPicture",
+        .model_chunk_inference_admission_queue_full => "InferenceAdmissionQueueFull",
+        .model_chunk_inference_capabilities_stale => "InferenceCapabilitiesStale",
+        .model_chunk_invalid_audio_window => "InvalidAudioWindow",
+        .model_chunk_invalid_chunk_continuation => "InvalidChunkContinuation",
+        .model_chunk_invalid_chunk_coordinates => "InvalidChunkCoordinates",
+        .model_chunk_invalid_chunk_geometry => "InvalidChunkGeometry",
+        .model_chunk_invalid_chunk_model => "InvalidChunkModel",
+        .model_chunk_invalid_chunk_policy => "InvalidChunkPolicy",
+        .model_chunk_invalid_chunk_provider => "InvalidChunkProvider",
+        .model_chunk_invalid_chunk_replay => "InvalidChunkReplay",
+        .model_chunk_invalid_chunk_source => "InvalidChunkSource",
+        .model_chunk_invalid_chunker_config => "InvalidChunkerConfig",
+        .model_chunk_invalid_chunker_response => "InvalidChunkerResponse",
+        .model_chunk_invalid_embedding_output => "InvalidEmbeddingOutput",
+        .model_chunk_invalid_input_shape => "InvalidInputShape",
+        .model_chunk_invalid_sampling_policy => "InvalidSamplingPolicy",
+        .model_chunk_invalid_source_reference => "InvalidSourceReference",
+        .model_chunk_invalid_utf8 => "InvalidUtf8",
+        .model_chunk_memory_budget_exceeded => "MemoryBudgetExceeded",
+        .model_chunk_missing_attachment_envelope => "MissingAttachmentEnvelope",
+        .model_chunk_missing_chunk_stream_context => "MissingChunkStreamContext",
+        .model_chunk_model_aware_chunk_provider_required => "ModelAwareChunkProviderRequired",
+        .model_chunk_shared_admission_exceeded => "SharedAdmissionExceeded",
+        .model_chunk_source_version_changed => "SourceVersionChanged",
+        .model_chunk_stale_chunk_continuation => "StaleChunkContinuation",
+        .model_chunk_stream_too_long => "StreamTooLong",
+        .model_chunk_timestamp_overflow => "TimestampOverflow",
+        .model_chunk_unknown_video_duration => "UnknownVideoDuration",
+        .model_chunk_unresolved_chunk_source => "UnresolvedChunkSource",
+        .model_chunk_unsupported_audio_format => "UnsupportedAudioFormat",
+        .model_chunk_unsupported_chunk_media_type => "UnsupportedChunkMediaType",
+        .model_chunk_working_budget => "ChunkWorkingBudgetExceeded",
+        .model_chunk_dependency_budget => "ChunkDependencyBudgetExceeded",
+        .model_chunk_coded_window_budget => "ChunkCodedWindowBudgetExceeded",
+        .model_chunk_event_budget => "ChunkEventBudgetExceeded",
+        .model_chunk_remote_bytes_budget => "RemoteReadBudgetExceeded",
+        .model_chunk_remote_requests_budget => "RemoteRequestBudgetExceeded",
+        .model_chunk_invalid_limits => "InvalidChunkLimits",
+        .model_chunk_streaming_profile => "UnsupportedStreamingAudioProfile",
+        .model_chunk_incomplete_audio_stream => "IncompleteAudioStream",
+
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
         .crc_mismatch => "CrcMismatch",
@@ -1967,6 +2135,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .temporary_name_server_failure => "TemporaryNameServerFailure",
         .name_server_failure => "NameServerFailure",
         .query_candidate_budget_exceeded => "QueryCandidateBudgetExceeded",
+        .decision_limit_exceeded => "DecisionLimitExceeded",
         .query_embedding_input_too_large => "QueryEmbeddingInputTooLarge",
         .query_embedding_overloaded => "QueryEmbeddingOverloaded",
         .embed_rate_limited => "EmbedRateLimited",
@@ -2142,6 +2311,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .body_capacity_exceeded => "BodyCapacityExceeded",
         .body_read_failed => "BodyReadFailed",
         .inference_provider_failure => "InferenceProviderFailure",
+        .inference_worker_executable_not_configured => "InferenceWorkerExecutableNotConfigured",
+        .inference_worker_unavailable => "InferenceWorkerUnavailable",
         .kernel_jit_required_dynamic_load => "KernelJitRequiredDynamicLoad",
         .unexpected_token => "UnexpectedToken",
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
@@ -2486,6 +2657,13 @@ test "external lake and spill errors retain exact identity across runtime archiv
     }
 }
 
+test "external lake evaluation limits retain their exact boundary identity" {
+    const value = statusFromError(error.DecisionLimitExceeded);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
+    try std.testing.expect(errorHasStableDetail(error.DecisionLimitExceeded));
+    try std.testing.expectEqual(error.DecisionLimitExceeded, errorFromStatus(value));
+}
+
 test "inference command and lifecycle errors retain their identities across engine calls" {
     inline for (.{ error.WarmInferenceServerUnavailable, error.UnsupportedServerGenerateOption, error.MissingInferenceListener, error.RuntimeFailed, error.RuntimeStopping, error.RuntimeAlreadyReady }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
@@ -2498,4 +2676,40 @@ test "storage callback boundaries retain capability integrity and bounded-read o
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(encoded));
     }
+}
+
+test "model-aware chunk failures preserve retry and source fencing semantics" {
+    const Case = struct { err: anyerror, code: Code };
+    for ([_]Case{
+        .{ .err = error.StaleChunkContinuation, .code = .conflict },
+        .{ .err = error.SourceVersionChanged, .code = .conflict },
+        .{ .err = error.EmbeddingIdentityMismatch, .code = .conflict },
+        .{ .err = error.IncompleteChunkCoverage, .code = .invalid_argument },
+        .{ .err = error.ChunkOutputTooLarge, .code = .invalid_argument },
+        .{ .err = error.MemoryBudgetExceeded, .code = .retryable },
+        .{ .err = error.UnsupportedChunkMediaType, .code = .unsupported },
+    }) |case| {
+        const wire = statusFromError(case.err);
+        try std.testing.expectEqual(@backingInt(case.code), wire.code);
+        try std.testing.expectEqual(case.err, errorFromStatus(wire));
+    }
+}
+
+test "inference worker setup and transport failures retain distinct boundary semantics" {
+    const missing = statusFromError(error.InferenceWorkerExecutableNotConfigured);
+    const unavailable = statusFromError(error.InferenceWorkerUnavailable);
+    const capacity = statusFromError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), missing.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), unavailable.code);
+    try std.testing.expect(missing.detail != unavailable.detail and unavailable.detail != capacity.detail);
+    for ([_]anyerror{ error.InferenceWorkerExecutableNotConfigured, error.InferenceWorkerUnavailable }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.InferenceProviderFailure)));
+    }
+}
+
+test "merged runtime error details preserve main wire identifiers" {
+    try std.testing.expectEqual(@as(c_int, 674), @backingInt(Detail.inference_worker_executable_not_configured));
+    try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
+    try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
+    try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
 }

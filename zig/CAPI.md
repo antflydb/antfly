@@ -159,19 +159,43 @@ handle rather than opening several.
 
 libantfly runs every inference backend, including Metal, CUDA, and ONNX, in
 the calling process. This applies to `antfly_inference` handles and to Lite
-handles opened with local inference.
+handles opened with local inference. A dylib-only build needs neither a
+separate worker executable nor an `ANTFLY_INFERENCE_WORKER` setting.
 
-The `antfly` server runs those backends in a worker process instead, because
-a GPU driver call or an ONNX model load has no per-call abort: the server
-stops a stuck call by killing the worker and starting a new one. A library
-cannot do that to its host program, so libantfly accepts the trade SQLite
-makes and runs them in-process:
+The `antfly` server can supervise inference in a worker to enforce hard
+deadlines around uninterruptible driver and native runtime calls. It can stop
+a stuck call by replacing that worker. Embedded handles keep the application
+in control of its process lifetime:
 
 - Once a call reaches the device or driver it runs to completion.
   `call_timeout_ms`, and closing a handle, take effect when it returns.
   Calls on CPU backends still stop cooperatively.
 - A GPU driver fault terminates the process.
 - A session wedged in the driver blocks close instead of being abandoned.
+
+Compatible native database connections retain one local inference service across
+foreground and maintenance snapshots. Refreshing a checkpoint does not reload
+models or reset admission accounting; the service drains and closes after its
+last retained database snapshot is released. Standalone `antfly_inference`
+handles continue to own independent runtimes. Explicit database `models_dir`
+values are copied during open and remain valid after the caller releases its
+options buffer. Idle maintenance writer admission does not schedule new replay.
+An idle turn can retain the serving runtime across its own fenced allocator and
+lease cleanup when primary and immutable index roots remain unchanged. An
+external writer's commit still requires normal runtime validation and refresh.
+
+`antfly_db_status_json` includes `inference.memory_admission` for a local runtime.
+It records the last denied admission's pressure category, requested/admitted
+bytes, configured limits, denial count, and monotonic timestamp. These are
+historical diagnostic values, not a claim that a current request is blocked.
+The limits describe the first request in the denied group; requested bytes are
+the group's totals. An unavailable memory sample is reported as zero.
+
+Graph replacement rows in `antfly_db_pending_work_stats_json` expose
+`blocked_reason`, `producer_artifacts` (including upstream producers),
+`producer_replay_target`, `producer_applied_sequence`, and
+upstream retry/error details. Waiting for producer enrichment preserves the
+graph's own `last_error` and does not spend its failure retry budget.
 
 ## Read-Only Modes
 
@@ -416,11 +440,13 @@ one table per turn, including one relational index page, and releases the writer
 turns, retaining pending work for subsequent turns.
 
 Detached maintenance primary transactions and index publications join the fair
-writer queue. They adopt the latest primary checkpoint when the namespace,
-catalog, and physical index inputs remain unchanged, so unrelated foreground
-commits do not force a retry. Inference and segment construction run outside
-the writer gate; changed index inputs or file replacement still cancel stale
-publication. Reclamation continues to yield on contention.
+writer queue. They adopt the latest primary checkpoint when the namespace
+and catalog remain unchanged, so unrelated foreground commits do not force a
+retry. Immutable index publication additionally checks its physical inputs;
+changed index inputs cancel that work while primary transactions can still
+persist completed replay progress against the latest checkpoint. Inference
+and segment construction run outside the writer gate; file replacement
+cancels stale publication. Reclamation continues to yield on contention.
 
 Replay-producing maintenance delivers its prepared effects to the current
 coordinator under that writer lease. It validates captured documents and
@@ -576,6 +602,9 @@ and temporary remote failures retry up to four times. Unclassified
 `Unexpected`, `InputOutput`, `ReadFailed` and `WriteFailed` errors fail immediately
 rather than assuming storage corruption is transient. A failure after a newer
 checkpoint uses that checkpoint for both retry accounting and recovery.
+A detached snapshot invalidated by concurrent publication yields and retries
+from its durable checkpoint. This does not fail the job or consume its
+transient-failure budget.
 
 Replacement ownership uses an IO mutex. Blocking cancellation and deletion park
 on it; backoff sleeps occur after releasing it. Regular activation catch-up has

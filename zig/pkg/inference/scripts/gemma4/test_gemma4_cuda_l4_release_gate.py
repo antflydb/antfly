@@ -35,6 +35,7 @@ import merge_gemma4_long_e2e_release_summary as merge_long_e2e
 
 from gemma4_cuda_l4_release_gate import (
     CAPTURE_KV_CAPACITY,
+    REQUIRED_ZIG_VERSION,
     DEFAULT_MIN_COMPARABLE_RATIO,
     E2B_ANTFLY_TOKENS,
     E2B_LLAMA_TOKENS,
@@ -841,7 +842,7 @@ class L4ReleaseGateTest(unittest.TestCase):
         toolchains = {
             name: dict(tool) for name in ("python", "git", "cuobjdump", "nvidia_smi")
         }
-        toolchains["zig"] = {**tool, "version": "0.16.0"}
+        toolchains["zig"] = {**tool, "version": REQUIRED_ZIG_VERSION}
         toolchains["nvcc"] = {**tool, "version": "Cuda compilation tools, release 13.2"}
         base = {
             "git": {

@@ -63,6 +63,8 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_media": ("zig/lib/media/src/mod.zig",),
+    "antfly_video": ("zig/lib/video/src/mod.zig",),
     "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),
     "storage_ordinal_options": (),
     "storage_engine_options": (),
@@ -71,6 +73,10 @@ SOURCE_MODULES = {
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
     "antfly_local_sources": ("zig/pkg/antfly-embedded/src/source_catalog.zig",),
     "antfly_inference_host": ("zig/pkg/inference/src/host/host.zig",),
+    "antfly_inference_engine": ("zig/pkg/inference/src/host/engine.zig",),
+    "engine_options": (),
+    "engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
+    "engine_memory": ("zig/lib/runtime/src/runtime_memory_abi.zig",),
     "sql_parser": ("zig/lib/sql/root.zig",),
     "antfly_public_server_openapi": (
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_public_server_openapi/root.zig",
@@ -165,6 +171,7 @@ SOURCE_MODULES = {
     "antfly_google": ("zig/lib/google/src/root.zig",),
     "antfly_hash": ("zig/lib/hash/src/mod.zig",),
     "antfly_image": ("zig/lib/image/src/mod.zig",),
+    "antfly_video_media": ("zig/lib/media/src/inference.zig",),
     "antfly_indexes_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_indexes_openapi/root.zig",
     ),

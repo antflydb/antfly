@@ -150,9 +150,7 @@ const CombinedControl = struct {
         // Both full controls remain borrowed until every synchronous binding
         // operation/guard completes. Retain their worker/IO carrier as well as
         // callbacks: process-required primitives must still arm the watchdog.
-        result.ptr = self;
-        result.check_fn = checkBoth;
-        return result;
+        return result.withCheckpoint(self, checkBoth);
     }
 };
 
@@ -211,7 +209,7 @@ test "seeded gradient trainer binding control preserves worker carrier both canc
     {
         // This exercises the real process-required guard/monitor contract
         // without a process, thread, device, timer or tensor allocation.
-        var guard = try active.enterUninterruptible(.process_required);
+        var guard = try active.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         const monitor = original.monitor.?;
         try std.testing.expectEqual(future - 2, monitor.deadline_ns.?);
@@ -243,7 +241,7 @@ test "seeded gradient trainer binding control preserves worker carrier both canc
     try std.testing.expectEqual(request.io.?, active.io.?);
     try std.testing.expectEqual(future - 3, active.deadline_ns.?);
     {
-        var guard = try active.enterUninterruptible(.process_required);
+        var guard = try active.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         try requested.monitor.?.check();
     }
@@ -256,7 +254,7 @@ test "seeded gradient trainer binding control preserves worker carrier both canc
     try std.testing.expectError(error.Timeout, active.check());
     combined.primary = null;
     combined.secondary = .{};
-    try std.testing.expectError(error.ProcessIsolationRequired, combined.control().enterUninterruptible(.process_required));
+    try std.testing.expectError(error.ProcessIsolationRequired, combined.control().enterUninterruptible(.uninterruptible));
 }
 
 fn validateSchedule(schedule: optimizers.LearningRateSchedule) !void {

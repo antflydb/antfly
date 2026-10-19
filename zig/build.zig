@@ -87,6 +87,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
+    @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
+    @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);
     const vopr_mod = shared.vopr_mod;
     const strip = shared.strip;
     const lmdb_backend = shared.lmdb_backend;
@@ -158,8 +160,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple OCR, generation, and transcription (macOS 27 SDK and Swift required)") orelse false;
     if (apple_reader_enabled and (target.result.os.tag != .macos or !link_libc))
         @panic("-Dapple-providers=true requires macOS and libc");
+    // Vision OCR is Objective-C and supports cross compilation with the
+    // release SDK. Generation/transcription additionally need the Swift sidecar.
+    const apple_ocr_enabled = b.option(bool, "apple-ocr", "Enable Apple Vision OCR (macOS and libc required)") orelse apple_reader_enabled;
+    if (apple_ocr_enabled and (target.result.os.tag != .macos or !link_libc))
+        @panic("-Dapple-ocr=true requires macOS and libc");
     const apple_reader_options = b.addOptions();
-    apple_reader_options.addOption(bool, "enabled", apple_reader_enabled);
+    apple_reader_options.addOption(bool, "enabled", apple_ocr_enabled);
     const apple_options_module = apple_reader_options.createModule();
     readers_mod.addImport("apple_reader_options", apple_options_module);
     readers_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
@@ -169,7 +176,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    apple_native_mod.addImport("apple_native_options", apple_options_module);
+    const apple_native_options = b.addOptions();
+    apple_native_options.addOption(bool, "enabled", apple_reader_enabled);
+    apple_native_mod.addImport("apple_native_options", if (apple_ocr_enabled == apple_reader_enabled) apple_options_module else apple_native_options.createModule());
     apple_native_mod.addImport("antfly_platform", platform_mod);
     apple_native_mod.addImport("httpx", httpx_mod);
     generating_mod.addImport("antfly_apple_native", apple_native_mod);
@@ -201,7 +210,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
         });
     }
-    if (apple_reader_enabled) {
+    if (apple_ocr_enabled) {
         addMacosSdkPaths(b, readers_mod, target);
         readers_mod.linkFramework("Foundation", .{});
         readers_mod.linkFramework("CoreGraphics", .{});
@@ -723,6 +732,54 @@ pub fn create(b: *std.Build) ?Artifacts {
         .run_raft_library_tests = run_raft_library_tests,
     });
     const antfly_test_mod = owner_tests.antfly_test_mod;
+    const model_chunk_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "model aware media", "model chunk artifact" },
+    });
+    const model_chunk_step = b.step("antfly-media-chunking-test", "Qualify typed chunk provider ownership, artifact recipes and incomplete coverage");
+    model_chunk_step.dependOn(&b.addRunArtifact(model_chunk_tests).step);
+    const chunk_capability_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("antfly_inference_remote_capabilities").?,
+        .filters = &.{"model aware media remote capability"},
+    });
+    model_chunk_step.dependOn(&b.addRunArtifact(chunk_capability_tests).step);
+    const chunk_error_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("storage_engine_errors").?,
+    });
+    const chunk_error_run = b.addRunArtifact(chunk_error_tests);
+    model_chunk_step.dependOn(&chunk_error_run.step);
+    const error_identity_step = b.step("runtime-error-identities-test", "Validate native error names and model-aware chunk failure transport");
+    error_identity_step.dependOn(&chunk_error_run.step);
+    const error_provider = b.addLibrary(.{ .name = "chunk-error-test-provider", .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const error_consumer = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    error_consumer.addImport("storage_engine_errors", antfly_test_mod.import_table.get("storage_engine_errors").?);
+    error_consumer.addImport("antfly_test_error_logs", antfly_test_mod.import_table.get("antfly_test_error_logs").?);
+    error_consumer.linkLibrary(error_provider);
+    const error_roundtrip = b.addRunArtifact(b.addTest(.{
+        .root_module = error_consumer,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }));
+    error_identity_step.dependOn(&error_roundtrip.step);
+    model_chunk_step.dependOn(&error_roundtrip.step);
+    const error_status_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_error_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) }));
+    error_identity_step.dependOn(&error_status_run.step);
+    model_chunk_step.dependOn(&error_status_run.step);
+
     const run_antfly_embedded_pkg_tests = owner_tests.run_antfly_embedded_pkg_tests;
     const run_lite_native_tests = owner_tests.run_lite_native_tests;
     const run_lite_cmd_tests = owner_tests.run_lite_cmd_tests;
@@ -770,6 +827,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_png_tests.step);
     lib_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     lib_test_step.dependOn(&run_lib_pdf_tests.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
     lib_test_step.dependOn(&run_lib_scraping_tests.step);
     lib_test_step.dependOn(&run_hf_tokenizer_tests.step);
     lib_test_step.dependOn(platform_test_step);
@@ -891,6 +950,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);
     const antfly_main = runtime.antfly_main;
     const runtime_library_artifacts = runtime.runtime_library_artifacts;
+    // This fixture intentionally tests the inline host implementation. Compile
+    // its function-table export in the same image, so the shared storage owner
+    // resolves to that host instead of introducing a second codec/TLS owner.
+    owner_tests.lib_standalone_runtime_tests.root_module.addImport("antfly_inference_native_exports", embedded.native_inference.root_module);
+    if (production_antfly_imports.shared_inference_core) @import("build_support/embedded/source_owner.zig").registerLocalProvider(owner_tests.lib_standalone_runtime_tests.root_module, embedded.native_inference);
     const consumer_test_metadata = @import("lib/build_info/build_support.zig").create(b, .{
         .root = b.path("lib/build_info"),
         .target = target,
@@ -1037,6 +1101,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     production_antfly_imports.configureEmbedded(b, lite_main_mod, link_libc);
     lite_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
     lite_main_mod.addImport("antfly_inference_host", production_antfly_imports.inference_host);
+    lite_main_mod.addImport("antfly_inference_engine", production_antfly_imports.inference_engine);
     build_info.link(lite_main_mod);
     const lite_main = b.addExecutable(.{
         .name = "antfly-lite",
@@ -1068,6 +1133,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     production_antfly_imports.configureEmbedded(b, lite_main_tests.root_module, link_libc);
     lite_main_tests.root_module.addImport("antfly-client", antfly_client_pkg_mod);
     lite_main_tests.root_module.addImport("antfly_inference_host", production_antfly_imports.inference_host);
+    lite_main_tests.root_module.addImport("antfly_inference_engine", production_antfly_imports.inference_engine);
     // Unit tests use the stable test version; only final products link release metadata.
     lite_main_tests.root_module.addImport("build_info", build_info.module);
     const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);

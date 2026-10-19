@@ -1593,6 +1593,7 @@ pub const ScanHash = struct {
 
 /// One row yielded by a snapshot-consistent scan. Slices are borrowed for the
 /// duration of the callback; consumers that retain them must copy them.
+pub const BorrowedScanDocument = @import("../scan_document.zig").Borrowed;
 pub const ScanVisitEntry = struct {
     id: []const u8,
     hash: u64,
@@ -1601,9 +1602,13 @@ pub const ScanVisitEntry = struct {
     relational_cursor: ?[]const u8 = null,
     json_null_fields: []const []const u8 = &.{},
     document_json: ?[]const u8 = null,
+    document_stream: ?BorrowedScanDocument = null,
 };
 
 pub const ScanVisitor = struct {
+    /// Opt in only when the callback consumes document_stream synchronously.
+    /// Ordinary collectors retain their existing document_json contract.
+    borrow_documents: bool = false,
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
@@ -1872,6 +1877,11 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Trusted request-local preparation, never decoded from public input.
+    native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
+    text_navigation_plan: ?*const @import("../../search/search.zig").TextNavigationPlan = null,
+    text_pattern_programs: ?*@import("../../search/query.zig").PatternPrograms = null,
+    text_pattern_membership: ?*@import("../../search/query.zig").PatternMembership = null,
     /// Authenticated internal two-phase hydration, never set by public parsing.
     document_authority_mode: document_authority.Mode = .none,
     document_authority_group: u64 = 0,
@@ -2149,6 +2159,10 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
     "minimum_competitive_score",
+    "text_navigation_plan",
+    "text_pattern_programs",
+    "text_pattern_membership",
+    "native_text_tie_rank",
 };
 
 fn auditHierarchyChildrenSearchRequestFields() void {

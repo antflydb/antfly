@@ -24,6 +24,7 @@ const bert = @import("bert.zig");
 const deberta = @import("deberta.zig");
 const modern_bert = @import("../architectures/modern_bert_config.zig");
 const gpt = @import("gpt.zig");
+const embedding_gemma2 = @import("embedding_gemma2.zig");
 const gliner_boundary = @import("gliner_boundary.zig");
 const gliner_qualification = @import("gliner_boundary_qualification.zig");
 const boundary_bundle = @import("gliner_boundary_bundle.zig");
@@ -203,6 +204,7 @@ pub const EmbeddingStyle = enum {
     jina_v5,
     /// Qwen3-Embedding trailing-EOS last-token pooling.
     qwen3_embedding,
+    /// Bidirectional multimodal EmbeddingGemma 2 encoder with mean pooling.
     embedding_gemma2,
 };
 
@@ -354,6 +356,10 @@ pub const ModelManifest = struct {
     // Pipeline config
     pooling: PoolingStrategy = .mean,
     normalize: bool = true,
+    /// Final token projection width advertised by SentenceTransformers.
+    embedding_dimension: u32 = 0,
+    /// Whether prompt/task-prefix tokens participate in mean pooling.
+    include_prompt: bool = true,
     embedding_profile: EmbeddingProfile = .{},
     embedding_style: EmbeddingStyle = .none,
     model_manifest_declarations: ModelManifestDeclarations = .{},
@@ -423,7 +429,8 @@ pub const ModelManifest = struct {
     add_eos_token: bool = false,
 
     pub fn maxTextSequenceLength(self: *const ModelManifest) usize {
-        if (self.embedding_style == .embedding_gemma2) return 8192;
+        if (self.embedding_style == .embedding_gemma2)
+            return @min(@as(usize, self.max_position_embeddings), embedding_gemma2.official_max_input_tokens);
         if (self.gliner_boundary_config) |config| return config.max_len;
         const position_id_mode: bert.PositionIdMode = if (self.bert_model_type == .roberta)
             .roberta_padding
@@ -551,6 +558,7 @@ pub const ModelManifest = struct {
     /// embedder (Qwen3-Embedding, Jina v5) eligible for the resident Qwen3
     /// embedding path and query/document prefix handling.
     pub fn isLastTokenDecoderEmbedder(self: *const ModelManifest) bool {
+        if (self.embedding_style == .embedding_gemma2) return false;
         if (self.embedding_style != .none) return self.model_type == .embedder;
         // Legacy heuristic kept for manifests written before embedding_style
         // existed: Jina v5's last pooling + document prefix pairing.
@@ -1863,7 +1871,7 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         // classification/decision tasks are declared by a bundle.
         manifest.model_type_origin = .config;
         if (manifest.inputs.len == 0) try setManifestInputs(manifest.allocator, manifest, &.{"text"});
-        for (manifest.inputs) |input| if (!std.mem.eql(u8, input, "text") and !std.mem.eql(u8, input, "image") and !std.mem.eql(u8, input, "audio")) return error.InvalidModelManifest;
+        for (manifest.inputs) |input| if (!std.mem.eql(u8, input, "text") and !std.mem.eql(u8, input, "image") and !std.mem.eql(u8, input, "audio") and !std.mem.eql(u8, input, "video")) return error.InvalidModelManifest;
         try removeManifestStrings(manifest.allocator, &manifest.tasks, &.{ "extract", "classify" });
         try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "typed_decisions", "classification", "extraction" });
         try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{ "embed", "decide" });
@@ -2741,6 +2749,23 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
                 if (manifest.model_type == .embedder) manifest.model_type = .classifier;
             } else if (std.mem.eql(u8, s, "jina_embeddings_v5")) {
                 manifest.model_type = .embedder;
+            } else if (std.mem.eql(u8, s, "embedding_gemma2")) {
+                manifest.model_type = .embedder;
+                manifest.model_type_origin = .config;
+                manifest.embedding_style = .embedding_gemma2;
+                manifest.pooling = .mean;
+                manifest.normalize = true;
+                var inferred_inputs = std.ArrayListUnmanaged([]const u8).empty;
+                errdefer {
+                    for (inferred_inputs.items) |input| allocator.free(input);
+                    inferred_inputs.deinit(allocator);
+                }
+                try inferred_inputs.append(allocator, try allocator.dupe(u8, "text"));
+                if (obj.get("vision_config")) |vision| if (vision == .object)
+                    try inferred_inputs.append(allocator, try allocator.dupe(u8, "image"));
+                if (obj.get("audio_config")) |audio| if (audio == .object)
+                    try inferred_inputs.append(allocator, try allocator.dupe(u8, "audio"));
+                replaceOwnedStringArray(allocator, &manifest.inputs, try inferred_inputs.toOwnedSlice(allocator));
             } else if (std.mem.eql(u8, s, "nomic_bert")) {
                 // Nomic Embed v1/v1.5 checkpoints require asymmetric literal
                 // task prefixes. Keep these in the manifest so HTTP and
@@ -2771,6 +2796,9 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             if (tc.object.get("max_position_embeddings")) |v| {
                 if (jsonU32(v)) |val| manifest.max_position_embeddings = val;
             }
+            if (tc.object.get("embedding_dim")) |v| {
+                if (jsonU32(v)) |val| manifest.embedding_dimension = val;
+            }
         }
     }
     if (obj.get("model_type")) |mt| {
@@ -2788,10 +2816,10 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             manifest.pooling = .mean;
             manifest.normalize = true;
             for (manifest.inputs) |input| {
-                if ((std.mem.eql(u8, input, "image") and !cfg.vision) or (std.mem.eql(u8, input, "audio") and !cfg.audio)) return error.InvalidEmbeddingTaskProfile;
+                if (((std.mem.eql(u8, input, "image") or std.mem.eql(u8, input, "video")) and !cfg.vision) or (std.mem.eql(u8, input, "audio") and !cfg.audio)) return error.InvalidEmbeddingTaskProfile;
             }
             if (!manifest.model_manifest_declarations.inputs) {
-                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio" } else if (cfg.vision) &.{ "text", "image" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
+                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio", "video" } else if (cfg.vision) &.{ "text", "image", "video" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
             }
         }
     }
@@ -2806,6 +2834,17 @@ fn parseSentenceTransformersPoolingConfig(manifest: *ModelManifest, allocator: s
     var selected: ?PoolingStrategy = null;
     if (obj.get("pooling_mode")) |mode| {
         if (mode == .string and std.mem.eql(u8, mode.string, "mean")) selected = .mean;
+    }
+
+    // SentenceTransformers 6 emits this compact shape for EmbeddingGemma 2.
+    if (obj.get("pooling_mode")) |mode| {
+        if (mode == .string) selected = std.meta.stringToEnum(PoolingStrategy, mode.string);
+    }
+    if (obj.get("embedding_dimension")) |dimension| {
+        if (jsonU32(dimension)) |value| manifest.embedding_dimension = value;
+    }
+    if (obj.get("include_prompt")) |include_prompt| {
+        if (include_prompt == .bool) manifest.include_prompt = include_prompt.bool;
     }
 
     if (jsonBool(obj.get("pooling_mode_cls_token"))) selected = .cls;
@@ -2892,7 +2931,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
             manifest.pooling = .mean;
             manifest.normalize = true;
             if (!manifest.model_manifest_declarations.inputs) {
-                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio" } else if (cfg.vision) &.{ "text", "image" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
+                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio", "video" } else if (cfg.vision) &.{ "text", "image", "video" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
             }
         }
     }
@@ -3448,6 +3487,24 @@ fn parseInferenceBundleJsonInternal(
         {
             return error.InvalidInferenceBundle;
         }
+        // A managed pull may contain only an explicitly selected variant,
+        // while the immutable Hub descriptor still names the repo default.
+        // Resolve a complete, published GLiNER variant before requiring the
+        // absent default; never guess a different single GGUF.
+        if (!managed_receipt.artifactPathIsSafe(encoder.?.string) or !managed_receipt.artifactPathIsSafe(head.?.string)) return error.InvalidModelArtifactPath;
+        if (catalog) |published| {
+            if (!try published.exists(encoder.?.string) or !try published.exists(head.?.string)) {
+                if (try published.readOptional("antfly_inference_variants.json")) |variants_bytes| {
+                    defer allocator.free(variants_bytes);
+                    const variants = try parseBundleObject(allocator, variants_bytes);
+                    defer variants.deinit();
+                    const family = variants.value.object.get("family") orelse return error.InvalidInferenceBundle;
+                    if (family != .string or !std.mem.eql(u8, family.string, "gliner2_variants/v1")) return error.InvalidInferenceBundle;
+                    try parseGliner2InferenceVariantsJson(manifest, allocator, catalog, model_dir_path, variants.value.object);
+                    if (manifest.isSplitGlinerBundle()) return .applied;
+                }
+            }
+        }
         const encoder_path = try resolveBundlePath(allocator, catalog, model_dir_path, encoder.?.string);
         errdefer allocator.free(encoder_path);
         const head_path = try resolveBundlePath(allocator, catalog, model_dir_path, head.?.string);
@@ -3599,10 +3656,9 @@ fn shouldUseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
 
 fn shouldParseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
     if (try shouldUseClipclapGgufVariant(catalog)) return true;
-    if (build_options.enable_cuda) {
-        return try catalog.exists("antfly_inference_variants.json");
-    }
-    return false;
+    // Artifact selection must not depend on compiled accelerator support.
+    // A GGUF pair includes its projections and cannot use ONNX sidecars.
+    return try catalog.exists("antfly_inference_variants.json");
 }
 
 fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8, json_bytes: []const u8) !void {
@@ -4124,9 +4180,9 @@ fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
         .embedding_gemma2 => {
             markEmbeddingTaskProfileRequired(manifest);
             if (!manifest.embedding_profile.query.declared)
-                try setEmbeddingProfilePrefix(manifest, .query, "task: search result | query: ");
+                try setEmbeddingProfilePrefix(manifest, .query, try embedding_gemma2.taskPrefix("RETRIEVAL_QUERY"));
             if (!manifest.embedding_profile.document.declared)
-                try setEmbeddingProfilePrefix(manifest, .document, "title: none | text: ");
+                try setEmbeddingProfilePrefix(manifest, .document, try embedding_gemma2.taskPrefix("RETRIEVAL_DOCUMENT"));
         },
         .none => {},
     }
@@ -4675,7 +4731,8 @@ test "GLiNER Decide listing falls back to tokenizer JSON marker IDs" {
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"added_tokens\":[{\"id\":50368,\"content\":\"[SEP_STRUCT]\"},{\"id\":50369,\"content\":\"[SEP_TEXT]\"},{\"id\":50370,\"content\":\"[P]\"},{\"id\":50371,\"content\":\"[C]\"},{\"id\":50372,\"content\":\"[E]\"},{\"id\":50373,\"content\":\"[R]\"},{\"id\":50374,\"content\":\"[L]\"}]}" });
     const path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(path);
-    try std.testing.expect(!hasGlinerPathHint(path));
+    // Parent checkout/worktree names may legitimately contain "gliner".
+    try std.testing.expect(!hasGlinerPathHint(tmp.sub_path[0..]));
     var listing = try loadListingFromDir(a, path);
     defer listing.deinit();
     try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, listing.gliner_classification_head);
@@ -4814,6 +4871,28 @@ test "manifest from config.json" {
     try std.testing.expectEqual(bert.ModelType.bert, manifest.bert_model_type);
     try std.testing.expectEqualStrings("bert", manifest.config_model_arch);
     try std.testing.expectEqual(ModelTypeOrigin.config, manifest.model_type_origin);
+}
+
+test "EmbeddingGemma2 manifest advertises unified inputs and serving dimensions" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    const config_json = @embedFile("../architectures/embedding_gemma2_config.json");
+    try parseConfigJson(&manifest, allocator, config_json);
+
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(EmbeddingStyle.embedding_gemma2, manifest.embedding_style);
+    try std.testing.expectEqual(PoolingStrategy.mean, manifest.pooling);
+    try std.testing.expect(manifest.normalize);
+    try std.testing.expectEqual(@as(u32, 768), manifest.embedding_dimension);
+    try std.testing.expectEqual(@as(usize, 8192), manifest.maxTextSequenceLength());
+    try std.testing.expectEqual(@as(usize, 4), manifest.inputs.len);
+    try std.testing.expectEqualStrings("text", manifest.inputs[0]);
+    try std.testing.expectEqualStrings("image", manifest.inputs[1]);
+    try std.testing.expectEqualStrings("audio", manifest.inputs[2]);
+    try std.testing.expectEqualStrings("video", manifest.inputs[3]);
+    try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
 }
 
 test "RoBERTa manifest reserves padding position indices" {
@@ -6312,6 +6391,92 @@ test "manifest loads canonical antfly clipclap variants before first gguf fallba
     try expectCanonicalPath(allocator, clap_path, manifest.audio_model_path.?);
 }
 
+test "manifest mixed clipclap install selects a complete GGUF pair independently of CUDA" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-clipclap-mixed-variants");
+    defer {
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q4_K.gguf" });
+    defer allocator.free(clip_path);
+    const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q4_K.gguf" });
+    defer allocator.free(clap_path);
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clip_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clap_path, .data = "GGUFstub" });
+
+    const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
+    defer allocator.free(model_manifest_path);
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
+        .sub_path = model_manifest_path,
+        .data = "{\"type\":\"embedder\",\"tasks\":[\"embed\"],\"inputs\":[\"text\",\"image\",\"audio\"]}",
+    });
+
+    const clip_config_path = try std.fs.path.join(allocator, &.{ dir_path, "clip_config.json" });
+    defer allocator.free(clip_config_path);
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
+        .sub_path = clip_config_path,
+        .data = "{\"model_type\":\"clipclap\",\"text_config\":{\"max_position_embeddings\":77}}",
+    });
+
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(variants_path);
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
+        .sub_path = variants_path,
+        .data =
+        \\{
+        \\  "family": "clipclap_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "clip": "clipclap-clip.Q4_K.gguf",
+        \\      "clap": "clipclap-clap.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+        ,
+    });
+
+    const onnx_files = [_][]const u8{ "text_model.onnx", "visual_model.onnx", "audio_model.onnx", "text_projection.onnx", "visual_projection.onnx", "audio_projection.onnx" };
+    for (onnx_files) |name| {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, name });
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
+    }
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.isClipclapGgufBundle());
+    try std.testing.expectEqual(NativeArchHint.clip, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("clipclap", manifest.config_model_arch);
+    try expectCanonicalPath(allocator, clip_path, manifest.gguf_path.?);
+    try expectCanonicalPath(allocator, clap_path, manifest.audio_model_path.?);
+    try std.testing.expect(manifest.onnx_path == null);
+    try std.testing.expect(manifest.visual_model_path == null);
+    try std.testing.expect(manifest.text_projection_path == null);
+    try std.testing.expect(manifest.visual_projection_path == null);
+    try std.testing.expect(manifest.audio_projection_path == null);
+    var listing = try loadListingFromDir(allocator, dir_path);
+    defer listing.deinit();
+    try std.testing.expect(listing.isClipclapGgufBundle());
+    try std.testing.expectEqualStrings(manifest.gguf_path.?, listing.gguf_path.?);
+    try std.testing.expectEqualStrings(manifest.audio_model_path.?, listing.audio_model_path.?);
+    try std.testing.expect(listing.onnx_path == null);
+    try std.testing.expect(listing.text_projection_path == null);
+
+    // An ONNX-only pull retains the variants sidecar but has no GGUF pair.
+    try std.Io.Dir.cwd().deleteFile(compat.testingIo(), clip_path);
+    try std.Io.Dir.cwd().deleteFile(compat.testingIo(), clap_path);
+    var onnx_only = try loadFromDir(allocator, dir_path);
+    defer onnx_only.deinit();
+    try std.testing.expect(!onnx_only.isClipclapGgufBundle());
+    try std.testing.expect(onnx_only.gguf_path == null);
+    try std.testing.expect(std.mem.endsWith(u8, onnx_only.onnx_path.?, "/text_model.onnx"));
+    try std.testing.expect(std.mem.endsWith(u8, onnx_only.text_projection_path.?, "/text_projection.onnx"));
+}
+
 test "manifest ignores stale clipclap variants with missing gguf files" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-stale-variants");
@@ -6425,6 +6590,35 @@ test "manifest parses gliner2 variants gguf pair" {
     try expectCanonicalPath(allocator, encoder_path, manifest.gguf_path.?);
     try expectCanonicalPath(allocator, head_path, manifest.gliner_head_gguf_path.?);
     try std.testing.expect(manifest.hasInput("text"));
+}
+
+test "manifest resolves pulled GLiNER variant when repository default is absent" {
+    const a = std.testing.allocator;
+    const io = compat.testingIo();
+    const dir = try testScratchDir(a, "manifest-gliner-selected-variant");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        a.free(dir);
+    }
+    const variants = "{\"family\":\"gliner2_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"format\":\"Q4_K\",\"encoder\":\"gliner2-encoder.Q4_K.gguf\",\"head\":\"gliner2-head.Q4_K.gguf\"}]}";
+    for ([_][]const u8{ "gliner2-encoder.Q4_K.gguf", "gliner2-head.Q4_K.gguf", "antfly_inference_variants.json" }) |name| {
+        const full = try std.fs.path.join(a, &.{ dir, name });
+        defer a.free(full);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = if (std.mem.endsWith(u8, name, ".json")) variants else "GGUFstub" });
+    }
+    var catalog = try ArtifactCatalog.initPublished(a, dir);
+    defer catalog.deinit();
+    var manifest = ModelManifest{ .allocator = a };
+    defer manifest.deinit();
+    try parseInferenceBundleJsonWithCatalog(
+        &manifest,
+        a,
+        &catalog,
+        "{\"family\":\"gliner2_split_bundle/v1\",\"wrapper\":\"gliner2\",\"encoder\":\"gliner2-encoder.Q8_0.gguf\",\"head\":\"gliner2-head.Q8_0.gguf\"}",
+    );
+    try std.testing.expect(manifest.isSplitGlinerBundle());
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "gliner2-encoder.Q4_K.gguf"));
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gliner_head_gguf_path.?, "gliner2-head.Q4_K.gguf"));
 }
 
 test "manifest parses florence2 variants gguf model" {

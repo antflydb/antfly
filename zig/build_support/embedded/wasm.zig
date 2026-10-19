@@ -196,6 +196,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    wasm_cancellation_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     wasm_runtime_abi_mod.addImport("httpx", httpx_mod);
     wasm_runtime_abi_mod.addImport("antfly_platform", wasm_platform_mod);
     embedded_support_wasm_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
@@ -387,6 +388,24 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    @import("antfly_media").support.attach(b, wasm_inference_audio_mod, b.path("lib/media"));
+    // Browser-owned modules must share the same media/image identities as
+    // audio and storage. Never borrow target-specific native runtime modules.
+    const wasm_chunker_mod = b.createModule(.{
+        .root_source_file = b.path("lib/chunker/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_chunker_mod.addImport("inference_audio", wasm_inference_audio_mod);
+    wasm_chunker_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
+    wasm_chunker_mod.addImport("antfly_image", wasm_image_mod);
+    wasm_chunker_mod.addImport("antfly_hash", wasm_hash_mod);
+    const fixed_tokenizer_files = b.addWriteFiles();
+    _ = fixed_tokenizer_files.addCopyFile(b.path("lib/tokenizer/testdata/embedder/tokenizer.json"), "tokenizer.json");
+    wasm_chunker_mod.addImport("inference_fixed_tokenizer_data", b.createModule(.{
+        .root_source_file = fixed_tokenizer_files.add("root.zig", "pub const tokenizer_json = @embedFile(\"tokenizer.json\");\n"),
+    }));
+    embedded_support_wasm_mod.addImport("inference_chunker", wasm_chunker_mod);
     const inference_wasm_inference_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/wasm_entry.zig"),
         .target = wasm_target,
@@ -395,10 +414,15 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     inference_wasm_inference_mod.addImport("antfly_decisions", @import("../../lib/decisions/build.zig").create(b, b.path("lib/decisions/root.zig")));
     inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
     inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
+    inference_wasm_inference_mod.addImport("antfly_media", wasm_inference_audio_mod.import_table.get("antfly_media").?);
     inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);
     inference_wasm_inference_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
     inference_wasm_inference_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
     inference_wasm_inference_mod.addImport("antfly_image", wasm_image_mod);
+    @import("antfly_video").support.attach(b, inference_wasm_inference_mod, b.path("lib/video"), .{
+        .media = wasm_inference_audio_mod.import_table.get("antfly_media").?,
+        .image = wasm_image_mod,
+    });
     inference_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
     inference_wasm_inference_mod.addImport("jinja", wasm_inference_jinja_mod);
     inference_wasm_inference_mod.addImport("ml", wasm_inference_ml_mod);

@@ -218,9 +218,9 @@ test "SQL external set leases retain complete array identities across disk block
             const array = row[0].array.?;
             try std.testing.expectEqual(arrays.ElementType.int64, array.element_type);
             try std.testing.expectEqual(@as(usize, 1), array.dimensions.len);
-            try std.testing.expectEqual(@as(usize, 2), array.elements.len);
-            try std.testing.expect(array.elements[1].sql_null);
-            const n = std.math.cast(usize, array.elements[0].value.integer) orelse return error.UnexpectedSetValue;
+            try std.testing.expectEqual(@as(usize, 2), array.cardinality());
+            try std.testing.expect(array.flatCell(1).sql_null);
+            const n = std.math.cast(usize, array.flatCell(0).value.integer) orelse return error.UnexpectedSetValue;
             try std.testing.expect(n < seen.len);
             const bound: usize = if (array.dimensions[0].lower == -3) 0 else if (array.dimensions[0].lower == 2) 1 else return error.UnexpectedArrayBound;
             try std.testing.expect(!seen[n][bound]);

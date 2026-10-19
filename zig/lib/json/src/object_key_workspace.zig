@@ -152,11 +152,13 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
                 }
             }
             if (!frame.keys.reset(if (frame.keys.queryCapacity() > reuse_limit) .free_all else .retain_capacity)) return error.OutOfMemory;
-            // Only completed storage competes for reuse. Required active ancestors
-            // must not force allocation churn in every small sibling.
-            if (self.stack.capacity * @sizeOf(Frame) + self.idle_bytes + frame.bytes > reuse_limit) {
+            // Only completed key buffers compete for reuse. The traversal vector
+            // is required for this value, including caller state in historical
+            // frames; finishValue enforces the total ceiling once traversal ends.
+            // A deep active stack must not retire every small sibling buffer.
+            if (self.idle_bytes + frame.bytes > reuse_limit) {
                 _ = frame.keys.reset(.free_all);
-                if (self.stack.capacity * @sizeOf(Frame) + self.idle_bytes + frame.bytes > reuse_limit) {
+                if (self.idle_bytes + frame.bytes > reuse_limit) {
                     frame.seen.deinit(tables_counted.allocator());
                     frame.seen = .empty;
                     frame.underused = false;

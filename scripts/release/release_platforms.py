@@ -71,6 +71,11 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
             )
             raise SystemExit(f"invalid release platform entry; missing {missing}")
         platform_id = platform["id"]
+        if platform["optimize"] not in ("debug", "safe", "fast", "small"):
+            raise SystemExit(
+                f"{platform_id} has invalid optimize mode {platform['optimize']!r}; "
+                "expected debug, safe, fast, or small"
+            )
         artifact_name = platform["artifact_name"]
         archive_key = (
             platform["archive_os"],
@@ -86,6 +91,19 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
         ids.add(platform_id)
         artifacts.add(artifact_name)
         archive_keys.add(archive_key)
+        if platform["archive_os"] == "Darwin":
+            target = re.fullmatch(
+                r"aarch64-macos\.(\d+)\.(\d+)(?:\.\d+)?", platform["zig_target"]
+            )
+            if target is None:
+                raise SystemExit(
+                    "Darwin releases require an explicit macOS deployment target"
+                )
+            expected_wheel = f"macosx_{target[1]}_{target[2]}_arm64"
+            if platform.get("wheel_platform") != expected_wheel:
+                raise SystemExit(
+                    f"Darwin wheel tag must match deployment target: {expected_wheel}"
+                )
         if platform.get("libc") == "glibc":
             expected = f"-linux-gnu.{glibc_minimum}"
             if expected not in platform["zig_target"]:
@@ -164,8 +182,26 @@ def main() -> int:
         default="validate",
     )
     parser.add_argument("consumer", nargs="?")
+    parser.add_argument(
+        "--archive-os",
+        choices=("Linux", "Darwin"),
+        help="select release targets for archive qualification",
+    )
     args = parser.parse_args()
     policy = load_policy()
+    if args.archive_os:
+        if args.command != "github-matrix":
+            parser.error("--archive-os requires github-matrix")
+        policy = {
+            **policy,
+            "platforms": [
+                platform
+                for platform in policy["platforms"]
+                if platform["archive_os"] == args.archive_os
+            ],
+        }
+        if not policy["platforms"]:
+            parser.error(f"no {args.archive_os} release platforms")
     if args.command == "github-matrix":
         print(json.dumps(github_matrix(policy), separators=(",", ":")))
     elif args.command == "consumer-matrix":
