@@ -262,6 +262,11 @@ the executing worker. Runtime admission credits this metadata exactly once and
 excludes independently admitted ahead-producer buffers. Inputs, indexes and
 range-provider configuration remain immutable through worker shutdown.
 
+Within that immutable scope, packet-table identity and cardinality locate the
+validated content binding without another table traversal. The inspection owns
+the validated backing descriptor, so preparation does not revalidate every packet.
+Identity reuse is never a content proof outside the request lifetime.
+
 A request may reuse its validated binding while its borrowed bytes, provider
 configuration and packet metadata remain immutable and owned through worker
 shutdown. This memo is discarded with the admission scope, so a new request

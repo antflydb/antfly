@@ -1836,6 +1836,21 @@ queued CPU patches when applicable, and token composition. GPU activations stay
 in the backend plan. Cached video avoids decoder/conversion allowances as well
 as device preparation, and retained inspection metadata receives explicit credit.
 
+Video consumers wake on preparation completion and project ready prefixes while
+later jobs remain pending. A session-owned, independently admitted eight-entry
+cache shares immutable resize/chroma coefficients and HDR LUTs across requests
+(up to 16 MiB device and 64 KiB host metadata). Eviction preserves active owners;
+cache admission failure uses private preparation. Pressure evicts shared storage
+before releasing its device lease, and reactivation requires new admission.
+Validated reader handoffs and
+request-local binding lookups avoid repeated packet-table traversal.
+
+Video-plan qualification reports median inspection, media preparation (decode,
+preparation, projection and composition), packing, encoder and readback times,
+as well as coefficient cache occupancy. Packing is a subset of media preparation.
+Use paired process runs and model-only controls when assessing code changes;
+these component medians need not sum to the median total.
+
 Metal preparation uses buffer-layout estimates independent of CPU RGB/repacking
 scratch. Uploads, chroma reconstruction and independent outputs are included;
 slab or external destinations exclude duplicate command output credit. Immutable

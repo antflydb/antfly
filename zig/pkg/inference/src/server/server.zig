@@ -37929,6 +37929,7 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
                 std.debug.print("embeddinggemma2 video_plan dense_sampling_tokens={d} bounded_legacy_retry_parity=true\n", .{dense_prepared.input_tokens});
             }
             var samples: [2][7]u64 = undefined;
+            var stage_samples: [2][7]grouped.MediaTimings = undefined;
             var stage_totals = grouped.MediaTimings{};
             for (0..9) |iteration| for (0..2) |phase| {
                 const route = phase ^ (iteration & 1);
@@ -37939,11 +37940,26 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
                 defer a.free(measured.vector);
                 const elapsed = platform.time.monotonicNs() -| started;
                 for (measured.vector, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
-                if (iteration >= 2) samples[route][iteration - 2] = elapsed;
+                if (iteration >= 2) {
+                    samples[route][iteration - 2] = elapsed;
+                    stage_samples[route][iteration - 2] = timing;
+                }
                 if (route == 1) stage_totals = timing;
             };
             for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
             std.debug.print("embeddinggemma2 video_plan reference_ns={d} optimized_ns={d} samples=7 parity=true retire_ns={d} rebind_ns={d} copy_ns={d} copy_bytes={d}\n", .{ samples[0][3], samples[1][3], stage_totals.stage_retire_ns, stage_totals.stage_rebind_ns, stage_totals.stage_copy_ns, stage_totals.stage_copy_bytes });
+            for (0..2) |route| {
+                inline for (.{ "inspection_ns", "media_prepare_ns", "pack_ns", "encoder_ns", "pool_readback_ns" }) |field| {
+                    var values: [7]u64 = undefined;
+                    for (stage_samples[route], &values) |timing, *value| value.* = @field(timing, field);
+                    std.mem.sort(u64, &values, {}, std.sort.asc(u64));
+                    std.debug.print("embeddinggemma2 video_stage route={d} stage={s} median_ns={d} samples=7\n", .{ route, field, values[3] });
+                }
+            }
+            if ((try session_factory.videoPreparationContext(loaded.session, false)).coefficients) |coefficients| {
+                const stats = coefficients.statistics();
+                std.debug.print("embeddinggemma2 video_coefficient_cache hits={d} inserts={d} bytes={d} entries={d}\n", .{ stats.hits, stats.inserts, stats.bytes, stats.entries });
+            }
         }
 
         if (std.mem.eql(u8, name, "text_video")) {

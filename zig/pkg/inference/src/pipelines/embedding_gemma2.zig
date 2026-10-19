@@ -333,6 +333,8 @@ fn partBytes(part: Part) []const u8 {
 }
 pub const Group = struct { title: ?[]const u8 = null, content: []const Part };
 pub const MediaTimings = struct {
+    inspection_ns: u64 = 0,
+    media_prepare_ns: u64 = 0,
     preprocess_ns: u64 = 0,
     gpu_frame_ns: u128 = 0,
     frame_submits: u64 = 0,
@@ -362,6 +364,7 @@ pub const MediaTimings = struct {
     device_owned_peak_bytes: ?u64 = null,
 };
 pub const Options = struct {
+    video_coefficients: ?*const @import("antfly_video").preparation.CoefficientCache = null,
     video_inspection_scope: ?*@import("embedding_gemma2_video.zig").InspectionScope = null,
     video_cache_pins: ?*@import("embedding_gemma2_video.zig").CachePins = null,
     video_decoder: @import("antfly_video").decoding.Options = .{},
@@ -415,7 +418,7 @@ pub const VideoAhead = struct {
     pub fn start(session: Session, movie: SampledVideo, control: Control, cache: ?*FrameCache, request_pool: *media_admission.Pool, decoder: @import("antfly_video").decoding.Options) !?*VideoAhead {
         try control.check();
         if (comptime @import("builtin").single_threaded or @import("builtin").cpu.arch.isWasm() or @import("builtin").os.tag == .freestanding) return null;
-        const context = try factory.videoPreparationContext(session);
+        var context = try factory.videoPreparationContext(session, false);
         const io = control.io orelse context.io orelse return null;
         const a = workspaceBackingAllocator(session.backend());
         const available = request_pool.limits.host_bytes -| request_pool.snapshot().host_bytes;
@@ -453,10 +456,11 @@ pub const VideoAhead = struct {
         errdefer permit.deinit();
         var guard = try control.enterUninterruptible(session.interruption());
         errdefer guard.deinit();
+        if (plan.commands != 0) context = try factory.videoPreparationContext(session, true);
         const self = try a.create(VideoAhead);
         errdefer a.destroy(self);
         self.* = .{ .allocator = a, .plan = plan, .movie = movie, .cache = cache, .pins = pins, .inspection_scope = inspection_scope, .inspection_allocator = inspection_allocator, .decoder = decoder, .bounded = .{ .backing = a, .limit = runtime_host }, .pool = .{ .limits = .{ .host_bytes = runtime_host, .device_bytes = device, .commands = plan.commands } }, .request_reservation = request_reservation, .permit = permit, .guard = guard };
-        self.producer = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(self.bounded.allocator(), io, context.device, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .cache = cache, .pool = &self.pool, .decoder = decoder, .cache_pins = pins, .inspection_scope = inspection_scope });
+        self.producer = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(self.bounded.allocator(), io, context.device, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .cache = cache, .pool = &self.pool, .decoder = decoder, .cache_pins = pins, .inspection_scope = inspection_scope, .coefficients = context.coefficients });
         return self;
     }
     pub fn matches(self: *const VideoAhead, movie: SampledVideo, decoder: @import("antfly_video").decoding.Options, session: Session, cache: ?*FrameCache) bool {
@@ -781,7 +785,9 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
         if (group.content.len != 1 or group.content[0] != .sampled_video or !ahead.matches(group.content[0].sampled_video, options.video_decoder, session, cache) or ahead.released) return error.InvalidVideoReaderSelection;
     }
     const effective = control orelse Control{};
+    const inspection_started = mediaNow();
     const inspection = try inspectGroup(bounded, session, cfg, group, options, effective);
+    if (options.timings) |timing| timing.inspection_ns += mediaNow() - inspection_started;
     const bounds = inspection.bounds;
     const input_bytes = inspection.input_bytes;
     const has_video = inspection.has_video;
@@ -806,9 +812,13 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     defer if (options.video_ahead == null) {
         if (prefetched) |producer| producer.deinit();
     };
-    if (options.video_ahead) |ahead| prefetched = ahead.producer;
+    if (options.video_ahead) |ahead| {
+        prefetched = ahead.producer;
+        if (prefetched) |producer| options.video_coefficients = producer.coefficients;
+    }
     if (has_video and prefetched == null) {
-        const context = try factory.videoPreparationContext(session);
+        const context = try factory.videoPreparationContext(session, command_slots != 0);
+        options.video_coefficients = context.coefficients;
         if (effective.io orelse context.io) |io| {
             for (group.content) |part| switch (part) {
                 inline .video, .sampled_video => |payload| {
@@ -816,7 +826,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
                     const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
                     const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
                     const selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null;
-                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(a, io, context.device, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &video_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope });
+                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(a, io, context.device, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &video_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
                     break;
                 },
                 else => {},
@@ -860,7 +870,9 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
         try effective.check();
         return .{ .vector = vectors[0], .input_tokens = counts[0] };
     }
+    const media_started = mediaNow();
     var prepared = prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, &video_budget, prefetched, cache) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
+    if (options.timings) |timing| timing.media_prepare_ns += mediaNow() - media_started;
     defer prepared.deinit(a);
     defer if (cb.embedding_stage) |stage| stage.cleanup();
     if (cb.embedding_stage) |stage| {
@@ -896,9 +908,13 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     }
     const input = prepared.tensor orelse try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(prepared.embeddings.?, &.{ @intCast(count), 512 }));
     defer if (prepared.tensor == null) cb.free(input);
+    const encoder_started = mediaNow();
     const output = try encoder.forwardPooledEmbeddingsCT(cb, a, cfg, input, mask, 1, count, options.dimensions);
     defer cb.free(output);
+    if (options.timings) |timing| timing.encoder_ns += mediaNow() - encoder_started;
+    const readback_started = mediaNow();
     const vector = try readNormalizedVector(cb, a, output, options.dimensions);
+    if (options.timings) |timing| timing.pool_readback_ns += mediaNow() - readback_started;
     errdefer a.free(vector);
     try effective.check();
     return .{ .vector = vector, .input_tokens = count };
@@ -980,6 +996,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     var execution_waiter = Scheduler.Waiter{};
     try enterModel(session, lock, control, &execution_waiter);
     defer leaveModel(lock, &execution_waiter);
+    if (session.backend() == .metal) options.video_coefficients = (try factory.videoPreparationContext(session, commands != 0)).coefficients;
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = idle_backend, .cb = &managed.backend, .control = control, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, total + items.len * 128) else null };
@@ -2059,7 +2076,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                 const encoded = if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encodeAllocStaged(a, cb, cb.embedding_stage);
-                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope });
+                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
                 errdefer if (owned) {
@@ -2140,6 +2157,10 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
             },
         }
     }
+    const pack_started = mediaNow();
+    defer if (options.timings) |timing| {
+        timing.pack_ns += mediaNow() - pack_started;
+    };
     var tokens = try tokenizer.encodeForModel(a, rendered.items, options.max_tokens + 1);
     defer tokens.deinit();
     var count: usize = 0;

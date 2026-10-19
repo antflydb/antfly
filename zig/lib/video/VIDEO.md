@@ -993,6 +993,29 @@ decoder nor active conversion scratch. Qualified Metal groups/cohorts use host
 composition bounds instead of charging GPU language/vision activations to host
 memory; unsupported planning policies retain their conservative envelopes.
 
+Preparation completion uses driver notifications. Normal completion wakes the
+consumer immediately; a 10 ms timeout only bounds cancellation/deadline checks.
+Consumers project a ready prefix and keep later submitted jobs pending outside
+the model lane. Error/cancellation cleanup drains pending and queued owners.
+
+A model session may own an independently admitted immutable coefficient cache:
+64 KiB host metadata and at most 16 MiB device storage, with eight LRU entries.
+Resize axes, chroma filters and HDR tone LUTs share storage across request queues.
+Keys include exact geometry and preparation policy and are scoped to the device.
+The cache counts physical buffer allocations, synchronizes publication/lookup,
+and never stores request input, output or command state. Preparers/commands retain
+entries after eviction; their private coefficient allowance covers those pins.
+If cache admission is unavailable, requests retain private preparation. Admission
+pressure disables publication and evicts shared entries before returning device
+credit. Active private pins remain admitted; reactivation requires a new device
+lease. Session close follows worker shutdown and releases the cache before its
+memory lease.
+
+Validated inspection descriptors also retain the packet backing view. Runtime
+handoffs skip repeated packet validation; scoped binding memo keys use immutable
+packet-table identity and cardinality rather than hashing every packet again.
+New scopes still validate content for mutable/unverified providers.
+
 The six immutable preparation PSOs share a synchronized, single-device cache.
 Replacing that bounded entry leaves active preparers' strong references valid.
 Queues, CoreVideo imports, slabs, geometry coefficients and tone LUTs remain

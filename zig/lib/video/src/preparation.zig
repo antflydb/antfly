@@ -23,8 +23,8 @@ extern fn av_preparer_create(*anyopaque, *?*anyopaque) i32;
 extern fn av_preparer_destroy(*anyopaque) void;
 extern fn av_preparer_output_slab(*anyopaque, usize) i32;
 extern fn av_prepared_offset(*anyopaque) usize;
-extern fn av_coefficients_create(*anyopaque, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
-extern fn av_chroma_create(*anyopaque, [*]const chroma_filter.Tap, usize, [*]const chroma_filter.Tap, usize, *?*anyopaque) i32;
+extern fn av_coefficients_create(*anyopaque, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, [*]const u32, *?*anyopaque) i32;
+extern fn av_chroma_create(*anyopaque, [*]const chroma_filter.Tap, usize, [*]const chroma_filter.Tap, usize, [*]const u32, *?*anyopaque) i32;
 extern fn av_chroma_destroy(*anyopaque) void;
 extern fn av_coefficients_destroy(*anyopaque) void;
 extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
@@ -35,11 +35,55 @@ extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, *
 extern fn av_prepared_gpu_seconds(*anyopaque) f64;
 extern fn av_preparer_device_bytes(*anyopaque) u64;
 extern fn av_prepared_poll(*anyopaque) c_int;
+extern fn av_prepared_wait(*anyopaque, u64) c_int;
 extern fn av_prepared_buffer(*anyopaque) *anyopaque;
 extern fn av_prepared_copy(*anyopaque, [*]f32, usize) i32;
 extern fn av_prepared_release_source(*anyopaque) c_int;
-extern fn av_preparer_tone_mask(*anyopaque) u32;
+extern fn av_preparer_tone_mask(*anyopaque, u32) u32;
 extern fn av_prepared_destroy(*anyopaque) void;
+
+extern fn av_preparation_cache_create(*anyopaque, usize, *?*anyopaque) i32;
+extern fn av_preparation_cache_destroy(*anyopaque) void;
+extern fn av_preparation_cache_suspend(*anyopaque) void;
+extern fn av_preparation_cache_resume(*anyopaque, usize) i32;
+extern fn av_preparation_cache_stats(*anyopaque, *[4]u64) void;
+extern fn av_preparation_cache_get(*anyopaque, u32, [*]const u32, usize, *?*anyopaque, *usize) i32;
+extern fn av_preparer_set_cache(*anyopaque, ?*anyopaque) void;
+
+/// Immutable geometry/chroma/LUT storage shared by independent request queues.
+/// The owner admits host_budget and device_budget for its entire lifetime.
+/// Preparers retain entries across replacement; their private coefficient
+/// allowance covers those pins even after the shared LRU evicts an entry.
+pub const CoefficientCache = struct {
+    pub const host_budget = 64 * 1024;
+    pub const device_budget = 16 * 1024 * 1024;
+    handle: *anyopaque,
+    pub fn init(device: *anyopaque, limit: usize) !CoefficientCache {
+        if (!supported) return error.UnsupportedVideoBackend;
+        var handle: ?*anyopaque = null;
+        if (av_preparation_cache_create(device, limit, &handle) != 0) return error.MetalPreparationUnavailable;
+        return .{ .handle = handle.? };
+    }
+    pub fn deinit(self: *CoefficientCache) void {
+        if (supported) av_preparation_cache_destroy(self.handle);
+        self.* = undefined;
+    }
+    /// Stop publication and drop cache ownership before releasing device credit.
+    /// Active preparers continue with independently admitted private pins.
+    pub fn disable(self: *CoefficientCache) void {
+        if (supported) av_preparation_cache_suspend(self.handle);
+    }
+    /// Call only after independently admitting the device budget again.
+    pub fn enable(self: *CoefficientCache, limit: usize) !void {
+        if (!supported) return error.UnsupportedVideoBackend;
+        if (av_preparation_cache_resume(self.handle, limit) != 0) return error.ResourceLimitExceeded;
+    }
+    pub fn statistics(self: *const CoefficientCache) struct { hits: u64, inserts: u64, bytes: u64, entries: u64 } {
+        var result: [4]u64 = @splat(0);
+        if (supported) av_preparation_cache_stats(self.handle, &result);
+        return .{ .hits = result[0], .inserts = result[1], .bytes = result[2], .entries = result[3] };
+    }
+};
 
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
 pub const Matrix = enum(u32) { bt601, bt709, bt2020_ncl, gbr_identity };
@@ -666,6 +710,9 @@ pub const Metal = struct {
         if (av_preparer_create(device, &out) != 0) return error.MetalPreparationUnavailable;
         return .{ .handle = out.? };
     }
+    pub fn useCoefficientCache(self: *Metal, cache: ?*const CoefficientCache) void {
+        if (supported) av_preparer_set_cache(self.handle, if (cache) |owner| owner.handle else null);
+    }
     pub fn deinit(self: *Metal) void {
         if (supported) {
             if (self.coefficients) |resident| av_coefficients_destroy(resident);
@@ -713,12 +760,12 @@ pub const Metal = struct {
         self.coefficient_build_bound = 0;
     }
     fn ensureCoefficients(self: *Metal, allocator: std.mem.Allocator, width: u32, height: u32, g: Geometry, options: Options, control: media.source.Control) !usize {
-        const mask = av_preparer_tone_mask(self.handle);
         const requested: u32 = switch (options.tone_mapping) {
             .none => 0,
             .pq_reinhard_100 => 1,
             .hlg_reinhard_100 => 2,
         };
+        const mask = av_preparer_tone_mask(self.handle, requested);
         const color_bytes = @as(usize, @popCount(mask | requested)) * 16385 * 4;
         if (self.chroma_bytes > self.coefficient_limit) return error.ResourceLimitExceeded;
         if (color_bytes > self.coefficient_limit - self.chroma_bytes) return error.ResourceLimitExceeded;
@@ -731,6 +778,20 @@ pub const Metal = struct {
             if (self.coefficient_bytes > self.coefficient_limit - color_bytes - self.chroma_bytes) return error.ResourceLimitExceeded;
             return color_upload;
         }
+        const build_bound = @max(try Axis.bound(key[0], key[2]), try Axis.bound(key[1], key[3]));
+        if (build_bound > options.max_scratch_bytes / 4) return error.ResourceLimitExceeded;
+        var cached: ?*anyopaque = null;
+        var cached_bytes: usize = 0;
+        if (av_preparation_cache_get(self.handle, 0, &key, key.len, &cached, &cached_bytes) == 1) {
+            errdefer av_coefficients_destroy(cached.?);
+            if (cached_bytes > self.coefficient_limit - color_bytes - self.chroma_bytes) return error.ResourceLimitExceeded;
+            if (self.coefficients) |old| av_coefficients_destroy(old);
+            self.coefficients = cached;
+            self.coefficient_key = key;
+            self.coefficient_bytes = cached_bytes;
+            self.coefficient_build_bound = build_bound;
+            return color_upload;
+        }
         var xaxis = try Axis.init(allocator, key[0], key[2], options.max_scratch_bytes / 4, options.torchvision);
         defer xaxis.deinit();
         var yaxis = try Axis.init(allocator, key[1], key[3], options.max_scratch_bytes / 4, options.torchvision);
@@ -739,7 +800,7 @@ pub const Metal = struct {
         const byte_count = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4;
         if (byte_count > self.coefficient_limit - color_bytes - self.chroma_bytes) return error.ResourceLimitExceeded;
         var resident: ?*anyopaque = null;
-        if (av_coefficients_create(self.handle, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &resident) != 0) return error.MetalPreparationFailed;
+        if (av_coefficients_create(self.handle, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &key, &resident) != 0) return error.MetalPreparationFailed;
         if (self.coefficients) |old| av_coefficients_destroy(old);
         self.coefficients = resident.?;
         self.coefficient_key = key;
@@ -751,13 +812,24 @@ pub const Metal = struct {
         if (options.matrix == .gbr_identity or options.rgb_rounding != .q13_reconstructed or options.tone_mapping != .none or chroma == 0) return 0;
         const key = [3]u32{ width, height, chroma };
         if (self.chroma_coefficients != null and std.mem.eql(u32, &key, &self.chroma_key)) return 0;
+        const color_bytes = @as(usize, @popCount(av_preparer_tone_mask(self.handle, 0))) * 16385 * 4;
+        var cached: ?*anyopaque = null;
+        var cached_bytes: usize = 0;
+        if (av_preparation_cache_get(self.handle, 1, &key, key.len, &cached, &cached_bytes) == 1) {
+            errdefer av_chroma_destroy(cached.?);
+            if (self.coefficient_bytes > self.coefficient_limit or color_bytes > self.coefficient_limit - self.coefficient_bytes or cached_bytes > self.coefficient_limit - self.coefficient_bytes - color_bytes) return error.ResourceLimitExceeded;
+            if (self.chroma_coefficients) |old| av_chroma_destroy(old);
+            self.chroma_coefficients = cached;
+            self.chroma_key = key;
+            self.chroma_bytes = cached_bytes;
+            return 0;
+        }
         var plan = try chroma_filter.Plan.init(a, width, height, chroma, control);
         defer plan.deinit();
         const bytes = plan.bytes();
-        const color_bytes = @as(usize, @popCount(av_preparer_tone_mask(self.handle))) * 16385 * 4;
         if (self.coefficient_bytes > self.coefficient_limit or color_bytes > self.coefficient_limit - self.coefficient_bytes or bytes > self.coefficient_limit - self.coefficient_bytes - color_bytes) return error.ResourceLimitExceeded;
         var resident: ?*anyopaque = null;
-        if (av_chroma_create(self.handle, plan.x.taps.ptr, plan.x.taps.len, plan.y.taps.ptr, plan.y.taps.len, &resident) != 0) return error.MetalPreparationFailed;
+        if (av_chroma_create(self.handle, plan.x.taps.ptr, plan.x.taps.len, plan.y.taps.ptr, plan.y.taps.len, &key, &resident) != 0) return error.MetalPreparationFailed;
         if (self.chroma_coefficients) |old| av_chroma_destroy(old);
         self.chroma_coefficients = resident.?;
         self.chroma_key = key;
@@ -880,14 +952,30 @@ pub const Prepared = struct {
     rgba_staging_bytes: usize = 0,
     native_staging_bytes: usize = 0,
     coefficient_staging_bytes: usize = 0,
+    pub fn isReady(self: *const Prepared) !bool {
+        if (!supported) return error.UnsupportedVideoBackend;
+        return switch (av_prepared_poll(self.handle)) {
+            1 => true,
+            -1 => error.MetalPreparationFailed,
+            else => false,
+        };
+    }
     pub fn wait(self: *const Prepared, io: std.Io, control: media.source.Control) !void {
+        _ = io;
         if (!supported) return error.UnsupportedVideoBackend;
         while (true) {
             try control.check();
-            switch (av_prepared_poll(self.handle)) {
-                1 => return,
+            // Dedicated preparation consumers sleep on driver completion. The
+            // bounded timeout is only for cancellation; normal completion wakes
+            // immediately and already-completed jobs never enter a native wait.
+            if (try self.isReady()) return;
+            switch (av_prepared_wait(self.handle, 10 * std.time.ns_per_ms)) {
+                1 => {
+                    try control.check();
+                    return;
+                },
                 -1 => return error.MetalPreparationFailed,
-                else => try std.Io.sleep(io, .fromMilliseconds(1), .awake),
+                else => {},
             }
         }
     }
