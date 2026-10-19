@@ -3093,3 +3093,12 @@ def test_length_aggregate_moments_scale_with_dag_geometry(graph_db):
     ]
     with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
         db.cypher_json("g", {"query": base + "RETURN sum(length(p))", "limits": limits})
+
+    # Map projection selectors read variables even though their AST stores the
+    # names as selectors rather than variable expressions. These values require
+    # the full length distribution and must survive dead-import pruning.
+    result = db.cypher_json(
+        "g",
+        {"query": base.replace("*1..", "*1..3") + "WITH b,length(p) AS n RETURN sum(b{n}.n)", "limits": limits},
+    )
+    assert result["rows"] == [[{"type": "integer", "value": "228"}]]
