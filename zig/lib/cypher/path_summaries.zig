@@ -36,6 +36,7 @@ const Lower = struct {
     changed: bool = false,
     used: std.StringHashMapUnmanaged(void) = .empty,
     carries: std.ArrayList(Carry) = .empty,
+    scopes: std.ArrayList([]const ast.Clause) = .empty,
     fn privateName(self: *@This()) ![]const u8 {
         while (true) {
             self.next += 1;
@@ -143,10 +144,27 @@ const Lower = struct {
         }
         const result = try self.a.create(ast.Expr);
         result.* = original.*;
-        // Nested query and comprehension scopes own their bindings. Keeping
-        // these expressions intact is a conservative full-value dependency.
-        if (original.value == .exists or original.value == .pattern_comprehension) return original;
         switch (original.value) {
+            .exists => |inner| result.value.exists = (try self.clauses(inner, scope, false)).clauses,
+            .pattern_comprehension => |c| {
+                // Use the same lexical scope rules as MATCH/RETURN. Correlated
+                // sources retain their lineage; locally introduced aliases do
+                // not escape the expression.
+                var local: std.ArrayList(Binding) = .empty;
+                for (scope) |entry| {
+                    if (c.path.alias) |alias| if (std.mem.eql(u8, alias, entry.name)) continue;
+                    try local.append(self.a, entry);
+                }
+                const child = try self.clauses(&.{
+                    .{ .span = original.span, .operation = .{ .match = .{ .paths = &.{c.path}, .predicate = c.predicate } } },
+                    .{ .span = original.span, .operation = .{ .project = .{ .final = true, .value = .{ .items = &.{.{ .expression = c.projection }} } } } },
+                }, local.items, true);
+                result.value.pattern_comprehension = .{
+                    .path = child.clauses[0].operation.match.paths[0],
+                    .predicate = child.clauses[0].operation.match.predicate,
+                    .projection = child.clauses[1].operation.project.value.items[0].expression,
+                };
+            },
             .comprehension => |c| {
                 var local: std.ArrayList(Binding) = .empty;
                 try local.appendSlice(self.a, scope);
@@ -301,6 +319,9 @@ const Lower = struct {
             },
             else => {},
         };
+        // Children are registered first, so their discarded imports disappear
+        // before a parent computes its correlated dependencies.
+        try self.scopes.append(self.a, out);
         return .{ .clauses = out, .scope = scope.items };
     }
 };
@@ -373,5 +394,92 @@ pub fn lower(a: A, query: ast.Query) !ast.Query {
         };
         carry.projection.items = items.items;
     }
+    for (plan.scopes.items) |clauses| {
+        var i = clauses.len;
+        while (i != 0) {
+            i -= 1;
+            // The arrays are owned by this lowering pass. Public final items,
+            // DISTINCT keys and potentially failing expressions remain intact.
+            const clause = @constCast(&clauses[i]);
+            if (clause.operation != .project or clause.operation.project.final) continue;
+            const projection = &clause.operation.project.value;
+            if (projection.distinct) continue;
+            var items: std.ArrayList(ast.Item) = .empty;
+            for (projection.items) |item| {
+                const name = item.alias orelse try plan.expressionName(item.expression);
+                if (!total(item.expression) or references(.{ projection.predicate, projection.order, clauses[i + 1 ..] }, name))
+                    try items.append(a, item);
+            }
+            projection.items = items.items;
+        }
+    }
     return result;
+}
+fn total(expression: *const ast.Expr) bool {
+    return switch (expression.value) {
+        .literal, .variable => true,
+        .list => |items| blk: {
+            for (items) |item| if (!total(item)) break :blk false;
+            break :blk true;
+        },
+        .map => |items| blk: {
+            for (items) |item| if (!total(item.value)) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+/// Execution metadata is a demand, not a binding declaration. Recompute it
+/// after dead projections and downstream column selection have been removed.
+/// Private names are collision-free across all lexical scopes.
+pub fn references(value: anytype, name: []const u8) bool {
+    const T = @TypeOf(value);
+    // MATCH aliases can constrain an existing binding even without a variable
+    // expression. Keeping them is essential when pruning WITH imports.
+    if (T == ast.Path or T == ast.Node or T == ast.Edge) {
+        if (value.alias) |alias| if (std.mem.eql(u8, alias, name)) return true;
+    }
+    if (T == ast.Expr) if (value.value == .variable) return std.mem.eql(u8, value.value.variable, name);
+    if (T == ast.MapSelector) if (value == .variable) return std.mem.eql(u8, value.variable, name);
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size == .one and p.child == ast.Expr) return references(value.*, name);
+            if (p.size == .slice and p.child != u8) for (value) |child| {
+                if (references(child, name)) return true;
+            };
+        },
+        .@"struct" => |info| inline for (info.field_names) |field_name| {
+            if (references(@field(value, field_name), name)) return true;
+        },
+        .@"union" => switch (value) {
+            inline else => |child| return references(child, name),
+        },
+        .optional => if (value) |child| return references(child, name),
+        else => {},
+    }
+    return false;
+}
+pub fn prune(a: A, original: ast.Path, consumers: anytype) !ast.Path {
+    var path = original;
+    inline for (@typeInfo(ast.PathSummary).@"struct".field_names) |field| {
+        if (@field(path.execution_summary, field)) |name| {
+            if (!references(consumers, name)) @field(path.execution_summary, field) = null;
+        }
+    }
+    var changed = false;
+    for (path.edges) |edge| if (edge.execution_length) |name| {
+        if (!references(consumers, name)) {
+            changed = true;
+            break;
+        }
+    };
+    if (changed) {
+        const edges = try a.dupe(ast.Edge, path.edges);
+        for (edges) |*edge| if (edge.execution_length) |name| {
+            if (!references(consumers, name)) edge.execution_length = null;
+        };
+        path.edges = edges;
+    }
+    return path;
 }

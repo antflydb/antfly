@@ -1995,9 +1995,8 @@ def test_sibling_branch_counts_do_not_enumerate_assignments(graph_db):
     assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
 
 
-def populate_layered_graph(db):
+def populate_layered_graph(db, layers=68):
     db.sql("CREATE INDEX docs_id ON docs(id)")
-    layers = 68
     patterns = ["(s:D {id:'start',score:0})"] + [
         f"(v{i}_{j}:D {{score:{i + 1}}})" for i in range(layers) for j in range(2)
     ]
@@ -3015,3 +3014,82 @@ def test_path_summaries_keep_route_multiplicity_compressed(graph_db):
             f"SELECT {aggregate} FROM GRAPH_TABLE(g MATCH p=(s IS D)-[rs IS R*32]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS hops)) q"
         )
         assert result["rows"] == [[expected]]
+
+
+def test_nested_path_summary_scopes_preserve_compressed_routes(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    base = "MATCH p=(s:D {id:'start'})-[:R*32..32]->(b:D) "
+    cases = (
+        (base + "WHERE EXISTS { WITH p WHERE length(p)=32 RETURN 1 } RETURN count(*)", [[str(2**32)]]),
+        (base + "WHERE EXISTS { WITH p AS q WHERE length(q)=33 RETURN 1 } RETURN count(*)", [["0"]]),
+        ("RETURN EXISTS { " + base + "WHERE length(p)=33 RETURN b }", [[False]]),
+        (
+            base + "RETURN sum(CASE WHEN EXISTS { WITH p WHERE length(p)=32 RETURN 1 } THEN 1 ELSE 0 END)",
+            [[str(2**32)]],
+        ),
+        ("RETURN size([p=(s:D {id:'start'})-[:R*32..32]->(b:D) WHERE length(p)=32 | length(p)])", [[str(2**32)]]),
+    )
+    for query, expected in cases:
+        result = db.cypher_json("g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 20000}})
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected
+
+
+def test_dead_path_demands_do_not_retain_histograms_or_routes(graph_db):
+    db = graph_db
+    populate_layered_graph(db, layers=32)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[rs:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 5000}
+    control = db.cypher_json("g", {"query": base + "WITH b RETURN count(*)", "limits": limits})
+    for discarded in ("length(p)", "size(rs)", "[p]", "{route:p}"):
+        result = db.cypher_json(
+            "g", {"query": base + f"WITH b,{discarded} AS unused RETURN count(*)", "limits": limits}
+        )
+        assert result["rows"] == control["rows"]
+    for discarded in ("[1/0]", "{error:1/0}"):
+        with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+            db.cypher_json("g", {"query": base + f"WITH b,{discarded} AS unused RETURN count(*)"})
+    # SQL's field negotiation must also discard summary dimensions that the
+    # outer consumer does not read.
+    assert db.sql(
+        "SELECT count(*) FROM GRAPH_TABLE(g MATCH p=(s IS D)-[rs IS R*]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS hops)) q"
+    )["rows"] == [["115469419894100"]]
+
+
+def test_length_aggregate_moments_scale_with_dag_geometry(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 12000}
+    counts, sums = [1, 2], [0, 2]
+    for _ in range(2, 69):
+        sums.append(2 * (sums[-1] + counts[-1]) + 2 * (sums[-2] + counts[-2]))
+        counts.append(2 * counts[-1] + 2 * counts[-2])
+    average = sum(sums[1:]) / sum(counts[1:])
+    result = db.cypher_json(
+        "g", {"query": base + "RETURN min(length(p)),max(length(p)),avg(length(p))", "limits": limits}
+    )
+    assert [cell["value"] for cell in result["rows"][0]] == ["1", "68", pytest.approx(average, rel=1e-13)]
+    result = db.cypher_json(
+        "g",
+        {
+            "query": base + "WITH b,length(p) AS n RETURN b.score,min(n),max(n),avg(n) ORDER BY b.score",
+            "limits": limits,
+        },
+    )
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [
+        [str(i), str((i + 1) // 2), str(i), pytest.approx(sums[i] / counts[i], rel=1e-13)] for i in range(1, 69)
+    ]
+    result = db.cypher_json(
+        "g",
+        {"query": base + "WHERE b.score<=32 RETURN count(length(p)),sum(length(p)),avg(length(p))", "limits": limits},
+    )
+    assert [cell["value"] for cell in result["rows"][0]] == [
+        str(sum(counts[1:33])),
+        str(sum(sums[1:33])),
+        pytest.approx(sum(sums[1:33]) / sum(counts[1:33]), rel=1e-13),
+    ]
+    with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
+        db.cypher_json("g", {"query": base + "RETURN sum(length(p))", "limits": limits})

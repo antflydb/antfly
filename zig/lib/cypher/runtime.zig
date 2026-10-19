@@ -24,6 +24,7 @@ const Budget = @import("budget.zig");
 const value_work = @import("value_work.zig");
 const A = std.mem.Allocator;
 const Count = @import("multiplicity.zig").Count;
+const path_summaries = @import("path_summaries.zig");
 pub const Row = []const v.Entry;
 pub const max_response_bytes: usize = 32 << 20;
 pub const Limits = struct { memory_bytes: usize = 64 << 20, scanned_anchors: usize = 1_000_000, explored_edges: usize = 1_000_000, intermediate_states: usize = 1_000_000, path_depth: usize = 1024, recursion_depth: usize = 64 };
@@ -154,7 +155,8 @@ pub const NodeCursor = struct {
         }
         projection.items = items.items;
         try self.engine.state();
-        const planned = try self.engine.reductionPath(path, &.{}, operation, projection, &.{});
+        const demanded = try path_summaries.prune(self.engine.a, path, .{ projection, operation.predicate });
+        const planned = try self.engine.reductionPath(demanded, &.{}, operation, projection, &.{});
         if (!try self.engine.batchEligible(planned, &.{}, operation, projection, &.{})) return null;
         return .{ .path = planned, .projection = projection, .multiplicity = multiplicity };
     }
@@ -1177,6 +1179,33 @@ const Engine = struct {
                 self.best = try value.clone(self.arena.allocator());
             }
         }
+        fn addMoments(self: *StreamingAggregate, engine: *Engine, kind: MomentCall, moments: PathMoments, weight: Count) !void {
+            if (kind == .sum) {
+                // Lengths are nonnegative: the exact moment certifies both
+                // final and intermediate signed overflow without regrouping.
+                const prior = self.sum.integer;
+                const contribution = try moments.sum.multiply(engine.a, engine.stream_fold.?.moment_factor);
+                const value = contribution.exact() orelse return error.CypherNumericOverflow;
+                self.sum = .{ .integer = std.math.cast(i64, @as(i128, prior) + value) orelse return error.CypherNumericOverflow };
+                return;
+            }
+            const value: v.Value = switch (kind) {
+                .min => .{ .integer = @intCast(moments.min) },
+                .max => .{ .integer = @intCast(moments.max) },
+                .count => .{ .integer = 0 },
+                .avg => .{ .number = if (moments.sum.cap(1) == 0) 0 else @floatCast(moments.sum.scaled().ratio(moments.count.scaled())) },
+                .sum => unreachable,
+            };
+            const literal: ast.Expr = .{ .span = .{}, .value = .{ .literal = switch (value) {
+                .integer => |n| .{ .integer = n },
+                .number => |n| .{ .number = n },
+                else => unreachable,
+            } } };
+            const saved = self.function;
+            self.function.args = &.{&literal};
+            defer self.function = saved;
+            return self.addWeighted(engine, &.{}, weight);
+        }
         fn result(self: StreamingAggregate) v.Value {
             if (std.ascii.eqlIgnoreCase(self.function.name, "count")) return .{ .integer = @intCast(self.count) };
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) return self.sum;
@@ -1303,6 +1332,9 @@ const Engine = struct {
         probe_tail: bool = true,
         weight: Count = Count.one,
         active_calls: ?[]const bool = null,
+        moment_calls: ?[]const ?MomentCall = null,
+        moments: ?PathMoments = null,
+        moment_factor: Count = Count.one,
         record_rows: bool = true,
         continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null, returned: ?*bool = null, capture: ?*StreamCapture = null, admission: bool = false } = null,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
@@ -1479,6 +1511,12 @@ const Engine = struct {
             }
             for (fold.groups.items[found.?].states, 0..) |*accumulator, i| {
                 if (fold.active_calls) |active| if (!active[i]) continue;
+                if (fold.moments) |moments| {
+                    if (fold.moment_calls.?[i]) |kind| {
+                        try accumulator.addMoments(engine, kind, moments, fold.weight);
+                        continue;
+                    }
+                }
                 try accumulator.addWeighted(engine, row, fold.weight);
             }
             if (fold.distinct_goal) |goal| if (fold.groups.items.len >= goal) return error.CypherStreamComplete;
@@ -1833,6 +1871,14 @@ const Engine = struct {
     fn discardable(expression: *const ast.Expr, node_shape: Row) bool {
         return switch (expression.value) {
             .literal, .variable => true,
+            .list => |items| blk: {
+                for (items) |item| if (!discardable(item, node_shape)) break :blk false;
+                break :blk true;
+            },
+            .map => |items| blk: {
+                for (items) |item| if (!discardable(item.value, node_shape)) break :blk false;
+                break :blk true;
+            },
             .property => |p| p.base.value == .variable and blk: {
                 const node = lookup(node_shape, p.base.value.variable) orelse break :blk false;
                 break :blk node.boolean;
@@ -4167,7 +4213,15 @@ const Engine = struct {
     fn countAllPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, start: *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
         return self.countAllPaths(input, path, mode, &.{start}, output);
     }
-    fn countAllPaths(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, starts: []const *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
+    fn countAllPaths(self: *Engine, input: MatchState, original_path: ast.Path, mode: ast.PathMode, starts: []const *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
+        const path = if (self.stream_fold) |fold| try path_summaries.prune(self.a, original_path, .{ fold.middle, fold.projection, self.stream_predicate }) else original_path;
+        if (try self.momentCalls(path)) |calls| {
+            const fold = self.stream_fold.?;
+            const saved = fold.moment_calls;
+            fold.moment_calls = calls;
+            defer fold.moment_calls = saved;
+            return self.countAllPathsTyped(PathMoments, input, path, mode, starts, output);
+        }
         // Native and SQL exact consumers keep arbitrary-precision counts.
         // Bounded and presence consumers retain the compact u64 DP.
         if (if (self.weighted_sink) |sink| sink.multiplicity == .exact else self.exactPathWeights())
@@ -4185,17 +4239,114 @@ const Engine = struct {
         }
         return false;
     }
+    const MomentCall = enum { count, sum, avg, min, max };
+    /// A path bag's sufficient statistics form an additive/product algebra.
+    /// Advancing an edge adds the count to the first moment. Union merges
+    /// counts/moments and extrema without retaining a length histogram.
+    const PathMoments = struct {
+        count: Count,
+        sum: Count = Count.init(0),
+        min: usize = 0,
+        max: usize = 0,
+        fn init(amount: Count) @This() {
+            return .{ .count = amount };
+        }
+        fn add(left: @This(), a: A, right: @This()) !@This() {
+            if (left.count.cap(1) == 0) return right;
+            if (right.count.cap(1) == 0) return left;
+            return .{ .count = try left.count.add(a, right.count), .sum = try left.sum.add(a, right.sum), .min = @min(left.min, right.min), .max = @max(left.max, right.max) };
+        }
+        fn multiply(left: @This(), a: A, right: @This()) !@This() {
+            return .{ .count = try left.count.multiply(a, right.count), .sum = try (try left.sum.multiply(a, right.count)).add(a, try right.sum.multiply(a, left.count)), .min = left.min + right.min, .max = left.max + right.max };
+        }
+        fn advance(self: @This(), a: A) !@This() {
+            return .{ .count = self.count, .sum = try self.sum.add(a, self.count), .min = self.min + 1, .max = self.max + 1 };
+        }
+    };
+    fn referencesAny(value: anytype, names: Names) bool {
+        var keys = names.keyIterator();
+        while (keys.next()) |key| if (path_summaries.references(value, key.*)) return true;
+        return false;
+    }
+    fn momentKind(aggregate_function: ast.Function, names: Names) ?MomentCall {
+        if (aggregate_function.args.len != 1 or aggregate_function.args[0].value != .variable or !names.contains(aggregate_function.args[0].value.variable)) return null;
+        inline for (@typeInfo(MomentCall).@"enum".field_names) |name| {
+            if (std.ascii.eqlIgnoreCase(aggregate_function.name, name) and (!aggregate_function.distinct or std.mem.eql(u8, name, "min") or std.mem.eql(u8, name, "max"))) return @field(MomentCall, name);
+        }
+        return null;
+    }
+    fn momentSafe(value: anytype, names: Names) bool {
+        const T = @TypeOf(value);
+        if (T == ast.MapSelector) if (value == .variable) return !names.contains(value.variable);
+        if (T == ast.Expr) {
+            if (value.value == .variable) return !names.contains(value.value.variable);
+            if (value.value == .call and momentKind(value.value.call, names) != null) return true;
+        }
+        switch (@typeInfo(T)) {
+            .pointer => |p| {
+                if (p.size == .one and p.child == ast.Expr) return momentSafe(value.*, names);
+                if (p.size == .slice and p.child != u8) for (value) |child| {
+                    if (!momentSafe(child, names)) return false;
+                };
+            },
+            .@"struct" => |info| inline for (info.field_names) |name| {
+                if (!momentSafe(@field(value, name), names)) return false;
+            },
+            .@"union" => switch (value) {
+                inline else => |child| return momentSafe(child, names),
+            },
+            .optional => if (value) |child| return momentSafe(child, names),
+            else => {},
+        }
+        return true;
+    }
+    fn momentCalls(self: *Engine, path: ast.Path) !?[]const ?MomentCall {
+        const length = path.execution_summary.length orelse return null;
+        if (self.weighted_sink != null or self.component_leaves.len != 0) return null;
+        const fold = self.stream_fold orelse return null;
+        if (fold.continuation != null or fold.calls.len == 0) return null;
+        for (path.edges) |edge| if (edge.execution_length != null) return null;
+        var names: Names = .empty;
+        try names.put(self.a, length, {});
+        if (referencesAny(self.stream_predicate, names)) return null;
+        for (fold.middle) |clause| {
+            if (clause.operation != .project) return null;
+            const projection = clause.operation.project.value;
+            if (projection.distinct or projection.skip != null or projection.limit != null) return null;
+            var next: Names = if (projection.wildcard) try names.clone(self.a) else .empty;
+            for (projection.items) |item| {
+                if (item.expression.value == .variable and names.contains(item.expression.value.variable)) {
+                    try next.put(self.a, item.alias orelse item.expression.value.variable, {});
+                } else if (referencesAny(item.expression, names)) return null;
+            }
+            if (referencesAny(.{ projection.predicate, projection.order }, names) or referencesAny(.{ projection.predicate, projection.order }, next)) return null;
+            names = next;
+        }
+        if (!momentSafe(fold.projection, names)) return null;
+        const calls = try self.a.alloc(?MomentCall, fold.calls.len);
+        for (fold.calls, calls) |expression, *kind| kind.* = momentKind(expression.value.call, names);
+        return calls;
+    }
+    fn waysCount(value: anytype) Count {
+        return if (@TypeOf(value) == PathMoments) value.count else if (@TypeOf(value) == Count) value else Count.init(value);
+    }
+    fn waysFromCount(comptime W: type, value: Count) W {
+        return if (W == PathMoments) PathMoments.init(value) else if (W == Count) value else waysCap(value);
+    }
+    fn advanceWays(self: *Engine, value: anytype) !@TypeOf(value) {
+        return if (@TypeOf(value) == PathMoments) value.advance(self.a) else value;
+    }
     fn waysInit(comptime W: type, value: u64) W {
-        return if (W == Count) Count.init(value) else value;
+        return waysFromCount(W, Count.init(value));
     }
     fn waysCap(value: anytype) u64 {
-        return if (@TypeOf(value) == Count) value.cap(std.math.maxInt(u64)) else value;
+        return waysCount(value).cap(std.math.maxInt(u64));
     }
     fn waysAdd(self: *Engine, left: anytype, right: @TypeOf(left)) !@TypeOf(left) {
-        return if (@TypeOf(left) == Count) left.add(self.a, right) else mergePathWays(left, right);
+        return if (@TypeOf(left) == Count or @TypeOf(left) == PathMoments) left.add(self.a, right) else mergePathWays(left, right);
     }
     fn waysMultiply(self: *Engine, left: anytype, right: @TypeOf(left)) !@TypeOf(left) {
-        return if (@TypeOf(left) == Count) left.multiply(self.a, right) else multiplyPathWays(left, right);
+        return if (@TypeOf(left) == Count or @TypeOf(left) == PathMoments) left.multiply(self.a, right) else multiplyPathWays(left, right);
     }
     fn countAllPathsTyped(self: *Engine, comptime W: type, input: MatchState, path: ast.Path, mode: ast.PathMode, starts: []const *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
         if (starts.len != 1 and (if (path.execution_reversed) path.execution_summary.last != null else path.execution_summary.first != null)) return false;
@@ -4259,9 +4410,9 @@ const Engine = struct {
             }
         }
         var products: SummaryProducts = .{};
-        if (path.execution_summary.length != null or for (path.edges) |edge| {
+        if (W != PathMoments and (path.execution_summary.length != null or for (path.edges) |edge| {
             if (edge.execution_length != null) break true;
-        } else false) graph.products = &products;
+        } else false)) graph.products = &products;
         const Counts = std.AutoHashMapUnmanaged(usize, W);
         var current: Counts = .empty;
         var next: Counts = .empty;
@@ -4373,7 +4524,7 @@ const Engine = struct {
                         try self.state();
                         if (!try self.constantProperties(.{ .relationship = arc.relationship }, edge.properties, input.row)) continue;
                         arc.eligible = true;
-                        reached[arc.target] = try self.waysAdd(reached[arc.target], ways);
+                        reached[arc.target] = try self.waysAdd(reached[arc.target], try self.advanceWays(ways));
                     };
                 }
                 std.mem.swap(Counts, &current, &endpoints);
@@ -4470,14 +4621,24 @@ const Engine = struct {
                     try sink.emit(sink.ptr, row, switch (sink.multiplicity) {
                         .presence => Count.one,
                         .capped => Count.init(@min(waysCap(ways), @as(u64, std.math.maxInt(i64)) + 1)),
-                        .exact => if (W == Count) ways else Count.init(ways),
+                        .exact => waysCount(ways),
                     });
                     continue;
                 }
                 const fold = self.stream_fold.?;
                 const previous_weight = fold.weight;
-                fold.weight = if (self.match_weight_demand == .presence) Count.one else try previous_weight.multiply(fold.retained, if (W == Count) ways else Count.init(ways));
+                fold.weight = if (self.match_weight_demand == .presence) Count.one else try previous_weight.multiply(fold.retained, waysCount(ways));
                 defer fold.weight = previous_weight;
+                const saved_moments = fold.moments;
+                const saved_factor = fold.moment_factor;
+                if (W == PathMoments) {
+                    fold.moments = ways;
+                    fold.moment_factor = previous_weight;
+                }
+                defer {
+                    fold.moments = saved_moments;
+                    fold.moment_factor = saved_factor;
+                }
                 try fold.add(self, row);
             }
         }
@@ -4559,9 +4720,9 @@ const Engine = struct {
         else
             0;
         const factor_key: BranchFactorKey = .{ .branch = key, .excluded = excluded_mask };
-        if (graph.branch_factors.get(factor_key)) |ways| return if (W == Count) ways else waysCap(ways);
+        if (graph.branch_factors.get(factor_key)) |ways| return waysFromCount(W, ways);
         const ways = try self.branchAssignmentsTyped(W, cached.sets, excluded_mask, mode == .repeatable);
-        try graph.branch_factors.put(self.a, factor_key, if (W == Count) ways else Count.init(ways));
+        try graph.branch_factors.put(self.a, factor_key, waysCount(ways));
         return ways;
     }
     fn branchAssignments(self: *Engine, choices: []const []const *const v.Relationship, excluded_mask: u16, repeatable: bool) anyerror!u64 {
@@ -4663,7 +4824,7 @@ const Engine = struct {
                         !try self.constantProperties(.{ .node = reached }, pattern.properties, graph.input.row)) continue;
                 }
                 const entry = try next.getOrPut(self.a, try graph.movedKey(self, candidate.key_ptr.*, arc.target));
-                const weight = if (source) |pivot| try self.waysMultiply(ways, try self.branchWays(W, graph, index, pivot, relationship, graph.mode)) else ways;
+                const weight = try self.advanceWays(if (source) |pivot| try self.waysMultiply(ways, try self.branchWays(W, graph, index, pivot, relationship, graph.mode)) else ways);
                 entry.value_ptr.* = try self.waysAdd(if (entry.found_existing) entry.value_ptr.* else waysInit(W, 0), weight);
             }
         }
@@ -5048,7 +5209,8 @@ const Engine = struct {
         for (path.nodes) |node| for (node.properties) |entry| if (self.constant(entry.value, input.row) == null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
         var arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
         defer arena.deinit();
-        var pruner: RoutePruner = .{ .fold = probe.fold, .a = arena.allocator(), .path = path, .predicate = self.stream_predicate, .row = input.row, .graph = .{ .input = .{ .row = input.row }, .path = path, .qualified = true, .mode = mode }, .start = start, .needs_bound = needs_bound };
+        const demanded = try path_summaries.prune(arena.allocator(), path, .{ probe.fold.middle, probe.fold.projection, self.stream_predicate });
+        var pruner: RoutePruner = .{ .fold = probe.fold, .a = arena.allocator(), .path = demanded, .predicate = self.stream_predicate, .row = input.row, .graph = .{ .input = .{ .row = input.row }, .path = demanded, .qualified = true, .mode = mode }, .start = start, .needs_bound = needs_bound };
         const previous_pruner = self.route_pruner;
         const previous_graph = self.lower_graph;
         self.route_pruner = &pruner;

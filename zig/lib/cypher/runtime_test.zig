@@ -2216,6 +2216,14 @@ test "endpoint pipeline bags and aggregate partitions agree with ordered route e
         }
     };
     for ([_]bool{ false, true }) |acyclic| for ([_][]const u8{ "", "REPEATABLE ELEMENTS " }) |mode| for ([_][]const u8{
+        "RETURN count(length(p)),sum(length(p)),avg(length(p)),min(length(p)),max(length(p))",
+        "RETURN b.rank,min(length(p)),max(length(p)),sum(length(p)),avg(length(p)) ORDER BY b.rank",
+        "WITH b,length(p) AS n RETURN b.rank,min(n),max(n),sum(n),avg(n) ORDER BY b.rank",
+        "WITH b,length(p) AS n RETURN b{n},min(n) ORDER BY b{n}",
+        "RETURN sum(length(p))+sum(b.rank),min(DISTINCT length(p)),max(DISTINCT length(p))",
+        "RETURN sum(DISTINCT length(p)),avg(DISTINCT length(p)),count(DISTINCT length(p))",
+        "WHERE length(p)>1 RETURN sum(length(p)),min(length(p))",
+        "WITH length(p) AS n RETURN n,count(*) ORDER BY n",
         "WITH b RETURN count(*),sum(b.rank),avg(b.rank)",
         "WITH b.rank AS score RETURN count(*),sum(score),avg(score)",
         "WITH b AS a WITH a.rank AS b WHERE b>=2 RETURN count(*),sum(b)",
@@ -2713,4 +2721,81 @@ test "private path summary bindings never enter wildcard result schemas" {
         try std.testing.expectEqual(@as(usize, 1), row[0].path.relationships.len);
         try std.testing.expectEqual(@as(i64, 1), row[1].integer);
     }
+}
+
+test "nested summary scopes preserve imports shadowing optional nulls and full paths" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN EXISTS { WITH p AS q WHERE length(q)=1 RETURN q },length(p)", "[[true,1],[true,1]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN EXISTS { WITH null AS p RETURN length(p) },length(p)", "[[true,1],[true,1]]");
+    try check("OPTIONAL MATCH p=(a:Document {id:'absent'})-[:CITES]->(b) RETURN EXISTS { WITH p WHERE length(p)=0 RETURN 1 },length(p)", "[[false,null]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN [p=(b)-[:CITES]->(c) | length(p)],length(p)", "[[[1,1],1],[[1,1],1]]");
+    try check("RETURN size([p=(a:Document {id:'a'})-[:CITES]->(b) | length(p)])", "[[2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) WITH p MATCH p=(x)-[:CITES*2..2]->(y) RETURN count(p)", "[[0]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) WITH p OPTIONAL MATCH p=(x)-[:CITES*2..2]->(y) RETURN count(p)", "[[2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN size([(b)-[:CITES]->(c) | length(p)]),length(p)", "[[2,1],[2,1]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH b,length(p) AS n RETURN b{n},count(*) ORDER BY b{n}", "[[{\"n\":0},1],[{\"n\":1},2]]");
+}
+
+test "path moments agree with independently enumerated observable paths" {
+    const Dag = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |edge| if (!std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
+            return .{ .items = out.items };
+        }
+    };
+    for ([_]bool{ false, true }) |acyclic| for ([_][]const u8{ "", "REPEATABLE ELEMENTS ", "DIFFERENT RELATIONSHIPS " }) |mode| for ([_][]const u8{
+        "(a:Document)-[:CITES*0..3]->(b)",
+        "(a:Document {id:'a'})-[:CITES*1..3]->(b)",
+        "(a:Document {id:'a'})-[:CITES*0..2]->()-[:CITES*0..2]->(b)",
+    }) |pattern| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        if (acyclic) callbacks.expand = Dag.expand;
+        const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
+        var diagnostic: c.Diagnostic = .{};
+        const prefix = try std.fmt.allocPrint(a, "MATCH {s}p={s} ", .{ mode, pattern });
+        var reference = try c.compile(a, try std.fmt.allocPrint(a, "{s}RETURN p", .{prefix}), .{}, &diagnostic);
+        defer reference.deinit();
+        var paths = try runtime.execute(a, backend, graph, &reference, &.{}, .{});
+        defer paths.deinit();
+        var sum: usize = 0;
+        var minimum: usize = std.math.maxInt(usize);
+        var maximum: usize = 0;
+        for (paths.rows) |row| {
+            const length = row[0].path.relationships.len;
+            sum += length;
+            minimum = @min(minimum, length);
+            maximum = @max(maximum, length);
+        }
+        var compiled = try c.compile(a, try std.fmt.allocPrint(a, "{s}RETURN count(length(p)),sum(length(p)),min(length(p)),max(length(p)),avg(length(p))", .{prefix}), .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(paths.rows.len)), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, @intCast(sum)), result.rows[0][1].integer);
+        try std.testing.expectEqual(@as(i64, @intCast(minimum)), result.rows[0][2].integer);
+        try std.testing.expectEqual(@as(i64, @intCast(maximum)), result.rows[0][3].integer);
+        try std.testing.expectApproxEqAbs(@as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(paths.rows.len)), result.rows[0][4].number, 1e-12);
+    };
+}
+
+test "nested summary and moment plans release every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, nested: bool) !void {
+            var fixed: FixedAllocation = .{ .backing = backing };
+            const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, if (nested) "MATCH p=(a:Document {id:'a'})-[:MENTIONS*0..1]->(b) WHERE EXISTS { WITH p WHERE length(p)>=0 RETURN 1 } RETURN min(length(p)),max(length(p)),sum(length(p)),avg(length(p))" else "MATCH p=(a:Document {id:'a'})-[:MENTIONS*0..1]->(b) RETURN min(length(p)),max(length(p)),sum(length(p)),avg(length(p))", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        }
+    };
+    inline for (.{ false, true }) |nested| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{nested});
 }

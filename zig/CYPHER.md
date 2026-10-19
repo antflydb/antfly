@@ -1595,7 +1595,7 @@ and relationship cardinality, segment-list sizes and certified first/last node
 accessors use execution-only bindings. WITH aliases carry these bindings, while
 public wildcard projections expand from their original visible scope. Private
 names cannot collide with user names. Full path values, DISTINCT path identity,
-shadowed lexical variables and unsupported nested expressions retain their
+shadowed lexical variables and other unsupported expressions retain their
 ordinary semantics and full-value dependencies.
 When lengths are observable, traversal products retain total hop counts and
 interned observed segment lengths alongside graph identity. Geometry captures
@@ -1606,6 +1606,25 @@ DFS order. Proved shortest-path frontiers can fold endpoint/length bags without
 expanding their equivalent route histories; saturated or unproved histories
 retain ordinary execution. These bindings also participate in OPTIONAL null
 extension, profiling scope, quota accounting and allocation-failure cleanup.
+
+Summary lowering follows correlated EXISTS imports and pattern-comprehension
+scopes, including local path shadowing. Total unused imports and projections are
+removed before outer dependency analysis. After projection pruning and SQL
+column negotiation, execution recomputes private summary demands; discarded hop
+slots cannot keep a length product alive or disable a topological reduction.
+
+Direct COUNT/SUM/AVG/MIN/MAX of a total path length use a bag algebra of exact
+counts, first moments and extrema. Every edge increments the moment by its bag
+count; union adds counts and moments and merges extrema. Proven DAG tails fold
+in topological order, including bounded ranges whose complete closure fits the
+bound. Native grouped reducers and direct WITH aliases consume these summaries
+without expanding length histograms. Signed SUM overflow remains exact because
+hop lengths are nonnegative, and promoted AVG counts use scaled ratios. Length
+predicates, grouping keys, non-extremum DISTINCT arguments, per-segment length
+observations and other distribution-dependent expressions retain exact hop
+states. Cyclic trail histories retain ordinary enumeration when uniqueness
+cannot be proved; repeatable bounded walks retain the finite hop recurrence.
+
 Intermediate ordered projections negotiate a weighted stage plan. DISTINCT
 collapses bindings before sorting and handing the ordered bag to downstream
 stages, without materializing the route multiplicity or removing observable
@@ -1714,6 +1733,7 @@ combines weighted means. Saturated path counts cannot serve as approximate
 numeric weights: exact SUM/AVG producers promote their counts instead of using
 an overflow sentinel or enumerating repeated routes. Expressions depending on intermediate entities, paths or
 unsupported consumers retain exact route production. The optimizer never substitutes shortest-path semantics for ALL.
+
 
 SQL pull cursors retain the selective interior anchor, traverse a reversed prefix,
 restore source path order and resume the suffix with shared uniqueness and deferred
