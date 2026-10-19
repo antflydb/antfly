@@ -168,6 +168,9 @@ cannot silently bypass the new validation entrypoint. Kernel owner ABI 78 adds
 fixed visibility targets: each bounded wait releases its owner lease before
 retrying, preserving the original replay sequence, timeout, and physical root.
 Catalog transitions can therefore proceed while derived work is pending.
+Ordered transaction apply commits primary resolution and durable replay debt
+without awaiting derived publication. The request coordinator waits for visibility
+after apply, keeping the Raft progress loop available to publish that work.
 Graph endpoint cleanup also runs in bounded background jobs so its Raft apply
 wait cannot block the control driver. Required-format proposals join protocol
 activation within their deadline rather than interpreting a concurrent probe
