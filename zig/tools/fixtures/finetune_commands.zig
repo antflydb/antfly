@@ -22,22 +22,43 @@ pub fn build(b: *std.Build) void {
     _ = project.create(b);
     _ = b.step("cache-finetune-registry", "Check command compilation coverage without rebuilding commands");
     const tests = b.top_level_steps.get("inference-finetune-test").?;
+    const test_specs = @import("pkg/inference/build/finetune/tests.zig").specs;
+    var isolated_runs: [test_specs.len]usize = undefined;
+    @memset(&isolated_runs, 0);
     var test_runs: usize = 0;
     for (tests.step.dependencies.items) |dependency| {
         const run = dependency.cast(std.Build.Step.Run) orelse continue;
         for (run.argv.items) |arg| {
             if (arg != .artifact) continue;
             const artifact = arg.artifact.artifact;
-            if (artifact.kind != .@"test" or !std.mem.eql(u8, artifact.name, "finetune-tests"))
-                @panic("unexpected finetune test executable");
-            test_runs += 1;
+            if (artifact.kind != .@"test") @panic("unexpected finetune test executable");
+            if (std.mem.eql(u8, artifact.name, "finetune-tests")) {
+                test_runs += 1;
+            } else {
+                const source = sourcePath(b, artifact.root_module.root_source_file.?);
+                var found = false;
+                for (test_specs, 0..) |spec, index| {
+                    if (!spec.isolated) continue;
+                    const expected = sourcePath(b, b.path(b.fmt("pkg/inference/{s}", .{spec.root_source_file})));
+                    if (std.mem.eql(u8, source, expected)) {
+                        isolated_runs[index] += 1;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) @panic("unexpected finetune test executable");
+            }
         }
     }
     if (test_runs != 1) @panic("finetune gate must execute one shared test artifact once");
+    for (test_specs, 0..) |spec, index| {
+        if (spec.isolated and isolated_runs[index] != 1)
+            @panic("isolated finetune root must execute exactly once");
+    }
     const test_root = @embedFile("pkg/inference/src/finetune_test_root.zig");
     var root_count: usize = 0;
     for (@import("pkg/inference/build/finetune/tests.zig").specs) |spec| {
-        if (spec.covered_by_inference) continue;
+        if (spec.covered_by_inference or spec.isolated) continue;
         const import = b.fmt("@import(\"{s}\")", .{spec.root_source_file["src/".len..]});
         if (std.mem.count(u8, test_root, import) != 1)
             std.debug.panic("shared finetune root must import {s} exactly once", .{spec.root_source_file});
@@ -71,6 +92,8 @@ pub fn build(b: *std.Build) void {
         @panic("finetune aggregate does not compile command checks");
     if (std.mem.indexOfScalar(*std.Build.Step, tests.step.dependencies.items, &checks.step) == null)
         @panic("finetune aggregate does not compile command checks");
+    const runtime_abi = checks.step.dependencies.items[0].cast(std.Build.Step.Compile).?.root_module.import_table.get("antfly_runtime_abi") orelse
+        @panic("missing command check runtime ABI");
     var actual = std.StringHashMap(*std.Build.Module).init(b.allocator);
     for (checks.step.dependencies.items) |dependency| {
         const group = dependency.cast(std.Build.Step.Compile) orelse @panic("unexpected command check dependency");
@@ -89,6 +112,9 @@ pub fn build(b: *std.Build) void {
         const module = actual.fetchRemove(path) orelse
             std.debug.panic("finetune aggregate does not compile {s}", .{spec.name});
         var expected = std.StringHashMap(void).init(b.allocator);
+        expected.put("antfly_runtime_abi", {}) catch @panic("OOM");
+        if (module.value.import_table.get("antfly_runtime_abi") != runtime_abi)
+            @panic("command lost its shared runtime ABI identity");
         for (spec.imports) |dependency| {
             expected.put(@tagName(dependency), {}) catch @panic("OOM");
             if (dependency == .onnx_graph) expected.put("onnx_data", {}) catch @panic("OOM");

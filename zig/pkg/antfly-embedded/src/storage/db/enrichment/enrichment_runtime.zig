@@ -2424,15 +2424,13 @@ fn unlockRuntime(runtime: *EnrichmentRuntime, maybe_io: ?std.Io) void {
     if (maybe_io) |io| runtime.mutex.unlock(io);
 }
 
-/// Read capture retains terminal request outcomes rather than acknowledging
-/// successful write visibility. Check replay and owner health together without
-/// allocating diagnostics or consulting the terminal repair ledger.
-fn requireEnrichmentSettledForQueryCapture(runtime: *EnrichmentRuntime, sequence: u64) !void {
+/// Retained reads freeze committed publications, including pending/failed
+/// request state. Provider retries are future mutations, not read barriers.
+/// Pipeline failure and incomplete graph recovery still require repair.
+fn requireEnrichmentHealthyForQueryCapture(runtime: *EnrichmentRuntime) !void {
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
     if (runtime.worker_failed) return RuntimeError.EnrichmentWorkerFailed;
-    if (runtime.retrying or runtime.applied_sequence < sequence)
-        return RuntimeError.EnrichmentRetryInProgress;
     if (comptime @hasField(EnrichmentRuntime, "graph_stage_recovery_pending"))
         if (runtime.graph_stage_recovery_pending) return RuntimeError.EnrichmentRetryInProgress;
 }
@@ -5157,7 +5155,7 @@ const UnsupportedEnrichmentRuntime = struct {
         try self.catchUpUntilWithVisibilityDeadline(sequence, cancellation, null);
     }
 
-    pub const requireSettledForQueryCapture = requireEnrichmentSettledForQueryCapture;
+    pub const requireHealthyForQueryCapture = requireEnrichmentHealthyForQueryCapture;
 
     pub fn syncWaitTimeoutMs(self: *const @This()) u64 {
         return @max(self.config.sync_wait_timeout_ms, 1);
@@ -5807,7 +5805,7 @@ const PlatformEnrichmentRuntime = struct {
         try self.waitForAppliedWithVisibilityDeadline(sequence, cancellation, null);
     }
 
-    pub const requireSettledForQueryCapture = requireEnrichmentSettledForQueryCapture;
+    pub const requireHealthyForQueryCapture = requireEnrichmentHealthyForQueryCapture;
 
     pub fn syncWaitTimeoutMs(self: *const EnrichmentRuntime) u64 {
         return @max(self.config.sync_wait_timeout_ms, 1);

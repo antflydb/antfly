@@ -87,6 +87,11 @@ pub const Budget = struct {
         self.remaining -= amount;
     }
 
+    /// Force the shared cancellation check independently of charged work.
+    pub fn poll(self: *Budget) !void {
+        if (self.shared) |context| try context.poll();
+    }
+
     pub fn orderBytes(self: *Budget, left: []const u8, right: []const u8) !Order {
         const count = @min(left.len, right.len);
         var offset: usize = 0;
@@ -877,8 +882,23 @@ pub fn compare(a: Json, b: Json, budget: *Budget, depth: usize) anyerror!Order {
     };
 }
 
+pub fn hashBoolean(value: bool, budget: *Budget) !u64 {
+    try budget.consume(1);
+    var state = std.hash.Wyhash.init(3);
+    state.update(&.{@intFromBool(value)});
+    return state.final();
+}
+pub fn hashString(value: []const u8, budget: *Budget) !u64 {
+    try budget.consume(1);
+    try budget.consume(value.len);
+    var state = std.hash.Wyhash.init(1);
+    state.update(value);
+    return state.final();
+}
 pub fn hash(value: Json, budget: *Budget, depth: usize) anyerror!u64 {
     if (depth > 64) return error.SqlProgramLimitExceeded;
+    if (value == .bool) return hashBoolean(value.bool, budget);
+    if (value == .string) return hashString(value.string, budget);
     try budget.consume(1);
     if (rank(value) == 2) {
         return switch (value) {
@@ -890,11 +910,7 @@ pub fn hash(value: Json, budget: *Budget, depth: usize) anyerror!u64 {
     var state = std.hash.Wyhash.init(rank(value));
     switch (value) {
         .null => {},
-        .bool => state.update(&.{@intFromBool(value.bool)}),
-        .string => {
-            try budget.consume(value.string.len);
-            state.update(value.string);
-        },
+        .bool, .string => unreachable,
         .array => for (value.array.items) |item| {
             var bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &bytes, try hash(item, budget, depth + 1), .little);

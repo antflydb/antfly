@@ -476,7 +476,154 @@ test "SQL datetime parameters preserve signed epoch instants across JSON and tex
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
+/// Frame-owned acceleration shared by all programs bound to one immutable
+/// execution. Warm reads are lock-free; cold preparation is serialized. Only
+/// used parameters warm up, and unsuccessful speculative builds are disabled.
+const MembershipCache = struct {
+    const Slot = struct {
+        state: std.atomic.Value(u8) = .init(0), // cold / disabled / ready / eligible
+        recent_scans: usize = 0,
+        recent_cells: usize = 0,
+        build_credit: usize = 0,
+        build_work: usize = 0,
+        index: ?*arrays.Membership = null,
+    };
+    backing: A,
+    memory: MemoryBudget,
+    slots: []Slot,
+    /// Only admission-complete frame storage is registered here. The cache,
+    /// values and payload lease share one execution lifetime.
+    values: []const scalar.Datum,
+    remaining: usize,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn init(backing: A, values: []const scalar.Datum, work: usize) !?*MembershipCache {
+        for (values) |value| {
+            if (value.array) |array| if (array.cardinality() >= 32 and array.element_type != .numeric) break;
+        } else return null;
+        const available = MemoryBudget.headroom(backing) orelse return null;
+        if (available < 64 * 1024 or work == 0) return null;
+        const self = try backing.create(MembershipCache);
+        errdefer backing.destroy(self);
+        const slots = try backing.alloc(Slot, values.len);
+        errdefer backing.free(slots);
+        for (slots, values) |*slot, value| {
+            slot.* = .{};
+            const eligible = if (value.array) |array| array.cardinality() >= 32 and array.element_type != .numeric else false;
+            if (!eligible) {
+                slot.state.store(1, .release);
+            } else {
+                const array = value.array.?;
+                slot.build_work = array.cardinality() *| 8;
+                if (array.element_type == .text or array.element_type == .jsonb or array.element_type == .uuid)
+                    slot.build_work = @max(slot.build_work, (try array.retainedBytes()) *| 2);
+            }
+        }
+        self.* = .{ .backing = backing, .memory = .{ .backing = backing, .limit = @min(2 * 1024 * 1024, available / 4) }, .slots = slots, .values = values, .remaining = @min(work, 1024 * 1024) };
+        return self;
+    }
+    /// Only this admission-complete registry mints array capabilities. The
+    /// opaque pointer needs no additional object or per-element metadata.
+    fn arraySource(self: *const MembershipCache, ordinal: usize) ?*const Frame.ArraySource {
+        if (ordinal >= self.values.len) return null;
+        const value = self.values[ordinal].array orelse return null;
+        return @ptrCast(value);
+    }
+
+    fn get(self: *MembershipCache, ordinal: usize, caller: *arrays.Budget) !?*const arrays.Membership {
+        if (ordinal >= self.slots.len) return null;
+        const slot = &self.slots[ordinal];
+        switch (slot.state.load(.acquire)) {
+            0, 1 => return null,
+            2 => return slot.index,
+            else => {},
+        }
+        // Other evaluations retain their scan path while preparation is in
+        // flight. Never wait under a row checkpoint or on a starved worker.
+        try caller.poll();
+        if (!self.mutex.tryLock()) return null;
+        defer self.mutex.unlock();
+        switch (slot.state.load(.acquire)) {
+            0, 1 => return null,
+            2 => return slot.index,
+            else => {},
+        }
+        const available = MemoryBudget.headroom(self.memory.allocator()).?;
+        if (available < 4096 or self.remaining == 0 or self.memory.isExhausted()) {
+            slot.state.store(1, .release);
+            return null;
+        }
+        const Poll = struct {
+            fn check(raw: ?*anyopaque) !void {
+                const owner: *arrays.Budget = @ptrCast(@alignCast(raw.?));
+                try owner.poll();
+            }
+        };
+        // Build work is bounded once per execution, independently of row work.
+        // Cancellation still belongs to the evaluating row and stays sticky.
+        var context: @import("numeric_value.zig").Context = .{ .alloc = self.memory.allocator(), .remaining = self.remaining, .checkpoint = Poll.check, .ptr = caller };
+        var work_budget: arrays.Budget = .{ .remaining = self.remaining, .shared = &context };
+        defer self.remaining = work_budget.remaining;
+        const index = self.memory.allocator().create(arrays.Membership) catch |err| {
+            if (err == error.OutOfMemory and self.memory.isExhausted()) {
+                slot.state.store(1, .release);
+                return null;
+            }
+            return err;
+        };
+        errdefer self.memory.allocator().destroy(index);
+        index.* = arrays.Membership.initFrameOwnedWithBudget(self.memory.allocator(), self.arraySource(ordinal).?, available - @sizeOf(arrays.Membership) - @sizeOf(MemoryBudget), &work_budget) catch |err| {
+            if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and self.memory.isExhausted())) {
+                self.memory.allocator().destroy(index);
+                slot.state.store(1, .release);
+                return null;
+            }
+            return err;
+        };
+        slot.index = index;
+        slot.state.store(2, .release);
+        return index;
+    }
+    fn observe(self: *MembershipCache, ordinal: usize, spent: usize, visited: usize) void {
+        if (ordinal >= self.slots.len) return;
+        const slot = &self.slots[ordinal];
+        if (slot.state.load(.acquire) != 0 or !self.mutex.tryLock()) return;
+        defer self.mutex.unlock();
+        if (slot.state.load(.acquire) != 0) return;
+        // Keep the useful-prefix estimate recent: halve its weight every 32
+        // observations once full, so arbitrarily old early hits cannot delay
+        // a new expensive phase. No per-observation storage is required.
+        if (slot.recent_scans == 64) {
+            slot.recent_scans /= 2;
+            // Round upward so a one-cell residual from an old cheap phase
+            // eventually disappears at the exact useful-prefix threshold.
+            slot.recent_cells = slot.recent_cells / 2 + slot.recent_cells % 2;
+        }
+        slot.recent_scans += 1;
+        slot.recent_cells +|= visited;
+        // Only substantial scans can repay construction. Credit is capped,
+        // rather than decayed, so large sources with moderate prefix lengths
+        // can still amortize a build over more than one history window.
+        if (visited >= 16) slot.build_credit = @min(slot.build_work, slot.build_credit +| spent);
+        // Publish eligibility once; cold readers avoid the build lock and
+        // headroom checks. Observations remain best-effort under contention.
+        if (slot.recent_scans >= 16 and slot.recent_cells / slot.recent_scans >= 16 and slot.build_credit >= slot.build_work)
+            slot.state.store(3, .release);
+    }
+    fn deinit(self: *MembershipCache) void {
+        for (self.slots) |slot| if (slot.index) |index| {
+            index.deinit();
+            self.memory.allocator().destroy(index);
+        };
+        std.debug.assert(self.memory.live == 0);
+        const backing = self.backing;
+        backing.free(self.slots);
+        backing.destroy(self);
+    }
+};
+
 pub const Frame = struct {
+    memberships: ?*MembershipCache = null,
     payload_owner: ?PayloadLease = null,
     arena: *std.heap.ArenaAllocator,
     budget: *MemoryBudget,
@@ -505,12 +652,50 @@ pub const Frame = struct {
 
     pub fn deinit(self: *Frame) void {
         const backing = self.budget.backing;
+        if (self.memberships) |cache| cache.deinit();
         self.arena.deinit();
         self.budget.allocator().destroy(self.arena);
         std.debug.assert(self.budget.live == 0);
         backing.destroy(self.budget);
         if (self.payload_owner) |owner| owner.release();
         self.* = undefined;
+    }
+
+    /// Opaque capability minted only from admission-complete frame storage.
+    /// The immutable frame and payload lease must outlive the capability and
+    /// any index borrowing it. Casting arbitrary Values to this type violates
+    /// the contract; callers must retain ordinary ingress validation.
+    pub const ArraySource = opaque {
+        pub fn borrowValidated(self: *const ArraySource) arrays.Value {
+            const value: *const arrays.Value = @ptrCast(@alignCast(self));
+            return value.*;
+        }
+    };
+
+    /// Borrows stable execution storage, never the movable Frame wrapper.
+    pub const Lookup = struct {
+        cache: ?*MembershipCache = null,
+        pub fn equalAny(self: Lookup, ordinal: usize, array: *const arrays.Value, values: []const scalar.Datum, element: arrays.Element, work: *arrays.Budget) !?bool {
+            // The cache registry is the sole binding authority. A copied
+            // evaluator with replaced parameters keeps its scan path without
+            // consulting or warming the original frame's indexes.
+            const cache: ?*MembershipCache = if (!element.sql_null) bound: {
+                const owner = self.cache orelse break :bound null;
+                if (values.ptr != owner.values.ptr or values.len != owner.values.len or ordinal >= values.len or values[ordinal].array != array) break :bound null;
+                break :bound owner;
+            } else null;
+            if (cache) |owner| if (try owner.get(ordinal, work)) |index| return index.equalAny(element, work);
+            const before = work.remaining;
+            const observed = try array.quantifiedObserved(element, .eq, .any, work);
+            if (cache) |owner| owner.observe(ordinal, before -| work.remaining, observed.visited);
+            return observed.result;
+        }
+    };
+    pub fn lookup(self: *const Frame) Lookup {
+        return .{ .cache = self.memberships };
+    }
+    pub fn equalAny(self: *const Frame, ordinal: usize, array: *const arrays.Value, element: arrays.Element, work: *arrays.Budget) !?bool {
+        return self.lookup().equalAny(ordinal, array, self.values, element, work);
     }
 
     pub fn prepare(backing: A, descriptors: []const scalar.Type, inputs: []const Input, limits: Limits) !Frame {
@@ -529,8 +714,9 @@ pub const Frame = struct {
         arena.* = std.heap.ArenaAllocator.init(budget.allocator());
         errdefer arena.deinit();
         const decoded = prepareLeaky(arena.allocator(), descriptors, inputs, limits) catch |err| return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
+        const memberships = try MembershipCache.init(MemoryBudget.reclaimingAllocator(budget.allocator()), decoded.values, limits.work -| decoded.work);
         if (limits.payload_owner) |owner| owner.retain();
-        return .{ .payload_owner = limits.payload_owner, .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
+        return .{ .memberships = memberships, .payload_owner = limits.payload_owner, .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
     }
 };
 
@@ -606,10 +792,12 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             const value = input.datum;
             const array = value.array orelse return error.SqlTypeMismatch;
             if (array.element_type != kind) return error.ConflictingSqlParameterTypes;
-            if (value.patterns() != null or value.value != .null) return error.SqlTypeMismatch;
-            _ = try array.validateWithBudget(.{ .bytes = limits.bytes, .elements = limits.elements }, work);
+            if (value.patterns() != null or value.numeric != null or value.value != .null) return error.SqlTypeMismatch;
+            const admitted = try array.validateWithBudget(.{ .bytes = limits.bytes, .elements = limits.elements }, work);
             if (array.stored != null and limits.payload_owner != null) return value;
-            return operators.cloneDatum(a, value);
+            // Clone the admitted header so caller-provided sizing metadata is
+            // refreshed by the existing validation walk before publication.
+            return operators.cloneDatum(a, .typedArray(&admitted));
         }
         const value = try a.create(arrays.Value);
         const value_limits: arrays.Limits = .{ .bytes = limits.bytes, .elements = limits.elements, .work = work.remaining };
@@ -753,4 +941,583 @@ test "SQL native parameter payload leases avoid compact frame copies" {
     }
     try std.testing.expect(peaks[1] < peaks[0] / 8);
     std.debug.print("SQL native leased parameter frame: copied_peak={} leased_peak={} retained_payload={}\n", .{ peaks[0], peaks[1], ingress.lease().bytes });
+}
+
+test "SQL prepared equality indexes warm once remain frame owned and preserve NULL semantics" {
+    const a = std.testing.allocator;
+    var cells: [128]scalar.Datum = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = if (i == 127) .{} else .json(.{ .integer = @intCast(i) });
+    const source = try arrays.Value.init(.int64, &.{ .{ .length = 2, .lower = -3 }, .{ .length = 64, .lower = 4 } }, &cells, .{});
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .integer, .element_type = .int64 }}, &.{.{ .kind = .array, .element_type = .int64 }}, .{});
+    defer program.deinit();
+    var frame = try Frame.prepare(a, program.parameter_descriptors, &.{.{ .datum = .typedArray(&source) }}, .{});
+    defer frame.deinit();
+    var shifted_cells: [128]scalar.Datum = undefined;
+    for (&shifted_cells, 0..) |*cell, i| cell.* = if (i == 127) .{} else .json(.{ .integer = @intCast(1000 + i) });
+    const shifted = try arrays.Value.init(.int64, source.dimensions, &shifted_cells, .{});
+    var second = try Frame.prepare(a, program.parameter_descriptors, &.{.{ .datum = .typedArray(&shifted) }}, .{});
+    defer second.deinit();
+    const prepared = try program.bindParameters(&frame);
+    const other = try program.bindParameters(&second);
+    for (0..64) |row| {
+        const needle: scalar.Datum = if (row % 3 == 0) .{} else .json(.{ .integer = if (row % 3 == 1) 42 else 999 });
+        const result = try prepared.evaluate(std.testing.failing_allocator, &.{needle}, .{});
+        if (row % 3 == 1) try std.testing.expect(result.value.bool) else try std.testing.expect(result.sql_null);
+    }
+    try std.testing.expectEqual(@as(u8, 2), frame.memberships.?.slots[0].state.load(.acquire));
+    const cached = frame.memberships.?.slots[0].index.?;
+    const live = frame.budget.live;
+    for (0..100) |_| _ = try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 42 })}, .{});
+    try std.testing.expectEqual(live, frame.budget.live);
+    try std.testing.expect(cached == frame.memberships.?.slots[0].index.?);
+    try std.testing.expectEqual(@as(u8, 0), second.memberships.?.slots[0].state.load(.acquire));
+    var rebound = prepared;
+    rebound.parameters = second.values;
+    try std.testing.expect((try rebound.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 42 })}, .{})).sql_null);
+    try std.testing.expectEqual(@as(u8, 0), second.memberships.?.slots[0].state.load(.acquire));
+    for (0..32) |_| _ = try other.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 42 })}, .{});
+    try std.testing.expect(cached != second.memberships.?.slots[0].index.?);
+    // A frozen frame/cached index remains valid when the move-only value moves.
+    var moved = frame;
+    try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 42 })}, .{})).value.bool);
+    const moved_prepared = try program.bindParameters(&moved);
+    try std.testing.expect((try moved_prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 42 })}, .{})).value.bool);
+}
+
+test "SQL prepared equality cache unwinds allocation failures limits and canceled builds" {
+    const a = std.testing.allocator;
+    var cells: [129]scalar.Datum = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
+    const source = try arrays.Value.init(.int64, &.{.{ .length = cells.len }}, &cells, .{});
+    const Fixture = struct {
+        fn run(backing: A, input: *const arrays.Value) !void {
+            var frame = try Frame.prepare(backing, &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(input) }}, .{});
+            defer frame.deinit();
+            var work: arrays.Budget = .{};
+            for (0..32) |_| _ = try frame.equalAny(0, frame.values[0].array.?, .json(.{ .integer = 128 }), &work);
+            const index = frame.memberships.?.slots[0].index.?;
+            try std.testing.expectEqual(@as(?bool, true), try index.equalAny(.json(.{ .integer = 128 }), &work));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{&source});
+    var frame = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(&source) }}, .{});
+    defer frame.deinit();
+    frame.memberships.?.memory.limit = 1024;
+    var work: arrays.Budget = .{};
+    for (0..32) |_| try std.testing.expectEqual(@as(?bool, true), try frame.equalAny(0, frame.values[0].array.?, .json(.{ .integer = 128 }), &work));
+    try std.testing.expect(!frame.budget.isExhausted());
+    var canceled = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(&source) }}, .{});
+    defer canceled.deinit();
+    for (0..16) |_| _ = try canceled.equalAny(0, canceled.values[0].array.?, .json(.{ .integer = 128 }), &work);
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 3) return error.Canceled;
+        }
+    };
+    var cancel: Cancel = .{};
+    var owner: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check, .ptr = &cancel };
+    var cancel_work: arrays.Budget = .{ .shared = &owner };
+    try std.testing.expectError(error.Canceled, canceled.equalAny(0, canceled.values[0].array.?, .json(.{ .integer = 128 }), &cancel_work));
+    try std.testing.expectEqual(@as(usize, 0), canceled.memberships.?.memory.live);
+    try std.testing.expectError(error.Canceled, cancel_work.consume(0));
+}
+
+test "SQL prepared equality lookup measures warm native rows without row allocations" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    var builder = try @import("array_compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
+    var work: arrays.Budget = .{};
+    for (0..8192) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &work);
+    const source = try builder.finish(region.allocator(), .{}, &work);
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .integer, .element_type = .int64 }}, &.{.{ .kind = .array, .element_type = .int64 }}, .{});
+    defer program.deinit();
+    var frame = try Frame.prepare(a, program.parameter_descriptors, &.{.{ .datum = .typedArray(&source) }}, .{});
+    defer frame.deinit();
+    const prepared = try program.bindParameters(&frame);
+    for (0..32) |_| _ = try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 99999 })}, .{});
+    const index = frame.memberships.?.slots[0].index.?;
+    var scan_prepared = prepared;
+    scan_prepared.lookup = .{};
+    for (0..2) |mode| {
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..1000) |i| {
+            const needle: scalar.Datum = .json(.{ .integer = if (i % 2 == 0) 8191 else 99999 });
+            const result = (try (if (mode == 0) scan_prepared else prepared).evaluate(std.testing.failing_allocator, &.{needle}, .{})).value.bool;
+            try std.testing.expectEqual(i % 2 == 0, result);
+        }
+        std.debug.print("SQL_PREPARED_ANY indexed={} rows=1000 source_cells=8192 retained_index_bytes={} elapsed_ns={} row_allocations=0\n", .{ mode == 1, index.budget.live, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+    }
+}
+
+test "SQL prepared equality cache publishes immutable indexes to concurrent workers" {
+    if (comptime @import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var cells: [129]scalar.Datum = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
+    const source = try arrays.Value.init(.int64, &.{.{ .length = cells.len }}, &cells, .{});
+    var frame = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(&source) }}, .{});
+    defer frame.deinit();
+    var io_impl = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(2) });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var gate: std.Io.Event = .unset;
+    const Worker = struct {
+        fn run(input: *const Frame, active_io: std.Io, start: *std.Io.Event) !void {
+            try start.wait(active_io);
+            for (0..64) |_| {
+                var work: arrays.Budget = .{};
+                const matched = try input.equalAny(0, input.values[0].array.?, .json(.{ .integer = 128 }), &work);
+                try std.testing.expectEqual(@as(?bool, true), matched);
+            }
+        }
+    };
+    var first = try io.concurrent(Worker.run, .{ &frame, io, &gate });
+    defer first.cancel(io) catch {};
+    var second = try io.concurrent(Worker.run, .{ &frame, io, &gate });
+    defer second.cancel(io) catch {};
+    gate.set(io);
+    try first.await(io);
+    try second.await(io);
+    try std.testing.expectEqual(@as(u8, 2), frame.memberships.?.slots[0].state.load(.acquire));
+}
+
+test "SQL prepared equality indexes retain widened mixed and exact numeric fallback" {
+    const a = std.testing.allocator;
+    var cells: [129]scalar.Datum = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
+    const source = try arrays.Value.init(.int64, &.{.{ .length = cells.len }}, &cells, .{});
+    var frame = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(&source) }}, .{});
+    defer frame.deinit();
+    var work: arrays.Budget = .{};
+    for (0..32) |_| _ = try frame.equalAny(0, frame.values[0].array.?, .json(.{ .integer = 128 }), &work);
+    const index = frame.memberships.?.slots[0].index.?;
+    for ([_]struct { sql: []const u8, expected: bool }{
+        .{ .sql = "127.5::double precision = ANY($1)", .expected = false },
+        .{ .sql = "127.5::numeric = ANY($1)", .expected = false },
+        .{ .sql = "128::real = ANY($1::real[])", .expected = true },
+        .{ .sql = "128 <> ALL($1)", .expected = false },
+        .{ .sql = "999 <> ALL($1)", .expected = true },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+        defer compiled.deinit();
+        var program = try scalar.bindTyped(a, compiled.expression, &.{}, frame.descriptors, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const prepared = try program.bindParameters(&frame);
+        const result = try prepared.evaluate(arena.allocator(), &.{}, .{});
+        try std.testing.expect(!result.sql_null);
+        try std.testing.expectEqual(case.expected, result.value.bool);
+        try std.testing.expect(index == frame.memberships.?.slots[0].index.?);
+    }
+}
+
+test "SQL prepared equality optional indexes respect parent quotas through arenas" {
+    const a = std.testing.allocator;
+    var parent: MemoryBudget = .{ .backing = a, .limit = 1024 * 1024 };
+    var arena = std.heap.ArenaAllocator.init(parent.allocator());
+    defer arena.deinit();
+    var cells: [129]scalar.Datum = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
+    const source = try arrays.Value.init(.int64, &.{.{ .length = cells.len }}, &cells, .{});
+    var frame = try Frame.prepare(arena.allocator(), &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(&source) }}, .{});
+    defer frame.deinit();
+    try std.testing.expect(frame.memberships != null);
+    const retained = parent.live;
+    parent.limit = retained + 1024;
+    var work: arrays.Budget = .{};
+    for (0..32) |_| try std.testing.expectEqual(@as(?bool, true), try frame.equalAny(0, frame.values[0].array.?, .json(.{ .integer = 128 }), &work));
+    try std.testing.expectEqual(retained, parent.live);
+    try std.testing.expect(!parent.isExhausted());
+    try std.testing.expectEqual(@as(?bool, true), try frame.values[0].array.?.quantified(.json(.{ .integer = 128 }), .eq, .any, &work));
+}
+
+test "SQL prepared equality admission measures cold short early tail and miss rows" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    var builder = try @import("array_compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
+    var work: arrays.Budget = .{};
+    for (0..8192) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &work);
+    const source = try builder.finish(region.allocator(), .{}, &work);
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .integer, .element_type = .int64 }}, &.{.{ .kind = .array, .element_type = .int64 }}, .{});
+    defer program.deinit();
+    for ([_]i64{ 0, 8191, 99999 }) |needle| for ([_]usize{ 8, 32, 1000 }) |rows| for (0..2) |mode| {
+        var best: i96 = std.math.maxInt(i96);
+        var retained: usize = 0;
+        var peak: usize = 0;
+        const trials: usize = if (@import("builtin").mode == .debug) 1 else 5;
+        for (0..trials) |_| {
+            var frame = try Frame.prepare(a, program.parameter_descriptors, &.{.{ .datum = .typedArray(&source) }}, .{});
+            defer frame.deinit();
+            var prepared = try program.bindParameters(&frame);
+            if (mode == 0) prepared.lookup = .{};
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            for (0..rows) |_| {
+                const result = try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = needle })}, .{});
+                try std.testing.expectEqual(needle != 99999, result.value.bool);
+            }
+            best = @min(best, @as(i96, @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start)));
+            const cache = frame.memberships.?;
+            retained = cache.memory.live;
+            peak = cache.memory.peak;
+            const should_index = mode == 1 and needle != 0 and rows > 16;
+            try std.testing.expectEqual(should_index, cache.slots[0].state.load(.acquire) == 2);
+            if (!should_index) try std.testing.expectEqual(@as(usize, 0), retained);
+            // One bucket vector owns u32 ordinals and byte fingerprints.
+            if (should_index) try std.testing.expect(retained < 85 * 1024 and peak < 125 * 1024);
+        }
+        std.debug.print("SQL_COLD_ANY automatic={} needle={} rows={} trials={} best_ns={} index_live={} index_peak={} row_allocations=0\n", .{ mode == 1, needle, rows, trials, best, retained, peak });
+    };
+}
+
+test "SQL prepared equality admission keeps long first hits cheap and adapts to later scans" {
+    const a = std.testing.allocator;
+    const payload: [1024]u8 = @splat('a');
+    var cells: [128]scalar.Datum = @splat(.json(.{ .string = &payload }));
+    const source = try arrays.Value.init(.text, &.{.{ .length = cells.len }}, &cells, .{});
+    // Exercise both scalar cells and native text, including rank/lower bounds.
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const bytes = try @import("array_storage.zig").encodeAlloc(region.allocator(), source, .{});
+    const native = try @import("array_storage.zig").viewLeaky(region.allocator(), .text, bytes, .{});
+    for ([_]*const arrays.Value{ &source, &native }) |input| {
+        var frame = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .text }}, &.{.{ .datum = .typedArray(input) }}, .{});
+        defer frame.deinit();
+        for (0..256) |_| {
+            var work: arrays.Budget = .{};
+            try std.testing.expectEqual(@as(?bool, true), try frame.equalAny(0, frame.values[0].array.?, .json(.{ .string = &payload }), &work));
+        }
+        try std.testing.expectEqual(@as(u8, 0), frame.memberships.?.slots[0].state.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), frame.memberships.?.memory.live);
+        const missing: [1024]u8 = @splat('b');
+        for (0..256) |_| {
+            var work: arrays.Budget = .{};
+            try std.testing.expectEqual(@as(?bool, false), try frame.equalAny(0, frame.values[0].array.?, .json(.{ .string = &missing }), &work));
+        }
+        try std.testing.expectEqual(@as(u8, 2), frame.memberships.?.slots[0].state.load(.acquire));
+    }
+}
+
+test "SQL prepared equality admits large equivalent representations within index quotas" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const cells = try region.allocator().alloc(scalar.Datum, 32768);
+    for (cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
+    const source = try arrays.Value.init(.int64, &.{.{ .length = @intCast(cells.len) }}, cells, .{});
+    const storage = @import("array_storage.zig");
+    const bytes = try storage.encodeAlloc(region.allocator(), source, .{});
+    const native = try storage.viewLeaky(region.allocator(), .int64, bytes, .{});
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .integer, .element_type = .int64 }}, &.{.{ .kind = .array, .element_type = .int64 }}, .{});
+    defer program.deinit();
+    for ([_]*const arrays.Value{ &source, &native }, 0..) |input, representation| for (0..2) |mode| {
+        var frame = try Frame.prepare(a, program.parameter_descriptors, &.{.{ .datum = .typedArray(input) }}, .{});
+        defer frame.deinit();
+        var prepared = try program.bindParameters(&frame);
+        if (mode == 0) prepared.lookup = .{};
+        const source_bytes = try frame.values[0].array.?.retainedBytes();
+        const cache = frame.memberships.?;
+        if (representation == 0) try std.testing.expect(source_bytes > cache.memory.limit);
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..1000) |_| try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 32767 })}, .{ .steps = 1_048_576 })).value.bool);
+        const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+        try std.testing.expectEqual(mode == 1, cache.slots[0].state.load(.acquire) == 2);
+        try std.testing.expect(cache.memory.peak < 512 * 1024);
+        if (mode == 0) try std.testing.expectEqual(@as(usize, 0), cache.memory.live);
+        std.debug.print("SQL_SOURCE_INDEX automatic={} native={} rows=1000 source_cells=32768 source_bytes={} index_live={} index_peak={} elapsed_ns={} row_allocations=0\n", .{ mode == 1, representation == 1, source_bytes, cache.memory.live, cache.memory.peak, elapsed });
+    };
+}
+
+test "SQL prepared equality recent admission adapts after long cheap phases and preserves build credit" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    var builder = try @import("array_compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
+    var initial: arrays.Budget = .{};
+    for (0..8192) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &initial);
+    const source = try builder.finish(region.allocator(), .{}, &initial);
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .integer, .element_type = .int64 }}, &.{.{ .kind = .array, .element_type = .int64 }}, .{});
+    defer program.deinit();
+    for ([_]i64{ 15, 31, 511, 8191 }) |needle| for (0..2) |phase| {
+        var frame = try Frame.prepare(a, program.parameter_descriptors, &.{.{ .datum = .typedArray(&source) }}, .{});
+        defer frame.deinit();
+        const prepared = try program.bindParameters(&frame);
+        const cache = frame.memberships.?;
+        if (phase == 1) {
+            for (0..65536) |_| try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 0 })}, .{})).value.bool);
+            try std.testing.expectEqual(@as(usize, 0), cache.memory.live);
+            try std.testing.expectEqual(@as(usize, 0), cache.slots[0].build_credit);
+            try std.testing.expect(cache.slots[0].recent_scans <= 64);
+            try std.testing.expectEqual(@as(u8, 0), cache.slots[0].state.load(.acquire));
+        }
+        var first_index_row: ?usize = null;
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..2048) |i| {
+            try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = needle })}, .{})).value.bool);
+            if (first_index_row == null and cache.slots[0].state.load(.acquire) == 2) first_index_row = i + 1;
+        }
+        const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+        try std.testing.expect(first_index_row != null);
+        try std.testing.expect(first_index_row.? <= (if (needle == 8191) @as(usize, 32) else if (needle == 511) @as(usize, 128) else @as(usize, 2048)));
+        try std.testing.expect(cache.slots[0].recent_scans <= 64);
+        try std.testing.expect(cache.slots[0].build_credit <= cache.slots[0].build_work);
+        std.debug.print("SQL_RECENT_ANY antecedent_cheap_rows={} prefix_cells={} timed_rows=2048 first_index_row={} index_live={} elapsed_ns={} row_allocations=0\n", .{ if (phase == 1) @as(usize, 65536) else @as(usize, 0), needle + 1, first_index_row.?, cache.memory.live, elapsed });
+    };
+}
+
+test "SQL frame array capabilities reuse admitted JSONB and survive owner moves" {
+    const a = std.testing.allocator;
+    const n = 1024;
+    var frame = admitted: {
+        var input = std.heap.ArenaAllocator.init(a);
+        defer input.deinit();
+        const cells = try input.allocator().alloc(scalar.Datum, n);
+        for (cells, 0..) |*cell, i| {
+            const payload = try input.allocator().alloc(u8, 256);
+            @memset(payload, 'a');
+            _ = try std.fmt.bufPrint(payload[0..8], "{d:0>8}", .{i});
+            cell.* = .json(.{ .string = payload });
+        }
+        const source = try arrays.Value.init(.jsonb, &.{.{ .length = n }}, cells, .{});
+        break :admitted try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&source) }}, .{});
+    };
+    const capability = frame.memberships.?.arraySource(0).?;
+    var moved = frame;
+    frame = undefined;
+    defer moved.deinit();
+    const owned = moved.values[0].array.?;
+    var spent: [2]usize = undefined;
+    for (0..2) |mode| {
+        var elapsed: i96 = 0;
+        var peak: usize = 0;
+        for (0..20) |_| {
+            var work: arrays.Budget = .{ .remaining = 1024 * 1024 };
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            var index = if (mode == 0)
+                try arrays.Membership.initBorrowedWithBudget(a, owned.*, .{}, 128 * 1024, &work)
+            else
+                try arrays.Membership.initFrameOwnedWithBudget(a, capability, 128 * 1024, &work);
+            defer index.deinit();
+            elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+            spent[mode] = 1024 * 1024 - work.remaining;
+            peak = @max(peak, index.budget.peak);
+            try std.testing.expectEqual(@as(usize, n), index.count);
+            try std.testing.expectEqual(@as(?i32, n), try index.firstPosition(owned.flatCell(n - 1), &work));
+            try std.testing.expectEqual(@as(usize, 10240), index.budget.live);
+        }
+        std.debug.print("SQL_FRAME_SOURCE owned={} cells={} repetitions=20 work={} peak={} elapsed_ns={}\n", .{ mode == 1, n, spent[mode], peak, elapsed });
+    }
+    var validation: arrays.Budget = .{ .remaining = 1024 * 1024 };
+    _ = try owned.validateWithBudget(.{}, &validation);
+    try std.testing.expectEqual(spent[0] - (1024 * 1024 - validation.remaining) + 1, spent[1]);
+    // Only the authenticated owner path fits this construction allowance.
+    var limited: arrays.Budget = .{ .remaining = spent[1] };
+    var index = try arrays.Membership.initFrameOwnedWithBudget(a, capability, 128 * 1024, &limited);
+    defer index.deinit();
+    try std.testing.expectEqual(@as(usize, 0), limited.remaining);
+    limited.remaining = spent[1];
+    try std.testing.expectError(error.SqlProgramLimitExceeded, arrays.Membership.initBorrowedWithBudget(a, owned.*, .{}, 128 * 1024, &limited));
+    var denied: arrays.Budget = .{ .remaining = 0 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, arrays.Membership.initFrameOwnedWithBudget(std.testing.failing_allocator, capability, 128 * 1024, &denied));
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check };
+    var interrupted: arrays.Budget = .{ .shared = &context };
+    try std.testing.expectError(error.Canceled, arrays.Membership.initFrameOwnedWithBudget(std.testing.failing_allocator, capability, 128 * 1024, &interrupted));
+    try std.testing.expectError(error.Canceled, interrupted.consume(0));
+
+    // Exercise complete prepared JSONB evaluation and automatic admission.
+    // Numeric probes remain logical JSON without text conversion scratch.
+    const mixed_cells = try a.dupe(scalar.Datum, owned.elements);
+    defer a.free(mixed_cells);
+    mixed_cells[n - 1] = .json(.{ .integer = 42 });
+    const mixed = try arrays.Value.init(.jsonb, &.{.{ .length = n }}, mixed_cells, .{});
+    var evaluation = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&mixed) }}, .{});
+    defer evaluation.deinit();
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .json, .element_type = .jsonb }}, &.{.{ .kind = .array, .element_type = .jsonb }}, .{});
+    defer program.deinit();
+    const prepared = try program.bindParameters(&evaluation);
+    for (0..1000) |i| {
+        const needle: scalar.Datum = .json(.{ .integer = if (i % 2 == 0) 42 else -1 });
+        try std.testing.expectEqual(i % 2 == 0, (try prepared.evaluate(std.testing.failing_allocator, &.{needle}, .{})).value.bool);
+    }
+    try std.testing.expectEqual(@as(u8, 2), evaluation.memberships.?.slots[0].state.load(.acquire));
+    try std.testing.expect(evaluation.memberships.?.remaining < 1024 * 1024);
+}
+
+test "SQL frame array capabilities preserve ingress admission and allocation faults" {
+    const a = std.testing.allocator;
+    var payloads: [64][256]u8 = undefined;
+    var cells: [64]scalar.Datum = undefined;
+    for (&payloads, &cells, 0..) |*payload, *cell, i| {
+        @memset(payload, 'a');
+        _ = try std.fmt.bufPrint(payload[0..8], "{d:0>8}", .{i});
+        cell.* = .json(.{ .string = payload });
+    }
+    const source = try arrays.Value.init(.jsonb, &.{.{ .length = cells.len }}, &cells, .{});
+    const Fixture = struct {
+        fn run(backing: A, value: *const arrays.Value) !void {
+            var frame = try Frame.prepare(backing, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(value) }}, .{});
+            defer frame.deinit();
+            var work: arrays.Budget = .{};
+            var index = try arrays.Membership.initFrameOwnedWithBudget(backing, frame.memberships.?.arraySource(0).?, 128 * 1024, &work);
+            defer index.deinit();
+            try std.testing.expectEqual(@as(usize, 64), index.count);
+            try std.testing.expectEqual(@as(?bool, true), try index.equalAny(frame.values[0].array.?.flatCell(63), &work));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{&source});
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&source) }}, .{ .elements = 63 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&source) }}, .{ .work = 100 }));
+    var stale = source;
+    stale.prepared_footprint = 1;
+    var refreshed = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&stale) }}, .{});
+    defer refreshed.deinit();
+    try std.testing.expectEqual(source.prepared_footprint, refreshed.values[0].array.?.prepared_footprint);
+    var zero: @import("numeric_value.zig").Value = .{};
+    var malformed = scalar.Datum.typedArray(&source);
+    malformed.numeric = &zero;
+    try std.testing.expectError(error.SqlTypeMismatch, Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = malformed }}, .{}));
+    cells[63] = .json(.{ .string = "\xff" });
+    try std.testing.expectError(error.SqlInvalidTextEncoding, Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&source) }}, .{}));
+    var work: arrays.Budget = .{};
+    try std.testing.expectError(error.SqlInvalidTextEncoding, arrays.Membership.initBorrowedWithBudget(a, source, .{}, 128 * 1024, &work));
+}
+
+test "SQL frame array capabilities cannot cross rebound parameter registries" {
+    const a = std.testing.allocator;
+    var cells: [64]scalar.Datum = undefined;
+    var other_cells: [64]scalar.Datum = undefined;
+    for (&cells, &other_cells, 0..) |*cell, *other, i| {
+        cell.* = .json(.{ .integer = @intCast(i) });
+        other.* = .json(.{ .integer = @as(i64, @intCast(i)) + 100 });
+    }
+    const source = try arrays.Value.init(.int64, &.{.{ .length = cells.len }}, &cells, .{});
+    const other = try arrays.Value.init(.int64, &.{.{ .length = other_cells.len }}, &other_cells, .{});
+    var first = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(&source) }}, .{});
+    defer first.deinit();
+    var second = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(&other) }}, .{});
+    defer second.deinit();
+    const rebound = first.lookup();
+    var work: arrays.Budget = .{};
+    for (0..32) |_| try std.testing.expectEqual(@as(?bool, true), try rebound.equalAny(0, second.values[0].array.?, second.values, .json(.{ .integer = 163 }), &work));
+    try std.testing.expectEqual(@as(usize, 0), first.memberships.?.slots[0].recent_scans);
+    try std.testing.expectEqual(@as(usize, 0), first.memberships.?.slots[0].build_credit);
+    for (0..32) |_| _ = try first.equalAny(0, first.values[0].array.?, .json(.{ .integer = 63 }), &work);
+    try std.testing.expect(first.memberships.?.slots[0].index != null);
+    try std.testing.expectEqual(@as(?bool, false), try rebound.equalAny(0, second.values[0].array.?, second.values, .json(.{ .integer = 63 }), &work));
+    try std.testing.expect(first.memberships.?.arraySource(1) == null);
+    std.debug.print("SQL_FRAME_LOOKUP handle_bytes={} registry_bound=true\n", .{@sizeOf(Frame.Lookup)});
+}
+
+test "SQL quantified JSONB logical strings preserve identity without row allocations" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "$1 = ANY($2)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{}, &.{ .{ .kind = .json, .element_type = .jsonb }, .{ .kind = .array, .element_type = .jsonb } }, .{});
+    defer program.deinit();
+    const Case = struct { probe: []const u8, element: scalar.Datum, expected: bool };
+    for ([_]Case{
+        .{ .probe = "alpha", .element = .json(.{ .string = "alpha" }), .expected = true },
+        .{ .probe = "123", .element = .json(.{ .string = "123" }), .expected = true },
+        .{ .probe = "null", .element = .json(.null), .expected = false },
+    }) |case| {
+        const array = try arrays.Value.init(.jsonb, &.{.{ .length = 1 }}, &.{case.element}, .{});
+        var frame = try Frame.prepare(a, program.parameter_descriptors, &.{ .{ .datum = .json(.{ .string = case.probe }) }, .{ .datum = .typedArray(&array) } }, .{});
+        defer frame.deinit();
+        var work: arrays.Budget = .{};
+        const direct = try frame.values[1].array.?.quantified(frame.values[0], .eq, .any, &work);
+        try std.testing.expectEqual(@as(?bool, case.expected), direct);
+        const prepared = try program.bindParameters(&frame);
+        const actual = try prepared.evaluate(std.testing.failing_allocator, &.{}, .{});
+        try std.testing.expectEqual(case.expected, actual.value.bool);
+    }
+}
+
+test "SQL quantified UUID cold and warm probes need no row allocations" {
+    const a = std.testing.allocator;
+    var payloads: [32][36]u8 = undefined;
+    var cells: [32]scalar.Datum = undefined;
+    for (&payloads, &cells, 0..) |*payload, *cell, i| {
+        _ = try std.fmt.bufPrint(payload, "00000000-0000-0000-0000-{d:0>12}", .{i});
+        cell.* = .json(.{ .string = payload });
+    }
+    const source = try arrays.Value.init(.uuid, &.{.{ .length = cells.len }}, &cells, .{});
+    var compiled = try @import("compiler.zig").compileScalar(a, "$1 = ANY($2)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{}, &.{ .{ .kind = .uuid, .element_type = .uuid }, .{ .kind = .array, .element_type = .uuid } }, .{});
+    defer program.deinit();
+    var frame = try Frame.prepare(a, program.parameter_descriptors, &.{ .{ .datum = cells[31] }, .{ .datum = .typedArray(&source) } }, .{});
+    defer frame.deinit();
+    const prepared = try program.bindParameters(&frame);
+    // Cold scans and the eventual cached lookup both borrow canonical input.
+    for (0..32) |_| try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{}, .{})).value.bool);
+    try std.testing.expectEqual(@as(u8, 2), frame.memberships.?.slots[1].state.load(.acquire));
+    for (0..1000) |_| try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{}, .{})).value.bool);
+}
+
+test "SQL quantified JSONB strings agree across scans indexes and all comparisons" {
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, comparison: arrays.Comparison, quantifier: arrays.Quantifier };
+    for ([_]Case{
+        .{ .sql = "$1 = ANY($2)", .comparison = .eq, .quantifier = .any },
+        .{ .sql = "$1 <> ALL($2)", .comparison = .ne, .quantifier = .all },
+        .{ .sql = "$1 = ALL($2)", .comparison = .eq, .quantifier = .all },
+        .{ .sql = "$1 <> ANY($2)", .comparison = .ne, .quantifier = .any },
+        .{ .sql = "$1 < ANY($2)", .comparison = .lt, .quantifier = .any },
+        .{ .sql = "$1 <= ALL($2)", .comparison = .le, .quantifier = .all },
+        .{ .sql = "$1 > ALL($2)", .comparison = .gt, .quantifier = .all },
+        .{ .sql = "$1 >= ANY($2)", .comparison = .ge, .quantifier = .any },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+        defer compiled.deinit();
+        var program = try scalar.bindTyped(a, compiled.expression, &.{}, &.{ .{ .kind = .json, .element_type = .jsonb }, .{ .kind = .array, .element_type = .jsonb } }, .{});
+        defer program.deinit();
+        // A long matching tail forces optional index admission; misses, JSON
+        // null, and SQL NULL must keep their ordinary three-valued semantics.
+        for ([_]scalar.Datum{ .json(.{ .string = "123" }), .json(.{ .string = "null" }), .json(.null), .{} }) |probe| {
+            for ([_]usize{ 0, 1, 64 }) |count| {
+                var cells: [64]scalar.Datum = @splat(.json(.{ .string = "alpha" }));
+                if (count != 0) cells[count - 1] = .json(.{ .string = "123" });
+                if (count > 1) cells[0] = .{};
+                const axes: [1]arrays.Dimension = .{.{ .length = @intCast(count) }};
+                const source = try arrays.Value.init(.jsonb, if (count == 0) &.{} else &axes, cells[0..count], .{});
+                var frame = try Frame.prepare(a, program.parameter_descriptors, &.{ .{ .datum = probe }, .{ .datum = .typedArray(&source) } }, .{});
+                defer frame.deinit();
+                var work: arrays.Budget = .{};
+                const expected = try source.quantified(probe, case.comparison, case.quantifier, &work);
+                const prepared = try program.bindParameters(&frame);
+                for (0..64) |_| {
+                    const actual = try prepared.evaluate(std.testing.failing_allocator, &.{}, .{});
+                    if (expected) |value| {
+                        try std.testing.expect(!actual.sql_null);
+                        try std.testing.expectEqual(value, actual.value.bool);
+                    } else try std.testing.expect(actual.sql_null);
+                }
+                if (count == 64 and probe.value == .string and !probe.sql_null and
+                    ((case.comparison == .eq and case.quantifier == .any) or (case.comparison == .ne and case.quantifier == .all)))
+                    try std.testing.expectEqual(@as(u8, 2), frame.memberships.?.slots[1].state.load(.acquire));
+            }
+        }
+    }
 }
