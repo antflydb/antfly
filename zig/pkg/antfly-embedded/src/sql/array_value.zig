@@ -688,11 +688,7 @@ pub fn validateElement(kind: ElementType, element: Element, budget: *Budget) !vo
         .uuid => {
             if (value != .string or value.string.len != 36) return error.SqlTypeMismatch;
             try budget.consume(value.string.len);
-            for (value.string, 0..) |byte, index| {
-                if (index == 8 or index == 13 or index == 18 or index == 23) {
-                    if (byte != '-') return error.SqlTypeMismatch;
-                } else if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.SqlTypeMismatch;
-            }
+            if (!@import("../common/uuid.zig").isCanonical(value.string)) return error.SqlTypeMismatch;
         },
         .int16, .int32, .int64 => {
             if (value != .integer) return error.SqlTypeMismatch;

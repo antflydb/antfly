@@ -1408,3 +1408,95 @@ test "SQL frame array capabilities cannot cross rebound parameter registries" {
     try std.testing.expect(first.memberships.?.arraySource(1) == null);
     std.debug.print("SQL_FRAME_LOOKUP handle_bytes={} registry_bound=true\n", .{@sizeOf(Frame.Lookup)});
 }
+
+test "SQL quantified JSONB logical strings preserve identity without row allocations" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "$1 = ANY($2)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{}, &.{ .{ .kind = .json, .element_type = .jsonb }, .{ .kind = .array, .element_type = .jsonb } }, .{});
+    defer program.deinit();
+    const Case = struct { probe: []const u8, element: scalar.Datum, expected: bool };
+    for ([_]Case{
+        .{ .probe = "alpha", .element = .json(.{ .string = "alpha" }), .expected = true },
+        .{ .probe = "123", .element = .json(.{ .string = "123" }), .expected = true },
+        .{ .probe = "null", .element = .json(.null), .expected = false },
+    }) |case| {
+        const array = try arrays.Value.init(.jsonb, &.{.{ .length = 1 }}, &.{case.element}, .{});
+        var frame = try Frame.prepare(a, program.parameter_descriptors, &.{ .{ .datum = .json(.{ .string = case.probe }) }, .{ .datum = .typedArray(&array) } }, .{});
+        defer frame.deinit();
+        var work: arrays.Budget = .{};
+        const direct = try frame.values[1].array.?.quantified(frame.values[0], .eq, .any, &work);
+        try std.testing.expectEqual(@as(?bool, case.expected), direct);
+        const prepared = try program.bindParameters(&frame);
+        const actual = try prepared.evaluate(std.testing.failing_allocator, &.{}, .{});
+        try std.testing.expectEqual(case.expected, actual.value.bool);
+    }
+}
+
+test "SQL quantified UUID cold and warm probes need no row allocations" {
+    const a = std.testing.allocator;
+    var payloads: [32][36]u8 = undefined;
+    var cells: [32]scalar.Datum = undefined;
+    for (&payloads, &cells, 0..) |*payload, *cell, i| {
+        _ = try std.fmt.bufPrint(payload, "00000000-0000-0000-0000-{d:0>12}", .{i});
+        cell.* = .json(.{ .string = payload });
+    }
+    const source = try arrays.Value.init(.uuid, &.{.{ .length = cells.len }}, &cells, .{});
+    var compiled = try @import("compiler.zig").compileScalar(a, "$1 = ANY($2)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{}, &.{ .{ .kind = .uuid, .element_type = .uuid }, .{ .kind = .array, .element_type = .uuid } }, .{});
+    defer program.deinit();
+    var frame = try Frame.prepare(a, program.parameter_descriptors, &.{ .{ .datum = cells[31] }, .{ .datum = .typedArray(&source) } }, .{});
+    defer frame.deinit();
+    const prepared = try program.bindParameters(&frame);
+    // Cold scans and the eventual cached lookup both borrow canonical input.
+    for (0..32) |_| try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{}, .{})).value.bool);
+    try std.testing.expectEqual(@as(u8, 2), frame.memberships.?.slots[1].state.load(.acquire));
+    for (0..1000) |_| try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{}, .{})).value.bool);
+}
+
+test "SQL quantified JSONB strings agree across scans indexes and all comparisons" {
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, comparison: arrays.Comparison, quantifier: arrays.Quantifier };
+    for ([_]Case{
+        .{ .sql = "$1 = ANY($2)", .comparison = .eq, .quantifier = .any },
+        .{ .sql = "$1 <> ALL($2)", .comparison = .ne, .quantifier = .all },
+        .{ .sql = "$1 = ALL($2)", .comparison = .eq, .quantifier = .all },
+        .{ .sql = "$1 <> ANY($2)", .comparison = .ne, .quantifier = .any },
+        .{ .sql = "$1 < ANY($2)", .comparison = .lt, .quantifier = .any },
+        .{ .sql = "$1 <= ALL($2)", .comparison = .le, .quantifier = .all },
+        .{ .sql = "$1 > ALL($2)", .comparison = .gt, .quantifier = .all },
+        .{ .sql = "$1 >= ANY($2)", .comparison = .ge, .quantifier = .any },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+        defer compiled.deinit();
+        var program = try scalar.bindTyped(a, compiled.expression, &.{}, &.{ .{ .kind = .json, .element_type = .jsonb }, .{ .kind = .array, .element_type = .jsonb } }, .{});
+        defer program.deinit();
+        // A long matching tail forces optional index admission; misses, JSON
+        // null, and SQL NULL must keep their ordinary three-valued semantics.
+        for ([_]scalar.Datum{ .json(.{ .string = "123" }), .json(.{ .string = "null" }), .json(.null), .{} }) |probe| {
+            for ([_]usize{ 0, 1, 64 }) |count| {
+                var cells: [64]scalar.Datum = @splat(.json(.{ .string = "alpha" }));
+                if (count != 0) cells[count - 1] = .json(.{ .string = "123" });
+                if (count > 1) cells[0] = .{};
+                const axes: [1]arrays.Dimension = .{.{ .length = @intCast(count) }};
+                const source = try arrays.Value.init(.jsonb, if (count == 0) &.{} else &axes, cells[0..count], .{});
+                var frame = try Frame.prepare(a, program.parameter_descriptors, &.{ .{ .datum = probe }, .{ .datum = .typedArray(&source) } }, .{});
+                defer frame.deinit();
+                var work: arrays.Budget = .{};
+                const expected = try source.quantified(probe, case.comparison, case.quantifier, &work);
+                const prepared = try program.bindParameters(&frame);
+                for (0..64) |_| {
+                    const actual = try prepared.evaluate(std.testing.failing_allocator, &.{}, .{});
+                    if (expected) |value| {
+                        try std.testing.expect(!actual.sql_null);
+                        try std.testing.expectEqual(value, actual.value.bool);
+                    } else try std.testing.expect(actual.sql_null);
+                }
+                if (count == 64 and probe.value == .string and !probe.sql_null and
+                    ((case.comparison == .eq and case.quantifier == .any) or (case.comparison == .ne and case.quantifier == .all)))
+                    try std.testing.expectEqual(@as(u8, 2), frame.memberships.?.slots[1].state.load(.acquire));
+            }
+        }
+    }
+}

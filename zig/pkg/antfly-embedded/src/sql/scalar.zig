@@ -3504,6 +3504,10 @@ const Evaluator = struct {
                         const exact_number = probe.numeric != null or array.element_type == .numeric;
                         const element: arrays.Element = if (exact_number) probe else if (probe.sql_null) .{} else if (mixed_number or builtin_cast.floating(array.element_type))
                             try self.castDatumBuiltin(probe, self.program.instructions[call.args[0]].type.element_type, .float64)
+                        else if (array.element_type == .jsonb and self.program.instructions[call.args[0]].type.kind == .json)
+                            // JSONB operands already contain logical JSON. In
+                            // particular, a string is not serialized JSON text.
+                            probe
                         else
                             arrays.Element.json(try self.convert(probe.value, arrayScalarType(array.element_type)));
                         const accepted = if (exact_number) try self.numericQuantified(probe, array.*, compare_op, every.bool) else ordinary: {
@@ -3880,10 +3884,16 @@ const Evaluator = struct {
                 else => error.SqlTypeMismatch,
             },
             .string => .{ .string = try self.formatText(value) },
-            .uuid => if (value == .string) .{ .string = @import("../common/uuid.zig").canonicalAlloc(self.alloc, value.string) catch |err| switch (err) {
-                error.InvalidUuid => return error.SqlTypeMismatch,
-                else => return err,
-            } } else error.SqlTypeMismatch,
+            .uuid => if (value == .string) blk: {
+                // Canonical inputs borrow their existing lifetime, as TEXT
+                // identity conversion does. Still validate generic backend
+                // rows rather than trusting their declared UUID type.
+                const uuid = @import("../common/uuid.zig");
+                if (uuid.isCanonical(value.string)) break :blk value;
+                const canonical = uuid.format(uuid.parse(value.string) catch return error.SqlTypeMismatch);
+                try self.charge(canonical.len);
+                break :blk .{ .string = try self.alloc.dupe(u8, &canonical) };
+            } else error.SqlTypeMismatch,
             .datetime => blk: {
                 if (value != .string) return error.SqlTypeMismatch;
                 const ns = datetime.parseDateTimeToNs(value.string) orelse return error.InvalidSqlDateTime;
@@ -6904,4 +6914,55 @@ test "SQL native constant membership borrows a source larger than index headroom
     try std.testing.expect(index.budget.peak <= 2048);
     try std.testing.expect((try program.evaluate(std.testing.failing_allocator, &.{.json(.{ .string = &payload })}, &.{}, .{})).value.bool);
     try std.testing.expect(!(try program.evaluate(std.testing.failing_allocator, &.{.json(.{ .string = "missing" })}, &.{}, .{})).value.bool);
+}
+
+test "SQL quantified generic UUID rows preserve normalization validation and quotas" {
+    const a = std.testing.allocator;
+    const canonical = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+    var compiled = try @import("compiler.zig").compileScalar(a, "id = ANY(items)", .{});
+    defer compiled.deinit();
+    var program = try bindTyped(a, compiled.expression, &.{ .{ .name = "id", .type = .uuid, .element_type = .uuid }, .{ .name = "items", .type = .array, .element_type = .uuid } }, &.{}, .{});
+    defer program.deinit();
+    // Backend column types do not prove that the payload was normalized.
+    const source = try arrays.Value.init(.uuid, &.{.{ .length = 1 }}, &.{.json(.{ .string = canonical })}, .{});
+    const cells: [2]Datum = .{ .json(.{ .string = canonical }), .typedArray(&source) };
+    try std.testing.expect((try program.evaluate(std.testing.failing_allocator, &cells, &.{}, .{ .output_bytes = 8 })).value.bool);
+    for ([_][]const u8{ "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11", "{a0eebc999c0b4ef8bb6d6bb9bd380a11}" }) |input| {
+        const row: [2]Datum = .{ .json(.{ .string = input }), .typedArray(&source) };
+        var buffer: [36]u8 = undefined;
+        var arena = std.heap.FixedBufferAllocator.init(&buffer);
+        try std.testing.expect((try program.evaluate(arena.allocator(), &row, &.{}, .{})).value.bool);
+        try std.testing.expectEqual(@as(usize, 36), arena.end_index);
+        try std.testing.expectError(error.OutOfMemory, program.evaluate(std.testing.failing_allocator, &row, &.{}, .{}));
+        try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.failing_allocator, &row, &.{}, .{ .output_bytes = 35 }));
+    }
+    for ([_][]const u8{ "bad", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1z" }) |input|
+        try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(std.testing.failing_allocator, &.{ .json(.{ .string = input }), .typedArray(&source) }, &.{}, .{}));
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.expectError(error.Canceled, program.evaluate(std.testing.failing_allocator, &cells, &.{}, .{ .checkpoint = Cancel.check }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.failing_allocator, &cells, &.{}, .{ .steps = 0 }));
+}
+
+test "SQL quantified JSONB compatibility inputs are logical while text casts still parse" {
+    const a = std.testing.allocator;
+    const source = try arrays.Value.init(.jsonb, &.{.{ .length = 1 }}, &.{.json(.{ .string = "alpha" })}, .{});
+    for ([_][]const u8{ "$1 = ANY(items)", "needle = ANY(items)", "needle::jsonb = ANY(items)" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bindTyped(a, compiled.expression, &.{ .{ .name = "needle", .type = .json, .element_type = .jsonb }, .{ .name = "items", .type = .array, .element_type = .jsonb } }, &.{.{ .kind = .json, .element_type = .jsonb }}, .{});
+        defer program.deinit();
+        try std.testing.expect((try program.evaluate(std.testing.failing_allocator, &.{ .json(.{ .string = "alpha" }), .typedArray(&source) }, &.{.{ .string = "alpha" }}, .{})).value.bool);
+    }
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle::jsonb = ANY(items)", .{});
+    defer compiled.deinit();
+    var program = try bindTyped(a, compiled.expression, &.{ .{ .name = "needle", .type = .string, .element_type = .text }, .{ .name = "items", .type = .array, .element_type = .jsonb } }, &.{}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expect((try program.evaluate(arena.allocator(), &.{ .json(.{ .string = "\"alpha\"" }), .typedArray(&source) }, &.{}, .{})).value.bool);
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, program.evaluate(arena.allocator(), &.{ .json(.{ .string = "alpha" }), .typedArray(&source) }, &.{}, .{}));
 }
