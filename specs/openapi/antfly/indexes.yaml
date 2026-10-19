@@ -173,6 +173,21 @@ components:
         value:
           type: string
           minLength: 1
+    EnrichmentProducerConfig:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [copy, generator, extractor, decision, reader, transcriber, document_extraction]
+        config:
+          description: Producer-specific configuration. Generator schemas and generated extractors share constrained output admission, batching, validation retry, and immutable artifact replay.
+          anyOf:
+            - $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGeneratorProducerConfig'
+            - $ref: '../ai/extraction.yaml#/components/schemas/GeneratedExtractorConfig'
+            - type: object
+              additionalProperties: true
     GraphArtifactProducerConfig:
       type: object
       additionalProperties: false
@@ -187,8 +202,8 @@ components:
         content_type: { type: string }
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
         producer:
-          type: object
-          additionalProperties: true
+          allOf:
+            - $ref: '#/components/schemas/EnrichmentProducerConfig'
           writeOnly: true
           description: "Write-only producer configuration. Cannot be combined with producer_json."
         producer_json:
@@ -351,6 +366,7 @@ components:
         fusion_prior: { type: number, format: double, minimum: 0, maximum: 1 }
         fusion_prior_weight: { type: number, format: double, minimum: 0 }
         min_confidence:
+          x-go-type-skip-optional-pointer: false
           type: number
           format: double
           minimum: 0
@@ -360,7 +376,9 @@ components:
             confidence is below this are never resolved — no canonical entity
             key, no mention edge, and relation endpoints referencing them are
             withheld. The cheap post-extraction junk filter for
-            score-carrying extractors; 0 (the default) admits everything.
+            score-carrying extractors; omission defaults to 0 for trained extractors.
+            Resolvers consuming verdict-only generated extraction must set this
+            field explicitly, including when the chosen floor is zero.
         config_generation: { type: integer, format: uint64, minimum: 0 }
     GraphResolverSuppressionConfig:
       type: object
@@ -400,13 +418,13 @@ components:
       properties:
         decider:
           $ref: "config.yaml#/components/schemas/DeciderConfig"
-          description: Frozen provider configuration. Requires decision_method=typed.
+          description: Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
         template:
           type: string
           minLength: 1
           maxLength: 65536
           description: >-
-            Bounded interpolation of m.text, m.canonical_text, m.label,
+            Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label,
             m.description, c.canonical_name, c.label and c.description.
             Missing descriptions render empty text, allowing name-only decisions.
         question:
@@ -671,6 +689,8 @@ components:
       properties:
         name: { type: string }
         kind: { $ref: "#/components/schemas/EnrichmentKind" }
+        source: { $ref: "#/components/schemas/GroupedArtifactSource" }
+        prior_context: { $ref: "#/components/schemas/PriorArtifactContext" }
         field: { type: string }
         template: { type: string }
         source_artifact_name: { type: string }
@@ -845,6 +865,7 @@ components:
         - chunk
         - asset
         - embedding
+        - group
       description: "Managed generated artifact kind."
     ExecutionPolicy:
       type: object
@@ -891,6 +912,12 @@ components:
           description: "Stable generated artifact name."
         kind:
           $ref: "#/components/schemas/EnrichmentKind"
+        source:
+          $ref: '#/components/schemas/GroupedArtifactSource'
+          description: Required for kind=group. The covering membership index and ordinary unit artifacts are maintained from source row commits.
+        prior_context:
+          $ref: '#/components/schemas/PriorArtifactContext'
+          description: Bounded earlier-segment context from an artifact sharing the same grouped source. Only valid for prompt-consuming asset producers.
         field:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -942,8 +969,8 @@ components:
           type: string
           description: "Produced asset content type for asset enrichments."
         producer:
-          type: object
-          additionalProperties: true
+          allOf:
+            - $ref: '#/components/schemas/EnrichmentProducerConfig'
           writeOnly: true
           description: "Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle."
         producer_json:
@@ -962,6 +989,75 @@ components:
         transcriber:
           $ref: "#/components/schemas/TranscriberEnrichmentConfig"
           description: "Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json."
+    GroupedArtifactSource:
+      type: object
+      additionalProperties: false
+      required: [group_by, order_by, field]
+      properties:
+        group_by:
+          type: string
+          minLength: 1
+        order_by:
+          type: string
+          minLength: 1
+          description: Field containing an integer ordinal. Ties use the document key.
+        segment_by:
+          type: string
+          minLength: 1
+        field:
+          type: string
+          minLength: 1
+        filter:
+          type: object
+          additionalProperties: true
+          description: Canonical row filter evaluated on the source projection.
+        max_bytes:
+          type: integer
+          minimum: 1
+          maximum: 4194304
+          default: 32768
+          description: UTF-8 text bytes per unit, including joining newlines. An oversized single member fails explicitly.
+        max_members:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 1024
+          description: Maximum members per unit; larger partitions emit multiple units.
+        window_ordinals:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 128
+          description: Fixed ordinal cells bound repartitioning and incremental work for long groups.
+    PriorArtifactContext:
+      type: object
+      additionalProperties: false
+      required: [artifact, render]
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: Artifact providing earlier items, including this producer's own artifact.
+        render:
+          type: string
+          minLength: 1
+          description: Template rendered for each prior item, newest first.
+        max_items:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 40
+        max_bytes:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          default: 16384
+        horizon_segments:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 8
+          description: Earlier segments available for context and the maximum later segments invalidated by an original source change. Recomputed outputs never extend that interval.
     EnrichmentNeighborContextConfig:
       type: object
       additionalProperties: false
