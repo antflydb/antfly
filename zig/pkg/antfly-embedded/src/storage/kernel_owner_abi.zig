@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 80;
+pub const abi_version: u32 = 81;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -598,6 +598,8 @@ pub const MetadataProjectionKind = enum(u32) {
     lake_index_lifecycle_work = 67,
     resolver_namespace_work = 68,
     resolver_namespace_replacement_matches = 69,
+    resolver_catalog_read = 70,
+    resolver_projection_valid = 71,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };

@@ -2009,6 +2009,7 @@ pub const StatusSource = struct {
         supports_query_definitions: bool = false,
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
+        supports_resolver_catalog_read: bool = false,
         acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
@@ -2732,6 +2733,7 @@ pub const StatusSource = struct {
             .system_catalog = Gen.systemCatalog,
             .supports_query_definitions = true,
             .supports_object_tables = true,
+            .supports_resolver_catalog_read = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .control_snapshot = if (@hasDecl(T, "controlSnapshot")) Gen.controlSnapshot else null,
@@ -21475,6 +21477,7 @@ pub const ApiHttpServer = struct {
         request.indexes_json = derived_indexes_json;
         @import("antfly_local_sources").api_local_tables.validateLakeIndexCapacity(self.alloc, supported_schema, derived_indexes_json) catch return contextualJsonErrorResponse(self.alloc, 400, "lake index declaration limit exceeded");
         self.createNativeOrLegacyTable(logical_name, table_name, request, authenticated_identity) catch |err| return switch (err) {
+            error.ResolverCurationConflict => try contextual_operations.textAlloc(self.alloc, 409, "resolver configuration conflicts with the destination namespace"),
             error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => contextualWitnessDDLError(self.alloc, err),
             error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.InvalidCatalogName, error.InvalidCatalogMutation, error.CatalogCommandTooLarge, error.Forbidden => try contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err)),
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
@@ -58079,11 +58082,14 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         owned: [2]?[]u8 = .{ null, null },
         commits: u64 = 0,
         expire_wait: bool = false,
+        narrow_reads: usize = 0,
+        forbid_snapshot: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
         fn snapshot(ptr: *anyopaque, context: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbid_snapshot) return error.UnexpectedFullCatalogRead;
             if (self.expire_wait and context.deadline_ns != null) {
                 const remaining = (try context.remainingTimeoutMs()).?;
                 try std.testing.io.sleep(.fromMilliseconds(@as(i64, remaining) + 1), .awake);
@@ -58107,6 +58113,26 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             self.tables[slot].indexes_json = bytes;
             self.commits += 1;
             return .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .term = 1, .index = self.commits };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            if (call != .resolver_catalog_read) return error.UnexpectedCatalogRead;
+            self.narrow_reads += 1;
+            const input = call.resolver_catalog_read;
+            const wire = @import("../metadata/resolver_catalog_read.zig");
+            const table = if (std.mem.eql(u8, input.table_name, "entities")) self.tables[1] else self.tables[0];
+            return std.json.Stringify.valueAlloc(a, wire.Page{
+                .version = 1,
+                .revision = self.commits,
+                .table = table,
+                .consumers = if (input.mode == .consumers) &.{.{ .table = self.tables[0], .names = &.{"concepts"} }} else &.{},
+                .next_cursor = if (input.mode == .consumers and input.cursor == null) "next" else null,
+                .indexed = true,
+            }, .{});
+        }
+        fn narrowIface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .replace_table_definition_stamped = replace, .system_catalog = catalog, .supports_resolver_catalog_read = true } };
         }
         fn iface(self: *@This()) StatusSource {
             return .{ .ptr = self, .vtable = &.{ .status = status, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .replace_table_definition_stamped = replace } };
@@ -58167,6 +58193,15 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     const keys = scoped.value.object.get("results").?.array.items[0].object.get("curation").?.object.get("suppress").?.object.get("keys").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), keys.len);
     try std.testing.expectEqualStrings("concept/noise", keys[0].string);
+    // The production read path never clones the catalog, even while polling
+    // consumer progress. Duplicate source edges across pages are folded once.
+    source.forbid_snapshot = true;
+    server.source = source.narrowIface();
+    try Run.call(&server, .entity_suppress, "entities", "", "concept/scoped", "{}", 202);
+    try Run.call(&server, .entity_redirects, "entities", "", "concept/scoped", "", 200);
+    try std.testing.expect(source.narrow_reads >= 7);
+    server.source = source.iface();
+    source.forbid_snapshot = false;
     // The authoritative CAS succeeds before the clipped observation expires.
     source.expire_wait = true;
     const before_wait = source.commits;

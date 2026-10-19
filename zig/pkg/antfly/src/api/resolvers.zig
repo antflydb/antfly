@@ -347,13 +347,13 @@ pub fn handle(server: anytype, alloc: std.mem.Allocator, op: Operation, table_na
 }
 
 fn executeWithRetry(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name: []const u8, resolver_name: []const u8, key: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
-    const entity_mutation = op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress;
+    const entity_request = op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress;
     var attempts: u8 = 0;
     while (true) {
         return execute(server, alloc, op, table_name, resolver_name, key, body, query, request) catch |err| {
             // These errors certify that the catalog CAS did not commit. Take
             // a fresh adoption cut, preserving any client expected_revision.
-            if (entity_mutation and attempts < 2 and (err == error.TableLifecycleConflict or err == error.TableGenerationChanged)) {
+            if (entity_request and attempts < 2 and (err == error.TableLifecycleConflict or err == error.TableGenerationChanged or err == error.CatalogGenerationChanged)) {
                 attempts += 1;
                 continue;
             }
@@ -367,13 +367,22 @@ pub fn failureStatus(err: anyerror) u16 {
         error.TableNotFound, error.ResolverNotFound, error.NotFound => 404,
         error.Forbidden, error.RowPolicyAuthenticationRequired, error.RowPolicyUnsupported, error.RowPolicyCatalogChanged => 403,
         error.Busy, error.WriterLocked, error.CapacityExhausted, error.ResourceBudgetExceeded => 429,
-        error.Conflict, error.ResolverCurationConflict, error.ResolverNamespaceMigrationConflict, error.ResolverNamespaceCurationRequired, error.TableGenerationChanged, error.TableLifecycleConflict, error.TableTransitionActive, error.ObjectTableDefinitionConflict => 409,
+        error.Conflict, error.ResolverCurationConflict, error.ResolverNamespaceMigrationConflict, error.ResolverNamespaceCurationRequired, error.TableGenerationChanged, error.CatalogGenerationChanged, error.TableLifecycleConflict, error.TableTransitionActive, error.ObjectTableDefinitionConflict => 409,
         error.GroupLeaderUnavailable, error.HttpExecutorUnavailable, error.MetadataMutationOutcomeUnknown, error.StorageUnavailable, error.UnknownGroup, error.NotLeader, error.LeaderUnavailable, error.ProposalDropped, error.Unavailable => 503,
         error.ResolverIdentityActive => 409,
         error.UnsupportedOperation, error.MethodNotAllowed => 405,
         error.InvalidCharacter, error.InvalidPadding, error.InvalidLength, error.InvalidResolverDistinctPair, error.InvalidResolverCurationRequest, error.InvalidResolverSuppression, error.InvalidResolverCurationKey, error.ResolverCurationLimitExceeded, error.ResolverRedirectExists, error.SuppressedResolverRedirectTarget, error.ResolverDistinctPair, error.InvalidResolverAlias, error.InvalidResolverAliasCycle, error.ResolverMergeNamespaceChange, error.InvalidArgument, error.InvalidResolverCurationVersion, error.SyntaxError, error.UnexpectedToken, error.UnknownField, error.MissingField, error.InvalidNumber, error.Overflow, error.InvalidEnumTag => 400,
         else => 500,
     };
+}
+
+const catalog_read = @import("../metadata/resolver_catalog_read.zig");
+fn readResolverCatalog(server: anytype, a: std.mem.Allocator, input: catalog_read.Request, request: operation.RequestContext) !catalog_read.Page {
+    try request.ensureActive();
+    const bytes = try server.source.systemCatalog(a, request, .{ .resolver_catalog_read = input });
+    const page = try std.json.parseFromSliceLeaky(catalog_read.Page, a, bytes, .{});
+    if (page.version != 1) return error.InvalidCatalogRecord;
+    return page;
 }
 
 fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name: []const u8, resolver_name: []const u8, key: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
@@ -383,6 +392,12 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     defer arena.deinit();
     const a = arena.allocator();
     const entity_mutation = op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress;
+    if (server.source.vtable.supports_resolver_catalog_read and (entity_mutation or op == .entity_redirects)) {
+        const page = try readResolverCatalog(server, a, .{ .table_name = table_name }, request);
+        var scoped = page.snapshot();
+        return entityOperation(server, alloc, a, &scoped, &page.table, op, key, body, request, page.revision);
+    }
+
     const adoption_revision = if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
         var cut = try server.source.linearizableRoutingSnapshot(request.deadline_ns);
         defer server.source.freeRoutingSnapshot(&cut);
@@ -496,30 +511,55 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     const Table = @TypeOf(snapshot.tables[0]);
     const Consumer = struct { table: Table, cfg: Config };
     var consumers: std.ArrayListUnmanaged(Consumer) = .empty;
-    var destinations: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
-    const source_configs = try a.alloc([]const Config, snapshot.tables.len);
-    for (snapshot.tables, source_configs) |source, *all| {
-        all.* = try configs(a, if (source.indexes_json.len == 0) "{}" else source.indexes_json);
-        for (all.*) |cfg| try destinations.put(a, cfg.table, cfg.table);
-    }
-    if (server.source.vtable.system_catalog != null) {
-        const domain = local.system_catalog_domain;
-        var offset: usize = 0;
-        var revision: ?u64 = null;
-        while (offset < destinations.count()) {
-            const end = @min(destinations.count(), offset + 256);
-            const targets = try a.alloc(domain.Target, end - offset);
-            for (destinations.keys()[offset..end], targets) |name, *target| target.* = try domain.Target.parse(name);
-            const reply = try server.source.systemCatalog(a, request, .{ .resolve_many = .{ .targets = targets, .expected_revision = revision } });
-            const bound = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, reply, .{});
-            if (bound.tables.len != targets.len) return error.InvalidCatalogRecord;
-            revision = bound.revision;
-            for (bound.tables, destinations.values()[offset..end]) |target, *name| name.* = if (target) |table| table.name else "";
-            offset = end;
+    var selected: std.ArrayListUnmanaged(Consumer) = .empty;
+    if (server.source.vtable.supports_resolver_catalog_read) {
+        var cursor: ?[]const u8 = null;
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        while (true) {
+            const page = try readResolverCatalog(server, a, .{ .table_name = entity_table.name, .mode = .consumers, .key = key, .expected_revision = adoption_revision, .cursor = cursor }, request);
+            for (page.consumers) |consumer| {
+                if ((try seen.getOrPut(a, consumer.table.table_id)).found_existing) continue;
+                for (try configs(a, consumer.table.indexes_json)) |cfg| {
+                    for (consumer.names) |name| if (std.mem.eql(u8, cfg.name, name)) {
+                        try selected.append(a, .{ .table = consumer.table, .cfg = cfg });
+                        break;
+                    };
+                }
+            }
+            cursor = page.next_cursor;
+            if (cursor == null) break;
         }
+    } else {
+        var destinations: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+        const source_configs = try a.alloc([]const Config, snapshot.tables.len);
+        for (snapshot.tables, source_configs) |source, *all| {
+            all.* = try configs(a, if (source.indexes_json.len == 0) "{}" else source.indexes_json);
+            for (all.*) |cfg| try destinations.put(a, cfg.table, cfg.table);
+        }
+        if (server.source.vtable.system_catalog != null) {
+            const domain = local.system_catalog_domain;
+            var offset: usize = 0;
+            var revision: ?u64 = null;
+            while (offset < destinations.count()) {
+                const end = @min(destinations.count(), offset + 256);
+                const targets = try a.alloc(domain.Target, end - offset);
+                for (destinations.keys()[offset..end], targets) |name, *target| target.* = try domain.Target.parse(name);
+                const reply = try server.source.systemCatalog(a, request, .{ .resolve_many = .{ .targets = targets, .expected_revision = revision } });
+                const bound = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, reply, .{});
+                if (bound.tables.len != targets.len) return error.InvalidCatalogRecord;
+                revision = bound.revision;
+                for (bound.tables, destinations.values()[offset..end]) |target, *name| name.* = if (target) |table| table.name else "";
+                offset = end;
+            }
+        }
+        for (snapshot.tables, source_configs) |source, all| for (all) |cfg| {
+            if (!std.mem.eql(u8, destinations.get(cfg.table).?, entity_table.name) or !curation.keyInNamespace(cfg.key_template, key)) continue;
+            try selected.append(a, .{ .table = source, .cfg = cfg });
+        };
     }
-    for (snapshot.tables, source_configs) |source, all| for (all) |cfg| {
-        if (!std.mem.eql(u8, destinations.get(cfg.table).?, entity_table.name) or !curation.keyInNamespace(cfg.key_template, key)) continue;
+    for (selected.items) |consumer| {
+        const source = consumer.table;
+        const cfg = consumer.cfg;
         try consumers.append(a, .{ .table = source, .cfg = cfg });
         if (!namespaces.contains(cfg.key_template)) try namespaces.put(a, cfg.key_template, .{ .key_template = cfg.key_template, .adoption_revision = adoption_revision, .adoption_standalone = server.cfg.deployment_mode == .standalone });
         // Fold legacy state only once. After adoption, source records are
@@ -531,7 +571,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             const current = namespaces.getPtr(cfg.key_template).?;
             current.* = try curation.foldNamespace(a, current.*, cfg);
         }
-    };
+    }
     if (namespaces.count() == 0) return error.ResolverNotFound;
     if (op == .entity_redirects) {
         var states = std.json.Array.init(a);
@@ -582,6 +622,8 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             try projected.validate();
         }
         if (plan.changed or namespace.revision == 0) {
+            namespace.adoption_revision = adoption_revision;
+            namespace.adoption_standalone = server.cfg.deployment_mode == .standalone;
             namespace.state = plan.state;
             namespace.merges = plan.merges;
             namespace.revision = try std.math.add(u64, namespace.revision, 1);
@@ -622,22 +664,28 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
         const scratch = iteration.allocator();
         var observation_request = try request.platformDeadline();
         if (wait != null) observation_request.deadline_ns = @min(observation_request.deadline_ns orelse std.math.maxInt(u64), deadline);
-        var snapshot = (server.source.linearizableSnapshot(observation_request) catch |err| {
+        const scoped = server.source.vtable.supports_resolver_catalog_read;
+        const page: ?catalog_read.Page = if (scoped) readResolverCatalog(server, scratch, .{ .table_name = table_name }, observation_request) catch |err| {
+            try request.ensureActive();
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{} };
+            return err;
+        } else null;
+        var snapshot = if (page) |*value| value.snapshot() else (server.source.linearizableSnapshot(observation_request) catch |err| {
             try request.ensureActive();
             if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{} };
             return err;
         }) orelse return error.TableNotFound;
         const table = tableByName(&snapshot, table_name) catch |err| {
-            server.source.freeAdminSnapshot(&snapshot);
+            if (!scoped) server.source.freeAdminSnapshot(&snapshot);
             return err;
         };
         const observation = sample(server, scratch, &snapshot, table, observation_request, wait != null) catch |err| {
-            server.source.freeAdminSnapshot(&snapshot);
+            if (!scoped) server.source.freeAdminSnapshot(&snapshot);
             try request.ensureActive();
             if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{} };
             return err;
         };
-        server.source.freeAdminSnapshot(&snapshot);
+        if (!scoped) server.source.freeAdminSnapshot(&snapshot);
         var progress = try observation.progress(scratch, cfg, revision);
         if (floor) |target| {
             var observed = false;

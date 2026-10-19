@@ -215,3 +215,77 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft):
     assert api.get(resolver + "/reviews")["reviews"] == []
     api.restart_server()
     assert api.get(resolver + "/reviews")["reviews"] == []
+
+
+@pytest.mark.parametrize("raft", [False, True], ids=["standalone", "raft"])
+def test_namespace_rejects_incompatible_consumer_without_blocking_metadata(
+    request, monkeypatch, raft
+):
+    import requests
+
+    if raft:
+        monkeypatch.setenv("ANTFLY_E2E_STATEFUL_RAFT", "1")
+    api = request.getfixturevalue("stateful_api")
+    suffix = uuid4().hex[:8]
+    destination, source = f"alias_entities_{suffix}", f"alias_source_{suffix}"
+    api.create_table(destination)
+    graph = {
+        "type": "graph",
+        "source": {
+            "artifact": "kg",
+            "format": "extraction_graph",
+            "mention_edge_type": "mentions",
+        },
+        "artifact": {
+            "name": "kg",
+            "kind": "asset",
+            "source": {"type": "field", "value": "kg"},
+            "content_type": "application/json",
+        },
+        "edge_types": [{"name": "mentions"}],
+        "resolvers": [
+            {
+                "name": "concepts",
+                "table": destination,
+                "promote": False,
+                "source_artifact": "kg",
+                "resolution_artifact": "resolved",
+                "key_template": "concept/{{uslug _entity.text}}",
+            }
+        ],
+    }
+    api.create_table(source, indexes={"knowledge": graph})
+    entity = f"/tables/{destination}/entities/{quote('concept/a', safe='')}"
+    merged = api.post(
+        entity + ":merge", {"into": "concept/b", "wait": {"timeout_ms": 5000}}
+    )
+    assert merged["applied"], merged
+    # The projected create must also publish its logical catalog binding and
+    # certify the inherited definition in both metadata implementations.
+    late = f"alias_late_{suffix}"
+    api.create_table(late, indexes={"knowledge": graph})
+    rendered = api.post(
+        f"/tables/{late}/resolvers/concepts:render", {"text": "A", "label": "concept"}
+    )
+    assert rendered["key"] == "concept/b", rendered
+    graph["resolvers"][0]["aliases"] = [{"key": "concept/b", "target": "concept/a"}]
+    with pytest.raises(requests.HTTPError) as rejected:
+        api.create_table(f"alias_rejected_{suffix}", indexes={"knowledge": graph})
+    rejected_response = rejected.value.response
+    assert rejected_response.status_code in (400, 409), (
+        rejected_response.status_code,
+        rejected_response.text,
+        api.debug_logs(),
+    )
+    assert "outcome is unknown" not in rejected_response.text, (
+        rejected_response.text,
+        api.debug_logs(),
+    )
+    api.create_table(f"alias_healthy_{suffix}")
+    assert api.get(entity + "/redirects")["results"][0]["canonical_key"] == "concept/b"
+    if api.supports_restart:
+        api.restart_server()
+        api.create_table(f"alias_after_restart_{suffix}")
+        assert (
+            api.get(entity + "/redirects")["results"][0]["canonical_key"] == "concept/b"
+        )

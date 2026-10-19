@@ -872,6 +872,7 @@ pub const Detail = enum(c_int) {
     unsupported_constrained_probabilities,
     unsupported_constrained_schema,
     unsupported_generated_extraction_schema,
+    resolver_curation_conflict,
 };
 
 pub const Status = extern struct {
@@ -889,6 +890,7 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.ResolverCurationConflict => status(.conflict, .resolver_curation_conflict),
         error.GroupedSourceOwnerChanged => status(.conflict, .grouped_source_owner_changed),
         error.GroupedSourceTopologyUnavailable => status(.unavailable, .grouped_source_topology_unavailable),
         error.AppleIntelligenceProviderUnavailable => status(.unavailable, .apple_intelligence_provider_unavailable),
@@ -1722,6 +1724,7 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .resolver_curation_conflict => "ResolverCurationConflict",
         .grouped_source_owner_changed => "GroupedSourceOwnerChanged",
         .grouped_source_topology_unavailable => "GroupedSourceTopologyUnavailable",
         .apple_intelligence_provider_unavailable => "AppleIntelligenceProviderUnavailable",
@@ -2940,4 +2943,10 @@ test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
     try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
     try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
+}
+
+test "resolver namespace rejection retains its conflict identity across runtime callbacks" {
+    const value = statusFromError(error.ResolverCurationConflict);
+    try std.testing.expectEqual(@backingInt(Code.conflict), value.code);
+    try std.testing.expectEqual(error.ResolverCurationConflict, errorFromStatus(value));
 }

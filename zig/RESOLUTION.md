@@ -1747,6 +1747,20 @@ namespace corrections. Lite retains its local resolver curation contract.
 Namespace projection is read-only; reverse dependency edges change only after
 table admission succeeds, in the same metadata transaction. Updates apply the edge
 set difference, so policy-only replay pages do not rewrite unchanged edges.
+Entity requests read one destination and seek its declared-target consumer index;
+progress polling reads only the source table and its ranges. Consumer pages visit
+at most 16 edges and stop after a 1 MiB source-record budget (one record may be up
+to 8 MiB). Cursors bind the destination identity, entity key, and catalog revision.
+Declared-target edges retain qualified logical names independently of physical
+owner IDs, so destination recreation does not hide existing consumers. Legacy
+catalog discovery uses bounded table pages until the v2 bootstrap is durable.
+Every changed namespace fences its validated consumer cut, including local alias
+edits. Incompatible alias cycles, distinct pins, and suppressed redirect targets
+are rejected before proposal and rechecked before any apply writes. A rejected
+namespace CAS retains one digest and exact Raft term/index per destination, allowing a certified
+retry without treating a committed outcome as retryable; acceptance or deletion
+clears it. Semantic rejection cannot stall metadata apply.
+
 Destination namespace records are private metadata and are excluded from index
 reconciliation and public table/index resources. Owner route discovery shares
 the caller's absolute deadline and cancellation token, including peer-cache
@@ -1758,11 +1772,11 @@ outcome receipt, source replay and ordered marker commit together. Retrying an
 older decision cannot replace a newer override. Public batch JSON cannot submit
 this control. Native/Lite decisions use the same atomic batch and full HA
 mutation stream; HA payload versions 22/23 reject older decoders before apply.
-Metadata protocol 34, data batch protocol 24 and native reader 9
+Metadata protocol 35, data batch protocol 24 and native reader 9
 fence the new state during upgrades.
 
 Native resolver owners retain the full candidate interface through a borrowed,
-layout-checked same-toolchain view (kernel owner ABI 80). Batch catalog bindings,
+layout-checked same-toolchain view (kernel owner ABI 81). Batch catalog bindings,
 bulk reads, generated adjudication, model revisions, descriptions, and caches
 survive the boundary. Batch leases and callback error identities retain their
 originating owner. Resolver review entry points dispatch through the storage

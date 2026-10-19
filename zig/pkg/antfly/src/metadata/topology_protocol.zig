@@ -63,8 +63,16 @@ const std = @import("std");
 /// relation-owner, logical-binding and metadata-incarnation mutation fence.
 /// Version 34 owns resolver corrections on destination namespaces, maintains
 /// their durable dependency index and applies bounded replay pages.
-pub const current_version: u16 = 34;
-pub const resolver_namespaces_version: u16 = 34;
+/// Version 35 rejects incompatible resolver projection at admission and apply,
+/// and fences every namespace mutation against its validated consumer cut.
+pub const current_version: u16 = 35;
+pub const resolver_namespaces_version: u16 = 35;
+/// Conservative admission over canonical stored JSON, shared by catalog and
+/// direct table writers so neither entry path can bypass the decoder floor.
+pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
+    return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null;
+}
+
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;

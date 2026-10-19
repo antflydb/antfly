@@ -540,6 +540,11 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         return error.InvalidTableDefinitionReplacement;
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        try service.ensureLinearizableReadWithContext(context);
+        if (!try store.resolverProjectionValid(service.alloc, service.metadata_group_id, replacement)) return error.ResolverCurationConflict;
+    }
+
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
         if (replacement.lake_index_catalog_json.len != 0 or expected.lake_index_catalog_json.len != 0) {
             try service.ensureLinearizableReadWithContext(context);
             var arena = std.heap.ArenaAllocator.init(service.alloc);
@@ -607,6 +612,7 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         return error.MetadataMutationOutcomeUnknown;
     };
     defer metadata_table_manager.freeTable(service.alloc, current);
+    if (try store.resolverNamespaceReplacementRejected(service.alloc, service.metadata_group_id, receipt.term, receipt.index, expected, replacement)) return error.TableGenerationChanged;
     if (try store.resolverNamespaceReplacementMatches(service.alloc, service.metadata_group_id, current, replacement)) return .{
         .metadata_group_id = service.metadata_group_id,
         .metadata_incarnation = metadata_incarnation,
@@ -694,6 +700,13 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
     const FakeStore = struct {
         current: metadata_table_manager.TableRecord,
         reads: usize = 0,
+        rejected_index: ?u64 = null,
+        pub fn resolverNamespaceReplacementRejected(self: *@This(), _: std.mem.Allocator, _: u64, term: u64, index: u64, _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !bool {
+            return term == 7 and self.rejected_index == index;
+        }
+        pub fn resolverNamespaceReplacementMatches(_: *@This(), _: std.mem.Allocator, _: u64, current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !bool {
+            return metadata_table_manager.tableDefinitionsEqual(current, replacement);
+        }
 
         fn getTableTransitionFence(
             _: *@This(),
@@ -814,6 +827,12 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
     );
     try std.testing.expectEqual(@as(usize, 1), superseded.wait_calls);
     try std.testing.expectEqual(@as(usize, 1), superseded.store.reads);
+    superseded.store.rejected_index = 19;
+    try std.testing.expectError(error.TableGenerationChanged, replaceTableDefinitionStampedWithReceipt(&superseded, expected, replacement));
+    // A rejection for identical bytes at a different apply position certifies
+    // nothing about this proposal, including after an intervening ABA edit.
+    superseded.store.rejected_index = 20;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, replaceTableDefinitionStampedWithReceipt(&superseded, expected, replacement));
     const guard: relation_catalog.RelationMutationGuard = .{ .target = .{ .name = "idx" }, .logical_table = "logical", .owner = .{ .table_id = expected.table_id, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) };
     const guarded_stamp = try replaceTableDefinitionGuardedWithReceipt(&committed, expected, replacement, guard);
     try std.testing.expectEqual(@as(u64, 19), guarded_stamp.index);
@@ -941,6 +960,11 @@ fn preflightProjectedPlacementWithContextImpl(service: anytype, request: api_ope
 }
 
 fn preflightTableRecordWithContextImpl(service: anytype, request: api_operation.RequestContext, table: metadata_table_manager.TableRecord) !void {
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        try service.ensureLinearizableReadWithContext(request);
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        if (!try store.resolverProjectionValid(service.alloc, service.metadata_group_id, table)) return error.InvalidCreateTableRequest;
+    }
     const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table });
     if (required_version != 0)
         _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
@@ -3407,7 +3431,7 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
     const namespace_indexes = switch (command) {
-        .apply_restore_staging => |bytes| bytes,
+        .apply_restore_staging, .apply_system_catalog => |bytes| bytes,
         .upsert_table => |table| table.indexes_json,
         .compare_and_replace_table => |cas| cas.replacement.indexes_json,
         .apply_table_topology => |mutation| switch (mutation) {
@@ -3416,7 +3440,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         else => "",
     };
-    if (std.mem.indexOf(u8, namespace_indexes, "_resolver_namespaces") != null or std.mem.indexOf(u8, namespace_indexes, "namespace_owned") != null or std.mem.indexOf(u8, namespace_indexes, "resolvers") != null) return metadata_topology_protocol.resolver_namespaces_version;
+    if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
     switch (command) {
         .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| for (delta.upsert_tables) |table| {
             if (transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }) >= metadata_topology_protocol.resolver_namespaces_version) return metadata_topology_protocol.resolver_namespaces_version;
@@ -13229,6 +13253,7 @@ test "metadata service reallocation barrier requires a current protocol from the
 test "metadata table topology protocol fences namespace writers and restored declarations" {
     const version = metadata_topology_protocol.resolver_namespaces_version;
     const table: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "source", .indexes_json = "{\"knowledge\":{\"resolvers\":[]}}" };
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"topology\":{\"create\":{\"table\":{\"indexes_json\":\"{\\\"resolvers\\\":[]}\"}}}}" }));
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } }));
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));

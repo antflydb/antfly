@@ -826,6 +826,9 @@ const LocalStandaloneMetadata = struct {
         committed: bool = false,
 
         fn upsertTable(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, table: antfly.metadata.TableRecord) !void {
+            if (metadata.lifecycle_store) |store| {
+                if (!try store.resolverProjectionValid(metadata.alloc, group_ids.main_metadata_group_id, table)) return error.ResolverCurationConflict;
+            }
             try self.captureTable(metadata, table.table_id);
             try metadata.manager.upsertTable(table);
         }
@@ -1077,6 +1080,7 @@ const LocalStandaloneMetadata = struct {
                 .status = status,
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
+                .supports_resolver_catalog_read = true,
                 .supports_object_tables = true,
                 .acquire_join_planning = acquireJoinPlanning,
                 .admin_snapshot = catalogAdminSnapshot,
@@ -2582,6 +2586,12 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            .resolver_catalog_read => |input| {
+                _ = try self.ensureNativeOwnerBindingLocked();
+                var read = input;
+                read.standalone = true;
+                return self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, read);
+            },
             .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,

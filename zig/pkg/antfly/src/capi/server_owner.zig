@@ -2060,6 +2060,20 @@ pub fn metadataApplyStoreProjection(
             defer handle.store.freeRanges(alloc, value.ranges);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .resolver_catalog_read => blk: {
+            const Read = @import("../metadata/resolver_catalog_read.zig").Request;
+            var parsed = std.json.parseFromSlice(Read, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const value = handle.store.resolverCatalogRead(alloc, request.group_id, parsed.value) catch |err| break :blk storageOwnerStatusFromError(err);
+            out_json.* = .{ .ptr = value.ptr, .len = @intCast(value.len) };
+            break :blk .ok;
+        },
+        .resolver_projection_valid => blk: {
+            var parsed = std.json.parseFromSlice(metadata_table_manager.TableRecord, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const value = handle.store.resolverProjectionValid(alloc, request.group_id, parsed.value) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .resolver_namespace_work => blk: {
             if (request.arg0 == 2) {
                 const value = handle.store.pendingResolverNamespaceDrop(alloc, request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -2077,10 +2091,10 @@ pub fn metadataApplyStoreProjection(
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .resolver_namespace_replacement_matches => blk: {
-            const Input = struct { current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord };
+            const Input = struct { current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, term: u64 = 0, index: u64 = 0 };
             var parsed = std.json.parseFromSlice(Input, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
             defer parsed.deinit();
-            const value = handle.store.resolverNamespaceReplacementMatches(alloc, request.group_id, parsed.value.current, parsed.value.replacement) catch |err| break :blk storageOwnerStatusFromError(err);
+            const value = (if (request.arg0 == 1) handle.store.resolverNamespaceReplacementRejected(alloc, request.group_id, parsed.value.term, parsed.value.index, parsed.value.current, parsed.value.replacement) else handle.store.resolverNamespaceReplacementMatches(alloc, request.group_id, parsed.value.current, parsed.value.replacement)) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .catalog_cursor => blk: {
