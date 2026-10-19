@@ -16,6 +16,7 @@
 """Physical-work regressions through the real public embedded boundary."""
 
 from contextlib import closing
+from math import comb
 
 import pytest
 
@@ -4078,6 +4079,40 @@ def test_statistic_cohorts_and_grouped_supports_stay_compressed(graph_db):
         f"WITH paths AS (SELECT n,depth FROM {single}) SELECT depth,count(DISTINCT n) FILTER(WHERE depth<0) FROM paths GROUP BY depth ORDER BY depth LIMIT 10"
     )
     assert [[int(value) for value in row] for row in result["rows"]] == [[depth, 0] for depth in range(1, 11)]
+    # Grouped consumers retain one endpoint packet rather than replaying its
+    # keys/predicates and initializing dense reducers for every scalar bin.
+    native_avg = ",".join(f"avg(length(p)*length(p)+{k}*length(p)) AS a{k}" for k in range(32))
+    native_distinct = ",".join(f"count(DISTINCT length(p)+{k}) AS a{k}" for k in range(32))
+    sql_distinct = ",".join(f"count(DISTINCT n+{k}) AS a{k}" for k in range(32))
+    expected_avg = []
+    for depth in range(1, 11):
+        histories = [(h, comb(h, depth - h) * 2**h) for h in range((depth + 1) // 2, depth + 1)]
+        count = sum(weight for _, weight in histories)
+        expected_avg.append(
+            [depth] + [sum((h * h + k * h) * weight for h, weight in histories) / count for k in range(32)]
+        )
+    for language, aggregates, wanted in (
+        ("cypher", native_avg, expected_avg),
+        ("cypher", native_distinct, [[depth] + [depth // 2 + 1] * 32 for depth in range(1, 11)]),
+        ("sql", reducers, expected_avg),
+        ("sql", sql_distinct, [[depth] + [depth // 2 + 1] * 32 for depth in range(1, 11)]),
+    ):
+        result = (
+            db.cypher_json(
+                "g",
+                {
+                    "query": base + f"RETURN b.score AS depth,{aggregates} ORDER BY depth LIMIT 10",
+                    "limits": {"explored_edges": 5000, "intermediate_states": 750000},
+                },
+            )
+            if language == "cypher"
+            else db.sql(f"SELECT depth,{aggregates} FROM {single} GROUP BY depth ORDER BY depth LIMIT 10")
+        )
+        for row, reference in zip(result["rows"], wanted, strict=True):
+            values = (
+                [float(value["value"]) for value in row] if language == "cypher" else [float(value) for value in row]
+            )
+            assert values == pytest.approx(reference, rel=1e-13)
     # Scalar tags must stay aligned across page boundaries and reducer kinds.
     result = db.sql(f"SELECT avg(n*n),min(2*a+b),max(2*a+b),count(DISTINCT n) FROM {relation}")
     assert [float(value) for value in result["rows"][0]] == pytest.approx(
@@ -4180,3 +4215,83 @@ def test_sql_bitmap_arguments_preserve_signed_holes_offsets_and_filters(graph_db
             n = len({cost for cost, d in costs if d == depth})
             expected.append([depth, n, n, n if depth == 3 else 0])
         assert [[int(value) for value in row] for row in result["rows"]] == expected
+
+
+def test_demanded_moment_basis_scales_independently_of_unused_path_axes(graph_db):
+    db = graph_db
+    layers = 68
+    populate_layered_graph(db, layers=layers)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    # Exact independent oracle: routes of h hops reaching depth d choose
+    # d-h double steps and one of two destination nodes at every hop.
+    routes = [sum(comb(h, depth - h) * 2**h for depth in range(h, min(layers, 2 * h) + 1)) for h in range(layers + 1)]
+    for axes in (12, 16):
+        path = "MATCH p=(s:D {id:'start'})" + "".join(
+            f"-[x{i}:R*1..]->" + ("(b:D)" if i == axes - 1 else "()") for i in range(axes)
+        )
+        sql_path = "MATCH p=(s IS D)" + "".join(
+            f"-[x{i} IS R*]->" + ("(b IS D)" if i == axes - 1 else "()") for i in range(axes)
+        )
+        weights = [(h, routes[h] * comb(h - 1, axes - 1)) for h in range(axes, layers + 1)]
+        count = sum(weight for _, weight in weights)
+        # Uniform positive compositions of h into axes segment lengths.
+        expected = [
+            sum(((2 * h * h - (axes - 1) * h) / (axes * (axes + 1))) * weight for h, weight in weights) / count,
+            sum(h * h * weight for h, weight in weights) / count,
+        ]
+        native = db.cypher_json(
+            "g",
+            {
+                "query": path + " RETURN avg(size(x0)*size(x0)),avg(length(p)*length(p))",
+                "limits": {"explored_edges": 1000, "intermediate_states": 400000, "memory_bytes": 32 << 20},
+            },
+        )
+        assert [cell["value"] for cell in native["rows"][0]] == pytest.approx(expected, rel=1e-13)
+        relation = f"GRAPH_TABLE(g {sql_path} WHERE s.id='start' COLUMNS(size(x0) AS a,length(p) AS n)) q"
+        assert db.sql(f"SELECT avg(a*a),avg(n*n) FROM {relation}")["rows"][0] == pytest.approx(expected, rel=1e-13)
+        columns = ",".join(f"size(x{i}) AS s{i}" for i in range(axes))
+        weighted_relation = f"GRAPH_TABLE(g {sql_path} WHERE s.id='start' COLUMNS({columns})) q"
+        for signed in (False, True):
+            coefficients = [(i + 1) * (-1 if signed and i >= axes // 2 else 1) for i in range(axes)]
+            first = sum(coefficients)
+            second = sum(value * value for value in coefficients)
+            expected_square = (
+                sum(
+                    (
+                        ((2 * h * h - (axes - 1) * h) / (axes * (axes + 1)) - h * (h + 1) / (axes * (axes + 1)))
+                        * second
+                        + h * (h + 1) / (axes * (axes + 1)) * first * first
+                    )
+                    * weight
+                    for h, weight in weights
+                )
+                / count
+            )
+            native_cost = "+".join(f"({coefficient}*size(x{i}))" for i, coefficient in enumerate(coefficients))
+            actual = db.cypher_json(
+                "g",
+                {
+                    "query": path + f" WITH {native_cost} AS cost RETURN avg(cost*cost)",
+                    "limits": {"explored_edges": 1000, "intermediate_states": 400000, "memory_bytes": 32 << 20},
+                },
+            )
+            assert actual["rows"][0][0]["value"] == pytest.approx(expected_square, rel=1e-13)
+            sql_cost = "+".join(f"({coefficient}*s{i})" for i, coefficient in enumerate(coefficients))
+            actual = db.sql(f"SELECT avg(({sql_cost})*({sql_cost})) FROM {weighted_relation}")
+            assert actual["rows"][0][0] == pytest.approx(expected_square, rel=1e-13)
+
+
+def test_wide_grouped_projection_retains_only_its_window(graph_db):
+    db = graph_db
+    populate(db, 2000)
+    aggregates = ",".join(f"count(n.score+{k}) AS a{k}" for k in range(32))
+    result = db.cypher_json(
+        "g",
+        {
+            "query": f"MATCH (n:D) RETURN n.score AS key,{aggregates} ORDER BY key DESC SKIP 2 LIMIT 3",
+            "limits": {"memory_bytes": 48 << 20},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
+        [key] + [1] * 32 for key in (1997, 1996, 1995)
+    ]

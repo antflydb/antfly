@@ -420,12 +420,8 @@ pub const NodeCursor = struct {
         const e = self.engine;
         for (try e.projectUnordered(&.{row}, self.query.clauses[1].operation.project.value, false)) |projected| {
             try e.values.output(.{ .map = projected });
-            if (e.statistic_bin) |bin| {
-                if (bin.support) |support| {
-                    try self.appendWeighted(projected, weight, .{ .slot = bin.slot, .support = support });
-                    continue;
-                }
-                try self.appendWeighted(projected, weight, .{ .slot = bin.slot, .value = bin.input });
+            if (e.statistic_packet) |arguments| {
+                try self.appendWeighted(projected, weight, .{ .batch = arguments });
             } else try self.appendWeighted(projected, weight, null);
         }
     }
@@ -1124,7 +1120,7 @@ const Engine = struct {
     statistic_targets: []const SummaryTarget = &.{},
     external_statistic: ?[]const Statistic.Request = null,
     external_statistic_global: bool = false,
-    statistic_bin: ?struct { call: ?*const ast.Expr, slot: usize, input: i64 = 0, support: ?StatisticSupport = null } = null,
+    statistic_packet: ?[]const Statistic.Argument = null,
     moment_input: Row = &.{},
     moment_endpoint: ?[]const u8 = null,
     moment_invariants: std.ArrayList(*const ast.Expr) = .empty,
@@ -1156,7 +1152,7 @@ const Engine = struct {
     join: ?*const Join = null,
     lookups: []Lookup = &.{},
     lookup: ?*Lookup = null,
-    aggregate_overrides: ?[]const AggregateValue = null,
+    aggregate_overrides: ?AggregateOverrides = null,
     projection_overrides: ?struct { items: []const ast.Item, row: Row } = null,
     projection_locals: ?*const @import("expressions.zig").Local = null,
     read_nodes: std.HashMapUnmanaged(v.Identity, ?*const v.Node, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
@@ -1195,7 +1191,7 @@ const Engine = struct {
         if (amount > self.limits.intermediate_states -| self.stats.intermediate_states) return error.CypherStateBudgetExceeded;
         self.stats.intermediate_states += amount;
     }
-    const AggregateValue = struct { expression: *const ast.Expr, value: v.Value };
+    const AggregateOverrides = struct { index: *const std.AutoHashMapUnmanaged(*const ast.Expr, usize), values: []const v.Value };
     fn checkpoint(self: *Engine) !void {
         try self.backend.vtable.checkpoint(self.backend.ptr);
     }
@@ -1223,6 +1219,31 @@ const Engine = struct {
             return output;
         };
         return (try self.bind(row, name, value)).?;
+    }
+    // Projection aliases shadow source bindings. Build this environment once;
+    // repeated replace() retained every growing prefix in the statement arena.
+    fn projectionScope(self: *Engine, source: Row, projected: Row) !Row {
+        const output = try self.a.alloc(v.Entry, source.len + projected.len);
+        @memcpy(output[0..source.len], source);
+        var length = source.len;
+        var positions: std.StringHashMapUnmanaged(usize) = .empty;
+        defer positions.deinit(self.a);
+        try positions.ensureTotalCapacity(self.a, @intCast(output.len));
+        for (source, 0..) |entry, index| {
+            const slot = positions.getOrPutAssumeCapacity(entry.name);
+            if (!slot.found_existing) slot.value_ptr.* = index;
+        }
+        for (projected) |entry| {
+            const slot = positions.getOrPutAssumeCapacity(entry.name);
+            if (slot.found_existing) {
+                output[slot.value_ptr.*].value = entry.value;
+            } else {
+                slot.value_ptr.* = length;
+                output[length] = entry;
+                length += 1;
+            }
+        }
+        return output[0..length];
     }
     const StreamingAggregate = struct {
         function: ast.Function,
@@ -1266,6 +1287,13 @@ const Engine = struct {
             }
             try Engine.chargeWork(engine, support.value.words.len * 2);
             self.count = try addPathCount(self.count, try self.distinct_support.?.add(a, support.value, support.offset));
+        }
+        fn addStatisticBin(self: *StreamingAggregate, engine: *Engine, row: Row, value: i64, weight: Count) !void {
+            const literal: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = value } } };
+            const saved = self.function;
+            self.function.args = &.{&literal};
+            defer self.function = saved;
+            try self.addWeighted(engine, row, weight);
         }
         fn addWeighted(self: *StreamingAggregate, engine: *Engine, row: Row, multiplicity: Count) !void {
             const value = if (self.function.star) v.Value{ .integer = 1 } else try engine.eval(self.function.args[0], row, null);
@@ -1466,26 +1494,55 @@ const Engine = struct {
         const copied = try (v.Value{ .list = key }).clone(a);
         return .{ .key = copied.list, .source = (try (v.Value{ .map = source }).clone(a)).map, .states = states };
     }
+    fn boundedGroupWindow(self: *Engine, projection: ast.Projection) bool {
+        // Invalid/unknown window expressions retain the original late error
+        // order. A proved nonnegative integer window can select incrementally.
+        const limit = self.constant(projection.limit orelse return false, &.{}) orelse return false;
+        if (limit != .integer or limit.integer < 0 or std.math.cast(usize, limit.integer) == null) return false;
+        if (projection.skip) |expression| {
+            const skip = self.constant(expression, &.{}) orelse return false;
+            if (skip != .integer or skip.integer < 0 or std.math.cast(usize, skip.integer) == null) return false;
+            _ = std.math.add(usize, @intCast(skip.integer), @intCast(limit.integer)) catch return false;
+        }
+        return true;
+    }
     fn finishStreamGroups(self: *Engine, groups: []const StreamGroup, calls: []const *const ast.Expr, projection: ast.Projection) ![]const Row {
         var projected: std.ArrayList(Projected) = .empty;
-        const overrides = try self.a.alloc(AggregateValue, calls.len);
+        var window: ?TopK = if (self.boundedGroupWindow(projection)) try TopK.init(self, projection, &.{}) else null;
+        defer if (window) |*top| top.deinit();
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        const retained = self.a;
+        var indices: std.AutoHashMapUnmanaged(*const ast.Expr, usize) = .empty;
+        defer indices.deinit(retained);
+        for (calls, 0..) |expression, index| try indices.put(retained, expression, index);
         const previous = self.aggregate_overrides;
         defer self.aggregate_overrides = previous;
         var unique_rows: DistinctRows = .{};
-        for (groups) |group| {
-            for (overrides, calls, group.states) |*override, expression, state_value| override.* = .{ .expression = expression, .value = try state_value.result().clone(self.a) };
-            self.aggregate_overrides = overrides;
+        for (groups, 0..) |group, sequence| {
+            _ = scratch.reset(.free_all);
+            const evaluation = if (window != null) scratch.allocator() else retained;
+            const eval_scope: ?EvalScope = if (window != null) EvalScope.enter(self, evaluation) else null;
+            defer if (eval_scope) |scope_| scope_.leave(self);
+            const overrides = try self.a.alloc(v.Value, calls.len);
+            for (overrides, group.states) |*override, state_value| override.* = if (window != null) state_value.result() else try state_value.result().clone(retained);
+            self.aggregate_overrides = .{ .index = &indices, .values = overrides };
             const row = try self.a.alloc(v.Entry, projection.items.len);
             for (projection.items, row) |item, *entry| entry.* = .{ .name = item.alias orelse try self.expressionName(item.expression), .value = try self.eval(item.expression, group.source, &.{}) };
-            var scope = group.source;
-            for (row) |entry| scope = try self.replace(scope, entry.name, entry.value);
+            const scope = if (projection.order.len != 0) try self.projectionScope(group.source, row) else group.source;
             if (projection.predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
-            if (projection.distinct and !try unique_rows.accept(self, self.a, row)) continue;
+            if (projection.distinct and !try unique_rows.accept(self, retained, row)) continue;
             const keys = try self.a.alloc(v.Value, projection.order.len);
             for (projection.order, keys) |order, *key| key.* = try self.orderValue(order.expression, projection, row, scope, &.{});
-            try projected.append(self.a, .{ .row = row, .source = group.source, .group = null, .keys = keys });
+            const candidate: Projected = .{ .row = row, .source = group.source, .group = null, .keys = keys, .sequence = sequence };
+            if (window) |*top| {
+                // Projection errors are still evaluated for every group,
+                // including losing candidates and LIMIT 0.
+                try top.acceptProjected(candidate);
+            } else try projected.append(retained, candidate);
         }
         self.aggregate_overrides = previous;
+        if (window) |*top| return top.finish(true);
         try self.sort(projected.items, projection.order);
         const skip = if (projection.skip) |expression| try self.count(expression) else 0;
         const limit = if (projection.limit) |expression| try self.count(expression) else projected.items.len;
@@ -1717,21 +1774,20 @@ const Engine = struct {
             } else if (!fold.has_keys and fold.groups.items[0].source.len == 0) {
                 fold.groups.items[0].source = (try (v.Value{ .map = row }).clone(fold.retained)).map;
             }
-            for (fold.groups.items[found.?].states, 0..) |*accumulator, i| {
-                if (fold.active_calls) |active| if (!active[i]) continue;
-                if (engine.statistic_bin) |bin| {
-                    if (bin.call != fold.calls[i]) continue;
-                    if (bin.support) |support| {
+            if (engine.statistic_packet) |arguments| {
+                for (arguments) |argument| {
+                    if (argument.slot >= fold.calls.len) return error.CypherInvalidBackendPage;
+                    if (fold.active_calls) |active| if (!active[argument.slot]) return error.CypherInvalidBackendPage;
+                    const accumulator = &fold.groups.items[found.?].states[argument.slot];
+                    if (argument.support) |support| {
                         try accumulator.addSupport(engine, support);
-                        continue;
+                    } else {
+                        try accumulator.addStatisticBin(engine, row, argument.value, try fold.weight.multiply(engine.a, argument.weight));
+                        if (argument.extra) |extra| try accumulator.addStatisticBin(engine, row, extra.value, try fold.weight.multiply(engine.a, extra.weight));
                     }
-                    const literal: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = bin.input } } };
-                    const saved = accumulator.function;
-                    accumulator.function.args = &.{&literal};
-                    defer accumulator.function = saved;
-                    try accumulator.addWeighted(engine, row, fold.weight);
-                    continue;
                 }
+            } else for (fold.groups.items[found.?].states, 0..) |*accumulator, i| {
+                if (fold.active_calls) |active| if (!active[i]) continue;
                 if (fold.moment_direct) |direct| if (direct.calls[i]) |input| {
                     try engine.validateMomentInput(input.expression);
                     try accumulator.addMoments(engine, input.kind, input.form, direct.values.part(input.form.field.?), direct.values.count, fold.weight);
@@ -4548,7 +4604,7 @@ const Engine = struct {
     const Statistic = @import("statistic.zig");
     const StatisticSupport = Statistic.SupportInput;
     const StatisticNames = std.StringHashMapUnmanaged(Statistic.Form);
-    const StatisticPlan = struct { kernel: Statistic.Plan, calls: []const *const ast.Expr = &.{}, global: bool = false };
+    const StatisticPlan = struct { kernel: Statistic.Plan, calls: []const *const ast.Expr = &.{}, call_slots: []const usize = &.{}, global: bool = false };
     fn statisticReferences(value: anytype, names: StatisticNames) bool {
         var keys = names.iterator();
         while (keys.next()) |entry| {
@@ -4654,6 +4710,7 @@ const Engine = struct {
         if (statisticReferences(fold.projection.predicate, names) or statisticReferences(fold.projection.order, names)) return null;
         var requests: std.ArrayList(Statistic.Request) = .empty;
         var calls: std.ArrayList(*const ast.Expr) = .empty;
+        var call_slots: std.ArrayList(usize) = .empty;
         var benefit = false;
         for (fold.calls, 0..) |expression, index| {
             if (fold.active_calls) |active| if (!active[index]) continue;
@@ -4669,52 +4726,45 @@ const Engine = struct {
             if (!form.eligible(kind)) return null;
             try requests.append(self.a, .{ .form = form, .kind = kind });
             try calls.append(self.a, expression);
+            try call_slots.append(self.a, index);
             benefit = benefit or statisticBenefit(form, kind, path);
         }
         if (requests.items.len == 0 or (require_benefit and !benefit)) return null;
         var kernel = try Statistic.Plan.init(self.a, requests.items);
         kernel.ptr = self;
         kernel.charge = chargeWork;
-        return .{ .kernel = kernel, .calls = calls.items, .global = !fold.has_keys and global };
-    }
-    fn emitStatisticBin(self: *Engine, row: Row, index: usize, input: i64, weight: Count) !void {
-        return self.emitStatisticInput(row, index, input, null, weight);
-    }
-    fn emitStatisticInput(self: *Engine, row: Row, index: usize, input: i64, support: ?StatisticSupport, weight: Count) !void {
-        if (weight.cap(1) == 0) return;
-        try self.state();
-        const plan = self.statistic_plan.?;
-        const prior = self.statistic_bin;
-        self.statistic_bin = .{ .call = if (plan.calls.len == 0) null else plan.calls[index], .slot = index, .input = input, .support = support };
-        defer self.statistic_bin = prior;
-        if (self.weighted_sink) |sink| return sink.emit(sink.ptr, row, weight);
-        const fold = self.stream_fold.?;
-        const saved = fold.weight;
-        fold.weight = try saved.multiply(fold.retained, weight);
-        defer fold.weight = saved;
-        try fold.add(self, row);
+        return .{ .kernel = kernel, .calls = calls.items, .call_slots = call_slots.items, .global = !fold.has_keys and global };
     }
     fn emitStatistics(self: *Engine, initial: Row, value: Statistic.Value) !void {
         var row = initial;
         for (self.statistic_targets) |target| row = try self.lengthRow(row, target.name, 0);
         const plan = self.statistic_plan.?;
-        for (plan.kernel.requests, 0..) |request, i| switch (request.kind) {
-            .count => try self.emitStatisticBin(row, i, 0, value.count),
-            .min, .max => {
-                const e = value.extreme(plan.kernel, i);
-                const input = std.math.cast(i64, @as(i128, request.form.coefficients[0]) + (if (request.kind == .min) e.min else e.max)) orelse return error.CypherStatisticDeclined;
-                try self.emitStatisticBin(row, i, input, Count.one);
-            },
-            .distinct => try self.emitStatisticInput(row, i, 0, .{ .value = value.support(plan.kernel, i), .offset = request.form.coefficients[0] }, Count.one),
-            .sum, .avg => {
-                const total = try (try value.total(self.a, request.form)).magnitude(self.a);
-                const divided = try total.amount.divRem(self.a, value.count);
-                const q = divided.quotient.exact() orelse return error.CypherNumericOverflow;
-                const low = std.math.cast(i64, if (total.negative) -@as(i128, q) else @as(i128, q)) orelse return error.CypherNumericOverflow;
-                try self.emitStatisticBin(row, i, low, try value.count.difference(self.a, divided.remainder));
-                if (divided.remainder.cap(1) != 0) try self.emitStatisticBin(row, i, std.math.add(i64, low, if (total.negative) -1 else 1) catch return error.CypherNumericOverflow, divided.remainder);
-            },
-        };
+        const arguments = try self.a.alloc(Statistic.Argument, plan.kernel.requests.len);
+        for (plan.kernel.requests, arguments, 0..) |request, *argument, i| {
+            argument.* = .{ .slot = if (plan.call_slots.len == 0) i else plan.call_slots[i] };
+            switch (request.kind) {
+                .count => argument.weight = value.count,
+                .min, .max => {
+                    const e = value.extreme(plan.kernel, i);
+                    argument.value = std.math.cast(i64, @as(i128, request.form.coefficients[0]) + (if (request.kind == .min) e.min else e.max)) orelse return error.CypherStatisticDeclined;
+                },
+                .distinct => argument.support = .{ .value = value.support(plan.kernel, i), .offset = request.form.coefficients[0] },
+                .sum, .avg => {
+                    const total = try (try value.total(self.a, plan.kernel, i)).magnitude(self.a);
+                    const divided = try total.amount.divRem(self.a, value.count);
+                    const q = divided.quotient.exact() orelse return error.CypherNumericOverflow;
+                    argument.value = std.math.cast(i64, if (total.negative) -@as(i128, q) else @as(i128, q)) orelse return error.CypherNumericOverflow;
+                    argument.weight = try value.count.difference(self.a, divided.remainder);
+                    if (divided.remainder.cap(1) != 0) argument.extra = .{ .value = std.math.add(i64, argument.value, if (total.negative) -1 else 1) catch return error.CypherNumericOverflow, .weight = divided.remainder };
+                },
+            }
+        }
+        try self.state();
+        const prior = self.statistic_packet;
+        self.statistic_packet = arguments;
+        defer self.statistic_packet = prior;
+        if (self.weighted_sink) |sink| return sink.emit(sink.ptr, row, Count.one);
+        try self.stream_fold.?.add(self, row);
     }
     const MomentCall = enum { count, sum, avg, min, max };
     const DirectMoment = struct { kind: MomentCall, form: Affine, expression: *const ast.Expr };
@@ -7420,7 +7470,7 @@ const Engine = struct {
         if (expression.value != .variable) if (self.projection_overrides) |overrides| for (overrides.items, overrides.row) |item, entry| {
             if (@import("expressions.zig").same(item.expression, expression) and @import("expressions.zig").unshadowed(expression, self.projection_locals)) return entry.value;
         };
-        if (self.aggregate_overrides) |overrides| for (overrides) |override| if (override.expression == expression) return override.value;
+        if (self.aggregate_overrides) |overrides| if (overrides.index.get(expression)) |index| return overrides.values[index];
         try self.checkpoint();
         return switch (expression.value) {
             .literal => |value| switch (value) {
@@ -8148,13 +8198,16 @@ const Engine = struct {
                 try row.append(engine.a, .{ .name = name, .value = lookup(source, name) orelse return error.UnboundCypherVariable });
             };
             for (self.projection.items) |item| try row.append(engine.a, .{ .name = item.alias orelse try engine.expressionName(item.expression), .value = try engine.eval(item.expression, source, null) });
-            var context = source;
-            for (row.items) |entry| context = try engine.replace(context, entry.name, entry.value);
+            const context = try engine.projectionScope(source, row.items);
             if (self.projection.predicate) |predicate| if ((try (try engine.eval(predicate, context, null)).truth()) != true) return;
             const keys = try engine.a.alloc(v.Value, self.projection.order.len);
             for (self.projection.order, keys) |order, *key| key.* = try engine.eval(order.expression, context, null);
             const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .sequence = self.sequence, .weight = @intCast(weight.cap(self.capacity)), .multiplicity = if (self.projection.limit == null) weight else null };
-            if (self.capacity == 0 or weight.cap(1) == 0) return;
+            return self.acceptProjected(candidate);
+        }
+        fn acceptProjected(self: *TopK, candidate: Projected) !void {
+            const engine = self.engine;
+            if (self.capacity == 0 or candidate.weight == 0) return;
             if (self.projection.limit != null and self.total == self.capacity and try engine.compareProjected(candidate, self.picks.items[0].value, self.projection.order) != .lt) return;
             var pick = try engine.clonePick(candidate);
             var owned = true;

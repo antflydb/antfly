@@ -41,11 +41,33 @@ fn addCellsMasked(context: anytype, bound: *const binding.Bound, grouped: anytyp
 }
 fn addCellsOverridden(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: catalog.Count, active: ?[]const usize, input: ?catalog.AggregateInput) !void {
     if (input) |argument| {
-        if (argument.slot >= bound.inputs.len or active == null or std.mem.indexOfScalar(usize, active.?, argument.slot) == null) return error.InvalidSqlBackendResponse;
+        var licensed = std.StaticBitSet(256).empty;
+        for (active orelse return error.InvalidSqlBackendResponse) |slot| {
+            if (slot >= bound.inputs.len or slot >= 256) return error.InvalidSqlBackendResponse;
+            licensed.set(slot);
+        }
+        if (argument.batch.len == 0) {
+            if (argument.slot >= 256 or !licensed.isSet(argument.slot)) return error.InvalidSqlBackendResponse;
+        } else for (argument.batch) |part| {
+            if (part.slot >= 256 or !licensed.isSet(part.slot) or !part.valid()) return error.InvalidSqlBackendResponse;
+        }
     }
     if (!try bound.input.matchesWithLimits(alloc, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) return;
     const values = try alloc.alloc(Datum, bound.group_count);
     for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
+    if (input) |packet| if (packet.batch.len != 0) {
+        var selected: std.ArrayList(@import("cypher").statistic.Argument) = .empty;
+        for (packet.batch) |argument| {
+            if (bound.filters[argument.slot]) |slot| {
+                const test_value = try context.evaluate(alloc, bound.input.projections[slot].?, cells);
+                if (test_value.sql_null) continue;
+                if (test_value.value != .bool) return error.SqlTypeMismatch;
+                if (!test_value.value.bool) continue;
+            }
+            try selected.append(alloc, argument);
+        }
+        return grouped.addStatistics(values, selected.items, weight);
+    };
     const inputs = try alloc.alloc(Datum, bound.inputs.len);
     for (bound.inputs, bound.filters, inputs, 0..) |index, filter, *value, aggregate_index| {
         value.* = .{};

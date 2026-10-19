@@ -460,9 +460,23 @@ pub const Page = struct {
     pub fn validateWeights(self: Page) !void {
         if (self.aggregate_inputs) |inputs| {
             if (inputs.len != self.rows.len or self.aggregate_slots == null or self.multiplicities == null) return error.InvalidSqlBackendResponse;
+            var licensed = std.StaticBitSet(256).empty;
+            for (self.aggregate_slots.?) |slot| {
+                if (slot >= 256) return error.InvalidSqlBackendResponse;
+                licensed.set(slot);
+            }
             for (inputs) |input| if (input) |argument| {
-                if (std.mem.indexOfScalar(usize, self.aggregate_slots.?, argument.slot) == null) return error.InvalidSqlBackendResponse;
-                if (argument.support) |support| if (!support.valid()) return error.InvalidSqlBackendResponse;
+                if (argument.batch.len != 0) {
+                    if (argument.batch.len > 256 or argument.support != null) return error.InvalidSqlBackendResponse;
+                    var seen = std.StaticBitSet(256).empty;
+                    for (argument.batch) |part| {
+                        if (part.slot >= 256 or !licensed.isSet(part.slot) or seen.isSet(part.slot) or !part.valid()) return error.InvalidSqlBackendResponse;
+                        seen.set(part.slot);
+                    }
+                } else {
+                    if (argument.slot >= 256 or !licensed.isSet(argument.slot)) return error.InvalidSqlBackendResponse;
+                    if (argument.support) |support| if (!support.valid()) return error.InvalidSqlBackendResponse;
+                }
             };
         }
         if (self.multiplicities) |weights| {
@@ -483,7 +497,7 @@ pub const Page = struct {
         const owned = try a.alloc(?AggregateInput, inputs.len);
         errdefer a.free(owned);
         var initialized: usize = 0;
-        errdefer for (owned[0..initialized]) |input| if (input) |argument| if (argument.support) |support| a.free(support.value.words);
+        errdefer for (owned[0..initialized]) |input| if (input) |argument| argument.deinitOwned(a);
         for (inputs, owned) |input, *out| {
             out.* = if (input) |argument| try argument.clone(a) else null;
             initialized += 1;
@@ -1179,4 +1193,53 @@ fn cloneBitmapInputs(a: std.mem.Allocator) !void {
 
 test "SQL bitmap page clones release partially initialized arguments" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneBitmapInputs, .{});
+}
+
+fn cloneStatisticBatch(a: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const big = try Count.parse(arena.allocator(), "1000000000000000000000000000000");
+    var words = [_]u64{5};
+    const Argument = @import("cypher").statistic.Argument;
+    const arguments = [_]Argument{
+        .{ .slot = 1, .value = 3, .weight = big, .extra = .{ .value = 4, .weight = big } },
+        .{ .slot = 7, .support = .{ .value = .{ .words = &words } } },
+    };
+    const inputs = [_]?AggregateInput{.{ .batch = &arguments }};
+    const rows = [_]Row{.{ .id = "r", .version = 0, .value = .null }};
+    var page: Page = .{ .rows = &rows, .multiplicities = &.{1}, .aggregate_slots = &.{ 1, 7 }, .aggregate_inputs = &inputs };
+    try page.validateWeights();
+    const cloned = (try page.cloneAggregateInputs(a)).?;
+    defer a.free(cloned);
+    defer cloned[0].?.deinitOwned(a);
+    words[0] = 0;
+    try std.testing.expectEqual(@as(u64, 5), cloned[0].?.batch[1].support.?.value.words[0]);
+    try std.testing.expectEqual(std.math.Order.eq, cloned[0].?.batch[0].weight.order(big));
+    page.aggregate_slots = &.{1};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+}
+
+test "SQL statistic batches deeply own promoted weights and bitmap arguments" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneStatisticBatch, .{});
+}
+
+test "SQL statistic batches reject duplicate slots and malformed bin/support payloads" {
+    const Argument = @import("cypher").statistic.Argument;
+    var arguments = [_]Argument{ .{ .slot = 0 }, .{ .slot = 0 } };
+    const inputs = [_]?AggregateInput{.{ .batch = &arguments }};
+    const rows = [_]Row{.{ .id = "r", .version = 0, .value = .null }};
+    const page: Page = .{ .rows = &rows, .multiplicities = &.{1}, .aggregate_slots = &.{ 0, 1 }, .aggregate_inputs = &inputs };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    arguments[1].slot = 1;
+    try page.validateWeights();
+    arguments[1].extra = .{ .value = 1, .weight = Count.init(0) };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    arguments[1].extra = .{ .value = 1, .weight = Count.one };
+    arguments[1].support = .{ .value = .{ .words = &.{1} } };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    arguments[1].extra = null;
+    arguments[1].support.?.value.words = &.{0};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    arguments[1].support.?.value.words = &.{1};
+    try page.validateWeights();
 }

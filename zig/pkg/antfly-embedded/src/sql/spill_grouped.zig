@@ -194,18 +194,58 @@ pub const Grouped = struct {
             } else value.* = try @import("aggregate_partial.zig").cell(a, state);
         }
         try self.append(.{ .keys = keys, .values = values, .ordinal = ordinal });
-        for (states, 0..) |state, slot| if (state.distinct) {
-            if (state.distinct_support) |support| {
-                // Each bounded spill record retains one word, never one row
-                // per set bit or an unbounded whole-group bitmap frame.
-                var words = support.words.iterator();
-                while (words.next()) |entry| try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = -1 - @as(i64, @intCast(slot)) }), Datum.json(.{ .integer = entry.key_ptr.* }), Datum.json(.{ .integer = @bitCast(entry.value_ptr.*) }) }, .ordinal = ordinal });
+        for (states, 0..) |state, slot| if (state.distinct) try self.distinctMembers(keys, state, slot, ordinal);
+    }
+    fn distinctMembers(self: *Grouped, keys: []const Datum, state: operators.Aggregate, slot: usize, ordinal: u64) !void {
+        if (state.distinct_support) |support| {
+            // Each bounded spill record retains one word, never one row
+            // per set bit or an unbounded whole-group bitmap frame.
+            var words = support.words.iterator();
+            while (words.next()) |entry| try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = -1 - @as(i64, @intCast(slot)) }), Datum.json(.{ .integer = entry.key_ptr.* }), Datum.json(.{ .integer = @bitCast(entry.value_ptr.*) }) }, .ordinal = ordinal });
+        }
+        for (state.distinct_values.items) |entry| {
+            try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), entry.row.row.values[0] }, .ordinal = ordinal });
+        }
+        if (state.kind == .pattern_set and state.patterns.?.has_null) try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
+    }
+    /// Sparse checkpoints keep slot ownership through spill instead of
+    /// allocating/encoding empty states for every other aggregate column.
+    /// A SQL NULL marker distinguishes them from dense and member records.
+    pub fn partialMapped(self: *Grouped, keys: []const Datum, states: []const operators.Aggregate, slots: []const u16, ordinal: u64) !void {
+        if (states.len == 0 or states.len != slots.len or states.len > self.specs.len) return error.InvalidSqlSpill;
+        if (states.len == self.specs.len and states.len <= 256) {
+            // Complete packets already own every reducer. Reorder borrowed
+            // handles into one dense frame, avoiding repeated keys/framing.
+            var ordered: [256]operators.Aggregate = undefined;
+            var seen = std.StaticBitSet(256).empty;
+            for (states, slots) |state, slot| {
+                if (slot >= states.len or seen.isSet(slot)) return error.InvalidSqlSpill;
+                seen.set(slot);
+                ordered[slot] = state;
             }
-            for (state.distinct_values.items) |entry| {
-                try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), entry.row.row.values[0] }, .ordinal = ordinal });
+            return self.partial(keys, ordered[0..states.len], ordinal);
+        }
+        for (states, slots) |state, slot| {
+            if (slot >= self.specs.len) return error.InvalidSqlSpill;
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var empty: ?operators.Aggregate = null;
+            defer if (empty) |*value| value.deinit();
+            if (state.distinct) {
+                empty = try operators.Aggregate.initTyped(a, state.kind, state.input_type, state.input_element);
+                empty.?.distinct = true;
             }
-            if (state.kind == .pattern_set and state.patterns.?.has_null) try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
-        };
+            const value = try @import("aggregate_partial.zig").cell(a, empty orelse state);
+            try self.append(.{ .keys = keys, .values = &.{ .{}, Datum.json(.{ .integer = slot }), value }, .ordinal = ordinal });
+            if (state.distinct) try self.distinctMembers(keys, state, slot, ordinal);
+        }
+    }
+    fn sparseSlot(self: *Grouped, values: []const Datum) !u16 {
+        if (values.len != 3 or !values[0].sql_null or values[0].value != .null or values[1].sql_null or values[1].value != .integer) return error.InvalidSqlSpill;
+        const slot = std.math.cast(u16, values[1].value.integer) orelse return error.InvalidSqlSpill;
+        if (slot >= self.specs.len) return error.InvalidSqlSpill;
+        return slot;
     }
     pub fn appendPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
         if (cells.len != self.specs.len) return error.InvalidSqlSpill;
@@ -461,10 +501,13 @@ pub const Grouped = struct {
     fn reduceNativeBlock(self: *Grouped, block: *spill.Sequential.OwnedBlock, ordinal_base: u64) !usize {
         if (self.fallback != null or block.count() < 2 or block.count() > 256 or block.width() != self.specs.len + 1) return 0;
         for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) return 0;
-        const partial_state = (try block.cell(0, 0)).value == .bool and (try block.cell(0, 0)).value.bool;
+        const first_marker = try block.cell(0, 0);
+        if (first_marker.sql_null) return 0;
+        const partial_state = first_marker.value == .bool and first_marker.value.bool;
         for (0..block.count()) |row| {
             const marker = try block.cell(row, 0);
-            if (marker.sql_null or marker.value != .bool) return error.InvalidSqlSpill;
+            if (marker.sql_null) return 0;
+            if (marker.value != .bool) return error.InvalidSqlSpill;
             if (marker.value.bool != partial_state) return 0;
         }
         var scratch = std.heap.ArenaAllocator.init(self.a);
@@ -536,9 +579,13 @@ pub const Grouped = struct {
                 for (values, 0..) |*value, column| value.* = try block.cell(lane, column);
                 for (keys, 0..) |*key, column| key.* = try block.keyCell(lane, column);
                 const row: operators.Row = .{ .values = values, .keys = keys, .ordinal = try std.math.add(u64, ordinal_base, block.ordinal(lane)) };
-                if (row.values.len == 0 or row.values[0].value != .bool) return error.InvalidSqlSpill;
-                const partial_state = row.values[0].value.bool;
-                const fits = if (self.fallback != null) false else if (partial_state)
+                if (row.values.len == 0) return error.InvalidSqlSpill;
+                const sparse: ?u16 = if (row.values[0].sql_null) try self.sparseSlot(row.values) else null;
+                if (sparse == null and row.values[0].value != .bool) return error.InvalidSqlSpill;
+                const partial_state = sparse != null or row.values[0].value.bool;
+                const fits = if (self.fallback != null) false else if (sparse) |slot|
+                    try self.local.?.tryImportPartialMapped(row.keys, row.values[2..], &.{slot}, row.ordinal)
+                else if (partial_state)
                     try self.local.?.tryImportPartial(row.keys, row.values[1..], row.ordinal)
                 else
                     self.nativeInputs(row.values[1..]) and try self.local.?.canRetain(row.keys, row.values[1..]);
@@ -703,9 +750,14 @@ pub const Grouped = struct {
                         distinct_ordinal += 1;
                     }
                 }
-            } else if (row.values[0].value != .bool) return error.InvalidSqlSpill else if (row.values[0].value.bool) {
-                if (row.values.len != 1 + states.len) return error.InvalidSqlSpill;
-                for (states, row.values[1..], self.specs, 0..) |*state, value, spec, slot| {
+            } else if (row.values[0].sql_null or (row.values[0].value == .bool and row.values[0].value.bool)) {
+                const sparse: ?u16 = if (row.values[0].sql_null) try self.sparseSlot(row.values) else null;
+                if (sparse == null and row.values.len != 1 + states.len) return error.InvalidSqlSpill;
+                const cells = if (sparse != null) row.values[2..] else row.values[1..];
+                for (cells, 0..) |value, index| {
+                    const slot: usize = if (sparse) |mapped| mapped else index;
+                    const spec = self.specs[slot];
+                    const state = &states[slot];
                     // Decoded checkpoints are temporary: retaining every
                     // incoming bitmap until the group ends defeats spill.
                     var partial_arena = std.heap.ArenaAllocator.init(self.a);
@@ -733,7 +785,7 @@ pub const Grouped = struct {
                     } else try @import("aggregate_partial.zig").merge(state, incoming);
                 }
             } else {
-                if (row.values.len != states.len + 1) return error.InvalidSqlSpill;
+                if (row.values[0].value != .bool or row.values.len != states.len + 1) return error.InvalidSqlSpill;
                 for (states, row.values[1..], self.specs, 0..) |*state, input, spec, slot| {
                     if (bitmapSpec(spec)) {
                         try self.bitmapValue(&bitmap, states, slot, input, &bitmap_ordinal, exact);
@@ -977,7 +1029,10 @@ fn transferredPartitionScenario(a: Allocator, bytes: usize) !void {
                 .{ .alloc = a, .kind = .sum, .input_type = .integer, .count = 1, .integer_sum = if (lane == 0) wide else if (lane == 1) -wide else 7 },
                 .{ .alloc = a, .kind = .count, .input_type = null, .count = 1 },
             };
-            try source.partial(&.{key}, &states, index);
+            if (index % 2 == 0) {
+                try source.partialMapped(&.{key}, states[1..], &.{1}, index);
+                try source.partialMapped(&.{key}, states[0..1], &.{0}, index);
+            } else try source.partial(&.{key}, &states, index);
         }
     }
     var target = try Grouped.init(a, &manager, &specs, 1, bytes);
@@ -1152,6 +1207,8 @@ fn bitmapSpillScenario(backing: Allocator, exact: bool, repeats: usize) !void {
         try states[0].addSupport(.{ .value = .{ .low = -1, .words = &.{0b10101} }, .offset = 10000000000 });
         try states[1].update(Datum.json(.{ .string = "a" }));
         try group.partial(&.{key}, &states, i);
+        try group.partialMapped(&.{key}, &.{ states[1], states[0] }, &.{ 1, 0 }, i);
+        try group.partialMapped(&.{key}, states[0..1], &.{0}, i);
         // Also exercise complete worker checkpoints and ordinary fallback rows.
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();

@@ -3249,3 +3249,19 @@ test "compressed DISTINCT supports merge with ordinary numeric contributions in 
     try check("UNWIND [['c',0],['a',0.0]] AS pair WITH pair[0] AS id,pair[1] AS k MATCH p=(s:Document {id:id})-[:CITES*0..2]->(b) RETURN count(DISTINCT length(p)+k)", "[[3]]");
     try check("UNWIND [['a',0.0],['c',0]] AS pair WITH pair[0] AS id,pair[1] AS k MATCH p=(s:Document {id:id})-[:CITES*0..2]->(b) RETURN count(DISTINCT length(p)+k)", "[[3]]");
 }
+
+test "group windows preserve alias shadowing, stable ties and projection failures" {
+    try check("UNWIND [2,1,3,2,1] AS x RETURN x,count(*) AS n ORDER BY n DESC,x SKIP 1 LIMIT 1", "[[2,2]]");
+    try check("UNWIND [2,1,3,2,1] AS x RETURN x AS y,count(*) AS x ORDER BY x DESC,y SKIP 1 LIMIT 1", "[[2,2]]");
+    for ([_][]const u8{
+        "UNWIND [0,1] AS x RETURN x,count(*)/(1-x) AS n ORDER BY x LIMIT 1",
+        "UNWIND [0,1] AS x RETURN x,count(*)/(1-x) AS n ORDER BY x LIMIT 0",
+        "UNWIND [0,1] AS x RETURN x,count(*)/(1-x) AS n LIMIT -1",
+    }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}

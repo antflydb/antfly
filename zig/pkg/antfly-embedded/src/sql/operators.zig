@@ -1858,6 +1858,82 @@ pub const Grouped = struct {
         self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
     }
 
+    fn statisticBin(a: Allocator, spec: AggregateSpec, value: i64, weight: @import("catalog.zig").Count) !Aggregate {
+        var state = try Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+        errdefer state.deinit();
+        state.distinct = spec.distinct;
+        const input = Datum.json(.{ .integer = value });
+        if (spec.distinct or Aggregate.presenceOnly(spec.kind)) {
+            try state.update(input);
+            return state;
+        }
+        if (weight.exact()) |count| if (count <= std.math.maxInt(i64)) {
+            try state.update(input);
+            if (state.numeric) |reducer| {
+                reducer.state.count = count;
+                reducer.state.nan_count *= count;
+                reducer.state.positive_infinity *= count;
+                reducer.state.negative_infinity *= count;
+                for (reducer.state.buckets.items) |*bucket| bucket.* = std.math.mul(i128, bucket.*, count) catch return error.SqlNumericOutOfRange;
+            }
+            if (spec.kind == .sum and spec.input_type == .integer) state.integer_sum = std.math.mul(i128, state.integer_sum, count) catch return error.SqlNumericOutOfRange;
+            state.count = count;
+            return state;
+        };
+        if (spec.kind == .count) return error.SqlNumericOutOfRange;
+        if (spec.kind != .sum and spec.kind != .avg) return error.InvalidSqlBackendResponse;
+        if (state.numeric) |reducer| {
+            reducer.deinit();
+            a.destroy(reducer);
+            state.numeric = null;
+        }
+        state.wide = try @import("wide_aggregate.zig").State.create(a);
+        try state.wide.?.add(input, weight);
+        state.count = 1;
+        return state;
+    }
+    /// One endpoint/pipeline binding resolves its group once. Only licensed
+    /// reducer slots own partial states; other columns are never initialized.
+    pub fn addStatistics(self: *Grouped, keys: []const Datum, arguments: []const @import("cypher").statistic.Argument, weight: @import("catalog.zig").Count) !void {
+        if (self.failed or self.finished or arguments.len > self.specs.len or weight.cap(1) == 0) return error.InvalidSqlBackendResponse;
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (arguments.len == 0) {
+            // FILTER may reject every argument while the SQL group remains.
+            const inputs = try a.alloc(Datum, self.specs.len);
+            @memset(inputs, .{});
+            return self.addCount(keys, inputs, @import("catalog.zig").Count.one);
+        }
+        const states = try a.alloc(Aggregate, arguments.len);
+        const slots = try a.alloc(u16, arguments.len);
+        var initialized: usize = 0;
+        defer for (states[0..initialized]) |*state| state.deinit();
+        var seen = std.StaticBitSet(256).empty;
+        for (arguments, states, slots) |argument, *state, *slot| {
+            if (argument.slot >= self.specs.len or argument.slot >= 256 or seen.isSet(argument.slot) or !argument.valid()) return error.InvalidSqlBackendResponse;
+            seen.set(argument.slot);
+            slot.* = @intCast(argument.slot);
+            const spec = self.specs[argument.slot];
+            if (argument.support) |support| {
+                state.* = try Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+                initialized += 1;
+                state.distinct = spec.distinct;
+                try state.addSupport(support);
+            } else {
+                state.* = try statisticBin(a, spec, argument.value, try weight.multiply(a, argument.weight));
+                initialized += 1;
+                if (argument.extra) |extra| {
+                    var other = try statisticBin(a, spec, extra.value, try weight.multiply(a, extra.weight));
+                    defer other.deinit();
+                    try @import("aggregate_partial.zig").merge(state, other);
+                }
+            }
+        }
+        try self.importTypedPartialMapped(keys, states, slots, self.source_ordinal orelse self.rows_seen);
+        self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+    }
+
     pub fn addSupport(self: *Grouped, keys: []const Datum, slot: usize, input: @import("cypher").statistic.SupportInput) !void {
         if (self.failed or self.finished or slot >= self.specs.len) return error.InvalidSqlBackendResponse;
         var arena = std.heap.ArenaAllocator.init(self.backing);
@@ -2695,14 +2771,25 @@ pub const Grouped = struct {
         };
         return true;
     }
-    fn importPartialMappedAdmitted(self: *Grouped, keys: []const Datum, cells: []const Datum, slots: ?[]const u16, ordinal: u64, require_fit: bool) !void {
+    pub fn tryImportPartialMapped(self: *Grouped, keys: []const Datum, cells: []const Datum, slots: []const u16, ordinal: u64) !bool {
+        self.importPartialMappedAdmitted(keys, cells, slots, ordinal, true) catch |err| return switch (err) {
+            error.SqlAggregateAdmissionExceeded => false,
+            else => err,
+        };
+        return true;
+    }
+    fn validateMappedWidth(self: *const Grouped, length: usize, slots: ?[]const u16) !void {
         if (slots) |mapping| {
-            if (mapping.len == 0 or mapping.len != cells.len or mapping.len > self.specs.len) return error.InvalidSqlSpill;
-            for (mapping, 0..) |slot, i| {
-                if (slot >= self.specs.len) return error.InvalidSqlSpill;
-                for (mapping[0..i]) |prior| if (prior == slot) return error.InvalidSqlSpill;
+            if (mapping.len == 0 or mapping.len != length or mapping.len > self.specs.len) return error.InvalidSqlSpill;
+            var seen = std.StaticBitSet(256).empty;
+            for (mapping) |slot| {
+                if (slot >= self.specs.len or slot >= 256 or seen.isSet(slot)) return error.InvalidSqlSpill;
+                seen.set(slot);
             }
-        } else if (cells.len != self.specs.len) return error.InvalidSqlSpill;
+        } else if (length != self.specs.len) return error.InvalidSqlSpill;
+    }
+    fn importPartialMappedAdmitted(self: *Grouped, keys: []const Datum, cells: []const Datum, slots: ?[]const u16, ordinal: u64, require_fit: bool) !void {
+        try self.validateMappedWidth(cells.len, slots);
         var arena = std.heap.ArenaAllocator.init(self.backing);
         defer arena.deinit();
         const a = arena.allocator();
@@ -2721,20 +2808,11 @@ pub const Grouped = struct {
         return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, false);
     }
     fn importTypedPartialMappedAdmitted(self: *Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16, ordinal: u64, require_fit: bool) !void {
-        if (slots) |mapping| {
-            if (mapping.len == 0 or mapping.len != states.len or mapping.len > self.specs.len) return error.InvalidSqlSpill;
-            for (mapping, 0..) |slot, i| {
-                if (slot >= self.specs.len) return error.InvalidSqlSpill;
-                for (mapping[0..i]) |prior| if (prior == slot) return error.InvalidSqlSpill;
-            }
-        } else if (states.len != self.specs.len) return error.InvalidSqlSpill;
+        try self.validateMappedWidth(states.len, slots);
         for (states, 0..) |state, i| {
             const spec = self.specs[if (slots) |mapping| mapping[i] else i];
             if (state.kind != spec.kind or state.input_type != spec.input_type or state.input_element != spec.input_element or state.distinct != spec.distinct) return error.InvalidSqlSpill;
         }
-        var arena = std.heap.ArenaAllocator.init(self.backing);
-        defer arena.deinit();
-        const a = arena.allocator();
         var input_storage: [256]Datum = undefined;
         const inputs = input_storage[0..self.specs.len];
         @memset(inputs, .{});
@@ -2752,26 +2830,7 @@ pub const Grouped = struct {
             if (self.limits.spill != null) try self.startSpill() else if (require_fit) return error.SqlAggregateAdmissionExceeded;
         }
         if (self.external) |external| {
-            if (slots) |mapping| {
-                // Existing spill frames are dense. Expand only at this durable
-                // boundary, while the in-memory typed columns touch used slots.
-                const dense = try a.alloc(Aggregate, self.specs.len);
-                var initialized_dense: usize = 0;
-                defer for (dense[0..initialized_dense]) |*state| state.deinit();
-                for (dense, self.specs) |*state, spec| {
-                    state.* = try Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
-                    state.distinct = spec.distinct;
-                    initialized_dense += 1;
-                }
-                for (mapping, states) |slot, value| {
-                    // A separate decode gives the dense frame its own payload
-                    // ownership and keeps failure cleanup independent.
-                    const replacement = try @import("aggregate_partial.zig").decode(a, try @import("aggregate_partial.zig").cell(a, value), self.specs[slot]);
-                    dense[slot].deinit();
-                    dense[slot] = replacement;
-                }
-                return external.partial(keys, dense, ordinal);
-            }
+            if (slots) |mapping| return external.partialMapped(keys, states, mapping, ordinal);
             return external.partial(keys, states, ordinal);
         }
         errdefer self.failed = true;
@@ -5641,4 +5700,45 @@ fn groupedBitmapScenario(backing: Allocator, count: usize) !void {
 test "SQL grouped bitmap growth spills before retaining rehashes and merges scalar inputs" {
     try groupedBitmapScenario(std.testing.allocator, 512);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, groupedBitmapScenario, .{@as(usize, 2)});
+}
+
+fn statisticBatchScenario(backing: Allocator, count: usize) !void {
+    var vtable = backing.vtable.*;
+    vtable.resize = Allocator.noResize;
+    vtable.remap = Allocator.noRemap;
+    const a: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false, .compression = .none };
+    defer manager.deinit();
+    const specs = [_]AggregateSpec{ .{ .kind = .avg, .input_type = .integer }, .{ .kind = .count, .distinct = true, .input_type = .integer }, .{ .kind = .min, .input_type = .integer }, .{ .kind = .count } };
+    const grouped = try Grouped.create(a, &specs, .{ .bytes = 16 * 1024, .spill = &manager });
+    defer grouped.deinit();
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const big = try @import("catalog.zig").Count.parse(source.allocator(), "1000000000000000000000000000000");
+    for (0..count) |i| {
+        const index: i64 = @intCast(i);
+        try grouped.addStatistics(&.{}, &.{
+            .{ .slot = 2, .value = -index },
+            .{ .slot = 0, .value = 3, .weight = big, .extra = .{ .value = 7, .weight = big } },
+            .{ .slot = 1, .support = .{ .value = .{ .low = index * 128 - 1, .words = &.{0b10101} } } },
+        }, @import("catalog.zig").Count.init(2));
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const row = (try grouped.nextResult(arena.allocator())).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 5), row.aggregates[0].value.float, 1e-12);
+    try std.testing.expectEqual(@as(i64, @intCast(count * 3)), row.aggregates[1].value.integer);
+    try std.testing.expectEqual(-@as(i64, @intCast(count - 1)), row.aggregates[2].value.integer);
+    try std.testing.expectEqual(@as(i64, 0), row.aggregates[3].value.integer);
+    try std.testing.expect((try grouped.nextResult(arena.allocator())) == null);
+    if (count >= 256) try std.testing.expect(manager.written_bytes > 0);
+}
+
+test "SQL statistic batches preserve sparse ownership and promoted bins through spill" {
+    try statisticBatchScenario(std.testing.allocator, 512);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, statisticBatchScenario, .{@as(usize, 2)});
 }

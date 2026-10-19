@@ -105,24 +105,82 @@ pub const SupportInput = struct {
         return present;
     }
 };
-pub const Input = struct {
+/// One reducer's exact argument, optionally represented by two weighted bins.
+/// A packet keeps all consumers of one binding together through grouping.
+pub const Argument = struct {
+    pub const Bin = struct { value: i64, weight: Count };
     slot: usize,
     value: i64 = 0,
+    weight: Count = Count.one,
+    extra: ?Bin = null,
     support: ?SupportInput = null,
+    pub fn valid(self: Argument) bool {
+        if (self.weight.cap(1) == 0) return false;
+        if (self.extra) |extra| if (extra.weight.cap(1) == 0 or self.support != null) return false;
+        return if (self.support) |support_| support_.valid() else true;
+    }
+    pub fn clone(self: Argument, a: A) !Argument {
+        var out = self;
+        out.weight = try self.weight.clone(a);
+        errdefer out.weight.deinitOwned(a);
+        if (self.extra) |extra| out.extra.?.weight = try extra.weight.clone(a);
+        errdefer if (out.extra) |extra| extra.weight.deinitOwned(a);
+        if (self.support) |support_| out.support.?.value.words = try a.dupe(u64, support_.value.words);
+        return out;
+    }
+    pub fn deinitOwned(self: Argument, a: A) void {
+        self.weight.deinitOwned(a);
+        if (self.extra) |extra| extra.weight.deinitOwned(a);
+        if (self.support) |support_| a.free(support_.value.words);
+    }
+};
+pub const Input = struct {
+    // Scalar arguments remain accepted for custom/legacy relation producers.
+    slot: usize = 0,
+    value: i64 = 0,
+    support: ?SupportInput = null,
+    batch: []const Argument = &.{},
     pub fn clone(self: Input, a: A) !Input {
         var result = self;
-        if (self.support) |support_| {
-            result.support.?.value.words = try a.dupe(u64, support_.value.words);
+        if (self.support) |support_| result.support.?.value.words = try a.dupe(u64, support_.value.words);
+        errdefer if (result.support) |support_| a.free(support_.value.words);
+        const batch = try a.alloc(Argument, self.batch.len);
+        errdefer a.free(batch);
+        var initialized: usize = 0;
+        errdefer for (batch[0..initialized]) |argument| argument.deinitOwned(a);
+        for (batch, self.batch) |*out, argument| {
+            out.* = try argument.clone(a);
+            initialized += 1;
         }
+        result.batch = batch;
         return result;
+    }
+    pub fn deinitOwned(self: Input, a: A) void {
+        if (self.support) |support_| a.free(support_.value.words);
+        for (self.batch) |argument| argument.deinitOwned(a);
+        a.free(self.batch);
+    }
+    pub fn remap(self: *Input, slots: []const usize) !void {
+        if (self.batch.len == 0) {
+            if (self.slot >= slots.len) return error.InvalidSqlBackendResponse;
+            self.slot = slots[self.slot];
+        } else for (@constCast(self.batch)) |*argument| {
+            if (argument.slot >= slots.len) return error.InvalidSqlBackendResponse;
+            argument.slot = slots[argument.slot];
+        }
     }
 };
 pub const Plan = struct {
     pub const Slot = struct { extreme: ?usize = null, support: ?usize = null };
+    pub const Pair = struct { left: usize, right: usize };
     requests: []const Request,
     dimensions: usize,
     moments: bool,
-    quadratic: bool,
+    axes: []const ?usize,
+    axis_weights: []const u64,
+    basis: []const usize,
+    pairs: []const Pair,
+    coefficients: []const i64,
     /// Dense physical state is independent of the number of moment reducers.
     extrema: []const []const i64,
     supports: []const []const i64,
@@ -130,6 +188,7 @@ pub const Plan = struct {
     ptr: ?*anyopaque = null,
     charge: ?*const fn (*anyopaque, usize) anyerror!void = null,
     pub fn init(a: A, requests: []const Request) !Plan {
+        if (requests.len == 0 or requests[0].form.dimensions > 32) return error.CypherStatisticDeclined;
         const n = requests[0].form.dimensions;
         const slots = try a.alloc(Slot, requests.len);
         errdefer a.free(slots);
@@ -138,11 +197,10 @@ pub const Plan = struct {
         var supports: std.ArrayList([]const i64) = .empty;
         defer supports.deinit(a);
         var moments = false;
-        var quadratic = false;
         for (requests, slots) |r, *slot| {
+            if (r.form.dimensions != n or r.form.coefficients.len != Form.width(n)) return error.CypherStatisticDeclined;
             slot.* = .{};
             moments = moments or r.kind == .avg or r.kind == .sum or r.kind == .count;
-            quadratic = quadratic or r.form.quadratic();
             // Constants are applied at emission. MIN/MAX of shifted forms and
             // DISTINCT consumers with different offsets share a cost direction.
             const coefficients = r.form.coefficients[1 .. 1 + n];
@@ -151,7 +209,114 @@ pub const Plan = struct {
         }
         const ext = try extrema.toOwnedSlice(a);
         errdefer a.free(ext);
-        return .{ .requests = requests, .dimensions = n, .moments = moments, .quadratic = quadratic, .extrema = ext, .supports = try supports.toOwnedSlice(a), .slots = slots };
+        // Normalized gradient columns prove that every demanded polynomial
+        // factors through a primitive positive weighted sum of these axes.
+        // Opposite signs stay in separate axes, retaining signed correlations.
+        // Passive axes and unobserved cross terms never enter traversal state.
+        var axes_storage: [32]?usize = @splat(null);
+        var basis_storage: [32]usize = undefined;
+        var basis_count: usize = 0;
+        var divisors: [32]u128 = undefined;
+        var gradient_gcd: [32]u128 = undefined;
+        for (0..n) |axis| gradient_gcd[axis] = axisGcd(requests, axis);
+        for (0..n) |axis| {
+            if (!activeAxis(requests, axis)) continue;
+            const slot = for (basis_storage[0..basis_count], 0..) |prior, index| {
+                if (equivalentAxes(requests, axis, prior, gradient_gcd[axis], gradient_gcd[prior])) break index;
+            } else blk: {
+                basis_storage[basis_count] = axis;
+                divisors[basis_count] = gradient_gcd[axis];
+                basis_count += 1;
+                break :blk basis_count - 1;
+            };
+            axes_storage[axis] = slot;
+            divisors[slot] = gcd(divisors[slot], gradient_gcd[axis]);
+        }
+        var weights_storage: [32]u64 = @splat(0);
+        for (axes_storage[0..n], 0..) |axis, index| if (axis) |slot| {
+            weights_storage[index] = std.math.cast(u64, gradient_gcd[index] / divisors[slot]) orelse return error.CypherStatisticDeclined;
+        };
+        var pair_storage: [528]Pair = undefined;
+        var pair_count: usize = 0;
+        for (basis_storage[0..basis_count], 0..) |right, j| for (basis_storage[0 .. j + 1], 0..) |left, i| {
+            const needed = for (requests) |r| {
+                if (momentKind(r.kind) and quadraticCoefficient(r.form, left, right) != 0) break true;
+            } else false;
+            if (needed) {
+                pair_storage[pair_count] = .{ .left = i, .right = j };
+                pair_count += 1;
+            }
+        };
+        const axes = try a.dupe(?usize, axes_storage[0..n]);
+        errdefer a.free(axes);
+        const axis_weights = try a.dupe(u64, weights_storage[0..n]);
+        errdefer a.free(axis_weights);
+        const basis = try a.dupe(usize, basis_storage[0..basis_count]);
+        errdefer a.free(basis);
+        const pairs = try a.dupe(Pair, pair_storage[0..pair_count]);
+        errdefer a.free(pairs);
+        const stride = 1 + basis_count + pair_count;
+        const coefficients = try a.alloc(i64, requests.len * stride);
+        errdefer a.free(coefficients);
+        @memset(coefficients, 0);
+        for (requests, 0..) |r, index| if (momentKind(r.kind)) {
+            const out = coefficients[index * stride ..][0..stride];
+            out[0] = r.form.coefficients[0];
+            for (basis, out[1 .. 1 + basis_count]) |axis, *coefficient| coefficient.* = try scaledCoefficient(r.form.coefficients[1 + axis], axis_weights[axis], 1);
+            for (pairs, out[1 + basis_count ..]) |pair_, *coefficient| coefficient.* = try scaledCoefficient(quadraticCoefficient(r.form, basis[pair_.left], basis[pair_.right]), axis_weights[basis[pair_.left]], axis_weights[basis[pair_.right]]);
+        };
+        return .{ .requests = requests, .dimensions = n, .moments = moments, .axes = axes, .axis_weights = axis_weights, .basis = basis, .pairs = pairs, .coefficients = coefficients, .extrema = ext, .supports = try supports.toOwnedSlice(a), .slots = slots };
+    }
+    fn momentKind(kind: Kind) bool {
+        return kind == .sum or kind == .avg;
+    }
+    fn quadraticCoefficient(form: Form, i: usize, j: usize) i64 {
+        return form.coefficients[Form.pair(form.dimensions, @min(i, j), @max(i, j))];
+    }
+    fn activeAxis(requests: []const Request, axis: usize) bool {
+        for (requests) |r| if (momentKind(r.kind)) {
+            if (r.form.coefficients[1 + axis] != 0) return true;
+            for (0..r.form.dimensions) |other| if (quadraticCoefficient(r.form, axis, other) != 0) return true;
+        };
+        return false;
+    }
+    fn gcd(left: u128, right: u128) u128 {
+        var l = left;
+        var r = right;
+        while (r != 0) {
+            const rest = l % r;
+            l = r;
+            r = rest;
+        }
+        return l;
+    }
+    fn axisGcd(requests: []const Request, axis: usize) u128 {
+        var divisor: u128 = 0;
+        for (requests) |r| if (momentKind(r.kind)) {
+            divisor = gcd(divisor, @abs(@as(i128, r.form.coefficients[1 + axis])));
+            for (0..r.form.dimensions) |other| {
+                const coefficient = @as(i128, quadraticCoefficient(r.form, axis, other)) * @as(i128, if (axis == other) 2 else 1);
+                divisor = gcd(divisor, @abs(coefficient));
+            }
+        };
+        return divisor;
+    }
+    fn equivalentAxes(requests: []const Request, left: usize, right: usize, left_divisor: u128, right_divisor: u128) bool {
+        for (requests) |r| if (momentKind(r.kind)) {
+            if (@divExact(@as(i128, r.form.coefficients[1 + left]), @as(i128, @intCast(left_divisor))) != @divExact(@as(i128, r.form.coefficients[1 + right]), @as(i128, @intCast(right_divisor)))) return false;
+            for (0..r.form.dimensions) |axis| {
+                const l = @as(i128, quadraticCoefficient(r.form, left, axis)) * @as(i128, if (left == axis) 2 else 1);
+                const rr = @as(i128, quadraticCoefficient(r.form, right, axis)) * @as(i128, if (right == axis) 2 else 1);
+                if (@divExact(l, @as(i128, @intCast(left_divisor))) != @divExact(rr, @as(i128, @intCast(right_divisor)))) return false;
+            }
+        };
+        return true;
+    }
+    fn scaledCoefficient(value: i64, left: u64, right: u64) !i64 {
+        if (value == 0) return 0;
+        const divisor = std.math.cast(i128, @as(u128, left) * right) orelse return error.CypherStatisticDeclined;
+        if (@rem(@as(i128, value), divisor) != 0) return error.CypherStatisticDeclined;
+        return @intCast(@divExact(@as(i128, value), divisor));
     }
     fn intern(a: A, directions_: *std.ArrayList([]const i64), coefficients: []const i64) !usize {
         for (directions_.items, 0..) |prior, index| if (std.mem.eql(i64, prior, coefficients)) return index;
@@ -287,7 +452,7 @@ pub const Value = struct {
     pub fn add(l: Value, a: A, r: Value, plan: Plan) !Value {
         if (l.count.cap(1) == 0) return r;
         if (r.count.cap(1) == 0) return l;
-        try plan.work(plan.dimensions + plan.directions() + @max(l.crosses.len, r.crosses.len));
+        try plan.work(plan.basis.len + plan.directions() + @max(l.crosses.len, r.crosses.len));
         var out = init(if (plan.moments) try l.count.add(a, r.count) else Count.one);
         const sums = try a.alloc(Count, @max(l.sums.len, r.sums.len));
         for (sums, 0..) |*v, i| v.* = try l.sum(i).add(a, r.sum(i));
@@ -311,17 +476,18 @@ pub const Value = struct {
         if (l.count.cap(1) == 0 or r.count.cap(1) == 0) return init(Count.init(0));
         if (r.sums.len == 0 and r.crosses.len == 0 and r.extrema.len == 0 and r.supports.len == 0 and r.count.exact() == 1) return l;
         if (l.sums.len == 0 and l.crosses.len == 0 and l.extrema.len == 0 and l.supports.len == 0 and l.count.exact() == 1) return r;
-        try plan.work(plan.dimensions + plan.directions() + @max(l.crosses.len, r.crosses.len));
+        try plan.work(plan.basis.len + plan.directions() + @max(l.crosses.len, r.crosses.len));
         var out = init(if (plan.moments) try l.count.multiply(a, r.count) else Count.one);
         const sums = try a.alloc(Count, @max(l.sums.len, r.sums.len));
         for (sums, 0..) |*v, i| v.* = try (try l.sum(i).multiply(a, r.count)).add(a, try r.sum(i).multiply(a, l.count));
         out.sums = sums;
-        if (plan.quadratic) {
-            const crosses = try a.alloc(Count, plan.dimensions * (plan.dimensions + 1) / 2);
-            for (0..plan.dimensions) |j| for (0..j + 1) |i| {
-                const k = j * (j + 1) / 2 + i;
+        if (plan.pairs.len != 0) {
+            const crosses = try a.alloc(Count, plan.pairs.len);
+            for (plan.pairs, 0..) |pair_, k| {
+                const i = pair_.left;
+                const j = pair_.right;
                 crosses[k] = try (try (try l.cross(k).multiply(a, r.count)).add(a, try r.cross(k).multiply(a, l.count))).add(a, try (try l.sum(i).multiply(a, r.sum(j))).add(a, try l.sum(j).multiply(a, r.sum(i))));
-            };
+            }
             out.crosses = crosses;
         }
         const ext = try a.alloc(Extrema, plan.extrema.len);
@@ -351,22 +517,24 @@ pub const Value = struct {
         return out;
     }
     pub fn advance(self: Value, a: A, edge: usize, plan: Plan) !Value {
-        try plan.work(plan.dimensions + plan.directions() + if (plan.quadratic) plan.dimensions * (plan.dimensions + 1) / 2 else @as(usize, 0));
+        const axis = plan.axes[edge];
+        try plan.work(plan.directions() + if (axis != null) plan.basis.len + plan.pairs.len else @as(usize, 0));
         var out = self;
-        if (plan.moments) {
-            const sums = try a.alloc(Count, plan.dimensions);
-            for (sums, 0..) |*v, i| v.* = if (i == edge) try self.sum(i).add(a, self.count) else self.sum(i);
+        if (axis) |active| {
+            const increment = Count.init(plan.axis_weights[edge]);
+            const weighted_count = try self.count.multiply(a, increment);
+            const sums = try a.alloc(Count, plan.basis.len);
+            for (sums, 0..) |*v, i| v.* = if (i == active) try self.sum(i).add(a, weighted_count) else self.sum(i);
             out.sums = sums;
-            if (plan.quadratic) {
-                const crosses = try a.alloc(Count, plan.dimensions * (plan.dimensions + 1) / 2);
-                for (0..plan.dimensions) |j| for (0..j + 1) |i| {
-                    const k = j * (j + 1) / 2 + i;
+            if (plan.pairs.len != 0) {
+                const crosses = try a.alloc(Count, plan.pairs.len);
+                for (plan.pairs, 0..) |pair_, k| {
                     var c = self.cross(k);
-                    if (i == edge) c = try c.add(a, self.sum(j));
-                    if (j == edge) c = try c.add(a, self.sum(i));
-                    if (i == edge and j == edge) c = try c.add(a, self.count);
+                    if (pair_.left == active) c = try c.add(a, try self.sum(pair_.right).multiply(a, increment));
+                    if (pair_.right == active) c = try c.add(a, try self.sum(pair_.left).multiply(a, increment));
+                    if (pair_.left == active and pair_.right == active) c = try c.add(a, try weighted_count.multiply(a, increment));
                     crosses[k] = c;
-                };
+                }
                 out.crosses = crosses;
             }
         }
@@ -385,11 +553,13 @@ pub const Value = struct {
         out.supports = supports;
         return out;
     }
-    pub fn total(self: Value, a: A, form: Form) !Signed {
+    pub fn total(self: Value, a: A, plan: Plan, request: usize) !Signed {
         var result: Signed = .{};
-        try result.add(a, self.count, form.coefficients[0]);
-        for (0..form.dimensions) |i| try result.add(a, self.sum(i), form.coefficients[1 + i]);
-        if (form.quadratic()) for (0..form.dimensions) |j| for (0..j + 1) |i| try result.add(a, self.cross(j * (j + 1) / 2 + i), form.coefficients[Form.pair(form.dimensions, i, j)]);
+        const stride = 1 + plan.basis.len + plan.pairs.len;
+        const coefficients = plan.coefficients[request * stride ..][0..stride];
+        try result.add(a, self.count, coefficients[0]);
+        for (coefficients[1 .. 1 + plan.basis.len], 0..) |coefficient, i| try result.add(a, self.sum(i), coefficient);
+        for (coefficients[1 + plan.basis.len ..], 0..) |coefficient, i| try result.add(a, self.cross(i), coefficient);
         return result;
     }
 };
@@ -410,7 +580,7 @@ test "statistics retain cross moments, signed costs and holes through compositio
     const first = try (try one.advance(a, 0, plan)).advance(a, 0, plan); // (2,0)
     const second = try (try one.advance(a, 0, plan)).advance(a, 1, plan); // (1,1)
     const bag = try first.add(a, second, plan);
-    const total = try (try bag.total(a, polynomial)).magnitude(a);
+    const total = try (try bag.total(a, plan, 0)).magnitude(a);
     try std.testing.expectEqual(@as(?u64, 6), total.amount.exact());
     try std.testing.expectEqual(@as(i128, 0), bag.extreme(plan, 1).min);
     try std.testing.expectEqual(@as(i128, 2), bag.extreme(plan, 1).max);
@@ -418,7 +588,7 @@ test "statistics retain cross moments, signed costs and holes through compositio
     try std.testing.expectEqual(@as(i64, 0), support.low);
     try std.testing.expectEqual(@as(u64, 5), support.words[0]);
     const product = try second.multiply(a, first, plan); // (3,1), x*x+x*y=12
-    try std.testing.expectEqual(@as(?u64, 12), (try (try product.total(a, polynomial)).magnitude(a)).amount.exact());
+    try std.testing.expectEqual(@as(?u64, 12), (try (try product.total(a, plan, 0)).magnitude(a)).amount.exact());
     try std.testing.expect((try Form.combine(xx, x, a, .multiply)) == null);
     const max = try Form.literal(a, std.math.maxInt(i64), 2);
     try std.testing.expect((try Form.combine(max, x, a, .add)) == null);
@@ -471,4 +641,98 @@ test "direction slots deduplicate offsets without tracking moment consumers" {
     try std.testing.expectEqual(@as(u64, 3), bag.support(plan, 6).words[0]);
     const product = try first.multiply(a, second, plan);
     try std.testing.expectEqual(@as(i128, 2), product.extreme(plan, 3).max);
+}
+
+test "moment basis removes passive axes and folds total-length geometry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const x = try Form.column(a, 12, 0, 20);
+    const xx = (try Form.combine(x, x, a, .multiply)).?;
+    const sparse = try Plan.init(a, &.{.{ .form = xx, .kind = .avg }});
+    try std.testing.expectEqual(@as(usize, 1), sparse.basis.len);
+    try std.testing.expectEqual(@as(usize, 1), sparse.pairs.len);
+    for (sparse.axes[1..]) |axis| try std.testing.expect(axis == null);
+    const passive = try Value.init(Count.one).advance(a, 11, sparse);
+    try std.testing.expectEqual(@as(usize, 0), passive.sums.len);
+    const two = try (try passive.advance(a, 0, sparse)).advance(a, 0, sparse);
+    try std.testing.expectEqual(@as(?u64, 4), (try (try two.total(a, sparse, 0)).magnitude(a)).amount.exact());
+    const n = try Form.column(a, 12, null, 20);
+    const nn = (try Form.combine(n, n, a, .multiply)).?;
+    const total_plan = try Plan.init(a, &.{ .{ .form = nn, .kind = .avg }, .{ .form = n, .kind = .avg } });
+    try std.testing.expectEqual(@as(usize, 1), total_plan.basis.len);
+    try std.testing.expectEqual(@as(usize, 1), total_plan.pairs.len);
+    for (total_plan.axes) |axis| try std.testing.expectEqual(@as(?usize, 0), axis);
+    const total_two = try (try Value.init(Count.one).advance(a, 11, total_plan)).advance(a, 0, total_plan);
+    try std.testing.expectEqual(@as(?u64, 4), (try (try total_two.total(a, total_plan, 0)).magnitude(a)).amount.exact());
+    try std.testing.expectEqual(@as(?u64, 2), (try (try total_two.total(a, total_plan, 1)).magnitude(a)).amount.exact());
+    const count = try Plan.init(a, &.{.{ .form = nn, .kind = .count }});
+    try std.testing.expectEqual(@as(usize, 0), count.basis.len);
+    try std.testing.expectEqual(@as(usize, 0), count.pairs.len);
+}
+
+test "sparse moment pairs preserve correlations and products against explicit histories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const x = try Form.column(a, 6, 0, 4);
+    const y = try Form.column(a, 6, 2, 4);
+    const z = try Form.column(a, 6, 4, 4);
+    const xy = (try Form.combine(x, y, a, .multiply)).?;
+    const zz = (try Form.combine(z, z, a, .multiply)).?;
+    const polynomial = (try Form.combine(xy, zz, a, .add)).?;
+    const shifted = (try Form.combine(polynomial, try Form.literal(a, 100, 6), a, .subtract)).?;
+    const plan = try Plan.init(a, &.{ .{ .form = polynomial, .kind = .avg }, .{ .form = shifted, .kind = .avg } });
+    try std.testing.expectEqual(@as(usize, 3), plan.basis.len);
+    try std.testing.expectEqual(@as(usize, 2), plan.pairs.len);
+    var bag = Value.init(Count.init(0));
+    var expected: u64 = 0;
+    var sx: u64 = 0;
+    var sy: u64 = 0;
+    var sz: u64 = 0;
+    for (0..32) |index| {
+        var value = Value.init(Count.one);
+        var history: [6]usize = undefined;
+        for (&history, 0..) |*hops, axis| {
+            hops.* = (index * (axis + 1) + axis) % 4;
+            for (0..hops.*) |_| value = try value.advance(a, axis, plan);
+        }
+        expected += history[0] * history[2] + history[4] * history[4];
+        sx += history[0];
+        sy += history[2];
+        sz += history[4];
+        bag = try bag.add(a, value, plan);
+    }
+    try std.testing.expectEqual(@as(?u64, expected), (try (try bag.total(a, plan, 0)).magnitude(a)).amount.exact());
+    const negative = try (try bag.total(a, plan, 1)).magnitude(a);
+    try std.testing.expect(negative.negative);
+    try std.testing.expectEqual(@as(?u64, 3200 - expected), negative.amount.exact());
+    const product = try bag.multiply(a, bag, plan);
+    try std.testing.expectEqual(@as(?u64, 2 * 32 * expected + 2 * sx * sy + 2 * sz * sz), (try (try product.total(a, plan, 0)).magnitude(a)).amount.exact());
+}
+
+test "primitive weighted axes preserve signed polynomial costs without a dense matrix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    inline for (.{ false, true }) |signed| {
+        var cost = try Form.literal(a, 0, 12);
+        for (0..12) |axis| {
+            const coefficient: i64 = @as(i64, @intCast(axis + 1)) * (if (signed and axis >= 6) @as(i64, -1) else 1);
+            const term = (try Form.combine(try Form.column(a, 12, axis, 20), try Form.literal(a, coefficient, 12), a, .multiply)).?;
+            cost = (try Form.combine(cost, term, a, .add)).?;
+        }
+        const square = (try Form.combine(cost, cost, a, .multiply)).?;
+        const plan = try Plan.init(a, &.{ .{ .form = square, .kind = .avg }, .{ .form = cost, .kind = .avg } });
+        try std.testing.expectEqual(@as(usize, if (signed) 2 else 1), plan.basis.len);
+        try std.testing.expectEqual(@as(usize, if (signed) 3 else 1), plan.pairs.len);
+        const value = try (try Value.init(Count.one).advance(a, 0, plan)).advance(a, 11, plan);
+        const expected: i64 = if (signed) -11 else 13;
+        try std.testing.expectEqual(@as(?u64, @intCast(expected * expected)), (try (try value.total(a, plan, 0)).magnitude(a)).amount.exact());
+        const total = try (try value.total(a, plan, 1)).magnitude(a);
+        try std.testing.expectEqual(signed, total.negative);
+        try std.testing.expectEqual(@as(?u64, @intCast(@abs(expected))), total.amount.exact());
+        const product = try value.multiply(a, value, plan);
+        try std.testing.expectEqual(@as(?u64, @intCast(4 * expected * expected)), (try (try product.total(a, plan, 0)).magnitude(a)).amount.exact());
+    }
 }

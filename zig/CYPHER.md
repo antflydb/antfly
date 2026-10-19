@@ -1812,6 +1812,13 @@ cost directions carry signed extrema directly, so unequal segment coefficients
 do not require a joint length distribution. Quadratic arguments retain exact
 first and cross moments: advancing an axis updates its square by twice the
 first moment plus the count, while composition retains both cross terms.
+The physical moment basis contains only demanded monomials and their first-
+moment dependencies. Passive geometric axes carry no moment state. Axes with
+positively proportional gradient columns across all moment consumers share a
+primitive integer weighted-sum axis. Opposite signs stay separate, preserving
+signed correlations. This keeps whole-path and weighted-cost squares compact
+even with many segments, without changing the original geometry used by extrema,
+supports or admission proofs.
 Polynomial certification checks every original intermediate against integer
 bounds; mixed-sign SUM and integer-to-binary64 conversions outside the exact
 range retain ordinary execution.
@@ -1826,9 +1833,12 @@ unproved shapes use the existing executor rather than changing query semantics.
 Consumers receive tagged aggregate arguments, never fabricated ordinary graph
 rows. First-moment consumers receive at most two integral bins with exact bag
 weights; extrema receive their exact value, and DISTINCT receives an owned
-bitmap argument. SQL tags identify one negotiated reducer per contribution and
-follow projection and positional UNION mappings. Compatible SQL polynomial
-reducers share one traversal and one count/first/cross-moment basis; only cost
+bitmap argument. All arguments for one endpoint/pipeline binding travel in one
+owned batch, with one tagged entry per reducer and at most two bins per entry.
+Grouping resolves the binding once and dispatches its licensed slots directly;
+filters remain independent for each reducer. SQL tags and exact promoted bin
+weights follow projection and positional UNION mappings. Compatible SQL
+polynomial reducers share one traversal and one count/first/cross-moment basis; only cost
 directions and DISTINCT supports add traversal state. Physical slots are dense
 by unique coefficient direction, independently of the number of moment
 consumers. MIN/MAX and shifted DISTINCT arguments share their respective
@@ -1842,8 +1852,12 @@ words directly into group state. SQL pages, CTE projections and positional
 UNION ALL adapters own and clone bitmap arguments without enumerating bits.
 The integer DISTINCT partial codec uses canonical sorted words (`AGB` version
 1), validates signatures and cardinalities, and accepts older scalar-member
-checkpoints. Spilling emits bounded word records; final reduction externally
-sorts by aggregate slot and word index, unions overlaps, and counts bits once.
+checkpoints. Sparse typed spill records preserve aggregate slot ownership
+without initializing unrelated reducers; complete packets use one dense frame.
+Existing dense checkpoints remain readable, including through partition transfer
+and repartition. DISTINCT spilling emits bounded word records; final reduction
+externally sorts by aggregate slot and word index, unions overlaps, and counts
+bits once.
 Hash-table growth is preflighted before retaining new state so memory pressure
 uses the existing spill boundary. Sparse words preserve holes and widely separated correlated
 offsets without expanding the support into scalar rows; ordinary fallback
@@ -1853,6 +1867,13 @@ obligations. Global endpoint merging is allowed only when those observations
 and row expansion are independent of the endpoint; otherwise statistics stay
 with their original binding. Native and SQL execution share the same pinned,
 authorized traversal and cycle/uniqueness proofs.
+
+Grouped projection constructs its source/alias environment once. Proved finite
+SKIP/LIMIT windows use the existing stable TopK selector, with per-group scratch
+for projection and ordering and independent ownership for selected rows. Every
+group still evaluates its projection and predicates, including losing candidates
+and LIMIT 0, so selection cannot suppress arithmetic errors. Unknown or invalid
+window expressions retain their original late evaluation order.
 
 Unproved length predicates, length grouping keys, non-extremum DISTINCT
 arguments and other distribution-dependent expressions retain exact hop states. Cyclic

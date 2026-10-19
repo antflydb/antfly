@@ -34,8 +34,17 @@ pub const Count = struct {
     pub fn clone(self: Count, a: std.mem.Allocator) !Count {
         const big = self.big orelse return self;
         const owned = try a.create(Big);
+        errdefer a.destroy(owned);
         owned.* = try big.cloneWithDifferentAllocator(a);
         return .{ .small = self.small, .big = owned };
+    }
+    /// Release an independently cloned count, never a borrowed arithmetic view.
+    pub fn deinitOwned(self: Count, a: std.mem.Allocator) void {
+        if (self.big) |value| {
+            const owned = @constCast(value);
+            owned.deinit();
+            a.destroy(owned);
+        }
     }
     pub fn text(self: Count, a: std.mem.Allocator) ![]u8 {
         if (self.big) |big| return big.toString(a, 10, .lower);

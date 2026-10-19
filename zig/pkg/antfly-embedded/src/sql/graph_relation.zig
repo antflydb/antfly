@@ -531,9 +531,8 @@ pub const Cursor = struct {
                     if (self.weight_passes.len != 0 and self.weight_passes[self.weight_pass].plan.statistic != null) {
                         const input = stream.last_statistic_inputs.items[row_index];
                         const active_slots = self.weight_passes[self.weight_pass].slots;
-                        if (input) |argument| if (argument.slot >= active_slots.len) return error.InvalidSqlBackendResponse;
                         var mapped = if (input) |argument| try argument.clone(owned) else null;
-                        if (mapped) |*argument| argument.slot = active_slots[argument.slot];
+                        if (mapped) |*argument| try argument.remap(active_slots);
                         try aggregate_inputs.append(owned, mapped);
                     }
                 };

@@ -116,6 +116,10 @@ pub const Collector = struct {
         if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
         try self.grouped.addCount(keys, inputs, count);
     }
+    pub fn addStatistics(self: *Collector, keys: []const Datum, arguments: []const @import("cypher").statistic.Argument, weight: @import("catalog.zig").Count) !void {
+        if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
+        try self.grouped.addStatistics(keys, arguments, weight);
+    }
     pub fn addSupport(self: *Collector, keys: []const Datum, slot: usize, input: @import("cypher").statistic.SupportInput) !void {
         if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
         try self.grouped.addSupport(keys, slot, input);
