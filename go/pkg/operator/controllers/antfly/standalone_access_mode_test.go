@@ -17,6 +17,7 @@ package controllers
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -111,5 +112,61 @@ func TestStandaloneSeedPVCRequiresRequestedAccessMode(t *testing.T) {
 	}
 	if _, err := r.reconcileHAStartupTargetPVC(context.Background(), cluster, "1Gi"); err == nil || !strings.Contains(err.Error(), "access mode migration") {
 		t.Fatalf("accepted incompatible seed: %v", err)
+	}
+}
+
+func TestStandaloneSuspendRetainsIdentityAndResumesOneOwner(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.StandaloneAccessMode = corev1.ReadWriteOncePod
+	c := newHAControllerTestClient(t, scheme, cluster)
+	r := &AntflyClusterReconciler{Client: c, Scheme: scheme}
+	r.applyDefaults(cluster)
+	ctx := context.Background()
+	if err := r.reconcileStandaloneStatefulSet(ctx, &envFromCache{}, cluster); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
+	before := &appsv1.StatefulSet{}
+	if err := c.Get(ctx, key, before); err != nil {
+		t.Fatal(err)
+	}
+	// Even a destructive old policy must be made safe before scaling down.
+	before.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType, WhenScaled: appsv1.DeletePersistentVolumeClaimRetentionPolicyType}
+	if err := c.Update(ctx, before); err != nil {
+		t.Fatal(err)
+	}
+	cluster.Spec.Standalone.Suspend = true
+	for i := 0; i < 2; i++ {
+		if err := r.reconcileStandaloneStatefulSet(ctx, &envFromCache{}, cluster); err != nil {
+			t.Fatal(err)
+		}
+	}
+	asleep := &appsv1.StatefulSet{}
+	if err := c.Get(ctx, key, asleep); err != nil {
+		t.Fatal(err)
+	}
+	if *asleep.Spec.Replicas != 0 || asleep.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType || asleep.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+		t.Fatal("suspend did not retain claims before stopping compute")
+	}
+	if !reflect.DeepEqual(before.Spec.Template, asleep.Spec.Template) || !reflect.DeepEqual(before.Spec.VolumeClaimTemplates, asleep.Spec.VolumeClaimTemplates) {
+		t.Fatal("suspension changed workload or storage identity")
+	}
+	cluster.Spec.Standalone.Suspend = false
+	if err := r.reconcileStandaloneStatefulSet(ctx, &envFromCache{}, cluster); err != nil {
+		t.Fatal(err)
+	}
+	awake := &appsv1.StatefulSet{}
+	if err := c.Get(ctx, key, awake); err != nil {
+		t.Fatal(err)
+	}
+	if *awake.Spec.Replicas != 1 || !reflect.DeepEqual(before.Spec.VolumeClaimTemplates, awake.Spec.VolumeClaimTemplates) {
+		t.Fatal("resume failed to reuse one owner and the same claim")
 	}
 }

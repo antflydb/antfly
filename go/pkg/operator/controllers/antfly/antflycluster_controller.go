@@ -513,7 +513,10 @@ func (r *AntflyClusterReconciler) reconcileSuspendedStandaloneStatefulSet(ctx co
 		}
 		return false, err
 	}
-	if existing.Spec.Replicas == nil || *existing.Spec.Replicas != 0 {
+	retention := existing.Spec.PersistentVolumeClaimRetentionPolicy
+	retain := retention != nil && retention.WhenScaled == appsv1.RetainPersistentVolumeClaimRetentionPolicyType && retention.WhenDeleted == appsv1.RetainPersistentVolumeClaimRetentionPolicyType
+	if existing.Spec.Replicas == nil || *existing.Spec.Replicas != 0 || !retain {
+		existing.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType, WhenScaled: appsv1.RetainPersistentVolumeClaimRetentionPolicyType}
 		zero := int32(0)
 		existing.Spec.Replicas = &zero
 		return true, r.Update(ctx, existing)
@@ -4801,6 +4804,15 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	if replicas == 0 {
 		replicas = 1
 	}
+	if standalone.Suspend {
+		replicas = 0
+		if held, err := r.reconcileSuspendedStandaloneStatefulSet(ctx, cluster); err != nil {
+			return err
+		} else if held {
+			return nil
+		}
+	}
+
 	storageSize := chooseStandaloneStorageSize(cluster)
 	startupGate := haRuntimeStartupGate(cluster)
 	activatedSeedGate := startupGate != nil && startupGate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && startupGate.RequiredReceipt != nil
@@ -4934,6 +4946,10 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 
 		statefulSet.Spec.Replicas = &replicas
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
+		if standalone.Suspend {
+			statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType, WhenScaled: appsv1.RetainPersistentVolumeClaimRetentionPolicyType}
+		}
+
 		deferPromotionRollout, err := r.shouldDeferPromotedStandaloneRollout(ctx, cluster, statefulSet)
 		if err != nil {
 			return err
@@ -6152,18 +6168,21 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 		cluster.Status.StandaloneNodesReady = readyReplicas
 		cluster.Status.MetadataNodesReady = 0
 		cluster.Status.DataNodesReady = 0
-		if readyReplicas >= standalone.Replicas && standalone.Replicas > 0 {
+		if readyReplicas >= standalone.Replicas && standalone.Replicas > 0 && !standalone.Suspend {
 			cluster.Status.Phase = "Running"
 		} else {
 			cluster.Status.Phase = "Pending"
 		}
 
+		if standalone.Suspend && standaloneSts.Spec.Replicas != nil && *standaloneSts.Spec.Replicas == 0 && standaloneSts.Status.Replicas == 0 {
+			cluster.Status.Phase = "Suspended"
+		}
 		if cluster.Status.StandaloneStatus == nil {
 			cluster.Status.StandaloneStatus = &antflyv1.StandaloneStatus{}
 		}
 		oldStatus := *cluster.Status.StandaloneStatus
 		inferenceEnabled := standalone.Inference == nil || standalone.Inference.Enabled
-		cluster.Status.StandaloneStatus.Ready = readyReplicas >= standalone.Replicas && standalone.Replicas > 0
+		cluster.Status.StandaloneStatus.Ready = readyReplicas >= standalone.Replicas && standalone.Replicas > 0 && !standalone.Suspend
 		cluster.Status.StandaloneStatus.MetadataReady = cluster.Status.StandaloneStatus.Ready
 		cluster.Status.StandaloneStatus.StoreReady = cluster.Status.StandaloneStatus.Ready
 		cluster.Status.StandaloneStatus.InferenceReady = !inferenceEnabled || cluster.Status.StandaloneStatus.Ready
@@ -6222,7 +6241,7 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 				Message:            "Inference is disabled",
 			})
 		}
-		r.setAvailableCondition(cluster, standaloneFindings, readyReplicas >= standalone.Replicas && standalone.Replicas > 0)
+		r.setAvailableCondition(cluster, standaloneFindings, readyReplicas >= standalone.Replicas && standalone.Replicas > 0 && !standalone.Suspend)
 		r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 		r.updateProductTierStatus(cluster)
 		if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {

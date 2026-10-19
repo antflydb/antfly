@@ -1368,6 +1368,11 @@ type DataNodesSpec struct {
 
 // StandaloneSpec defines the configuration for operator-managed standalone mode.
 type StandaloneSpec struct {
+	// Suspend stops serving compute while retaining the existing volume and
+	// workload identity. Clear it to resume the same database.
+	// +optional
+	Suspend bool `json:"suspend,omitempty"`
+
 	// ResourceIdentity selects the immutable Kubernetes identity layout for the
 	// single-node workload. LegacySwarmV1 preserves pre-Standalone PVC names.
 	// +optional
