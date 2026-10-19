@@ -17,6 +17,9 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 const generating_runtime = @import("generating/mod.zig");
+const constrained = @import("antfly_structured");
+const constrained_runtime = @import("generating/constrained_runtime.zig");
+const generated_extractor = @import("antfly_structured").extraction;
 const managed_embedder = @import("inference/managed_embedder.zig");
 const common_secrets = @import("common/secrets.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
@@ -726,7 +729,18 @@ pub const Runtime = struct {
         const transport: inference_work.AttachmentTransport = switch (requests[0].producer_type) {
             .copy, .document_extraction => .borrowed_binary,
             .decision => blk: {
+                var parsed = try @import("functions/materialization.zig").parse(alloc, requests[0].config_json);
+                defer parsed.deinit();
+                const cfg = parsed.value.decider;
                 remote = true;
+                if (cfg.decision_method == .generated) {
+                    try self.routeGeneratorConfig(alloc, &parsed.value.decider.generator.?);
+                    var engine = self.constrainedRuntime();
+                    const capabilities = try engine.capabilities(alloc, &parsed.value.decider.generator.?);
+                    _ = try capabilities.select(cfg.output, cfg.probabilities);
+                    remote = parsed.value.decider.generator.?.provider != .antfly or parsed.value.decider.generator.?.url.len > 0;
+                } else if (cfg.provider == .antfly and cfg.url.len == 0 and self.antfly_provider != null) remote = self.antfly_provider.?.decide_json == null;
+                if (!remote) allocator_owner = try localInvocationAllocatorOwner(self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable);
                 break :blk .borrowed_binary;
             },
             .reader => blk: {
@@ -761,6 +775,11 @@ pub const Runtime = struct {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
+                if (parsed.output_schema != null) {
+                    var engine = self.constrainedRuntime();
+                    const caps = try engine.capabilities(alloc, &parsed.generator);
+                    _ = try caps.select(parsed.output, null);
+                }
                 remote = parsed.generator.provider != .apple and (parsed.generator.url.len > 0 or parsed.generator.provider != .antfly);
                 if (parsed.generator.provider == .apple) {
                     try @import("antfly_generating").apple_native.checkAvailable();
@@ -770,6 +789,7 @@ pub const Runtime = struct {
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
+                    if (parsed.output_schema != null and local.generate_json != null) break :blk .borrowed_binary;
                     if (local.generate_messages_with_attachments != null or
                         local.generate_messages_with_attachments_with_context != null) break :blk .borrowed_binary;
                     if (local.generate_messages == null and local.generate_messages_with_context == null)
@@ -784,6 +804,17 @@ pub const Runtime = struct {
                 break :blk remoteAttachmentTransport(caps, if (caps == null) .data_uri else .base64_payload);
             },
             .extractor => blk: {
+                if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) {
+                    var parsed = try generated_extractor.parse(alloc, requests[0].config_json);
+                    defer parsed.deinit();
+                    try self.routeGeneratorConfig(alloc, &parsed.value.generator);
+                    var engine = self.constrainedRuntime();
+                    const caps = try engine.capabilities(alloc, &parsed.value.generator);
+                    _ = try caps.select(parsed.value.output, parsed.value.probabilities);
+                    remote = parsed.value.generator.provider != .antfly or parsed.value.generator.url.len > 0;
+                    if (!remote) allocator_owner = try localInvocationAllocatorOwner(self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable);
+                    break :blk .borrowed_binary;
+                }
                 var parsed = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
                 try self.routeExtractorConfig(alloc, &parsed);
@@ -992,6 +1023,7 @@ pub const Runtime = struct {
                 break :blk local.transcribe_audio_with_context != null;
             },
             .extractor => blk: {
+                if (try generated_extractor.isGenerated(alloc, request.config_json)) break :blk true;
                 var parsed = try extracting.parseConfigFromSlice(alloc, request.config_json);
                 defer parsed.deinit(alloc);
                 try self.routeExtractorConfig(alloc, &parsed);
@@ -1160,13 +1192,27 @@ pub const Runtime = struct {
                 defer cfg.deinit();
                 break :blk try self.readerCapabilities(alloc, cfg.value);
             },
+            .decision => blk: {
+                var parsed = try @import("functions/materialization.zig").parse(alloc, requests[0].config_json);
+                defer parsed.deinit();
+                if (parsed.value.decider.decision_method != .generated) break :blk null;
+                try self.routeGeneratorConfig(alloc, &parsed.value.decider.generator.?);
+                break :blk try self.constrainedProducerCapabilities(alloc, &parsed.value.decider.generator.?, parsed.value.decider.output, parsed.value.decider.probabilities, parsed.value.decider.batch, .generate);
+            },
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
+                if (parsed.output_schema != null) break :blk try self.constrainedProducerCapabilities(alloc, &parsed.generator, parsed.output, null, parsed.batch, .generate);
                 break :blk try self.generatorCapabilities(alloc, parsed.generator);
             },
             .extractor => blk: {
+                if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) {
+                    var parsed = try generated_extractor.parse(alloc, requests[0].config_json);
+                    defer parsed.deinit();
+                    try self.routeGeneratorConfig(alloc, &parsed.value.generator);
+                    break :blk try self.constrainedProducerCapabilities(alloc, &parsed.value.generator, parsed.value.output, parsed.value.probabilities, parsed.value.batch, .extract);
+                }
                 var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
                 defer cfg.deinit(alloc);
                 break :blk try self.extractorCapabilities(alloc, cfg);
@@ -1184,7 +1230,11 @@ pub const Runtime = struct {
         }
         return switch (first.producer_type) {
             .copy => .native,
-            .document_extraction, .decision => .none,
+            .document_extraction => .none,
+            .decision => blk: {
+                const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse break :blk .none;
+                break :blk capabilities.batch.mode;
+            },
             .reader => blk: {
                 if (!try self.canReadBatch(alloc, requests)) break :blk .none;
                 var cfg = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
@@ -1204,6 +1254,7 @@ pub const Runtime = struct {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
+                if (parsed.output_schema != null) break :blk if (parsed.batch.max_items_per_call > 1) .native else .serial_compatibility;
                 // The embedded callback is one invocation per item today.
                 if (parsed.generator.url.len == 0) break :blk .serial_compatibility;
                 const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse
@@ -1216,6 +1267,7 @@ pub const Runtime = struct {
             // model, whose runs serialise on its execution gate.
             .transcriber => .serial_compatibility,
             .extractor => blk: {
+                if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) break :blk .native;
                 if (!try self.canExtractBatch(alloc, requests)) break :blk .none;
                 const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse break :blk .none;
                 break :blk capabilities.batch.mode;
@@ -1363,6 +1415,10 @@ pub const Runtime = struct {
     // Planning already owns a parsed, routed configuration. Reuse it so the
     // bounded contract resolver need not retain a second JSON/config tree.
     fn canGenerateBatchWithConfig(self: *Runtime, parsed: GeneratorProducerConfig, requests: []const asset_producer.Request) bool {
+        if (parsed.output_schema != null) {
+            for (requests) |request| if (request.media.len > 0) return false;
+            return true;
+        }
         if (parsed.generator.provider == .apple) {
             for (requests) |request| if (request.media.len > 0) return false;
             return parsed.tool_output == .content;
@@ -1426,6 +1482,7 @@ pub const Runtime = struct {
 
     fn canExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
         if (!requestsShareRoute(requests)) return false;
+        if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) return true;
         const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return false;
         if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
             capabilities.batch.mode == .none) return false;
@@ -1526,11 +1583,7 @@ pub const Runtime = struct {
         try self.capabilityCache().invalidate(cfg.resolvedUrl().?, cfg.model, .extract, headers);
     }
 
-    fn decide(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
-        const d = @import("functions/decisions.zig");
-        const materialization = @import("functions/materialization.zig");
-        const parsed = try materialization.parse(alloc, request.config_json);
-        defer parsed.deinit();
+    fn validateDecisionInput(alloc: Allocator, request: asset_producer.Request) !void {
         if (request.media.len > 0) return error.InvalidDecisionSpecification;
         if (request.source_parts_json) |raw_parts| {
             // Templates always carry content parts, including plain text.
@@ -1550,6 +1603,73 @@ pub const Runtime = struct {
                 if (kind != .string or !std.mem.eql(u8, kind.string, "text") or text != .string) return error.InvalidDecisionSpecification;
             }
         }
+    }
+
+    fn tryDecideBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        var batch = try self.decideBatch(alloc, requests);
+        defer batch.deinit(alloc);
+        return batch.intoOutputs(alloc);
+    }
+
+    fn constrainedExecution(report: constrained.Report, requested: usize) inference_work.ExecutionReport {
+        return .{ .requested_items = requested, .native_batches = report.native_batches, .native_items = report.native_items, .serial_items = report.serial_items, .rejected_items = report.rejected_items };
+    }
+
+    fn decideBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
+        if (!requestsShareRoute(requests)) return error.BatchIncompatible;
+        const d = @import("functions/decisions.zig");
+        const materialization = @import("functions/materialization.zig");
+        var parsed = try materialization.parse(alloc, requests[0].config_json);
+        defer parsed.deinit();
+        if (parsed.value.decider.decision_method != .generated) return error.BatchIncompatible;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var registry = @import("common/provider_registry.zig").Registry.init(a);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("materialized", parsed.value.decider);
+        const inputs = try a.alloc(d.Request, requests.len);
+        for (inputs, requests) |*input, request| {
+            try validateDecisionInput(a, request);
+            input.* = .{ .decider = "materialized", .questions = parsed.value.questions, .input = request.source_text };
+        }
+        var execution: @import("functions/runtime.zig").Runtime = .{
+            .registry = &registry,
+            .http = self.http,
+            .io = self.http.io,
+            .limits = self.limits,
+            .context = self.requestContext(),
+            .secret_store = self.secret_store,
+            .antfly_provider = self.antfly_provider,
+            .antfly_url = self.inference_api_url,
+            .source_table = self.execution.routing.source_table,
+        };
+        const results = try execution.evaluateGeneratedPartial(a, "materialized", inputs);
+        const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |item| if (item.result == .value) alloc.free(item.result.value);
+            alloc.free(items);
+        }
+        for (items, results.values, results.failures, requests) |*item, value, failure, request| {
+            var response = value;
+            if (response) |*answer| {
+                var info = try materialization.provenanceWithRevision(a, parsed.value, request.source_fingerprint, answer.object.get("model_revision"));
+                try d.put(a, &info, "model", answer.object.get("model").?);
+                try d.put(a, answer, "provenance", info);
+            }
+            item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = if (response) |answer| .{ .value = try std.json.Stringify.valueAlloc(alloc, answer, .{}) } else .{ .item_error = .{ .cause = failure orelse error.InvalidDecisionOutput, .code = .generation_failed } } };
+            initialized += 1;
+        }
+        return .{ .items = items, .execution = constrainedExecution(results.execution, requests.len) };
+    }
+
+    fn decide(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+        const d = @import("functions/decisions.zig");
+        const materialization = @import("functions/materialization.zig");
+        const parsed = try materialization.parse(alloc, request.config_json);
+        defer parsed.deinit();
+        try validateDecisionInput(alloc, request);
         var registry = @import("common/provider_registry.zig").Registry.init(alloc);
         defer registry.deinit();
         try registry.registerDeciderConfig("materialized", parsed.value.decider);
@@ -1601,7 +1721,8 @@ pub const Runtime = struct {
             .generator => self.tryGenerateBatch(alloc, requests),
             .extractor => self.tryExtractBatch(alloc, requests),
             .transcriber => self.tryTranscribeBatch(alloc, requests),
-            .document_extraction, .decision => error.BatchIncompatible,
+            .decision => self.tryDecideBatch(alloc, requests),
+            .document_extraction => error.BatchIncompatible,
         };
         if (batch_result) |items| {
             return items;
@@ -1627,6 +1748,13 @@ pub const Runtime = struct {
                 outputs,
                 inference_work.ExecutionReport.fallback(requests.len, "mixed_producer_types"),
             );
+        };
+        if (first_type == .decision) return self.decideBatch(alloc, requests) catch |err| switch (err) {
+            error.BatchIncompatible => {
+                const outputs = try self.produceBatchSequential(alloc, requests);
+                return asset_producer.producedBatchFromOutputs(alloc, requests, outputs, inference_work.ExecutionReport.serial(requests.len));
+            },
+            else => return err,
         };
         if (first_type == .reader) return self.tryReadBatchReported(alloc, requests) catch |err| switch (err) {
             error.BatchIncompatible => blk: {
@@ -1903,6 +2031,7 @@ pub const Runtime = struct {
     }
 
     fn tryExtractBatchReported(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
+        if (requests.len > 0 and try generated_extractor.isGenerated(alloc, requests[0].config_json)) return self.extractGenerated(alloc, requests);
         for (requests) |request| {
             if (request.producer_type != .extractor) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
@@ -2081,6 +2210,7 @@ pub const Runtime = struct {
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
         defer parsed_cfg.deinit(alloc);
         try self.routeGeneratorConfig(alloc, &parsed_cfg.generator);
+        if (parsed_cfg.output_schema != null) return self.generateConstrained(alloc, &parsed_cfg, requests);
         const cfg = parsed_cfg.generator;
         try generating_runtime.validateGenerationOutputTokenBudget(cfg, requests.len);
         const generation_policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
@@ -2585,10 +2715,68 @@ pub const Runtime = struct {
         return try asset_producer.producedBatchFromOutputs(alloc, requests, out, reader_execution);
     }
 
+    fn constrainedProducerCapabilities(self: *Runtime, a: Allocator, generator: *generating_runtime.GeneratorConfig, output: constrained.Output, probabilities: ?constrained.Probabilities, batch: constrained.Batch, task: inference_work.Task) !inference_work.InferenceCapabilities {
+        var engine = self.constrainedRuntime();
+        const resolved = try engine.capabilities(a, generator);
+        _ = try resolved.select(output, probabilities);
+        const revision: ?[32]u8 = if (resolved.model_revision) |value| blk: {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+            break :blk digest;
+        } else null;
+        return .{ .model_revision = revision, .task = task, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = if (task == .extract) .extraction else .generated_text, .batch = .{ .mode = if (batch.max_items_per_call > 1) .native else .serial_compatibility, .preferred_items = batch.max_items_per_call, .max_items = batch.max_items_per_call, .per_item_failures = true } };
+    }
+
+    fn constrainedRuntime(self: *Runtime) constrained_runtime.Runtime {
+        return .{ .http = self.http, .cache = self.capabilityCache(), .options = .{
+            .antfly_provider = self.antfly_provider,
+            .secret_store = self.secret_store,
+            .max_response_bytes = self.max_provider_response_bytes,
+            .source_table = self.execution.routing.source_table,
+            .execution = self.execution,
+            .request_context = self.requestContext(),
+            .limits = self.limits,
+        } };
+    }
+
+    fn generateConstrained(self: *Runtime, alloc: Allocator, parsed: *GeneratorProducerConfig, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var cfg = try parsed.generator.clone(a);
+        var engine = self.constrainedRuntime();
+        const caps = try engine.capabilities(a, &cfg);
+        const mode = try caps.select(parsed.output, null);
+        const inputs = try a.alloc([]const u8, requests.len);
+        for (requests, inputs) |request, *input| {
+            if (request.media.len > 0) return error.UnsupportedConstrainedMedia;
+            input.* = request.source_text;
+        }
+        const result = try engine.execute(a, cfg, mode, parsed.output_schema.?, parsed.instructions, parsed.batch, inputs);
+        const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |item| if (item.result == .value) alloc.free(item.result.value);
+            alloc.free(items);
+        }
+        for (items, requests, result.values, result.failures) |*item, request, value, failure| {
+            item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = if (value) |output| .{ .value = try std.json.Stringify.valueAlloc(alloc, output, .{}) } else .{ .item_error = .{ .cause = failure orelse error.InvalidConstrainedOutput, .code = .generation_failed } } };
+            initialized += 1;
+        }
+        return .{ .items = items, .execution = constrainedExecution(result.execution, requests.len) };
+    }
+
     fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) anyerror![]u8 {
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, request.config_json);
         defer parsed_cfg.deinit(alloc);
         try self.routeGeneratorConfig(alloc, &parsed_cfg.generator);
+        if (parsed_cfg.output_schema != null) {
+            var batch_result = try self.generateConstrained(alloc, &parsed_cfg, &.{request});
+            defer batch_result.deinit(alloc);
+            const outputs = try batch_result.intoOutputs(alloc);
+            defer alloc.free(outputs);
+            return outputs[0];
+        }
         var cfg = parsed_cfg.generator;
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         for (request.media) |media| try validateEncodedMedia(media);
@@ -3259,7 +3447,66 @@ pub const Runtime = struct {
         return try transcribing.speakerAttributedTextAlloc(alloc, &result);
     }
 
+    fn extractGenerated(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
+        if (!requestsShareRoute(requests)) return error.BatchIncompatible;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var parsed = try generated_extractor.parse(a, requests[0].config_json);
+        defer parsed.deinit();
+        var config = parsed.value;
+        try self.routeGeneratorConfig(a, &config.generator);
+        var engine = self.constrainedRuntime();
+        const caps = try engine.capabilities(a, &config.generator);
+        const mode = try caps.select(config.output, config.probabilities);
+        config.generator.logprobs = config.probabilities == .token_logprobs;
+        const texts = try a.alloc([]const u8, requests.len);
+        for (requests, texts) |request, *text| {
+            if (request.media.len > 0) return error.UnsupportedGeneratedExtractionMedia;
+            if (request.content_type.len > 0 and !isJsonContentType(request.content_type)) return error.UnsupportedGeneratedExtractionContentType;
+            text.* = request.source_text;
+        }
+        const request_context = self.requestContext();
+        const TextCheck = struct {
+            fn check(ptr: *const anyopaque) !void {
+                const context: *const execution_context.RequestContext = @ptrCast(@alignCast(ptr));
+                try context.check();
+            }
+        };
+        const text_control: @import("antfly_extracting").text_processing.Checkpoint = .{ .ptr = &request_context, .check_fn = TextCheck.check };
+        const planned = try generated_extractor.planWithControl(a, config, texts, text_control);
+        const instructions = try std.fmt.allocPrint(a, "Extract only entities and relations grounded in each input text. Use literal source surface forms. Include every occurrence through its surface form. Relations reference entity positions. Set present=false for an absent or unsupported candidate. Never supply offsets or confidence. {s}", .{config.instructions});
+        var validation = generated_extractor.Validation{ .config = config };
+        engine.semantic_validation = .{ .ptr = &validation, .validate = generated_extractor.Validation.validate };
+        const generated = try engine.execute(a, config.generator, mode, try generated_extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
+        const failures = try a.alloc(?anyerror, requests.len);
+        @memset(failures, null);
+        for (planned.windows, generated.failures) |window, failure| if (failure != null and failures[window.document] == null) {
+            failures[window.document] = failure;
+        };
+        const outputs = try generated_extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
+        try self.requestContext().check();
+        const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |item| if (item.result == .value) alloc.free(item.result.value);
+            alloc.free(items);
+        }
+        for (items, outputs, requests, failures) |*item, output, request, failure| {
+            item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = if (output) |value| .{ .value = try std.json.Stringify.valueAlloc(alloc, value, .{}) } else .{ .item_error = .{ .cause = failure orelse error.InvalidConstrainedOutput, .code = .generation_failed } } };
+            initialized += 1;
+        }
+        return .{ .items = items, .execution = if (planned.windows.len == requests.len) constrainedExecution(generated.execution, requests.len) else inference_work.ExecutionReport.serial(requests.len) };
+    }
+
     pub fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+        if (try generated_extractor.isGenerated(alloc, request.config_json)) {
+            var batch = try self.extractGenerated(alloc, &.{request});
+            defer batch.deinit(alloc);
+            const outputs = try batch.intoOutputs(alloc);
+            defer alloc.free(outputs);
+            return outputs[0];
+        }
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         for (request.media) |media| try validateEncodedMedia(media);
         var cfg = try extracting.parseConfigFromSlice(alloc, request.config_json);
@@ -3432,92 +3679,17 @@ test "asset producer runtime invocation context can only tighten configured cont
     try std.testing.expect(scoped.execution.cancellation.isCancelled());
 }
 
-const GeneratorToolOutput = enum {
-    arguments,
-    content,
-};
-
-const GeneratorProducerConfig = struct {
-    generator: generating_runtime.GeneratorConfig,
-    parsed: std.json.Parsed(std.json.Value),
-    tool_choice: ?std.json.Value = null,
-    tool_name: ?[]const u8 = null,
-    tool_output: GeneratorToolOutput = .content,
-
-    pub fn deinit(self: *GeneratorProducerConfig, alloc: Allocator) void {
-        self.generator.deinit(alloc);
-        self.parsed.deinit();
-        self.* = undefined;
-    }
-};
-
-fn parseGeneratorProducerConfig(alloc: Allocator, raw: []const u8) !GeneratorProducerConfig {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
-    errdefer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidGeneratorConfig;
-
-    var cfg = try generatorConfigFromValue(alloc, parsed.value);
-    errdefer cfg.deinit(alloc);
-
-    const tools = parsed.value.object.get("tools");
-    const tool_choice = parsed.value.object.get("tool_choice");
-    const tool_name = if (parsed.value.object.get("tool_name")) |value|
-        if (value == .string) value.string else null
-    else
-        forcedToolName(tool_choice);
-    const tool_output = if (parsed.value.object.get("tool_output")) |value| blk: {
-        if (value != .string) return error.InvalidGeneratorToolConfig;
-        if (std.mem.eql(u8, value.string, "arguments")) break :blk GeneratorToolOutput.arguments;
-        if (std.mem.eql(u8, value.string, "content")) break :blk GeneratorToolOutput.content;
-        return error.InvalidGeneratorToolConfig;
-    } else if (tools != null) GeneratorToolOutput.arguments else GeneratorToolOutput.content;
-
-    return .{
-        .generator = cfg,
-        .parsed = parsed,
-        .tool_choice = tool_choice,
-        .tool_name = tool_name,
-        .tool_output = tool_output,
-    };
-}
-
-fn generatorConfigFromValue(alloc: Allocator, value: std.json.Value) !generating_runtime.GeneratorConfig {
-    if (value != .object) return error.InvalidGeneratorConfig;
-    // Asset-only envelope fields are handled here; all provider configuration
-    // is parsed by the canonical generator contract (including future fields).
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(alloc);
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        const key = entry.key_ptr.*;
-        if (std.mem.eql(u8, key, "tools") or std.mem.eql(u8, key, "tool_choice") or
-            std.mem.eql(u8, key, "tool_name") or std.mem.eql(u8, key, "tool_output")) continue;
-        try object.put(alloc, key, entry.value_ptr.*);
-    }
-    var cfg = try generating_runtime.parseConfigFromValue(alloc, .{ .object = object });
-    errdefer cfg.deinit(alloc);
-    if (value.object.get("tools")) |tools| cfg.tools_json = try std.json.Stringify.valueAlloc(alloc, tools, .{});
-    if (value.object.get("tool_choice")) |choice| cfg.tool_choice_json = try std.json.Stringify.valueAlloc(alloc, choice, .{});
-    return cfg;
-}
+const producer_config = @import("generating/producer_config.zig");
+const GeneratorToolOutput = producer_config.ToolOutput;
+const GeneratorProducerConfig = producer_config.Config;
+const parseGeneratorProducerConfig = producer_config.parse;
+const generatorConfigFromValue = producer_config.generatorConfigFromValue;
+const forcedToolName = producer_config.forcedToolName;
 
 fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
     if (value != .object) return null;
     const found = value.object.get(field) orelse return null;
     return if (found == .string) found.string else null;
-}
-
-fn forcedToolName(tool_choice: ?std.json.Value) ?[]const u8 {
-    const choice = tool_choice orelse return null;
-    switch (choice) {
-        .object => |obj| {
-            const function = obj.get("function") orelse return null;
-            if (function != .object) return null;
-            const name = function.object.get("name") orelse return null;
-            return if (name == .string) name.string else null;
-        },
-        else => return null,
-    }
 }
 
 fn toolCallArgumentsOutputAlloc(alloc: Allocator, calls: []const generating_runtime.ToolCall, expected_name: ?[]const u8) ![]u8 {

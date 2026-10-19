@@ -913,6 +913,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
                 .text_memory_attribution_stats_best_effort = textMemoryAttributionStatsBestEffort,
                 .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
+                .preflight_grouped_source_batch_group_local = preflightGroupedSourceBatchGroupLocal,
                 .prepare_hot_standby_seed_snapshot_group_local = prepareHotStandbySeedSnapshotGroupLocal,
                 .capture_hot_standby_seed_snapshot_group_local = captureHotStandbySeedSnapshotGroupLocal,
                 .find_median_key_group_local = findMedianKeyGroupLocal,
@@ -1710,9 +1711,35 @@ pub const ProvisionedKernelOwnerSource = struct {
             .enrichments => .enrichments,
             .full_index => .full_index,
         };
-        var lease = try self.acquire(group_id, table_name);
-        defer lease.deinit();
-        try lease.owner().waitForSyncWithCancellation(table_name, owner_sync_level, cancellation);
+        var target: abi.SyncTarget = .{};
+        const Slice = struct {
+            outer: db_types.CancellationToken,
+            until: u64,
+            fn cancelled(ptr: *const anyopaque) bool {
+                const slice: *const @This() = @ptrCast(@alignCast(ptr));
+                return slice.outer.isCancelled() or platform_time.monotonicNs() >= slice.until;
+            }
+        };
+        while (true) {
+            try cancellation.check();
+            if (target.captured != 0 and platform_time.monotonicNs() >= target.deadline_ns) return error.Timeout;
+            const complete = blk: {
+                // Owner transitions may be prerequisites of derived progress.
+                // Keep a fixed replay target, but never retain this lease for
+                // the entire visibility wait and block those transitions.
+                var lease = try self.acquire(group_id, table_name);
+                defer lease.deinit();
+                const slice = Slice{ .outer = cancellation, .until = @min(platform_time.monotonicNs() +| 50 * std.time.ns_per_ms, if (target.captured != 0) target.deadline_ns else std.math.maxInt(u64)) };
+                lease.owner().waitForSyncTargetWithCancellation(table_name, owner_sync_level, &target, .{ .ptr = &slice, .is_cancelled_fn = Slice.cancelled }) catch |err| switch (err) {
+                    error.Canceled => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
+            };
+            if (complete) return;
+            try cancellation.check();
+            platform_time.sleepNs(std.time.ns_per_ms);
+        }
     }
 
     pub fn applyHotStandbyReplicationRecordGroupLocal(
@@ -2492,6 +2519,17 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
         }
         return false;
+    }
+
+    fn preflightGroupedSourceBatchGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        if (!try lease.owner().preflightWriteAdmissionJson(table_name, "")) return {};
+        const encoded = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(encoded);
+        _ = try lease.owner().preflightWriteAdmissionJson(table_name, encoded);
+        return {};
     }
 
     fn preflightWriteAdmissionGroupLocal(
@@ -4742,7 +4780,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!opts.fk_generation_source_control or !opts.fk_generation_source_read_index_certified or
             key.len != 0 or consistency != .stale or
             opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or
-            opts.relational_activation_json.len != 0 or opts.relational_index_status_json.len != 0 or
+            opts.relational_activation_json.len != 0 or opts.group_source_query_json.len != 0 or opts.relational_index_status_json.len != 0 or
             opts.row_policy_receipt != null or opts.restore_staging_scope != null or
             opts.include_primary_digest or opts.fields.len != 0) return false;
         if (opts.relational_integrity_catalog)
@@ -4801,7 +4839,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const handoff_identity = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}");
         const handoff_receipt = handoff_identity or std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}");
         if (handoff_identity and (fence != null or opts.include_primary_digest or opts.relational_integrity_catalog or opts.relational_integrity_action or
-            opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or
+            opts.relational_integrity_jobs_json.len != 0 or opts.group_source_query_json.len != 0 or opts.relational_index_status_json.len != 0 or
             opts.relational_activation_json.len != 0 or opts.fields.len != 0 or opts.generation_handoff_install_read_index_certified)) return error.RestoreStagingScopeChanged;
         if (handoff_receipt and (opts.restore_staging_plan_id == null or key.len != 0)) return error.RestoreStagingScopeChanged;
         var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, opts.restore_staging_plan_id, if (handoff_receipt) .resolve else .read, .{ .deadline_ns = opts.execution_deadline_ns, .deadline_io = opts.execution_io, .cancellation = opts.cancellation orelse .none });
@@ -5051,6 +5089,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer if (private_path) |path| alloc.free(path);
         var lease = if (descriptor) |owned| try self.acquireDescriptor(group_id, table_name, private_path.?, owned) else try self.acquire(group_id, table_name);
         defer lease.deinit();
+        if (descriptor == null and (req.writes.len != 0 or req.transforms.len != 0)) _ = try lease.owner().preflightWriteAdmissionJson(table_name, request_json);
         if (req.transaction != null and req.restore_staging_scope != null) {
             // Private activation uses the batch route to retain exact Plan
             // authority for every transaction phase, including abort/retry.

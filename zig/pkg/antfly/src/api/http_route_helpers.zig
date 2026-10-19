@@ -122,12 +122,14 @@ pub const OwnedLookupOptions = struct {
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
+    group_source_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
     opts: @import("antfly_local_sources").storage_db_types.LookupOptions = .{},
 
     pub fn deinit(self: *OwnedLookupOptions, alloc: std.mem.Allocator) void {
         if (self.relational_integrity_jobs_json.len != 0) alloc.free(self.relational_integrity_jobs_json);
         if (self.relational_activation_json.len != 0) alloc.free(self.relational_activation_json);
+        if (self.group_source_query_json.len != 0) alloc.free(self.group_source_query_json);
         if (self.relational_index_status_json.len != 0) alloc.free(self.relational_index_status_json);
         if (self.relational_topology_json.len != 0) alloc.free(self.relational_topology_json);
         for (self.fields) |field| alloc.free(field);
@@ -213,6 +215,12 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             result.relational_integrity_jobs_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_relational_integrity_jobs=".len..]);
             if (result.relational_integrity_jobs_json.len == 0 or result.relational_integrity_jobs_json.len > 4096) return error.InvalidQueryRequest;
             result.opts.relational_integrity_jobs_json = result.relational_integrity_jobs_json;
+        } else if (std.mem.startsWith(u8, part, "_group_source=")) {
+            if (seen) return error.InvalidQueryRequest;
+            seen = true;
+            result.group_source_query_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_group_source=".len..]);
+            if (result.group_source_query_json.len == 0 or result.group_source_query_json.len > 65536) return error.InvalidQueryRequest;
+            result.opts.group_source_query_json = result.group_source_query_json;
         } else if (std.mem.startsWith(u8, part, "_relational_index_status=")) {
             if (seen) return error.InvalidQueryRequest;
             seen = true;

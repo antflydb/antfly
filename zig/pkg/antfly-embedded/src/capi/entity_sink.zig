@@ -31,7 +31,7 @@ pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
 
 /// Read-only candidate seam also used by ephemeral query resolution.
 pub fn candidateSource(handle: *h.Handle) callbacks.CandidateSource {
-    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .adjudicate = adjudicate, .get_description = getDescription, .revisions = candidateRevisions, .embedding_cache_prepare = embeddingCachePrepare, .embedding_cache_flush = embeddingCacheFlush, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
+    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .adjudicate = adjudicate, .adjudicate_batch = adjudicateBatch, .adjudicator_model_revision = adjudicatorModelRevision, .get_description = getDescription, .revisions = candidateRevisions, .embedding_cache_prepare = embeddingCachePrepare, .embedding_cache_flush = embeddingCacheFlush, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
 }
 
 fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, index: []const u8, embedding: []const u8) anyerror!callbacks.CandidateSource.Revisions {
@@ -441,27 +441,38 @@ fn getDescription(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key:
     return @import("../functions/resolver_adjudication.zig").projectedDescription(a, row.json, artifact);
 }
 
-fn adjudicate(ptr: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
-    const handle: *h.Handle = @ptrCast(@alignCast(ptr));
+fn adjudicationProducer(handle: *h.Handle) !@import("../storage/db/enrichment/asset_producer.zig").Producer {
     const database = handle.database();
     const io = database.backend_runtime.io() orelse return error.MissingAdjudicator;
-    // The ordinary asset producer owns provider policy, credentials, local model
-    // routing and deadline propagation. No resolver-specific provider client.
-    const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
     handle.query_producer_mutex.lockUncancelable(io);
     const cached = if (handle.query_producer) |runtime| runtime.producer() else null;
     handle.query_producer_mutex.unlock(io);
-    if (cached) |producer| return producer.withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
-    if (database.enrichment_runtime) |runtime| if (runtime.config.asset_producer) |producer| {
-        return producer.withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
-    };
+    if (cached) |producer| return producer;
+    if (database.enrichment_runtime) |runtime| if (runtime.config.asset_producer) |producer| return producer;
     handle.query_producer_mutex.lockUncancelable(io);
-    const producer = blk: {
-        defer handle.query_producer_mutex.unlock(io);
-        if (handle.query_producer == null) handle.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() });
-        break :blk handle.query_producer.?.producer();
-    };
+    defer handle.query_producer_mutex.unlock(io);
+    if (handle.query_producer == null) handle.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() });
+    return handle.query_producer.?.producer();
+}
+
+fn adjudicate(ptr: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
+    const handle: *h.Handle = @ptrCast(@alignCast(ptr));
+    const io = handle.database().backend_runtime.io() orelse return error.MissingAdjudicator;
+    const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+    const producer = try adjudicationProducer(handle);
     return producer.withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
+}
+
+fn adjudicatorModelRevision(ptr: *anyopaque, a: std.mem.Allocator, specification: []const u8, timeout_ms: u32) anyerror!?[32]u8 {
+    const handle: *h.Handle = @ptrCast(@alignCast(ptr));
+    return @import("../functions/resolver_adjudication.zig").modelRevision(a, try adjudicationProducer(handle), .{ .io = handle.database().backend_runtime.io() orelse return error.MissingAdjudicator }, specification, timeout_ms);
+}
+
+fn adjudicateBatch(ptr: *anyopaque, a: std.mem.Allocator, requests: []const @import("antfly_resolver").adjudication.Request) anyerror![]@import("antfly_resolver").adjudication.Result {
+    const handle: *h.Handle = @ptrCast(@alignCast(ptr));
+    const io = handle.database().backend_runtime.io() orelse return error.MissingAdjudicator;
+    const producer = try adjudicationProducer(handle);
+    return @import("../functions/resolver_adjudication.zig").executeBatch(a, producer, .{ .io = io }, requests);
 }
 
 fn embedMention(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {

@@ -34,7 +34,7 @@ fn capture(alloc: std.mem.Allocator, txn: anytype, config: catalog.ResolverConfi
     const owned = arena.allocator();
     const ordered = (try inventory.load(owned, txn)) orelse return error.ArtifactCatalogDrift;
     const binding = ordered.value.command.binding;
-    if (binding.effect_protocol != 15 or binding.epoch != authority.epoch or
+    if (binding.effect_protocol < 15 or binding.epoch != authority.epoch or
         !std.mem.eql(u8, &binding.digest, &authority.catalog_digest) or
         !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace)) return error.ArtifactCatalogDrift;
     const local = try inventory.catalogs(txn);

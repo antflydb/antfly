@@ -80,6 +80,7 @@ pub const SharedModules = struct {
     chunking_api_openapi: ?*std.Build.Module = null,
     extraction_openapi: ?*std.Build.Module = null,
     extracting: ?*std.Build.Module = null,
+    generating: ?*std.Build.Module = null,
     reader_config: ?*std.Build.Module = null,
     inference_client: ?*std.Build.Module = null,
 };
@@ -206,6 +207,11 @@ pub fn create(config: Config) Graph {
         mod.addImport("antfly_regex", regex_mod);
         break :blk mod;
     };
+    const structured_mod = b.modules.get("antfly_structured") orelse blk: {
+        const module = b.addModule("antfly_structured", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/structured/root.zig")) });
+        module.addImport("antfly_jsonschema", jsonschema_mod);
+        break :blk module;
+    };
     const hash_mod = shared.hash orelse createSharedModule(config, "lib/hash/src/mod.zig");
     const image_mod = shared.image orelse createSharedModule(config, "lib/image/src/mod.zig");
     if (shared.image == null) image_mod.addImport("antfly_hash", hash_mod);
@@ -270,6 +276,14 @@ pub fn create(config: Config) Graph {
         mod.addImport("antfly_s3_openapi", s3_openapi_mod);
         break :blk mod;
     };
+    const generating_mod = shared.generating orelse blk: {
+        const module = createSharedModule(config, "lib/generating/src/mod.zig");
+        module.addImport("antfly-json", json_mod);
+        module.addImport("antfly_generating_openapi", generating_openapi_mod);
+        break :blk module;
+    };
+    structured_mod.addImport("antfly_generating", generating_mod);
+    structured_mod.addImport("antfly_extracting", extracting_mod);
     const transcribing_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/transcribing/src/mod.zig")),
         .target = target,
@@ -289,6 +303,7 @@ pub fn create(config: Config) Graph {
     apple_native_mod.addImport("antfly_platform", platform_mod);
     apple_native_mod.addImport("httpx", httpx_mod);
     transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
+    if (shared.generating == null) generating_mod.addImport("antfly_apple_native", apple_native_mod);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
@@ -354,6 +369,8 @@ pub fn create(config: Config) Graph {
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/decisions/root.zig")),
     });
     inference_mod.addImport("antfly_decisions", decisions_mod);
+    inference_mod.addImport("antfly_structured", structured_mod);
+    decisions_mod.addImport("antfly_structured", structured_mod);
     addInferenceRootImports(inference_mod, .{
         .build_info_mod = shared.build_info_mod,
         .identities = identities,
@@ -420,6 +437,7 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
     inference_internal_mod.addImport("antfly_decisions", decisions_mod);
+    inference_internal_mod.addImport("antfly_structured", structured_mod);
     inference_internal_mod.addImport("build_info", shared.build_info_mod);
     identities.addImports(inference_internal_mod);
     inference_internal_mod.addImport("build_options", build_options_mod);
@@ -675,7 +693,7 @@ fn addInferenceApiModule(
             .target = target,
             .optimize = optimize,
         });
-        mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths));
+        mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_generating_openapi", generating_openapi_mod);
         mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
@@ -688,7 +706,7 @@ fn addInferenceApiModule(
             .target = target,
             .optimize = optimize,
         });
-        mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths));
+        mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_generating_openapi", generating_openapi_mod);
         mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
@@ -702,7 +720,7 @@ fn addInferenceApiModule(
         .target = target,
         .optimize = optimize,
     });
-    mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths));
+    mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
     mod.addImport("httpx", httpx_mod);
     mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
@@ -710,11 +728,10 @@ fn addInferenceApiModule(
     return mod;
 }
 
-fn addDecisionOpenApiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, paths: Paths) *std.Build.Module {
+fn addDecisionOpenApiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, paths: Paths, generating: *std.Build.Module) *std.Build.Module {
     _ = target;
     _ = optimize;
-    if (b.modules.get("antfly_decision_openapi")) |existing| return existing;
-    return b.addModule("antfly_decision_openapi", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig")) });
+    return @import("../../../lib/decisions/build.zig").createOpenApi(b, b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig")), generating);
 }
 
 fn addChunkingApiOpenApiModule(

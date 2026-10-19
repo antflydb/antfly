@@ -622,6 +622,7 @@ test "reranking runtime maps Vertex record IDs back to input order" {
 
 fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8, history_len: usize) !inference.GenerateResult {
     const Response = struct {
+        usageMetadata: ?struct { promptTokenCount: u64 = 0, candidatesTokenCount: u64 = 0, thoughtsTokenCount: u64 = 0 } = null,
         candidates: []const struct {
             content: struct { parts: []const std.json.Value = &.{} },
         } = &.{},
@@ -679,6 +680,7 @@ fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8, history_len: u
         .content = content,
         .tool_calls = try calls.toOwnedSlice(alloc),
         .google_parts_json = google_parts,
+        .usage = if (parsed.value.usageMetadata) |usage| .{ .input_tokens = usage.promptTokenCount, .output_tokens = usage.candidatesTokenCount +| usage.thoughtsTokenCount } else null,
         .allocator = alloc,
     };
 }

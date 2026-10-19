@@ -467,6 +467,13 @@ pub const TableWriteSource = struct {
         text_memory_attribution_stats_best_effort: ?*const fn (
             ptr: *anyopaque,
         ) db_mod.TextMemoryAttributionStats = null,
+        preflight_grouped_source_batch_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+        ) anyerror!?void = null,
         preflight_write_admission_group_local: ?*const fn (
             ptr: *anyopaque,
             group_id: u64,
@@ -1434,6 +1441,11 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.request_table_structural_reconcile orelse return null;
         return try BoundaryAbi.call("request_table_structural_reconcile", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
+    }
+
+    pub fn preflightGroupedSourceBatchGroupLocal(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest) !?void {
+        const fn_ptr = self.vtable.preflight_grouped_source_batch_group_local orelse return null;
+        return try BoundaryAbi.call("preflight_grouped_source_batch_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req });
     }
 
     pub fn preflightWriteAdmissionGroupLocal(

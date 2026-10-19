@@ -1805,7 +1805,7 @@ export class AntflyClient {
     /**
      * Get table details and status
      */
-    get: async (tableName: string) => {
+    get: async (tableName: string): Promise<Table | undefined> => {
       const { data, error } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });

@@ -17,6 +17,9 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const decisions = @import("decisions.zig");
+const generated = @import("generated.zig");
+const constrained_runtime = @import("../generating/constrained_runtime.zig");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const openai = @import("openai.zig");
 const registry_mod = @import("../common/provider_registry.zig");
 const secrets = @import("../common/secrets.zig");
@@ -51,6 +54,7 @@ fn parseResponse(a: std.mem.Allocator, bytes: []const u8) !decisions.Json {
 }
 
 fn requestBody(a: std.mem.Allocator, cfg: decisions.DeciderConfig, request: decisions.Request) ![]const u8 {
+    if (cfg.decision_method == .generated) return std.json.Stringify.valueAlloc(a, .{ .input = request.input, .questions = request.questions, .instructions = cfg.instructions }, .{});
     if (cfg.provider == .openai) return openai.requestBody(a, cfg.modelName(), request.input, request.questions);
     return decisions.wireRequest(a, cfg, request.input, request.questions);
 }
@@ -72,7 +76,21 @@ pub const Runtime = struct {
     batches: u64 = 0,
     latency_ns: u64 = 0,
     profile_allocator: ?std.mem.Allocator = null,
-    provenance: std.ArrayList(struct { decider: []const u8, provider: decisions.Provider, model: []const u8, rows: u64 = 0 }) = .empty,
+    provenance: std.ArrayList(struct { decider: []const u8, provider: []const u8, model: []const u8, rows: u64 = 0 }) = .empty,
+    fn recordProvenance(self: *Runtime, name: []const u8, cfg: decisions.DeciderConfig, value: decisions.Json) !void {
+        const stats_a = self.profile_allocator orelse return;
+        const model = value.object.get("model").?.string;
+        const provider_name = if (cfg.generator) |generator| @tagName(generator.provider) else @tagName(cfg.provider);
+        for (self.provenance.items) |*item| if (std.mem.eql(u8, item.decider, name) and std.mem.eql(u8, item.model, model) and std.mem.eql(u8, item.provider, provider_name)) {
+            item.rows += 1;
+            return;
+        };
+        const decider = try stats_a.dupe(u8, name);
+        errdefer stats_a.free(decider);
+        const owned_model = try stats_a.dupe(u8, model);
+        errdefer stats_a.free(owned_model);
+        try self.provenance.append(stats_a, .{ .decider = decider, .provider = provider_name, .model = owned_model, .rows = 1 });
+    }
     pub fn provider(self: *@This()) decisions.DecisionProvider {
         return .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
     }
@@ -90,6 +108,117 @@ pub const Runtime = struct {
         try cfg.validate();
         _ = try quotas.Policy.fromConfig(cfg.rate_limit);
         try decisions.validateQuestions(questions, cfg.resolvedCapabilities());
+        if (cfg.decision_method == .generated) {
+            var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+            defer arena.deinit();
+            var cache = remote_capabilities.Cache.init(std.heap.smp_allocator, self.io);
+            defer cache.deinit();
+            var engine = self.constrainedRuntime(&cache);
+            var generator = try cfg.generator.?.clone(arena.allocator());
+            if (generator.provider == .antfly and generator.url.len == 0) generator.url = self.antfly_url orelse "";
+            const caps = try engine.capabilities(arena.allocator(), &generator);
+            const mode = try caps.select(cfg.output, cfg.probabilities);
+            try @import("antfly_structured").validateProviderSchema(generator, mode, try generated.questionSchema(arena.allocator(), questions));
+            if (cfg.probabilities == .token_logprobs) for (questions.object.values()) |question| {
+                const kind = question.object.get("type").?.string;
+                if (std.mem.eql(u8, kind, "multi_choice") or std.mem.eql(u8, kind, "score")) return error.UnsupportedConstrainedProbabilities;
+            };
+        }
+    }
+    fn constrainedRuntime(self: *Runtime, cache: *remote_capabilities.Cache) constrained_runtime.Runtime {
+        return .{ .http = self.http, .cache = cache, .options = .{
+            .antfly_provider = self.antfly_provider,
+            .secret_store = self.secret_store,
+            .max_response_bytes = max_response_bytes,
+            .source_table = self.source_table,
+            .execution = .{ .routing = .{ .source_table = self.source_table } },
+            .request_context = self.context,
+            .limits = self.limits,
+        } };
+    }
+    pub fn evaluateGeneratedPartial(self: *Runtime, a: std.mem.Allocator, name: []const u8, requests: []const decisions.Request) !GeneratedBatch {
+        try validate(self, name, requests[0].questions);
+        const cfg = try self.registry.getDeciderConfig(name);
+        if (cfg.decision_method != .generated) return error.InvalidDeciderConfig;
+        var lease = admission.tryAcquireLease() orelse return error.DecisionRateLimited;
+        defer lease.release();
+        if (self.rows + requests.len > cfg.max_rows) return error.DecisionLimitExceeded;
+        var estimated = self.estimated_input_tokens;
+        for (requests) |request| {
+            if (request.input.len > cfg.resolvedCapabilities().max_input_bytes) return error.DecisionLimitExceeded;
+            const body = try requestBody(a, cfg, request);
+            defer a.free(body);
+            estimated +|= body.len;
+            if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
+        }
+        self.estimated_input_tokens = estimated;
+        const result = try self.generateBatchPartial(a, cfg, requests);
+        self.rows += requests.len;
+        self.input_tokens +|= result.input_tokens;
+        self.output_tokens +|= result.output_tokens;
+        self.batches +|= result.calls;
+        if (self.input_tokens > cfg.max_input_tokens) return error.DecisionLimitExceeded;
+        return result;
+    }
+    fn generateBatchPartial(self: *Runtime, a: std.mem.Allocator, cfg: decisions.DeciderConfig, requests: []const decisions.Request) !GeneratedBatch {
+        var cache = remote_capabilities.Cache.init(a, self.io);
+        defer cache.deinit();
+        var engine = self.constrainedRuntime(&cache);
+        const source_table = if (requests[0].source_table.len > 0) requests[0].source_table else self.source_table;
+        engine.options.source_table = source_table;
+        engine.options.execution.routing.source_table = source_table;
+        var generator = try cfg.generator.?.clone(a);
+        defer generator.deinit(a);
+        if (generator.provider == .antfly and generator.url.len == 0 and self.antfly_url != null) {
+            generator.url = try a.dupe(u8, self.antfly_url.?);
+        }
+        const caps = try engine.capabilities(a, &generator);
+        const mode = try caps.select(cfg.output, cfg.probabilities);
+        generator.logprobs = cfg.probabilities == .token_logprobs;
+        const inputs = try a.alloc([]const u8, requests.len);
+        defer a.free(inputs);
+        for (inputs, requests) |*input, request| input.* = request.input;
+        var batch = cfg.batch;
+        batch.max_items_per_call = @min(batch.max_items_per_call, cfg.batch_size);
+        const responses = try a.alloc(?decisions.Json, requests.len);
+        @memset(responses, null);
+        var validation = GeneratedValidation{ .cfg = cfg, .requests = requests, .responses = responses };
+        engine.semantic_validation = .{ .ptr = &validation, .validate = GeneratedValidation.validate };
+        const result = try engine.execute(a, generator, mode, try generated.questionSchema(a, requests[0].questions), cfg.instructions, batch, inputs);
+        for (responses) |*response| if (response.*) |*value| {
+            if (caps.model_revision) |revision| try value.object.put(a, "model_revision", .{ .string = revision });
+        };
+        // Charge all attempts once, including attempts for invalid items.
+        for (responses) |*response| if (response.*) |*value| {
+            const usage = value.object.getPtr("usage").?;
+            try usage.object.put(a, "input_tokens", .{ .integer = @intCast(result.input_tokens) });
+            try usage.object.put(a, "output_tokens", .{ .integer = @intCast(result.output_tokens) });
+            break;
+        };
+        return .{ .values = responses, .failures = result.failures, .input_tokens = result.input_tokens, .output_tokens = result.output_tokens, .calls = result.calls, .execution = result.execution };
+    }
+    pub const GeneratedBatch = struct {
+        values: []?decisions.Json,
+        failures: []?anyerror,
+        input_tokens: u64,
+        output_tokens: u64,
+        calls: usize,
+        execution: @import("antfly_structured").Report,
+    };
+    const GeneratedValidation = struct {
+        cfg: decisions.DeciderConfig,
+        requests: []const decisions.Request,
+        responses: []?decisions.Json,
+        fn validate(ptr: *anyopaque, a: std.mem.Allocator, id: usize, value: decisions.Json, proof: ?@import("antfly_structured").TokenEvidence) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.responses[id] = try generated.responseValue(a, self.cfg, self.requests[id].questions, value, proof, id, 0, 0);
+        }
+    };
+    fn generateBatch(self: *Runtime, a: std.mem.Allocator, cfg: decisions.DeciderConfig, requests: []const decisions.Request) ![]const decisions.Json {
+        const partial = try self.generateBatchPartial(a, cfg, requests);
+        const responses = try a.alloc(decisions.Json, requests.len);
+        for (partial.values, partial.failures, responses) |value, failure, *response| response.* = value orelse return failure orelse error.InvalidDecisionOutput;
+        return responses;
     }
     const Job = struct {
         runtime: *Runtime,
@@ -114,6 +243,7 @@ pub const Runtime = struct {
             try checkpoint(self.runtime);
             const a = self.arena.allocator();
             const cfg = self.cfg;
+            if (cfg.decision_method == .generated) return (try self.runtime.generateBatch(a, cfg, &.{self.request}))[0];
             const body = try requestBody(a, cfg, self.request);
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_url orelse cfg.baseUrl() else cfg.baseUrl();
             const url = try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
@@ -215,6 +345,31 @@ pub const Runtime = struct {
             batch_size = @min(batch_size, cfg.batch_size);
         }
         self.estimated_input_tokens = estimated;
+        if (requests.len > 0) {
+            const first = try self.registry.getDeciderConfig(requests[0].decider);
+            var compatible = first.decision_method == .generated;
+            const question_bytes = try std.json.Stringify.valueAlloc(a, requests[0].questions, .{});
+            defer a.free(question_bytes);
+            for (requests[1..]) |request| {
+                const bytes = try std.json.Stringify.valueAlloc(a, request.questions, .{});
+                defer a.free(bytes);
+                compatible = compatible and std.mem.eql(u8, request.decider, requests[0].decider) and std.mem.eql(u8, request.source_table, requests[0].source_table) and std.mem.eql(u8, bytes, question_bytes);
+            }
+            if (compatible) {
+                const partial = try self.generateBatchPartial(a, first, requests);
+                self.rows += requests.len;
+                self.input_tokens +|= partial.input_tokens;
+                self.output_tokens +|= partial.output_tokens;
+                self.batches +|= partial.calls;
+                if (self.input_tokens > first.max_input_tokens) return error.DecisionLimitExceeded;
+                for (partial.values, partial.failures, out, requests) |value, failure, *response, request| {
+                    response.* = value orelse return failure orelse error.InvalidDecisionOutput;
+                    try self.recordProvenance(request.decider, first, response.*);
+                }
+                return out;
+            }
+        }
+
         var begin: usize = 0;
         while (begin < requests.len) {
             try checkpoint(ptr);
@@ -245,16 +400,7 @@ pub const Runtime = struct {
                 }
                 const normalized = try decisions.normalizeResponseWithConfig(a, job.request.questions, job.response.?, job.cfg);
                 const usage = normalized.object.get("usage").?.object;
-                if (self.profile_allocator) |stats_a| {
-                    const model = normalized.object.get("model").?.string;
-                    var found = false;
-                    for (self.provenance.items) |*item| if (std.mem.eql(u8, item.decider, job.request.decider) and std.mem.eql(u8, item.model, model)) {
-                        item.rows += 1;
-                        found = true;
-                        break;
-                    };
-                    if (!found) try self.provenance.append(stats_a, .{ .decider = try stats_a.dupe(u8, job.request.decider), .provider = job.cfg.provider, .model = try stats_a.dupe(u8, model), .rows = 1 });
-                }
+                try self.recordProvenance(job.request.decider, job.cfg, normalized);
                 self.rows += 1;
                 self.input_tokens +|= @intCast(usage.get("input_tokens").?.integer);
                 self.output_tokens +|= @intCast(usage.get("output_tokens").?.integer);
@@ -593,7 +739,7 @@ test "decision functions OpenAI HTTP routing alignment provenance budgets and er
     try std.testing.expectEqual(@as(u64, 2), runtime.batches);
     try std.testing.expectEqual(@as(u64, 4), runtime.input_tokens);
     try std.testing.expectEqual(@as(usize, 1), runtime.provenance.items.len);
-    try std.testing.expectEqual(decisions.Provider.openai, runtime.provenance.items[0].provider);
+    try std.testing.expectEqualStrings("openai", runtime.provenance.items[0].provider);
     try std.testing.expectEqualStrings("resolved-model", runtime.provenance.items[0].model);
     try std.testing.expectEqual(@as(u64, 2), runtime.provenance.items[0].rows);
     try std.testing.expectError(error.DecisionLimitExceeded, runtime.provider().evaluateBatch(alloc, &.{.{ .input = "refund", .decider = "openai", .questions = questions }}));
@@ -611,4 +757,50 @@ test "decision functions OpenAI HTTP routing alignment provenance budgets and er
     var cancelled = std.atomic.Value(bool).init(true);
     runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
     try std.testing.expectError(error.Cancelled, runtime.provider().evaluateBatch(alloc, &.{.{ .input = "refund", .decider = "openai", .questions = questions }}));
+}
+
+test "generating backend generated decisions batch through native constrained output" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "generator", .url = "" }, .probabilities = .verdict_only });
+    const Fake = struct {
+        calls: usize = 0,
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const body = try std.json.parseFromSliceLeaky(decisions.Json, alloc, bytes, .{});
+            try std.testing.expect(body.object.contains("response_format"));
+            const messages = body.object.get("messages").?.array.items;
+            const prompt = try std.json.parseFromSliceLeaky(decisions.Json, alloc, messages[1].object.get("content").?.string, .{});
+            try std.testing.expectEqual(@as(usize, 2), prompt.object.get("items").?.array.items.len);
+            return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":0,\"value\":{\"answer\":\"same\"}},{\"item\":1,\"value\":{\"answer\":\"different\"}}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            );
+        }
+        fn caps(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_inference_work").Task) !@import("antfly_inference_work").InferenceCapabilities {
+            return .{ .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true };
+        }
+    };
+    var fake = Fake{};
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = std.testing.io, .antfly_provider = .{
+        .ptr = &fake,
+        .embed_dense_texts = undefined,
+        .embed_sparse_texts = undefined,
+        .generate_json = Fake.generate,
+        .model_capabilities = Fake.caps,
+    } };
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
+    , .{});
+    const result = try runtime.provider().evaluateBatch(scratch, &.{ .{ .decider = "judge", .questions = questions, .input = "A B" }, .{ .decider = "judge", .questions = questions, .input = "C D" } });
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("same", result[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqualStrings("verdict", result[1].object.get("answers").?.array.items[0].object.get("probability_source").?.string);
+    try std.testing.expectEqual(@as(u64, 10), runtime.input_tokens);
 }

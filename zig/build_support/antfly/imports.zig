@@ -114,6 +114,7 @@ pub const AntflyRootImports = struct {
     sql_regex: *std.Build.Module,
     json: *std.Build.Module,
     jsonschema: *std.Build.Module,
+    structured: *std.Build.Module,
     mcp: *std.Build.Module,
     toon: *std.Build.Module,
     a2a: *std.Build.Module,
@@ -193,6 +194,7 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_sql_regex", .field = "sql_regex" },
         .{ .name = "antfly-json", .field = "json" },
         .{ .name = "antfly_jsonschema", .field = "jsonschema" },
+        .{ .name = "antfly_structured", .field = "structured" },
         .{ .name = "antfly_mcp", .field = "mcp" },
         .{ .name = "antfly_toon", .field = "toon" },
         .{ .name = "antfly_a2a", .field = "a2a" },
@@ -286,7 +288,7 @@ pub const AntflyRootImports = struct {
             "reranking",          "chunking",        "json",                     "handlebars",
             "openai_api",         "indexes_openapi", "embeddings_openapi",       "embeddings",
             "inference_chunker",  "vector",          "structlog",                "hash",
-            "image",
+            "image",              "structured",
         }) |field| self.addImport(mod, field);
         mod.link_libc = link_libc;
     }
@@ -307,15 +309,16 @@ pub const AntflyRootImports = struct {
     fn configureDatabase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         self.configureBase(mod, link_libc);
         inline for (.{
-            "bloom",          "chunking",           "common_openapi",    "credentials",
-            "embeddings",     "embeddings_openapi", "extracting",        "generating",
-            "google",         "handlebars",         "hash",              "httpx",
-            "image",          "indexes_openapi",    "inference_chunker", "inference_api",
-            "json",           "logging_openapi",    "metadata_openapi",  "objectstore",
-            "openai_api",     "pdf",                "query_openapi",     "reader_config",
-            "readers",        "regex",              "reranking",         "scraping",
-            "synthesizing",   "transcribing",       "vector",            "fst",
-            "schema_openapi", "sql_regex",          "resolver",
+            "bloom",            "chunking",           "common_openapi",    "credentials",
+            "embeddings",       "embeddings_openapi", "extracting",        "generating",
+            "google",           "handlebars",         "hash",              "httpx",
+            "image",            "indexes_openapi",    "inference_chunker", "inference_api",
+            "json",             "jsonschema",         "structured",        "logging_openapi",
+            "metadata_openapi", "objectstore",        "openai_api",        "pdf",
+            "query_openapi",    "reader_config",      "readers",           "regex",
+            "reranking",        "scraping",           "synthesizing",      "transcribing",
+            "vector",           "fst",                "schema_openapi",    "sql_regex",
+            "resolver",
         }) |field| self.addImport(mod, field);
     }
 

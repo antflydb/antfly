@@ -58,12 +58,13 @@ pub const GenerateMessagesRequest = struct {
 pub fn localGenerationStatusError(alloc: std.mem.Allocator, status: u16, body: ?[]const u8) anyerror {
     if (status == 429) return error.RateLimit;
     if (status == 504) return error.Timeout;
-    if (status == 503 or status == 502) {
+    if (status == 503 or status == 502 or status == 500) {
         const Failure = struct { @"error": []const u8 = "", retryable: bool = false };
         if (body) |bytes| {
             var parsed = std.json.parseFromSlice(Failure, alloc, bytes, .{ .ignore_unknown_fields = true }) catch
                 return error.GenerateRequestFailed;
             defer parsed.deinit();
+            if (status == 500 and std.mem.eql(u8, parsed.value.@"error", "STRUCTURED_OUTPUT_INVALID")) return error.InvalidStructuredOutput;
             if (parsed.value.retryable and status == 503 and std.mem.eql(u8, parsed.value.@"error", "MODEL_RESOURCE_BUSY"))
                 return error.GenerationCapacityUnavailable;
             if (parsed.value.retryable and status == 502 and std.mem.eql(u8, parsed.value.@"error", "TOOL_ARGUMENTS_INVALID"))
@@ -127,6 +128,9 @@ pub const ChatWireFlavor = enum {
 };
 
 pub const ChatRequestOptions = struct {
+    response_format_json: ?[]const u8 = null,
+    logprobs: bool = false,
+    top_logprobs: u8 = 20,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -171,6 +175,14 @@ pub fn chatRequestJsonWithOptionsAlloc(
     if (options.tool_choice_json) |tool_choice_json| {
         try out.appendSlice(alloc, ",\"tool_choice\":");
         try out.appendSlice(alloc, tool_choice_json);
+    }
+    if (options.response_format_json) |format| {
+        try out.appendSlice(alloc, ",\"response_format\":");
+        try out.appendSlice(alloc, format);
+    }
+    if (options.logprobs) {
+        try out.appendSlice(alloc, ",\"logprobs\":true");
+        try appendJsonI64Field(alloc, &out, "top_logprobs", options.top_logprobs);
     }
     if (options.max_tokens) |max_tokens| {
         try appendJsonI64Field(alloc, &out, "max_tokens", max_tokens);
@@ -366,11 +378,15 @@ pub const SparseEmbedResult = struct {
 pub const GenerateResult = struct {
     content: []const u8,
     tool_calls: []ToolCall = &.{},
+    tool_calls_synthesized: bool = false,
+    token_logprobs_json: ?[]const u8 = null,
     google_parts_json: ?[]const u8 = null,
+    usage: ?struct { input_tokens: u64, output_tokens: u64 } = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {
         self.allocator.free(self.content);
+        if (self.token_logprobs_json) |evidence| self.allocator.free(evidence);
         if (self.google_parts_json) |parts| self.allocator.free(parts);
         for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
         if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);

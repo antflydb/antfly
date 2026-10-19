@@ -637,5 +637,11 @@
     "required": [
       "Maintained Antfly Zig port; see PORTING.md and SOURCE_NOTICES.md."
     ]
+  },
+  "zig/lib/extracting/src/unicode_tables.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
+  "zig/lib/extracting/src/case_data.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
   }
 }

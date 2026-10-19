@@ -28,8 +28,9 @@ class GraphResolverAdjudicationConfig:
 
         Attributes:
             decider (DeciderConfig):
-            template (str): Bounded interpolation of m.text, m.canonical_text, m.label, m.description, c.canonical_name,
-                c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
+            template (str): Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description,
+                c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only
+                decisions.
             question (ChoiceDecisionQuestion):
             accept (GraphResolverAdjudicationAcceptance):
             reject (GraphResolverAdjudicationAcceptance | Unset):

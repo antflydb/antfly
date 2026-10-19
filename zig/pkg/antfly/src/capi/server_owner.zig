@@ -3568,12 +3568,21 @@ pub fn storageOwnerReconcile(
 
 pub fn storageOwnerPreflightWriteAdmission(
     owner: ?*anyopaque,
-    request: *const kernel_owner_abi.TableRequest,
+    request: *const kernel_owner_abi.WriteAdmissionRequest,
+    out_has_groups: *u8,
 ) callconv(.c) kernel_owner_abi.Status {
+    out_has_groups.* = 0;
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    return if (handle.db.denseRepairWriteBackpressured()) .dense_repair_backpressure else .ok;
+    if (handle.db.denseRepairWriteBackpressured()) return .dense_repair_backpressure;
+    if (!handle.db.core.index_manager.hasGroupSources()) return .ok;
+    out_has_groups.* = 1;
+    if (request.request_json.len == 0) return .ok;
+    var batch = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer batch.deinit(handle.alloc);
+    local_write.validateGroupedSourceBatch(handle.alloc, &handle.db, batch.req.writes, batch.req.deletes, batch.req.transforms) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
 }
 
 pub fn storageOwnerFindMedianKey(
@@ -4035,7 +4044,19 @@ pub fn storageOwnerWaitForSync(
             return callback(req.cancellation_ctx) != 0;
         }
     };
-    handle.db.waitForCurrentSyncLevelWithCancellation(sync_level, .{ .ptr = request, .is_cancelled_fn = Adapter.cancelled }) catch |err| return storageOwnerStatusFromError(err);
+    const cancellation = db_mod.types.CancellationToken{ .ptr = request, .is_cancelled_fn = Adapter.cancelled };
+    if (request.target) |target| {
+        const root = handle.db.durableRootIncarnation() catch |err| return storageOwnerStatusFromError(err);
+        if (target.captured == 0) {
+            std.mem.writeInt(u128, &target.root_incarnation_le, root, .little);
+            target.sequence = handle.db.core.nextDerivedSequence();
+            const timeout_ms = if (handle.db.enrichment_runtime) |runtime| runtime.syncWaitTimeoutMs() else 5 * std.time.ms_per_min;
+            target.deadline_ns = antfly.platform_time.monotonicNs() +| (std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64));
+            target.captured = 1;
+        } else if (target.captured != 1 or std.mem.readInt(u128, &target.root_incarnation_le, .little) != root) return storageOwnerStatusFromError(error.StorageKernelOwnerStaleDescriptor);
+        if (antfly.platform_time.monotonicNs() >= target.deadline_ns) return storageOwnerStatusFromError(error.Timeout);
+        handle.db.waitForResolvedTransactionSyncWithCancellation(sync_level, target.sequence, cancellation) catch |err| return storageOwnerStatusFromError(err);
+    } else handle.db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 

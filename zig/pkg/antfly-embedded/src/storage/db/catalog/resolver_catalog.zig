@@ -67,7 +67,9 @@ pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader
 pub const graph_expiration_namespace_reader_version: u32 = 4;
 pub const adjudication_reader_version: u32 = 5;
 pub const curation_reader_version: u32 = 6;
-pub const supported_reader_version: u32 = curation_reader_version;
+pub const generated_producers_reader_version: u32 = 7;
+pub const grouped_sources_reader_version: u32 = 8;
+pub const supported_reader_version: u32 = grouped_sources_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -77,6 +79,8 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         4 => "4",
         5 => "5",
         6 => "6",
+        7 => "7",
+        8 => "8",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -99,7 +103,16 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
     var required: u32 = if (parsed.value == .object) @intCast(parsed.value.object.get("version").?.integer) else 1;
     for (rows.array.items) |entry| {
         if (entry != .object) return error.InvalidResolverConfig;
-        if (entry.object.contains("adjudicate_json")) required = @max(required, adjudication_reader_version);
+        if (entry.object.get("adjudicate_json")) |adjudicate| {
+            required = @max(required, adjudication_reader_version);
+            if (adjudicate == .string and adjudicate.string.len > 0) {
+                const config = try std.json.parseFromSlice(std.json.Value, a, adjudicate.string, .{});
+                defer config.deinit();
+                if (config.value == .object) if (config.value.object.get("decider")) |decider| if (decider == .object) if (decider.object.get("decision_method")) |method| {
+                    if (method == .string and std.mem.eql(u8, method.string, "generated")) required = @max(required, generated_producers_reader_version);
+                };
+            }
+        }
         if (entry.object.contains("suppress_json") or entry.object.contains("curation_json") or entry.object.contains("curation_revision")) required = @max(required, curation_reader_version);
         if (entry.object.contains("replacement_index") or entry.object.contains("replacement_resolver")) required = @max(required, 3);
         for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
@@ -251,7 +264,7 @@ pub const ResolverConfig = struct {
     /// and are dropped by the canonical-only rule). The cheap
     /// post-extraction junk filter for score-carrying extractors (GLiNER);
     /// 0 admits everything.
-    min_confidence: f64 = 0.0,
+    min_confidence: ?f64 = null,
     /// Bumped to force a versioned re-resolution pass.
     config_generation: u64 = 0,
 
@@ -521,7 +534,7 @@ pub const ResolverConfig = struct {
         if (std.mem.eql(u8, self.candidate_search, "ann")) {
             if (self.candidate_ann_index.len == 0 and self.name_embedding.len == 0) return error.InvalidResolverConfig;
         }
-        if (!(self.min_confidence >= 0.0 and self.min_confidence <= 1.0)) return error.InvalidResolverConfig;
+        if (self.min_confidence) |floor| if (!(floor >= 0.0 and floor <= 1.0)) return error.InvalidResolverConfig;
         if (self.fusion_combine.len == 0) return;
         if (fusionStrategy(self.fusion_combine) == null) return error.InvalidResolverConfig;
         if (!(self.fusion_trust > 0.0 and self.fusion_trust <= 1.0)) return error.InvalidResolverConfig;

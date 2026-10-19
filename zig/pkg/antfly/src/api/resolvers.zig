@@ -405,7 +405,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
             const mention = try std.json.parseFromSliceLeaky(Mention, a, body, .{});
             const routing = local.storage_db_resolution_runtime;
             const excluded = try routing.siblingClaimedLabelsAlloc(a, all, &cfg);
-            var parsed = try resolver.Resolver.initFromParts(a, cfg.table, cfg.key_template, .{ .labels = cfg.labels, .exclude_labels = excluded, .min_confidence = cfg.min_confidence }, cfg.type_must_match, "");
+            var parsed = try resolver.Resolver.initFromParts(a, cfg.table, cfg.key_template, .{ .labels = cfg.labels, .exclude_labels = excluded, .min_confidence = cfg.min_confidence orelse 0 }, cfg.type_must_match, "");
             defer parsed.deinit();
             if (!parsed.consumesLabel(mention.label)) return error.InvalidArgument;
             const minted = try parsed.renderKeyAlloc(a, .{ .text = mention.text, .label = mention.label, .local_id = mention.local_id });

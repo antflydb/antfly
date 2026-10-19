@@ -1512,6 +1512,7 @@ pub const IndexManager = struct {
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     retired_resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     cached_has_generated_enrichment_targets: std.atomic.Value(bool),
+    cached_has_group_sources: std.atomic.Value(bool) = .init(false),
     status_only_index_configs: []types.IndexConfig,
     // Indexes whose persisted artifacts failed to open (e.g. UnsupportedVersion).
     // Their configs are quarantined into status_only_index_configs so the
@@ -5859,12 +5860,14 @@ pub const IndexManager = struct {
         /// Catalog-wide completion requirements include projections and
         /// resolver/promotion work that never appears in the provider queue.
         completion_plan: ?@import("../artifact_completion_plan.zig").Plan = null,
+        group_sources: ?@import("../group_source_mutations.zig").Plan = null,
         /// For each chunk template, indexes of embedding templates consuming
         /// its artifact. Compiling this adjacency once avoids an all-template
         /// scan for every chunk of every row.
         chunk_dependents: [][]u32,
 
         pub fn deinit(self: *WritePlanSnapshot) void {
+            if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
             for (self.text_fields) |field| self.alloc.free(field);
@@ -6180,7 +6183,7 @@ pub const IndexManager = struct {
                 requests.deinit(alloc);
             }
             for (self.generated_templates, 0..) |template, template_index| {
-                if (!self.generatedTemplateRequired(extracted, template_index)) continue;
+                if (!self.generatedTemplateRequired(extracted, template_index) or !enrichment_types.appliesToDocument(template, doc_key)) continue;
 
                 var request = try enrichment_types.cloneGeneratedRequest(alloc, template);
                 errdefer enrichment_types.freeGeneratedRequest(alloc, request);
@@ -6246,7 +6249,7 @@ pub const IndexManager = struct {
                 requests.deinit(alloc);
             }
             for (self.generated_templates, 0..) |template, template_index| {
-                if (!self.generatedTemplateRequired(extracted, template_index)) continue;
+                if (!self.generatedTemplateRequired(extracted, template_index) or !enrichment_types.appliesToDocument(template, doc_key)) continue;
                 var request = template;
                 request.doc_key = doc_key;
                 if (request.kind == .dense_embedding or request.kind == .sparse_embedding) {
@@ -6362,6 +6365,8 @@ pub const IndexManager = struct {
         }
         const generated_templates = try self.planGeneratedEnrichments(alloc, "", "{}", &.{}, &.{});
         errdefer enrichment_types.deinitGeneratedRequests(alloc, generated_templates);
+        var group_sources = try @import("../group_source_mutations.zig").Plan.init(alloc, generated_templates);
+        errdefer group_sources.deinit();
         const chunk_dependents = try alloc.alloc([]u32, generated_templates.len);
         @memset(chunk_dependents, &.{});
         var chunk_dependents_initialized: usize = 0;
@@ -6418,6 +6423,7 @@ pub const IndexManager = struct {
             .sparse_fields = sparse_fields,
             .graph_fields = graph_fields,
             .generated_templates = generated_templates,
+            .group_sources = group_sources,
             .completion_plan = completion_plan,
             .chunk_dependents = chunk_dependents,
             .text_requires_root = text_requires_root,
@@ -12810,6 +12816,25 @@ pub const IndexManager = struct {
             existing.config_generation != next.config_generation;
     }
 
+    /// Verdict scores are deliberate 0/1 assertions, so resolver admission
+    /// requires the consuming policy to state its confidence floor explicitly.
+    fn requireGeneratedExtractorFloor(self: *const IndexManager, cfg: resolver_catalog.ResolverConfig) !void {
+        if (cfg.min_confidence != null) return;
+        const source = self.getEnrichmentByName(cfg.source_artifact) orelse return;
+        if (source.producer_json.len == 0) return;
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, source.producer_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const producer = parsed.value.object;
+        const kind = producer.get("type") orelse return;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "extractor")) return;
+        const config = producer.get("config") orelse return;
+        if (config != .object) return;
+        const method = config.object.get("method") orelse return;
+        const policy = config.object.get("probabilities") orelse return;
+        if (method == .string and std.mem.eql(u8, method.string, "generated") and policy == .string and std.mem.eql(u8, policy.string, "verdict_only")) return error.InvalidResolverConfig;
+    }
+
     pub fn addResolver(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig) !void {
         var cfg = input_cfg;
         cfg.inline_managed = false;
@@ -12820,6 +12845,7 @@ pub const IndexManager = struct {
         cfg.replacement_index = "";
         cfg.replacement_resolver = "";
         try self.requireResolverSourceNotStaged(cfg);
+        try self.requireGeneratedExtractorFloor(cfg);
         if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
         for (self.retired_resolvers.items) |entry| if (std.mem.eql(u8, entry.name, cfg.name)) return error.ResolverAlreadyExists;
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
@@ -12869,6 +12895,7 @@ pub const IndexManager = struct {
             return error.NotFound;
         }
         try self.requireResolverSourceNotStaged(cfg);
+        try self.requireGeneratedExtractorFloor(cfg);
         // Reactivation uses the retained namespace and merges through the same
         // admission checks as an active definition. Restore ownership on failure.
         var reactivated: ?usize = null;
@@ -14566,7 +14593,7 @@ pub const IndexManager = struct {
             }
             if (entry.chunk_name) |chunk_name| {
                 const chunk_cfg = self.getEnrichmentExcluding(.chunk, chunk_name, excluded_enrichment) orelse continue;
-                if (chunk_cfg.source_artifact_name.len == 0) return true;
+                if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0) return true;
             }
             for (entry.source_artifact_names) |artifact_name| {
                 if (self.getEnrichmentExcluding(.chunk, artifact_name, excluded_enrichment) != null or
@@ -14596,7 +14623,14 @@ pub const IndexManager = struct {
     }
 
     fn storeGeneratedEnrichmentTargetCache(self: *IndexManager, value: bool) void {
+        const grouped = for (self.enrichments.items) |entry| {
+            if (entry.group_source_json.len > 0) break true;
+        } else false;
+        self.cached_has_group_sources.store(grouped, .release);
         self.cached_has_generated_enrichment_targets.store(value, .release);
+    }
+    pub fn hasGroupSources(self: *const IndexManager) bool {
+        return self.cached_has_group_sources.load(.acquire);
     }
 
     pub fn hasGeneratedEnrichmentTargets(self: *const IndexManager) bool {
@@ -14951,6 +14985,7 @@ pub const IndexManager = struct {
     pub fn getEnrichmentPublic(self: *const IndexManager, alloc: Allocator, kind: types.EnrichmentKind, name: []const u8) !?types.EnrichmentConfig {
         const internal_kind = publicEnrichmentKindToInternal(kind);
         const cfg = self.getEnrichment(internal_kind, name) orelse return null;
+        if ((kind == .group) != (cfg.group_source_json.len > 0)) return null;
         return try enrichmentToPublic(alloc, cfg.*);
     }
 
@@ -15031,6 +15066,8 @@ pub const IndexManager = struct {
                     .full_text_index = entry.full_text_index,
                     .content_type = if (entry.content_type.len > 0) entry.content_type else "",
                     .producer_json = if (entry.producer_json.len > 0) entry.producer_json else "",
+                    .group_source_json = entry.group_source_json,
+                    .prior_context_json = entry.prior_context_json,
                     .neighbor_context_json = if (entry.neighbor_context_json.len > 0) entry.neighbor_context_json else "",
                     .execution_json = if (entry.execution_json.len > 0) entry.execution_json else "",
                 });
@@ -15042,14 +15079,14 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |entry| {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name)) |chunk_cfg| {
-                    if (chunk_cfg.source_artifact_name.len == 0) {
+                    if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0) {
                         try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
                     }
                 }
             }
             for (entry.source_artifact_names) |artifact_name| {
                 const chunk_cfg = self.getEnrichment(.chunk, artifact_name) orelse continue;
-                if (chunk_cfg.source_artifact_name.len > 0) continue;
+                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0) continue;
                 try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
             }
         }
@@ -15057,7 +15094,7 @@ pub const IndexManager = struct {
         for (self.graph_indexes.items) |entry| {
             for (entry.artifact_sources) |source| {
                 const chunk_cfg = self.getEnrichment(.chunk, source.artifact_name) orelse continue;
-                if (chunk_cfg.source_artifact_name.len > 0) continue;
+                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0) continue;
                 try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, true);
             }
         }
@@ -15123,7 +15160,7 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0)
+                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0)
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
@@ -15228,7 +15265,7 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims != 0) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0)
+                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0)
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
@@ -15322,6 +15359,37 @@ pub const IndexManager = struct {
                     }
                 }
             }
+        }
+        for (requests.items) |*request| {
+            var root = self.assetGroupRoot(request.artifact_name);
+            if (root.len == 0 and request.embedding_name.len > 0) root = self.assetGroupRoot(request.embedding_name);
+            if (root.len == 0) continue;
+            const cfg = self.getEnrichment(.asset, root).?;
+            const source = try std.json.parseFromSlice(@import("../group_sources.zig").Config, alloc, cfg.group_source_json, .{});
+            defer source.deinit();
+            request.group_artifact_name = try alloc.dupe(u8, root);
+            request.group_configuration = @import("../group_sources.zig").definitionDigest(root, source.value);
+            if (request.kind != .asset) {
+                if (request.source_field.len > 0) alloc.free(request.source_field);
+                if (request.source_template.len > 0) alloc.free(request.source_template);
+                if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
+                request.source_field = try alloc.dupe(u8, "_group_unit.text");
+                request.source_template = "";
+                request.upstream_artifact_name = "";
+                request.input_kind = if (request.chunk_size > 0 or request.chunker_json.len > 0) .inline_chunks else .document;
+            }
+        }
+        if (doc_key.len > 0) {
+            var retained: usize = 0;
+            for (requests.items) |request| {
+                if (!enrichment_types.appliesToDocument(request, doc_key)) {
+                    enrichment_types.freeGeneratedRequest(alloc, request);
+                    continue;
+                }
+                requests.items[retained] = request;
+                retained += 1;
+            }
+            requests.shrinkRetainingCapacity(retained);
         }
         return try requests.toOwnedSlice(alloc);
     }
@@ -16696,8 +16764,25 @@ pub const IndexManager = struct {
         return false;
     }
 
+    fn assetGroupRoot(self: *const IndexManager, name: []const u8) []const u8 {
+        var current = name;
+        var depth: usize = 0;
+        while (current.len > 0 and depth <= self.enrichments.items.len) : (depth += 1) {
+            var found: ?*const enrichment_catalog.EnrichmentConfig = null;
+            for (self.enrichments.items) |*cfg| if (std.mem.eql(u8, cfg.name, current)) {
+                found = cfg;
+                break;
+            };
+            const cfg = found orelse return "";
+            if (cfg.group_source_json.len > 0) return cfg.name;
+            current = cfg.source_artifact_name;
+        }
+        return "";
+    }
+
     fn assetSourceSupportsUnitGrouping(self: *const IndexManager, artifact_name: []const u8) bool {
         const asset_cfg = self.getEnrichment(.asset, artifact_name) orelse return false;
+        if (asset_cfg.group_source_json.len > 0) return false;
         var producer = asset_producer_mod.parseProducerConfig(self.alloc, asset_cfg.producer_json) catch return false;
         defer producer.deinit(self.alloc);
         return producer.type == .document_extraction;
@@ -23069,6 +23154,34 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
+        // Removed source definitions lose readiness in the same durable DDL
+        // transaction. Re-adding identical configuration must backfill again.
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (txn.get(enrichment_catalog_key)) |previous| {
+            const old = try std.json.parseFromSliceLeaky([]enrichment_catalog.EnrichmentConfig, a, previous, .{});
+            const namespace = try @import("../doc_identity.zig").loadNamespaceTxn(&txn);
+            var table: u128 = if (namespace) |value| value.table_id else 0;
+            if (table == 0) {
+                const raw = txn.get(@import("../group_source_mutations.zig").table_identity_key) catch |err| switch (err) {
+                    error.NotFound => "",
+                    else => return err,
+                };
+                if (raw.len == 48) table = std.mem.readInt(u128, raw[0..16], .big);
+            }
+            if (table != 0) for (old) |cfg| {
+                if (cfg.group_source_json.len == 0) continue;
+                const retained = for (self.enrichments.items) |current| {
+                    if (std.mem.eql(u8, current.name, cfg.name) and std.mem.eql(u8, current.group_source_json, cfg.group_source_json)) break true;
+                } else false;
+                if (retained) continue;
+                const groups = @import("../group_sources.zig");
+                const source = try std.json.parseFromSliceLeaky(groups.Config, a, cfg.group_source_json, .{});
+                try @import("../group_source_baseline.zig").invalidate(a, &txn, .{ .table_incarnation = table, .configuration = groups.definitionDigest(cfg.name, source) });
+            };
+        } else |err| if (err != error.NotFound) return err;
+        try @import("../group_source_retirement.zig").invalidate(a, &txn);
         try txn.put(enrichment_catalog_key, data);
         const resolvers = try self.serializeResolverDefinitionsForMutation(self.alloc);
         defer self.alloc.free(resolvers);
@@ -23154,9 +23267,11 @@ pub const IndexManager = struct {
         };
         const baseline = if (baseline_raw) |raw| try std.fmt.parseInt(u32, raw, 10) else current;
         if (baseline > resolver_catalog.supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
-        const producer_version: u32 = for (self.enrichments.items) |producer| {
-            if (producer.graph_inline_managed == true) break 3;
-        } else 1;
+        var producer_version: u32 = 1;
+        for (self.enrichments.items) |producer| {
+            if (producer.graph_inline_managed == true) producer_version = @max(producer_version, 3);
+            producer_version = @max(producer_version, try enrichment_config_validation.requiredReaderVersion(self.alloc, producer));
+        }
         const graph_version: u32 = for (self.graph_indexes.items) |entry| {
             if (entry.ttl_duration_ns != 0) break resolver_catalog.graph_expiration_namespace_reader_version;
         } else 1;
@@ -23549,6 +23664,8 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 !std.mem.eql(u8, existing.content_type, cfg.content_type) or
                 !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
+                !std.mem.eql(u8, existing.group_source_json, cfg.group_source_json) or
+                !std.mem.eql(u8, existing.prior_context_json, cfg.prior_context_json) or
                 !std.mem.eql(u8, existing.neighbor_context_json, cfg.neighbor_context_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
@@ -23563,7 +23680,13 @@ pub const IndexManager = struct {
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
         if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
-        const consumes_asset_artifact = cfg.kind == .asset and cfg.source_artifact_name.len > 0;
+        if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) {
+            var public = try enrichmentToPublic(self.alloc, cfg);
+            defer public.deinit(self.alloc);
+            try enrichment_config_validation.validatePublicConfig(self.alloc, public);
+            if (cfg.group_source_json.len > 0) return;
+        }
+        const consumes_asset_artifact = cfg.source_artifact_name.len > 0;
         if (cfg.source_field.len == 0 and cfg.source_template.len == 0 and !consumes_asset_artifact) return error.InvalidEnrichmentConfig;
         if (cfg.execution_json.len > 0) _ = try enrichment_types.parseExecutionPolicyJson(self.alloc, cfg.execution_json);
         if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
@@ -23580,7 +23703,7 @@ pub const IndexManager = struct {
                 {
                     return error.InvalidEnrichmentConfig;
                 }
-                if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null) {
+                if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null and self.assetGroupRoot(cfg.source_artifact_name).len == 0) {
                     return error.InvalidEnrichmentConfig;
                 }
             },
@@ -23643,11 +23766,17 @@ pub const IndexManager = struct {
     }
 
     fn validateEnrichmentCatalogGraph(self: *const IndexManager) !void {
+        for (self.resolvers.items) |resolver| try self.requireGeneratedExtractorFloor(resolver);
         for (self.enrichments.items, 0..) |cfg, i| {
             for (self.enrichments.items[0..i]) |prior| {
                 if (std.mem.eql(u8, prior.name, cfg.name)) return error.ConflictingEnrichmentConfig;
             }
             try validateEnrichmentConfig(self, cfg);
+            if (cfg.prior_context_json.len > 0) {
+                const context = try std.json.parseFromSlice(@import("../group_sources.zig").PriorContext, self.alloc, cfg.prior_context_json, .{});
+                defer context.deinit();
+                if (!enrichment_config_validation.priorSharesGroup(self.enrichments.items, cfg.name, context.value.artifact)) return error.InvalidEnrichmentConfig;
+            }
         }
         try self.validateIndexEnrichmentReferences();
     }
@@ -32896,6 +33025,7 @@ pub const GraphConfig = struct {
 
 fn publicEnrichmentKindToInternal(kind: types.EnrichmentKind) enrichment_catalog.EnrichmentType {
     return switch (kind) {
+        .group => .asset,
         .chunk => .chunk,
         .asset => .asset,
         .embedding => .embedding,
@@ -32918,10 +33048,16 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         break :blk json;
     } else "";
     errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
+    const group_source_json = if (cfg.source) |source| try canonicalEnrichmentPart(alloc, source) else "";
+    errdefer if (group_source_json.len > 0) alloc.free(group_source_json);
+    const prior_context_json = if (cfg.prior_context) |context| try canonicalEnrichmentPart(alloc, context) else "";
+    errdefer if (prior_context_json.len > 0) alloc.free(prior_context_json);
     return .{
+        .group_source_json = group_source_json,
+        .prior_context_json = prior_context_json,
         .name = try alloc.dupe(u8, cfg.name),
         .kind = publicEnrichmentKindToInternal(cfg.kind),
-        .source_field = if (cfg.template.len == 0 and cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
+        .source_field = if (cfg.kind == .group) try alloc.dupe(u8, "_group_unit") else if (cfg.template.len == 0 and cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
         .source_template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .embedding_input = cfg.embedding_input,
@@ -32931,8 +33067,8 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
         .full_text_index = cfg.full_text_index,
-        .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
-        .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .content_type = if (cfg.kind == .group) try alloc.dupe(u8, "application/json") else if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+        .producer_json = if (cfg.kind == .group) try alloc.dupe(u8, "{\"type\":\"copy\"}") else if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         .neighbor_context_json = neighbor_context_json,
         .execution_json = execution_json,
     };
@@ -32940,6 +33076,8 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
 
 fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) !bool {
     return a.kind == b.kind and
+        std.mem.eql(u8, a.group_source_json, b.group_source_json) and
+        std.mem.eql(u8, a.prior_context_json, b.prior_context_json) and
         std.mem.eql(u8, a.name, b.name) and
         std.mem.eql(u8, a.source_field, b.source_field) and
         std.mem.eql(u8, a.source_template, b.source_template) and
@@ -32979,10 +33117,10 @@ pub fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentCo
             .limit = parsed.limit,
         };
     } else null;
-    const out = types.EnrichmentConfig{
+    var out = types.EnrichmentConfig{
         .name = try alloc.dupe(u8, cfg.name),
-        .kind = internalEnrichmentKindToPublic(cfg.kind),
-        .field = if (cfg.source_field.len > 0) try alloc.dupe(u8, cfg.source_field) else "",
+        .kind = if (cfg.group_source_json.len > 0) .group else internalEnrichmentKindToPublic(cfg.kind),
+        .field = if (cfg.group_source_json.len > 0) "" else if (cfg.source_field.len > 0) try alloc.dupe(u8, cfg.source_field) else "",
         .template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .embedding_input = cfg.embedding_input,
@@ -32992,11 +33130,22 @@ pub fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentCo
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
         .full_text_index = cfg.full_text_index,
-        .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
-        .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .content_type = if (cfg.group_source_json.len > 0) "" else if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+        .producer_json = if (cfg.group_source_json.len > 0) "" else if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         .neighbor_context = neighbor_context,
         .execution = execution,
     };
+    errdefer out.deinit(alloc);
+    if (cfg.group_source_json.len > 0) {
+        const parsed = try std.json.parseFromSlice(@import("../group_sources.zig").Config, alloc, cfg.group_source_json, .{});
+        defer parsed.deinit();
+        out.source = try parsed.value.clone(alloc);
+    }
+    if (cfg.prior_context_json.len > 0) {
+        const parsed = try std.json.parseFromSlice(@import("../group_sources.zig").PriorContext, alloc, cfg.prior_context_json, .{});
+        defer parsed.deinit();
+        out.prior_context = try parsed.value.clone(alloc);
+    }
     return out;
 }
 
@@ -48833,4 +48982,12 @@ test "ordered artifact inventory TTL replacement retains temporary envelope with
             try Check.matches(&manager, &store);
         }
     }
+}
+
+fn canonicalEnrichmentPart(alloc: Allocator, value: anytype) ![]u8 {
+    const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    return @import("../document_content_hash.zig").canonicalJsonValueAlloc(alloc, parsed.value);
 }

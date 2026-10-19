@@ -62,8 +62,9 @@ class GraphResolverConfig:
         fusion_prior_weight (float | Unset):
         min_confidence (float | Unset): Mention admission floor: mentions whose extractor-asserted confidence is below
             this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are
-            withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits
-            everything.
+            withheld. The cheap post-extraction junk filter for score-carrying extractors; omission defaults to 0 for
+            trained extractors. Resolvers consuming verdict-only generated extraction must set this field explicitly,
+            including when the chosen floor is zero.
         config_generation (int | Unset):
     """
 

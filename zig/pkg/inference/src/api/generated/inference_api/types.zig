@@ -2306,6 +2306,10 @@ pub const GenerateRequest = struct {
     model: []const u8,
     /// Conversation messages (OpenAI-compatible format)
     messages: []const ChatMessage,
+    /// Return actual token log-probabilities for non-streaming native grammar decoding. Incompatible routes reject the request.
+    logprobs: ?bool = null,
+    /// Bounded alternatives per decoded token; retained evidence also has a hard byte ceiling.
+    top_logprobs: ?i64 = null,
     /// Maximum tokens to generate
     max_tokens: ?i64 = null,
     /// Sampling temperature (0.0 = deterministic, higher = more random)
@@ -2362,6 +2366,8 @@ pub const GenerateRequest = struct {
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "messages", "messages", false },
+        .{ "logprobs", "logprobs", true },
+        .{ "top_logprobs", "top_logprobs", true },
         .{ "max_tokens", "max_tokens", true },
         .{ "temperature", "temperature", true },
         .{ "top_p", "top_p", true },
@@ -2405,6 +2411,14 @@ pub const GenerateRequest = struct {
         try jw.write(self.model);
         try jw.objectField("messages");
         try jw.write(self.messages);
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        }
+        if (self.top_logprobs) |value| {
+            try jw.objectField("top_logprobs");
+            try jw.write(value);
+        }
         if (self.max_tokens) |value| {
             try jw.objectField("max_tokens");
             try jw.write(value);
@@ -2810,7 +2824,9 @@ pub const ModelFormat = enum {
 pub const ModelInfo = struct {
     /// Effective model-aware chunk operational ceilings for working/output/event bytes, chunk/dependency/index counts and remote fetched bytes, requests and cache bytes. Independent of model token limits and object length. Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>. Scoped and unscoped embedding discovery expose the same values.
     chunking_limits: ?std.json.ArrayHashMap(i64) = null,
-    /// Immutable resolved embedding generation, returned for scoped model/task discovery without loading weights.
+    /// Resolved executor/task facts; generation bits are false when the selected executor does not implement them.
+    inference_capabilities: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights.
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
     qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -2822,6 +2838,7 @@ pub const ModelInfo = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "chunking_limits", "chunking_limits", true },
+        .{ "inference_capabilities", "inference_capabilities", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
@@ -2840,6 +2857,10 @@ pub const ModelInfo = struct {
         try jw.beginObject();
         if (self.chunking_limits) |value| {
             try jw.objectField("chunking_limits");
+            try jw.write(value);
+        }
+        if (self.inference_capabilities) |value| {
+            try jw.objectField("inference_capabilities");
             try jw.write(value);
         }
         if (self.model_revision) |value| {

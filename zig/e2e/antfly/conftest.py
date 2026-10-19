@@ -379,13 +379,15 @@ def wait_for_listener(url: str, timeout: float = 5.0) -> bool:
 
 def _start_stateful_server_with_retry(
     binary: str, port: int
-) -> PublicAntflyServer | StandaloneAntflyServer:
+) -> PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer:
     if Path(binary).name != "antfly":
         return PublicAntflyServer(binary, "127.0.0.1", port)
 
     last_error: RuntimeError | None = None
     for _ in range(3):
         try:
+            if os.environ.get("ANTFLY_E2E_STATEFUL_RAFT") == "1":
+                return StatefulAntflyServer(binary, "127.0.0.1", port)
             return StandaloneAntflyServer(binary, "127.0.0.1", port)
         except RuntimeError as exc:
             last_error = exc

@@ -1735,7 +1735,59 @@ test "REVIEW adjudication persists authoritative receipts without work caches" {
     var explicit_fallback = try parseResolution(a, minted);
     defer explicit_fallback.deinit();
     try testing.expectEqual(Decision.new, explicit_fallback.entities[0].decision);
-    try testing.expectEqual(adjudication.Status.failed, explicit_fallback.entities[0].adjudication.?.status);
+    try testing.expectEqual(adjudication.Status.budget_exhausted, explicit_fallback.entities[0].adjudication.?.status);
+}
+
+test "REVIEW batched partial results survive replay and revision changes exclude credential rotation" {
+    const a = testing.allocator;
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var config = try adjudication.Config.parse(a, adjudication_test_config);
+    defer config.deinit();
+    try config.value.decider.object.put(config.arena.allocator(), "decision_method", .{ .string = "generated" });
+    const F = struct {
+        base: AdjudicationFixture = .{},
+        calls: usize = 0,
+        revision: u8 = 1,
+        fn single(_: *anyopaque, _: std.mem.Allocator, _: adjudication.Request) anyerror![]u8 {
+            return error.UnexpectedSerialInvocation;
+        }
+        fn batch(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const adjudication.Request) anyerror![]adjudication.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try testing.expectEqual(@as(usize, 2), requests.len);
+            const out = try alloc.alloc(adjudication.Result, 2);
+            out[0] = .{ .value = try std.mem.replaceOwned(u8, alloc, adjudication_test_response, "\"decision_method\":\"typed\"", "\"decision_method\":\"generated\",\"probability_source\":\"token_logprobs\",\"raw_structured_answer\":\"same\"") };
+            out[1] = .{ .failure = "Timeout" };
+            return out;
+        }
+        fn modelRevision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) anyerror!?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @as([32]u8, @splat(self.revision));
+        }
+    };
+    var f: F = .{};
+    var map: MapStore = .{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"a\",\"label\":\"concept\",\"text\":\"Antfly database\"},{\"id\":\"b\",\"label\":\"concept\",\"text\":\"Antfly store\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = .{ .ptr = &f, .execute = F.single, .execute_batch = F.batch, .model_revision = F.modelRevision }, .work_retention = .none };
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), f.base.provider(), "source", "resolution"));
+    const bytes = (try map.store().get(a, "resolution")).?;
+    defer a.free(bytes);
+    var result = try parseResolution(a, bytes);
+    defer result.deinit();
+    try testing.expectEqual(adjudication.Status.accepted, result.entities[0].adjudication.?.status);
+    try testing.expectEqual(adjudication.Status.budget_exhausted, result.entities[1].adjudication.?.status);
+    try testing.expectEqual(RunResult.unchanged, try stage.run(a, map.store(), f.base.provider(), "source", "resolution"));
+    try config.value.decider.object.put(config.arena.allocator(), "api_key", .{ .string = "rotated-fixture-credential" });
+    stage.adjudicate = config.value;
+    try testing.expectEqual(RunResult.unchanged, try stage.run(a, map.store(), f.base.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 1), f.calls);
+    f.revision = 2;
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), f.base.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 2), f.calls);
 }
 
 test "REVIEW adjudication abstains rejects bounds work and propagates cancellation" {
@@ -1982,7 +2034,15 @@ pub const ResolutionStage = struct {
         parsed.entities = parsed.entities[0..kept];
 
         const arena = parsed.arena.allocator();
-        const receipt_hash = if (self.adjudicate) |config| try fingerprintHex(arena, .{ self.config_generation, self.execution_dependency, config, extraction.?, self.mention_descriptions_json, self.sibling_resolutions_json }) else "";
+        const model_revision: ?[32]u8 = if (self.adjudicate) |config| blk: {
+            const method = config.decider.object.get("decision_method") orelse break :blk null;
+            if (method != .string or !std.mem.eql(u8, method.string, "generated")) break :blk null;
+            const executor = self.adjudicator orelse break :blk null;
+            const resolve = executor.model_revision orelse break :blk null;
+            break :blk try resolve(executor.ptr, arena, try config.producerSpecification(arena), @min(config.timeout_ms, config.budget_ms));
+        } else null;
+        const base_receipt_hash = if (self.adjudicate) |config| try fingerprintHex(arena, .{ self.config_generation, self.execution_dependency, try config.semantic(arena), extraction.?, self.mention_descriptions_json, self.sibling_resolutions_json }) else "";
+        const receipt_hash = if (model_revision) |revision| try fingerprintHex(arena, .{ base_receipt_hash, revision }) else base_receipt_hash;
         const receipts = if (self.adjudicate != null and existing != null) try parseResolution(gpa, existing.?) else null;
         defer if (receipts) |value| {
             var owner = value;
@@ -2139,7 +2199,7 @@ pub const ResolutionStage = struct {
                 entity.* = try cloneResolvedEntity(result_arena, receipt);
             }
         }
-        if (self.adjudicate) |config| try self.adjudicateReviews(result_arena, config, &resolution, parsed.entities, lists, reused, receipt_hash);
+        if (self.adjudicate) |config| try self.adjudicateReviews(result_arena, config, &resolution, parsed.entities, lists, reused, receipt_hash, model_revision);
 
         // Apply human-curation overrides: a reviewed mention takes the curator's
         // decision and endpoint (strings copied into the resolution arena so they
@@ -2190,9 +2250,19 @@ pub const ResolutionStage = struct {
         return try resolution.toJson(gpa);
     }
 
-    fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, execution_hash: []const u8) !void {
+    fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, execution_hash: []const u8, model_revision: ?[32]u8) !void {
         const specification = try config.producerSpecification(a);
-        const specification_hash = try fingerprintHex(a, config);
+        const specification_hash = if (model_revision) |revision| try fingerprintHex(a, .{ try config.semantic(a), revision }) else try fingerprintHex(a, try config.semantic(a));
+        const Prepared = struct {
+            index: usize,
+            candidate: Candidate,
+            target: @TypeOf(resolution.entities[0].doc_ref),
+            inputs: adjudication.Inputs,
+            description_observed: bool,
+            evidence: adjudication.Evidence,
+            request: ?adjudication.Request = null,
+        };
+        var prepared: std.ArrayList(Prepared) = .empty;
         var calls: u32 = 0;
         const deadline = if (self.now_ns) |now| now() + @as(u64, config.budget_ms) * std.time.ns_per_ms else null;
         for (@constCast(resolution.entities), 0..) |*entity, i| {
@@ -2232,6 +2302,7 @@ pub const ResolutionStage = struct {
                 .deterministic_probability = best_probability,
                 .status = .failed,
             };
+            var pending_request: ?adjudication.Request = null;
             execute: {
                 var timeout_ms = config.timeout_ms;
                 if (deadline) |end| {
@@ -2253,35 +2324,101 @@ pub const ResolutionStage = struct {
                         break :execute;
                     },
                 };
-                const executor = self.adjudicator orelse {
+                if (self.adjudicator == null) {
                     evidence.failure = "MissingAdjudicator";
                     break :execute;
-                };
+                }
                 calls += 1;
-                const raw = executor.execute(executor.ptr, a, .{ .specification_json = specification, .input = input, .source_fingerprint = evidence.input_hash, .timeout_ms = timeout_ms }) catch |err| switch (err) {
-                    error.OutOfMemory, error.Cancelled, error.Canceled, error.Busy, error.WriterLocked, error.PromotionWriterFenceReleased => return err,
-                    else => {
-                        evidence.failure = @errorName(err);
-                        break :execute;
+                pending_request = .{ .specification_json = specification, .input = input, .source_fingerprint = evidence.input_hash, .timeout_ms = timeout_ms };
+            }
+            try prepared.append(a, .{ .index = i, .candidate = candidate, .target = .{ .table = target.table, .key = target.key }, .inputs = inputs, .description_observed = description_observed, .evidence = evidence, .request = pending_request });
+        }
+        // Freeze input snapshots first, then invoke one bounded batch. IDs are
+        // positional within this artifact; committed evidence is reused above.
+        var requests: std.ArrayList(adjudication.Request) = .empty;
+        var indices: std.ArrayList(usize) = .empty;
+        for (prepared.items, 0..) |item, i| if (item.request) |request| {
+            var bounded = request;
+            if (deadline) |end_ns| {
+                const now = self.now_ns.?();
+                if (now >= end_ns) {
+                    prepared.items[i].evidence.status = .budget_exhausted;
+                    continue;
+                }
+                bounded.timeout_ms = @intCast(@min(bounded.timeout_ms, @max(1, (end_ns - now) / std.time.ns_per_ms)));
+            }
+            try requests.append(a, bounded);
+            try indices.append(a, i);
+        };
+        if (requests.items.len > 0) {
+            const executor = self.adjudicator.?;
+            const results = if (executor.execute_batch) |batch| batch(executor.ptr, a, requests.items) catch |err| switch (err) {
+                error.OutOfMemory, error.Cancelled, error.Canceled, error.Busy, error.WriterLocked, error.PromotionWriterFenceReleased => return err,
+                else => blk: {
+                    const failures = try a.alloc(adjudication.Result, requests.items.len);
+                    for (failures) |*failure| failure.* = .{ .failure = @errorName(err) };
+                    break :blk failures;
+                },
+            } else blk: {
+                const values = try a.alloc(adjudication.Result, requests.items.len);
+                for (requests.items, values) |request, *value| {
+                    var bounded = request;
+                    if (deadline) |end_ns| {
+                        const now = self.now_ns.?();
+                        if (now >= end_ns) {
+                            value.* = .{ .failure = "Timeout" };
+                            continue;
+                        }
+                        bounded.timeout_ms = @intCast(@min(bounded.timeout_ms, @max(1, (end_ns - now) / std.time.ns_per_ms)));
+                    }
+                    value.* = .{ .value = executor.execute(executor.ptr, a, bounded) catch |err| switch (err) {
+                        error.OutOfMemory, error.Cancelled, error.Canceled, error.Busy, error.WriterLocked, error.PromotionWriterFenceReleased => return err,
+                        else => {
+                            value.* = .{ .failure = @errorName(err) };
+                            continue;
+                        },
+                    } };
+                }
+                break :blk values;
+            };
+            if (results.len != indices.items.len) return error.InvalidAdjudicationOutput;
+            for (results, indices.items) |result, index| {
+                const evidence = &prepared.items[index].evidence;
+                const raw = switch (result) {
+                    .value => |value| value,
+                    .failure => |failure| {
+                        evidence.failure = failure;
+                        if (std.mem.eql(u8, failure, "Timeout")) evidence.status = .budget_exhausted;
+                        continue;
                     },
                 };
                 if (raw.len > 1024 * 1024) {
                     evidence.failure = "AdjudicationResponseTooLarge";
-                    break :execute;
+                    continue;
                 }
                 const response = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .allocate = .alloc_always }) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => {
                         evidence.failure = "InvalidAdjudicationOutput";
-                        break :execute;
+                        continue;
                     },
                 };
                 evidence.status = adjudication.classify(a, config, response) catch |err| {
                     evidence.failure = @errorName(err);
-                    break :execute;
+                    continue;
                 };
                 evidence.response = response;
             }
+        }
+        for (prepared.items) |item| {
+            const entity = &@constCast(resolution.entities)[item.index];
+            const candidate = item.candidate;
+            const target = item.target;
+            const canonical_record = candidate.resolved_record orelse candidate.record;
+            const candidate_description = item.inputs.candidate_description;
+            const description_observed = item.description_observed;
+            const inputs = item.inputs;
+            const evidence = item.evidence;
             if (self.candidate_validator) |validator| try validator.validate(validator.ptr, a, candidate);
             // A generated description can change without a primary-document
             // revision. Re-read the selected asset after inference as well.

@@ -790,6 +790,8 @@ const ExactWireCapabilities = struct {
     prompt_policy: work.PromptPolicy,
     borrowed_attachments: bool,
     framed_attachments: bool,
+    generation_grammar_v1: bool = false,
+    generation_token_logprobs_v1: bool = false,
     model_aware_chunking_v1: bool = false,
     numeric_responses_v1: bool,
     rerank_documents_v1: bool,
@@ -949,6 +951,14 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         if (value != .bool) return error.InvalidInferenceCapabilities;
         break :blk value.bool;
     } else false;
+    const generation_grammar_v1 = if (object.get("generation_grammar_v1")) |value| blk: {
+        if (value != .bool) return error.InvalidInferenceCapabilities;
+        break :blk value.bool;
+    } else false;
+    const generation_token_logprobs_v1 = if (object.get("generation_token_logprobs_v1")) |value| blk: {
+        if (value != .bool) return error.InvalidInferenceCapabilities;
+        break :blk value.bool;
+    } else false;
     const model_aware_chunking_v1 = if (object.get("model_aware_chunking_v1")) |value| blk: {
         if (value != .bool) return error.InvalidInferenceCapabilities;
         break :blk value.bool;
@@ -975,6 +985,8 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         .prompt_policy = prompt_policy,
         .borrowed_attachments = borrowed_value.bool,
         .framed_attachments = framed_attachments,
+        .generation_grammar_v1 = generation_grammar_v1,
+        .generation_token_logprobs_v1 = generation_token_logprobs_v1,
         .model_aware_chunking_v1 = model_aware_chunking_v1,
         .numeric_responses_v1 = numeric_responses_v1,
         .rerank_documents_v1 = rerank_documents_v1,
@@ -1057,6 +1069,8 @@ pub fn parseModelCapabilities(
         // even if a misconfigured upstream publishes its local ABI fact.
         .borrowed_attachments = false,
         .framed_attachments = if (exact) |value| value.framed_attachments else false,
+        .generation_grammar_v1 = if (exact) |value| value.generation_grammar_v1 else false,
+        .generation_token_logprobs_v1 = if (exact) |value| value.generation_token_logprobs_v1 else false,
         .model_aware_chunking_v1 = if (exact) |value| value.model_aware_chunking_v1 else false,
         .numeric_responses_v1 = if (exact) |value| value.numeric_responses_v1 else false,
         .rerank_documents_v1 = if (exact) |value| value.rerank_documents_v1 else false,

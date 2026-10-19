@@ -29,6 +29,8 @@ pub const Provider = struct {
     attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    response_format_json: ?[]const u8 = null,
+    logprobs: bool = false,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -185,6 +187,8 @@ pub const Provider = struct {
     /// the shared wire encoder and their non-OpenAI sampling extensions.
     fn chatRequestJsonAlloc(self: *const Provider, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) ![]u8 {
         const options = inference.ChatRequestOptions{
+            .response_format_json = self.response_format_json,
+            .logprobs = self.logprobs,
             .tools_json = self.tools_json,
             .tool_choice_json = self.tool_choice_json,
             .max_tokens = self.max_tokens,
@@ -199,6 +203,8 @@ pub const Provider = struct {
         // Reuse multimodal/tool message adaptation, then let the generated
         // upstream type own provider parameter names and optional-field encoding.
         const envelope = try inference.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .openai_compatible, .{
+            .response_format_json = self.response_format_json,
+            .logprobs = self.logprobs,
             .tools_json = self.tools_json,
             .tool_choice_json = self.tool_choice_json,
         });
@@ -232,6 +238,9 @@ pub const Provider = struct {
             .messages = wire_messages,
             .tools = if (parsed.value.object.get("tools")) |tools| tools.array.items else null,
             .tool_choice = parsed.value.object.get("tool_choice"),
+            .response_format = if (self.response_format_json) |raw| try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{}) else null,
+            .logprobs = if (self.logprobs) .{ .value = true } else .absent,
+            .top_logprobs = if (self.logprobs) .{ .integer = 20 } else null,
         };
         if (self.max_completion_tokens) |limit| {
             request.max_completion_tokens = .{ .value = limit };
@@ -255,7 +264,9 @@ pub const Provider = struct {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
         const Response = struct {
+            usage: ?struct { prompt_tokens: u64 = 0, completion_tokens: u64 = 0 } = null,
             choices: []const struct {
+                logprobs: ?std.json.Value = null,
                 message: struct {
                     content: ?[]const u8 = null,
                     tool_calls: ?[]const struct {
@@ -288,16 +299,23 @@ pub const Provider = struct {
         defer parsed.deinit();
 
         const choices = parsed.value.choices;
+        var synthesized = false;
         if (choices.len > 0) {
+            const proof = if (choices[0].logprobs) |evidence| try std.json.Stringify.valueAlloc(alloc, evidence, .{}) else null;
+            errdefer if (proof) |value| alloc.free(value);
             var tool_calls = try cloneOpenAIToolCalls(alloc, choices[0].message.tool_calls);
             errdefer freeToolCalls(alloc, tool_calls);
             if (choices[0].message.content) |content| {
                 if (tool_calls.len == 0) {
                     tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, self.tools_json, self.tool_choice_json);
+                    synthesized = tool_calls.len > 0;
                 }
                 return .{
                     .content = try alloc.dupe(u8, content),
                     .tool_calls = tool_calls,
+                    .tool_calls_synthesized = synthesized,
+                    .usage = if (parsed.value.usage) |usage| .{ .input_tokens = usage.prompt_tokens, .output_tokens = usage.completion_tokens } else null,
+                    .token_logprobs_json = proof,
                     .allocator = alloc,
                 };
             }
@@ -305,6 +323,9 @@ pub const Provider = struct {
                 return .{
                     .content = try alloc.dupe(u8, ""),
                     .tool_calls = tool_calls,
+                    .tool_calls_synthesized = synthesized,
+                    .usage = if (parsed.value.usage) |usage| .{ .input_tokens = usage.prompt_tokens, .output_tokens = usage.completion_tokens } else null,
+                    .token_logprobs_json = proof,
                     .allocator = alloc,
                 };
             }

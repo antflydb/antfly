@@ -8268,6 +8268,18 @@ pub const ProvisionedTableWriteSource = struct {
     /// deliberately bypasses this gate. The resource check keeps the ordinary
     /// proposal path allocation-free and avoids touching the writer cache until
     /// the node is actually under hard replay/backlog pressure.
+    pub fn preflightGroupedSourceWriteAdmission(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest) !void {
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            _ = (try local_source.preflightGroupedSourceBatchGroupLocal(alloc, group_id, table_name, req)) orelse return error.StorageKernelOwnerUnavailable;
+            return;
+        }
+        if (self.local_write_owner) |owner| return owner.preflightGroupedSourceWriteAdmission(alloc, group_id, table_name, req);
+        var lease = (try self.leaseCachedGroupWriter(alloc, group_id, table_name)) orelse return error.StorageKernelOwnerUnavailable;
+        defer lease.deinit(alloc);
+        try physical_local_write.validateGroupedSourceBatch(alloc, lease.db, req.writes, req.deletes, req.transforms);
+    }
+
     pub fn preflightDenseRepairWriteAdmission(
         self: *ProvisionedTableWriteSource,
         group_id: u64,
@@ -32480,6 +32492,7 @@ fn validateTableBatchAgainstSchemaJson(
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
     if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
+    if (comptime !control_only_storage_sources) try physical_local_write.validateGroupedSourceBatch(alloc, db, writes, deletes, transforms);
     const raw_schema_json = schema_json orelse return;
     if (raw_schema_json.len == 0) return;
 
@@ -32502,9 +32515,12 @@ fn validateTransactionAgainstCatalogSchema(
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
-    if (try transactionUsesDurableContract(alloc, db, txn_id)) return;
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
+    if (try transactionUsesDurableContract(alloc, db, txn_id)) {
+        if (comptime !control_only_storage_sources) try physical_local_write.validateGroupedSourceBatch(alloc, db, batch_writes, deletes, transforms);
+        return;
+    }
     try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, batch_writes, deletes, transforms);
 }
 

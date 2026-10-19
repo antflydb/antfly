@@ -203,7 +203,7 @@ fn baselinePage(alloc: std.mem.Allocator, store_handle: anytype) !void {
             break;
         }
         if (visited != 0 and (visited >= 64 or bytes >= 64 * 1024 or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
-        if (keys.isStoredDocumentRowKey(row.key)) try docs.append(a, (try keys.decodeStoredDocumentRowKeyAlloc(a, row.key)) orelse return error.ArtifactCatalogCorrupt);
+        if (keys.isStoredSourceRowKey(row.key)) try docs.append(a, (try keys.decodeStoredSourceRowKeyAlloc(a, row.key)) orelse return error.ArtifactCatalogCorrupt);
         next = try a.dupe(u8, row.key);
         bytes +|= row.key.len;
         visited += 1;

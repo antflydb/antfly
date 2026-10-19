@@ -281,7 +281,9 @@ pub fn addOpenApiSourceSteps(
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/shared/generating.yaml"), "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/reranking.yaml"), "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi", "types", &.{}),
-        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/ai/decision.yaml"), "antfly_decision_openapi", antfly_generated_root ++ "/antfly_decision_openapi", "types", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/ai/decision.yaml"), "antfly_decision_openapi", antfly_generated_root ++ "/antfly_decision_openapi", "types", &.{
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+        }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/ai/extraction.yaml"), "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi", "types", &.{
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
@@ -409,9 +411,7 @@ fn committedModule(b: *std.Build, options: CommittedOptions, name: []const u8, h
         .target = options.target,
         .optimize = options.optimize,
     };
-    const module = if (std.mem.eql(u8, name, "antfly_decision_openapi"))
-        @import("../lib/decisions/build.zig").createOpenApi(b, settings.root_source_file.?)
-    else if (options.export_modules) b.addModule(name, settings) else b.createModule(settings);
+    const module = if (options.export_modules) b.addModule(name, settings) else b.createModule(settings);
     if (httpx) module.addImport("httpx", options.httpx);
     return module;
 }
@@ -446,8 +446,8 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     const embeddings_openapi_mod = committedModule(b, options, "antfly_embeddings_openapi", false);
     const provider_openapi_mod = committedModule(b, options, "antfly_provider_openapi", false);
     const common_openapi_mod = committedModule(b, options, "antfly_common_openapi", false);
-    const decision_openapi_mod = committedModule(b, options, "antfly_decision_openapi", false);
     const generating_openapi_mod = committedModule(b, options, "antfly_generating_openapi", false);
+    const decision_openapi_mod = @import("../lib/decisions/build.zig").createOpenApi(b, options.root.path(b, "antfly_decision_openapi/root.zig"), generating_openapi_mod);
     const reranking_openapi_mod = committedModule(b, options, "antfly_reranking_openapi", false);
     embeddings_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
     generating_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);

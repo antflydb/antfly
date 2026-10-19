@@ -502,6 +502,7 @@ pub const VTable = struct {
     runBackgroundTurnWithCancellation: *const fn (*DB, types.CancellationToken, bool) Outcome(bool),
     runBackgroundMaintenanceWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(bool),
     registry: *const fn () Outcome(*anyopaque),
+    writeValidateGroupedSourceBatch: *const fn (std.mem.Allocator, *DB, []const types.BatchWrite, []const []const u8, []const types.DocumentTransform) Outcome(void),
 };
 pub const Boundary = callback.Boundary(VTable);
 pub const FieldLayout = extern struct { name: [*:0]const u8, type_name: [*:0]const u8, offset: usize, size: usize, alignment: usize };
@@ -518,7 +519,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 25,
+    version: u32 = 27,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -590,18 +591,18 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
-extern fn antfly_storage_engine_get_descriptor_v25() callconv(.c) *const Descriptor;
+extern fn antfly_storage_engine_get_descriptor_v27() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
     return anyerror!@FieldType(Wire, "value");
 }
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_descriptor_v25();
+    const descriptor = antfly_storage_engine_get_descriptor_v27();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
     // A global table would retain every physical operation in every consumer.
-    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v25" });
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v27" });
     const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Args = std.meta.ArgsTuple(Function);
@@ -634,10 +635,10 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_descriptor_v25();
+    return antfly_storage_engine_get_descriptor_v27();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 25 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 27 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

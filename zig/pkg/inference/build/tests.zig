@@ -49,6 +49,7 @@ pub fn create(ctx: Context) Suite {
     });
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     tests.root_module.addImport("antfly_decisions", ctx.graph.inference_mod.import_table.get("antfly_decisions").?);
+    tests.root_module.addImport("antfly_structured", ctx.graph.inference_mod.import_table.get("antfly_structured").?);
     ctx.graph.identities.addImports(tests.root_module);
     tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
     tests.root_module.addImport("antfly-json", ctx.graph.json_mod);
@@ -81,6 +82,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);
     tests.root_module.addImport("antfly_video", ctx.graph.inference_mod.import_table.get("antfly_video").?);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("jinja", ctx.graph.jinja_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
@@ -272,6 +274,7 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
     tests.root_module.addImport("build_options", ctx.graph.build_options_mod);
     tests.root_module.addImport("antfly_platform", platform);
     tests.root_module.addImport("antfly_image", ctx.graph.image_mod);
+    tests.root_module.addImport("antfly_extracting", ctx.graph.extracting_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);

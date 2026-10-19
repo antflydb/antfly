@@ -2467,3 +2467,20 @@ test "external lake public compatibility normalization preserves exact schema li
         \\{"indexes":{"text":{"type":"full_text","store_source":true,"_index_incarnation":7}}}
     ));
 }
+
+test "grouped enrichment public normalization retains typed source and finite prior policy" {
+    const a = std.testing.allocator;
+    const group = try parseArtifactEnrichmentRequest(a, "turns",
+        \\{"kind":"group","source":{"group_by":"thread","order_by":"ordinal","segment_by":"turn","field":"text","filter":{"term":{"speaker":["user","assistant"]}},"max_bytes":32768}}
+    );
+    defer a.free(group);
+    const consumer = try parseArtifactEnrichmentRequest(a, "claims",
+        \\{"kind":"asset","source_artifact_name":"turns","prior_context":{"artifact":"claims","render":"{{id}}","horizon_segments":8},"producer":{"type":"generator","config":{}}}
+    );
+    defer a.free(consumer);
+    try std.testing.expect(std.mem.indexOf(u8, group, "group_by") != null);
+    try std.testing.expect(std.mem.indexOf(u8, consumer, "prior_context") != null);
+    try std.testing.expectError(error.InvalidArtifactEnrichmentRequest, parseArtifactEnrichmentRequest(a, "turns",
+        \\{"kind":"group","source":{"group_by":"thread","order_by":"ordinal","field":"text","max_bytez":1}}
+    ));
+}

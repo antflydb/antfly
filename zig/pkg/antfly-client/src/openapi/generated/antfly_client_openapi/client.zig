@@ -558,7 +558,7 @@ pub const Client = struct {
 
     /// Answer named decision questions
     /// POST /ai/v1/decisions
-    pub fn decide(self: *@This(), body: types.InferenceDecideRequest) !ApiResponse(types.InferenceDecideResponse) {
+    pub fn decide(self: *@This(), body: types.DecisionRequest) !ApiResponse(types.InferenceDecideResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/decisions", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
@@ -611,7 +611,7 @@ pub const Client = struct {
 
     /// Extract entities, relations, classifications, and structures
     /// POST /ai/v1/extract
-    pub fn extract(self: *@This(), body: types.ExtractionRequest) !ApiResponse(types.ExtractionResponse) {
+    pub fn extract(self: *@This(), body: types.ExtractionInputRequest) !ApiResponse(types.ExtractionResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);

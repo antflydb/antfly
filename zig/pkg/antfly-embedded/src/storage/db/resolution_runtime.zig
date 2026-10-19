@@ -279,7 +279,7 @@ pub fn resolveExtraction(
         gpa,
         cfg.table,
         cfg.key_template,
-        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence orelse 0 },
         cfg.type_must_match,
         cfg.scorer_json,
     );
@@ -484,7 +484,7 @@ fn processChangedExtractionWithConfigOptions(
         gpa,
         cfg.table,
         cfg.key_template,
-        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence orelse 0 },
         cfg.type_must_match,
         cfg.scorer_json,
     );
@@ -595,7 +595,7 @@ fn processChangedExtractionWithConfigOptions(
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
         .adjudicate = if (policy) |parsed_policy| parsed_policy.value else null,
-        .adjudicator = if (batch_source) |source| if (source.vtable.adjudicate) |execute| .{ .ptr = source.ptr, .execute = execute, .get_description = source.vtable.get_description } else null else null,
+        .adjudicator = if (batch_source) |source| if (source.vtable.adjudicate) |execute| .{ .ptr = source.ptr, .execute = execute, .execute_batch = source.vtable.adjudicate_batch, .model_revision = source.vtable.adjudicator_model_revision, .get_description = source.vtable.get_description } else null else null,
         .execution_dependency = execution_dependency orelse "",
         .candidate_validator = if (policy != null and batch_source != null) .{ .ptr = &validation, .validate = AdjudicationCandidateValidator.validate } else null,
         .mention_descriptions_json = mention_descriptions,

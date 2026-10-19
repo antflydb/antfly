@@ -323,7 +323,9 @@ pub fn parseSpeculationCalibration(raw: []const u8) ?SpeculationCalibration {
     return null;
 }
 
+pub const token_logprobs = @import("token_logprobs.zig");
 pub const GenerationConfig = struct {
+    token_observer: ?token_logprobs.Observer = null,
     max_tokens: i32 = 256,
     temperature: f32 = 0,
     top_p: f32 = 0,
@@ -9875,6 +9877,7 @@ pub const NativeGenerationPipeline = struct {
         gbnf_grammar: ?*grammar_mod.GbnfGrammar,
     ) !SampleOutcome {
         const has_grammar = json_grammar.* != null or gbnf_grammar != null;
+        if (config.token_observer != null and !has_grammar) return error.TokenEvidenceRequiresGrammar;
         const suppress_token_ids = self.gpt_config.suppressTokenIds();
         const needs_mutable_logits = has_grammar or suppress_token_ids.len > 0;
         const working_logits = if (needs_mutable_logits)
@@ -9889,6 +9892,14 @@ pub const NativeGenerationPipeline = struct {
         applySuppressTokenMask(working_logits, suppress_token_ids);
 
         const next_token = sample(working_logits, config, penalty_state, self.allocator);
+        if (config.token_observer) |observer| {
+            // Evidence is the finite grammar-constrained model distribution,
+            // before temperature/top-k sampling (including at temperature 0).
+            // The sampler applies penalties on its own copy; mirror those
+            // adjustments for the observed decoder scores after sampling.
+            if (hasSamplingPenalties(config) and !penalty_state.isEmpty()) applyRepetitionPenalties(working_logits, penalty_state, config);
+            try observer.record(observer.ptr, token_table orelse return error.TokenEvidenceRequiresGrammar, working_logits, @intCast(next_token));
+        }
         const grammar_complete = if (has_grammar)
             try self.advanceGrammarWithToken(next_token, json_grammar, gbnf_grammar)
         else

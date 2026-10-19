@@ -223,6 +223,7 @@ pub const ResolverMergeRequest = struct {
     replace: ?bool = null,
     /// Pin the replaced former target distinct. Requires an existing different redirect and replace=true.
     pin_distinct: ?bool = null,
+    /// Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
     expected_revision: ?u64 = null,
     wait: ?ResolverWait = null,
 
@@ -341,6 +342,7 @@ pub const ResolverNamespaceRequest = struct {
     reset_curation: ?bool = null,
     key_map: ?[]const ResolverRedirect = null,
     aliases: ?[]const ResolverRedirect = null,
+    /// Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
     expected_revision: ?u64 = null,
     wait: ?ResolverWait = null,
 
@@ -899,6 +901,7 @@ pub const ResolverSuppressionRequest = struct {
     texts: ?[]const []const u8 = null,
     add: ?ResolverSuppressionSelection = null,
     remove: ?ResolverSuppressionSelection = null,
+    /// Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
     expected_revision: ?u64 = null,
     wait: ?ResolverWait = null,
 
@@ -984,6 +987,7 @@ pub const ResolverSuppressionSelection = struct {
 
 pub const ResolverUnmergeRequest = struct {
     pin_distinct: ?bool = null,
+    /// Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
     expected_revision: ?u64 = null,
     wait: ?ResolverWait = null,
 

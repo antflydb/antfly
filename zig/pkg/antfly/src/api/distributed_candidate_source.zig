@@ -122,6 +122,8 @@ pub const DistributedCandidateSource = struct {
     const vtable = CandidateSource.VTable{
         .begin_batch = beginBatch,
         .adjudicate = adjudicate,
+        .adjudicate_batch = adjudicateBatch,
+        .adjudicator_model_revision = adjudicatorModelRevision,
         .get_description = getDescription,
         .get_many = getManyFn,
         .get = getFn,
@@ -138,6 +140,32 @@ pub const DistributedCandidateSource = struct {
         const row = (try self.lookupDocument(a, physical, key, .{ .fields = &.{field}, .include_all_fields = false })) orelse return null;
         defer a.free(row);
         return @import("antfly_local_sources").functions_resolver_adjudication.projectedDescription(a, row, artifact);
+    }
+
+    fn adjudicatorModelRevision(ptr: *anyopaque, a: std.mem.Allocator, specification: []const u8, timeout_ms: u32) anyerror!?[32]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const io = self.io orelse return error.MissingAdjudicator;
+        var runtime = try @import("antfly_local_sources").asset_producer_runtime.Runtime.createOwned(a, io, if (self.producer_options) |options| options.get(options.ptr) else .{});
+        defer {
+            runtime.deinit();
+            a.destroy(runtime);
+        }
+        var context = self.request_context orelse @import("antfly_local_sources").storage_db_enrichment_asset_producer.InvocationContext{};
+        context.io = io;
+        return @import("antfly_local_sources").functions_resolver_adjudication.modelRevision(a, runtime.producer(), context, specification, timeout_ms);
+    }
+
+    fn adjudicateBatch(ptr: *anyopaque, a: std.mem.Allocator, requests: []const @import("antfly_resolver").adjudication.Request) anyerror![]@import("antfly_resolver").adjudication.Result {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const io = self.io orelse return error.MissingAdjudicator;
+        var runtime = try @import("antfly_local_sources").asset_producer_runtime.Runtime.createOwned(a, io, if (self.producer_options) |options| options.get(options.ptr) else .{});
+        defer {
+            runtime.deinit();
+            a.destroy(runtime);
+        }
+        var context = self.request_context orelse @import("antfly_local_sources").storage_db_enrichment_asset_producer.InvocationContext{};
+        context.io = io;
+        return @import("antfly_local_sources").functions_resolver_adjudication.executeBatch(a, runtime.producer(), context, requests);
     }
 
     fn adjudicate(ptr: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {

@@ -4,6 +4,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const types = @import("types.zig");
+const antfly_decision_openapi = @import("antfly_decision_openapi");
 const antfly_extraction_openapi = @import("antfly_extraction_openapi");
 
 /// --- Extractors (framework-agnostic) ---
@@ -18,8 +19,8 @@ pub fn parseChunkTextBody(allocator: std.mem.Allocator, body: []const u8) !std.j
 }
 
 /// Parse the JSON request body for decide.
-pub fn parseDecideBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DecideRequest) {
-    return std.json.parseFromSlice(types.DecideRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseDecideBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_decision_openapi.DecisionRequest) {
+    return std.json.parseFromSlice(antfly_decision_openapi.DecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for dictate.
@@ -38,8 +39,8 @@ pub fn parseCreateEmbeddingBody(allocator: std.mem.Allocator, body: []const u8) 
 }
 
 /// Parse the JSON request body for extract.
-pub fn parseExtractBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_extraction_openapi.ExtractionRequest) {
-    return std.json.parseFromSlice(antfly_extraction_openapi.ExtractionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseExtractBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_extraction_openapi.ExtractionInputRequest) {
+    return std.json.parseFromSlice(antfly_extraction_openapi.ExtractionInputRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for generateContent.

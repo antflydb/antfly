@@ -105,6 +105,8 @@ pub const CandidateSource = struct {
     };
     pub const VTable = struct {
         get_description: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!?[]u8 = null,
+        adjudicator_model_revision: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32) anyerror!?[32]u8 = null,
+        adjudicate_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("antfly_resolver").adjudication.Request) anyerror![]@import("antfly_resolver").adjudication.Result = null,
         adjudicate: ?*const fn (*anyopaque, std.mem.Allocator, @import("antfly_resolver").adjudication.Request) anyerror![]u8 = null,
         /// Root-source caches join the resolution transaction. Other physical
         /// stores flush one optional shared-cache batch after resolution commit.
@@ -136,6 +138,14 @@ pub const CandidateSource = struct {
         return NativeBoundary.call("get_description", self.callback_dispatch, method, .{ self.ptr, a, table, key, artifact });
     }
 
+    pub fn adjudicatorModelRevision(self: CandidateSource, a: std.mem.Allocator, specification: []const u8, timeout_ms: u32) !?[32]u8 {
+        const method = self.vtable.adjudicator_model_revision orelse return null;
+        return NativeBoundary.call("adjudicator_model_revision", self.callback_dispatch, method, .{ self.ptr, a, specification, timeout_ms });
+    }
+    pub fn adjudicateBatch(self: CandidateSource, a: std.mem.Allocator, requests: []const @import("antfly_resolver").adjudication.Request) ![]@import("antfly_resolver").adjudication.Result {
+        const method = self.vtable.adjudicate_batch orelse return error.MissingAdjudicator;
+        return NativeBoundary.call("adjudicate_batch", self.callback_dispatch, method, .{ self.ptr, a, requests });
+    }
     pub fn adjudicate(self: CandidateSource, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) ![]u8 {
         const method = self.vtable.adjudicate orelse return error.MissingAdjudicator;
         return NativeBoundary.call("adjudicate", self.callback_dispatch, method, .{ self.ptr, a, request });
@@ -195,6 +205,8 @@ pub const CandidateSource = struct {
         pub fn sourceView(self: *Receiver) CandidateSource {
             self.vtable = .{ .get = Receiver.get };
             if (self.source.vtable.get_description != null) self.vtable.get_description = Receiver.get_description;
+            if (self.source.vtable.adjudicator_model_revision != null) self.vtable.adjudicator_model_revision = Receiver.adjudicator_model_revision;
+            if (self.source.vtable.adjudicate_batch != null) self.vtable.adjudicate_batch = Receiver.adjudicate_batch;
             if (self.source.vtable.adjudicate != null) self.vtable.adjudicate = Receiver.adjudicate;
             if (self.source.vtable.bound_table != null) self.vtable.bound_table = bound_table;
             if (self.source.vtable.embed_mention != null) self.vtable.embed_mention = embed_mention;
@@ -213,6 +225,12 @@ pub const CandidateSource = struct {
         }
         fn get_description(raw: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8) anyerror!?[]u8 {
             return original(raw).getDescription(a, table, key, artifact);
+        }
+        fn adjudicator_model_revision(raw: *anyopaque, a: std.mem.Allocator, specification: []const u8, timeout_ms: u32) anyerror!?[32]u8 {
+            return original(raw).adjudicatorModelRevision(a, specification, timeout_ms);
+        }
+        fn adjudicate_batch(raw: *anyopaque, a: std.mem.Allocator, requests: []const @import("antfly_resolver").adjudication.Request) anyerror![]@import("antfly_resolver").adjudication.Result {
+            return original(raw).adjudicateBatch(a, requests);
         }
         fn adjudicate(raw: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
             return original(raw).adjudicate(a, request);

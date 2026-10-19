@@ -10910,7 +10910,7 @@ pub const Node = struct {
             }
         }
 
-        const base_units = estimateGenerateAdmissionUnitsFromShape(text_bytes, media_count, max_tokens);
+        const base_units = std.math.add(usize, estimateGenerateAdmissionUnitsFromShape(text_bytes, media_count, max_tokens), if (body.logprobs orelse false) 8 else 0) catch std.math.maxInt(usize);
         const speculation = parseGenerateSpeculationOptions(
             body.draft_model != null,
             body.speculative_k,
@@ -12980,6 +12980,18 @@ pub const Node = struct {
             config.grammar = grammar;
         }
 
+        const wants_logprobs = body.logprobs orelse false;
+        const evidence_count = body.top_logprobs orelse 64;
+        if (evidence_count < 1 or evidence_count > 64 or
+            (wants_logprobs and (want_stream or tool_parser != null or config.grammar == null or body.draft_model != null or body.compiled_target != null)))
+            return ctx.status(400).json(.{ .@"error" = "UNSUPPORTED_TOKEN_LOGPROBS", .message = "token evidence requires non-streaming native grammar decoding without tools or speculation" });
+        var token_evidence = generation.token_logprobs.Collector{ .allocator = ctx.allocator, .max_tokens = @intCast(config.max_tokens), .max_alternatives = @intCast(evidence_count) };
+        defer token_evidence.deinit();
+        if (wants_logprobs) {
+            config.token_observer = token_evidence.observer();
+            config.speculation_policy = .off;
+        }
+
         // Native Moondream2 (moondream1 checkpoints): one image plus the
         // last user turn's question; no ONNX Runtime.
         if (moondream_pipeline.isSupportedModelDir(ctx.allocator, model_path)) {
@@ -13010,7 +13022,7 @@ pub const Node = struct {
                 else => return generationErrorResponse(ctx, err),
             };
             defer result.deinit();
-            return self.buildGenerateResponse(ctx, body.model, result.text, null, result.finish_reason, result.prompt_tokens, result.tokens_used, 0, null, null);
+            return self.buildGenerateResponse(ctx, body.model, result.text, null, result.finish_reason, result.prompt_tokens, result.tokens_used, 0, null, null, null);
         }
 
         // Native generation (CPU/GPU GPT arch forward pass).
@@ -13858,6 +13870,7 @@ pub const Node = struct {
                 config.speculation_policy,
                 config.speculation_calibration,
             ),
+            if (wants_logprobs) token_evidence.entries.items else null,
         );
     }
 
@@ -14259,6 +14272,7 @@ pub const Node = struct {
     }
 
     fn generateBatchUnsupportedReasonPreflight(body: api.GenerateRequest) ?api.GenerateBatchError {
+        if (body.logprobs orelse false) return .{ .code = "UNSUPPORTED_TOKEN_LOGPROBS", .message = "token evidence is available on the scalar native grammar route", .retryable = false };
         if (body.stream orelse false) return .{ .code = "UNSUPPORTED_STREAM", .message = "batch generation does not support stream=true", .retryable = false };
         if (body.tools != null or body.tool_choice != null) return .{ .code = "UNSUPPORTED_TOOLS", .message = "batch generation does not support tools yet", .retryable = false };
         _ = parseGenerateNumericOptions(body.max_tokens, body.top_k) catch |err| return .{
@@ -16229,6 +16243,7 @@ pub const Node = struct {
         cached_prompt_tokens: usize,
         tool_calls: ?[]const tool_parser_mod.ToolCall,
         speculative: ?generation.SpeculativeDecodeStats,
+        logprobs: ?[]const generation.token_logprobs.Entry,
     ) !httpx.Response {
         recordSpeculationOutcome(&self.metrics, speculative);
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -16265,8 +16280,9 @@ pub const Node = struct {
             .index = 0,
             .message = message,
             .finish_reason = parseFinishReason(finish_reason),
+            .logprobs = .absent,
         }};
-        return ctx.json(api.GenerateResponse{
+        const response: api.GenerateResponse = .{
             .id = completion_id,
             .object = "chat.completion",
             .created = created,
@@ -16277,7 +16293,9 @@ pub const Node = struct {
                 .{ .value = status }
             else
                 .absent,
-        });
+        };
+        if (logprobs) |entries| return ctx.json(NativeEvidenceResponse{ .response = response, .entries = entries });
+        return ctx.json(response);
     }
 
     fn prependSystemPrompt(
@@ -19809,6 +19827,14 @@ pub const Node = struct {
             var public_envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, request_json, .{ .duplicate_field_behavior = .@"error" }) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "body must be a valid extraction request" });
             defer public_envelope.deinit();
+            if (public_envelope.value == .object) if (public_envelope.value.object.get("method")) |method| {
+                if (method != .string or !std.mem.eql(u8, method.string, "generated") or uses_attachment_envelope) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Unsupported extraction method or media" });
+                const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, execution_control) catch |err| return extractionDirectFailureResponse(ctx, err);
+                defer ctx.allocator.free(output);
+                try ctx.setHeader("content-type", "application/json");
+                _ = ctx.response.body(output);
+                return ctx.response.build();
+            };
             @import("antfly_decisions").validateExtractionBoundary(public_envelope.value) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "standalone decisions use /decisions" });
         }
@@ -20129,7 +20155,16 @@ pub const Node = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const decision_api = @import("antfly_decisions");
-        const public_request = try decision_api.parse(a, request_json);
+        if (request_json.len > 16 * 1024 * 1024) return error.DecideRequestLimitExceeded;
+        var envelope = try std.json.parseFromSliceLeaky(std.json.Value, a, request_json, .{ .duplicate_field_behavior = .@"error" });
+        if (envelope == .object) if (envelope.object.get("decision_method")) |method| {
+            if (method != .string) return error.InvalidDecideRequest;
+            if (std.mem.eql(u8, method.string, "generated")) return self.generatedDecisionJson(allocator, a, envelope, control);
+            if (!std.mem.eql(u8, method.string, "typed")) return error.InvalidDecideRequest;
+            // Legacy typed requests do not carry a redundant method field.
+            _ = envelope.object.swapRemove("decision_method");
+        };
+        const public_request = try decision_api.parseValue(a, envelope);
         const request = public_request.inner;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
@@ -20165,6 +20200,226 @@ pub const Node = struct {
         defer extraction.deinit();
         const response_json = if (typed_span) extraction.json else try decision_api.trainedResponse(a, public_request, extraction.json, decision_contract);
         return allocator.dupe(u8, response_json);
+    }
+
+    const StructuredGeneration = struct {
+        node: *Node,
+        io: std.Io,
+        control: InferenceExecutionControl,
+        generator: std.json.Value,
+        model: []const u8,
+        logprobs: bool,
+        fn cancelled(ptr: ?*const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr.?));
+            self.control.check() catch |err| return err == error.Cancelled or err == error.Canceled;
+            return false;
+        }
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.control.check();
+        }
+        fn textCheck(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            try self.control.check();
+        }
+        fn invoke(ptr: *anyopaque, a: std.mem.Allocator, invocation: @import("antfly_structured").Invocation) !@import("antfly_structured").Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const c = @import("antfly_structured");
+            try self.control.check();
+            var body = c.object();
+            try c.put(a, &body, "model", .{ .string = self.model });
+            try c.put(a, &body, "stream", .{ .bool = false });
+            try c.put(a, &body, "enable_thinking", .{ .bool = false });
+            try c.put(a, &body, "logprobs", .{ .bool = self.logprobs });
+            try c.put(a, &body, "top_logprobs", .{ .integer = 64 });
+            for ([_][]const u8{ "max_tokens", "temperature", "top_p", "top_k", "frequency_penalty", "presence_penalty" }) |field| if (self.generator.object.get(field)) |value| try c.put(a, &body, field, value);
+            var format = c.object();
+            try c.put(a, &format, "type", .{ .string = "json_schema" });
+            var schema = c.object();
+            try c.put(a, &schema, "name", .{ .string = "antfly_output" });
+            try c.put(a, &schema, "strict", .{ .bool = true });
+            try c.put(a, &schema, "schema", invocation.schema);
+            try c.put(a, &format, "json_schema", schema);
+            try c.put(a, &body, "response_format", format);
+            const input = try std.json.Stringify.valueAlloc(a, .{ .instructions = invocation.instructions, .items = invocation.items, .validation_error = invocation.validation_error }, .{ .emit_null_optional_fields = false });
+            const system = try std.fmt.allocPrint(a, "Return one structured result per input. Preserve item IDs. JSON schema: {s}", .{try std.json.Stringify.valueAlloc(a, invocation.schema, .{})});
+            try c.put(a, &body, "messages", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .{ .role = "system", .content = system }, .{ .role = "user", .content = input } }, .{}), .{}));
+            var request = try httpx.Request.init(a, .POST, "/generate");
+            defer request.deinit();
+            request.body = try std.json.Stringify.valueAlloc(a, body, .{});
+            var ctx = httpx.Context.init(a, self.io, &request);
+            defer ctx.deinit();
+            ctx.application_deadline_ns = self.control.deadline_ns;
+            ctx.cancellation_probe = .{ .ptr = self, .is_cancelled = cancelled };
+            var response = try self.node.generateContent(&ctx);
+            defer response.deinit();
+            try self.control.check();
+            if (!response.ok()) {
+                if (response.status.code == 429) return error.RateLimit;
+                if (response.status.code == 504) return error.Timeout;
+                if (response.status.code == 500) if (response.body) |raw| {
+                    const failure = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return error.GenerateRequestFailed;
+                    if (failure == .object) if (failure.object.get("error")) |code| if (code == .string and std.mem.eql(u8, code.string, "STRUCTURED_OUTPUT_INVALID")) return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[]}", .{}) };
+                };
+                return error.GenerateRequestFailed;
+            }
+            if ((response.body orelse return error.InvalidConstrainedOutput).len > 1024 * 1024) return error.ResponseTooLarge;
+            const result = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body orelse return error.InvalidConstrainedOutput, .{ .allocate = .alloc_always });
+            const choices = result.object.get("choices") orelse return error.InvalidConstrainedOutput;
+            if (choices != .array or choices.array.items.len != 1) return error.InvalidConstrainedOutput;
+            const raw = choices.array.items[0].object.get("message").?.object.get("content").?;
+            if (raw != .string) return error.InvalidConstrainedOutput;
+            const value = std.json.parseFromSliceLeaky(std.json.Value, a, raw.string, .{ .allocate = .alloc_always }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[]}", .{}) };
+            };
+            const usage = result.object.get("usage").?.object;
+            return .{ .value = value, .input_tokens = @intCast(usage.get("prompt_tokens").?.integer), .output_tokens = @intCast(usage.get("completion_tokens").?.integer), .token_evidence = if (choices.array.items[0].object.get("logprobs")) |proof| (try c.token_evidence.Index.init(a, raw.string, proof)).evidence() else null };
+        }
+    };
+
+    fn admitStructuredGenerator(self: *Node, a: std.mem.Allocator, io: std.Io, generator: std.json.Value, output: @import("antfly_structured").Output, probabilities: @import("antfly_structured").Probabilities) !@import("antfly_structured").Output {
+        const c = @import("antfly_structured");
+        var parsed = try std.json.parseFromValue(c.extraction.GeneratorConfig, a, generator, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        try parsed.value.validate();
+        if (parsed.value.provider != .antfly or parsed.value.url.len != 0 or parsed.value.tools_json != null or parsed.value.tool_choice_json != null or parsed.value.rate_limit != null or parsed.value.api_key != null) return error.UnsupportedConstrainedOutput;
+        const path = try self.resolveRequestModelPath(a, io, parsed.value.model, "generators");
+        var manifest = try manifest_mod.loadListingFromDir(a, path);
+        defer manifest.deinit();
+        const native = resolvedExecutorKind("generate", &manifest) == .native_generation;
+        return (c.Capabilities{ .grammar = native, .token_logprobs = native }).select(output, probabilities);
+    }
+
+    fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl) ![]u8 {
+        const c = @import("antfly_structured");
+        const extractor = c.extraction;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var config_value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, envelope, .{}), .{ .allocate = .alloc_always });
+        const inputs = config_value.object.fetchSwapRemove("inputs") orelse return error.InvalidGeneratedExtractorConfig;
+        if (inputs.value != .array or inputs.value.array.items.len == 0 or inputs.value.array.items.len > 128) return error.InvalidGeneratedExtractorConfig;
+        const texts = try a.alloc([]const u8, inputs.value.array.items.len);
+        for (texts, inputs.value.array.items) |*text, input| {
+            if (input != .object or input.object.count() > 2) return error.InvalidGeneratedExtractorConfig;
+            for (input.object.keys()) |key| if (!std.mem.eql(u8, key, "content") and !std.mem.eql(u8, key, "id")) return error.InvalidGeneratedExtractorConfig;
+            if (input.object.get("id")) |id| if (id != .string or id.string.len == 0 or id.string.len > 1024 or !std.unicode.utf8ValidateSlice(id.string)) return error.InvalidGeneratedExtractorConfig;
+            const content = input.object.get("content") orelse return error.InvalidGeneratedExtractorConfig;
+            if (content != .string or content.string.len > 1024 * 1024) return error.InvalidGeneratedExtractorConfig;
+            text.* = content.string;
+        }
+        if (config_value.object.fetchSwapRemove("schema_version")) |version| if (version.value != .integer or version.value.integer != 2) return error.InvalidGeneratedExtractorConfig;
+        const raw_config = try std.json.Stringify.valueAlloc(a, config_value, .{});
+        var parsed = try extractor.parse(a, raw_config);
+        defer parsed.deinit();
+        const config = parsed.value;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |value| {
+            var owned = value;
+            owned.deinit();
+        };
+        const io = self.inferenceIo(a, control.io, &owned_io);
+        const generator = config_value.object.get("generator").?;
+        const mode = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities);
+        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs };
+        var validation = extractor.Validation{ .config = config };
+        const Combined = struct {
+            backend: *StructuredGeneration,
+            validation: *extractor.Validation,
+            fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, invocation: c.Invocation) !c.Reply {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                return StructuredGeneration.invoke(self_.backend, alloc, invocation);
+            }
+            fn check(ptr: *anyopaque) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                try self_.backend.control.check();
+            }
+            fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, id: usize, value: std.json.Value, proof: ?c.TokenEvidence) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                try extractor.Validation.validate(self_.validation, alloc, id, value, proof);
+            }
+        };
+        var combined = Combined{ .backend = &backend, .validation = &validation };
+        const text_control: @import("antfly_extracting").text_processing.Checkpoint = .{ .ptr = &backend, .check_fn = StructuredGeneration.textCheck };
+        const planned = try extractor.planWithControl(a, config, texts, text_control);
+        const instructions = try std.fmt.allocPrint(a, "Extract only entities and relations grounded in each input. Use literal source surface forms. Relations reference entity positions. Set present=false for absent candidates. Never invent offsets or confidence. {s}", .{config.instructions});
+        const generated = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
+        const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
+        var data = try c.array(a, &.{});
+        for (values, inputs.value.array.items) |value, input| {
+            var result = value orelse return error.InvalidConstrainedOutput;
+            if (input.object.get("id")) |id| {
+                if (id != .string) return error.InvalidGeneratedExtractorConfig;
+                try c.put(a, &result, "id", id);
+            }
+            try data.array.append(result);
+        }
+        return std.json.Stringify.valueAlloc(allocator, .{ .object = "extraction", .schema_version = @as(u8, 2), .model = config.generator.model, .data = data, .usage = .{ .input_tokens = generated.input_tokens, .output_tokens = generated.output_tokens } }, .{});
+    }
+
+    fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
+        const c = @import("antfly_structured");
+        const contract = @import("antfly_decisions");
+        const generated = contract.generated;
+        const request = try generated.parseRequest(a, envelope);
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*value| value.deinit();
+        const io = self.inferenceIo(a, if (control) |effective| effective.io else null, &owned_io);
+        const mode = try self.admitStructuredGenerator(a, io, request.generator, request.output, request.probabilities);
+        const options = generated.Options{ .model = request.model, .probabilities = request.probabilities };
+        const Validation = struct {
+            options: generated.Options,
+            questions: std.json.Value,
+            values: []?std.json.Value,
+            fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, id: usize, value: std.json.Value, proof: ?c.TokenEvidence) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                self_.values[id] = try contract.publicResponse(alloc, try generated.responseValue(alloc, self_.options, self_.questions, value, proof, id, 0, 0));
+            }
+        };
+        const values = try a.alloc(?std.json.Value, request.inputs.len);
+        @memset(values, null);
+        var validation = Validation{ .options = options, .questions = request.questions, .values = values };
+        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = request.generator, .model = request.model, .logprobs = request.probabilities == .token_logprobs };
+        const Combined = struct {
+            backend: *StructuredGeneration,
+            validation: *Validation,
+            fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, invocation: c.Invocation) !c.Reply {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                return StructuredGeneration.invoke(self_.backend, alloc, invocation);
+            }
+            fn check(ptr: *anyopaque) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                try self_.backend.control.check();
+            }
+            fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, id: usize, value: std.json.Value, proof: ?c.TokenEvidence) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                try Validation.validate(self_.validation, alloc, id, value, proof);
+            }
+        };
+        var combined = Combined{ .backend = &backend, .validation = &validation };
+        const inputs = try a.alloc([]const u8, request.inputs.len);
+        for (inputs, request.inputs) |*input, item| input.* = item.input;
+        const result = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try generated.questionSchema(a, request.questions), request.instructions, request.batch, inputs);
+        var root = c.object();
+        try c.put(a, &root, "model", .{ .string = request.model });
+        try c.put(a, &root, "usage", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens }, .{}), .{}));
+        if (!request.batched) {
+            const value = values[0] orelse return result.failures[0] orelse error.InvalidConstrainedOutput;
+            try c.put(a, &root, "answers", value.object.get("answers").?);
+        } else {
+            var data = try c.array(a, &.{});
+            for (values, request.inputs, result.failures, 0..) |value, item, failure, i| {
+                var row = c.object();
+                try c.put(a, &row, "input_index", .{ .integer = @intCast(i) });
+                if (item.id) |id| try c.put(a, &row, "id", .{ .string = id });
+                try c.put(a, &row, "answers", if (value) |answer| answer.object.get("answers").? else try c.array(a, &.{}));
+                if (failure) |err| try c.put(a, &row, "error", .{ .string = @errorName(err) });
+                try data.array.append(row);
+            }
+            try c.put(a, &root, "data", data);
+        }
+        return std.json.Stringify.valueAlloc(allocator, root, .{});
     }
 
     fn decideEmbeddingSimilarity(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, public_request: @import("antfly_decisions").Request, control: ?InferenceExecutionControl) ![]u8 {
@@ -20536,6 +20791,12 @@ pub const Node = struct {
             error.InvalidEmbeddingCalibration, error.EmbeddingCalibrationMismatch, error.UnqualifiedEmbeddingCalibration => ctx.status(400).json(.{ .@"error" = "INVALID_CALIBRATION", .message = @errorName(err) }),
             error.DecideRequestLimitExceeded => ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = @errorName(err) }),
             error.InvalidDecideRequest,
+            error.InvalidGeneratorConfig,
+            error.InvalidConstrainedGenerationConfig,
+            error.UnsupportedConstrainedOutput,
+            error.UnsupportedConstrainedProbabilities,
+            error.UnexpectedToken,
+            error.UnknownField,
             error.UnsupportedDecisionWindowing,
             error.UnsupportedEmbeddingDecisionKind,
             error.EmbeddingMultiLabelThresholdRequired,
@@ -20593,23 +20854,25 @@ pub const Node = struct {
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const json_body = try self.listModelsJsonAlloc(ctx.allocator, ctx.io);
         defer ctx.allocator.free(json_body);
-        // Scoped discovery may pin one embedding generation without loading its
-        // weights. Avoid fingerprinting every model in an unscoped catalog.
-        if (try ctx.queryDecoded("model")) |name| if (ctx.query("task")) |task| if (std.mem.eql(u8, task, "embed")) {
+        // Scoped discovery pins one embedding or generator generation without
+        // loading weights. Avoid fingerprinting every model in an unscoped catalog.
+        if (try ctx.queryDecoded("model")) |name| if (ctx.query("task")) |task| if (std.mem.eql(u8, task, "embed") or std.mem.eql(u8, task, "generate")) {
+            const category: []const u8 = if (std.mem.eql(u8, task, "embed")) "embedders" else "generators";
             var catalog = try std.json.parseFromSlice(std.json.Value, ctx.allocator, json_body, .{});
             defer catalog.deinit();
-            if (catalog.value == .object) if (catalog.value.object.getPtr("embedders")) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
-                const path = try self.resolveRequestModelPath(ctx.allocator, ctx.io, name, "embedders");
+            if (catalog.value == .object) if (catalog.value.object.getPtr(category)) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
+                const path = try self.resolveRequestModelPath(ctx.allocator, ctx.io, name, category);
                 defer ctx.allocator.free(path);
                 var manifest = try manifest_mod.loadFromDir(ctx.allocator, path);
                 defer manifest.deinit();
                 const revision = if (self.model_manager.acquireLoadedModel(path)) |cached| loaded: {
                     var handle = cached;
                     defer handle.release();
-                    break :loaded handle.get().resolution_revision orelse return error.InvalidEmbeddingIdentity;
+                    break :loaded handle.get().resolution_revision orelse if (std.mem.eql(u8, task, "embed")) return error.InvalidEmbeddingIdentity else try self.model_manager.modelIdentityForManifest(path, manifest);
                 } else try self.model_manager.modelIdentityForManifest(path, manifest);
                 const hex = std.fmt.bytesToHex(revision, .lower);
                 try info.object.put(ctx.allocator, "model_revision", .{ .string = &hex });
+                if (std.mem.eql(u8, task, "generate")) return ctx.json(catalog.value);
                 const limits_json = try std.json.Stringify.valueAlloc(ctx.allocator, self.config.chunking_limits, .{});
                 defer ctx.allocator.free(limits_json);
                 const parsed_limits = try std.json.parseFromSlice(std.json.Value, ctx.allocator, limits_json, .{ .allocate = .alloc_always });
@@ -22107,6 +22370,14 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
             "inference_admission",
         ),
         error.InvalidExtractionConfig,
+        error.InvalidGeneratedExtractorConfig,
+        error.InvalidGeneratorConfig,
+        error.InvalidConstrainedGenerationConfig,
+        error.UnsupportedConstrainedOutput,
+        error.UnsupportedConstrainedProbabilities,
+        error.UnsupportedGeneratedExtractionSchema,
+        error.UnexpectedToken,
+        error.UnknownField,
         error.InvalidExtractionAttachment,
         error.InvalidClassificationSchema,
         error.InvalidEntitySchema,
@@ -23985,6 +24256,10 @@ fn appendResolvedInferenceCapabilities(
         std.mem.eql(u8, resolved_task, "chunk") or
         std.mem.eql(u8, resolved_task, "transcribe") or
         std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
+    try buf.appendSlice(allocator, ",\"generation_grammar_v1\":");
+    try buf.appendSlice(allocator, if (executor_kind == .native_generation) "true" else "false");
+    try buf.appendSlice(allocator, ",\"generation_token_logprobs_v1\":");
+    try buf.appendSlice(allocator, if (executor_kind == .native_generation) "true" else "false");
     try buf.appendSlice(allocator, ",\"model_aware_chunking_v1\":");
     try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed")) "true" else "false");
     try buf.appendSlice(allocator, ",\"numeric_responses_v1\":");
@@ -24256,6 +24531,7 @@ pub const ResolvedExecutorBatchImplementation = struct {
 /// Adding a fused backend is an explicit registration here; compatibility
 /// loops cannot accidentally advertise native batching.
 pub const ResolvedExecutorKind = enum {
+    native_generation,
     compatibility,
     /// Ordered groups are executed serially, with one vector per group.
     grouped_dense_embedding,
@@ -24339,6 +24615,9 @@ pub fn resolvedExecutorKind(
     resolved_task: []const u8,
     manifest: *const manifest_mod.ModelManifest,
 ) ResolvedExecutorKind {
+    if (std.mem.eql(u8, resolved_task, "generate") and
+        (manifest.usesGgufWeights() or manifest.isQwen3VlGenerationSafetensorsBundle()) and
+        !std.mem.eql(u8, manifest.config_model_arch, "moondream1")) return .native_generation;
     if (std.mem.eql(u8, resolved_task, "embed") and manifest.embedding_style == .embedding_gemma2)
         return .grouped_dense_embedding;
     if (std.mem.eql(u8, resolved_task, "embed")) {
@@ -31264,7 +31543,7 @@ fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !
 fn deinitChunkRequestInput(allocator: std.mem.Allocator, input: lib_chunker.Input) void {
     switch (input) {
         .binary => |binary| allocator.free(binary.data),
-        .text => {},
+        .text, .source => {},
     }
 }
 
@@ -37559,4 +37838,72 @@ test "embeddinggemma2 video partial DASH pretrained windows preserve vectors acr
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
     std.debug.print("partial DASH live pretrained metal={} windows={d} callbacks={d} early={d} prefix=2 requests={d} max_error={d:.9}\n", .{ metal, capture.count, capture.calls, capture.early, transport.requests, max_error });
+}
+
+/// Serialize exact token bytes directly. Building a JSON Value for every byte
+/// would multiply the collector's bounded memory by the Value object size.
+const NativeEvidenceResponse = struct {
+    response: api.GenerateResponse,
+    entries: []const generation.token_logprobs.Entry,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        const value = self.response;
+        try writer.beginObject();
+        inline for (.{ "id", "object", "created", "model" }) |field| {
+            try writer.objectField(field);
+            try writer.write(@field(value, field));
+        }
+        try writer.objectField("choices");
+        try writer.beginArray();
+        for (value.choices) |choice| {
+            try writer.beginObject();
+            inline for (.{ "index", "message", "finish_reason" }) |field| {
+                try writer.objectField(field);
+                try writer.write(@field(choice, field));
+            }
+            try writer.objectField("logprobs");
+            try writer.write(.{ .content = self.entries });
+            try writer.endObject();
+        }
+        try writer.endArray();
+        try writer.objectField("usage");
+        try writer.write(value.usage);
+        if (value.speculation == .value) {
+            try writer.objectField("speculation");
+            try writer.write(value.speculation.value);
+        }
+        try writer.endObject();
+    }
+};
+
+test "generated constrained public routes admit native models and reject proxy configuration before IO" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    const foreign =
+        \\{"decision_method":"generated","generator":{"provider":"openai","model":"gpt-4.1"},"probabilities":"verdict_only","input":"source","questions":[{"name":"answer","type":"predicate","instructions":"Is it present?"}]}
+    ;
+    try std.testing.expectError(error.UnsupportedConstrainedOutput, node.decideDirectJsonWithControl(a, foreign, null));
+    var request = try httpx.Request.init(a, .POST, "/decisions");
+    defer request.deinit();
+    request.body = foreign;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.decide(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    const score =
+        \\{"decision_method":"generated","generator":{"provider":"antfly","model":"missing-generated-fixture-1187"},"probabilities":"verdict_only","instructions":"Rate the statement between zero and one.","input":"source","questions":[{"name":"score","type":"score"}]}
+    ;
+    try std.testing.expectError(error.ModelNotFound, node.decideDirectJsonWithControl(a, score, null));
+    const extraction =
+        \\{"method":"generated","generator":{"provider":"openai","model":"gpt-4.1"},"probabilities":"verdict_only","inputs":[{"content":"Éva"}],"schema":{"entities":["person"]}}
+    ;
+    var extract_request = try httpx.Request.init(a, .POST, "/extract");
+    defer extract_request.deinit();
+    extract_request.body = extraction;
+    var extract_ctx = httpx.Context.init(a, std.testing.io, &extract_request);
+    defer extract_ctx.deinit();
+    var extract_response = try node.extractJSON(&extract_ctx);
+    defer extract_response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), extract_response.status.code);
 }

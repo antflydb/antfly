@@ -289,6 +289,12 @@ pub const storage_db_artifact_publication_owner = @import("storage/db/artifact_p
 pub const storage_db_artifact_publication_resolution = @import("storage/db/artifact_publication_resolution.zig");
 pub const storage_db_artifact_publication_transport = @import("storage/db/artifact_publication_transport.zig");
 pub const storage_db_artifact_publication_transport_codec = @import("storage/db/artifact_publication_transport_codec.zig");
+pub const storage_db_group_sources = @import("storage/db/group_sources.zig");
+pub const storage_db_group_source_contract = @import("storage/db/group_source_contract.zig");
+pub const storage_db_group_source_index = @import("storage/db/group_source_index.zig");
+pub const storage_db_group_source_reads = @import("storage/db/group_source_reads.zig");
+pub const storage_db_group_source_worker = @import("storage/db/group_source_worker.zig");
+
 pub const storage_db_artifact_publication_wire = @import("storage/db/artifact_publication_wire.zig");
 pub const storage_db_artifact_reconcile = @import("storage/db/artifact_reconcile.zig");
 pub const storage_db_artifact_reconcile_intent = @import("storage/db/artifact_reconcile_intent.zig");

@@ -48,7 +48,7 @@ fn bindTemplate(alloc: std.mem.Allocator, txn: anytype, request: requests.Genera
     var ordered = (try inventory.load(alloc, txn)) orelse return error.ArtifactCatalogDrift;
     defer ordered.deinit();
     const binding = ordered.value.command.binding;
-    if (binding.effect_protocol != 15 or binding.epoch != authority.epoch or
+    if (binding.effect_protocol < 15 or binding.epoch != authority.epoch or
         !std.mem.eql(u8, &binding.digest, &authority.catalog_digest) or
         !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace)) return error.ArtifactCatalogDrift;
     const local = try inventory.catalogs(txn);
@@ -164,6 +164,7 @@ pub fn definitionDigest(request: requests.GeneratedEnrichmentRequest) publicatio
         const value = @field(request, reflected_name);
         switch (@typeInfo(field_type)) {
             .pointer => hashDefinitionBytes(&hash, value),
+            .array => |array| if (array.child == u8) hashDefinitionBytes(&hash, &value) else @compileError("producer array needs a canonical field encoding"),
             .@"enum" => hashDefinitionBytes(&hash, @tagName(value)),
             .bool => hash.update(&.{@intFromBool(value)}),
             .int => {
@@ -197,6 +198,7 @@ test "ordered artifact inventory producer definition identity binds every provid
             .@"enum" => @field(changed, reflected_name) = std.meta.tags(field_type)[(@as(usize, @backingInt(@field(request, reflected_name))) + 1) % std.meta.tags(field_type).len],
             .bool => @field(changed, reflected_name) = !@field(request, reflected_name),
             .int => @field(changed, reflected_name) += 1,
+            .array => @field(changed, reflected_name)[0] ^= 1,
             else => unreachable,
         }
         try std.testing.expect(!sameDefinition(request, changed));
@@ -238,7 +240,7 @@ pub fn capture(
     const logical = if (materializer) |reader| try reader.materialize(reader.ptr, alloc, source_store_key, raw) else null;
     defer if (logical) |value| alloc.free(value);
     if (!std.mem.eql(u8, logical orelse raw, observed_logical_input)) return error.EnrichmentSourceChanged;
-    if (request.sequence != 0) {
+    if (request.sequence != 0 and !keys.isGroupSourceRowKey(source_store_key)) {
         const ordinal = (try identity.lookupOrdinalTxn(alloc, txn, request.doc_key)) orelse return error.EnrichmentSourceChanged;
         const state = (try identity.lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
         if (!state.isLive() or state.created_generation > request.sequence) return error.EnrichmentSourceChanged;

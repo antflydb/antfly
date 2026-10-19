@@ -5,12 +5,16 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.constrained_output import ConstrainedOutput
+from ..models.constrained_probabilities import ConstrainedProbabilities
 from ..models.decider_config_decision_method import DeciderConfigDecisionMethod
 from ..models.decider_config_provider import DeciderConfigProvider
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.constrained_generation_batch import ConstrainedGenerationBatch
     from ..models.decider_config_embedding_options import DeciderConfigEmbeddingOptions
+    from ..models.generator_config import GeneratorConfig
     from ..models.rate_limit_config import RateLimitConfig
 
 
@@ -21,10 +25,18 @@ T = TypeVar("T", bound="DeciderConfig")
 class DeciderConfig:
     """
     Attributes:
-        provider (DeciderConfigProvider):
+        provider (DeciderConfigProvider | Unset):
         decision_method (DeciderConfigDecisionMethod | Unset): Explicit result contract. embedding_similarity is
             available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests
             and returns raw cosine similarities. Default: DeciderConfigDecisionMethod.TYPED.
+        generator (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
+             Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
+        instructions (str | Unset):
+        output (ConstrainedOutput | Unset): Provider and model admission selects a supported constrained mechanism. Auto
+            prefers forced tools, then provider JSON schema, then native grammar. Free-text parsing is not a mode.
+        probabilities (ConstrainedProbabilities | Unset): Token probabilities require complete decoder evidence for the
+            allowed values. Verdict-only is explicit opt-in; model-reported confidence is never used.
+        batch (ConstrainedGenerationBatch | Unset):
         model (str | Unset): Required for Antfly and OpenAI; Jev defaults to jev-latest.
         model_identity (str | Unset): Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
         embedding_options (DeciderConfigEmbeddingOptions | Unset): EmbeddingGemma 2 geometry and acceptance defaults.
@@ -42,8 +54,13 @@ class DeciderConfig:
         batch_size (int | Unset):  Default: 32.
     """
 
-    provider: DeciderConfigProvider
+    provider: DeciderConfigProvider | Unset = UNSET
     decision_method: DeciderConfigDecisionMethod | Unset = DeciderConfigDecisionMethod.TYPED
+    generator: GeneratorConfig | Unset = UNSET
+    instructions: str | Unset = UNSET
+    output: ConstrainedOutput | Unset = UNSET
+    probabilities: ConstrainedProbabilities | Unset = UNSET
+    batch: ConstrainedGenerationBatch | Unset = UNSET
     model: str | Unset = UNSET
     model_identity: str | Unset = UNSET
     embedding_options: DeciderConfigEmbeddingOptions | Unset = UNSET
@@ -55,11 +72,31 @@ class DeciderConfig:
     batch_size: int | Unset = 32
 
     def to_dict(self) -> dict[str, Any]:
-        provider = self.provider.value
+        provider: str | Unset = UNSET
+        if not isinstance(self.provider, Unset):
+            provider = self.provider.value
 
         decision_method: str | Unset = UNSET
         if not isinstance(self.decision_method, Unset):
             decision_method = self.decision_method.value
+
+        generator: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.generator, Unset):
+            generator = self.generator.to_dict()
+
+        instructions = self.instructions
+
+        output: str | Unset = UNSET
+        if not isinstance(self.output, Unset):
+            output = self.output.value
+
+        probabilities: str | Unset = UNSET
+        if not isinstance(self.probabilities, Unset):
+            probabilities = self.probabilities.value
+
+        batch: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.batch, Unset):
+            batch = self.batch.to_dict()
 
         model = self.model
 
@@ -85,13 +122,21 @@ class DeciderConfig:
 
         field_dict: dict[str, Any] = {}
 
-        field_dict.update(
-            {
-                "provider": provider,
-            }
-        )
+        field_dict.update({})
+        if provider is not UNSET:
+            field_dict["provider"] = provider
         if decision_method is not UNSET:
             field_dict["decision_method"] = decision_method
+        if generator is not UNSET:
+            field_dict["generator"] = generator
+        if instructions is not UNSET:
+            field_dict["instructions"] = instructions
+        if output is not UNSET:
+            field_dict["output"] = output
+        if probabilities is not UNSET:
+            field_dict["probabilities"] = probabilities
+        if batch is not UNSET:
+            field_dict["batch"] = batch
         if model is not UNSET:
             field_dict["model"] = model
         if model_identity is not UNSET:
@@ -115,11 +160,18 @@ class DeciderConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.constrained_generation_batch import ConstrainedGenerationBatch
         from ..models.decider_config_embedding_options import DeciderConfigEmbeddingOptions
+        from ..models.generator_config import GeneratorConfig
         from ..models.rate_limit_config import RateLimitConfig
 
         d = dict(src_dict)
-        provider = DeciderConfigProvider(d.pop("provider"))
+        _provider = d.pop("provider", UNSET)
+        provider: DeciderConfigProvider | Unset
+        if isinstance(_provider, Unset):
+            provider = UNSET
+        else:
+            provider = DeciderConfigProvider(_provider)
 
         _decision_method = d.pop("decision_method", UNSET)
         decision_method: DeciderConfigDecisionMethod | Unset
@@ -127,6 +179,36 @@ class DeciderConfig:
             decision_method = UNSET
         else:
             decision_method = DeciderConfigDecisionMethod(_decision_method)
+
+        _generator = d.pop("generator", UNSET)
+        generator: GeneratorConfig | Unset
+        if isinstance(_generator, Unset):
+            generator = UNSET
+        else:
+            generator = GeneratorConfig.from_dict(_generator)
+
+        instructions = d.pop("instructions", UNSET)
+
+        _output = d.pop("output", UNSET)
+        output: ConstrainedOutput | Unset
+        if isinstance(_output, Unset):
+            output = UNSET
+        else:
+            output = ConstrainedOutput(_output)
+
+        _probabilities = d.pop("probabilities", UNSET)
+        probabilities: ConstrainedProbabilities | Unset
+        if isinstance(_probabilities, Unset):
+            probabilities = UNSET
+        else:
+            probabilities = ConstrainedProbabilities(_probabilities)
+
+        _batch = d.pop("batch", UNSET)
+        batch: ConstrainedGenerationBatch | Unset
+        if isinstance(_batch, Unset):
+            batch = UNSET
+        else:
+            batch = ConstrainedGenerationBatch.from_dict(_batch)
 
         model = d.pop("model", UNSET)
 
@@ -159,6 +241,11 @@ class DeciderConfig:
         decider_config = cls(
             provider=provider,
             decision_method=decision_method,
+            generator=generator,
+            instructions=instructions,
+            output=output,
+            probabilities=probabilities,
+            batch=batch,
             model=model,
             model_identity=model_identity,
             embedding_options=embedding_options,

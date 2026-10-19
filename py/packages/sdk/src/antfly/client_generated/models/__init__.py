@@ -180,6 +180,11 @@ from .connections_response import ConnectionsResponse
 from .connector_capabilities import ConnectorCapabilities
 from .connector_capabilities_chatgpt import ConnectorCapabilitiesChatgpt
 from .connector_capabilities_chatgpt_reason import ConnectorCapabilitiesChatgptReason
+from .constrained_generation_batch import ConstrainedGenerationBatch
+from .constrained_generator_producer_config import ConstrainedGeneratorProducerConfig
+from .constrained_generator_producer_config_output_schema import ConstrainedGeneratorProducerConfigOutputSchema
+from .constrained_output import ConstrainedOutput
+from .constrained_probabilities import ConstrainedProbabilities
 from .create_algebraic_index_request import CreateAlgebraicIndexRequest
 from .create_algebraic_index_request_type import CreateAlgebraicIndexRequestType
 from .create_api_key_request import CreateApiKeyRequest
@@ -330,10 +335,12 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
-from .enrichment_config_producer import EnrichmentConfigProducer
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
+from .enrichment_producer_config import EnrichmentProducerConfig
+from .enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
+from .enrichment_producer_config_type import EnrichmentProducerConfigType
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
 from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
@@ -473,6 +480,7 @@ from .extraction_long_document_options import ExtractionLongDocumentOptions
 from .extraction_long_document_options_mode import ExtractionLongDocumentOptionsMode
 from .extraction_long_document_options_record_identity import ExtractionLongDocumentOptionsRecordIdentity
 from .extraction_object import ExtractionObject
+from .extraction_object_probability_source import ExtractionObjectProbabilitySource
 from .extraction_object_structure_metadata import ExtractionObjectStructureMetadata
 from .extraction_object_structures import ExtractionObjectStructures
 from .extraction_offset_unit import ExtractionOffsetUnit
@@ -538,6 +546,39 @@ from .full_text_index_stats_resolution import FullTextIndexStatsResolution
 from .full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
 from .fuzziness_type_1 import FuzzinessType1
 from .fuzzy_query import FuzzyQuery
+from .generated_choice_answer import GeneratedChoiceAnswer
+from .generated_choice_answer_decision_method import GeneratedChoiceAnswerDecisionMethod
+from .generated_choice_answer_probability_source import GeneratedChoiceAnswerProbabilitySource
+from .generated_choice_answer_type import GeneratedChoiceAnswerType
+from .generated_choice_decision_question import GeneratedChoiceDecisionQuestion
+from .generated_choice_decision_question_type import GeneratedChoiceDecisionQuestionType
+from .generated_decide_request import GeneratedDecideRequest
+from .generated_decide_request_decision_method import GeneratedDecideRequestDecisionMethod
+from .generated_extraction_input import GeneratedExtractionInput
+from .generated_extraction_request import GeneratedExtractionRequest
+from .generated_extraction_request_entity_definitions import GeneratedExtractionRequestEntityDefinitions
+from .generated_extraction_request_method import GeneratedExtractionRequestMethod
+from .generated_extractor_config import GeneratedExtractorConfig
+from .generated_extractor_config_entity_definitions import GeneratedExtractorConfigEntityDefinitions
+from .generated_extractor_config_method import GeneratedExtractorConfigMethod
+from .generated_multi_choice_answer import GeneratedMultiChoiceAnswer
+from .generated_multi_choice_answer_decision_method import GeneratedMultiChoiceAnswerDecisionMethod
+from .generated_multi_choice_answer_probability_source import GeneratedMultiChoiceAnswerProbabilitySource
+from .generated_multi_choice_answer_type import GeneratedMultiChoiceAnswerType
+from .generated_multi_choice_decision_question import GeneratedMultiChoiceDecisionQuestion
+from .generated_multi_choice_decision_question_type import GeneratedMultiChoiceDecisionQuestionType
+from .generated_predicate_answer import GeneratedPredicateAnswer
+from .generated_predicate_answer_decision_method import GeneratedPredicateAnswerDecisionMethod
+from .generated_predicate_answer_probability_source import GeneratedPredicateAnswerProbabilitySource
+from .generated_predicate_answer_type import GeneratedPredicateAnswerType
+from .generated_predicate_decision_question import GeneratedPredicateDecisionQuestion
+from .generated_predicate_decision_question_type import GeneratedPredicateDecisionQuestionType
+from .generated_score_answer import GeneratedScoreAnswer
+from .generated_score_answer_decision_method import GeneratedScoreAnswerDecisionMethod
+from .generated_score_answer_probability_source import GeneratedScoreAnswerProbabilitySource
+from .generated_score_answer_type import GeneratedScoreAnswerType
+from .generated_score_decision_question import GeneratedScoreDecisionQuestion
+from .generated_score_decision_question_type import GeneratedScoreDecisionQuestionType
 from .generation_step_config import GenerationStepConfig
 from .generator_config import GeneratorConfig
 from .generator_provider import GeneratorProvider
@@ -578,7 +619,6 @@ from .graph_artifact_node_mapping_config import GraphArtifactNodeMappingConfig
 from .graph_artifact_node_mapping_config_model import GraphArtifactNodeMappingConfigModel
 from .graph_artifact_producer_config import GraphArtifactProducerConfig
 from .graph_artifact_producer_config_kind import GraphArtifactProducerConfigKind
-from .graph_artifact_producer_config_producer import GraphArtifactProducerConfigProducer
 from .graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
 from .graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 from .graph_artifact_producer_source_config_type import GraphArtifactProducerSourceConfigType
@@ -745,6 +785,8 @@ from .graph_work_budget_exceeded_error_dimension import GraphWorkBudgetExceededE
 from .graph_work_budget_exceeded_error_error import GraphWorkBudgetExceededErrorError
 from .graph_work_budget_exceeded_error_status import GraphWorkBudgetExceededErrorStatus
 from .ground_truth import GroundTruth
+from .grouped_artifact_source import GroupedArtifactSource
+from .grouped_artifact_source_filter import GroupedArtifactSourceFilter
 from .hierarchy_ancestor import HierarchyAncestor
 from .hierarchy_ancestor_document import HierarchyAncestorDocument
 from .hierarchy_ancestors import HierarchyAncestors
@@ -901,6 +943,7 @@ from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
@@ -1134,6 +1177,7 @@ from .phrase_query import PhraseQuery
 from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
+from .prior_artifact_context import PriorArtifactContext
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
@@ -1777,6 +1821,11 @@ __all__ = (
     "ConnectorCapabilities",
     "ConnectorCapabilitiesChatgpt",
     "ConnectorCapabilitiesChatgptReason",
+    "ConstrainedGenerationBatch",
+    "ConstrainedGeneratorProducerConfig",
+    "ConstrainedGeneratorProducerConfigOutputSchema",
+    "ConstrainedOutput",
+    "ConstrainedProbabilities",
     "CreateAlgebraicIndexRequest",
     "CreateAlgebraicIndexRequestType",
     "CreateApiKeyRequest",
@@ -1925,10 +1974,12 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
-    "EnrichmentConfigProducer",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
+    "EnrichmentProducerConfig",
+    "EnrichmentProducerConfigConfigType2",
+    "EnrichmentProducerConfigType",
     "EnrichmentRuntimeStatus",
     "EnrichmentRuntimeStatusActivePhase",
     "EnrichmentRuntimeStatusStallReason",
@@ -2062,6 +2113,7 @@ __all__ = (
     "ExtractionLongDocumentOptionsMode",
     "ExtractionLongDocumentOptionsRecordIdentity",
     "ExtractionObject",
+    "ExtractionObjectProbabilitySource",
     "ExtractionObjectStructureMetadata",
     "ExtractionObjectStructures",
     "ExtractionOffsetUnit",
@@ -2127,6 +2179,39 @@ __all__ = (
     "FullTextIndexStatsTextMerge",
     "FuzzinessType1",
     "FuzzyQuery",
+    "GeneratedChoiceAnswer",
+    "GeneratedChoiceAnswerDecisionMethod",
+    "GeneratedChoiceAnswerProbabilitySource",
+    "GeneratedChoiceAnswerType",
+    "GeneratedChoiceDecisionQuestion",
+    "GeneratedChoiceDecisionQuestionType",
+    "GeneratedDecideRequest",
+    "GeneratedDecideRequestDecisionMethod",
+    "GeneratedExtractionInput",
+    "GeneratedExtractionRequest",
+    "GeneratedExtractionRequestEntityDefinitions",
+    "GeneratedExtractionRequestMethod",
+    "GeneratedExtractorConfig",
+    "GeneratedExtractorConfigEntityDefinitions",
+    "GeneratedExtractorConfigMethod",
+    "GeneratedMultiChoiceAnswer",
+    "GeneratedMultiChoiceAnswerDecisionMethod",
+    "GeneratedMultiChoiceAnswerProbabilitySource",
+    "GeneratedMultiChoiceAnswerType",
+    "GeneratedMultiChoiceDecisionQuestion",
+    "GeneratedMultiChoiceDecisionQuestionType",
+    "GeneratedPredicateAnswer",
+    "GeneratedPredicateAnswerDecisionMethod",
+    "GeneratedPredicateAnswerProbabilitySource",
+    "GeneratedPredicateAnswerType",
+    "GeneratedPredicateDecisionQuestion",
+    "GeneratedPredicateDecisionQuestionType",
+    "GeneratedScoreAnswer",
+    "GeneratedScoreAnswerDecisionMethod",
+    "GeneratedScoreAnswerProbabilitySource",
+    "GeneratedScoreAnswerType",
+    "GeneratedScoreDecisionQuestion",
+    "GeneratedScoreDecisionQuestionType",
     "GenerationStepConfig",
     "GeneratorConfig",
     "GeneratorProvider",
@@ -2167,7 +2252,6 @@ __all__ = (
     "GraphArtifactNodeMappingConfigModel",
     "GraphArtifactProducerConfig",
     "GraphArtifactProducerConfigKind",
-    "GraphArtifactProducerConfigProducer",
     "GraphArtifactProducerConfigProducerJson",
     "GraphArtifactProducerSourceConfig",
     "GraphArtifactProducerSourceConfigType",
@@ -2334,6 +2418,8 @@ __all__ = (
     "GraphWorkBudgetExceededErrorError",
     "GraphWorkBudgetExceededErrorStatus",
     "GroundTruth",
+    "GroupedArtifactSource",
+    "GroupedArtifactSourceFilter",
     "HierarchyAncestor",
     "HierarchyAncestorDocument",
     "HierarchyAncestors",
@@ -2490,6 +2576,7 @@ __all__ = (
     "InferenceModelFormat",
     "InferenceModelInfo",
     "InferenceModelInfoChunkingLimits",
+    "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
     "InferenceModelKind",
     "InferenceModelQuantization",
@@ -2717,6 +2804,7 @@ __all__ = (
     "PredicateDecisionQuestion",
     "PredicateDecisionQuestionType",
     "PrefixQuery",
+    "PriorArtifactContext",
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",

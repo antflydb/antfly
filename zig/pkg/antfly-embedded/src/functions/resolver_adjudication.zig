@@ -68,3 +68,35 @@ test "resolver adjudication validates frozen typed specifications and rejects un
     defer a.free(projected);
     try std.testing.expectEqualStrings("\"A database\"", projected);
 }
+
+/// Share the ordinary producer's partial-result contract across local and
+/// distributed candidate adapters. A sibling failure cannot discard evidence.
+pub fn executeBatch(a: std.mem.Allocator, producer: @import("../storage/db/enrichment/asset_producer.zig").Producer, context: @import("../storage/db/enrichment/asset_producer.zig").InvocationContext, requests: []const @import("antfly_resolver").adjudication.Request) ![]@import("antfly_resolver").adjudication.Result {
+    const asset = @import("../storage/db/enrichment/asset_producer.zig");
+    const inputs = try a.alloc(asset.Request, requests.len);
+    defer a.free(inputs);
+    var scoped = context;
+    const now = @import("antfly_platform").time.monotonicNs();
+    for (inputs, requests, 0..) |*input, request, i| {
+        const deadline = now + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+        scoped.deadline_ns = if (scoped.deadline_ns) |caller| @min(caller, deadline) else deadline;
+        input.* = .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint, .item_id = try std.fmt.allocPrint(a, "{d}", .{i}) };
+    }
+    var batch = try producer.withInvocationContext(scoped).produceBatchReported(a, inputs);
+    defer batch.deinit(a);
+    if (batch.items.len != requests.len) return error.InvalidAdjudicationOutput;
+    const results = try a.alloc(@import("antfly_resolver").adjudication.Result, requests.len);
+    for (batch.items, results) |item, *result| result.* = switch (item.result) {
+        .value => |value| .{ .value = try a.dupe(u8, value) },
+        .item_error => |failure| .{ .failure = @errorName(failure.cause) },
+    };
+    return results;
+}
+
+pub fn modelRevision(a: std.mem.Allocator, producer: @import("../storage/db/enrichment/asset_producer.zig").Producer, context: @import("../storage/db/enrichment/asset_producer.zig").InvocationContext, specification: []const u8, timeout_ms: u32) !?[32]u8 {
+    var scoped = context;
+    const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, timeout_ms) * std.time.ns_per_ms;
+    scoped.deadline_ns = if (context.deadline_ns) |caller| @min(caller, deadline) else deadline;
+    const capabilities = (try producer.withInvocationContext(scoped).capabilitiesForRequests(a, &.{.{ .producer_type = .decision, .config_json = specification, .source_text = "" }})) orelse return null;
+    return capabilities.model_revision;
+}

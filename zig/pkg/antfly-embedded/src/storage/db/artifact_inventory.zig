@@ -33,7 +33,7 @@ pub const Binding = struct {
     effect_protocol: u16 = 14,
 
     pub fn valid(self: Binding) bool {
-        return self.epoch != 0 and (self.effect_protocol == 14 or self.effect_protocol == 15);
+        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= 16);
     }
 
     pub fn compatible(a: Binding, b: Binding) bool {
@@ -106,7 +106,7 @@ test "ordered artifact inventory compatibility binds the complete effect protoco
     try std.testing.expect(direct.valid() and extended.valid());
     try std.testing.expect(!direct.compatible(extended));
     try std.testing.expect(extended.compatible(extended));
-    extended.effect_protocol = 16;
+    extended.effect_protocol = 17;
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }
 
@@ -195,9 +195,10 @@ pub fn load(alloc: std.mem.Allocator, txn: anytype) !?std.json.Parsed(Ordered) {
     return parsed;
 }
 pub fn stageOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, applied_index: u64) !void {
-    const raw = try prepareOrdered(alloc, txn, command, applied_index) orelse return;
-    defer alloc.free(raw);
-    try txn.put(ordered_key, raw);
+    const raw = try prepareOrdered(alloc, txn, command, applied_index);
+    defer if (raw) |value| alloc.free(value);
+    if (raw) |value| try txn.put(ordered_key, value);
+    try @import("artifact_catalog_activation.zig").stage(alloc, txn, command);
 }
 
 pub fn prepareOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, applied_index: u64) !?[]u8 {

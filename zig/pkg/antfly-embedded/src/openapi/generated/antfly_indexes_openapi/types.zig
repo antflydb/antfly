@@ -1668,6 +1668,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
 pub const CreatedEnrichmentConfig = struct {
     name: []const u8,
     kind: EnrichmentKind,
+    source: ?GroupedArtifactSource = null,
+    prior_context: ?PriorArtifactContext = null,
     field: ?[]const u8 = null,
     template: ?[]const u8 = null,
     source_artifact_name: ?[]const u8 = null,
@@ -1687,6 +1689,8 @@ pub const CreatedEnrichmentConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
         .{ "kind", "kind", false },
+        .{ "source", "source", true },
+        .{ "prior_context", "prior_context", true },
         .{ "field", "field", true },
         .{ "template", "template", true },
         .{ "source_artifact_name", "source_artifact_name", true },
@@ -1716,6 +1720,14 @@ pub const CreatedEnrichmentConfig = struct {
         try jw.write(self.name);
         try jw.objectField("kind");
         try jw.write(self.kind);
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.prior_context) |value| {
+            try jw.objectField("prior_context");
+            try jw.write(value);
+        }
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
@@ -3789,6 +3801,10 @@ pub const EnrichmentConfig = struct {
     /// Stable generated artifact name.
     name: []const u8,
     kind: EnrichmentKind,
+    /// Required for kind=group. The covering membership index and ordinary unit artifacts are maintained from source row commits.
+    source: ?GroupedArtifactSource = null,
+    /// Bounded earlier-segment context from an artifact sharing the same grouped source. Only valid for prompt-consuming asset producers.
+    prior_context: ?PriorArtifactContext = null,
     /// Source field to read from the source document or source artifact payload.
     field: ?[]const u8 = null,
     /// Optional template for generated text input.
@@ -3812,7 +3828,7 @@ pub const EnrichmentConfig = struct {
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
     /// Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle.
-    producer: ?std.json.ArrayHashMap(std.json.Value) = null,
+    producer: ?std.json.Value = null,
     /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
     /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
@@ -3826,6 +3842,8 @@ pub const EnrichmentConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
         .{ "kind", "kind", false },
+        .{ "source", "source", true },
+        .{ "prior_context", "prior_context", true },
         .{ "field", "field", true },
         .{ "template", "template", true },
         .{ "source_artifact_name", "source_artifact_name", true },
@@ -3858,6 +3876,14 @@ pub const EnrichmentConfig = struct {
         try jw.write(self.name);
         try jw.objectField("kind");
         try jw.write(self.kind);
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.prior_context) |value| {
+            try jw.objectField("prior_context");
+            try jw.write(value);
+        }
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
@@ -3934,12 +3960,14 @@ pub const EnrichmentKind = enum {
     chunk,
     asset,
     embedding,
+    group,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .chunk => "chunk",
             .asset => "asset",
             .embedding => "embedding",
+            .group => "group",
         };
         try jw.write(s);
     }
@@ -3953,6 +3981,7 @@ pub const EnrichmentKind = enum {
             .{ "chunk", .chunk },
             .{ "asset", .asset },
             .{ "embedding", .embedding },
+            .{ "group", .group },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -3999,6 +4028,37 @@ pub const EnrichmentNeighborContextConfig = struct {
         }
         if (self.limit) |value| {
             try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const EnrichmentProducerConfig = struct {
+    type: []const u8,
+    /// Producer-specific configuration. Generator schemas and generated extractors share constrained output admission, batching, validation retry, and immutable artifact replay.
+    config: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "config", "config", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.config) |value| {
+            try jw.objectField("config");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4794,7 +4854,7 @@ pub const GraphArtifactProducerConfig = struct {
     content_type: ?[]const u8 = null,
     execution: ?ExecutionPolicy = null,
     /// Write-only producer configuration. Cannot be combined with producer_json.
-    producer: ?std.json.ArrayHashMap(std.json.Value) = null,
+    producer: ?std.json.Value = null,
     /// Write-only producer configuration; it may contain credentials and is never returned.
     producer_json: ?std.json.ArrayHashMap(std.json.Value) = null,
 
@@ -8013,9 +8073,9 @@ pub const GraphResolverAdjudicationAcceptance = struct {
 
 /// Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges.
 pub const GraphResolverAdjudicationConfig = struct {
-    /// Frozen provider configuration. Requires decision_method=typed.
+    /// Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
     decider: antfly_common_openapi.DeciderConfig,
-    /// Bounded interpolation of m.text, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
+    /// Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
     template: []const u8,
     question: antfly_decision_openapi.ChoiceDecisionQuestion,
     accept: GraphResolverAdjudicationAcceptance,
@@ -8125,7 +8185,7 @@ pub const GraphResolverConfig = struct {
     fusion_trust: ?f64 = null,
     fusion_prior: ?f64 = null,
     fusion_prior_weight: ?f64 = null,
-    /// Mention admission floor: mentions whose extractor-asserted confidence is below this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits everything.
+    /// Mention admission floor: mentions whose extractor-asserted confidence is below this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors; omission defaults to 0 for trained extractors. Resolvers consuming verdict-only generated extraction must set this field explicitly, including when the chosen floor is zero.
     min_confidence: ?f64 = null,
     config_generation: ?u64 = null,
 
@@ -8983,6 +9043,73 @@ pub const GraphWhereNotEqual = struct {
 
 pub const GraphWhereNotExists = struct {
     not_exists: GraphNotExistsPattern,
+};
+
+pub const GroupedArtifactSource = struct {
+    group_by: []const u8,
+    /// Field containing an integer ordinal. Ties use the document key.
+    order_by: []const u8,
+    segment_by: ?[]const u8 = null,
+    field: []const u8,
+    /// Canonical row filter evaluated on the source projection.
+    filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// UTF-8 text bytes per unit, including joining newlines. An oversized single member fails explicitly.
+    max_bytes: ?i64 = null,
+    /// Maximum members per unit; larger partitions emit multiple units.
+    max_members: ?i64 = null,
+    /// Fixed ordinal cells bound repartitioning and incremental work for long groups.
+    window_ordinals: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "group_by", "group_by", false },
+        .{ "order_by", "order_by", false },
+        .{ "segment_by", "segment_by", true },
+        .{ "field", "field", false },
+        .{ "filter", "filter", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "max_members", "max_members", true },
+        .{ "window_ordinals", "window_ordinals", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group_by");
+        try jw.write(self.group_by);
+        try jw.objectField("order_by");
+        try jw.write(self.order_by);
+        if (self.segment_by) |value| {
+            try jw.objectField("segment_by");
+            try jw.write(value);
+        }
+        try jw.objectField("field");
+        try jw.write(self.field);
+        if (self.filter) |value| {
+            try jw.objectField("filter");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.max_members) |value| {
+            try jw.objectField("max_members");
+            try jw.write(value);
+        }
+        if (self.window_ordinals) |value| {
+            try jw.objectField("window_ordinals");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for an index
@@ -10658,6 +10785,55 @@ pub const PatternStep = struct {
         }
         if (self.edge) |value| {
             try jw.objectField("edge");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const PriorArtifactContext = struct {
+    /// Artifact providing earlier items, including this producer's own artifact.
+    artifact: []const u8,
+    /// Template rendered for each prior item, newest first.
+    render: []const u8,
+    max_items: ?i64 = null,
+    max_bytes: ?i64 = null,
+    /// Earlier segments available for context and the maximum later segments invalidated by an original source change. Recomputed outputs never extend that interval.
+    horizon_segments: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "artifact", "artifact", false },
+        .{ "render", "render", false },
+        .{ "max_items", "max_items", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "horizon_segments", "horizon_segments", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("artifact");
+        try jw.write(self.artifact);
+        try jw.objectField("render");
+        try jw.write(self.render);
+        if (self.max_items) |value| {
+            try jw.objectField("max_items");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.horizon_segments) |value| {
+            try jw.objectField("horizon_segments");
             try jw.write(value);
         }
         try jw.endObject();

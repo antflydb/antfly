@@ -22,9 +22,15 @@ pub fn create(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
     return b.addModule("antfly_decisions", .{ .root_source_file = root });
 }
 
-/// Generated decision wire types are std-only, so one source identity can
-/// inherit each consumer's target without duplicate generated-file ownership.
-pub fn createOpenApi(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
-    if (b.modules.get("antfly_decision_openapi")) |existing| return existing;
-    return b.addModule("antfly_decision_openapi", .{ .root_source_file = root });
+const WireBinding = struct { generator: *std.Build.Module, module: *std.Build.Module };
+var wire_bindings: std.ArrayList(WireBinding) = .empty;
+
+/// Wire types embed GeneratorConfig. Reuse their source identity within one
+/// dependency graph, without mixing native and WASM generator modules.
+pub fn createOpenApi(b: *std.Build, root: std.Build.LazyPath, generator: *std.Build.Module) *std.Build.Module {
+    for (wire_bindings.items) |binding| if (binding.generator == generator) return binding.module;
+    const module = b.createModule(.{ .root_source_file = root });
+    module.addImport("antfly_generating_openapi", generator);
+    wire_bindings.append(b.allocator, .{ .generator = generator, .module = module }) catch @panic("OOM");
+    return module;
 }

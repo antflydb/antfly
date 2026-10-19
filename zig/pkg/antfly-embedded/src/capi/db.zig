@@ -558,6 +558,18 @@ pub fn liteEnrichmentCatalogEntryJsonAlloc(alloc: Allocator, cfg: db_mod.types.E
         try buf.appendSlice(alloc, ",\"producer_json\":");
         try buf.appendSlice(alloc, producer_json_json);
     }
+    if (cfg.source) |source| {
+        const json = try std.json.Stringify.valueAlloc(alloc, source, .{});
+        defer alloc.free(json);
+        try buf.appendSlice(alloc, ",\"source\":");
+        try buf.appendSlice(alloc, json);
+    }
+    if (cfg.prior_context) |context| {
+        const json = try std.json.Stringify.valueAlloc(alloc, context, .{});
+        defer alloc.free(json);
+        try buf.appendSlice(alloc, ",\"prior_context\":");
+        try buf.appendSlice(alloc, json);
+    }
     try buf.append(alloc, '}');
     return try buf.toOwnedSlice(alloc);
 }
@@ -1063,6 +1075,7 @@ pub fn decodeBase64Alloc(alloc: Allocator, encoded: []const u8) ![]u8 {
 }
 
 pub fn parseEnrichmentKind(kind: []const u8) ?db_mod.types.EnrichmentKind {
+    if (std.mem.eql(u8, kind, "group")) return .group;
     if (std.mem.eql(u8, kind, "chunk")) return .chunk;
     if (std.mem.eql(u8, kind, "asset")) return .asset;
     if (std.mem.eql(u8, kind, "embedding")) return .embedding;

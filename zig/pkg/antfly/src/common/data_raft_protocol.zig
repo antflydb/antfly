@@ -40,7 +40,9 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 22;
+pub const batch_protocol_version: u16 = 23;
+/// Version 23 applies grouped-source private state and unit sources atomically.
+pub const batch_group_source_protocol_version: u16 = 23;
 pub const batch_row_semantics_protocol_version: u16 = 18;
 pub const batch_artifact_catalog_protocol_version: u16 = 14;
 /// Full producer publications require a separate all-member barrier; the

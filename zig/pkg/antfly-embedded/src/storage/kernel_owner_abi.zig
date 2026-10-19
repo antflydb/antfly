@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 76;
+pub const abi_version: u32 = 78;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1347,6 +1347,15 @@ pub const ReconcileResult = extern struct {
     restore_repair_pending: u64 = 0,
 };
 
+pub const WriteAdmissionRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    /// Empty probes return the compiled owner's grouping capability without
+    /// serializing or parsing ordinary writes on tables that have no groups.
+    request_json: BorrowedBytes = .{},
+};
+
 pub const TableRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -1453,7 +1462,17 @@ pub const SyncLevel = enum(u32) {
     full_index = 4,
 };
 
+/// Fixed visibility target, borrowed across bounded waits. A later slice
+/// cannot chase new writes or reuse a target after physical owner replacement.
+pub const SyncTarget = extern struct {
+    root_incarnation_le: [16]u8 = @splat(0),
+    sequence: u64 = 0,
+    deadline_ns: u64 = 0,
+    captured: u8 = 0,
+};
+
 pub const SyncRequest = extern struct {
+    target: ?*SyncTarget = null,
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
     version: u32 = abi_version,
@@ -1947,7 +1966,8 @@ pub extern fn antfly_storage_owner_reconcile(
 /// currently backpressured and must not be proposed.
 pub extern fn antfly_storage_owner_preflight_write_admission(
     owner: ?*anyopaque,
-    request: *const TableRequest,
+    request: *const WriteAdmissionRequest,
+    out_has_groups: *u8,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_find_median_key(
