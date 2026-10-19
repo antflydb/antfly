@@ -334,6 +334,14 @@ pub const Program = struct {
         };
     }
 
+    fn preparedConstantArray(self: *const Program, input: u32) ?*const arrays.Value {
+        if (self.constant_arrays.get(input)) |array| return array;
+        // Mandatory input storage is already admitted and immutable. A small
+        // speculative allowance need not re-admit that borrowed result just
+        // to prepare its index.
+        return if (self.constant_inputs.get(input)) |value| value.array else null;
+    }
+
     fn prepareConstantArrays(self: *Program, a: Allocator, limits: BindLimits) !void {
         for (self.instructions) |instruction| {
             if (instruction.input_function or instruction.type.kind == .array or (instruction.type.kind == .number and instruction.type.element_type == .numeric)) break;
@@ -415,16 +423,16 @@ pub const Program = struct {
                 ((self.instructions[call.args[2]].operation.literal.integer == @backingInt(arrays.Comparison.eq) and !self.instructions[call.args[3]].operation.literal.bool) or
                     (self.instructions[call.args[2]].operation.literal.integer == @backingInt(arrays.Comparison.ne) and self.instructions[call.args[3]].operation.literal.bool));
             if (!quantified and call.function != .@"$contains" and call.function != .@"$overlaps" and !(call.function == .array_position and call.args.len == 2)) continue;
-            const source = if (quantified or (call.function == .@"$overlaps" and self.constant_arrays.contains(call.args[1]))) call.args[1] else call.args[0];
+            const source = if (quantified or (call.function == .@"$overlaps" and self.preparedConstantArray(call.args[1]) != null)) call.args[1] else call.args[0];
             if (self.constant_memberships.contains(source)) continue;
-            const array = self.constant_arrays.get(source) orelse continue;
+            const array = self.preparedConstantArray(source) orelse continue;
             if (quantified and (array.cardinality() < 32 or array.element_type == .numeric)) continue;
             if (pool.memory.isExhausted() or pool.remaining == 0 or pool.memory.footprint() >= pool.memory.limit) break;
             const index = try a.create(arrays.Membership);
             var work: arrays.Budget = .{ .remaining = pool.remaining };
-            index.* = arrays.Membership.initWithBudget(pool.memory.allocator(), array.*, .{
-                .bytes = pool.memory.limit -| pool.memory.footprint(),
-            }, &work) catch |err| {
+            index.* = arrays.Membership.initBorrowedWithBudget(pool.memory.allocator(), array.*, .{
+                .bytes = pool.memory.limit,
+            }, pool.memory.limit -| pool.memory.footprint(), &work) catch |err| {
                 pool.remaining = work.remaining;
                 if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and pool.memory.isExhausted())) continue;
                 return err;
@@ -6872,4 +6880,28 @@ test "SQL native constant equality quantifiers share bounded immutable indexes" 
             if (i != 1) try std.testing.expect(result.sql_null) else try std.testing.expectEqual(std.mem.indexOf(u8, prefix, "<>") == null, result.value.bool);
         }
     }
+}
+
+test "SQL native constant membership borrows a source larger than index headroom" {
+    const a = std.testing.allocator;
+    const payload: [1024]u8 = @splat('a');
+    var sql: std.Io.Writer.Allocating = .init(a);
+    defer sql.deinit();
+    try sql.writer.writeAll("needle = ANY('{");
+    for (0..32) |i| {
+        if (i != 0) try sql.writer.writeByte(',');
+        try sql.writer.writeAll(&payload);
+    }
+    try sql.writer.writeAll("}'::text[])");
+    var compiled = try @import("compiler.zig").compileScalar(a, sql.written(), .{});
+    defer compiled.deinit();
+    var program = try bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .string, .element_type = .text }}, &.{}, .{ .constant_bytes = 2048 });
+    defer program.deinit();
+    try std.testing.expectEqual(@as(usize, 1), program.constant_memberships.count());
+    var indexes = program.constant_memberships.valueIterator();
+    const index = indexes.next().?.*;
+    try std.testing.expect(try index.value.retainedBytes() > 2048);
+    try std.testing.expect(index.budget.peak <= 2048);
+    try std.testing.expect((try program.evaluate(std.testing.failing_allocator, &.{.json(.{ .string = &payload })}, &.{}, .{})).value.bool);
+    try std.testing.expect(!(try program.evaluate(std.testing.failing_allocator, &.{.json(.{ .string = "missing" })}, &.{}, .{})).value.bool);
 }

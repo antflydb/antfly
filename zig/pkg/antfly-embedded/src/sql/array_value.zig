@@ -1155,8 +1155,15 @@ pub const Membership = struct {
     }
 
     pub fn initWithBudget(backing: Allocator, value: Value, limits: Limits, work: *Budget) !Membership {
-        const validated = try value.validateWithBudget(limits, work);
-        var index = try initValidated(backing, validated, limits);
+        return initBorrowedWithBudget(backing, value, limits, limits.bytes, work);
+    }
+
+    /// Source admission belongs to the immutable input owner; index_bytes
+    /// bounds only new index storage. Validation and construction still share
+    /// the caller's work/cancellation budget. The owner must outlive the index.
+    pub fn initBorrowedWithBudget(backing: Allocator, value: Value, source_limits: Limits, index_bytes: usize, work: *Budget) !Membership {
+        const validated = try value.validateWithBudget(source_limits, work);
+        var index = try initValidated(backing, validated, .{ .bytes = index_bytes });
         errdefer index.deinit();
         try index.populate(work);
         return index;
@@ -1890,14 +1897,45 @@ test "SQL compact membership handles collisions duplicates growth and bounded me
     var repeated: [8192]Element = @splat(.json(.{ .integer = 42 }));
     repeated[31] = .{};
     const source = try Value.init(.int64, &.{.{ .length = repeated.len, .lower = -7 }}, &repeated, .{});
-    var index = try Membership.initValidated(std.testing.allocator, source, .{ .bytes = 256 });
-    defer index.deinit();
     var build_work: Budget = .{};
-    try index.populate(&build_work);
+    var index = try Membership.initBorrowedWithBudget(std.testing.allocator, source, .{}, 256, &build_work);
+    defer index.deinit();
     try std.testing.expectEqual(@as(usize, 1), index.count);
     try std.testing.expect(index.budget.peak <= 256);
     var work: Budget = .{};
     try std.testing.expectEqual(@as(?i32, -7), try index.firstPosition(.json(.{ .integer = 42 }), &work));
     try std.testing.expectEqual(@as(?i32, 24), try index.firstPosition(.{}, &work));
     try std.testing.expectEqual(@as(?bool, null), try index.equalAny(.json(.{ .integer = 41 }), &work));
+}
+
+test "SQL borrowed membership keeps source admission independent of index storage" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var cells: [128]Element = undefined;
+            for (&cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
+            const source = try Value.init(.int64, &.{.{ .length = cells.len, .lower = -7 }}, &cells, .{});
+            var work: Budget = .{};
+            var index = try Membership.initBorrowedWithBudget(a, source, .{}, 2048, &work);
+            defer index.deinit();
+            try std.testing.expect(try source.retainedBytes() > 2048);
+            try std.testing.expect(index.budget.peak <= 2048);
+            try std.testing.expect(try index.contains(source, &work));
+            try std.testing.expectEqual(@as(?i32, 120), try index.firstPosition(.json(.{ .integer = 127 }), &work));
+        }
+    };
+    const a = std.testing.allocator;
+    try Harness.run(a);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{});
+    var cells: [128]Element = @splat(.json(.{ .integer = 42 }));
+    const source = try Value.init(.int64, &.{.{ .length = cells.len }}, &cells, .{});
+    var work: Budget = .{};
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Membership.initBorrowedWithBudget(a, source, .{ .bytes = 2048 }, 65536, &work));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Membership.initBorrowedWithBudget(a, source, .{ .elements = 127 }, 65536, &work));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Membership.initBorrowedWithBudget(a, source, .{}, 1, &work));
+    // Cached sizing metadata does not authorize skipping typed validation.
+    cells[127] = .json(.{ .string = "invalid bigint" });
+    try std.testing.expectError(error.SqlTypeMismatch, Membership.initBorrowedWithBudget(a, source, .{}, 65536, &work));
+    cells[127] = .json(.{ .integer = 42 });
+    var denied: Budget = .{ .remaining = 0 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Membership.initBorrowedWithBudget(a, source, .{}, 65536, &denied));
 }

@@ -482,19 +482,20 @@ test "SQL datetime parameters preserve signed epoch instants across JSON and tex
 const MembershipCache = struct {
     const Slot = struct {
         state: std.atomic.Value(u8) = .init(0), // cold / disabled / ready / eligible
-        rows: usize = 0,
-        scan_work: usize = 0,
-        scan_cells: usize = 0,
+        recent_scans: usize = 0,
+        recent_cells: usize = 0,
+        build_credit: usize = 0,
         build_work: usize = 0,
         index: ?*arrays.Membership = null,
     };
     backing: A,
     memory: MemoryBudget,
     slots: []Slot,
+    source_limits: arrays.Limits,
     remaining: usize,
     mutex: std.atomic.Mutex = .unlocked,
 
-    fn init(backing: A, values: []const scalar.Datum, work: usize) !?*MembershipCache {
+    fn init(backing: A, values: []const scalar.Datum, source_limits: arrays.Limits, work: usize) !?*MembershipCache {
         for (values) |value| {
             if (value.array) |array| if (array.cardinality() >= 32 and array.element_type != .numeric) break;
         } else return null;
@@ -516,7 +517,7 @@ const MembershipCache = struct {
                     slot.build_work = @max(slot.build_work, (try array.retainedBytes()) *| 2);
             }
         }
-        self.* = .{ .backing = backing, .memory = .{ .backing = backing, .limit = @min(2 * 1024 * 1024, available / 4) }, .slots = slots, .remaining = @min(work, 1024 * 1024) };
+        self.* = .{ .backing = backing, .memory = .{ .backing = backing, .limit = @min(2 * 1024 * 1024, available / 4) }, .slots = slots, .source_limits = source_limits, .remaining = @min(work, 1024 * 1024) };
         return self;
     }
     fn get(self: *MembershipCache, ordinal: usize, array: *const arrays.Value, caller: *arrays.Budget) !?*const arrays.Membership {
@@ -561,7 +562,7 @@ const MembershipCache = struct {
             return err;
         };
         errdefer self.memory.allocator().destroy(index);
-        index.* = arrays.Membership.initWithBudget(self.memory.allocator(), array.*, .{ .bytes = available - @sizeOf(arrays.Membership) - @sizeOf(MemoryBudget) }, &work_budget) catch |err| {
+        index.* = arrays.Membership.initBorrowedWithBudget(self.memory.allocator(), array.*, self.source_limits, available - @sizeOf(arrays.Membership) - @sizeOf(MemoryBudget), &work_budget) catch |err| {
             if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and self.memory.isExhausted())) {
                 self.memory.allocator().destroy(index);
                 slot.state.store(1, .release);
@@ -579,12 +580,24 @@ const MembershipCache = struct {
         if (slot.state.load(.acquire) != 0 or !self.mutex.tryLock()) return;
         defer self.mutex.unlock();
         if (slot.state.load(.acquire) != 0) return;
-        slot.rows +|= 1;
-        slot.scan_work +|= spent;
-        slot.scan_cells +|= visited;
-        // Publish eligibility once, so ordinary cold lookups avoid the build
-        // lock and headroom checks. Observations remain best-effort under load.
-        if (slot.rows >= 16 and slot.scan_cells / slot.rows >= 16 and slot.scan_work >= slot.build_work)
+        // Keep the useful-prefix estimate recent: halve its weight every 32
+        // observations once full, so arbitrarily old early hits cannot delay
+        // a new expensive phase. No per-observation storage is required.
+        if (slot.recent_scans == 64) {
+            slot.recent_scans /= 2;
+            // Round upward so a one-cell residual from an old cheap phase
+            // eventually disappears at the exact useful-prefix threshold.
+            slot.recent_cells = slot.recent_cells / 2 + slot.recent_cells % 2;
+        }
+        slot.recent_scans += 1;
+        slot.recent_cells +|= visited;
+        // Only substantial scans can repay construction. Credit is capped,
+        // rather than decayed, so large sources with moderate prefix lengths
+        // can still amortize a build over more than one history window.
+        if (visited >= 16) slot.build_credit = @min(slot.build_work, slot.build_credit +| spent);
+        // Publish eligibility once; cold readers avoid the build lock and
+        // headroom checks. Observations remain best-effort under contention.
+        if (slot.recent_scans >= 16 and slot.recent_cells / slot.recent_scans >= 16 and slot.build_credit >= slot.build_work)
             slot.state.store(3, .release);
     }
     fn deinit(self: *MembershipCache) void {
@@ -677,7 +690,7 @@ pub const Frame = struct {
         arena.* = std.heap.ArenaAllocator.init(budget.allocator());
         errdefer arena.deinit();
         const decoded = prepareLeaky(arena.allocator(), descriptors, inputs, limits) catch |err| return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
-        const memberships = try MembershipCache.init(MemoryBudget.reclaimingAllocator(budget.allocator()), decoded.values, limits.work -| decoded.work);
+        const memberships = try MembershipCache.init(MemoryBudget.reclaimingAllocator(budget.allocator()), decoded.values, .{ .bytes = limits.bytes, .elements = limits.elements }, limits.work -| decoded.work);
         if (limits.payload_owner) |owner| owner.retain();
         return .{ .memberships = memberships, .payload_owner = limits.payload_owner, .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
     }
@@ -1147,4 +1160,75 @@ test "SQL prepared equality admission keeps long first hits cheap and adapts to 
         }
         try std.testing.expectEqual(@as(u8, 2), frame.memberships.?.slots[0].state.load(.acquire));
     }
+}
+
+test "SQL prepared equality admits large equivalent representations within index quotas" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const cells = try region.allocator().alloc(scalar.Datum, 32768);
+    for (cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
+    const source = try arrays.Value.init(.int64, &.{.{ .length = @intCast(cells.len) }}, cells, .{});
+    const storage = @import("array_storage.zig");
+    const bytes = try storage.encodeAlloc(region.allocator(), source, .{});
+    const native = try storage.viewLeaky(region.allocator(), .int64, bytes, .{});
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .integer, .element_type = .int64 }}, &.{.{ .kind = .array, .element_type = .int64 }}, .{});
+    defer program.deinit();
+    for ([_]*const arrays.Value{ &source, &native }, 0..) |input, representation| for (0..2) |mode| {
+        var frame = try Frame.prepare(a, program.parameter_descriptors, &.{.{ .datum = .typedArray(input) }}, .{});
+        defer frame.deinit();
+        var prepared = try program.bindParameters(&frame);
+        if (mode == 0) prepared.lookup = .{};
+        const source_bytes = try frame.values[0].array.?.retainedBytes();
+        const cache = frame.memberships.?;
+        if (representation == 0) try std.testing.expect(source_bytes > cache.memory.limit);
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..1000) |_| try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 32767 })}, .{ .steps = 1_048_576 })).value.bool);
+        const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+        try std.testing.expectEqual(mode == 1, cache.slots[0].state.load(.acquire) == 2);
+        try std.testing.expect(cache.memory.peak < 512 * 1024);
+        if (mode == 0) try std.testing.expectEqual(@as(usize, 0), cache.memory.live);
+        std.debug.print("SQL_SOURCE_INDEX automatic={} native={} rows=1000 source_cells=32768 source_bytes={} index_live={} index_peak={} elapsed_ns={} row_allocations=0\n", .{ mode == 1, representation == 1, source_bytes, cache.memory.live, cache.memory.peak, elapsed });
+    };
+}
+
+test "SQL prepared equality recent admission adapts after long cheap phases and preserves build credit" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    var builder = try @import("array_compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
+    var initial: arrays.Budget = .{};
+    for (0..8192) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &initial);
+    const source = try builder.finish(region.allocator(), .{}, &initial);
+    var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .integer, .element_type = .int64 }}, &.{.{ .kind = .array, .element_type = .int64 }}, .{});
+    defer program.deinit();
+    for ([_]i64{ 15, 31, 511, 8191 }) |needle| for (0..2) |phase| {
+        var frame = try Frame.prepare(a, program.parameter_descriptors, &.{.{ .datum = .typedArray(&source) }}, .{});
+        defer frame.deinit();
+        const prepared = try program.bindParameters(&frame);
+        const cache = frame.memberships.?;
+        if (phase == 1) {
+            for (0..65536) |_| try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = 0 })}, .{})).value.bool);
+            try std.testing.expectEqual(@as(usize, 0), cache.memory.live);
+            try std.testing.expectEqual(@as(usize, 0), cache.slots[0].build_credit);
+            try std.testing.expect(cache.slots[0].recent_scans <= 64);
+            try std.testing.expectEqual(@as(u8, 0), cache.slots[0].state.load(.acquire));
+        }
+        var first_index_row: ?usize = null;
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..2048) |i| {
+            try std.testing.expect((try prepared.evaluate(std.testing.failing_allocator, &.{.json(.{ .integer = needle })}, .{})).value.bool);
+            if (first_index_row == null and cache.slots[0].state.load(.acquire) == 2) first_index_row = i + 1;
+        }
+        const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+        try std.testing.expect(first_index_row != null);
+        try std.testing.expect(first_index_row.? <= (if (needle == 8191) @as(usize, 32) else if (needle == 511) @as(usize, 128) else @as(usize, 2048)));
+        try std.testing.expect(cache.slots[0].recent_scans <= 64);
+        try std.testing.expect(cache.slots[0].build_credit <= cache.slots[0].build_work);
+        std.debug.print("SQL_RECENT_ANY antecedent_cheap_rows={} prefix_cells={} timed_rows=2048 first_index_row={} index_live={} elapsed_ns={} row_allocations=0\n", .{ if (phase == 1) @as(usize, 65536) else @as(usize, 0), needle + 1, first_index_row.?, cache.memory.live, elapsed });
+    };
 }
