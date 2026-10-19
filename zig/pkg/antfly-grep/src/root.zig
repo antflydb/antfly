@@ -3576,7 +3576,7 @@ pub const Search = struct {
             const utf8 = self.options.json_compact or std.unicode.utf8ValidateSlice(text);
             const encoded = if (utf8) null else try base64(a, text);
             var captured_spans: std.ArrayList(@import("matcher.zig").Span) = .empty;
-            const subs = JsonSubmatches{ .capture = if (self.lexical_capture and !self.lexical_overflow) .{ .a = self.lexical_staging.?.arena.allocator(), .spans = &captured_spans, .failed = &self.lexical_overflow } else null, .spans = if (self.lexical_replay_row) |row| row.spans else null, .matcher = &self.matcher, .text = text, .terminated = terminated, .runs = if (self.replay_spans and matched) self.cachedRuns() else null, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
+            const subs = JsonSubmatches{ .bulk_fields = self.output_bytes >= 128 * 1024, .capture = if (self.lexical_capture and !self.lexical_overflow) .{ .a = self.lexical_staging.?.arena.allocator(), .spans = &captured_spans, .failed = &self.lexical_overflow } else null, .spans = if (self.lexical_replay_row) |row| row.spans else null, .matcher = &self.matcher, .text = text, .terminated = terminated, .runs = if (self.replay_spans and matched) self.cachedRuns() else null, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
             const raw_valid = std.unicode.utf8ValidateSlice(raw);
             if (self.options.json_compact) {
                 try self.json(.{ .type = if (matched) "match" else "context", .data = .{ .lines = JsonText{ .text = if (raw_valid) raw else null, .bytes = if (raw_valid) null else try base64(a, raw) }, .line_number = line, .absolute_offset = byte_offset, .submatches = subs }, .probability = p, .scope = if (p != null and !independent) "region" else "line" });
@@ -3738,6 +3738,7 @@ pub const Search = struct {
     const JsonSubmatches = struct {
         const Collector = struct { a: Allocator, spans: *std.ArrayList(@import("matcher.zig").Span), failed: *bool };
         capture: ?Collector = null,
+        bulk_fields: bool = false,
         spans: ?[]const @import("matcher.zig").Span = null,
         matcher: *Matcher,
         text: []const u8,
@@ -3763,7 +3764,8 @@ pub const Search = struct {
             };
             const bytes = self.text[span.start..span.end];
             if (std.unicode.utf8ValidateSlice(bytes)) {
-                try @import("json_fields.zig").write(json_writer, .{ .match = .{ .text = bytes }, .start = span.start, .end = span.end });
+                const value = .{ .match = .{ .text = bytes }, .start = span.start, .end = span.end };
+                if (self.bulk_fields) try @import("json_fields.zig").write(json_writer, value) else try json_writer.write(value);
             } else {
                 // Invalid byte matches are rare; bounded chunks of base64 avoid
                 // a second array proportional to the number of occurrences.
@@ -3939,7 +3941,7 @@ pub const Search = struct {
         text: ?[]const u8,
         bytes: ?[]const u8,
         pub fn jsonStringify(self: @This(), writer: anytype) !void {
-            if (self.text) |value| try @import("json_fields.zig").write(writer, .{ .text = value }) else try @import("json_fields.zig").write(writer, .{ .bytes = self.bytes.? });
+            if (self.text) |value| try writer.write(.{ .text = value }) else try writer.write(.{ .bytes = self.bytes.? });
         }
     };
     pub fn jsonText(a: Allocator, text: []const u8) !JsonText {
@@ -4034,6 +4036,7 @@ pub const Search = struct {
             value: @TypeOf(value),
             source: @TypeOf(self.provenance),
             compact: bool,
+            bulk_fields: bool,
             file_id: ?[64]u8,
             pub fn jsonStringify(envelope: @This(), json_writer: *std.json.Stringify) !void {
                 try json_writer.beginObject();
@@ -4044,8 +4047,13 @@ pub const Search = struct {
                         try json_writer.write(field.value_ptr.*);
                     }
                 } else inline for (@typeInfo(@FieldType(@This(), "value")).@"struct".field_names) |field_name| {
-                    try @import("json_fields.zig").field(json_writer, field_name);
-                    try @import("json_fields.zig").write(json_writer, @field(envelope.value, field_name));
+                    if (envelope.bulk_fields) {
+                        try @import("json_fields.zig").field(json_writer, field_name);
+                        try @import("json_fields.zig").write(json_writer, @field(envelope.value, field_name));
+                    } else {
+                        try json_writer.objectField(field_name);
+                        try json_writer.write(@field(envelope.value, field_name));
+                    }
                 }
                 if (envelope.compact) {
                     try @import("json_fields.zig").field(json_writer, "result_schema_version");
@@ -4062,13 +4070,13 @@ pub const Search = struct {
                     }
                     if (!envelope.compact or envelope.file_id == null or std.mem.eql(u8, eventKind(envelope.value), "begin")) {
                         try @import("json_fields.zig").field(json_writer, "source");
-                        try @import("json_fields.zig").write(json_writer, envelope.source);
+                        if (envelope.bulk_fields) try @import("json_fields.zig").write(json_writer, envelope.source) else try json_writer.write(envelope.source);
                     }
                 }
                 try json_writer.endObject();
             }
         };
-        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .file_id = if (self.options.json_compact and ((std.mem.eql(u8, eventKind(value), "begin") or (self.json_started and !std.mem.eql(u8, eventKind(value), "summary") and !std.mem.eql(u8, eventKind(value), "inventory") and !std.mem.eql(u8, eventKind(value), "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
+        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .bulk_fields = self.output_bytes >= 128 * 1024, .file_id = if (self.options.json_compact and ((std.mem.eql(u8, eventKind(value), "begin") or (self.json_started and !std.mem.eql(u8, eventKind(value), "summary") and !std.mem.eql(u8, eventKind(value), "inventory") and !std.mem.eql(u8, eventKind(value), "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
         try writer.writeByte('\n');
     }
     fn json(self: *Search, value: anytype) !void {
@@ -4119,6 +4127,27 @@ pub fn lineRanges(a: Allocator, bytes: []const u8) ![]Line {
 pub fn lineRangesWith(a: Allocator, bytes: []const u8, delimiter: u8, crlf: bool) ![]Line {
     return @import("source_cache.zig").lines(a, bytes, delimiter, crlf);
 }
+test "bulk JSON envelopes and submatches preserve small record bytes" {
+    const a = std.testing.allocator;
+    const options: Options = .{ .json = true, .json_compact = true };
+    var search: Search = .{ .a = a, .io = std.testing.io, .options = &options, .matcher = undefined, .decider = undefined, .compact_file_id = @splat('a'), .json_started = true };
+    search.provenance.uri = "file:///é";
+    for ([_][]const u8{ "begin", "match", "summary" }) |kind| {
+        var small = std.Io.Writer.Allocating.init(a);
+        defer small.deinit();
+        var bulk = std.Io.Writer.Allocating.init(a);
+        defer bulk.deinit();
+        for ([_]bool{ false, true }) |large| {
+            search.output_bytes = if (large) 128 * 1024 else 0;
+            const text = "é hit\n";
+            const spans = [_]@import("matcher.zig").Span{.{ .start = 3, .end = 6 }};
+            const value = .{ .type = kind, .data = .{ .lines = Search.JsonText{ .text = text, .bytes = null }, .submatches = Search.JsonSubmatches{ .bulk_fields = large, .matcher = &search.matcher, .text = text, .terminated = true, .hits = null, .spans = &spans }, .stats = Summary{ .files = 1, .matches = 1 } }, .probability = @as(?f64, 0.5) };
+            try search.encodeJson(value, if (large) &bulk.writer else &small.writer);
+        }
+        try std.testing.expectEqualStrings(small.written(), bulk.written());
+    }
+}
+
 test "line offsets preserve CRLF and unterminated final lines" {
     const a = std.testing.allocator;
     const lines = try lineRanges(a, "a\r\n\nlast");

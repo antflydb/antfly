@@ -3036,8 +3036,9 @@ Full output still requires encoding and transfer. Worker rendering now reuses at
 most 64 KiB of scratch between rows, releases exceptional larger records, and
 borrows pinned workspace paths for queued tasks; live discovery retains explicit
 string ownership. Per-file elapsed labels use stack storage, and compact end
-records avoid unused path encoding. Typed JSON envelopes pre-quote static ASCII
-schema keys; dynamic keys, value escaping, numeric formatting and custom
+records avoid unused path encoding. After 128 KiB of output, typed JSON envelopes pre-quote static ASCII
+schema keys; small records keep the standard encoder to bound fixed work. Both
+paths produce identical envelopes and submatches; dynamic keys, value escaping, numeric formatting and custom
 serializers remain with `std.json`, with byte-equivalence tests. Cold captures
 read directly into their
 immutable content owner and use the existing size/ctime/identity barrier to reject
