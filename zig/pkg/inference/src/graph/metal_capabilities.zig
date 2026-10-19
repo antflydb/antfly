@@ -543,7 +543,7 @@ fn metalGatherHasResidentShape(query: CapabilityQuery) bool {
         .gather => |attrs| attrs,
         else => return false,
     };
-    if (attrs.elements) return false;
+    if (attrs.elements or attrs.nd) return false;
     if (attrs.axis != 0) return false;
     const input_shape = nodeInputShape(query, 0) orelse return false;
     const indices_shape = nodeInputShape(query, 1) orelse return false;
@@ -1565,6 +1565,9 @@ test "metal eager graph capability decisions are attrs and shape aware" {
     const valid_gather_decision = decideMetalEagerGraph(valid_gather_query);
     try std.testing.expect(valid_gather_decision.can_execute);
     try std.testing.expect(!metalEagerGraphNodeIsHostAssisted(valid_gather_query));
+    var nd_query = valid_gather_query;
+    nd_query.op.gather.nd = true;
+    try std.testing.expect(!decideMetalEagerGraph(nd_query).can_execute);
 
     const invalid_gather_query = CapabilityQuery{
         .graph = &gather_graph,
