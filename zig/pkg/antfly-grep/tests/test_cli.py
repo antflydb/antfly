@@ -6721,6 +6721,53 @@ class CliTests(unittest.TestCase):
             self.assertEqual(stats["lexical_index_admission_skips"], 0)
             self.assertEqual(stats["matches"], 1)
 
+    def test_workspace_small_delta_spills_and_preserves_line_buffered_output(self):
+        for flags in ([], ["--line-buffered"]):
+            with self.subTest(flags=flags):
+                path = self.write("src/a.txt", "STOP original\n")
+                with self.workspace("src") as (ready, request):
+                    handle = request("register", args=["STOP", *flags])[0][
+                        "query_handle"
+                    ]
+
+                    def search(ready, token):
+                        rows = request(
+                            "search",
+                            revision=ready["revision"],
+                            query_handle=handle,
+                            if_result_token=token,
+                            delta=True,
+                        )
+                        self.assertEqual(rows[0]["type"], "workspace_begin")
+                        self.assertEqual(rows[-1]["type"], "workspace_end")
+                        self.assertIn(rows[-1]["exit_code"], (0, 1))
+                        token = next(
+                            r["result_token"]
+                            for r in rows
+                            if r["type"] == "result_token"
+                        )
+                        stats = next(r["stats"] for r in rows if r["type"] == "summary")
+                        self.assertTrue(stats["complete"])
+                        return rows, stats, token
+
+                    _, _, token = search(ready, "0" * 64)
+                    # Much larger than the 8 KiB framing buffer: delivery must
+                    # spill rather than retain the whole response or deadlock.
+                    path.write_text("STOP é\n" * 5000)
+                    ready = request("refresh", force_rescan=True)[0]
+                    rows, stats, token = search(ready, token)
+                    self.assertTrue(
+                        any(r["type"] == "workspace_lexical_delta" for r in rows)
+                    )
+                    self.assertEqual(stats["lexical_entries_visited"], 1)
+                    self.assertEqual(stats["matches"], 5000)
+                    self.assertEqual(sum(r["type"] == "match" for r in rows), 5000)
+                    path.write_text("negative\n")
+                    ready = request("refresh", force_rescan=True)[0]
+                    rows, stats, _ = search(ready, token)
+                    self.assertEqual(stats["matches"], 0)
+                    self.assertEqual(rows[-1]["exit_code"], 1)
+
     def test_workspace_minimal_acknowledgement_is_terminal_bound_and_budgeted(self):
         path = self.write("src/a.txt", "STOP old\n")
         with self.workspace("src") as (ready, request):

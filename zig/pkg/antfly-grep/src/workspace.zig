@@ -35,6 +35,12 @@ fn emit(a: A, io: std.Io, value: anytype) !void {
     buffer[writer.end] = '\n';
     try std.Io.File.stdout().writeStreamingAll(io, buffer[0 .. writer.end + 1]);
 }
+fn emitTo(a: A, io: std.Io, value: anytype, output: ?*std.Io.Writer) !void {
+    if (output) |writer| {
+        try std.json.Stringify.value(value, .{}, writer);
+        try writer.writeByte('\n');
+    } else try emit(a, io, value);
+}
 pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 {
     if (base.pre != null or base.search_zip or base.table_config != null or base.pattern_files.items.len != 0 or base.inventory or base.follow) return error.UnsupportedWorkspaceCaptureOptions;
     const Watch = @import("source_watch.zig").Watch;
@@ -176,12 +182,26 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                     }
                 };
             };
-            try emit(a, io, .{ .type = "workspace_begin", .id = request.id, .revision = generation.revision });
-            const code = (if (plan) |prepared| registered(Search, a, io, generation, &session, &reuse, prepared, request.if_result_token, request.delta) else search(Search, a, io, base, generation, &session, &reuse, request.args, request.if_result_token)) catch |err| blk: {
-                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
+            // One changed path commonly fits in a single pipe write. Stage
+            // only bounded framing; large payloads automatically stream when
+            // this buffer fills. Preserve explicit line-buffered operation.
+            const coalesce = if (plan) |prepared| request.delta and !prepared.options.line_buffered and
+                Search.lexicalDeltaEligible(&prepared.options) and generation.changes.items.len <= 1 and
+                prepared.lexical.healthy and prepared.lexical.revision != null and generation.parent_revision != null and
+                std.mem.eql(u8, &prepared.lexical.revision.?, &generation.parent_revision.?) and
+                !std.mem.eql(u8, &prepared.lexical.revision.?, &generation.revision) and
+                prepared.completion != null and std.mem.eql(u8, request.if_result_token.?, &prepared.completion.?.token) and
+                std.mem.eql(u8, &prepared.completion.?.revision, &prepared.lexical.revision.?) else false;
+            var output_buffer: [8192]u8 = undefined;
+            var output = std.Io.File.stdout().writerStreaming(io, &output_buffer);
+            const sink: ?*std.Io.Writer = if (coalesce) &output.interface else null;
+            try emitTo(a, io, .{ .type = "workspace_begin", .id = request.id, .revision = generation.revision }, sink);
+            const code = (if (plan) |prepared| registered(Search, a, io, generation, &session, &reuse, prepared, request.if_result_token, request.delta, sink) else search(Search, a, io, base, generation, &session, &reuse, request.args, request.if_result_token)) catch |err| blk: {
+                try emitTo(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) }, sink);
                 break :blk @as(u8, 2);
             };
-            try emit(a, io, .{ .type = "workspace_end", .id = request.id, .revision = generation.revision, .exit_code = code });
+            try emitTo(a, io, .{ .type = "workspace_end", .id = request.id, .revision = generation.revision, .exit_code = code }, sink);
+            if (coalesce) try output.interface.flush();
         } else if (std.mem.eql(u8, request.op, "close")) {
             try emit(a, io, .{ .type = "workspace_closed", .id = request.id });
             return 0;
@@ -218,7 +238,7 @@ fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generat
     return searcher.run();
 }
 
-fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, plan: *@import("prepared_query.zig").Registry(Search).Plan, token: ?[]const u8, delta: bool) !u8 {
+fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, plan: *@import("prepared_query.zig").Registry(Search).Plan, token: ?[]const u8, delta: bool, output: ?*std.Io.Writer) !u8 {
     // Any staging/allocation/output failure invalidates partly updated metadata.
     // The client applies patches only after a complete successful transaction.
     errdefer plan.lexical.clear();
@@ -229,6 +249,7 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
     if (token) |value| if (try Search.conditional(a, io, &plan.options, generation, reuse, plan.identity, value)) |code| return code;
     var searcher = try Search.initCompiled(a, io, &plan.options, &plan.matcher, plan.cwd);
     defer searcher.deinit();
+    searcher.sink = output;
     if (plan.options.ask != null) try session.configure(&plan.options);
     searcher.workspace_generation = generation;
     searcher.reuse = reuse;

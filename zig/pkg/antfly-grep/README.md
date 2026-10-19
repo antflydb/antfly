@@ -3151,3 +3151,13 @@ cannot become another response. Response and retained-payload allowances remain
 independent; Python allocation overhead is additional. `bench/retained_delivery.py`
 compares this path with the unchanged decoded-tree application path against the
 same binary, retaining all paired timings and a separate traced-allocation probe.
+
+Validated single-path lexical deltas also coalesce transaction framing and result
+records in an 8 KiB stack writer. It flushes automatically for larger responses
+and flushes the terminal frame before reading another request. Explicit line
+buffering bypasses this path. The response remains the same newline-delimited
+protocol, with the same output accounting and transactional fallback. Producer
+summary time can exclude the final buffered transport; client elapsed and the
+external per-process/per-thread CPU probes cover the complete request. The
+regression checks both default and line-buffered operation with a 5,000-row
+changed file larger than the buffer and a following all-miss delta.
