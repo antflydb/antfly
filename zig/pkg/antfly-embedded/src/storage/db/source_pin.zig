@@ -18,8 +18,8 @@
 //! Artifact serialization and hashing run only against the durable seal.
 const std = @import("std");
 const ledger = @import("online_source.zig");
-const seal = @import("native_backup_seal.zig");
-const backup = @import("native_backup.zig");
+const seal = @import("native/backup_seal.zig");
+const backup = @import("native/backup.zig");
 const fs = @import("antfly_runtime_fs").fs_paths;
 const state = @import("../source_pin_state.zig");
 const snapshot = @import("../source_snapshot.zig");
@@ -836,8 +836,8 @@ test "relational index system source pin prepared crash blocks markers then reop
             try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, portable.exportPortableToWriterWithOptions(alloc, db.core.store, &ordinary.writer, .{}));
             if (trial == 0) {
                 try db.core.store.putBatch(&.{.{ .key = graph_key, .value = graph_value }}, &.{});
-                const publication = @import("artifact_publication.zig");
-                const provenance = @import("artifact_producer_provenance.zig");
+                const publication = @import("artifact/publication.zig");
+                const provenance = @import("artifact/producer_provenance.zig");
                 var namespace: publication.Namespace = undefined;
                 @import("doc_identity.zig").encodeNamespace(&namespace, options.identity_namespace.?);
                 const source = publication.Source{ .document_key = "a", .content_digest = @splat(3), .timestamp = 111, .input_position = .{ .raft = .{ .term = 1, .index = 1 } } };
@@ -938,7 +938,7 @@ test "relational index system source pin prepared crash blocks markers then reop
             const restored_graph = try decoder.core.store.get(alloc, graph_key);
             defer alloc.free(restored_graph);
             try std.testing.expectEqualSlices(u8, graph_value, restored_graph);
-            var namespace: @import("artifact_publication.zig").Namespace = undefined;
+            var namespace: @import("artifact/publication.zig").Namespace = undefined;
             @import("doc_identity.zig").encodeNamespace(&namespace, options.identity_namespace.?);
             const imported_key = @import("source_proof_batch.zig").importKey(namespace, @splat(5));
             const imported = try decoder.core.store.get(alloc, &imported_key);
@@ -946,7 +946,7 @@ test "relational index system source pin prepared crash blocks markers then reop
             var decoded = try @import("source_proof_batch.zig").decodeValue(alloc, namespace, @splat(5), imported);
             defer decoded.deinit();
             try std.testing.expectEqualSlices(u8, &.{1}, decoded.bitmap);
-            try std.testing.expectError(error.NotFound, decoder.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
+            try std.testing.expectError(error.NotFound, decoder.core.store.get(alloc, @import("artifact/publication.zig").authority_key));
             const paged_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/paged-proof", .{tmp.sub_path});
             defer alloc.free(paged_path);
             var paged = try db_mod.DB.open(alloc, paged_path, .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
@@ -960,7 +960,7 @@ test "relational index system source pin prepared crash blocks markers then reop
             const paged_proof = try paged.core.store.get(alloc, &imported_key);
             defer alloc.free(paged_proof);
             try std.testing.expectEqualSlices(u8, imported, paged_proof);
-            try std.testing.expectError(error.NotFound, paged.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
+            try std.testing.expectError(error.NotFound, paged.core.store.get(alloc, @import("artifact/publication.zig").authority_key));
         }
         try std.testing.expectError(error.SourceCopyRestoreUnsupported, portable.validateCompleteDatabaseImageAlloc(alloc, decoder.core.store));
         const primary_key = try @import("../internal_keys.zig").relationalRowKeyAlloc(alloc, "a");

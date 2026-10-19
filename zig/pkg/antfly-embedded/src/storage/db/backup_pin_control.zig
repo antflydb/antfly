@@ -17,7 +17,7 @@
 //! Keep distributed table orchestration outside the storage compilation owner.
 const std = @import("std");
 
-pub fn execute(alloc: std.mem.Allocator, db: *@import("mod.zig").DB, group_id: u64, request: @import("native_backup_seal_contract.zig").Request, control: @import("../../api/backup_contract.zig").BackupOperationControl) ![]u8 {
+pub fn execute(alloc: std.mem.Allocator, db: *@import("mod.zig").DB, group_id: u64, request: @import("native/backup_seal_contract.zig").Request, control: @import("../../api/backup_contract.zig").BackupOperationControl) ![]u8 {
     try control.ensureActive();
     const fence = switch (request) {
         .seal => |value| value.fence,

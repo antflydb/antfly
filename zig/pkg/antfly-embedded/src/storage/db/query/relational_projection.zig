@@ -16,7 +16,7 @@
 const std = @import("std");
 const codec = @import("../algebraic/relational_row_codec.zig");
 const schema = @import("../../schema.zig");
-const document_query = @import("../document_query.zig");
+const document_query = @import("../document/query.zig");
 const JsonView = @import("json_view.zig").View;
 
 /// Positive field selections compiled against one immutable layout. Nested

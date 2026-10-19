@@ -17,7 +17,7 @@
 const std = @import("std");
 const Plan = @import("relational_projection.zig").Plan;
 const codec = @import("../algebraic/relational_row_codec.zig");
-const document = @import("../document_query.zig");
+const document = @import("../document/query.zig");
 const native_writer = @import("../../native_writer.zig");
 pub const Context = struct {
     scratch: std.mem.Allocator,

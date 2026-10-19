@@ -26,7 +26,7 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const full_text_index_defaults = @import("../../../common/full_text_index_defaults.zig");
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
-const native_backup = @import("../native_backup.zig");
+const native_backup = @import("../native/backup.zig");
 const process_memory = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
@@ -35,7 +35,7 @@ const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const types = @import("../types.zig");
 const doc_identity = @import("../doc_identity.zig");
-const artifact_ids = @import("../artifact_ids.zig");
+const artifact_ids = @import("../artifact/ids.zig");
 const graph_asset_state = @import("../graph_asset_state.zig");
 const dynamic_field_capability = @import("../dynamic_field_capability.zig");
 const apply_state = @import("../derived/apply_state.zig");
@@ -69,7 +69,7 @@ const schema_api = @import("../../../schema/mod.zig");
 const schema_registry_mod = @import("../schema_registry.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const ttl_mod = @import("../../ttl.zig");
-const mapper = @import("../document_mapper.zig");
+const mapper = @import("../document/mapper.zig");
 const relational_store = @import("../relational_store.zig");
 const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
@@ -5844,7 +5844,7 @@ pub const IndexManager = struct {
         /// Catalog bytes and provider templates are captured under the same
         /// publication fence. Worker authorization never joins this epoch to
         /// generation numbers borrowed from the mutable manager.
-        artifact_catalogs: ?@import("../artifact_inventory.zig").Catalogs = null,
+        artifact_catalogs: ?@import("../artifact/inventory.zig").Catalogs = null,
         catalog_empty: [3]bool = @splat(false),
         /// Artifact-only text indexes consume generated records, not base rows.
         has_text_consumers: bool = false,
@@ -5859,7 +5859,7 @@ pub const IndexManager = struct {
         generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
         /// Catalog-wide completion requirements include projections and
         /// resolver/promotion work that never appears in the provider queue.
-        completion_plan: ?@import("../artifact_completion_plan.zig").Plan = null,
+        completion_plan: ?@import("../artifact/completion_plan.zig").Plan = null,
         /// For each chunk template, indexes of embedding templates consuming
         /// its artifact. Compiling this adjacency once avoids an all-template
         /// scan for every chunk of every row.
@@ -5910,7 +5910,7 @@ pub const IndexManager = struct {
         /// Definition identity only, not a materialization-readiness vote.
         /// Repair/load readiness can change independently of this epoch and
         /// must be checked by the admission barrier, not cached here.
-        pub fn matchesArtifactInventory(self: WritePlanSnapshot, expected: @import("../artifact_inventory.zig").Catalogs) bool {
+        pub fn matchesArtifactInventory(self: WritePlanSnapshot, expected: @import("../artifact/inventory.zig").Catalogs) bool {
             const actual = self.artifact_catalogs orelse return false;
             inline for (.{ "indexes", "enrichments", "resolvers" }, 0..) |field, index| {
                 const bytes = @field(expected, field);
@@ -6402,7 +6402,7 @@ pub const IndexManager = struct {
         errdefer alloc.free(catalog_enrichments);
         const catalog_resolvers = try self.serializeResolverDefinitions(alloc);
         errdefer alloc.free(catalog_resolvers);
-        var completion_plan = try @import("../artifact_completion_plan.zig").Plan.init(alloc, .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers }, generated_templates);
+        var completion_plan = try @import("../artifact/completion_plan.zig").Plan.init(alloc, .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers }, generated_templates);
         errdefer completion_plan.deinit();
         return .{
             .alloc = alloc,
@@ -9415,7 +9415,7 @@ pub const IndexManager = struct {
         const namespace = blk: {
             var read = try store.beginReadTxn();
             defer read.abort();
-            const selected = (try @import("../artifact_publication.zig").authority(&read)) orelse return;
+            const selected = (try @import("../artifact/publication.zig").authority(&read)) orelse return;
             break :blk selected.namespace;
         };
         var guard = try self.lockManagedIndexApply(.{ .name = update.index_name, .kind = .full_text });
@@ -12048,7 +12048,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(merge_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
-        try @import("../artifact_inventory.zig").refresh(&txn);
+        try @import("../artifact/inventory.zig").refresh(&txn);
         try txn.commit();
         self.publishCatalogReaderStamp(reader_version);
         if (enrichments_changed) self.storeGeneratedEnrichmentTargetCache(has_generated_targets);
@@ -12236,7 +12236,7 @@ pub const IndexManager = struct {
             const resolvers = try self.serializeResolverDefinitionsForMutation(self.alloc);
             defer self.alloc.free(resolvers);
             upgraded_reader_version = try self.stampCatalogReaderVersion(&txn, resolvers);
-            try @import("../artifact_inventory.zig").refresh(&txn);
+            try @import("../artifact/inventory.zig").refresh(&txn);
         }
         try txn.commit();
         // Ordinary progress checkpoints must not overwrite a concurrent
@@ -22483,7 +22483,7 @@ pub const IndexManager = struct {
 
     /// The caller holds catalog_mutex from before opening txn through commit
     /// and publication of the returned reader/envelope stamp.
-    pub fn alignRowDerivedArtifactCatalogNoLock(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !CatalogReaderStamp {
+    pub fn alignRowDerivedArtifactCatalogNoLock(self: *IndexManager, txn: anytype, expected: @import("../artifact/inventory.zig").Catalogs, configs: []const types.IndexConfig) !CatalogReaderStamp {
         if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
         const desired_format = if (expected.resolvers.len == 0) 1 else try resolver_catalog.catalogReaderVersion(self.alloc, expected.resolvers);
         const current_reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
@@ -22562,11 +22562,11 @@ pub const IndexManager = struct {
                 else => return err,
             };
         }
-        try @import("../artifact_inventory.zig").refresh(txn);
+        try @import("../artifact/inventory.zig").refresh(txn);
         return .{ .reader = reader_version, .format = desired_format };
     }
 
-    pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
+    pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact/inventory.zig").Catalogs) !bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         if (self.failed_index_loads.count() != 0 or self.status_only_index_configs.len != 0) return false;
@@ -22628,7 +22628,7 @@ pub const IndexManager = struct {
             reader_version = try self.stampCatalogReaderVersion(&txn, resolvers);
             break;
         };
-        try @import("../artifact_inventory.zig").refresh(&txn);
+        try @import("../artifact/inventory.zig").refresh(&txn);
         try txn.commit();
         if (reader_version) |version| self.publishCatalogReaderStamp(version);
         _ = self.write_plan_generation.fetchAdd(1, .release);
@@ -22786,7 +22786,7 @@ pub const IndexManager = struct {
             if (retiring_reservation) try self.requireReplacementGenerationOwnership(&txn, job);
         }
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
-        try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
+        try @import("../artifact/projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
         var retiring_names: std.ArrayList([]const u8) = .empty;
         defer retiring_names.deinit(self.alloc);
@@ -22989,7 +22989,7 @@ pub const IndexManager = struct {
             },
         };
         const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
-        try @import("../artifact_inventory.zig").refresh(&txn);
+        try @import("../artifact/inventory.zig").refresh(&txn);
         try txn.commit();
         self.publishCatalogReaderStamp(reader_version);
         self.truncateResolvers(0);
@@ -23048,7 +23048,7 @@ pub const IndexManager = struct {
         const resolvers = try self.serializeResolverDefinitionsForMutation(self.alloc);
         defer self.alloc.free(resolvers);
         const reader_version = try self.stampCatalogReaderVersion(&txn, resolvers);
-        try @import("../artifact_inventory.zig").refresh(&txn);
+        try @import("../artifact/inventory.zig").refresh(&txn);
         try txn.commit();
         self.publishCatalogReaderStamp(reader_version);
         // Enrichment definitions are part of the immutable foreground write
@@ -23102,8 +23102,8 @@ pub const IndexManager = struct {
         const merge_data = try self.serializeResolverMerges(self.alloc);
         defer self.alloc.free(merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
-        try @import("../artifact_inventory.zig").refresh(&txn);
-        try @import("../artifact_inventory.zig").invalidateOrdered(&txn);
+        try @import("../artifact/inventory.zig").refresh(&txn);
+        try @import("../artifact/inventory.zig").invalidateOrdered(&txn);
         try txn.commit();
         self.publishCatalogReaderStamp(reader_version);
         self.invalidateWritePlanSnapshot();
@@ -23220,7 +23220,7 @@ pub const IndexManager = struct {
             defer self.alloc.free(fenced_catalog);
             try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, fenced_catalog);
             try txn.put(resolver_catalog_key, fenced_catalog);
-            try @import("../artifact_inventory.zig").refresh(&txn);
+            try @import("../artifact/inventory.zig").refresh(&txn);
         }
         try txn.commit();
         if (version >= resolver_catalog.graph_expiration_namespace_reader_version) {
@@ -23361,7 +23361,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(merge_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
-        try @import("../artifact_inventory.zig").refresh(&txn);
+        try @import("../artifact/inventory.zig").refresh(&txn);
         if (mode == .mark_reresolve_dirty or routing_changed) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");
             try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
@@ -26999,7 +26999,7 @@ pub const IndexManager = struct {
             const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
             defer self.alloc.free(parent_doc_id);
             if (entry.embedding_names.len == 0) {
-                var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &txn, parent_doc_id, entry.chunk_name.?);
+                var chunks = try @import("../artifact/chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &txn, parent_doc_id, entry.chunk_name.?);
                 defer chunks.close();
                 while (try chunks.next()) |row| {
                     if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
@@ -48740,7 +48740,7 @@ test "inline resolver replacement reserves source subscriptions in both admissio
 
 test "ordered artifact inventory TTL replacement retains temporary envelope without promoting its baseline" {
     const a = std.testing.allocator;
-    const inventory = @import("../artifact_inventory.zig");
+    const inventory = @import("../artifact/inventory.zig");
     for ([_]u32{ 1, 2 }) |baseline| {
         for ([_]bool{ false, true }) |upgrade| {
             var tmp = std.testing.tmpDir(.{});

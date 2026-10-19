@@ -72,7 +72,7 @@ pub const View = struct {
         fn include(self: @This(), alloc: Allocator, dst: *std.json.ObjectMap, path: []const []const u8) !void {
             var source = std.json.ObjectMap.empty;
             try source.put(alloc, self.name, if (self.embedding_stream) |stream| try (try stream.fields(alloc)).materialize(alloc) else if (self.embeddings) |fields| try fields.materialize(alloc) else self.value);
-            try @import("../document_query.zig").applyIncludeBorrowedPath(alloc, source, dst, path);
+            try @import("../document/query.zig").applyIncludeBorrowedPath(alloc, source, dst, path);
         }
     };
 
@@ -951,7 +951,7 @@ pub const View = struct {
             const value = try std.json.parseFromSliceLeaky(Value, alloc, node.raw, .{ .parse_numbers = self.parse_numbers });
             var source = std.json.ObjectMap.empty;
             try source.put(alloc, name, value);
-            return @import("../document_query.zig").applyIncludePath(alloc, source, dst, &.{ name, "*" });
+            return @import("../document/query.zig").applyIncludePath(alloc, source, dst, &.{ name, "*" });
         }
         switch (node.kind()) {
             '{' => {
@@ -1121,7 +1121,7 @@ test "public graph metric borrowed wire compact object projections retain unplan
                 var view = View.init(s, raw);
                 view.parse_numbers = true;
                 {
-                    var plan = (try @import("../document_query.zig").SpanProjectionPlan.init(a, .{ .fields = fields[0..count], .include_all_fields = false })).?;
+                    var plan = (try @import("../document/query.zig").SpanProjectionPlan.init(a, .{ .fields = fields[0..count], .include_all_fields = false })).?;
                     defer plan.deinit();
                     try view.prepareProjection(plan.selector, .all, .object_only);
                     var result: std.json.ObjectMap = .empty;
@@ -1144,7 +1144,7 @@ test "public graph metric borrowed wire compact object projections retain unplan
             }
             var empty = View.init(s, "{}");
             {
-                var plan = (try @import("../document_query.zig").SpanProjectionPlan.init(a, .{ .fields = &.{"missing"}, .include_all_fields = false })).?;
+                var plan = (try @import("../document/query.zig").SpanProjectionPlan.init(a, .{ .fields = &.{"missing"}, .include_all_fields = false })).?;
                 defer plan.deinit();
                 try empty.prepareProjection(plan.selector, .all, .object_only);
             }

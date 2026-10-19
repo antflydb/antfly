@@ -696,7 +696,7 @@ pub const Staged = struct {
 
 const schema = @import("../schema.zig");
 const schema_registry = @import("schema_registry.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const docstore = @import("../docstore.zig");
 
 fn testPlan(alloc: Allocator) !plans.View {

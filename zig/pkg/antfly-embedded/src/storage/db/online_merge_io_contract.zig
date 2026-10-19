@@ -119,7 +119,7 @@ pub fn validateReceiptScope(scope: source.Scope, receipt: pages.Progress) !void 
 }
 
 pub const AdmissionFacts = struct {
-    artifact_catalog: ?@import("artifact_inventory.zig").Binding = null,
+    artifact_catalog: ?@import("artifact/inventory.zig").Binding = null,
     authority: source.Authority = .raft,
     /// Rewrite-only immutable public mappings for every durable native epoch.
     /// The caller owns the decoded response, not a borrowed native DB view.

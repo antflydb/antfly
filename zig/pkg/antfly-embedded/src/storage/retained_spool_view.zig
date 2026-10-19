@@ -16,7 +16,7 @@
 //! Stable, bounded file-backed source for an authenticated retained frame.
 const std = @import("std");
 const retained = @import("retained_frame.zig");
-const native = @import("db/native_backup.zig");
+const native = @import("db/native/backup.zig");
 
 pub const Source = struct {
     alloc: std.mem.Allocator,

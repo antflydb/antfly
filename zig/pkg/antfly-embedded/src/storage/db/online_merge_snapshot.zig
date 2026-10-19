@@ -159,7 +159,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     const pins = @import("source_pin.zig");
     const lock_path = try pins.lockPath(alloc, db.core.path, (try pins.locate(db, scope)).slot);
     defer alloc.free(lock_path);
-    var lease = try @import("native_backup_seal.zig").StoreLock.acquire(alloc, io, lock_path, cancellation);
+    var lease = try @import("native/backup_seal.zig").StoreLock.acquire(alloc, io, lock_path, cancellation);
     defer lease.deinit();
     if ((try db.onlineSourceStatus(scope)).phase == .released) return error.OnlineSourceScopeChanged;
     const root = try pins.pathAlloc(alloc, db.core.path, scope);
@@ -213,7 +213,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
                 if (proofs.items.len != 0) break;
                 continue;
             };
-            var namespace: @import("artifact_publication.zig").Namespace = undefined;
+            var namespace: @import("artifact/publication.zig").Namespace = undefined;
             @import("doc_identity.zig").encodeNamespace(&namespace, receipt.source.namespace);
             const key_array = proof_batch.mergeKey(namespace, receipt.source.pin_digest, descriptor.digest);
             const key = try owned.dupe(u8, &key_array);
@@ -446,8 +446,8 @@ test "online direct vector fulltext-only receiver preserves latent artifacts thr
 
 const LateAuthority = enum { none, before_publication, before_fence };
 
-fn activateTestAuthority(db: *DB, namespace: @import("artifact_publication.zig").Namespace, catalog_digest: [32]u8) !void {
-    const publication = @import("artifact_publication.zig");
+fn activateTestAuthority(db: *DB, namespace: @import("artifact/publication.zig").Namespace, catalog_digest: [32]u8) !void {
+    const publication = @import("artifact/publication.zig");
     var writer = try db.core.store.beginWriteTxn();
     errdefer writer.abort();
     try publication.stageAuthority(&writer, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
@@ -520,8 +520,8 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
     defer receiver_catalog.catalogs.deinit(alloc);
     try std.testing.expect(donor_catalog.binding.compatible(receiver_catalog.binding));
     if (transfer_proof and selected_proof) {
-        const publication = @import("artifact_publication.zig");
-        const provenance = @import("artifact_producer_provenance.zig");
+        const publication = @import("artifact/publication.zig");
+        const provenance = @import("artifact/producer_provenance.zig");
         var namespace: publication.Namespace = undefined;
         @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
         var read = try donor.core.store.beginReadTxn();
@@ -545,7 +545,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
         try provenance.stageIndexed(&writer, command, encoded, .{ .raft = .{ .term = 1, .index = 1 } }, &indexed);
         try writer.commit();
     } else if (transfer_proof) {
-        const publication = @import("artifact_publication.zig");
+        const publication = @import("artifact/publication.zig");
         var namespace: publication.Namespace = undefined;
         @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
         var writer = try donor.core.store.beginWriteTxn();
@@ -559,7 +559,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
     try server_test_adapter.applyOrdered(&donor, .{ .artifact_catalog = donor_catalog, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = donor_catalog.binding } } }, .{ .term = 1, .index = 2 });
     const certificate = try donor.prepareOnlineSourcePublication(scope, .none);
     if (late_authority == .before_publication) {
-        var namespace: @import("artifact_publication.zig").Namespace = undefined;
+        var namespace: @import("artifact/publication.zig").Namespace = undefined;
         @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
         try activateTestAuthority(&donor, namespace, donor_catalog.binding.digest);
         try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 }));
@@ -579,7 +579,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
     };
     try server_test_adapter.applyOrdered(&donor, .{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 6 });
     if (late_authority == .before_fence) {
-        var namespace: @import("artifact_publication.zig").Namespace = undefined;
+        var namespace: @import("artifact/publication.zig").Namespace = undefined;
         @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
         try activateTestAuthority(&donor, namespace, donor_catalog.binding.digest);
         try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = retained_head } } }, .{ .term = 1, .index = 7 }));
@@ -634,7 +634,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
         if (transfer_proof and request.merge_page.?.tail != null and request.merge_page.?.tail.? == .finish) {
             try std.testing.expect((proof_pages != 0) == selected_proof);
             try std.testing.expectError(error.OnlineMergeProvenanceAdoptionRequired, server_test_adapter.applyOrdered(&receiver, request, .{ .term = 1, .index = index }));
-            var namespace: @import("artifact_publication.zig").Namespace = undefined;
+            var namespace: @import("artifact/publication.zig").Namespace = undefined;
             @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
             const proof_key = @import("source_proof_batch.zig").mergeKey(namespace, source_identity.pin_digest, @splat(5));
             const witness_key = @import("source_proof_batch.zig").witnessKey(namespace, source_identity.pin_digest, @splat(5));
@@ -647,16 +647,16 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
                 const witness = try receiver.core.store.get(alloc, &witness_key);
                 defer alloc.free(witness);
                 try std.testing.expectEqualSlices(u8, &decoded.record_digest, witness);
-                var receiver_namespace: @import("artifact_publication.zig").Namespace = undefined;
+                var receiver_namespace: @import("artifact/publication.zig").Namespace = undefined;
                 @import("doc_identity.zig").encodeNamespace(&receiver_namespace, receiver_options.identity_namespace.?);
                 var receiver_read = try receiver.core.store.beginReadTxn();
                 defer receiver_read.abort();
-                try std.testing.expect((try @import("artifact_publication.zig").artifactRevision(&receiver_read, receiver_namespace, large_key)) != null);
+                try std.testing.expect((try @import("artifact/publication.zig").artifactRevision(&receiver_read, receiver_namespace, large_key)) != null);
             } else {
                 try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, &proof_key));
                 try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, &witness_key));
             }
-            try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
+            try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, @import("artifact/publication.zig").authority_key));
             return;
         }
         try server_test_adapter.applyOrdered(&receiver, request, .{ .term = 1, .index = index });
@@ -703,12 +703,12 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
         if (!checked_replay_without_catalog and request.merge_page.?.artifact_effects.len != 0) {
             // A delayed retry must retire its new Raft position without
             // consulting a projection catalog that may already have changed.
-            var receiver_namespace: @import("artifact_publication.zig").Namespace = undefined;
+            var receiver_namespace: @import("artifact/publication.zig").Namespace = undefined;
             @import("doc_identity.zig").encodeNamespace(&receiver_namespace, receiver_options.identity_namespace.?);
-            const revision_key = @import("artifact_publication.zig").artifactRevisionKey(receiver_namespace, request.merge_page.?.artifact_effects[0].key);
+            const revision_key = @import("artifact/publication.zig").artifactRevisionKey(receiver_namespace, request.merge_page.?.artifact_effects[0].key);
             const original_revision = try receiver.core.store.get(alloc, &revision_key);
             defer alloc.free(original_revision);
-            const inventory_key = @import("artifact_inventory.zig").ordered_key;
+            const inventory_key = @import("artifact/inventory.zig").ordered_key;
             const inventory = try receiver.core.store.get(alloc, inventory_key);
             defer alloc.free(inventory);
             try receiver.core.store.delete(inventory_key);

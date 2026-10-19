@@ -104,7 +104,7 @@ fn matches(comptime T: type, expected: T, actual: std.json.Value) bool {
 }
 
 pub fn decodeAlloc(alloc: Allocator, raw: []const u8, expected: Identity) !Owned {
-    if (raw.len > @import("../artifact_publication.zig").max_payload_bytes) return error.ResourceBudgetExceeded;
+    if (raw.len > @import("../artifact/publication.zig").max_payload_bytes) return error.ResourceBudgetExceeded;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();

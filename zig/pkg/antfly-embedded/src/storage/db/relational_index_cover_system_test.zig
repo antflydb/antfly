@@ -135,7 +135,7 @@ fn prepareCoverAllocationFailure(test_alloc: std.mem.Allocator) !void {
     defer schema_view.release();
     var plan = try plans.View.init(test_alloc, schema_view, &.{.{ .name = "covered", .generation = 1, .keys = &.{.{ .column = "id" }}, .include_columns = &.{"label"} }});
     defer plan.release();
-    var prepared = try @import("document_mapper.zig").PreparedRelationalWrite.init(test_alloc, "a", "{\"id\":1,\"label\":\"data\"}", null, schema_view.tableSchema().*, schema_view.physicalLayout());
+    var prepared = try @import("document/mapper.zig").PreparedRelationalWrite.init(test_alloc, "a", "{\"id\":1,\"label\":\"data\"}", null, schema_view.tableSchema().*, schema_view.physicalLayout());
     defer prepared.deinit(test_alloc);
     var batch = plans.Batch.init(test_alloc, plan);
     defer batch.deinit();
@@ -157,7 +157,7 @@ test "relational index system covering preparation releases every allocation fai
 
 test "relational index system covering cold bindings reuse historical ordinals and reject incompatible layouts" {
     const schema = @import("../schema.zig");
-    const mapper = @import("document_mapper.zig");
+    const mapper = @import("document/mapper.zig");
     const covering = @import("relational_index_cover.zig");
     const current: schema.TableSchema = .{ .version = 10, .storage_mode = .relational, .relational_columns = &.{
         .{ .name = "id", .path = "id", .column_type = .integer },

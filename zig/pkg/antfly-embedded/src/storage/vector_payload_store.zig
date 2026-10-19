@@ -1511,7 +1511,7 @@ pub const Store = struct {
         const active_bytes = store.wal_committed_bytes - sealed_bytes;
         remaining_wal.* = std.math.sub(u64, remaining_wal.*, active_bytes) catch return error.QueryCandidateBudgetExceeded;
         const paths = @import("antfly_runtime_fs").fs_paths;
-        const backup = @import("db/native_backup.zig");
+        const backup = @import("db/native/backup.zig");
         try paths.createDirPathPortable(io, target);
         var total: u64 = 0;
         for (manifest.segments) |segment| {

@@ -3028,7 +3028,7 @@ test "prepared pattern filters preserve document numeric semantics in lazy ordin
     defer layout.deinit();
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"fraction\":0.10000000000000001,\"large\":1e21,\"integer\":9007199254740993}", .{ .parse_numbers = false });
     defer parsed.deinit();
-    const canonical = try @import("../document_content_hash.zig").canonicalJsonValueAlloc(alloc, parsed.value);
+    const canonical = try @import("../document/content_hash.zig").canonicalJsonValueAlloc(alloc, parsed.value);
     defer alloc.free(canonical);
     const cells = [_]relational_row_codec.Cell{.{ .ordinal = 0, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = canonical } }};
     const encoded = try relational_row_codec.serializeOrdinal(alloc, 1, &columns, &cells, @splat(0));

@@ -27,7 +27,7 @@ const derived_executor_mod = @import("derived/derived_executor.zig");
 const derived_types = @import("derived/derived_types.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
-const document_child_range_effects = @import("document_child_range_effects.zig");
+const document_child_range_effects = @import("document/child_range_effects.zig");
 const durable_outbox_store = @import("durable_outbox_store.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
@@ -40,7 +40,7 @@ const graph_edge_ttl_tombstone = @import("graph_edge_ttl_tombstone.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const internal_keys = @import("../internal_keys.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const merge_state_mod = @import("merge_state.zig");
 const platform = @import("antfly_platform");
 const platform_clock = @import("antfly_platform").clock;
@@ -980,11 +980,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var namespace: [24]u8 = undefined;
                 doc_identity.encodeNamespace(&namespace, S.ownerField(self, "core").*.identity_namespace);
                 if (req.artifact_catalog) |install| {
-                    if (!install.binding.compatible(binding) or !std.mem.eql(u8, &install.binding.digest, &(try @import("artifact_inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
-                } else try @import("artifact_inventory.zig").requireCompatibleReady(S.ownerField(self, "alloc").*, &read, namespace, binding);
-                if (!try self.artifactMaterializationsReady(&read, try @import("artifact_inventory.zig").catalogs(&read))) return error.ArtifactCatalogDrift;
+                    if (!install.binding.compatible(binding) or !std.mem.eql(u8, &install.binding.digest, &(try @import("artifact/inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
+                } else try @import("artifact/inventory.zig").requireCompatibleReady(S.ownerField(self, "alloc").*, &read, namespace, binding);
+                if (!try self.artifactMaterializationsReady(&read, try @import("artifact/inventory.zig").catalogs(&read))) return error.ArtifactCatalogDrift;
                 if (prepared_artifacts.receiver_binding) |prepared_binding| {
-                    const inventory = @import("artifact_inventory.zig");
+                    const inventory = @import("artifact/inventory.zig");
                     const observed = try inventory.status(S.ownerField(self, "alloc").*, &read, namespace);
                     if (!observed.ready or !std.meta.eql(observed.ordered, @as(?inventory.Binding, prepared_binding))) return error.ArtifactCatalogDrift;
                 }
@@ -1938,15 +1938,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             // Typed online artifact afterimages participate in the same primary,
             // derived replay and page-receipt transaction as ordinary artifacts.
-            var transferred_artifact_position_bytes: [@import("artifact_publication.zig").Position.encoded_len]u8 = undefined;
+            var transferred_artifact_position_bytes: [@import("artifact/publication.zig").Position.encoded_len]u8 = undefined;
             if (transferred_artifacts.len != 0) {
                 const entry = opts.ordered_apply_receipt orelse return error.InvalidMergePage;
-                transferred_artifact_position_bytes = try (@import("artifact_publication.zig").Position{ .raft = .{ .term = entry.term, .index = entry.index } }).encode();
+                transferred_artifact_position_bytes = try (@import("artifact/publication.zig").Position{ .raft = .{ .term = entry.term, .index = entry.index } }).encode();
             }
-            var receiver_artifact_namespace: @import("artifact_publication.zig").Namespace = undefined;
+            var receiver_artifact_namespace: @import("artifact/publication.zig").Namespace = undefined;
             doc_identity.encodeNamespace(&receiver_artifact_namespace, S.ownerField(self, "core").*.identity_namespace);
             for (transferred_artifacts) |effect| {
-                const revision_key = @import("artifact_publication.zig").artifactRevisionKey(receiver_artifact_namespace, effect.key);
+                const revision_key = @import("artifact/publication.zig").artifactRevisionKey(receiver_artifact_namespace, effect.key);
                 const owned_revision_key = try S.ownerField(self, "alloc").*.dupe(u8, &revision_key);
                 owned_store_keys.append(S.ownerField(self, "alloc").*, owned_revision_key) catch |err| {
                     S.ownerField(self, "alloc").*.free(owned_revision_key);
@@ -2523,11 +2523,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var read = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer read.abort();
                 if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace))) return error.IdentityNamespaceMismatch;
-                if (!std.mem.eql(u8, &command.binding.digest, &(try @import("artifact_inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
-                ordered_artifact_value = try @import("artifact_inventory.zig").prepareOrdered(S.ownerField(self, "alloc").*, &read, command, entry.index);
-                if (ordered_artifact_value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("artifact_inventory.zig").ordered_key, .value = value });
-                if (try @import("artifact_reconcile_intent.zig").validateCompletion(S.ownerField(self, "alloc").*, &read, command, entry.index)) try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").key);
-                try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
+                if (!std.mem.eql(u8, &command.binding.digest, &(try @import("artifact/inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
+                ordered_artifact_value = try @import("artifact/inventory.zig").prepareOrdered(S.ownerField(self, "alloc").*, &read, command, entry.index);
+                if (ordered_artifact_value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("artifact/inventory.zig").ordered_key, .value = value });
+                if (try @import("artifact/reconcile_intent.zig").validateCompletion(S.ownerField(self, "alloc").*, &read, command, entry.index)) try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact/reconcile_intent.zig").key);
+                try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact/reconcile_intent.zig").resolver_cursor_key);
             }
             var split_sequence_buf: [8]u8 = undefined;
             var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
@@ -2682,7 +2682,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Local producer receipts are fenced by the latest primary mutation,
             // not by the immutable document identity. Stamp in the primary batch.
             if (S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(S.ownerField(self, "core").*.store)) {
-                const readiness = @import("artifact_producer_readiness.zig");
+                const readiness = @import("artifact/producer_readiness.zig");
                 for (identity_upsert_keys.items, identity_upsert_write_indexes.items) |document, write_index| {
                     // An identical logical row creates no producer replay debt.
                     if (!derived_changed_flags[write_index]) continue;
@@ -2820,10 +2820,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (S.ownerField(self, "root_incarnation").* == 0 or explicit_embedding_artifact_writes.items.len == 0) break :blk 0;
                 var probe = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer probe.abort();
-                if (try @import("artifact_publication.zig").authority(&probe) == null) break :blk 0;
+                if (try @import("artifact/publication.zig").authority(&probe) == null) break :blk 0;
                 break :blk S.ownerField(self, "root_incarnation").*;
             };
-            var authored_acceptance = try @import("artifact_authored_acceptance.zig").Prepared.init(
+            var authored_acceptance = try @import("artifact/authored_acceptance.zig").Prepared.init(
                 S.ownerField(self, "alloc").*,
                 authored_root,
                 explicit_embedding_artifact_writes.items,
@@ -3413,7 +3413,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (@import("../artifact_footprint.zig").isKey(key)) return true;
             if (@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(key)) return true;
             if (@import("retirement_set_summary.zig").isKey(key)) return true;
-            if (@import("native_topology_receipt.zig").isKey(key)) return true;
+            if (@import("native/topology_receipt.zig").isKey(key)) return true;
             const generation_admission = @import("relational_integrity_generation_admission.zig");
             return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational_integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key) or
                 std.mem.eql(u8, key, @import("relational_integrity_activation.zig").key) or
@@ -4656,7 +4656,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn orderedCoverageActive(store: *docstore_mod.DocStore) !bool {
             var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
             defer probe.abort();
-            return try @import("artifact_publication.zig").authority(&probe) != null;
+            return try @import("artifact/publication.zig").authority(&probe) != null;
         }
 
         pub fn preflightReplicationMirrorSyncCommitContext(ctx: *const BatchExecutionContext, mirror: ?ReplicationAsyncEffectMirror) !void {

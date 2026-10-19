@@ -568,7 +568,7 @@ test "merge preserves common sorted segment index_sort metadata" {
 
 test "bounded merge splits output and preserves live documents" {
     const alloc = std.testing.allocator;
-    const mapper = @import("storage/db/document_mapper.zig");
+    const mapper = @import("storage/db/document/mapper.zig");
 
     const seg1 = (try mapper.buildTextSegmentFromDocuments(alloc, &.{
         .{ .key = "doc:1", .value = "{\"body\":\"alpha one\"}" },
@@ -852,7 +852,7 @@ test "merge direct-copies single-source field sections when eligible" {
 
 test "merge mapper-built multi-field text segments" {
     const alloc = std.testing.allocator;
-    const mapper = @import("storage/db/document_mapper.zig");
+    const mapper = @import("storage/db/document/mapper.zig");
     const text_analysis = @import("introducer.zig").TextAnalysisConfig{};
 
     const seg1 = (try mapper.buildTextSegmentFromDocuments(alloc, &.{
@@ -918,7 +918,7 @@ test "merge mapper-built multi-field text segments" {
 
 test "merge mapper-built segments preserves typed doc values" {
     const alloc = std.testing.allocator;
-    const mapper = @import("storage/db/document_mapper.zig");
+    const mapper = @import("storage/db/document/mapper.zig");
     const text_analysis = @import("introducer.zig").TextAnalysisConfig{};
 
     const seg1 = (try mapper.buildTextSegmentFromDocuments(alloc, &.{

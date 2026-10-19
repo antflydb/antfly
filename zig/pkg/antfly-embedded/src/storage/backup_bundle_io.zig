@@ -25,7 +25,7 @@ const std = @import("std");
 const backup_codec = @import("backup_codec.zig");
 const bundle = @import("backup_bundle.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const native_backup = @import("db/native_backup.zig");
+const native_backup = @import("db/native/backup.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const io_buffer_bytes: usize = 256 * 1024;

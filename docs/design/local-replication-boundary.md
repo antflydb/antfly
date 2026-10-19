@@ -122,7 +122,7 @@ checks remain in storage and are the only authority to retire upload bytes.
 
 ## Producer scheduling, publication recovery, and TTL routing
 
-`storage/db/artifact_producer_scheduler.zig` owns volatile producer polling,
+`storage/db/artifact/producer_scheduler.zig` owns volatile producer polling,
 single-flight admission, fairness cursors, and retry rounds. It is shared local
 maintenance, including native inference. DB supplies budgeted transactional work;
 it retains durable obligations, exact-generation checks, replay-journal append,
@@ -156,7 +156,7 @@ identity when encoding the unchanged notification ABI. Detachment still waits
 for in-flight observations, and installing a hook still rehydrates durable repair
 state. An observer that needs local DB access borrows it through its own context.
 
-`storage/db/document_child_range_effects.zig` partitions prepared generated effects
+`storage/db/document/child_range_effects.zig` partitions prepared generated effects
 against local manifest snapshots and physical key bounds. A pure, bounded
 selection callback supplies a destination; planning does not inspect server role
 or placement status. `storage/server_document_child_range.zig` interprets committed
@@ -217,7 +217,7 @@ state and a start attempt; enrichment runtime replacement remains protected by
 its lifecycle mutex, and structural mutations still govern paused runtimes.
 The durable owner lane drains before the borrowed context is destroyed.
 
-`storage/db/native_projection_owner.zig` owns wakeups, worker admission, retryable
+`storage/db/native/projection_owner.zig` owns wakeups, worker admission, retryable
 failure classification, and shutdown/join. Its stable AsyncContext supplies one
 publication round. Catalog pins, stable-tip/cardinality checks, snapshot admission,
 and durable checkpoint publication remain local storage operations. Shutdown
@@ -377,7 +377,7 @@ The visibility-hook routing guard covers the extracted `query_visibility.zig`
 definition as well as the legacy inline location, preventing server table/group
 identity or a DB pointer from becoming fields of the shared local hook.
 
-`storage/db/document_collectors.zig` owns synchronous document materialization,
+`storage/db/document/collectors.zig` owns synchronous document materialization,
 text projections and their retained output buffers over borrowed stores/managers.
 DB retains the source selection and publication fences. `result_collectors.zig`
 owns scan rows and enrichment arrays until their public result is fully assembled.

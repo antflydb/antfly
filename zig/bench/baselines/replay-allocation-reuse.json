@@ -25955,7 +25955,7 @@
     "candidate": "working tree follow-up; production and harness hashes below",
     "source_sha256": {
       "zig/pkg/antfly/src/storage/db/db.zig": "0ad581649d2ea34045a9b1ed3840d94592ff60b33c45993602a37b512bbee041",
-      "zig/pkg/antfly/src/storage/db/document_read_scratch.zig": "1f4cc86479eaa9dcf5bd7a233d6cd39cf5c107888e946575050beeb24f9d0079",
+      "zig/pkg/antfly/src/storage/db/document/read_scratch.zig": "1f4cc86479eaa9dcf5bd7a233d6cd39cf5c107888e946575050beeb24f9d0079",
       "zig/pkg/antfly/src/storage/vector_payload_store.zig": "bf8499e8ccba250ac20481b854013fd8e253c6d98e16300cb6b70ed9f35210b0",
       "zig/pkg/antfly/src/vector_payload_bench.zig": "630fe94e4712d3f8eefc526525a020c4d583abbec9c86706a2210f9d08bed253",
       "zig/tools/measure_allocation_reuse.py": "476e1a900b41c4b1317a93f91a84268ca9059ec9e8fb5c70a42f67496712b9d4",

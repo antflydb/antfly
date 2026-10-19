@@ -51,7 +51,7 @@ pub const Owner = struct {
 };
 
 pub const SealReceipt = struct {
-    handle: @import("../storage/db/native_backup_seal.zig").Handle,
+    handle: @import("../storage/db/native/backup_seal.zig").Handle,
     source_node_id: u64,
     pub fn jsonStringify(self: SealReceipt, writer: anytype) @TypeOf(writer.*).Error!void {
         try @import("../storage/db/relational_integrity_json.zig").write(self, writer);

@@ -189,7 +189,7 @@ pub const ProgramSet = struct {
 fn definitionDigest(alloc: Allocator, json: []const u8) !contract.Digest {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false });
     defer parsed.deinit();
-    const canonical = try @import("document_content_hash.zig").canonicalJsonValueAlloc(alloc, parsed.value);
+    const canonical = try @import("document/content_hash.zig").canonicalJsonValueAlloc(alloc, parsed.value);
     defer alloc.free(canonical);
     return staging.digest(canonical);
 }

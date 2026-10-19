@@ -127,8 +127,8 @@ fn applyChunk(db: *db_mod.DB, index: *u64, lsn: *u64, standby: bool, request: ty
 
 test "relational index system merge tail source proofs stage inertly with exact page replay" {
     const proof_batch = @import("source_proof_batch.zig");
-    const publication = @import("artifact_publication.zig");
-    const provenance = @import("artifact_producer_provenance.zig");
+    const publication = @import("artifact/publication.zig");
+    const provenance = @import("artifact/producer_provenance.zig");
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-proof-receiver");
     defer directory.cleanup();
     const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 11, .shard_id = 102, .range_id = 102 }, .start_optional_runtimes = false };

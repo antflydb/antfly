@@ -16,7 +16,7 @@
 const std = @import("std");
 const db_mod = @import("mod.zig");
 const rows = @import("relational_rows.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const alloc = std.testing.allocator;
 
 test "relational index system NUMERIC public scalar constraints survive LSM reopen and portable restore" {

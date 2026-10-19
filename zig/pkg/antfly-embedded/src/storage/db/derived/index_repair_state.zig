@@ -203,7 +203,7 @@ pub const IndexRepairIntent = struct {
     previous_active_relative_path: ?[]u8 = null,
     detected_sequence: u64,
     build_floor_sequence: u64 = 0,
-    build_source_guard: ?@import("../artifact_source_gap.zig").Guard = null,
+    build_source_guard: ?@import("../artifact/source_gap.zig").Guard = null,
     /// Last source-store key durably incorporated into a reopenable building
     /// candidate. Resume scans begin strictly after this key. The cumulative
     /// count is diagnostic/accounting state and is not used for correctness.
@@ -970,7 +970,7 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
             const present = try readInt(raw[0..payload_end], &pos, u8);
             if (present > 1) return error.InvalidIndexRepairState;
             if (present == 1) {
-                const SourceGuard = @import("../artifact_source_gap.zig").Guard;
+                const SourceGuard = @import("../artifact/source_gap.zig").Guard;
                 const size = @sizeOf(SourceGuard.Encoded);
                 if (pos > payload_end or size > payload_end - pos) return error.InvalidIndexRepairState;
                 intent.build_source_guard = SourceGuard.decode(raw[pos..][0..size]) catch return error.InvalidIndexRepairState;

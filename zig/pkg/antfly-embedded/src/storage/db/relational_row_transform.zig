@@ -25,7 +25,7 @@ const expressions = @import("../../schema/relational_expression.zig");
 const registry = @import("schema_registry.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const store = @import("relational_store.zig");
-const content = @import("document_content_hash.zig");
+const content = @import("document/content_hash.zig");
 const Allocator = std.mem.Allocator;
 pub const Digest = [32]u8;
 

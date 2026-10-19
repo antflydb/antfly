@@ -17,7 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
-const artifact_ids = @import("artifact_ids.zig");
+const artifact_ids = @import("artifact/ids.zig");
 pub const Scan = struct {
     alloc: Allocator,
     include_documents: bool,
@@ -300,7 +300,7 @@ test "result collectors release complete graph identity and extraction transfers
         fn run(alloc: Allocator) !void {
             var collector: Extraction = .{ .alloc = alloc };
             defer collector.deinit();
-            const mapper = @import("document_mapper.zig");
+            const mapper = @import("document/mapper.zig");
             var extracted: mapper.ExtractedWrite = .{ .cleaned_value = null, .graph_writes = &.{}, .mentioned_graph_indexes = &.{}, .dense_embeddings = &.{}, .sparse_embeddings = &.{} };
             const artifact_key = try @import("../internal_keys.zig").artifactNamedPrefixAlloc(alloc, "doc", "asset", "embedding");
             defer alloc.free(artifact_key);

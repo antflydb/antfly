@@ -135,7 +135,7 @@ pub const ProjectionSnapshot = struct {
     alloc: Allocator,
     guard: CheckpointWriteGuard,
     checkpoint: CheckpointMap,
-    authority: @import("../artifact_publication.zig").Authority,
+    authority: @import("../artifact/publication.zig").Authority,
     epoch: u64,
 
     pub fn deinit(self: *@This()) void {
@@ -152,9 +152,9 @@ pub const ProjectionSnapshot = struct {
     /// Recheck in the evidence publication transaction. Raw physical resets,
     /// authority switches and reopen can revoke independently of this lock.
     pub fn requireCurrent(self: *const @This(), txn: anytype) !void {
-        const current = (try @import("../artifact_publication.zig").authority(txn)) orelse return error.ArtifactCatalogDrift;
+        const current = (try @import("../artifact/publication.zig").authority(txn)) orelse return error.ArtifactCatalogDrift;
         if (!std.meta.eql(self.authority, current)) return error.ArtifactCatalogDrift;
-        try @import("../artifact_projection_epoch.zig").requireCurrent(txn, self.epoch);
+        try @import("../artifact/projection_epoch.zig").requireCurrent(txn, self.epoch);
     }
 };
 
@@ -182,8 +182,8 @@ pub fn tryAcquireProjectionSnapshot(
     defer runtime.deinit();
     var txn = try runtime.store.beginProbe();
     defer txn.abort();
-    const authority = (try @import("../artifact_publication.zig").authority(&txn)) orelse return null;
-    const epoch = try @import("../artifact_projection_epoch.zig").load(&txn);
+    const authority = (try @import("../artifact/publication.zig").authority(&txn)) orelse return null;
+    const epoch = try @import("../artifact/projection_epoch.zig").load(&txn);
     var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -288,8 +288,8 @@ pub fn saveAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u6
     const previous = mutable_txn.get(key) catch |err| if (err == error.NotFound) null else return err;
     if (previous) |raw| {
         if (raw.len != 8) return error.InvalidDerivedApplyState;
-        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
-    } else try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
+        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) try @import("../artifact/projection_epoch.zig").revoke(mutable_txn);
+    } else try @import("../artifact/projection_epoch.zig").revoke(mutable_txn);
     try mutable_txn.put(key, &buf);
 }
 
@@ -416,7 +416,7 @@ pub fn clearAppliedSequenceWithCheckpoint(
 
 pub fn clearAppliedSequenceTxn(txn: anytype, index_name: []const u8) !void {
     var mutable_txn = txn;
-    try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
+    try @import("../artifact/projection_epoch.zig").revoke(mutable_txn);
     var key_buf: [256]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
     mutable_txn.delete(key) catch |err| switch (err) {
@@ -599,8 +599,8 @@ fn loadProjectionCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, inde
 test "ordered artifact inventory projection snapshot owns a coherent checkpoint and publication fence" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const publication = @import("../artifact_publication.zig");
-    const epoch = @import("../artifact_projection_epoch.zig");
+    const publication = @import("../artifact/publication.zig");
+    const epoch = @import("../artifact/projection_epoch.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-snapshot", .{tmp.sub_path});
@@ -667,8 +667,8 @@ test "ordered artifact inventory projection snapshot owns a coherent checkpoint 
 test "ordered artifact inventory projection sidecar transitions revoke completion before publication" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const publication = @import("../artifact_publication.zig");
-    const epoch = @import("../artifact_projection_epoch.zig");
+    const publication = @import("../artifact/publication.zig");
+    const epoch = @import("../artifact/projection_epoch.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-epoch", .{tmp.sub_path});
@@ -758,7 +758,7 @@ fn revokeCompletion(alloc: Allocator, store: anytype) !void {
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
-    try @import("../artifact_projection_epoch.zig").revoke(&txn);
+    try @import("../artifact/projection_epoch.zig").revoke(&txn);
     try txn.commit();
 }
 

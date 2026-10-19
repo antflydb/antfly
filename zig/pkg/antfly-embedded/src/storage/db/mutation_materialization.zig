@@ -25,7 +25,7 @@ const ant_json = @import("antfly-json");
 const appendOwnedKey = @import("owned_keys.zig").appendOwnedKey;
 const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
 const apply_state = @import("derived/apply_state.zig");
-const artifact_ids = @import("artifact_ids.zig");
+const artifact_ids = @import("artifact/ids.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const backend_types = @import("../backend_types.zig");
 const build_options = @import("build_options");
@@ -43,8 +43,8 @@ const collectSparseFieldWritesProfiled = @import("replay_vector_collectors.zig")
 const denseEmbeddingDocKeySet = @import("replay_vector_collectors.zig").denseEmbeddingDocKeySet;
 const derived_types = @import("derived/derived_types.zig");
 const docstore_mod = @import("../docstore.zig");
-const document_child_range_effects = @import("document_child_range_effects.zig");
-const document_child_range_outbox = @import("document_child_range_outbox.zig");
+const document_child_range_effects = @import("document/child_range_effects.zig");
+const document_child_range_outbox = @import("document/child_range_outbox.zig");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
 const document_unit_fingerprint = @import("enrichment/document_unit_fingerprint.zig");
 const embedder_mod = @import("enrichment/embedder.zig");
@@ -64,7 +64,7 @@ const hbc_mod = @import("../hbc_adapter.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const internal_keys = @import("../internal_keys.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const relational_store = @import("relational_store.zig");
 const resolver_lib = @import("antfly_resolver");
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -768,7 +768,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
 
-        pub fn artifactMaterializationsReady(self: anytype, txn: anytype, catalogs: @import("artifact_inventory.zig").Catalogs) !bool {
+        pub fn artifactMaterializationsReady(self: anytype, txn: anytype, catalogs: @import("artifact/inventory.zig").Catalogs) !bool {
             if (!try S.ownerField(self, "core").*.index_manager.matchesArtifactInventory(catalogs)) return false;
             const prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(S.ownerField(self, "alloc").*);
             defer S.ownerField(self, "alloc").*.free(prefix);
@@ -2776,7 +2776,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .doc_key = owned_doc_key,
                     .outcome = outcome,
                 });
-                const readiness = @import("artifact_producer_readiness.zig");
+                const readiness = @import("artifact/producer_readiness.zig");
                 const sources = try S.ownerField(db, "core").*.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
                 defer {
                     for (sources) |source| alloc.free(source);
@@ -2839,7 +2839,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var groups = grouped.iterator();
             while (groups.next()) |group| {
                 const index_name = group.key_ptr.*;
-                const generation = index_manager.coverageGenerationForIndex(@import("artifact_producer_readiness.zig").localScopeIndex(index_name)) orelse continue;
+                const generation = index_manager.coverageGenerationForIndex(@import("artifact/producer_readiness.zig").localScopeIndex(index_name)) orelse continue;
                 // Multiple generated requests may feed one index for the same source
                 // document. The strongest exact terminal result wins deterministically.
                 const final_outcomes = group.value_ptr;
@@ -2866,8 +2866,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         entry.key_ptr.*,
                     );
                     errdefer alloc.free(marker_key);
-                    if (!std.mem.eql(u8, index_name, @import("artifact_producer_readiness.zig").localScopeIndex(index_name))) {
-                        const revision_key = try @import("artifact_producer_readiness.zig").localReceiptRevisionKeyAlloc(alloc, marker_key);
+                    if (!std.mem.eql(u8, index_name, @import("artifact/producer_readiness.zig").localScopeIndex(index_name))) {
+                        const revision_key = try @import("artifact/producer_readiness.zig").localReceiptRevisionKeyAlloc(alloc, marker_key);
                         owned_keys.append(alloc, revision_key) catch |err| {
                             alloc.free(revision_key);
                             return err;
@@ -7168,7 +7168,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 alloc.free(sources);
             }
             for (sources) |source| {
-                const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_name, source, pinned.plan());
+                const scope = try @import("artifact/producer_readiness.zig").localScopeAlloc(alloc, index_name, source, pinned.plan());
                 defer alloc.free(scope);
                 try deleteDerivedCoverageScopeForDocKeys(alloc, store, scope, generation, doc_keys);
             }
@@ -7223,7 +7223,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 counts[i] = try derivedCoverageOutcomeCounterValueForTxn(scratch, &txn, index_name, generation, @tagName(outcome));
             }
             var removed_counts = @as([outcomes.len]u64, @splat(0));
-            const readiness = @import("artifact_producer_readiness.zig");
+            const readiness = @import("artifact/producer_readiness.zig");
             const source_specific = !std.mem.eql(u8, index_name, readiness.localScopeIndex(index_name));
             for (doc_keys) |doc_key| {
                 const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(scratch, index_name, generation, doc_key);

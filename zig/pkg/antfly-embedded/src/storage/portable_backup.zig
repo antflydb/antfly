@@ -37,8 +37,8 @@ const SchemaSpool = @import("schema_spool.zig").Spool;
 const public_table_schema = @import("../schema/mod.zig");
 const source_snapshot = @import("source_snapshot.zig");
 const db_types = @import("db/types.zig");
-const artifact_ids = @import("db/artifact_ids.zig");
-const producer_provenance = @import("db/artifact_producer_provenance.zig");
+const artifact_ids = @import("db/artifact/ids.zig");
+const producer_provenance = @import("db/artifact/producer_provenance.zig");
 const source_proof_batch = @import("db/source_proof_batch.zig");
 const enrichment_artifact_codec = @import("db/enrichment/artifact_codec.zig");
 const index_manager = @import("db/catalog/index_manager.zig");
@@ -458,7 +458,7 @@ pub const SourceCopyProof = struct {
     }
 };
 pub const CohortProof = struct {
-    seal: @import("db/native_backup_seal.zig").Handle,
+    seal: @import("db/native/backup_seal.zig").Handle,
     namespace: doc_identity.Namespace,
 
     pub fn encode(self: CohortProof) ![168]u8 {
@@ -532,7 +532,7 @@ pub fn exportPortableToWriterWithOptions(
     };
     var scan = try store.beginReadTxn();
     defer scan.abort();
-    try @import("db/artifact_reconcile_intent.zig").requireAbsent(&scan);
+    try @import("db/artifact/reconcile_intent.zig").requireAbsent(&scan);
     const source_summary: ?[]SourceGenerationAdmissionSummaryEntry = if (options.source_generation_summary_output) |output|
         try sourceGenerationAdmissionSummaryTxnAlloc(output.alloc, &scan, options.cohort.?)
     else
@@ -799,7 +799,7 @@ test "portable backup namespace seeks preserve adjacent binary and legacy keys" 
 }
 
 fn exportSourceProofs(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput, range: @import("byte_range.zig").ByteRange, namespace: [24]u8) !void {
-    const publication = @import("db/artifact_publication.zig");
+    const publication = @import("db/artifact/publication.zig");
     const active = (try publication.authority(scan)) orelse return;
     if (!std.mem.eql(u8, &active.namespace, &namespace)) return error.SourceSnapshotCutMismatch;
     const scoped = try std.mem.concat(alloc, u8, &.{ producer_provenance.prefix, &active.namespace });
@@ -3963,7 +3963,7 @@ fn validateSourceProofBatch(alloc: Allocator, payload: []const u8, archive: *Por
 
 test "ordered artifact inventory source proof export restores inert selected evidence" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
+    const publication = @import("db/artifact/publication.zig");
     var source_tmp = std.testing.tmpDir(.{});
     defer source_tmp.cleanup();
     var destination_tmp = std.testing.tmpDir(.{});
@@ -4204,7 +4204,7 @@ test "relational index system source snapshot certificate survives transfer rest
     const io = std.testing.io;
     const DB = @import("db/mod.zig").DB;
     const retained = @import("retained_effects.zig");
-    const native = @import("db/native_backup.zig");
+    const native = @import("db/native/backup.zig");
     const cut: source_snapshot.Cut = .{ .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .applied_index = 11, .retained_start = 0 };
     const padding = try alloc.alloc(u8, 3 * 1024 * 1024);
     defer alloc.free(padding);

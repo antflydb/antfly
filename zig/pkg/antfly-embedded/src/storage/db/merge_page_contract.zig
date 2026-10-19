@@ -47,7 +47,7 @@ pub fn validateArtifactEffect(source: Source, key_bytes: []const u8, value: ?[]c
 }
 
 pub fn validateProvenanceKey(source: Source, key_bytes: []const u8) !void {
-    var namespace: @import("artifact_publication.zig").Namespace = undefined;
+    var namespace: @import("artifact/publication.zig").Namespace = undefined;
     @import("doc_identity.zig").encodeNamespace(&namespace, source.namespace);
     _ = try @import("source_proof_batch.zig").transferDigest(namespace, source.pin_digest, key_bytes);
 }
@@ -97,7 +97,7 @@ pub const Source = struct {
     applied_index: u64,
     retention: ?Retention = null,
     integrity: ?IntegrityBinding = null,
-    artifact_catalog: ?@import("artifact_inventory.zig").Binding = null,
+    artifact_catalog: ?@import("artifact/inventory.zig").Binding = null,
     provenance_required: bool = false,
 
     pub fn jsonStringify(self: @This(), stream: anytype) !void {

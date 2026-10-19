@@ -17,7 +17,7 @@
 //! carries only immutable evidence identity; followers recapture their local
 //! read sets and never accept donor positions or copied receipt bytes.
 const std = @import("std");
-const Digest = @import("artifact_publication.zig").Digest;
+const Digest = @import("artifact/publication.zig").Digest;
 const Attempt = @import("relational_integrity_handoff_contract.zig").MergeCopyAttempt;
 const pages = @import("merge_page_contract.zig");
 const merge = @import("merge_state.zig");

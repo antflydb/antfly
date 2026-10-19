@@ -1427,7 +1427,7 @@ pub fn backupStorageKernelOwnerDb(
     return backupStorageKernelOwnerDbWithControl(alloc, db, db_path, group_id, backup_root, backup_id, format, null, null, .{ .deadline_ns = std.math.maxInt(u64) });
 }
 
-pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
+pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native/backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
     if (comptime storage_engine.enabled) return storage_engine.call("writeBackupStorageKernelOwnerDbWithControl", .{ alloc, db, db_path, group_id, backup_root, backup_id, format, cohort, sealed, control });
     try control.ensureActive();
     if (cohort) |fence| {
@@ -2187,7 +2187,7 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
 
 pub const PortableCohortSource = struct {
     db: *db_mod.DB,
-    handle: @import("db/native_backup_seal.zig").Handle,
+    handle: @import("db/native/backup_seal.zig").Handle,
     cancellation: @import("../api/operation.zig").CancellationToken,
     source_generation_summary_output: ?*?[]portable_backup.SourceGenerationAdmissionSummaryEntry = null,
 };

@@ -22,11 +22,11 @@ const types = @import("types.zig");
 const db_core = @import("core.zig");
 const docstore_mod = @import("../docstore.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
-const artifact_ids = @import("artifact_ids.zig");
+const artifact_ids = @import("artifact/ids.zig");
 const internal_keys = @import("../internal_keys.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const db_query_projection = @import("query/projection.zig");
-const assetContentTypeIsJson = @import("document_collectors.zig").assetContentTypeIsJson;
+const assetContentTypeIsJson = @import("document/collectors.zig").assetContentTypeIsJson;
 const freeJsonValue = db_query_projection.freeJsonValue;
 const cloneJsonValue = db_query_projection.cloneJsonValue;
 const putOwnedValue = db_query_projection.putOwnedValue;
@@ -42,7 +42,7 @@ pub fn loadChunkFieldValueTxn(self: Source, alloc: Allocator, doc_key: []const u
     }
     // One logical scan pins heads and members together, skips obsolete tails,
     // and owns no second copy of the raw output set beside projected JSON.
-    var cursor = try @import("artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).open(alloc, read_txn.?, doc_key);
+    var cursor = try @import("artifact/chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).open(alloc, read_txn.?, doc_key);
     defer cursor.close();
 
     var chunks_obj = std.json.ObjectMap.empty;
@@ -953,7 +953,7 @@ test "public graph metric borrowed wire selected embeddings retain only selected
             defer if (compact) |*owner| owner.deinit(budget.allocator());
             var stream = if (mode == 1) try openEmbeddingStreamTxn(.{ .core = undefined }, budget.allocator(), "doc", &read) else null;
             defer if (stream) |*owner| owner.deinit();
-            const query = @import("document_query.zig");
+            const query = @import("document/query.zig");
             var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = fields, .include_all_fields = false })).?;
             defer plan.deinit();
             const sources = [_]query.ProjectionSource{.{ .name = "_embeddings", .embeddings = if (compact) |*owner| owner else null, .embedding_stream = if (stream) |*owner| owner else null }};

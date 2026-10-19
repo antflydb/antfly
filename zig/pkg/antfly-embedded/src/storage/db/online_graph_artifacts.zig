@@ -22,8 +22,8 @@ const keys = @import("../internal_keys.zig");
 const codec = @import("enrichment/artifact_codec.zig");
 const states = @import("graph_asset_state.zig");
 const contenders = @import("graph_edge_contender.zig");
-const catalogs = @import("artifact_inventory.zig");
-const view = @import("artifact_catalog_view.zig");
+const catalogs = @import("artifact/inventory.zig");
+const view = @import("artifact/catalog_view.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Effect = struct {

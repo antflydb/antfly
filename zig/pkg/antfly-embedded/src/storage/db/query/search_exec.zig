@@ -18,7 +18,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const aggregations_mod = @import("../aggregations.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
-const artifact_ids = @import("../artifact_ids.zig");
+const artifact_ids = @import("../artifact/ids.zig");
 const runtime_schema_mod = @import("../../schema.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -41,7 +41,7 @@ const runtime_preflight = @import("../runtime_preflight.zig");
 const control_contract = @import("control_contract.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
-const mapper_mod = @import("../document_mapper.zig");
+const mapper_mod = @import("../document/mapper.zig");
 const schema_api = @import("../../../schema/mod.zig");
 const persistent_mod = @import("../../persistent.zig");
 const hbc_mod = @import("../../hbc_adapter.zig");
@@ -32780,7 +32780,7 @@ test "external lake ordinal identity projection avoids stored key I/O and preser
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    const mapper = @import("../document_mapper.zig");
+    const mapper = @import("../document/mapper.zig");
     const docs = try ca.alloc(mapper.MapperDoc, 4000);
     var random = std.Random.DefaultPrng.init(73);
     for (docs, 0..) |*doc, i| {

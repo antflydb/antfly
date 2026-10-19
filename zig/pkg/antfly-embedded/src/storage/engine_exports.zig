@@ -252,19 +252,19 @@ pub fn relationalSessionNormalizeRows(session: *@import("db/relational_read_sess
     return .{ .value = session.normalizeRows(alloc, writes) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-pub fn documentSessionDeinit(self: *@import("db/document_rows.zig").Session) engine.Outcome(void) {
+pub fn documentSessionDeinit(self: *@import("db/document/rows.zig").Session) engine.Outcome(void) {
     return .{ .value = self.deinit() };
 }
 
-pub fn documentSessionRangeProofs(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator) engine.Outcome([]@import("range_protection.zig").Proof) {
+pub fn documentSessionRangeProofs(self: *@import("db/document/rows.zig").Session, alloc: std.mem.Allocator) engine.Outcome([]@import("range_protection.zig").Proof) {
     return .{ .value = self.rangeProofs(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-pub fn documentSessionNormalizeRows(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) engine.Outcome([]types.BatchWrite) {
+pub fn documentSessionNormalizeRows(self: *@import("db/document/rows.zig").Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) engine.Outcome([]types.BatchWrite) {
     return .{ .value = self.normalizeRows(alloc, writes) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-pub fn documentSessionNext(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, limit: u32) engine.Outcome(@import("relational_read_view.zig").View.Page) {
+pub fn documentSessionNext(self: *@import("db/document/rows.zig").Session, alloc: std.mem.Allocator, limit: u32) engine.Outcome(@import("relational_read_view.zig").View.Page) {
     return .{ .value = self.next(alloc, limit) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -290,7 +290,7 @@ pub fn statementFenceRelease(fence: *DB.StatementReadFence) engine.Outcome(void)
 pub fn relationalRowsUnderLease(lease: *const DB.QueryReadLease, alloc: Allocator, fields: []const []const u8, version: u32) engine.Outcome(@import("db/relational_rows.zig").Reader) {
     return .{ .value = lease.relationalRows(alloc, fields, version) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
-pub fn exportBackupCohortPortable(self: *DB, handle: @import("db/native_backup_seal.zig").Handle, writer: engine.WriterBorrow, options: engine.PortableExportOptions, cancellation: types.CancellationToken) engine.Outcome(void) {
+pub fn exportBackupCohortPortable(self: *DB, handle: @import("db/native/backup_seal.zig").Handle, writer: engine.WriterBorrow, options: engine.PortableExportOptions, cancellation: types.CancellationToken) engine.Outcome(void) {
     var receiving_writer = writer.receive();
     var spool_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (options.spool) |spool| spool.io.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
     var received_options = options.value;
@@ -529,7 +529,7 @@ pub fn writeBackupStorageKernelOwnerDb(alloc: std.mem.Allocator, database: *@imp
     return .{ .value = @import("write.zig").backupStorageKernelOwnerDb(alloc, database, db_path, group_id, backup_root, backup_id, format) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-pub fn writeBackupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: @import("../api/backups.zig").BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: @import("../api/backups.zig").BackupOperationControl) engine.Outcome([]@import("../api/backups.zig").ShardSnapshot) {
+pub fn writeBackupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: @import("../api/backups.zig").BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native/backup_seal_contract.zig").Handle, control: @import("../api/backups.zig").BackupOperationControl) engine.Outcome([]@import("../api/backups.zig").ShardSnapshot) {
     return .{ .value = @import("write.zig").backupStorageKernelOwnerDbWithControl(alloc, database, db_path, group_id, backup_root, backup_id, format, cohort, sealed, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -733,19 +733,19 @@ pub fn restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(staged_genera
     return .{ .value = DB.restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(staged_generation, alloc, received_io, snapshot_root, path, opts, identity, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-pub fn restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, primary_snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, native_generation: *@import("db/native_backup.zig").LoadedManifest, cancellation: types.CancellationToken) engine.Outcome(void) {
+pub fn restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, primary_snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, native_generation: *@import("db/native/backup.zig").LoadedManifest, cancellation: types.CancellationToken) engine.Outcome(void) {
     var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
     const received_io = receiver.io();
     return .{ .value = DB.restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(staged_generation, alloc, received_io, primary_snapshot_root, path, opts, identity, native_generation, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-pub fn restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, primary_snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, native_generation: *@import("db/native_backup.zig").LoadedManifest, cancellation: types.CancellationToken) engine.Outcome(void) {
+pub fn restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, primary_snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, native_generation: *@import("db/native/backup.zig").LoadedManifest, cancellation: types.CancellationToken) engine.Outcome(void) {
     var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
     const received_io = receiver.io();
     return .{ .value = DB.restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(staged_generation, alloc, received_io, primary_snapshot_root, path, opts, identity, native_generation, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-pub fn finishMaterializedNativeGenerationWithIo(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, path: []const u8, opts: db.OpenOptions, native_generation: *@import("db/native_backup.zig").LoadedManifest, complete_runtime_repair: bool) engine.Outcome(void) {
+pub fn finishMaterializedNativeGenerationWithIo(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, path: []const u8, opts: db.OpenOptions, native_generation: *@import("db/native/backup.zig").LoadedManifest, complete_runtime_repair: bool) engine.Outcome(void) {
     var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
     const received_io = receiver.io();
     return .{ .value = DB.finishMaterializedNativeGenerationWithIo(staged_generation, alloc, received_io, path, opts, native_generation, complete_runtime_repair) catch |err| return .{ .failure = .init(@errorName(err)) } };

@@ -79,7 +79,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, request: wire.Request, cancellatio
             const expected = progress.artifact_catalog orelse return error.ArtifactCatalogDrift;
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
-            var ordered = (try @import("artifact_inventory.zig").load(alloc, &read)) orelse return error.ArtifactCatalogDrift;
+            var ordered = (try @import("artifact/inventory.zig").load(alloc, &read)) orelse return error.ArtifactCatalogDrift;
             defer ordered.deinit();
             if (!std.meta.eql(ordered.value.command.binding, expected)) return error.ArtifactCatalogDrift;
             // These are the immutable bytes bound before snapshot publication,
@@ -897,7 +897,7 @@ pub fn requireSnapshotIndexes(db: *DB, alloc: Allocator, identity: pages.Source,
     if (identity.artifact_catalog) |binding| {
         var txn = try db.core.store.beginProbeTxn();
         defer txn.abort();
-        try @import("artifact_inventory.zig").requireReady(alloc, &txn, scope_namespace: {
+        try @import("artifact/inventory.zig").requireReady(alloc, &txn, scope_namespace: {
             var namespace: [24]u8 = undefined;
             @import("doc_identity.zig").encodeNamespace(&namespace, identity.namespace);
             break :scope_namespace namespace;

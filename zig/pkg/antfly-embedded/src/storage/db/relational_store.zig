@@ -14,8 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const document_mapper = @import("document_mapper.zig");
-const document_content_hash = @import("document_content_hash.zig");
+const document_mapper = @import("document/mapper.zig");
+const document_content_hash = @import("document/content_hash.zig");
 const internal_keys = @import("../internal_keys.zig");
 const schema = @import("../schema.zig");
 const row_codec = @import("algebraic/relational_row_codec.zig");

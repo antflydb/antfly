@@ -1069,7 +1069,7 @@ fn testPublication(comptime Backend: type) !void {
     try std.testing.expectEqual(@as(u64, 2), current.head.revision);
     try std.testing.expectEqual(@as(u64, 1), pinned.head.revision);
     try std.testing.expect(!batch.isForPlan(current.plan));
-    var prepared_row = try @import("document_mapper.zig").PreparedRelationalWrite.init(alloc, "row", "{\"id\":7,\"label\":\"a\"}", null, view.tableSchema().*, view.physicalLayout());
+    var prepared_row = try @import("document/mapper.zig").PreparedRelationalWrite.init(alloc, "row", "{\"id\":7,\"label\":\"a\"}", null, view.tableSchema().*, view.physicalLayout());
     defer prepared_row.deinit(alloc);
     // The retired snapshot remains usable for its owner, but is fenced out
     // from committing by the current-plan identity above.

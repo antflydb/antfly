@@ -20,7 +20,7 @@
 const std = @import("std");
 const arrays = @import("array_value.zig");
 pub const layout = @import("../common/sql_array_layout.zig");
-const canonical_json = @import("../storage/db/document_content_hash.zig");
+const canonical_json = @import("../storage/db/document/content_hash.zig");
 const json_order = @import("json_order.zig");
 const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");

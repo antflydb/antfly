@@ -1485,8 +1485,8 @@ test "relational integrity topology durable backup metadata scaling benchmark" {
         // corpus bytes; timings are diagnostic rather than flaky assertions.
         const linked = try std.fmt.allocPrint(alloc, "{s}/runs/{d}.tbl", .{ target, checkpoint.run_ids[0] });
         defer alloc.free(linked);
-        const before = try @import("native_backup.zig").statRegularFile(std.testing.io, checkpoint.run_paths[0]);
-        const after = try @import("native_backup.zig").statRegularFile(std.testing.io, linked);
+        const before = try @import("native/backup.zig").statRegularFile(std.testing.io, checkpoint.run_paths[0]);
+        const after = try @import("native/backup.zig").statRegularFile(std.testing.io, linked);
         try std.testing.expectEqual(before.inode, after.inode);
         std.debug.print("\nbackup durable seal benchmark runs={} corpus_bytes={} metadata_ns={}\n", .{ checkpoint.run_ids.len, bytes, elapsed });
     }
@@ -1494,7 +1494,7 @@ test "relational integrity topology durable backup metadata scaling benchmark" {
 
 test "relational integrity topology durable backup seal survives restart and later writes" {
     const alloc = std.testing.allocator;
-    const seal = @import("native_backup_seal.zig");
+    const seal = @import("native/backup_seal.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/seal-source", .{tmp.sub_path});

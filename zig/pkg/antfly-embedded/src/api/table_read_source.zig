@@ -950,7 +950,7 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         input: []const u8,
     ) !?query_api.QueryResponse {
-        const bound = try @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc(alloc, input, group_id);
+        const bound = try @import("../storage/db/native/query_cut_contract.zig").bindBodyAlloc(alloc, input, group_id);
         defer if (bound) |bytes| alloc.free(bytes);
         const body = bound orelse input;
         if (self.route_fence) |fence| {
@@ -968,7 +968,7 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         input: []const u8,
     ) !?query_api.QueryResponse {
-        const bound = try @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc(alloc, input, group_id);
+        const bound = try @import("../storage/db/native/query_cut_contract.zig").bindBodyAlloc(alloc, input, group_id);
         defer if (bound) |bytes| alloc.free(bytes);
         const body = bound orelse input;
         if (self.route_fence) |fence| {
@@ -1521,4 +1521,4 @@ test "scan stream preserves chunk backpressure without buffered fallback" {
     try std.testing.expectEqual(@as(usize, 0), fake.buffered_calls);
 }
 
-pub const bindNativeCutBodyAlloc = @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc;
+pub const bindNativeCutBodyAlloc = @import("../storage/db/native/query_cut_contract.zig").bindBodyAlloc;

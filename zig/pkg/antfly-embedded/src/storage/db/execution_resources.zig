@@ -19,7 +19,7 @@
 
 const materialized_sources = @import("materialized_sources.zig");
 
-const document_child_range_outbox = @import("document_child_range_outbox.zig");
+const document_child_range_outbox = @import("document/child_range_outbox.zig");
 
 const std = @import("std");
 
@@ -59,7 +59,7 @@ const internal_keys = @import("../internal_keys.zig");
 
 const doc_identity = @import("doc_identity.zig");
 
-const document_content_hash = @import("document_content_hash.zig");
+const document_content_hash = @import("document/content_hash.zig");
 
 const doc_set = @import("doc_set.zig");
 
@@ -131,7 +131,7 @@ const platform_clock = @import("antfly_platform").clock;
 
 const platform_time = @import("antfly_platform").time;
 
-const ArtifactPublicationDispatcher = @import("artifact_publication.zig").Dispatcher;
+const ArtifactPublicationDispatcher = @import("artifact/publication.zig").Dispatcher;
 
 pub const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
 
@@ -218,7 +218,7 @@ pub const AsyncContext = struct {
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_admission: @import("dense_publication_admission.zig").Owner = .{},
-    native_projection_owner: @import("native_projection_owner.zig").Owner = .{},
+    native_projection_owner: @import("native/projection_owner.zig").Owner = .{},
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     index_repair_replay_pinned: std.atomic.Value(bool) = .init(false),
     index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
@@ -1015,7 +1015,7 @@ pub const BatchExecutionOptions = struct {
     restore_replication_request: ?types.BatchRequest = null,
     /// Borrowed upload identity. Finalization retires staged bytes in the
     /// same transaction as either accepted effects or a durable rejection.
-    artifact_upload_finalize: ?@import("artifact_publication_transport.zig").Finalization = null,
+    artifact_upload_finalize: ?@import("artifact/publication_transport.zig").Finalization = null,
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
     snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease = null,
@@ -1090,7 +1090,7 @@ pub const ShadowState = struct {
 
 pub const LocalExecutionState = struct {
     /// Optional generation hint, accessed only under the physical query-pin guard.
-    native_query_reuse: ?@import("native_query_reuse.zig").State = null,
+    native_query_reuse: ?@import("native/query_reuse.zig").State = null,
     native_query_reuse_epoch: [16]u8 = @splat(0),
     native_query_reuse_epoch_ready: bool = false,
     table_storage: table_storage_mod.Settings = .{},
@@ -2246,7 +2246,7 @@ pub fn stopNativeProjectionMaintenance(ctx: *AsyncContext) void {
 
 const graph_restore_materialization = @import("graph_restore_materialization.zig");
 
-const document_child_range_effects = @import("document_child_range_effects.zig");
+const document_child_range_effects = @import("document/child_range_effects.zig");
 
 const durable_outbox = @import("durable_outbox.zig");
 

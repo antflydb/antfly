@@ -17,10 +17,10 @@
 //! plus selected-output bitmaps, never copied receipt or authority records.
 const std = @import("std");
 const missingAsNull = @import("../backend_types.zig").missingAsNull;
-const provenance = @import("artifact_producer_provenance.zig");
-const publication = @import("artifact_publication.zig");
-const inventory = @import("artifact_inventory.zig");
-const catalog_view = @import("artifact_catalog_view.zig");
+const provenance = @import("artifact/producer_provenance.zig");
+const publication = @import("artifact/publication.zig");
+const inventory = @import("artifact/inventory.zig");
+const catalog_view = @import("artifact/catalog_view.zig");
 
 pub const import_prefix = "\x00\x00__metadata__:source_proof:";
 pub const merge_prefix = "\x00\x00__metadata__:merge_source_proof:";

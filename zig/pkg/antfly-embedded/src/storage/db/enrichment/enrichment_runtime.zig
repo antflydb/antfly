@@ -27,8 +27,8 @@ const inference_request_context = @import("antfly_inference_execution_context");
 const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const docstore_mod = @import("../../docstore.zig");
-const ordered_publication = @import("../artifact_publication.zig");
-const producer_input = @import("../artifact_producer_input.zig");
+const ordered_publication = @import("../artifact/publication.zig");
+const producer_input = @import("../artifact/producer_input.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const mem_backend = @import("../../mem_backend.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -64,7 +64,7 @@ const document_extraction_client = if (!builtin.is_test and build_options.linked
 else
     struct {};
 const document_unit_fingerprint = @import("document_unit_fingerprint.zig");
-const artifact_ids = @import("../artifact_ids.zig");
+const artifact_ids = @import("../artifact/ids.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
 else
@@ -91,7 +91,7 @@ const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi 
     @import("../scraping_stub.zig")
 else
     @import("antfly_scraping");
-const mapper = @import("../document_mapper.zig");
+const mapper = @import("../document/mapper.zig");
 const relational_store = @import("../relational_store.zig");
 
 var activity_epoch_salt = @import("antfly_platform").atomic.Value(u64).init(1);
@@ -301,7 +301,7 @@ pub const GeneratedRecordBatch = derived_types.DerivedBatch;
 
 pub const ArtifactUnitTurnCommit = struct {
     ptr: *anyopaque,
-    commit: *const fn (*anyopaque, ?*const @import("../artifact_unit_jobs.zig").DocumentTurn, ?*const @import("../artifact_unit_jobs.zig").WorkTurn) anyerror!void,
+    commit: *const fn (*anyopaque, ?*const @import("../artifact/unit_jobs.zig").DocumentTurn, ?*const @import("../artifact/unit_jobs.zig").WorkTurn) anyerror!void,
 };
 pub const RequestFailure = struct {
     kind: enrichment_types.GeneratedEnrichmentKind,
@@ -4282,7 +4282,7 @@ const AssetProducerBatchItem = struct {
     artifact_key: []u8,
     state_key: []u8,
     state_value: []u8,
-    producer_context: ?@import("../artifact_producer_context.zig").Token = null,
+    producer_context: ?@import("../artifact/producer_context.zig").Token = null,
 
     fn asRequest(self: *const @This()) asset_producer_mod.Request {
         return .{
@@ -11990,7 +11990,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
 pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []const u8, guard: ForegroundCatchUpGuard) !void {
     const store = runtime.artifact_store orelse return;
     if (runtime.config.root_incarnation == 0) return;
-    const unit_jobs = @import("../artifact_unit_jobs.zig");
+    const unit_jobs = @import("../artifact/unit_jobs.zig");
     {
         // Most documents have no unit outbox. Check absence with point reads
         // before acquiring a cursor-capable primary snapshot.
@@ -12739,7 +12739,7 @@ fn processAsset(
         if (context) |*value| {
             var read = try runtime.store.beginProbe();
             defer read.abort();
-            break :blk try @import("../artifact_asset_publication.zig").readUpstream(runtime.alloc, value, &read, upstream_key);
+            break :blk try @import("../artifact/asset_publication.zig").readUpstream(runtime.alloc, value, &read, upstream_key);
         }
         break :blk try storeGetOptionalAllocWithRetry(runtime, upstream_key);
     } else try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request)) orelse {
@@ -13456,7 +13456,7 @@ fn runtimeDocumentExtractionReprocessPending(
     producer_json: []const u8,
     generation: u64,
 ) !bool {
-    const intent = @import("../artifact_reprocess_intent.zig");
+    const intent = @import("../artifact/reprocess_intent.zig");
     const intent_key = try intent.keyAlloc(runtime.alloc, doc_key, artifact_name);
     defer runtime.alloc.free(intent_key);
     const requested = try storeGetOptionalAllocWithRetry(runtime, intent_key);
@@ -13466,7 +13466,7 @@ fn runtimeDocumentExtractionReprocessPending(
 }
 
 pub fn embeddingReprocessGeneration(runtime: *EnrichmentRuntime, doc_key: []const u8, embedding_name: []const u8, producer_json: []const u8) !u64 {
-    const intent = @import("../artifact_reprocess_intent.zig");
+    const intent = @import("../artifact/reprocess_intent.zig");
     const key = try intent.embeddingKeyAlloc(runtime.alloc, doc_key, embedding_name);
     defer runtime.alloc.free(key);
     const raw = try storeGetOptionalAllocWithRetry(runtime, key);
@@ -21841,7 +21841,7 @@ fn publishOrderedUnitChunks(runtime: *EnrichmentRuntime, parent_request: enrichm
 
 /// Scoped outbox callbacks cannot silently rebind stale work to a new parent.
 /// Retirement is separate and requires a current accepted-result receipt.
-fn publishOrderedUnitJob(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, job: @import("../artifact_unit_jobs.zig").Job) !void {
+fn publishOrderedUnitJob(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, job: @import("../artifact/unit_jobs.zig").Job) !void {
     if (!std.mem.eql(u8, parent_request.doc_key, job.document) or job.child.len == 0 or std.mem.allEqual(u8, &job.generation, 0)) return error.InvalidBatchRequest;
     return publishOrderedUnitChunksGeneration(runtime, parent_request, job.child, job.unit, job.generation);
 }
@@ -21856,7 +21856,7 @@ fn publishOrderedUnitChunksGeneration(runtime: *EnrichmentRuntime, parent_reques
     return publishOrderedUnitChunksGenerationWithAllocator(runtime, alloc, parent_request, producer_name, unit_key, generation) catch |err| {
         if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
         if (err == error.ArtifactCoverageBaselinePending) {
-            var identity = (try @import("../artifact_ids.zig").decodeArtifactRefAlloc(alloc, unit_key)) orelse return error.InvalidBatchRequest;
+            var identity = (try @import("../artifact/ids.zig").decodeArtifactRefAlloc(alloc, unit_key)) orelse return error.InvalidBatchRequest;
             defer identity.deinit(alloc);
             const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .chunk_text, .index_name = "", .artifact_name = producer_name, .doc_key = parent_request.doc_key, .source_field = "", .upstream_artifact_name = parent_request.artifact_name };
             try driveOrderedChunkInventoryScoped(runtime, request, identity.unit_id orelse return error.InvalidBatchRequest);
@@ -21871,8 +21871,8 @@ fn publishOrderedUnitChunksWithAllocator(runtime: *EnrichmentRuntime, alloc: All
 }
 
 fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8, generation: ?ordered_publication.Digest) !void {
-    const publication = @import("../artifact_chunk_publication.zig");
-    const inventory = @import("../artifact_chunk_manifest.zig");
+    const publication = @import("../artifact/chunk_publication.zig");
+    const inventory = @import("../artifact/chunk_manifest.zig");
     const enrichment_catalog = @import("../catalog/enrichment_catalog.zig");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -21904,7 +21904,7 @@ fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, 
     defer input.deinit();
     var desired: []chunker_mod.Chunk = &.{};
     defer chunker_mod.freeChunks(alloc, desired);
-    var identity = (try @import("../artifact_ids.zig").decodeArtifactRefAlloc(alloc, unit_key)) orelse return error.InvalidDocumentExtractionManifest;
+    var identity = (try @import("../artifact/ids.zig").decodeArtifactRefAlloc(alloc, unit_key)) orelse return error.InvalidDocumentExtractionManifest;
     defer identity.deinit(alloc);
     var unit: document_extraction_mod.Unit = undefined;
     var fingerprint: []const u8 = "";
@@ -22098,10 +22098,10 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
     const artifact_name = requestArtifactName(request);
     const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
     defer alloc.free(artifact_key);
-    const extraction = @import("../artifact_extraction_generation.zig");
-    const scope = try @import("../artifact_generation_scope.zig").extractionKeyAlloc(alloc, request.doc_key, artifact_name);
+    const extraction = @import("../artifact/extraction_generation.zig");
+    const scope = try @import("../artifact/generation_scope.zig").extractionKeyAlloc(alloc, request.doc_key, artifact_name);
     defer alloc.free(scope);
-    var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+    var borrowed: @import("../artifact/chunk_cursor.zig").BorrowedRead = .{ .read = &read };
     var selected = try extraction.View(@TypeOf(borrowed)).open(alloc, &borrowed, scope);
     defer if (selected) |*view| view.deinit();
     const stored = if (selected) |*view|
@@ -22119,7 +22119,7 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
         if ((stored == null) != (observed == null)) return error.EnrichmentSourceChanged;
         if (stored) |value| if (!std.mem.eql(u8, value, observed.?)) return error.EnrichmentSourceChanged;
     }
-    const context = try @import("../artifact_graph_planning.zig").Context.createWithProof(alloc, &read, request.doc_key, artifact_name, proof_key, proof_value);
+    const context = try @import("../artifact/graph_planning.zig").Context.createWithProof(alloc, &read, request.doc_key, artifact_name, proof_key, proof_value);
     defer context.destroy();
     context.ttl_now_ns = runtime.clock.nowRealtimeNs();
     var window: GeneratedReplayWindow = .{ .alloc = alloc };
@@ -22141,7 +22141,7 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
         encoded.deinit(alloc);
     }
     for (context.commands.items) |command| {
-        const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, command);
+        const bytes = try @import("../artifact/publication_transport_codec.zig").encodeAlloc(alloc, command);
         errdefer alloc.free(bytes);
         try encoded.append(alloc, bytes);
     }
@@ -23808,8 +23808,8 @@ fn processOrderedChunkVectorRequest(
 /// No local write/queue acknowledgement can replace the ordered census page.
 /// False requests materialization; true still means replay must remain pending
 /// until upstream closure and obligation discharge have been certified.
-fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, limits: @import("../artifact_stream_census.zig").Limits) !bool {
-    const progress = @import("../artifact_stream_progress.zig");
+fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, limits: @import("../artifact/stream_census.zig").Limits) !bool {
+    const progress = @import("../artifact/stream_progress.zig");
     var encoded: ?[]u8 = null;
     defer if (encoded) |bytes| alloc.free(bytes);
     var namespace: ordered_publication.Namespace = undefined;
@@ -23819,13 +23819,13 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
         var read = try runtime.store.beginRead();
         defer read.abort();
         if (try ordered_publication.authority(&read) == null) return false;
-        try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
+        try @import("../artifact/reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
         if (runtime.config.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
         const fence = try requiredRuntimeStoreWriteFence(runtime);
         try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
         var plan = try runtime.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
-        var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+        var borrowed: @import("../artifact/chunk_cursor.zig").BorrowedRead = .{ .read = &read };
         var prepared = (progress.prepare(alloc, &borrowed, runtime.config.root_incarnation, request, plan.plan(), limits, null) catch |err| switch (err) {
             error.ArtifactPublicationPending => return false,
             else => return err,
@@ -23833,7 +23833,7 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
         defer prepared.deinit();
         const command = try progress.commandFor(&prepared, request, plan.plan(), limits);
         namespace = command.namespace;
-        encoded = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, command);
+        encoded = try @import("../artifact/publication_transport_codec.zig").encodeAlloc(alloc, command);
     }
     // Release the pinned read, immutable plan and ownership/apply fence before
     // touching the dispatcher. Queue refusal leaves durable progress unchanged.
@@ -23844,12 +23844,12 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
 
 fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, consumers: []const []const u8) !bool {
     if (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) return error.ArtifactPublicationPending;
-    const publication = @import("../artifact_chunk_vector_publication.zig");
-    const logical = @import("../artifact_chunk_cursor.zig");
-    const Candidates = @import("../artifact_chunk_vector_cursor.zig").Cursor(logical.BorrowedRead);
+    const publication = @import("../artifact/chunk_vector_publication.zig");
+    const logical = @import("../artifact/chunk_cursor.zig");
+    const Candidates = @import("../artifact/chunk_vector_cursor.zig").Cursor(logical.BorrowedRead);
     const Item = struct { input: publication.Input, text: ?[]const u8, precomputed: ?[]const f32 = null, model_hash: ?u64 = null };
-    const Observation = @import("../artifact_stream_observation.zig").Observation;
-    const checkpoints = @import("../artifact_stream_checkpoint.zig");
+    const Observation = @import("../artifact/stream_observation.zig").Observation;
+    const checkpoints = @import("../artifact/stream_checkpoint.zig");
     var observation: ?Observation = null;
     var checkpoint_key: ?checkpoints.Key = null;
     var checkpoint_digest: ?ordered_publication.Digest = null;
@@ -23879,7 +23879,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                 if (after != null) return error.ArtifactCatalogDrift;
                 return false;
             }
-            try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
+            try @import("../artifact/reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
             const fence = try requiredRuntimeStoreWriteFence(runtime);
             try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
             var plan = try runtime.index_manager.acquireWritePlanSnapshot();
@@ -23887,7 +23887,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             if (checkpoint_key == null) {
                 if (runtime.config.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
                 const active = (try ordered_publication.authority(&read)).?;
-                const catalogs = try @import("../artifact_inventory.zig").catalogs(&read);
+                const catalogs = try @import("../artifact/inventory.zig").catalogs(&read);
                 if (!plan.plan().matchesArtifactInventory(catalogs) or !std.mem.eql(u8, &catalogs.digest(), &active.catalog_digest)) return error.ArtifactCatalogDrift;
                 const defined = for (plan.plan().generated_templates) |candidate| {
                     if (producer_input.sameDefinition(request, candidate)) break true;
@@ -23928,7 +23928,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             if (after) |key| try cursor.seekAfter(key);
             if (scan_after) |key| try cursor.resumePhysical(key);
             if (logical_after) |key| try cursor.resumeLogical(key);
-            var scan_budget: @import("../artifact_chunk_vector_cursor.zig").Budget = .{
+            var scan_budget: @import("../artifact/chunk_vector_cursor.zig").Budget = .{
                 .max_visits = max_items,
                 .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms,
             };
@@ -23940,7 +23940,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                     .member => |key| key,
                     .end => {
                         if (!publishing) {
-                            var upstream = try @import("../artifact_chunk_publication.zig").readAcceptedRoot(alloc, &read, request.doc_key, request.artifact_name);
+                            var upstream = try @import("../artifact/chunk_publication.zig").readAcceptedRoot(alloc, &read, request.doc_key, request.artifact_name);
                             defer upstream.deinit();
                             try observation.?.observeProof(request.doc_key, upstream.proof);
                         }
@@ -24655,7 +24655,7 @@ fn materializeProducerInput(ctx: *anyopaque, alloc: Allocator, key: []const u8, 
     return manager.materializeStoredValueAlloc(alloc, key, raw);
 }
 
-fn captureAssetProducerContext(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: ?[]const u8) !?@import("../artifact_producer_context.zig").Token {
+fn captureAssetProducerContext(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: ?[]const u8) !?@import("../artifact/producer_context.zig").Token {
     if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
     defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
     var read = try runtime.store.beginProbe();
@@ -24663,21 +24663,21 @@ fn captureAssetProducerContext(runtime: *EnrichmentRuntime, request: enrichment_
     if (try ordered_publication.authority(&read) == null) return null;
     var plan = try runtime.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
-    return @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical_input, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput });
+    return @import("../artifact/asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical_input, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput });
 }
 
 fn finishAcceptedAssetGraph(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
     _ = try publishOrderedGraphForRuntime(runtime, request, .current);
 }
 
-fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact_producer_context.zig").Token, key: []const u8, payload: ?[]const u8) !void {
+fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact/producer_context.zig").Token, key: []const u8, payload: ?[]const u8) !void {
     try enqueueProducerEffects(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }});
     // Acceptance can race enqueue, including a deferred provider callback.
     // Consume the accepted bytes, never this callback's uncommitted response.
     try finishAcceptedAssetGraph(runtime, request);
 }
 
-fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation) !void {
+fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact/producer_context.zig").Token, effects: []const ordered_publication.Mutation) !void {
     {
         const fence = try requiredRuntimeStoreWriteFence(runtime);
         var read = try runtime.store.beginProbe();
@@ -24690,7 +24690,7 @@ fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artif
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
     const command = try token.command(effects);
     try command.validate(runtime.alloc);
-    const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
+    const bytes = try @import("../artifact/publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
     defer runtime.alloc.free(bytes);
     try dispatcher.submit(token.namespace, bytes);
     // Provider completion is not owner acceptance; hold replay progress until
@@ -24731,7 +24731,7 @@ fn enqueueProducerArtifact(runtime: *EnrichmentRuntime, token: *const producer_i
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
     const command = token.command(&.{.{ .family = .base_vector, .key = key, .value = payload, .source_index = 0 }});
     try command.validate(runtime.alloc);
-    const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
+    const bytes = try @import("../artifact/publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
     defer runtime.alloc.free(bytes);
     // The callback owns a bounded clone. Never hold a store/catalog/apply lock
     // across it, and never credit coverage merely because enqueue succeeded.
@@ -24768,7 +24768,7 @@ fn storeGuardedEmbeddingsTxn(runtime: *EnrichmentRuntime, txn: anytype, writes: 
     // Process counters with each put so duplicate keys do not inflate counts.
     @memset(accepted, false);
     for (writes, 0..) |write, i| {
-        try @import("../artifact_publication.zig").requireLegacyMaterialization(txn, write.key);
+        try @import("../artifact/publication.zig").requireLegacyMaterialization(txn, write.key);
         if (!try embeddingSourceStillCurrent(runtime.alloc, txn, write)) continue;
         const pair = KVPair{ .key = write.key, .value = write.value };
         try updateDenseArtifactTargetCountersTxn(runtime, txn, &.{pair}, &.{});
@@ -25835,9 +25835,9 @@ const PdfEmbeddingWindowPrefetch = struct {
 /// Returns false only for the legacy authority. Ordered producers never fall
 /// back to owner-local artifact writes when inventory or admission is pending.
 fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry)) !bool {
-    const inventory = @import("../artifact_chunk_manifest.zig");
+    const inventory = @import("../artifact/chunk_manifest.zig");
     const Captured = struct {
-        token: @import("../artifact_producer_context.zig").Token,
+        token: @import("../artifact/producer_context.zig").Token,
         previous: inventory.Manifest,
         source_digest: ?[32]u8,
         persist: bool,
@@ -25858,7 +25858,7 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
         const stored = read.get(source_key) catch |err| if (err == error.NotFound) null else return err;
         const logical = if (stored) |raw| try materializeProducerInput(runtime.index_manager, runtime.alloc, source_key, raw) else null;
         defer if (logical) |raw| runtime.alloc.free(raw);
-        var token = (try @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput })) orelse return error.ArtifactCatalogDrift;
+        var token = (try @import("../artifact/asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput })) orelse return error.ArtifactCatalogDrift;
         errdefer token.deinit();
         const manifest_key = token.preconditions.items[0].key;
         const previous = try inventory.Manifest.decode(try read.get(manifest_key));
@@ -25930,14 +25930,14 @@ fn driveOrderedChunkInventoryScoped(runtime: *EnrichmentRuntime, request: enrich
         defer read.abort();
         var plan = try runtime.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
-        var prepared = (@import("../artifact_chunk_inventory_progress.zig").prepare(alloc, &read, runtime.config.root_incarnation, request, plan.plan(), unit, .{}, null) catch |err| {
+        var prepared = (@import("../artifact/chunk_inventory_progress.zig").prepare(alloc, &read, runtime.config.root_incarnation, request, plan.plan(), unit, .{}, null) catch |err| {
             if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
             return err;
         }) orelse return;
         defer prepared.deinit();
         const command = prepared.command(requestArtifactName(request));
         namespace = command.namespace;
-        encoded = @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, command) catch |err| {
+        encoded = @import("../artifact/publication_transport_codec.zig").encodeAlloc(alloc, command) catch |err| {
             if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
@@ -25978,11 +25978,11 @@ fn processChunkText(
     const persist_chunks = try shouldStoreChunkArtifacts(runtime.alloc, request, text_indexes.len != 0);
     // Prepare before cleanup as well as upserts. No ephemeral payload is
     // encoded when neither storage nor a text consumer needs one.
-    var prepared_chunks: ?@import("../artifact_chunk_manifest.zig").PreparedRows = if (chunks.len != 0 and (persist_chunks or text_indexes.len != 0))
+    var prepared_chunks: ?@import("../artifact/chunk_manifest.zig").PreparedRows = if (chunks.len != 0 and (persist_chunks or text_indexes.len != 0))
         if (persist_chunks)
-            try @import("../artifact_chunk_manifest.zig").PreparedRows.init(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
+            try @import("../artifact/chunk_manifest.zig").PreparedRows.init(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
         else
-            try @import("../artifact_chunk_manifest.zig").PreparedRows.initProjection(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
+            try @import("../artifact/chunk_manifest.zig").PreparedRows.initProjection(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
     else
         null;
     defer if (prepared_chunks) |*prepared| prepared.deinit();
@@ -28198,9 +28198,9 @@ fn scanRuntimeDocumentExtractionPreviousStateFromStore(
 
     var read = try runtime.store.beginRead();
     defer read.abort();
-    const logical_chunks = @import("../artifact_chunk_cursor.zig");
+    const logical_chunks = @import("../artifact/chunk_cursor.zig");
     var borrowed: logical_chunks.BorrowedRead = .{ .read = &read };
-    out.unit_keys = try @import("../artifact_extraction_generation.zig").unitKeysAlloc(runtime.alloc, &borrowed, doc_key, artifact_name);
+    out.unit_keys = try @import("../artifact/extraction_generation.zig").unitKeysAlloc(runtime.alloc, &borrowed, doc_key, artifact_name);
 
     var chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -28245,7 +28245,7 @@ fn scanRuntimeDocumentExtractionNavigationBlockKeys(
 ) ![]const []const u8 {
     var read = try runtime.store.beginRead();
     defer read.abort();
-    var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+    var borrowed: @import("../artifact/chunk_cursor.zig").BorrowedRead = .{ .read = &read };
     return scanRuntimeDocumentExtractionNavigationBlockKeysFromRead(runtime.alloc, &borrowed, doc_key, artifact_name);
 }
 
@@ -28821,7 +28821,7 @@ fn queueArtifactCoverageOutcomeForRequest(
         };
         if (!is_graph and !is_full_text) continue;
         try queueDerivedCoverageOutcomeForIndex(runtime, window, index_name, request, outcome);
-        const readiness = @import("../artifact_producer_readiness.zig");
+        const readiness = @import("../artifact/producer_readiness.zig");
         var pinned = try runtime.index_manager.acquireWritePlanSnapshot();
         defer pinned.release();
         const requirements = if (pinned.plan().completion_plan) |*value| value else return error.ArtifactCatalogDrift;
@@ -29732,7 +29732,7 @@ fn deleteStaleChunkArtifacts(
 fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, source_field: []const u8, producer_json: []const u8) !?u64 {
     var read = try runtime.store.beginRead();
     defer read.abort();
-    const raw = (try @import("../artifact_chunk_generation.zig").readMember(runtime.alloc, &read, chunk_key)) orelse return null;
+    const raw = (try @import("../artifact/chunk_generation.zig").readMember(runtime.alloc, &read, chunk_key)) orelse return null;
 
     const source = try chunk_artifact_mod.artifactTextAlloc(runtime.alloc, raw, source_field) orelse return null;
     defer runtime.alloc.free(source);
@@ -29754,7 +29754,7 @@ fn storedChunkEmbeddingSourcesForRequest(
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_name: []const u8,
 ) ![]ChunkEmbeddingSource {
-    const logical = @import("../artifact_chunk_cursor.zig");
+    const logical = @import("../artifact/chunk_cursor.zig");
     var read = try runtime.store.beginRead();
     defer read.abort();
     var borrowed: logical.BorrowedRead = .{ .read = &read };
@@ -29787,8 +29787,8 @@ fn storedChunkEmbeddingSourcesForRequest(
 test "ordered artifact inventory embedding fallback reads selected chunk generations including empty output" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const chunks = @import("../artifact_chunk_manifest.zig");
-    const generations = @import("../artifact_chunk_generation.zig");
+    const chunks = @import("../artifact/chunk_manifest.zig");
+    const generations = @import("../artifact/chunk_generation.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-consumer", .{tmp.sub_path});
@@ -30308,7 +30308,7 @@ fn coverageReceiptIsCurrent(runtime: *EnrichmentRuntime, txn: anytype, transitio
     const identity = @import("../doc_identity.zig");
     const ordinal = (try identity.lookupOrdinalTxn(runtime.alloc, txn, document)) orelse return false;
     const state = (try identity.lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
-    const revision = (try @import("../artifact_producer_readiness.zig").localPrimaryRevision(runtime.alloc, txn, document)) orelse state.created_generation;
+    const revision = (try @import("../artifact/producer_readiness.zig").localPrimaryRevision(runtime.alloc, txn, document)) orelse state.created_generation;
     return state.isLive() and transition.source_sequence != 0 and revision <= transition.source_sequence;
 }
 
@@ -30977,7 +30977,7 @@ fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, t
         const weaker_than_existing_failure = existing_outcome == .terminal_failed and target_outcome == .skipped;
         if (transition.source_specific and !weaker_than_existing_failure) {
             const receipt_alloc = receipt_arena.allocator();
-            const key = try @import("../artifact_producer_readiness.zig").localReceiptRevisionKeyAlloc(receipt_alloc, transition.marker_key);
+            const key = try @import("../artifact/producer_readiness.zig").localReceiptRevisionKeyAlloc(receipt_alloc, transition.marker_key);
             const value = try receipt_alloc.alloc(u8, 8);
             std.mem.writeInt(u64, value[0..8], transition.source_sequence, .little);
             try writes.append(runtime.alloc, .{ .key = key, .value = value });
@@ -31822,7 +31822,7 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
     var txn = try live_store.*.beginWrite();
     errdefer txn.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
-    try @import("../artifact_publication.zig").requireLegacyMaterialization(&txn, key);
+    try @import("../artifact/publication.zig").requireLegacyMaterialization(&txn, key);
     const write = KVPair{ .key = key, .value = value };
     try updateDenseArtifactTargetCountersTxn(runtime, &txn, &.{write}, &.{});
     try txn.put(key, value);
@@ -31846,8 +31846,8 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
     var batch = try live_store.*.beginBatch();
     errdefer batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
-    for (writes) |write| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, write.key);
-    for (deletes) |key| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, key);
+    for (writes) |write| try @import("../artifact/publication.zig").requireLegacyMaterialization(&batch, write.key);
+    for (deletes) |key| try @import("../artifact/publication.zig").requireLegacyMaterialization(&batch, key);
     try updateDenseArtifactTargetCountersTxn(runtime, &batch, writes, deletes);
     var marker_keys = std.ArrayListUnmanaged([]u8).empty;
     defer {
@@ -33076,7 +33076,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = ordered_publication;
-    const manifest = @import("../artifact_chunk_manifest.zig");
+    const manifest = @import("../artifact/chunk_manifest.zig");
     const Harness = struct {
         encoded: ?[]u8 = null,
         calls: usize = 0,
@@ -33099,13 +33099,13 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
             const source = try publication.capturePrimarySource(a, &txn, authority.namespace, "doc");
             var command: publication.Command = .{ .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_kind = .enrichment, .producer_name = "units", .producer_generation = authority.epoch, .producer_artifact_name = "units", .sources = (&source)[0..1], .mutations = &.{.{ .family = .document_artifact, .key = key, .value = value, .source_index = 0 }}, .publication_digest = @splat(0) };
             command.publication_digest = command.digest();
-            var proof = try @import("../artifact_producer_provenance.zig").fromCommand(a, command);
+            var proof = try @import("../artifact/producer_provenance.zig").fromCommand(a, command);
             defer proof.deinit();
-            const encoded = try @import("../artifact_producer_provenance.zig").encodeAlloc(a, proof.proof);
+            const encoded = try @import("../artifact/producer_provenance.zig").encodeAlloc(a, proof.proof);
             const position: publication.Position = .{ .raft = .{ .term = 1, .index = index } };
             if (value) |raw| try txn.put(key, raw) else try txn.delete(key);
             try publication.stageArtifactRevisions(&txn, command, position);
-            try @import("../artifact_producer_provenance.zig").stage(&txn, command, encoded, position);
+            try @import("../artifact/producer_provenance.zig").stage(&txn, command, encoded, position);
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 1, .little);
             std.mem.writeInt(u64, marker[8..16], index, .little);
@@ -33113,7 +33113,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
             try txn.commit();
         }
         fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
-            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(db.alloc, self.encoded.?);
+            var decoded = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(db.alloc, self.encoded.?);
             defer decoded.deinit();
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
         }
@@ -33157,7 +33157,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     request.doc_key = "doc";
     // A durable generation-bound job must not fall back to a legacy unit row
     // after its selected parent disappeared. No provider/publication runs.
-    const stale_job: @import("../artifact_unit_jobs.zig").Job = .{ .generation = @splat(42), .document = "doc", .child = "chunks", .unit = unit_key };
+    const stale_job: @import("../artifact/unit_jobs.zig").Job = .{ .generation = @splat(42), .document = "doc", .child = "chunks", .unit = unit_key };
     try std.testing.expectError(error.EnrichmentSourceChanged, publishOrderedUnitJob(runtime, request, stale_job));
     try std.testing.expectEqual(@as(usize, 0), harness.calls);
     var foreign_job = stale_job;
@@ -33228,7 +33228,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
 
 test "ordered artifact inventory chunk callback waits for acceptance and atomically publishes empty streams" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const inventory = @import("../artifact_chunk_manifest.zig");
+    const inventory = @import("../artifact/chunk_manifest.zig");
     const alloc = std.testing.allocator;
     const Harness = struct {
         encoded: ?[]u8 = null,
@@ -33278,7 +33278,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
-    const progress = @import("../artifact_stream_progress.zig");
+    const progress = @import("../artifact/stream_progress.zig");
     var previous: ?progress.DocumentClosure = null;
     defer if (previous) |*value| value.deinit();
     {
@@ -33307,7 +33307,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
             try std.testing.expectError(error.ArtifactPublicationPending, progress.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, unreconciled, plan.plan()));
         }
         {
-            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            var decoded = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
             defer decoded.deinit();
             try std.testing.expectEqual(.census, decoded.command.mode);
             try std.testing.expectEqual(.enrichment, decoded.command.producer_kind);
@@ -33320,7 +33320,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
         try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, unreconciled, &cache, &window));
         try std.testing.expectEqual(@as(usize, 2), harness.calls);
         {
-            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            var decoded = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
             defer decoded.deinit();
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = 5 });
         }
@@ -33336,7 +33336,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
                 defer read.abort();
                 try std.testing.expectError(error.EnrichmentSourceChanged, value.requireCurrent(&read, db.root_incarnation));
             }
-            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            var decoded = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
             defer decoded.deinit();
             const manifest = decoded.command.mutations[decoded.command.mutations.len - 1];
             const next = try inventory.Manifest.decode(manifest.value.?);
@@ -33357,14 +33357,14 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
             previous = try progress.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, request, plan.plan());
             try previous.?.requireCurrent(&read, db.root_incarnation);
             try std.testing.expectError(error.DurableRootIncarnationUnavailable, previous.?.requireCurrent(&read, db.root_incarnation + 1));
-            var verifier: @import("../artifact_completion_progress.zig").StreamVerifier = .{ .plan = plan.plan() };
+            var verifier: @import("../artifact/completion_progress.zig").StreamVerifier = .{ .plan = plan.plan() };
             var witness = (try verifier.verify(alloc, &read, db.root_incarnation, "doc", try plan.plan().completion_plan.?.providerFor(request))).?;
             defer witness.deinit();
             try witness.requireCurrent(&read, db.root_incarnation);
             if (pass == 0) {
                 const Check = struct {
                     fn run(a: Allocator, txn: *@TypeOf(read), root: u128, selected: enrichment_types.GeneratedEnrichmentRequest, snapshot: *const index_manager_mod.IndexManager.WritePlanSnapshot) !void {
-                        var closure = try @import("../artifact_stream_progress.zig").prepareEnrichmentClosure(a, txn, root, selected, snapshot);
+                        var closure = try @import("../artifact/stream_progress.zig").prepareEnrichmentClosure(a, txn, root, selected, snapshot);
                         defer closure.deinit();
                     }
                 };
@@ -33442,10 +33442,10 @@ test "ordered artifact inventory authored document callbacks bypass providers an
         {
             var txn = try db.core.store.beginWriteTxn();
             errdefer txn.abort();
-            try @import("../artifact_inventory.zig").stageOrdered(alloc, &txn, catalog, 1);
+            try @import("../artifact/inventory.zig").stageOrdered(alloc, &txn, catalog, 1);
             try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
-            try @import("../artifact_producer_obligations.zig").begin(alloc, &txn, authority);
-            try @import("../artifact_producer_validation.zig").begin(alloc, &txn, authority);
+            try @import("../artifact/producer_obligations.zig").begin(alloc, &txn, authority);
+            try @import("../artifact/producer_validation.zig").begin(alloc, &txn, authority);
             try txn.commit();
         }
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -33456,7 +33456,7 @@ test "ordered artifact inventory authored document callbacks bypass providers an
         const output = try internal_keys.embeddingArtifactKeyForDocumentAlloc(owned, "doc", "model");
         const value = if (dense) try enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(owned, &.{ 1, 2 }) else try enrichment_artifact_codec.encodeAuthoredSparseEmbeddingAlloc(owned, &.{1}, &.{2});
         const writes = [_]@import("../../docstore.zig").KVPair{ .{ .key = primary, .value = "{\"body\":\"hello\"}" }, .{ .key = ttl, .value = &.{ 1, 0, 0, 0, 0, 0, 0, 0 } }, .{ .key = output, .value = value } };
-        var ingress = try @import("../artifact_authored_acceptance.zig").Prepared.init(alloc, db.root_incarnation, writes[2..], &writes);
+        var ingress = try @import("../artifact/authored_acceptance.zig").Prepared.init(alloc, db.root_incarnation, writes[2..], &writes);
         defer ingress.deinit();
         try db.core.store.putBatchWithReplayAndParticipant(null, &writes, &.{}, null, .{}, ingress.participant());
         try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &harness, .dense_embed_fn = Harness.dense }, .sparse_embedder = .{ .ptr = &harness, .sparse_embed_fn = Harness.sparse } });
@@ -33486,7 +33486,7 @@ test "ordered artifact inventory chunk vector callback publishes and retires wit
 
 fn testOrderedChunkVectorCallback(dense: bool) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const inventory = @import("../artifact_chunk_manifest.zig");
+    const inventory = @import("../artifact/chunk_manifest.zig");
     const alloc = std.testing.allocator;
     const Harness = struct {
         encoded: ?[]u8 = null,
@@ -33527,7 +33527,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
             return processMaterializedChunkSparseRequest(runtime, request, "chunks", "model", .{ .ptr = self, .sparse_embed_fn = embed }, &.{"sparse"}, window);
         }
         fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
-            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, self.encoded.?);
+            var decoded = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, self.encoded.?);
             defer decoded.deinit();
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
         }
@@ -33580,14 +33580,14 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         if (candidate.kind == (if (dense) enrichment_types.GeneratedEnrichmentKind.dense_embedding else enrichment_types.GeneratedEnrichmentKind.sparse_embedding)) break candidate;
     } else return error.TestUnexpectedResult;
     vector_request.doc_key = "doc";
-    const stream_progress = @import("../artifact_stream_progress.zig");
+    const stream_progress = @import("../artifact/stream_progress.zig");
     {
         // Baseline inventory contains an empty manifest, but no producer has
         // accepted an empty result. Neither raw bytes nor EOF are evidence.
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        const census = @import("../artifact_stream_census.zig");
-        const start: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&read, "doc") };
+        const census = @import("../artifact/stream_census.zig");
+        const start: census.Progress = .{ .observation = try @import("../artifact/stream_observation.zig").Observation.capture(&read, "doc") };
         try std.testing.expectError(error.ArtifactPublicationPending, census.scan(alloc, &read, vector_request, plan.plan(), start, .{}));
     }
     var last_verified: ?stream_progress.Prepared = null;
@@ -33616,11 +33616,11 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         if (pass == 1) try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 7 });
         try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, chunk_request, &cache, &window));
         try harness.apply(&db, if (pass == 0) 4 else 8);
-        const census = @import("../artifact_stream_census.zig");
+        const census = @import("../artifact/stream_census.zig");
         if (pass == 0) {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
-            const start: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&read, "doc") };
+            const start: census.Progress = .{ .observation = try @import("../artifact/stream_observation.zig").Observation.capture(&read, "doc") };
             try std.testing.expectError(error.ArtifactPublicationPending, census.scan(alloc, &read, vector_request, plan.plan(), start, .{}));
         }
         const before = harness.calls;
@@ -33634,12 +33634,12 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                 snapshot: *@TypeOf(read),
                 catalog_reads: usize = 0,
                 pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-                    if (std.mem.eql(u8, key, @import("../artifact_inventory.zig").ordered_key)) self.catalog_reads += 1;
+                    if (std.mem.eql(u8, key, @import("../artifact/inventory.zig").ordered_key)) self.catalog_reads += 1;
                     return self.snapshot.get(key);
                 }
             };
             var counted: Counted = .{ .snapshot = &read };
-            const bound = (try @import("../artifact_chunk_vector_publication.zig").captureSession(alloc, &counted, vector_request, plan.plan())).?;
+            const bound = (try @import("../artifact/chunk_vector_publication.zig").captureSession(alloc, &counted, vector_request, plan.plan())).?;
             for (0..16) |_| {
                 var input = try bound.capture(alloc, member);
                 defer input.deinit();
@@ -33655,12 +33655,12 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
             // An empty physical scan is not accepted empty production. These
             // aborted changes model a missing manifest and a same-revision
             // corrupted replacement without modifying the serving fixture.
-            const manifests = @import("../artifact_chunk_manifest.zig");
+            const manifests = @import("../artifact/chunk_manifest.zig");
             var writer = try db.core.store.beginWriteTxn();
             defer writer.abort();
             const original = try alloc.dupe(u8, try writer.get(manifest_key));
             defer alloc.free(original);
-            const start: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&writer, "doc") };
+            const start: census.Progress = .{ .observation = try @import("../artifact/stream_observation.zig").Observation.capture(&writer, "doc") };
             try writer.delete(manifest_key);
             try std.testing.expectError(error.ArtifactPublicationPending, census.scan(alloc, &writer, vector_request, plan.plan(), start, .{}));
             var changed = try manifests.Manifest.decode(original);
@@ -33673,7 +33673,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
             try std.testing.expect(empty.progress.enumerated);
             // A selected empty generation cannot borrow the older accepted
             // manifest's proof. Staged/head bytes alone are not acceptance.
-            const generations = @import("../artifact_chunk_generation.zig");
+            const generations = @import("../artifact/chunk_generation.zig");
             const spec = try generations.Spec.init(start.observation.authority, manifest_key, @splat(1), manifests.Builder.init().finish(), 1);
             var selected = try generations.Plan.init(alloc, manifest_key, spec);
             defer selected.deinit();
@@ -33688,7 +33688,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         try std.testing.expectError(error.ArtifactPublicationPending, harness.process(runtime, vector_request, &window, dense));
         try std.testing.expectEqual(accepted + 1, harness.calls);
         {
-            var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            var queued = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
             defer queued.deinit();
             try std.testing.expectEqual(.census, queued.command.mode);
         }
@@ -33696,7 +33696,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         if (pass == 0) _ = try read.get(output) else try std.testing.expectError(error.NotFound, read.get(output));
-        var progress: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&read, "doc") };
+        var progress: census.Progress = .{ .observation = try @import("../artifact/stream_observation.zig").Observation.capture(&read, "doc") };
         var wrong_kind = vector_request;
         wrong_kind.input_kind = .document;
         try std.testing.expectError(error.OnlineMergeArtifactTailsUnsupported, census.scan(alloc, &read, wrong_kind, plan.plan(), progress, .{}));
@@ -33711,7 +33711,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                 var writer = try db.core.store.beginWriteTxn();
                 defer writer.abort();
                 try writer.put(pending_output, "uncertified output");
-                const start: census.Progress = .{ .observation = try @import("../artifact_stream_observation.zig").Observation.capture(&writer, "doc") };
+                const start: census.Progress = .{ .observation = try @import("../artifact/stream_observation.zig").Observation.capture(&writer, "doc") };
                 var prefix = try census.scan(alloc, &writer, vector_request, plan.plan(), start, .{});
                 defer prefix.deinit();
                 try std.testing.expect(!prefix.progress.enumerated);
@@ -33777,7 +33777,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                 defer prepared.deinit();
                 try std.testing.expect(try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }));
                 {
-                    var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, progress_harness.encoded.?);
+                    var queued = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, progress_harness.encoded.?);
                     defer queued.deinit();
                     try std.testing.expectEqualDeep(try stream_progress.commandFor(&prepared, vector_request, plan.plan(), .{ .visits = 1 }), queued.command);
                 }
@@ -33801,11 +33801,11 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                 {
                     var writer = try db.core.store.beginWriteTxn();
                     errdefer writer.abort();
-                    const pending = (try @import("../artifact_producer_obligations.zig").load(&writer)).?.pending_documents;
+                    const pending = (try @import("../artifact/producer_obligations.zig").load(&writer)).?.pending_documents;
                     try std.testing.expect(try stream_progress.stage(&writer, db.root_incarnation, &prepared));
                     try std.testing.expect(!try stream_progress.stage(&writer, db.root_incarnation, &prepared));
                     if (competing) |*value| try std.testing.expectError(error.EnrichmentSourceChanged, stream_progress.stage(&writer, db.root_incarnation, value));
-                    try std.testing.expectEqual(pending, (try @import("../artifact_producer_obligations.zig").load(&writer)).?.pending_documents);
+                    try std.testing.expectEqual(pending, (try @import("../artifact/producer_obligations.zig").load(&writer)).?.pending_documents);
                     try writer.commit();
                 }
                 try std.testing.expectEqual(replay, db.core.store.lastReplaySequence(0));
@@ -33858,11 +33858,11 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         {
             var writer = try db.core.store.beginWriteTxn();
             defer writer.abort();
-            const pending = (try @import("../artifact_producer_obligations.zig").load(&writer)).?.pending_documents;
+            const pending = (try @import("../artifact/producer_obligations.zig").load(&writer)).?.pending_documents;
             try last_closure.?.requireCurrent(&writer, db.root_incarnation);
             // A per-stream certificate neither clears document work nor
             // survives loss/replacement of the verified progress it binds.
-            try std.testing.expectEqual(pending, (try @import("../artifact_producer_obligations.zig").load(&writer)).?.pending_documents);
+            try std.testing.expectEqual(pending, (try @import("../artifact/producer_obligations.zig").load(&writer)).?.pending_documents);
             try writer.delete(&last_closure.?.selected);
             try std.testing.expectError(error.EnrichmentSourceChanged, last_closure.?.requireCurrent(&writer, db.root_incarnation));
             try std.testing.expectError(error.ArtifactPublicationPending, stream_progress.prepareClosure(alloc, &writer, db.root_incarnation, vector_request, plan.plan()));
@@ -33882,7 +33882,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
             defer live.deinit();
             try std.testing.expectEqual(@as(u64, 1), live.record.progress.members);
             const live_command = try stream_progress.commandFor(&live, vector_request, plan.plan(), .{});
-            var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            var queued = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
             defer queued.deinit();
             try std.testing.expectEqualDeep(live_command, queued.command);
             try harness.apply(&db, 6);
@@ -33907,12 +33907,12 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         try writer.delete(&last_verified.?.selected);
         try writer.commit();
     }
-    const census_bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, census_command);
+    const census_bytes = try @import("../artifact/publication_transport_codec.zig").encodeAlloc(alloc, census_command);
     defer alloc.free(census_bytes);
-    var decoded_census = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, census_bytes);
+    var decoded_census = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, census_bytes);
     defer decoded_census.deinit();
     {
-        var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        var queued = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
         defer queued.deinit();
         try std.testing.expectEqualDeep(census_command, queued.command);
     }
@@ -33936,13 +33936,13 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         defer read.abort();
         try std.testing.expectEqual(ordered_publication.Rejection.stale_catalog, (try ordered_publication.rejected(&read, wrong_generation)).?.reason);
     }
-    const Observation = @import("../artifact_stream_observation.zig").Observation;
+    const Observation = @import("../artifact/stream_observation.zig").Observation;
     var local: Observation = undefined;
     var foreign: Observation = undefined;
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        var input = (try @import("../artifact_chunk_vector_publication.zig").capture(alloc, &read, vector_request, plan.plan(), member)).?;
+        var input = (try @import("../artifact/chunk_vector_publication.zig").capture(alloc, &read, vector_request, plan.plan(), member)).?;
         defer input.deinit();
         var proof = (try input.token.acceptedProof(alloc, &read)).?;
         defer proof.deinit();
@@ -33980,7 +33980,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
         defer read.abort();
         try std.testing.expectError(error.EnrichmentSourceChanged, local.requireCurrent(&read, "doc"));
         try std.testing.expectError(error.EnrichmentSourceChanged, last_closure.?.requireCurrent(&read, db.root_incarnation));
-        try std.testing.expectError(error.EnrichmentSourceChanged, @import("../artifact_stream_census.zig").scan(alloc, &read, vector_request, plan.plan(), .{ .observation = local }, .{}));
+        try std.testing.expectError(error.EnrichmentSourceChanged, @import("../artifact/stream_census.zig").scan(alloc, &read, vector_request, plan.plan(), .{ .observation = local }, .{}));
     }
     {
         var writer = try db.core.store.beginWriteTxn();
@@ -34128,7 +34128,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
     defer alloc.free(key);
     const calls_per_pass: usize = if (graph) 3 else 2;
     const entries_per_pass: usize = if (graph) 4 else 3;
-    const streams = @import("../artifact_stream_progress.zig");
+    const streams = @import("../artifact/stream_progress.zig");
     var previous_closure: ?streams.DocumentClosure = null;
     defer if (previous_closure) |*value| value.deinit();
     for (0..@as(usize, if (delete_live) 2 else 3)) |pass| {
@@ -34159,7 +34159,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             try std.testing.expectError(error.ArtifactPublicationPending, batch.flush(runtime, &window, &scope));
         } else try std.testing.expectError(error.ArtifactPublicationPending, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
         try std.testing.expectEqual(pass * calls_per_pass + 1, harness.calls);
-        var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        var decoded = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
         defer decoded.deinit();
         try std.testing.expectEqual(@as(usize, 1), decoded.command.mutations.len);
         if (pass == 0) {
@@ -34174,7 +34174,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             try std.testing.expectError(error.QueueFull, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
             try std.testing.expectEqual(pass * calls_per_pass + 1, harness.calls);
             try std.testing.expectError(error.ArtifactPublicationPending, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
-            var graph_command = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            var graph_command = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
             defer graph_command.deinit();
             try std.testing.expect(graph_command.command.producer_kind == .graph);
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = graph_command.command }, .{ .term = 1, .index = pass * entries_per_pass + 5 });
@@ -34190,11 +34190,11 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
         try std.testing.expectEqual((pass + 1) * calls_per_pass - 1, harness.calls);
         try std.testing.expectError(error.ArtifactPublicationPending, processAsset(runtime, downstream, &batch, &prepared_sources, &window, &scope));
         try std.testing.expectEqual((pass + 1) * calls_per_pass, harness.calls);
-        var child = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        var child = try @import("../artifact/publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
         defer child.deinit();
         try std.testing.expectEqual(@as(usize, if (deleted) 0 else 2), child.command.artifact_sources.len);
         if (!deleted) {
-            const head = try @import("../artifact_extraction_generation.zig").headKeyAlloc(alloc, "doc", "copy");
+            const head = try @import("../artifact/extraction_generation.zig").headKeyAlloc(alloc, "doc", "copy");
             defer alloc.free(head);
             try std.testing.expectEqualStrings(key, child.command.artifact_sources[0].key);
             try std.testing.expectEqualStrings(head, child.command.artifact_sources[1].key);
@@ -34205,7 +34205,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
         try std.testing.expectEqual((pass + 1) * calls_per_pass, harness.calls);
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        var verifier: @import("../artifact_completion_progress.zig").StreamVerifier = .{ .plan = plan.plan() };
+        var verifier: @import("../artifact/completion_progress.zig").StreamVerifier = .{ .plan = plan.plan() };
         for ([_]enrichment_types.GeneratedEnrichmentRequest{ request, downstream }) |selected| {
             var closure = try streams.prepareEnrichmentClosure(alloc, &read, db.root_incarnation, selected, plan.plan());
             defer closure.deinit();
@@ -34226,7 +34226,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             try witness.requireCurrent(&read, db.root_incarnation);
             const Check = struct {
                 fn run(a: Allocator, txn: *@TypeOf(read), root: u128, chosen: enrichment_types.GeneratedEnrichmentRequest, snapshot: *const index_manager_mod.IndexManager.WritePlanSnapshot) !void {
-                    var value = try @import("../artifact_stream_progress.zig").prepareEnrichmentClosure(a, txn, root, chosen, snapshot);
+                    var value = try @import("../artifact/stream_progress.zig").prepareEnrichmentClosure(a, txn, root, chosen, snapshot);
                     defer value.deinit();
                 }
             };

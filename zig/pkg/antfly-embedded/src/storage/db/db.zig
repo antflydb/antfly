@@ -22,45 +22,45 @@ const antfly_runtime_abi = @import("antfly_runtime_abi");
 const antfly_runtime_fs = @import("antfly_runtime_fs");
 const antfly_server_test_sources = @import("antfly_server_test_sources");
 const antfly_test_error_logs = @import("antfly_test_error_logs");
-const artifact_asset_publication = @import("artifact_asset_publication.zig");
-const artifact_authored_acceptance = @import("artifact_authored_acceptance.zig");
-const artifact_chunk_cursor = @import("artifact_chunk_cursor.zig");
-const artifact_chunk_generation = @import("artifact_chunk_generation.zig");
-const artifact_chunk_inventory_progress = @import("artifact_chunk_inventory_progress.zig");
-const artifact_chunk_manifest = @import("artifact_chunk_manifest.zig");
-const artifact_chunk_scan_position = @import("artifact_chunk_scan_position.zig");
-const artifact_chunk_vector_cursor = @import("artifact_chunk_vector_cursor.zig");
-const artifact_completion_progress = @import("artifact_completion_progress.zig");
-const artifact_coverage_epoch = @import("artifact_coverage_epoch.zig");
-const artifact_coverage_layout = @import("artifact_coverage_layout.zig");
+const artifact_asset_publication = @import("artifact/asset_publication.zig");
+const artifact_authored_acceptance = @import("artifact/authored_acceptance.zig");
+const artifact_chunk_cursor = @import("artifact/chunk_cursor.zig");
+const artifact_chunk_generation = @import("artifact/chunk_generation.zig");
+const artifact_chunk_inventory_progress = @import("artifact/chunk_inventory_progress.zig");
+const artifact_chunk_manifest = @import("artifact/chunk_manifest.zig");
+const artifact_chunk_scan_position = @import("artifact/chunk_scan_position.zig");
+const artifact_chunk_vector_cursor = @import("artifact/chunk_vector_cursor.zig");
+const artifact_completion_progress = @import("artifact/completion_progress.zig");
+const artifact_coverage_epoch = @import("artifact/coverage_epoch.zig");
+const artifact_coverage_layout = @import("artifact/coverage_layout.zig");
 const artifact_footprint_mod = @import("../artifact_footprint.zig");
-const artifact_inventory = @import("artifact_inventory.zig");
-const artifact_native_stream = @import("artifact_native_stream.zig");
+const artifact_inventory = @import("artifact/inventory.zig");
+const artifact_native_stream = @import("artifact/native_stream.zig");
 const artifact_payload_mod = @import("../artifact_payload.zig");
-const artifact_producer_baseline = @import("artifact_producer_baseline.zig");
-const artifact_producer_obligations = @import("artifact_producer_obligations.zig");
-const artifact_producer_provenance = @import("artifact_producer_provenance.zig");
-const artifact_producer_readiness = @import("artifact_producer_readiness.zig");
-const artifact_producer_scheduler_mod = @import("artifact_producer_scheduler.zig");
-const artifact_producer_validation = @import("artifact_producer_validation.zig");
-const artifact_projection_epoch = @import("artifact_projection_epoch.zig");
-const artifact_publication = @import("artifact_publication.zig");
-const artifact_publication_resolution = @import("artifact_publication_resolution.zig");
-const artifact_publication_transport = @import("artifact_publication_transport.zig");
-const artifact_publication_transport_codec = @import("artifact_publication_transport_codec.zig");
-const artifact_reconcile = @import("artifact_reconcile.zig");
-const artifact_reconcile_intent = @import("artifact_reconcile_intent.zig");
-const artifact_source_gap = @import("artifact_source_gap.zig");
-const artifact_stream_checkpoint = @import("artifact_stream_checkpoint.zig");
-const artifact_stream_progress = @import("artifact_stream_progress.zig");
-const artifact_unit_jobs = @import("artifact_unit_jobs.zig");
-const artifact_unit_progress = @import("artifact_unit_progress.zig");
+const artifact_producer_baseline = @import("artifact/producer_baseline.zig");
+const artifact_producer_obligations = @import("artifact/producer_obligations.zig");
+const artifact_producer_provenance = @import("artifact/producer_provenance.zig");
+const artifact_producer_readiness = @import("artifact/producer_readiness.zig");
+const artifact_producer_scheduler_mod = @import("artifact/producer_scheduler.zig");
+const artifact_producer_validation = @import("artifact/producer_validation.zig");
+const artifact_projection_epoch = @import("artifact/projection_epoch.zig");
+const artifact_publication = @import("artifact/publication.zig");
+const artifact_publication_resolution = @import("artifact/publication_resolution.zig");
+const artifact_publication_transport = @import("artifact/publication_transport.zig");
+const artifact_publication_transport_codec = @import("artifact/publication_transport_codec.zig");
+const artifact_reconcile = @import("artifact/reconcile.zig");
+const artifact_reconcile_intent = @import("artifact/reconcile_intent.zig");
+const artifact_source_gap = @import("artifact/source_gap.zig");
+const artifact_stream_checkpoint = @import("artifact/stream_checkpoint.zig");
+const artifact_stream_progress = @import("artifact/stream_progress.zig");
+const artifact_unit_jobs = @import("artifact/unit_jobs.zig");
+const artifact_unit_progress = @import("artifact/unit_progress.zig");
 const backend_mod = @import("../lite/backend.zig");
 const bulk_ingest_session_mod = @import("bulk_ingest_session.zig");
 const cleanup_job_owner = @import("cleanup_job_owner.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const document_mutation_revision_mod = @import("../document_mutation_revision.zig");
-const document_query = @import("document_query.zig");
+const document_query = @import("document/query.zig");
 const empty_generation_handoff = @import("empty_generation_handoff.zig");
 const enrichment_runtime_owner = @import("enrichment_runtime_owner.zig");
 const graph_cleanup_contract_mod = @import("../graph_cleanup_contract.zig");
@@ -74,12 +74,12 @@ const merge_page_chunks = @import("merge_page_chunks.zig");
 const merge_page_contract = @import("merge_page_contract.zig");
 const merge_proof_adoption = @import("merge_proof_adoption.zig");
 const merge_tail_reader = @import("merge_tail_reader.zig");
-const native_backup_seal = @import("native_backup_seal.zig");
-const native_query_cut = @import("native_query_cut.zig");
-const native_query_cut_repository = @import("native_query_cut_repository.zig");
-const native_query_reuse = @import("native_query_reuse.zig");
-const native_query_warming_mod = @import("native_query_warming.zig");
-const native_topology_receipt = @import("native_topology_receipt.zig");
+const native_backup_seal = @import("native/backup_seal.zig");
+const native_query_cut = @import("native/query_cut.zig");
+const native_query_cut_repository = @import("native/query_cut_repository.zig");
+const native_query_reuse = @import("native/query_reuse.zig");
+const native_query_warming_mod = @import("native/query_warming.zig");
+const native_topology_receipt = @import("native/topology_receipt.zig");
 const node_admission_mod = @import("../../graph/node_admission.zig");
 const online_graph_artifacts = @import("online_graph_artifacts.zig");
 const online_integrity_shadow = @import("online_integrity_shadow.zig");
@@ -197,7 +197,7 @@ const MutationDependencies = struct {
     pub const test_portable_runtime_batch_prelock_hook = &DBModule.test_portable_runtime_batch_prelock_hook;
 };
 const local_mutation = @import("local_mutation.zig").ImplementationFor(MutationDependencies);
-const document_collectors = @import("document_collectors.zig");
+const document_collectors = @import("document/collectors.zig");
 const materialized_sources = @import("materialized_sources.zig");
 const graph_restore_materialization = @import("graph_restore_materialization.zig");
 const status_projection = @import("status_projection.zig");
@@ -205,9 +205,9 @@ const result_collectors = @import("result_collectors.zig");
 const independent_maintenance = @import("independent_maintenance.zig");
 const portable_activation_recovery = @import("portable_activation_recovery.zig");
 const quarantine_recovery = @import("quarantine_recovery.zig");
-const document_child_range_manifest = @import("document_child_range_manifest.zig");
-const document_child_range_effects = @import("document_child_range_effects.zig");
-const document_child_range_outbox = @import("document_child_range_outbox.zig");
+const document_child_range_manifest = @import("document/child_range_manifest.zig");
+const document_child_range_effects = @import("document/child_range_effects.zig");
+const document_child_range_outbox = @import("document/child_range_outbox.zig");
 const replicated_mutation = @import("replicated_mutation.zig");
 const std = @import("std");
 const missingAsNull = backend_types.missingAsNull;
@@ -252,14 +252,14 @@ const graph_edge_contender = @import("graph_edge_contender.zig");
 const graph_edge_ttl_expiration = @import("graph_edge_ttl_expiration.zig");
 const graph_edge_ttl_tombstone = @import("graph_edge_ttl_tombstone.zig");
 const graph_state_name = @import("graph_state_name.zig");
-const native_backup = @import("native_backup.zig");
+const native_backup = @import("native/backup.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const snapshot_admission_mod = @import("snapshot_admission.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 const doc_identity = @import("doc_identity.zig");
-const document_content_hash = @import("document_content_hash.zig");
+const document_content_hash = @import("document/content_hash.zig");
 const range_cardinality = @import("range_cardinality.zig");
 const replay_batcher_mod = @import("batcher.zig");
 pub const DocIdentityNamespace = doc_identity.Namespace;
@@ -275,10 +275,10 @@ const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const merge_state_mod = @import("merge_state.zig");
 const types = @import("types.zig");
-const document_artifact_child_range = @import("document_artifact_child_range.zig");
+const document_artifact_child_range = @import("document/artifact_child_range.zig");
 const aggregations_mod = @import("aggregations.zig");
 const algebraic_mod = @import("algebraic/mod.zig");
-const artifact_ids = @import("artifact_ids.zig");
+const artifact_ids = @import("artifact/ids.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
@@ -475,10 +475,10 @@ const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const relational_store = @import("relational_store.zig");
 const lookup_key_scratch = @import("lookup_key_scratch.zig");
-const document_read_scratch = @import("document_read_scratch.zig");
+const document_read_scratch = @import("document/read_scratch.zig");
 const relational_columns = @import("relational_columns.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
@@ -9601,7 +9601,7 @@ pub const DB = struct {
         const value = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            var input = try @import("artifact_extraction_generation.zig").captureInput(alloc, &read, internal_key);
+            var input = try @import("artifact/extraction_generation.zig").captureInput(alloc, &read, internal_key);
             defer input.deinit();
             const raw = input.value orelse {
                 artifact_ref.deinit(alloc);
@@ -19932,7 +19932,7 @@ pub const DB = struct {
             var nonce: [32]u8 = undefined;
             try io.randomSecure(&nonce);
             const id = std.fmt.bytesToHex(nonce, .lower);
-            state = .{ .request = .{ .id = try a.dupe(u8, &id), .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 }, .sequence = sequence };
+            state = .{ .request = .{ .id = try a.dupe(u8, &id), .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native/query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 }, .sequence = sequence };
             // The parent directory is created by capture; persist only once
             // the coherent local generation is sealed.
             try self.captureQueryCutInternal(state.?.request, cancellation, false);
@@ -25994,8 +25994,8 @@ pub const DB = struct {
             command: publication.Command,
             sequence: u64,
             coverage: []const publication.Coverage,
-            chunk_fence: ?@import("artifact_chunk_publication.zig").Fence,
-            chunk_vector_fence: ?@import("artifact_chunk_vector_publication.zig").Fence,
+            chunk_fence: ?@import("artifact/chunk_publication.zig").Fence,
+            chunk_vector_fence: ?@import("artifact/chunk_vector_publication.zig").Fence,
             asset_upstream_fences: []const artifact_asset_publication.UpstreamFence,
             position: publication.Position,
             proof: []const u8,
@@ -31716,8 +31716,8 @@ pub const DB = struct {
             break :blk try obligations.scanWork(scratch, &read, authority, cursor);
         };
         defer page.deinit();
-        const dispatch = @import("artifact_producer_dispatch.zig");
-        const retry = @import("artifact_producer_retry.zig");
+        const dispatch = @import("artifact/producer_dispatch.zig");
+        const retry = @import("artifact/producer_retry.zig");
         const retry_now = self.independentMaintenanceNowNs();
         self.artifact_producer_scheduler.observeAuthority(page.authority);
         const retry_real_now: u64 = @intCast(@max(0, std.Io.Timestamp.now(self.core.index_manager.checkpointIo(), .real).toNanoseconds()));
@@ -39351,7 +39351,7 @@ pub const DB = struct {
     /// no query, projection, bound or filter bytes are borrowed from the caller.
     pub const RelationalReadSession = @import("relational_read_session.zig").Session;
 
-    pub const DocumentReadSession = @import("document_rows.zig").Session;
+    pub const DocumentReadSession = @import("document/rows.zig").Session;
 
     pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, from_key, to_key, opts });
@@ -131332,7 +131332,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
     try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateArtifactSources(alloc, &pinned, authority.namespace, &source_inputs, &absent_head));
     const logical = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc\x00", "chunks", "unit\xff", 0);
     defer alloc.free(logical);
-    var producer_input: @import("artifact_producer_context.zig").Token = .{
+    var producer_input: @import("artifact/producer_context.zig").Token = .{
         .arena = std.heap.ArenaAllocator.init(alloc),
         .namespace = authority.namespace,
         .epoch = authority.epoch,
@@ -131562,7 +131562,7 @@ test "db ordered artifact inventory generation retirement resumes after restart 
 test "db ordered artifact inventory generation discovery resumes scoped cursors and races incarnation proposals safely" {
     const alloc = std.testing.allocator;
     const generations = artifact_chunk_generation;
-    const recovery = @import("artifact_generation_recovery.zig");
+    const recovery = @import("artifact/generation_recovery.zig");
     const chunks = artifact_chunk_manifest;
     const publication = artifact_publication;
     const Guard = struct {
@@ -131975,7 +131975,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
 test "db ordered artifact inventory local stream checkpoints survive restart without discharging work" {
     const alloc = std.testing.allocator;
     const checkpoints = artifact_stream_checkpoint;
-    const Observation = @import("artifact_stream_observation.zig").Observation;
+    const Observation = @import("artifact/stream_observation.zig").Observation;
     const publication = artifact_publication;
     const obligations = artifact_producer_obligations;
     const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) };
@@ -132175,7 +132175,7 @@ test "db ordered artifact inventory local stream checkpoints survive restart wit
 
 test "db ordered artifact inventory chunk reconstruction resumes bounded pages and rejects stream races" {
     const alloc = std.testing.allocator;
-    const reconstruction = @import("artifact_chunk_reconstruction.zig");
+    const reconstruction = @import("artifact/chunk_reconstruction.zig");
     const chunks = artifact_chunk_manifest;
     const publication = artifact_publication;
     var tmp = std.testing.tmpDir(.{});
