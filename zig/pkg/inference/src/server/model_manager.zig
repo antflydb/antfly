@@ -14162,6 +14162,14 @@ test "chunk planning survives metadata-only re-pulls and rejects changed tokeniz
     try tmp.dir.deleteFile(io, "linked.json");
     try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "changed!" });
+    // Some Linux filesystems give successive same-size writes identical
+    // mtime/ctime values within one clock tick. Exercise content revalidation
+    // with an observable generation change without sleeping or making warm
+    // planning reread tokenizer/model contents on every request.
+    var changed = try tmp.dir.openFile(io, "tokenizer.json", .{ .mode = .read_write });
+    defer changed.close(io);
+    const stat = try changed.stat(io);
+    try changed.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(stat.mtime.toNanoseconds() + std.time.ns_per_s) } });
     try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
 }
 
