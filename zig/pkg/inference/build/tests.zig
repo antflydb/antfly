@@ -145,6 +145,18 @@ pub fn create(ctx: Context) Suite {
     }
     build_test_filters.addRuntimeControls(run_cli_tests, ctx.args orelse &.{});
     const run_tests = ctx.addRunArtifact(tests);
+    // Keep backend packaging covered even when CUDA implementation tests are
+    // excluded. A CPU/Metal test product must not retain a device image.
+    const artifact_module = b.createModule(.{
+        .root_source_file = ctx.path("src/ops/cuda/artifact.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    artifact_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
+    const artifact_tests = b.addTest(.{ .root_module = artifact_module });
+    const run_artifact_tests = ctx.addRunArtifact(artifact_tests);
+    run_tests.step.dependOn(&run_artifact_tests.step);
+    ctx.step("test-cuda-artifact", "Check that CUDA device images match the enabled backend").dependOn(&run_artifact_tests.step);
     for (selected_test_filters) |filter| {
         run_tests.addArgs(&.{ "--test-filter", filter });
     }

@@ -34,11 +34,24 @@ pub fn hasBf16WmmaCodeFor(compute_major: i32, compute_minor: i32) bool {
     return false;
 }
 
-const artifact_bytes = if (is_sm89)
+// Artifact identity is also queried by backend-independent diagnostics. Keep
+// those references from embedding NVIDIA device images in CPU/Metal products.
+const artifact_bytes = if (!build_options.enable_cuda)
+    ""
+else if (is_sm89)
     @embedFile("artifacts/inference_cuda_kernels_sm89.cubin")
 else if (is_fatbin)
     @embedFile("artifacts/inference_cuda_kernels.fatbin")
 else
     @embedFile("artifacts/inference_cuda_kernels.ptx");
 
-pub const image = artifact_bytes ++ if (uses_jit) "\x00" else "";
+pub const image = artifact_bytes ++ if (build_options.enable_cuda and uses_jit) "\x00" else "";
+
+test "CUDA image belongs only to products with the CUDA backend" {
+    if (build_options.enable_cuda) {
+        try std.testing.expect(image.len > 0);
+        if (uses_jit) try std.testing.expectEqual(@as(u8, 0), image[image.len - 1]);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), image.len);
+    }
+}
