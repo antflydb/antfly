@@ -694,7 +694,7 @@ fn foldGather(
     const out_shape = n.output_shape;
     if (table_shape.dtype != out_shape.dtype) return null;
     const attrs = n.op.gather;
-    if (attrs.elements) return null;
+    if (attrs.elements or attrs.nd) return null;
     const axis = attrs.axis;
     const rank = table_shape.rank();
     if (axis >= rank) return null;

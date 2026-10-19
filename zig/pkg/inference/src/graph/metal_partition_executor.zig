@@ -15378,7 +15378,7 @@ fn executeRuntimeGather(
     stats: ?*PartitionExecutor.ExecutionStats,
     resident_input_cache: ?*ResidentInputCache,
 ) !?CT {
-    if (inputs.len < 2) return null;
+    if (inputs.len < 2 or attrs.nd or attrs.elements) return null;
     var input_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
     const input_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &input_shape_buf);
     const input_value = valueFor(values, inputs[0]) orelse return null;
@@ -16548,7 +16548,9 @@ fn sweepExpiredValuesThroughNode(
         if (raw_id >= last_use.len) continue;
         const node_id: NodeId = @intCast(raw_id);
         const use_id = last_use[raw_id];
-        if (use_id == std.math.maxInt(u32)) continue;
+        // A later partition may consume this value even when this Metal
+        // partition has no remaining local references to it.
+        if (use_id == std.math.maxInt(u32) or use_id > boundary_node_id) continue;
         if (valueReferencedAfterBoundary(graph, node_ids, boundary_pos, node_id)) continue;
         if (runtime_region_plan) |plan| {
             if (plan.needsAttentionInputAfterNode(node_id, boundary_node_id)) continue;
@@ -16568,7 +16570,7 @@ fn sweepExpiredValuesThroughNode(
             }
             const other_id: NodeId = @intCast(other_raw_id);
             const other_use = last_use[other_raw_id];
-            if (other_use == std.math.maxInt(u32) or valueReferencedAfterBoundary(graph, node_ids, boundary_pos, other_id)) {
+            if (other_use == std.math.maxInt(u32) or other_use > boundary_node_id or valueReferencedAfterBoundary(graph, node_ids, boundary_pos, other_id)) {
                 has_live_alias = true;
                 break;
             }
@@ -22266,4 +22268,36 @@ test "metal partition executor owned lifecycle deinitializes cleanly" {
     const exec = try MetalPartitionExecutor.create(allocator, &g, &cb);
     const pe = exec.partitionExecutor();
     pe.deinitExecutor();
+}
+
+test "metal partition lifetime sweep preserves inputs to later native partitions" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+    const input = try b.parameter("shared", ml.graph.Shape.init(.f32, &.{4}));
+    const early = try b.neg(input);
+    const late = try b.mul(input, input);
+    try g.markOutput(early);
+    try g.markOutput(late);
+    const reachable = try interpreter.computeReachable(a, &g);
+    defer a.free(reachable);
+    const last_use = try interpreter.computeLastUse(a, &g, reachable);
+    defer a.free(last_use);
+    var values: [3]?CT = @splat(null);
+    values[input] = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
+    defer if (values[input]) |value| cb.free(value);
+    var devices: [3]DeviceId = @splat(0);
+    const first = try sweepExpiredValuesThroughNode(a, &g, &cb, &values, &devices, &.{ input, early }, 1, early, 0, last_use, null, .empty, .empty, .{});
+    try std.testing.expectEqual(@as(usize, 0), first);
+    try std.testing.expect(values[input] != null);
+    const final = try sweepExpiredValuesThroughNode(a, &g, &cb, &values, &devices, &.{late}, 0, late, 0, last_use, null, .empty, .empty, .{});
+    try std.testing.expectEqual(@as(usize, 1), final);
+    try std.testing.expect(values[input] == null);
 }

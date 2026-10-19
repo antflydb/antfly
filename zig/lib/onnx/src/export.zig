@@ -2154,7 +2154,7 @@ fn mapOp(alloc: Allocator, graph: *const Graph, n: *const Node) !OpMapping {
         .range => simpleOp("Range"),
         .shape_of => |a| try shapeOfOp(alloc, a),
         .size_of => simpleOp("Size"),
-        .gather => |a| try intAttrOp(alloc, if (a.elements) "GatherElements" else "Gather", "axis", a.axis),
+        .gather => |a| if (a.nd) try intAttrOp(alloc, "GatherND", "batch_dims", a.batch_dims) else try intAttrOp(alloc, if (a.elements) "GatherElements" else "Gather", "axis", a.axis),
         .scatter_add => simpleOp("ScatterElements"),
 
         // Contraction
@@ -3393,4 +3393,28 @@ test "fused_rope permutation does not add identity on partial half-split partner
     try std.testing.expectEqual(@as(f32, 1.0), readF32(data.raw_data, 1 * head_dim + 5));
     try std.testing.expectEqual(@as(f32, 0.0), readF32(data.raw_data, 4 * head_dim + 4));
     try std.testing.expectEqual(@as(f32, 0.0), readF32(data.raw_data, 5 * head_dim + 5));
+}
+
+test "exportGraph preserves GatherND and batch_dims" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const data = try b.parameter("data", Shape.init(.f32, &.{ 2, 3, 4 }));
+    const coords = try b.parameter("coords", Shape.init(.i64, &.{ 2, 5, 1 }));
+    const out = try graph.addNode(.{
+        .op = .{ .gather = .{ .nd = true, .batch_dims = 1 } },
+        .output_shape = Shape.init(.f32, &.{ 2, 5, 4 }),
+        .inputs = .{ data, coords, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 2,
+    });
+    try graph.markOutput(out);
+    const bytes = try exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    var parsed = try proto.parseModelProto(a, bytes);
+    defer parsed.deinit(a);
+    const node = parsed.graph.?.nodes[0];
+    try std.testing.expectEqualStrings("GatherND", node.op_type);
+    try std.testing.expectEqualStrings("batch_dims", node.attributes[0].name);
+    try std.testing.expectEqual(@as(i64, 1), node.attributes[0].i);
 }

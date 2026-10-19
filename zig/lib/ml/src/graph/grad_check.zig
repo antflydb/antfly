@@ -396,6 +396,7 @@ fn evalNode(
         },
 
         .gather => |attrs| {
+            if (attrs.nd) return error.UnsupportedOp;
             const table = getVal(node_vals, ins[0]);
             const indices = getVal(node_vals, ins[1]);
             return evalGatherRef(

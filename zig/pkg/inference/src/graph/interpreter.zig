@@ -635,7 +635,7 @@ fn computeGatherAddBiasPreserveSet(allocator: std.mem.Allocator, graph: *const G
             .gather => |attrs| attrs,
             else => unreachable,
         };
-        if (gather_attrs.axis != 0) continue;
+        if (gather_attrs.axis != 0 or gather_attrs.nd or gather_attrs.elements) continue;
 
         const gather_inputs = gather_node.getInputs();
         if (gather_inputs.len < 2 or gather_inputs[0] == null_node or gather_inputs[0] >= count) continue;
@@ -4026,6 +4026,13 @@ pub fn executeNode(
             const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             var indices_buf: [8]i64 = undefined;
             const indices_shape = runtimeOrDeclaredShape(state, graph, ins[1], &indices_buf);
+            if (attrs.nd) {
+                const actual_input = try cb.tensorShape(V.get(ins[0]), std.heap.page_allocator);
+                defer std.heap.page_allocator.free(actual_input);
+                const actual_indices = try cb.tensorShape(V.get(ins[1]), std.heap.page_allocator);
+                defer std.heap.page_allocator.free(actual_indices);
+                return executeGatherND(std.heap.page_allocator, cb, V.get(ins[0]), V.get(ins[1]), actual_input, actual_indices, attrs.batch_dims);
+            }
             if (attrs.elements) {
                 const actual_in_shape = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
                 defer if (actual_in_shape) |shape| std.heap.page_allocator.free(shape);
@@ -4584,6 +4591,115 @@ fn fromFloatValues(cb: *const ComputeBackend, values: []const f64, dtype: ml.gra
     };
     const shape = [_]i64{@intCast(values.len)};
     return (try cb.fromConstantBytes(bytes, dtype, &shape)) orelse error.UnsupportedTensorType;
+}
+
+fn gatherNDNumel(dims: []const i64) !usize {
+    var count: usize = 1;
+    for (dims) |dim| {
+        if (dim < 0) return error.InvalidTensorShape;
+        count = try std.math.mul(usize, count, @intCast(dim));
+    }
+    return count;
+}
+
+fn exportGatherTensor(allocator: std.mem.Allocator, cb: *const ComputeBackend, value: CT) !ops_mod.ExportTensorData {
+    if (try cb.exportTensorData(value, allocator)) |data| return data;
+    // Metal exposes exact bytes for integer tensors and uses its regular
+    // float download path for activations, including deferred products.
+    switch (try cb.tensorDType(value)) {
+        .f16, .bf16, .f32, .f64 => {},
+        else => return error.UnsupportedTensorType,
+    }
+    const floats = try cb.toFloat32(value, allocator);
+    defer allocator.free(floats);
+    return .{ .dtype = .f32, .payload = .{ .bytes = try allocator.dupe(u8, std.mem.sliceAsBytes(floats)) } };
+}
+
+/// GatherND retains the source bytes (including bool and exact i64 payloads).
+/// Ordinary Gather cannot infer coordinate semantics from the indices' shape.
+fn executeGatherND(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    input: CT,
+    indices: CT,
+    input_shape: []const i64,
+    indices_shape: []const i64,
+    batch_dims: u8,
+) !CT {
+    if (input_shape.len == 0 or indices_shape.len == 0 or input_shape.len > 8 or indices_shape.len > 8 or
+        batch_dims >= @min(input_shape.len, indices_shape.len)) return error.InvalidTensorShape;
+    const depth = std.math.cast(usize, indices_shape[indices_shape.len - 1]) orelse return error.InvalidTensorShape;
+    if (depth == 0 or depth > input_shape.len - batch_dims) return error.InvalidTensorShape;
+    if (!std.mem.eql(i64, input_shape[0..batch_dims], indices_shape[0..batch_dims])) return error.ShapeMismatch;
+    const suffix_start = batch_dims + depth;
+    const prefix_rank = indices_shape.len - 1;
+    const output_rank = prefix_rank + input_shape.len - suffix_start;
+    if (output_rank > 8) return error.InvalidTensorShape;
+    var output_shape: [8]i64 = undefined;
+    @memcpy(output_shape[0..prefix_rank], indices_shape[0..prefix_rank]);
+    @memcpy(output_shape[prefix_rank..][0 .. input_shape.len - suffix_start], input_shape[suffix_start..]);
+    const input_count = try gatherNDNumel(input_shape);
+    const tuples = try gatherNDNumel(indices_shape[0..prefix_rank]);
+    const slice_size = try gatherNDNumel(input_shape[suffix_start..]);
+    const tuples_per_batch = try gatherNDNumel(indices_shape[batch_dims..prefix_rank]);
+    const batch_size = try gatherNDNumel(input_shape[batch_dims..]);
+    const data = try exportGatherTensor(allocator, cb, input);
+    defer allocator.free(data.payload.bytes);
+    const index_data = try exportGatherTensor(allocator, cb, indices);
+    defer allocator.free(index_data.payload.bytes);
+    const width = data.dtype.byteSize();
+    if (data.payload.bytes.len != try std.math.mul(usize, input_count, width) or
+        index_data.payload.bytes.len != try std.math.mul(usize, try std.math.mul(usize, tuples, depth), index_data.dtype.byteSize())) return error.ShapeMismatch;
+    const output = try allocator.alloc(u8, try std.math.mul(usize, try std.math.mul(usize, tuples, slice_size), width));
+    defer allocator.free(output);
+    for (0..tuples) |tuple| {
+        var offset: usize = 0;
+        for (0..depth) |d| {
+            const i = tuple * depth + d;
+            const bytes = index_data.payload.bytes;
+            var coord: i64 = switch (index_data.dtype) {
+                .i64 => std.mem.readInt(i64, bytes[i * 8 ..][0..8], .little),
+                .i32 => std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little),
+                // Legacy backends may store ONNX index tensors as f32.
+                .f32 => blk: {
+                    const value: f64 = @as(f32, @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little)));
+                    if (!std.math.isFinite(value) or @trunc(value) != value or value < -9223372036854775808.0 or value >= 9223372036854775808.0) return error.InvalidTensorIndex;
+                    break :blk @intFromFloat(value);
+                },
+                else => return error.UnsupportedTensorType,
+            };
+            const extent = input_shape[batch_dims + d];
+            if (extent < 0) return error.InvalidTensorShape;
+            if (coord < 0) coord += extent;
+            if (coord < 0 or coord >= extent) return error.IndexOutOfBounds;
+            offset = try std.math.add(usize, try std.math.mul(usize, offset, @intCast(extent)), @intCast(coord));
+        }
+        const batch_offset = (tuple / tuples_per_batch) * batch_size;
+        const from = (batch_offset + offset * slice_size) * width;
+        const to = tuple * slice_size * width;
+        @memcpy(output[to..][0 .. slice_size * width], data.payload.bytes[from..][0 .. slice_size * width]);
+    }
+    const dtype = std.meta.stringToEnum(ml.graph.DType, @tagName(data.dtype)) orelse return error.UnsupportedTensorType;
+    if (try cb.fromConstantBytes(output, dtype, output_shape[0..output_rank])) |result| return result;
+    // Preserve exact storage where supported. Legacy backends use F32
+    // activations, so widen only the gathered floating-point values when
+    // they cannot import the source dtype. Integers must stay byte-exact.
+    switch (dtype) {
+        .f16, .bf16, .f32, .f64 => {},
+        else => return error.UnsupportedTensorType,
+    }
+    const floats = try allocator.alloc(f32, output.len / width);
+    defer allocator.free(floats);
+    for (floats, 0..) |*value, i| value.* = switch (dtype) {
+        .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, output[i * 2 ..][0..2], .little)))),
+        .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, output[i * 2 ..][0..2], .little)) << 16),
+        .f32 => @bitCast(std.mem.readInt(u32, output[i * 4 ..][0..4], .little)),
+        .f64 => @floatCast(@as(f64, @bitCast(std.mem.readInt(u64, output[i * 8 ..][0..8], .little)))),
+        else => unreachable,
+    };
+    var dims: [8]i32 = undefined;
+    for (output_shape[0..output_rank], 0..) |dim, d| dims[d] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+    return cb.fromFloat32Shape(floats, dims[0..output_rank]);
 }
 
 fn executeGatherElements(
@@ -8486,4 +8602,157 @@ test "native Conv1d preserves dilation with padding stride and multiple channels
     attrs.padding[0] = .{ 0, 0 };
     attrs.strides[0] = 1;
     try expectNativeConvolution(attrs, Shape.init(.f32, &.{ 1, 2, 5 }), Shape.init(.f32, &.{ 1, 2, 2 }), Shape.init(.f32, &.{ 1, 1, 3 }), &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, &.{ 1, 2, 5 }, &.{ 1, 2, 3, 4 }, &.{ 1, 2, 2 }, &.{ 57, 67, 77 }, &.{ 1, 1, 3 });
+}
+
+test "native interpreter imports ClipClap GatherND boolean attention mask with dynamic shapes" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+    const data = try b.parameter("mask", Shape.init(.bool_, &.{ -1, -1 }));
+    const indices = try b.parameter("coords", Shape.init(.i64, &.{ -1, -1, 2 }));
+    const node = @import("onnx_graph").NodeProto{ .op_type = "GatherND" };
+    const out = try @import("onnx_graph").ops.convertNode(a, &b, &node, &.{ data, indices }, null);
+    try std.testing.expect(g.node(out).op.gather.nd);
+    try std.testing.expectEqualSlices(i64, &.{ -1, -1 }, g.node(out).output_shape.dims[0..2]);
+    try g.markOutput(out);
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var mask: [77]u8 = undefined;
+    var coords: [154]i64 = undefined;
+    for (0..77) |i| {
+        mask[i] = @intFromBool(i < 4);
+        coords[i * 2] = 0;
+        coords[i * 2 + 1] = @intCast(i);
+    }
+    const input = (try cb.fromConstantBytes(&mask, .bool_, &.{ 1, 77 })).?;
+    defer cb.free(input);
+    const index = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&coords), .i64, &.{ 1, 77, 2 })).?;
+    defer cb.free(index);
+    var result = try execute(a, &g, &cb, .{ .runtime_inputs = &.{ .{ .node_id = data, .value = input }, .{ .node_id = indices, .value = index } } });
+    defer result.deinit(&cb);
+    const actual = (try cb.exportTensorData(result.outputs[0], a)).?;
+    defer a.free(actual.payload.bytes);
+    try std.testing.expectEqual(.bool_, actual.dtype);
+    try std.testing.expectEqualSlices(u8, &mask, actual.payload.bytes);
+    const shape = try cb.tensorShape(result.outputs[0], a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 77 }, shape);
+}
+
+test "native GatherND preserves exact slices batch dims negative indices and bounds" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const values = [_]i64{ 9007199254740993, 2, 3, 4, 5, -9007199254740993, 7, 8, 9, 10, 11, 12 };
+    const input = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&values), .i64, &.{ 2, 3, 2 })).?;
+    defer cb.free(input);
+    const coords = [_]i64{ 0, 0, 1, -1 };
+    const index = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&coords), .i64, &.{ 2, 2 })).?;
+    defer cb.free(index);
+    const out = try executeGatherND(a, &cb, input, index, &.{ 2, 3, 2 }, &.{ 2, 2 }, 0);
+    defer cb.free(out);
+    const raw = (try cb.exportTensorData(out, a)).?;
+    defer a.free(raw.payload.bytes);
+    try std.testing.expectEqual(.i64, raw.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ values[0], 2, 11, 12 }), raw.payload.bytes);
+    const batch_index = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 0, -1 }), .i64, &.{ 2, 1, 1 })).?;
+    defer cb.free(batch_index);
+    const batch_out = try executeGatherND(a, &cb, input, batch_index, &.{ 2, 3, 2 }, &.{ 2, 1, 1 }, 1);
+    defer cb.free(batch_out);
+    const batch_raw = (try cb.exportTensorData(batch_out, a)).?;
+    defer a.free(batch_raw.payload.bytes);
+    try std.testing.expectEqualSlices(u8, raw.payload.bytes, batch_raw.payload.bytes);
+    for ([_]i64{ -4, 3, 9007199254740993 }) |bad| {
+        const invalid = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 0, bad }), .i64, &.{ 1, 2 })).?;
+        defer cb.free(invalid);
+        try std.testing.expectError(error.IndexOutOfBounds, executeGatherND(a, &cb, input, invalid, &.{ 2, 3, 2 }, &.{ 1, 2 }, 0));
+    }
+    const floating = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, &.{ 2, 3, 2 });
+    defer cb.free(floating);
+    const float_out = try executeGatherND(a, &cb, floating, index, &.{ 2, 3, 2 }, &.{ 2, 2 }, 0);
+    defer cb.free(float_out);
+    const float_values = try cb.toFloat32(float_out, a);
+    defer a.free(float_values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 11, 12 }, float_values);
+    const empty = (try cb.fromConstantBytes(&.{}, .i64, &.{ 0, 2 })).?;
+    defer cb.free(empty);
+    const empty_out = try executeGatherND(a, &cb, input, empty, &.{ 2, 3, 2 }, &.{ 0, 2 }, 0);
+    defer cb.free(empty_out);
+    const empty_shape = try cb.tensorShape(empty_out, a);
+    defer a.free(empty_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 2 }, empty_shape);
+}
+
+test "native GatherND widens floating weight slices when exact import is unavailable" {
+    const a = std.testing.allocator;
+    const tensor_mod = @import("../backends/tensor.zig");
+    const source_values = [_]f32{ 1.5, -2.25, 127.5, -0.0, 0x1p-24, std.math.inf(f32) };
+    const expected = [_]f32{ -0.0, 0x1p-24, std.math.inf(f32), 1.5, -2.25, 127.5 };
+    for ([_]tensor_mod.DType{ .f16, .bf16, .f64 }) |dtype| {
+        var raw: [source_values.len * 8]u8 = undefined;
+        const bytes = raw[0 .. source_values.len * dtype.byteSize()];
+        for (source_values, 0..) |value, i| switch (dtype) {
+            .f16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @bitCast(@as(f16, @floatCast(value))), .little),
+            .bf16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @intCast(@as(u32, @bitCast(value)) >> 16), .little),
+            .f64 => std.mem.writeInt(u64, bytes[i * 8 ..][0..8], @bitCast(@as(f64, value)), .little),
+            else => unreachable,
+        };
+        var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        defer ws.resident_weights.deinit(a);
+        try ws.resident_weights.put(a, "floating", .{ .tensor = .{
+            .data = bytes,
+            .dtype = dtype,
+            .shape = &.{ 2, 3 },
+            .name = "floating",
+            .allocator = a,
+            .owns_data = false,
+            .owns_shape = false,
+        } });
+        var compute = NativeCompute.init(a, &ws, null);
+        defer compute.deinit();
+        const backend = compute.computeBackend();
+        const input = try backend.getWeight("floating");
+        defer backend.free(input);
+        try std.testing.expectEqual(dtype, try backend.tensorDType(input));
+        // Cover backends that export raw floating bytes and those exposing
+        // only the legacy F32 download API. Both decline exact float import.
+        for ([_]bool{ true, false }) |raw_export| {
+            var vtable = backend.vtable.*;
+            if (!raw_export) vtable.exportTensorData = null;
+            var cb = backend;
+            cb.vtable = &vtable;
+            const index = try cb.fromFloat32Shape(&.{ -1, 0 }, &.{ 2, 1 });
+            defer cb.free(index);
+            var g = Graph.init(a);
+            defer g.deinit();
+            var b = ml.graph.Builder.init(&g);
+            const data = try b.parameter("data", Shape.init(std.meta.stringToEnum(ml.graph.DType, @tagName(dtype)).?, &.{ 2, 3 }));
+            const coords = try b.parameter("coords", Shape.init(.i64, &.{ 2, 1 }));
+            const node = @import("onnx_graph").NodeProto{ .op_type = "GatherND" };
+            const out = try @import("onnx_graph").ops.convertNode(a, &b, &node, &.{ data, coords }, null);
+            try g.markOutput(out);
+            var result = try execute(a, &g, &cb, .{ .runtime_inputs = &.{ .{ .node_id = data, .value = input }, .{ .node_id = coords, .value = index } } });
+            defer result.deinit(&cb);
+            const actual = try cb.toFloat32(result.outputs[0], a);
+            defer a.free(actual);
+            // Bit comparisons also check signed zero and infinity.
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(actual));
+            try std.testing.expectEqual(.f32, try cb.tensorDType(result.outputs[0]));
+            const shape = try cb.tensorShape(result.outputs[0], a);
+            defer a.free(shape);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, shape);
+        }
+        const empty = (try backend.fromConstantBytes(&.{}, .i64, &.{ 0, 1 })).?;
+        defer backend.free(empty);
+        const empty_out = try executeGatherND(a, &backend, input, empty, &.{ 2, 3 }, &.{ 0, 1 }, 0);
+        defer backend.free(empty_out);
+        const empty_shape = try backend.tensorShape(empty_out, a);
+        defer a.free(empty_shape);
+        try std.testing.expectEqualSlices(i64, &.{ 0, 3 }, empty_shape);
+    }
 }

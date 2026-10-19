@@ -1080,6 +1080,7 @@ fn applyVjp(
         // ── Data movement ────────────────────────────────────────────
 
         .gather => |attrs| {
+            if (attrs.nd) return error.NoVjpRule;
             if (strict and n.op.gather.axis != 0) return error.NoVjpRule;
             // d/d(table)(gather(table, indices)) = scatter_add(adj, indices)
             const table_shape = g.node(ins[0]).output_shape;
