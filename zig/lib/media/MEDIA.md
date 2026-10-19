@@ -832,3 +832,11 @@ occur after commands are fenced; a denied replacement never authorizes work.
 Mixed-image preparation stably groups equal geometries inside the existing
 bounded wave and scatters projections back to original content slots, including
 waves with indexed failures. Neither policy expands producer lookahead.
+
+Qualified Metal phases replace generic model-size scratch with a positive
+explicit workspace plan while preserving physical-input and model-profile
+floors. Composition and backbone use distinct envelopes. On a reclaimable phase
+denial, the pipeline retains tensor leases and its model turn, retires provider
+bindings, retries admission and selectively reclaims idle caches. Ownership is
+restored before return, including cancellation/error cleanup. Other quota or
+forced denials do not trigger cache eviction.

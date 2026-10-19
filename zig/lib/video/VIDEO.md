@@ -989,3 +989,10 @@ this admission hook retains conservative batch sizing. Decode/preparation
 queues retain their leases while model execution supplements are released at
 waits. Eight-frame tower parity and completed clip comparisons are available
 through `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VIDEO_PLAN=1` in the pretrained suite.
+
+Video cohort calibration includes the exact admitted frame count in addition
+to powers of two, so six-frame geometries can be qualified at six. Selection
+uses completed cost per frame and respects smaller resource ceilings. Prepared
+and legacy observations are isolated; retry cost cannot poison prepared-plan
+calibration. Metal queue, composition and backbone memory estimates describe
+their own physical stages and preserve global/process admission checks.

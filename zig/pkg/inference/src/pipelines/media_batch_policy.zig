@@ -20,50 +20,42 @@ const widths = [_]usize{ 1, 2, 4, 8 };
 const Cost = struct { samples: u32 = 0, nanos_per_frame: u64 = 0, pending: u64 = 0 };
 const Entry = struct {
     key: u128 = 0,
-    costs: [4]Cost = @splat(.{}),
+    costs: [8]Cost = @splat(.{}),
     decisions: u64 = 0,
-    fn choose(self: *Entry, cap: usize) usize {
+    fn candidate(width: usize, cap: usize) bool {
+        return width <= cap and (std.math.isPowerOfTwo(width) or width == cap);
+    }
+    fn select(self: *Entry, cap: usize, depth: bool) usize {
+        std.debug.assert(cap >= 1 and cap <= 8);
         self.decisions +%= 1;
-        // Two completed observations for every admissible candidate, followed
-        // by sparse exploration so changing contention/hardware can be learned.
-        var candidates: usize = 0;
-        for (widths, 0..) |width, i| {
-            if (width > cap) break;
-            candidates += 1;
-            if (self.costs[i].samples < 2) return width;
+        var candidates: [5]usize = undefined;
+        var count: usize = 0;
+        for (1..cap + 1) |width| if (candidate(width, cap)) {
+            candidates[count] = width;
+            count += 1;
+        };
+        // Frame cohorts explore upwards; layer groups preserve their qualified
+        // deepest cold-start policy. Include the exact admission ceiling.
+        for (0..count) |offset| {
+            const width = candidates[if (depth) count - 1 - offset else offset];
+            if (self.costs[width - 1].samples < 2) return width;
         }
-        if (self.decisions % 32 == 0) return widths[@intCast((self.decisions / 32) % candidates)];
-        var best: usize = 0;
-        for (1..candidates) |i| {
-            // Prefer the smaller allocation unless throughput improves >5%.
-            if (@as(u128, self.costs[i].nanos_per_frame) * 105 < @as(u128, self.costs[best].nanos_per_frame) * 100) best = i;
+        if (self.decisions % 32 == 0) return candidates[@intCast((self.decisions / 32) % count)];
+        var best = candidates[if (depth) count - 1 else 0];
+        for (candidates[0..count]) |width| {
+            if (@as(u128, self.costs[width - 1].nanos_per_frame) * 105 < @as(u128, self.costs[best - 1].nanos_per_frame) * 100) best = width;
         }
-        return widths[best];
+        return best;
+    }
+    fn choose(self: *Entry, cap: usize) usize {
+        return self.select(cap, false);
     }
     fn chooseDepth(self: *Entry, cap: usize) usize {
-        self.decisions +%= 1;
-        var candidates: usize = 0;
-        for (widths) |width| {
-            if (width > cap) break;
-            candidates += 1;
-        }
-        // Preserve the qualified grouping on cold starts. Splitting frames
-        // increases provider/command overhead; prefer deeper groups on ties.
-        var remaining = candidates;
-        while (remaining > 0) {
-            remaining -= 1;
-            if (self.costs[remaining].samples < 2) return widths[remaining];
-        }
-        if (self.decisions % 32 == 0) return widths[@intCast((self.decisions / 32) % candidates)];
-        var best = candidates - 1;
-        for (0..candidates) |i| {
-            if (@as(u128, self.costs[i].nanos_per_frame) * 105 < @as(u128, self.costs[best].nanos_per_frame) * 100) best = i;
-        }
-        return widths[best];
+        return self.select(cap, true);
     }
     fn observe(self: *Entry, count: usize, elapsed: u64) void {
-        const i = std.mem.indexOfScalar(usize, &widths, count) orelse return;
-        const cost = &self.costs[i];
+        if (count == 0 or count > 8) return;
+        const cost = &self.costs[count - 1];
         const sample = @max(@as(u64, 1), elapsed / count);
         // Pair minima exclude one-off cold weight uploads and scheduling
         // stalls. Smoothed successive pairs still adapt to sustained changes.
@@ -79,8 +71,8 @@ const Entry = struct {
 var mutex: std.atomic.Mutex = .unlocked;
 var entries: [64]Entry = @splat(.{});
 var eviction: usize = 0;
-fn entry(metal: bool, width: u32, height: u32, batch: usize) *Entry {
-    const key = (@as(u128, width) << 64) | (@as(u128, height) << 32) | (@as(u128, batch) << 1) | @intFromBool(metal);
+fn entry(metal: bool, width: u32, height: u32, batch: usize, prepared: bool) *Entry {
+    const key = (@as(u128, width) << 64) | (@as(u128, height) << 32) | (@as(u128, batch) << 2) | (@as(u128, @intFromBool(prepared)) << 1) | @intFromBool(metal);
     for (&entries) |*item| if (item.key == key) return item;
     const item = &entries[eviction];
     eviction = (eviction + 1) % entries.len;
@@ -88,15 +80,21 @@ fn entry(metal: bool, width: u32, height: u32, batch: usize) *Entry {
     return item;
 }
 pub fn capacity(metal: bool, width: u32, height: u32, maximum: usize) usize {
+    return capacityForPlan(metal, width, height, maximum, false);
+}
+pub fn capacityForPlan(metal: bool, width: u32, height: u32, maximum: usize, prepared: bool) usize {
     std.debug.assert(maximum >= 1);
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
     defer mutex.unlock();
-    return entry(metal, width, height, 0).choose(@min(maximum, 8));
+    return entry(metal, width, height, 0, prepared).choose(@min(maximum, 8));
 }
 pub fn completed(metal: bool, width: u32, height: u32, count: usize, elapsed: u64) void {
+    completedForPlan(metal, width, height, count, elapsed, false);
+}
+pub fn completedForPlan(metal: bool, width: u32, height: u32, count: usize, elapsed: u64, prepared: bool) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
     defer mutex.unlock();
-    entry(metal, width, height, 0).observe(count, elapsed);
+    entry(metal, width, height, 0, prepared).observe(count, elapsed);
 }
 test "embeddinggemma2 video batch policy learns completed throughput within admission" {
     var cpu = Entry{};
@@ -132,12 +130,12 @@ test "embeddinggemma2 video batch calibration separates cold setup from warm cos
 pub fn layerCapacity(width: u32, height: u32, batch: usize, maximum: usize) usize {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
     defer mutex.unlock();
-    return entry(true, width, height, batch).chooseDepth(@min(maximum, 8));
+    return entry(true, width, height, batch, false).chooseDepth(@min(maximum, 8));
 }
 pub fn layerCompleted(width: u32, height: u32, batch: usize, group: usize, layers: usize, elapsed: u64) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
     defer mutex.unlock();
-    entry(true, width, height, batch).observe(group, @intCast(@as(u128, elapsed) * group / @max(layers, 1)));
+    entry(true, width, height, batch, false).observe(group, @intCast(@as(u128, elapsed) * group / @max(layers, 1)));
 }
 
 test "embeddinggemma2 video layer policy is independent for every frame batch" {
@@ -162,4 +160,27 @@ test "embeddinggemma2 video depth calibration preserves qualified grouping on co
     try std.testing.expectEqual(@as(usize, 2), policy.chooseDepth(2));
     for (0..32) |_| policy.observe(1, 50);
     try std.testing.expectEqual(@as(usize, 1), policy.chooseDepth(2));
+}
+
+test "embeddinggemma2 calibration learns exact admitted widths and preserves smaller limits" {
+    for ([_]usize{ 3, 5, 6, 7 }) |cap| {
+        var policy = Entry{};
+        for (1..cap + 1) |width| if (Entry.candidate(width, cap)) {
+            for (0..2) |_| {
+                try std.testing.expectEqual(width, policy.choose(cap));
+                policy.observe(width, 1000 + width * 100);
+            }
+        };
+        try std.testing.expectEqual(cap, policy.choose(cap));
+        for (0..40) |_| try std.testing.expect(policy.choose(2) <= 2);
+    }
+    // Production geometry 576x528 admits six frames, not a power of two.
+    const projector = @import("../architectures/gemma4_projector.zig");
+    try std.testing.expectEqual(@as(usize, 6), try projector.embeddingGemma2VideoPreparedCapacity(576, 528, 768 * 1024 * 1024));
+}
+
+test "embeddinggemma2 prepared calibration is isolated from legacy fallback timings" {
+    for ([_]bool{ false, true }) |prepared| for ([_]usize{ 1, 2, 4, 6 }) |width| for (0..2) |_| completedForPlan(true, 97, 51, width, if (prepared) 1000 + width * 100 else width * width * 100, prepared);
+    try std.testing.expectEqual(@as(usize, 6), capacityForPlan(true, 97, 51, 6, true));
+    try std.testing.expectEqual(@as(usize, 1), capacityForPlan(true, 97, 51, 6, false));
 }

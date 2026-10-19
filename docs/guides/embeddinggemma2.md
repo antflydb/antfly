@@ -1761,3 +1761,40 @@ One optimized short-clip call recorded 1,077,248 copied bytes in 0.655 ms,
 0.097 ms of explicit backend retirement and 0.110 ms of provider reacquisition.
 These counters preserve independent tensor ownership and exclude lazy binding
 setup during later dispatch.
+
+Qualified Metal media phases set `RunRequest.workspace_planned` with a positive
+workspace envelope. This replaces the generic model-weight-size allowance;
+physical staging, model-profile estimates, process limits and live-memory checks
+remain enforced. Queued video reserves retained inputs and preparation. Token
+composition adds text lookup, composed rows and an independent handoff copy.
+The backbone uses the shared linear activation envelope over physical rows;
+Metal segmented attention reports unavailable capabilities instead of silently
+materializing dense/host attention. CPU/CUDA retain conservative planning.
+
+A relevant phase-supplement denial retires request-local provider bindings while
+retaining the model's FIFO turn and independent tensor leases. Admission retries
+after retirement, then reclaims optional media and language caches in order.
+Forced denials, permanent size failures and unrelated quotas bypass eviction.
+Provider ownership is restored on success, cancellation and failure before the
+caller can free or consume its tensors. Standalone image helpers use the same
+fenced admission path, including separately admitted legacy fallback.
+
+Completed video calibration considers powers of two plus the exact admitted
+ceiling. A 576x528 frame has 1188 patch rows and admits six frames; six is now a
+measured candidate alongside one, two and four. Smaller caps remain hard bounds.
+Prepared and conservative plans have separate calibration namespaces; a declined
+prepared attempt that retries legacy subcohorts does not train the prepared
+policy. The video qualifier includes alternating completed four/six-frame tower
+measurements and vector checks. The stage qualifier forces a warmed-cache
+admission denial and verifies retained input after provider retirement/recovery.
+
+The completed ReleaseFast 576x528 tower comparison measured 330.481 ms for
+four frames and 491.649 ms for six (82.620 and 81.942 ms/frame), using seven
+samples after two warmups in alternating order with projection parity. This
+falls inside the policy's 5% preference margin and does not establish a larger
+batch throughput win. Debug measured 90.773 versus 98.396 ms/frame, favouring
+four; this variability reinforces completed-cost selection. The same
+ReleaseFast shared-host run measured 194.692 versus
+194.838 ms for the full short-clip legacy/prepared comparison: effectively flat.
+These admission and candidate-selection changes do not establish PyTorch parity
+or a production latency SLO.

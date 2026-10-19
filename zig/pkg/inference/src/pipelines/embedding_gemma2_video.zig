@@ -1479,6 +1479,7 @@ const Capture = struct {
     native_limit: usize = 1,
     claimed: [32]bool = @splat(false),
     apple_published: usize = 0,
+    last_prepared: bool = false,
     fn loadCached(self: *Capture, slot: usize, ticket: CacheTicket) !void {
         try self.control.check();
         const tokens = ticket.entry.tokens;
@@ -1622,6 +1623,7 @@ const Capture = struct {
     fn encodeGpu(self: *Capture, input: CT, options: video.preparation.Options, frames: usize) !projector.EncodedDeviceImage {
         const stage = self.cb.embedding_stage;
         const required = self.preparedVision();
+        self.last_prepared = required;
         const scratch = if (required) try projector.embeddingGemma2VideoPreparedScratch(options.width, options.height, frames) else try std.math.mul(usize, try projector.embeddingGemma2VideoScratch(options.width, options.height), frames);
         if (stage) |lane| try lane.workspace(scratch);
         return projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, input, options.width, options.height, frames, required) catch |err| {
@@ -1630,6 +1632,7 @@ const Capture = struct {
             // input is still live; no producer job is consumed a second time.
             if (self.cb.decoderRuntimeHasActiveFrame() or self.cb.decoderRuntimeHasSubmittedFrame()) return error.PreparedVisionFallbackBusy;
             try self.control.check();
+            self.last_prepared = false;
             return self.encodeLegacyGpu(input, options, frames);
         };
     }
@@ -1669,7 +1672,7 @@ const Capture = struct {
         while (consumed < jobs.len) {
             const first = consumed;
             const options = jobs[first].options;
-            const capacity = batch_policy.capacity(true, options.width, options.height, if (self.preparedVision()) try projector.embeddingGemma2VideoPreparedCapacity(options.width, options.height, 768 * 1024 * 1024) else try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024));
+            const capacity = batch_policy.capacityForPlan(true, options.width, options.height, if (self.preparedVision()) try projector.embeddingGemma2VideoPreparedCapacity(options.width, options.height, 768 * 1024 * 1024) else try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024), self.preparedVision());
             var stop = first + 1;
             while (stop < jobs.len and stop - first < capacity and jobs[stop].options.width == options.width and jobs[stop].options.height == options.height) : (stop += 1) {}
             consumed = stop; // Cohort consumes all its leases, including on failure.
@@ -1729,7 +1732,7 @@ const Capture = struct {
                 self.frame_tokens[job.slot] = per_frame;
                 self.storeDevice(job.slot, outputs[i], per_frame);
             }
-            batch_policy.completed(true, options.width, options.height, jobs.len, batch_clock.monotonicNs() -| started);
+            if (!self.preparedVision() or self.last_prepared) batch_policy.completedForPlan(true, options.width, options.height, jobs.len, batch_clock.monotonicNs() -| started, self.last_prepared);
         } else return error.UnsupportedVideoBackend;
     }
     fn projectGpuNow(self: *Capture, slot: usize, value: video.preparation.Prepared, options: video.preparation.Options) !void {
@@ -1761,7 +1764,7 @@ const Capture = struct {
                 defer self.a.free(embeddings);
                 try self.save(slot, .{ .embeddings = embeddings, .tokens = encoded.tokens });
             }
-            batch_policy.completed(true, options.width, options.height, 1, batch_clock.monotonicNs() -| started);
+            if (!self.preparedVision() or self.last_prepared) batch_policy.completedForPlan(true, options.width, options.height, 1, batch_clock.monotonicNs() -| started, self.last_prepared);
         } else return error.UnsupportedVideoBackend;
     }
     fn validateRange(self: *const Capture, full: bool) !void {

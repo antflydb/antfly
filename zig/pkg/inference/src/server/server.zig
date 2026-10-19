@@ -37665,6 +37665,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
             for (vector, expected) |actual, value| try std.testing.expectApproxEqAbs(value, actual, 1e-3);
         }
         std.debug.print("embeddinggemma2 mixed_geometry alternating_aspects=true scatter_parity=true\n", .{});
+        try grouped.qualifyVideoPhaseReclaim(a, loaded.session, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
             extern "c" fn unsetenv([*:0]const u8) c_int;
@@ -37851,6 +37852,37 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
                 try std.testing.expectEqual(single.tokens * 8, projected.tokens);
                 for (0..8) |frame| for (values[frame * single_values.len ..][0..single_values.len], single_values) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
                 std.debug.print("embeddinggemma2 video_plan full_frames=8 singleton_projection_parity=true\n", .{});
+                // Qualify the exact non-power-of-two ceiling as well as eight.
+                // Readback precedes the clock stop; comparisons follow it.
+                const pixels = try a.alloc(f32, 1188 * 768);
+                defer a.free(pixels);
+                for (pixels, 0..) |*v, index| v.* = @as(f32, @floatFromInt(index % 239)) / 239 - 0.5;
+                const frame = try cb.fromFloat32Shape(pixels, &.{ 1188, 768 });
+                defer cb.free(frame);
+                const cohort_input = (try cb.allocUninitF32Shape(&.{ 7128, 768 })) orelse return error.UnsupportedPrimitiveOp;
+                defer cb.free(cohort_input);
+                for (0..6) |index| try std.testing.expect(try cb.copyRows2D(a, cohort_input, index * 1188, frame, 0, 1188, 768));
+                const four_input = try cb.sliceRows2D(a, cohort_input, 0, 4 * 1188, 768);
+                defer cb.free(four_input);
+                const six = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, a, cohort_input, 576, 528, 6, true);
+                defer cb.free(six.tensor);
+                const reference_six = try cb.toFloat32(six.tensor, a);
+                defer a.free(reference_six);
+                var costs: [2][7]u64 = undefined;
+                for (0..9) |iteration| for (0..2) |phase| {
+                    const route = phase ^ (iteration & 1);
+                    const count: usize = if (route == 0) 4 else 6;
+                    const started = platform.time.monotonicNs();
+                    const encoded = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, a, if (route == 0) four_input else cohort_input, 576, 528, count, true);
+                    defer cb.free(encoded.tensor);
+                    const actual = try cb.toFloat32(encoded.tensor, a);
+                    defer a.free(actual);
+                    const elapsed = platform.time.monotonicNs() -| started;
+                    for (actual, reference_six[0..actual.len]) |got, want| try std.testing.expectApproxEqAbs(want, got, 1e-3);
+                    if (iteration >= 2) costs[route][iteration - 2] = elapsed;
+                };
+                for (&costs) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+                std.debug.print("embeddinggemma2 video_exact_ceiling frames=6 four_ns={d} six_ns={d} four_per_frame_ns={d} six_per_frame_ns={d} samples=7 parity=true\n", .{ costs[0][3], costs[1][3], costs[0][3] / 4, costs[1][3] / 6 });
             }
             const flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN";
             const saved = if (platform.env.getenv(flag)) |old| try a.dupeSentinel(u8, old, 0) else null;

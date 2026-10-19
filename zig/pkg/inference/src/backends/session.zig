@@ -180,8 +180,9 @@ pub const RunAdmission = struct {
         if (request.output_kv_bytes > output_bytes) return error.ResourceLimitExceeded;
         const dynamic_base = try addBytes(request.backend_input_bytes orelse input_bytes, output_bytes);
         const dynamic_workspace = try mulBytes(dynamic_base, 6);
+        if (request.workspace_planned and request.workspace_bytes == 0) return error.ResourceLimitExceeded;
         const workspace = @max(
-            @max(self.static_workspace_bytes, request.workspace_bytes),
+            @max(if (request.workspace_planned) @as(usize, 0) else self.static_workspace_bytes, request.workspace_bytes),
             @max(dynamic_workspace, try self.profiledWorkspace(request)),
         );
         const resident_input_bytes = try addBytes(
@@ -327,6 +328,10 @@ pub const RunRequest = struct {
     output_bytes: ?usize = null,
     output_kv_bytes: usize = 0,
     workspace_bytes: usize = 0,
+    /// A qualified phase provides its own positive workspace envelope. Physical
+    /// staging and model-profile floors still apply; only the generic allowance
+    /// derived from total model weight size is replaced.
+    workspace_planned: bool = false,
     host_preprocess_bytes: usize = 0,
     /// Media towers have completed; their transient peak is no longer live.
     /// Retained model caches carry independent leases.
@@ -843,6 +848,14 @@ pub const Session = struct {
     /// Credit two independent live owners without merging external lease
     /// tokens. Only acquire the component-wise deficit beyond both owners.
     pub fn admitSupplementPair(self: Session, base: *const RunPermit, other: ?*const RunPermit, target: memory.AdmissionAmounts) !RunPermit {
+        var pressure: ?memory.AdmissionPressure = null;
+        return self.admitSupplementPairWithPressure(base, other, target, &pressure);
+    }
+
+    /// Supplemental admission reports the same denial constraint as initial
+    /// admission, while preserving credit from independently owned live leases.
+    pub fn admitSupplementPairWithPressure(self: Session, base: *const RunPermit, other: ?*const RunPermit, target: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
         if (base.session.ptr != self.ptr or base.session.vtable != self.vtable or base.execution_yielded) return error.InvalidAdmissionLeaseReduction;
         const admission = self.run_admission orelse return .{ .session = self, .lease = null };
         const lease = base.lease orelse return error.InvalidAdmissionLeaseReduction;
@@ -858,7 +871,8 @@ pub const Session = struct {
         var extra = memory.AdmissionAmounts{};
         inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| @field(extra, name) = @field(target, name) -| @field(owned, name);
         if (std.meta.eql(extra, memory.AdmissionAmounts{})) return .{ .session = self, .lease = null };
-        return .{ .session = self, .lease = try admission.acquireAmounts(extra) };
+        if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
+        return .{ .session = self, .lease = try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, extra, admission.check_live_memory, pressure) };
     }
 
     /// Preserve the exact denial constraint for bounded batch planning. A
@@ -2141,4 +2155,18 @@ test "embeddinggemma2 stage admission reduces independent supplements without bo
     extra.deinit();
     base.deinit();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().scratchTotalBytes());
+}
+
+test "embeddinggemma2 explicit phase workspace replaces only the generic model allowance" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 4096, .check_live_memory = false, .model_profile = .{ .hidden_size = 16, .intermediate_size = 32 } };
+    var request = RunRequest{ .workspace_bytes = 128, .backend_input_bytes = 0, .output_bytes = 0 };
+    try std.testing.expectEqual(@as(usize, 4096), (try admission.estimateRequest(request, &.{})).backend_scratch_bytes);
+    request.workspace_planned = true;
+    // The model profile remains a hard floor above the explicit 128 bytes.
+    try std.testing.expectEqual(@as(usize, 512), (try admission.estimateRequest(request, &.{})).backend_scratch_bytes);
+    request.backend_input_bytes = 1024;
+    try std.testing.expectEqual(@as(usize, 6144), (try admission.estimateRequest(request, &.{})).backend_scratch_bytes);
+    request.workspace_bytes = 0;
+    try std.testing.expectError(error.ResourceLimitExceeded, admission.estimateRequest(request, &.{}));
 }
