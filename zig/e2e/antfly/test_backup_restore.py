@@ -543,6 +543,8 @@ def _constraint_probe_outcome(response, expected_error):
             return False
     if response.status_code == 503 and text == "write unavailable":
         return False
+    if _precommit_batch_retry_delay(response) is not None:
+        return False
     raise AssertionError(
         f"expected {expected_error}, got {response.status_code}: {text}"
     )
@@ -554,28 +556,34 @@ def _assert_constraint_rejected(
     deadline = time.monotonic() + timeout_s
     observations = []
 
-    def rejected():
-        cluster.assert_processes_alive()
-        # No transport-exception retry: an invalid write might have committed
-        # if enforcement regressed and only its response was lost.
-        try:
-            response = session.post(
-                f"{cluster.data_api_urls[0]}/tables/{table}/batch",
-                json={"inserts": inserts},
-                timeout=max(0.001, min(20.0, deadline - time.monotonic())),
-            )
-        except requests.RequestException as exc:
-            # wait_until also serves read-only polling and understands some
-            # retryable HTTPError responses. Do not inherit that for writes.
-            raise AssertionError(f"constraint probe transport failed: {exc}") from exc
-        observations.append(f"{response.status_code}: {response.text[:1024]}")
-        del observations[:-8]
-        return _constraint_probe_outcome(response, expected_error)
-
     try:
-        assert wait_until(rejected, timeout_s=timeout_s, interval_s=0.5), (
-            f"constraint did not return {expected_error}"
-        )
+        while True:
+            cluster.assert_processes_alive()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # A lost response might conceal a committed invalid write. Only
+            # the explicit non-commit responses below authorize another probe.
+            try:
+                response = session.post(
+                    f"{cluster.data_api_urls[0]}/tables/{table}/batch",
+                    json={"inserts": inserts},
+                    timeout=min(20.0, remaining),
+                )
+            except requests.RequestException as exc:
+                raise AssertionError(
+                    f"constraint probe transport failed: {exc}"
+                ) from exc
+            observations.append(f"{response.status_code}: {response.text[:1024]}")
+            del observations[:-8]
+            if _constraint_probe_outcome(response, expected_error):
+                return
+            delay = _precommit_batch_retry_delay(response)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.5 if delay is None else delay, remaining))
+        raise AssertionError(f"constraint did not return {expected_error}")
     except (AssertionError, requests.RequestException) as exc:
         raise AssertionError(
             f"constraint probe failed: {exc}; observations={observations}\n"
@@ -680,11 +688,16 @@ def _precommit_batch_retry_delay(response) -> float | None:
         payload = response.json()
     except ValueError:
         return None
-    if not isinstance(payload, dict) or payload.get("code") not in {
-        "transaction_precommit_read_unavailable",
-        "transaction_precommit_aborted",
-        "constraint_activation_pending",
-    }:
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("code"), str)
+        or payload.get("code")
+        not in {
+            "transaction_precommit_read_unavailable",
+            "transaction_precommit_aborted",
+            "constraint_activation_pending",
+        }
+    ):
         return None
     if payload.get("retryable") is not True or any(
         payload.get(key) is not None for key in ("transaction_id", "status")
@@ -2218,6 +2231,8 @@ def test_setup_batch_retries_explicit_precommit_rejection(monkeypatch, code):
     [
         {"code": "transaction_outcome_unknown"},
         {"code": "constraint_violation"},
+        {"code": []},
+        {"code": {}},
         {"retryable": False},
         {"status": "committed_pending"},
         {"transaction_id": "opaque"},
