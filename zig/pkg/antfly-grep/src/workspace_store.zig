@@ -412,7 +412,7 @@ pub const Generation = struct {
         var requires_inode_witness = false;
         for (stage.entries.items) |entry| if (entry.blob.token == null or !w.intact(entry.blob.token.?)) {
             missing_inode_witness = true;
-            if (entry.explicit_file or (entry.blob.stamp != null and entry.blob.stamp.?.nlink > 1)) requires_inode_witness = true;
+            if (entry.explicit_file or (entry.blob.stamp.valid and entry.blob.stamp.nlink > 1)) requires_inode_witness = true;
         };
         const native_source_proof = @import("builtin").os.tag == .linux and journal.allow_native_sources and journal.native_covered and !requires_inode_witness;
         const sources_covered = journal.sources_covered and (!missing_inode_witness or native_source_proof);
@@ -743,7 +743,7 @@ pub const Generation = struct {
         old.discovery_reused = true;
         for (j.membership_dirs.items) |directory| j.inventories.getPtr(directory.path).?.* = if (directory.native_names) null else directory.stamp;
         for (stage.entries.items) |entry| if (entry.blob.token == null or !w.intact(entry.blob.token.?)) {
-            if (@import("builtin").os.tag != .linux or entry.explicit_file or (entry.blob.stamp != null and entry.blob.stamp.?.nlink > 1) or !j.native_covered or !j.allow_native_sources) j.sources_covered = false;
+            if (@import("builtin").os.tag != .linux or entry.explicit_file or (entry.blob.stamp.valid and entry.blob.stamp.nlink > 1) or !j.native_covered or !j.allow_native_sources) j.sources_covered = false;
             j.native_active = true;
         };
         j.source_epoch = w.epoch;
@@ -846,21 +846,22 @@ pub const Generation = struct {
 /// Independent allocations never borrow a generation allocator. Refresh can
 /// release the old generation immediately, including after arbitrarily many reuses.
 const Stamp = struct {
-    inode: @FieldType(std.Io.File.Stat, "inode"),
-    size: u64,
-    mtime: @FieldType(std.Io.File.Stat, "mtime"),
-    ctime: @FieldType(std.Io.File.Stat, "ctime"),
-    nlink: @FieldType(std.Io.File.Stat, "nlink"),
-    kind: @FieldType(std.Io.File.Stat, "kind"),
+    inode: @FieldType(std.Io.File.Stat, "inode") = undefined,
+    size: u64 = undefined,
+    mtime: @FieldType(std.Io.File.Stat, "mtime") = undefined,
+    ctime: @FieldType(std.Io.File.Stat, "ctime") = undefined,
+    nlink: @FieldType(std.Io.File.Stat, "nlink") = undefined,
+    kind: @FieldType(std.Io.File.Stat, "kind") = .unknown,
+    valid: bool = false,
     fn from(value: std.Io.File.Stat) Stamp {
-        return .{ .inode = value.inode, .size = value.size, .mtime = value.mtime, .ctime = value.ctime, .nlink = value.nlink, .kind = value.kind };
+        return .{ .inode = value.inode, .size = value.size, .mtime = value.mtime, .ctime = value.ctime, .nlink = value.nlink, .kind = value.kind, .valid = true };
     }
 };
 const Blob = struct {
     backing: A,
     refs: usize = 1, // capture/publication run serially after query workers join
     bytes: []u8,
-    stamp: ?Stamp = null,
+    stamp: Stamp = .{},
     watcher: ?*Watch = null,
     token: ?Token = null,
     fn create(a: A, size: usize) !*Blob {
@@ -1034,7 +1035,7 @@ const CaptureQueue = struct {
             const i = self.cursor.fetchAdd(1, .monotonic);
             if (i >= self.count) return;
             const job = &self.jobs[i];
-            job.revision = readBlob(self.collector.io, job.file, job.blob.?.stamp.?, job.blob.?) catch |err| {
+            job.revision = readBlob(self.collector.io, job.file, job.blob.?.stamp, job.blob.?) catch |err| {
                 job.failure = err;
                 continue;
             };
@@ -1166,7 +1167,7 @@ const Collector = struct {
         const available = generation.budget.limit -| generation.budget.live;
         if (available < @sizeOf(Blob)) return error.OutOfMemory;
         if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
-            if (old.blob.token != null and old.blob.watcher == watcher and old.blob.stamp != null and sameStamp(old.blob.stamp.?, before) and watcher.clean(old.blob.token.?, file_handle)) {
+            if (old.blob.token != null and old.blob.watcher == watcher and old.blob.stamp.valid and sameStamp(old.blob.stamp, before) and watcher.clean(old.blob.token.?, file_handle)) {
                 if (old.blob.charge() > available) return error.OutOfMemory;
                 old.blob.refs += 1;
                 errdefer old.blob.release();
@@ -1205,7 +1206,7 @@ const Collector = struct {
         const generation = self.generation;
         const available = generation.budget.limit -| generation.budget.live;
         generation.source_bytes_read += captured.bytes.len;
-        if (captured.token) |token| self.watcher.?.certify(token);
+        if (captured.token) |token| self.watcher.?.certifyPending(token);
         var blob = captured;
         errdefer blob.release();
         const stamp = captured.stamp;
@@ -1587,4 +1588,14 @@ test "parallel cold capture allocation failures release descriptors and immutabl
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer a.free(path);
     try std.testing.checkAllAllocationFailures(a, coldFailureCase, .{path});
+}
+
+test "source blob stamp validity shares existing header padding" {
+    // Optional Stamp needs a separate 16-byte tag on 64-bit targets. Its
+    // validity bit fits beside the other header flags without that overhead.
+    const Tagged = struct { backing: A, refs: usize, bytes: []u8, stamp: ?Stamp, watcher: ?*Watch, token: ?Token };
+    if (@sizeOf(usize) == 8) try std.testing.expect(@sizeOf(Blob) < @sizeOf(Tagged));
+    const blob = try Blob.create(std.testing.allocator, 0);
+    defer blob.release();
+    try std.testing.expect(!blob.stamp.valid);
 }

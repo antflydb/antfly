@@ -36,7 +36,7 @@ from session_compare import Service
 
 
 class Client(Service):
-    def exchange(self, op, **fields):
+    def exchange(self, op, *, consume=None, **fields):
         started = time.monotonic()
         before = self.wire_bytes
         self.response_start = before
@@ -49,7 +49,8 @@ class Client(Service):
         begun = False
         while True:
             row = self.read()
-            rows.append(row)
+            if consume is None or not consume(row, self.last_record):
+                rows.append(row)
             if first_event is None and row["type"] in (
                 "match",
                 "workspace_unchanged",

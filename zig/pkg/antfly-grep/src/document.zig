@@ -109,13 +109,74 @@ pub fn localUri(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
 /// Search workers share one immutable invocation directory, avoiding getcwd
 /// and its filesystem traversal for every JSON provenance record.
 pub fn localUriAt(a: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
+    // Most discovery paths are already normalized. Preserve resolveAlloc's
+    // lexical semantics for dot components, repeated separators and Windows;
+    // ordinary POSIX paths need neither a joined path nor a growable writer.
+    if (comptime @import("builtin").os.tag != .windows) {
+        if (normalizedPosix(path)) {
+            if (std.fs.path.isAbsolute(path)) return encodeUri(a, &.{path});
+            if (normalizedPosix(cwd) and std.fs.path.isAbsolute(cwd))
+                return encodeUri(a, if (std.mem.eql(u8, cwd, "/")) &.{ cwd, path } else &.{ cwd, "/", path });
+        }
+    }
     const absolute = try std.fs.path.resolveAlloc(a, &.{ cwd, path });
     defer a.free(absolute);
-    var out: std.Io.Writer.Allocating = .init(a);
-    errdefer out.deinit();
-    try out.writer.writeAll("file://");
-    for (absolute) |byte| {
-        if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "/-_.~:", byte) != null) try out.writer.writeByte(byte) else try out.writer.print("%{X:0>2}", .{byte});
+    return encodeUri(a, &.{absolute});
+}
+fn normalizedPosix(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.mem.eql(u8, path, "/")) return true;
+    var components = std.mem.splitScalar(u8, if (path[0] == '/') path[1..] else path, '/');
+    while (components.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
     }
-    return out.toOwnedSlice();
+    return true;
+}
+fn uriSafe(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or switch (byte) {
+        '/', '-', '_', '.', '~', ':' => true,
+        else => false,
+    };
+}
+fn encodeUri(a: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    var size: usize = "file://".len;
+    for (parts) |part| for (part) |byte| {
+        size = try std.math.add(usize, size, if (uriSafe(byte)) 1 else 3);
+    };
+    const out = try a.alloc(u8, size);
+    @memcpy(out[0..7], "file://");
+    var cursor: usize = 7;
+    const hex = "0123456789ABCDEF";
+    for (parts) |part| for (part) |byte| {
+        if (uriSafe(byte)) {
+            out[cursor] = byte;
+            cursor += 1;
+        } else {
+            out[cursor..][0..3].* = .{ '%', hex[byte >> 4], hex[byte & 15] };
+            cursor += 3;
+        }
+    };
+    return out;
+}
+
+test "local URI fast paths preserve resolved and percent encoded byte identities" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "/", "/tmp/work", "/tmp/a b", "/tmp/../work" }) |cwd| {
+        for ([_][]const u8{ "src/file.txt", "/src/file.txt", ".", "", "./a", "../a", "a//b", "a/", "/", "/a/../b", "é ?#%\xff", "a:b", "a/./b" }) |path| {
+            const resolved = try std.fs.path.resolveAlloc(a, &.{ cwd, path });
+            defer a.free(resolved);
+            var reference = std.Io.Writer.Allocating.init(a);
+            defer reference.deinit();
+            try reference.writer.writeAll("file://");
+            for (resolved) |byte| {
+                if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "/-_.~:", byte) != null)
+                    try reference.writer.writeByte(byte)
+                else
+                    try reference.writer.print("%{X:0>2}", .{byte});
+            }
+            const actual = try localUriAt(a, cwd, path);
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(reference.written(), actual);
+        }
+    }
 }

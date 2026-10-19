@@ -39,6 +39,40 @@ def path_bytes(value):
     return base64.b64decode(value["bytes"], validate=True)
 
 
+class Payloads:
+    """Stage validated original frames without keeping decoded per-match trees."""
+
+    def __init__(self):
+        self.identities = {}
+        self.files = {}
+        self.open = {}
+
+    def consume(self, row, encoded):
+        kind = row["type"]
+        if kind == "begin":
+            path = path_bytes(row["data"]["path"])
+            identity = row["file_id"]
+            if identity in self.identities or path in self.files or path in self.open:
+                raise RuntimeError("duplicate file identity")
+            self.identities[identity] = path
+            self.open[path] = [encoded]
+        elif kind in ("match", "context", "end"):
+            path = self.identities.get(row["file_id"])
+            if path not in self.open:
+                raise RuntimeError("unbound file identity")
+            self.open[path].append(encoded)
+            if kind == "end":
+                self.files[path] = b"[" + b",".join(self.open.pop(path)) + b"]"
+        else:
+            return False
+        return True
+
+    def finish(self):
+        if self.open:
+            raise RuntimeError("incomplete file payload")
+        return self.files
+
+
 @dataclass
 class View:
     handle: str
@@ -61,13 +95,16 @@ class View:
                 rows.append(row)
         return rows
 
-    def apply(self, rows, revision, observed_at):
+    def apply(self, rows, revision, observed_at, *, payloads=None):
         terminal = rows[-1]
+        if payloads is not None:
+            payloads.finish()
         if terminal.get("exit_code") not in (0, 1):
             raise RuntimeError("incomplete workspace transaction")
         if terminal["type"] == "workspace_not_modified":
             if (
                 len(rows) != 1
+                or (payloads is not None and payloads.files)
                 or not terminal.get("complete")
                 or terminal["revision"] != revision
                 or terminal["result_token"] != self.token
@@ -81,7 +118,11 @@ class View:
             raise RuntimeError("incomplete workspace transaction")
         unchanged = next((r for r in rows if r["type"] == "workspace_unchanged"), None)
         if unchanged is not None:
-            if unchanged["result_token"] != self.token or self.revision != revision:
+            if (
+                (payloads is not None and payloads.files)
+                or unchanged["result_token"] != self.token
+                or self.revision != revision
+            ):
                 raise RuntimeError("unknown unchanged baseline")
             self.observed_at = unchanged["observed_at"]
             return
@@ -93,29 +134,32 @@ class View:
             or patch["revision"] != revision
         ):
             raise RuntimeError("unknown delta baseline")
-        files, staged, ended = {}, {}, set()
-        for row in rows:
-            kind = row["type"]
-            if kind == "begin":
-                path = path_bytes(row["data"]["path"])
-                identity = row["file_id"]
-                if identity in files or path in staged:
-                    raise RuntimeError("duplicate file identity")
-                files[identity] = path
-                staged[path] = [row]
-            elif kind in ("match", "context", "end"):
-                identity = row["file_id"]
-                if identity not in files or identity in ended:
-                    raise RuntimeError("unbound file identity")
-                staged[files[identity]].append(row)
-                if kind == "end":
-                    ended.add(identity)
-        if len(ended) != len(files):
-            raise RuntimeError("incomplete file payload")
-        upserts = {
-            path: json.dumps(value, separators=(",", ":")).encode()
-            for path, value in staged.items()
-        }
+        if payloads is None:
+            files, staged, ended = {}, {}, set()
+            for row in rows:
+                kind = row["type"]
+                if kind == "begin":
+                    path = path_bytes(row["data"]["path"])
+                    identity = row["file_id"]
+                    if identity in files or path in staged:
+                        raise RuntimeError("duplicate file identity")
+                    files[identity] = path
+                    staged[path] = [row]
+                elif kind in ("match", "context", "end"):
+                    identity = row["file_id"]
+                    if identity not in files or identity in ended:
+                        raise RuntimeError("unbound file identity")
+                    staged[files[identity]].append(row)
+                    if kind == "end":
+                        ended.add(identity)
+            if len(ended) != len(files):
+                raise RuntimeError("incomplete file payload")
+            upserts = {
+                path: json.dumps(value, separators=(",", ":")).encode()
+                for path, value in staged.items()
+            }
+        else:
+            upserts = payloads.finish()
         removed = [path_bytes(p) for p in patch["removed"]] if patch else []
         # All parsing and validation precedes publication. Successful deltas
         # mutate this owned live view in O(changed paths), without copying the
@@ -184,6 +228,11 @@ class RetainedClient(Client):
         try:
             result, rows = super().exchange(op, **fields)
         except Exception:
+            # A streaming consumer failure may leave unread transaction frames.
+            # Retire the owned stream rather than reuse a desynchronized client.
+            if fields.get("consume") is not None and self.process.poll() is None:
+                self.process.kill()
+                self.process.wait(timeout=5)
             if self.process.poll() is not None:
                 self.valid = False
                 self.view = None
@@ -224,8 +273,10 @@ class RetainedClient(Client):
             }
         if view is None or view.handle != handle:
             view = View(handle)
+        payloads = Payloads()
         result, rows = self.exchange(
             "search",
+            consume=payloads.consume,
             query_handle=handle,
             revision=revision,
             if_result_token=view.token or "0" * 64,
@@ -233,7 +284,7 @@ class RetainedClient(Client):
             acknowledgement="minimal",
         )
         try:
-            view.apply(rows, revision, self.ready["observed_at"])
+            view.apply(rows, revision, self.ready["observed_at"], payloads=payloads)
         except Exception:
             self.view = None
             raise

@@ -6672,6 +6672,55 @@ class CliTests(unittest.TestCase):
             self.assertEqual(stats["lexical_entries_visited"], 1)
             self.assertEqual(stats["matches"], 1)
 
+    def test_workspace_lexical_growth_rebuilds_before_persistent_rejection(self):
+        if os.name == "nt":
+            self.skipTest("long path fixture requires POSIX paths")
+        source = "src/" + "/".join(ch * 240 for ch in "ab")
+        directory = self.root / source
+        directory.mkdir(parents=True)
+        # 80% of 32768 slots: one addition crosses a table growth boundary.
+        # The final table + keys fit 16 MiB, but old + new tables do not.
+        count = 26214
+        for n in range(count):
+            (directory / f"f{n:05}.txt").write_text("negative\n")
+        with self.workspace(source) as (ready, request):
+            handle = request("register", args=["STOP", "--threads=2"])[0][
+                "query_handle"
+            ]
+
+            def search(ready, token):
+                rows = request(
+                    "search",
+                    revision=ready["revision"],
+                    query_handle=handle,
+                    if_result_token=token,
+                    delta=True,
+                )
+                stats = next(r["stats"] for r in rows if r["type"] == "summary")
+                self.assertTrue(stats["complete"])
+                self.assertEqual(stats["lexical_index_admission_failures"], 0)
+                token = next(
+                    r["result_token"] for r in rows if r["type"] == "result_token"
+                )
+                return rows, stats, token
+
+            _, stats, token = search(ready, "0" * 64)
+            self.assertEqual(stats["files"], count)
+            added = directory / f"f{count:05}.txt"
+            added.write_text("STOP added\n")
+            ready = request("refresh", force_rescan=True)[0]
+            rows, stats, token = search(ready, token)
+            self.assertEqual(stats["lexical_index_admissions"], 1)
+            self.assertFalse(any(r["type"] == "workspace_lexical_delta" for r in rows))
+            self.assertEqual(stats["matches"], 1)
+            added.write_text("STOP edited\n")
+            ready = request("refresh", force_rescan=True)[0]
+            rows, stats, _ = search(ready, token)
+            self.assertTrue(any(r["type"] == "workspace_lexical_delta" for r in rows))
+            self.assertEqual(stats["lexical_entries_visited"], 1)
+            self.assertEqual(stats["lexical_index_admission_skips"], 0)
+            self.assertEqual(stats["matches"], 1)
+
     def test_workspace_minimal_acknowledgement_is_terminal_bound_and_budgeted(self):
         path = self.write("src/a.txt", "STOP old\n")
         with self.workspace("src") as (ready, request):

@@ -157,6 +157,9 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     const benchmark_tools = b.addSystemCommand(&.{"python3"});
     benchmark_tools.addFileArg(b.path("pkg/antfly-grep/tests/test_benchmark_tools.py"));
     test_step.dependOn(&benchmark_tools.step);
+    const retained_tools = b.addSystemCommand(&.{"python3"});
+    retained_tools.addFileArg(b.path("pkg/antfly-grep/tests/test_retained_tools.py"));
+    test_step.dependOn(&retained_tools.step);
     const compatibility = b.addSystemCommand(&.{"python3"});
     compatibility.addFileArg(b.path("pkg/antfly-grep/tests/check_compatibility.py"));
     compatibility.addArg("--check");

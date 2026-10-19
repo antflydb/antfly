@@ -803,6 +803,19 @@ pub const Search = struct {
     // Protocol metadata is observation-global. It must not acquire a file's
     // source envelope or make an otherwise successful bounded search fail.
     fn protocolJson(self: *Search, value: anytype, optional: bool) !void {
+        // Small transaction records should not allocate, copy, then issue a
+        // separate delimiter write. Oversized removal lists retain the bounded
+        // allocating fallback and the same record-atomic budget check.
+        var buffer: [2048]u8 = undefined;
+        var fixed = std.Io.Writer.fixed(buffer[0 .. buffer.len - 1]);
+        if (std.json.Stringify.value(value, .{}, &fixed)) |_| {
+            buffer[fixed.end] = '\n';
+            if (fixed.end + 1 > self.options.max_output_bytes - self.output_bytes) {
+                if (optional) return;
+                return error.OutputBudgetExceeded;
+            }
+            return self.write(buffer[0 .. fixed.end + 1]);
+        } else |_| {}
         const bytes = std.json.Stringify.valueAlloc(self.a, value, .{}) catch |err| {
             if (optional) return;
             return err;
@@ -1478,7 +1491,7 @@ pub const Search = struct {
         defer if (local_uri) |uri| self.a.free(uri);
         const previous_source = self.provenance;
         defer self.provenance = previous_source;
-        self.provenance = .{ .uri = local_uri, .observed_at = if (self.options.json) std.Io.Clock.real.now(self.io).toSeconds() else null };
+        self.provenance = .{ .uri = local_uri, .observed_at = if (self.options.json and self.workspace_entry == null) std.Io.Clock.real.now(self.io).toSeconds() else null };
         if (self.workspace_entry) |entry| {
             self.file_revision = entry.revision();
             self.provenance.revision = &self.file_revision;
@@ -4060,7 +4073,8 @@ pub const Search = struct {
                     try json_writer.write(@as(u32, 2));
                     if (envelope.file_id) |id| {
                         try @import("json_fields.zig").field(json_writer, "file_id");
-                        try json_writer.write(@as([]const u8, &id));
+                        // IDs are generated internally as exactly 64 lowercase hex bytes.
+                        try json_writer.print("\"{s}\"", .{id});
                     }
                 }
                 if (!std.mem.eql(u8, eventKind(envelope.value), "summary")) {

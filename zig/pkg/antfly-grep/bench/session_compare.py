@@ -79,6 +79,7 @@ class Service:
                 line = bytes(self.pending[self.cursor : end])
                 self.wire_bytes += end + 1 - self.cursor
                 self.cursor = end + 1
+                self.last_record = line
                 return json.loads(line)
             if self.cursor:
                 del self.pending[: self.cursor]

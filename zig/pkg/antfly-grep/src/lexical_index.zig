@@ -37,6 +37,7 @@ pub fn Index(comptime Summary: type) type {
         files: std.StringHashMapUnmanaged(Logical) = .empty,
         aggregate: Summary = .{},
         inexact: usize = 0,
+        path_bytes: usize = 0,
         revision: ?[64]u8 = null,
         healthy: bool = true,
         mutex: std.Io.Mutex = .init,
@@ -73,8 +74,11 @@ pub fn Index(comptime Summary: type) type {
                 self.budget.denied = true;
                 return false;
             };
+            self.budget.denied = false;
             self.files.ensureTotalCapacity(self.budget.allocator(), count) catch return false;
-            self.budget.denied = paths > self.budget.limit -| self.budget.live;
+            // Existing owned keys already count toward live allocation. Compare
+            // the final path footprint with map storage, not with paths twice.
+            self.budget.denied = paths > self.budget.limit -| (self.budget.live - self.path_bytes);
             return !self.budget.denied;
         }
         pub fn init(a: A, io: std.Io) Self {
@@ -85,6 +89,7 @@ pub fn Index(comptime Summary: type) type {
             while (keys.next()) |key| self.budget.allocator().free(key.*);
             self.files.deinit(self.budget.allocator());
             self.files = .empty;
+            self.path_bytes = 0;
         }
         pub fn clear(self: *Self) void {
             self.deinit();
@@ -113,6 +118,7 @@ pub fn Index(comptime Summary: type) type {
         pub fn remove(self: *Self, path: []const u8) void {
             if (self.files.fetchRemove(path)) |old| {
                 self.adjust(old.value, false);
+                self.path_bytes -= old.key.len;
                 self.budget.allocator().free(old.key);
             }
         }
@@ -133,6 +139,7 @@ pub fn Index(comptime Summary: type) type {
                 self.healthy = false;
                 return;
             };
+            self.path_bytes += owned.len;
             self.adjust(logical, true);
             self.budget.denied = false;
         }
@@ -194,4 +201,33 @@ test "lexical admission remembers failure across content revisions and uses hyst
     // an inventory shrink or a new registration.
     failing.fail_index = std.math.maxInt(usize);
     try std.testing.expect(transient.reserve(1000, 10000));
+}
+
+test "incremental map growth recovers within the same final allocation limit" {
+    const I = Index(TestSummary);
+    var index = I.init(std.testing.allocator, std.testing.io);
+    defer index.deinit();
+    index.budget.limit = 1728;
+    try std.testing.expect(index.reserve(8, 64));
+    for (0..12) |n| {
+        var name: [8]u8 = undefined;
+        index.record(try std.fmt.bufPrint(&name, "{d:0>8}", .{n}), .{ .files = 1 }, false);
+    }
+    try std.testing.expectEqual(@as(usize, 96), index.path_bytes);
+    try std.testing.expect(index.reserve(12, 96));
+    // Growing needs both hash tables live. A cold table for the same final
+    // inventory fits, so this must never become persistent negative admission.
+    try std.testing.expect(!index.reserve(13, 104));
+    try std.testing.expect(index.budget.denied);
+    index.clear();
+    try std.testing.expectEqual(@as(usize, 0), index.path_bytes);
+    try std.testing.expect(index.reserve(13, 104));
+    for (0..13) |n| {
+        var name: [8]u8 = undefined;
+        index.record(try std.fmt.bufPrint(&name, "{d:0>8}", .{n}), .{ .files = 1 }, false);
+    }
+    try std.testing.expect(index.healthy);
+    try std.testing.expect(index.reserve(13, 104));
+    index.remove("00000000");
+    try std.testing.expectEqual(@as(usize, 96), index.path_bytes);
 }

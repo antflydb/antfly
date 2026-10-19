@@ -3107,3 +3107,47 @@ Evidence: [macOS CPU/output](bench/results/overhead-macos.json),
 [large-file reuse](bench/results/overhead-lexical-linux.json),
 [oracle results](bench/results/overhead-differential.json), and
 [source/binary/report/archive identities](bench/results/overhead-validation.json).
+
+### Incremental admission recovery and streaming view consumption
+
+Lexical index admission distinguishes a final footprint that cannot fit from
+old/new hash-table overlap during growth. After removing changed entries, the
+coordinator reserves the final map and path footprint before producing a patch.
+A quota failure on an existing index releases that index and attempts one cold
+reservation. Success delivers a complete replacement and restores changed-path
+searches on the next revision; only a failed cold reservation records negative
+admission. Backing-allocator failures retain bounded retry backoff. Path-byte
+accounting excludes keys already charged to the index. The regression crosses a
+real 16 MiB growth boundary and checks the following edit visits one file.
+
+The serial workspace parser reuses at most 16 KiB of request scratch, released
+on EOF, without constructing a second parser arena. Registrations and source
+generations own everything they retain beyond the request. Small transaction
+records use stack storage and one buffered write; large removal lists retain
+the allocating, record-atomic budget fallback. Local URI construction uses one
+exact allocation, with direct encoding for normalized POSIX paths and the usual
+path resolver for dot components, repeated separators and Windows. URI encoding
+is tested against the previous resolver/formatter across escaped and byte paths.
+Generated compact file IDs avoid rescanning their known hexadecimal alphabet;
+other strings retain ordinary JSON escaping.
+
+Cold capture stores stamp validity in existing stamp padding, reducing its
+source header from 160 to 144 bytes on the qualified 64-bit targets. It retains
+full inode, size, kind, link-count and nanosecond timestamps. Fresh-read witness
+certification does not perform an additional event drain per file: the
+coordinator's existing final drain/publication barrier observes pending writes
+and invalidates affected sequences. No namespace or identity barrier is removed.
+A regression queues a write before deferred certification and verifies that the
+publication drain still rejects the earlier token.
+
+The reference retained consumer stages validated original JSON frames per file
+and releases each decoded row after validating its binding. It retains control
+records until the terminal frame, then publishes only a complete transaction.
+It avoids retaining a decoded result tree and serializing that tree again;
+explicit `materialize()` still decodes the complete view. Duplicate identities,
+unbound rows, missing file ends and payloads hidden in minimal acknowledgements
+are rejected. A consumer failure retires the owned connection so unread frames
+cannot become another response. Response and retained-payload allowances remain
+independent; Python allocation overhead is additional. `bench/retained_delivery.py`
+compares this path with the unchanged decoded-tree application path against the
+same binary, retaining all paired timings and a separate traced-allocation probe.

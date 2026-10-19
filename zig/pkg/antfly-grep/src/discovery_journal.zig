@@ -507,7 +507,7 @@ pub const Journal = struct {
         // generation's sorted inventory supplies file lookup; no second
         // per-file pathname table or canonicalization pass is retained.
         for (entries) |entry| if (comptime @hasField(@TypeOf(entry), "explicit_file")) {
-            const requires_inode = entry.explicit_file or (entry.blob.stamp != null and entry.blob.stamp.?.nlink > 1);
+            const requires_inode = entry.explicit_file or (entry.blob.stamp.valid and entry.blob.stamp.nlink > 1);
             if (requires_inode and (entry.blob.token == null or !sources.intact(entry.blob.token.?))) self.allow_native_sources = false;
         };
         // Events observed during capture are retained, forcing another read.

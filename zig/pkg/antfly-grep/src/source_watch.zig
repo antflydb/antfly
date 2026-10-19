@@ -241,6 +241,13 @@ pub const Watch = struct {
     }
     pub fn certify(self: *Watch, token: Token) void {
         self.poll();
+        self.certifyPending(token);
+    }
+    /// Mark only the recorded sequence. The capture coordinator must drain
+    /// events at its publication barrier before using intact() or reusing any
+    /// source. Delayed writes then invalidate this checkpoint normally. This
+    /// avoids an extra kernel poll per freshly read file in a capture batch.
+    pub fn certifyPending(self: *Watch, token: Token) void {
         if (self.get(token)) |slot| if (slot.sequence == token.sequence) {
             slot.dirty = false;
         };
@@ -501,4 +508,29 @@ test "full witness table preserves hard links and Linux directory mask upgrades"
         watch.poll();
         try std.testing.expect(watch.slots[directory_token.slot].dirty);
     }
+}
+
+test "deferred certification preserves writes at the publication barrier" {
+    if (comptime !supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "old" });
+    const file = try tmp.dir.openFile(io, "a", .{});
+    defer file.close(io);
+    var watch = Watch.init();
+    defer watch.deinit();
+    const token = watch.arm(file) orelse return error.SkipZigTest;
+    defer watch.release(token);
+    watch.certifyPending(token);
+    watch.poll();
+    try std.testing.expect(watch.intact(token));
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "new" });
+    // An unread write must not be erased by certification. Both writes queued
+    // before this call and writes queued afterwards survive the final poll.
+    watch.certifyPending(token);
+    watch.poll();
+    try std.testing.expect(!watch.intact(token));
+    watch.certifyPending(token);
+    try std.testing.expect(!watch.intact(token));
 }

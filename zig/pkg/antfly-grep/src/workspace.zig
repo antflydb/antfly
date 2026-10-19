@@ -73,16 +73,18 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     const buffer = try a.alloc(u8, 65536);
     defer a.free(buffer);
     var reader = std.Io.File.stdin().readerStreaming(io, buffer);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
     while (try reader.interface.takeDelimiter('\n')) |line| {
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
+        // One serial request arena, with bounded reuse across small frames.
+        // Registrations and generations copy every value they retain.
+        defer _ = arena.reset(.{ .retain_with_limit = 16 * 1024 });
         const scratch = arena.allocator();
         const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false, query_handle: ?[]const u8 = null, compact: bool = true, delta: bool = false, acknowledgement: enum { full, minimal } = .full };
-        const parsed = std.json.parseFromSlice(Request, scratch, line, .{}) catch {
+        const request = std.json.parseFromSliceLeaky(Request, scratch, line, .{}) catch {
             try emit(a, io, .{ .type = "workspace_error", .id = @as(?u64, null), .message = "InvalidWorkspaceRequest" });
             continue;
         };
-        const request = parsed.value;
         if (request.version != 1) {
             try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnsupportedWorkspaceVersion" });
             continue;
@@ -260,7 +262,7 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
         const same = plan.lexical.healthy and plan.lexical.revision != null and std.mem.eql(u8, &plan.lexical.revision.?, &generation.revision);
         if (!same) {
             const parent = plan.lexical.healthy and plan.lexical.revision != null and generation.parent_revision != null and std.mem.eql(u8, &plan.lexical.revision.?, &generation.parent_revision.?);
-            const patch = parent and delta and token != null and plan.completion != null and std.mem.eql(u8, token.?, &plan.completion.?.token) and std.mem.eql(u8, &plan.completion.?.revision, &plan.lexical.revision.?);
+            var patch = parent and delta and token != null and plan.completion != null and std.mem.eql(u8, token.?, &plan.completion.?.token) and std.mem.eql(u8, &plan.completion.?.revision, &plan.lexical.revision.?);
             var removed: std.ArrayList(Search.JsonText) = .empty;
             if (parent) {
                 for (generation.changes.items) |path| {
@@ -270,11 +272,22 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
             } else {
                 plan.lexical.clear();
                 searcher.summary.lexical_index_admissions = 1;
-                if (!plan.lexical.reserve(generation.entries.items.len, generation.path_bytes)) {
-                    if (plan.lexical.budget.denied) plan.lexical_admission.reject(generation.entries.items.len, generation.path_bytes, plan.lexical.budget.limit) else plan.lexical_admission.deferRetry();
-                    plan.lexical.clear();
-                    searcher.summary.lexical_index_admission_failures = 1;
-                }
+            }
+            // Reserve before scanning or publishing a patch. Incremental map
+            // growth can exceed the quota only because old/new tables overlap;
+            // retry once from empty before remembering a persistent rejection.
+            var reserved = plan.lexical.reserve(generation.entries.items.len, generation.path_bytes);
+            if (!reserved and parent and plan.lexical.budget.denied) {
+                plan.lexical.clear();
+                patch = false;
+                searcher.summary.lexical_index_admissions = 1;
+                reserved = plan.lexical.reserve(generation.entries.items.len, generation.path_bytes);
+            }
+            if (!reserved) {
+                patch = false;
+                if (plan.lexical.budget.denied) plan.lexical_admission.reject(generation.entries.items.len, generation.path_bytes, plan.lexical.budget.limit) else plan.lexical_admission.deferRetry();
+                plan.lexical.clear();
+                searcher.summary.lexical_index_admission_failures = 1;
             }
             if (searcher.summary.lexical_index_admission_failures == 0) searcher.lexical_index = &plan.lexical;
             if (patch) {
