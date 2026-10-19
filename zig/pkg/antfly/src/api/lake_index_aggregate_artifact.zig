@@ -352,22 +352,32 @@ fn loadRoot(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Canc
     return root;
 }
 
-/// Immutable, recipe-validated reducer payloads. Every pointer (including
-/// DISTINCT members and exact numeric state) belongs to the bounded cache arena.
-const TypedBlock = struct {
-    block: spill.ColumnarBlock,
-    states: []const operators.Aggregate,
-    width: usize,
-    fn decode(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, recipe: recipes.Recipe) !TypedBlock {
-        const bytes = try readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
-        const block = try spill.decodeColumnarBlockInArena(a, bytes, max_block_bytes);
-        if (block.values.len != recipe.inputs.len or block.keys.len != recipe.keys.len) return error.InvalidNativeAggregateArtifact;
-        const states = try a.alloc(operators.Aggregate, try std.math.mul(usize, block.count(), recipe.inputs.len));
-        for (0..block.count()) |row| for (recipe.inputs, 0..) |input, column| {
+/// One selected physical state column. Dictionary checkpoints are expanded once
+/// and all row headers borrow those immutable reducers. The encoded block lease
+/// is acquired first, so interpretation never nests another decode-cache flight.
+const TypedColumn = struct {
+    states: ?[]const operators.Aggregate = null,
+    decoded_states: usize = 0,
+    const Args = struct { block: spill.ColumnarBlock, recipe: recipes.Recipe, column: usize };
+    fn decode(a: A, _: stores.ArtifactStore, _: Ref, token: Cancellation, _: ?CachedRead, args: Args) !TypedColumn {
+        const block = args.block;
+        if (block.values.len != args.recipe.inputs.len or block.keys.len != args.recipe.keys.len or args.column >= block.values.len) return error.InvalidNativeAggregateArtifact;
+        const states = try a.alloc(operators.Aggregate, block.count());
+        var dictionary: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+        defer dictionary.deinit(a);
+        var decoded: usize = 0;
+        for (states, 0..) |*state, row| {
             try token.check();
-            states[row * recipe.inputs.len + column] = try local.sql_aggregate_partial.decode(a, try block.cell(row, column), input.spec);
-        };
-        return .{ .block = block, .states = states, .width = recipe.inputs.len };
+            const identity = try block.dictionaryIdentity(row, args.column, false);
+            if (identity) |id| if (dictionary.get(id)) |prior| {
+                state.* = states[prior];
+                continue;
+            };
+            state.* = try local.sql_aggregate_partial.decode(a, try block.cell(row, args.column), args.recipe.inputs[args.column].spec);
+            decoded += 1;
+            if (identity) |id| try dictionary.put(a, id, row);
+        }
+        return .{ .states = states, .decoded_states = decoded };
     }
 };
 
@@ -382,7 +392,9 @@ pub const Reader = struct {
     root: Root,
     metadata: ?@import("lake_index_decoded_metadata.zig").Owned(Root) = null,
     block: ?spill.ColumnarBlock = null,
-    typed_block: ?@import("lake_index_decoded_metadata.zig").Owned(TypedBlock) = null,
+    typed_columns: []const @import("lake_index_decoded_metadata.zig").Owned(TypedColumn) = &.{},
+    /// Bound the complete selected page, independently of each cached column.
+    max_typed_bytes: usize = 32 * 1024 * 1024,
     block_metadata: ?@import("lake_index_decoded_metadata.zig").Owned(spill.ColumnarBlock) = null,
     cohort_metadata: ?@import("lake_index_decoded_metadata.zig").Owned(Cohort) = null,
     block_index: usize = 0,
@@ -457,6 +469,7 @@ pub const Reader = struct {
         const part = self.root.partitions[index];
         const reader = try Reader.openWithCache(self.a, self.store, part.artifact, self.root.recipe, self.cancellation, self.cached);
         errdefer reader.cursor().close(reader);
+        reader.max_typed_bytes = self.max_typed_bytes;
         if (part.artifact.metadata_version >= 4 and reader.root.radix_depth != self.root.radix_depth + 1) return error.InvalidNativeAggregateArtifact;
         if (reader.root.groups != part.groups) return error.InvalidNativeAggregateArtifact;
         if (self.partition_states) |maps| {
@@ -562,8 +575,8 @@ pub const Reader = struct {
             self.block = null;
             if (self.block_metadata) |owned| owned.release();
             self.block_metadata = null;
-            if (self.typed_block) |owned| owned.release();
-            self.typed_block = null;
+            for (self.typed_columns) |owned| owned.release();
+            self.typed_columns = &.{};
             self.position = 0;
             if (self.block_index == self.root.blocks.len) {
                 if (self.emitted != self.root.groups) return error.InvalidNativeAggregateArtifact;
@@ -574,23 +587,46 @@ pub const Reader = struct {
             const ref = self.root.blocks[self.block_index];
             const state_recipe = self.root.state_recipe orelse self.root.recipe;
             const fingerprint = state_recipe.fingerprint();
-            const typed = if (self.cached) |cached| @import("lake_index_decoded_metadata.zig").acquireInterpreted(TypedBlock, cached, self.store, .{ .kind = .algebraic_segment, .artifact_id = ref.artifact.artifact_id, .checksum = ref.artifact.checksum, .byte_len = ref.artifact.byte_len }, self.cancellation, &fingerprint, state_recipe, TypedBlock.decode) catch |err| fallback: {
-                // Optional expanded residency must not reject an otherwise
-                // admissible encoded block (e.g. a large DISTINCT checkpoint).
-                if (err != error.OutOfMemory) return err;
-                break :fallback null;
-            } else null;
-            errdefer if (typed) |value| value.release();
-            const owned = if (typed == null) if (self.cached) |cached| try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, self.store, ref.artifact, self.cancellation) else null else null;
+            const owned = if (self.cached) |cached| try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, self.store, ref.artifact, self.cancellation) else null;
             errdefer if (owned) |value| value.release();
-            const block = if (typed) |value| value.value.block else if (owned) |value| value.value.* else decode: {
+            const block = if (owned) |value| value.value.* else decode: {
                 const bytes = try readArtifact(pa, self.store, ref.artifact, self.cancellation, null);
                 break :decode try spill.decodeColumnarBlockInArena(pa, bytes, max_block_bytes);
             };
-            const state_width = if (self.root.state_recipe) |recipe| recipe.inputs.len else self.root.recipe.inputs.len;
-            if (block.count() != ref.rows or block.keys.len != self.root.recipe.keys.len or block.values.len != state_width) return error.InvalidNativeAggregateArtifact;
+            if (block.count() != ref.rows or block.keys.len != self.root.recipe.keys.len or block.values.len != state_recipe.inputs.len) return error.InvalidNativeAggregateArtifact;
+            const width = if (self.state_slots) |slots| slots.len else self.root.recipe.inputs.len;
+            var columns: std.ArrayList(@import("lake_index_decoded_metadata.zig").Owned(TypedColumn)) = .empty;
+            var typed_bytes: usize = 0;
+            errdefer for (columns.items) |column| column.release();
+            if (self.cached) |cached| for (0..width) |logical| {
+                const physical = self.physicalSlot(logical);
+                var interpretation: [34]u8 = undefined;
+                @memcpy(interpretation[0..32], &fingerprint);
+                std.mem.writeInt(u16, interpretation[32..34], @intCast(physical), .little);
+                const column = @import("lake_index_decoded_metadata.zig").acquireInterpretedBounded(TypedColumn, cached, self.store, .{ .kind = .algebraic_segment, .artifact_id = ref.artifact.artifact_id, .checksum = ref.artifact.checksum, .byte_len = ref.artifact.byte_len }, self.cancellation, &interpretation, TypedColumn.Args{ .block = block, .recipe = state_recipe, .column = physical }, TypedColumn.decode, 16 * 1024 * 1024, .{}) catch |err| fallback: {
+                    if (err != error.OutOfMemory) return err;
+                    break :fallback null;
+                };
+                if (column) |value| {
+                    const bytes = value.lease.item.budget.live;
+                    if (value.value.states != null and bytes <= self.max_typed_bytes -| typed_bytes) {
+                        typed_bytes += bytes;
+                        columns.append(pa, value) catch |err| {
+                            value.release();
+                            return err;
+                        };
+                        continue;
+                    }
+                    value.release();
+                }
+                // The encoded fallback handles the complete selected row. Do
+                // not retain a partially expanded set of logical columns.
+                for (columns.items) |value| value.release();
+                columns.clearRetainingCapacity();
+                break;
+            };
             self.block_metadata = owned;
-            self.typed_block = typed;
+            self.typed_columns = columns.items;
             self.block = block;
             self.block_index += 1;
             self.blocks_decoded += 1;
@@ -600,7 +636,7 @@ pub const Reader = struct {
         const result = try a.alloc(operators.GroupResult, count);
         const width = if (self.state_slots) |slots| slots.len else self.root.recipe.inputs.len;
         const key_cells = try a.alloc(local.sql_scalar.Datum, try std.math.mul(usize, count, block.keys.len));
-        const typed_cells = if (self.typed_block != null) try a.alloc(operators.Aggregate, try std.math.mul(usize, count, width)) else null;
+        const typed_cells = if (self.typed_columns.len != 0) try a.alloc(operators.Aggregate, try std.math.mul(usize, count, width)) else null;
         const encoded_cells = if (typed_cells == null) try a.alloc(local.sql_scalar.Datum, try std.math.mul(usize, count, width)) else null;
         for (result, 0..) |*row, index| {
             const keys = key_cells[index * block.keys.len ..][0..block.keys.len];
@@ -608,8 +644,8 @@ pub const Reader = struct {
             const states = if (typed_cells) |cells| cells[index * width ..][0..width] else null;
             const cells: []local.sql_scalar.Datum = if (encoded_cells) |values| values[index * width ..][0..width] else &.{};
             for (0..width) |column| {
-                const physical = if (self.state_slots) |slots| slots[column] else if (self.root.state_slot) |slot| @as(usize, slot) else column;
-                if (states) |values| values[column] = self.typed_block.?.value.states[self.position * self.typed_block.?.value.width + physical] else cells[column] = try block.cell(self.position, physical);
+                const physical = self.physicalSlot(column);
+                if (states) |values| values[column] = self.typed_columns[column].value.states.?[self.position] else cells[column] = try block.cell(self.position, physical);
             }
             row.* = .{ .keys = keys, .aggregates = cells, .typed_states = states, .ordinal = block.ordinals[self.position], .aggregate_slots = self.output_slots };
             self.position += 1;
@@ -617,12 +653,15 @@ pub const Reader = struct {
         }
         return result;
     }
+    fn physicalSlot(self: *const Reader, logical: usize) usize {
+        return if (self.state_slots) |slots| slots[logical] else if (self.root.state_slot) |slot| @as(usize, slot) else logical;
+    }
     fn close(raw: *anyopaque) void {
         const self: *Reader = @ptrCast(@alignCast(raw));
         const a = self.a;
         if (self.child) |child| child.cursor().close(child);
         if (self.block_metadata) |owned| owned.release();
-        if (self.typed_block) |owned| owned.release();
+        for (self.typed_columns) |owned| owned.release();
         if (self.cohort_metadata) |owned| owned.release();
         self.page.deinit();
         if (self.metadata) |owned| owned.release();
@@ -1276,18 +1315,18 @@ test "external lake aggregate publishers carry authenticated proofs without chil
     const count_rows = (try count.cursor().next(count, out, 1)).?;
     try std.testing.expectEqual(@as(i64, 9007199254740993), try Check.value(out, sum_rows[0], specs[0]));
     try std.testing.expectEqual(@as(i64, 1), try Check.value(out, count_rows[0], specs[1]));
-    try std.testing.expect(sum.child.?.typed_block.?.value == count.child.?.typed_block.?.value);
-    const block = count.child.?.typed_block.?.value;
+    try std.testing.expect(sum.child.?.block_metadata.?.value == count.child.?.block_metadata.?.value);
+    const block = count.child.?.typed_columns[0].value;
     sum.cursor().close(sum);
     sum_open = false;
-    try std.testing.expectEqual(@as(i128, 9007199254740993), block.states[0].integer_sum);
+    try std.testing.expectEqual(@as(u64, 1), block.states.?[0].count);
     var isolated = cached;
     isolated.scope = @splat(2);
     const other = try Reader.openWithCache(a, store, inherited[1], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none, isolated);
     defer other.cursor().close(other);
     try std.testing.expect(other.cohort_metadata.?.value != count.cohort_metadata.?.value);
     _ = try other.cursor().next(other, out, 1);
-    try std.testing.expect(other.child.?.typed_block.?.value != block);
+    try std.testing.expect(other.child.?.typed_columns[0].value != block);
     count.cached.?.context.deadline_ns = 1;
     try std.testing.expectError(error.DeadlineExceeded, count.cursor().next(count, out, 1));
 }
@@ -1350,8 +1389,32 @@ test "external lake typed aggregate blocks preserve distinct exact sums extrema 
     const warm = try Reader.openWithCache(a, store, refs[1], .{ .keys = &.{}, .inputs = recipe.inputs[1..2] }, .none, cached);
     defer warm.cursor().close(warm);
     const warm_rows = (try warm.cursor().next(warm, out, 1)).?;
-    try std.testing.expect(reader.typed_block.?.value == warm.typed_block.?.value);
+    try std.testing.expect(reader.typed_columns[1].value == warm.typed_columns[0].value);
     try std.testing.expectEqual(@as(i128, 18014398509481989), warm_rows[0].typed_states.?[0].integer_sum);
+    // Several individually admissible columns must not multiply the page's
+    // retained expansion allowance. Declining after the first lease releases
+    // the partial set and preserves exact encoded imports without poisoning
+    // reusable column entries for other readers.
+    const bounded = try Reader.openWithCache(a, store, refs[0], .{ .keys = &.{}, .inputs = recipe.inputs[0..1] }, .none, cached);
+    defer bounded.cursor().close(bounded);
+    try bounded.setOutputSlot(0);
+    for (1..4) |slot| {
+        const other = try Reader.openWithCache(a, store, refs[slot], .{ .keys = &.{}, .inputs = recipe.inputs[slot..][0..1] }, .none, cached);
+        defer other.cursor().close(other);
+        try std.testing.expect(try bounded.fuse(other, @intCast(slot)));
+    }
+    bounded.max_typed_bytes = reader.typed_columns[0].lease.item.budget.live + reader.typed_columns[1].lease.item.budget.live - 1;
+    const fallback_rows = (try bounded.cursor().next(bounded, out, 256)).?;
+    try std.testing.expectEqual(@as(usize, 0), bounded.typed_columns.len);
+    try std.testing.expect(fallback_rows[0].typed_states == null);
+    const fallback_group = try operators.Grouped.create(a, &specs, .{});
+    defer fallback_group.deinit();
+    try fallback_group.importPartialBatch(fallback_rows);
+    const fallback_row = (try fallback_group.nextResult(out)).?;
+    try std.testing.expectEqual(@as(i64, 2), fallback_row.aggregates[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 18014398509481989), fallback_row.aggregates[1].value.integer);
+    try std.testing.expectEqualStrings("alpha", fallback_row.aggregates[2].value.string);
+    try std.testing.expectEqual(@as(i64, 4), fallback_row.aggregates[3].value.integer);
     // A different interpretation of identical physical bytes cannot hit the
     // typed cache. Signature validation still fails before importing a state.
     var incompatible = recipe;
@@ -1360,5 +1423,51 @@ test "external lake typed aggregate blocks preserve distinct exact sums extrema 
     incompatible.inputs = inputs;
     const ref = reader.root.blocks[0].artifact;
     const fingerprint = incompatible.fingerprint();
-    try std.testing.expectError(error.InvalidSqlSpill, @import("lake_index_decoded_metadata.zig").acquireInterpreted(TypedBlock, cached, store, .{ .kind = .algebraic_segment, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none, &fingerprint, incompatible, TypedBlock.decode));
+    try std.testing.expectError(error.InvalidSqlSpill, @import("lake_index_decoded_metadata.zig").acquireInterpreted(TypedColumn, cached, store, .{ .kind = .algebraic_segment, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none, &fingerprint, TypedColumn.Args{ .block = reader.block.?, .recipe = incompatible, .column = 1 }, TypedColumn.decode));
+}
+
+test "external lake typed aggregate caching selects columns and shares dictionary reducers" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-selected-partials");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .count }, .{ .kind = .min, .input_type = .string }, .{ .kind = .max, .input_type = .string } };
+    const recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "key", .type = .integer, .nullable = false }}, .inputs = &.{
+        .{ .spec = specs[0], .column = null },
+        .{ .spec = specs[1], .column = .{ .path = "s", .type = .string, .nullable = false } },
+        .{ .spec = specs[2], .column = .{ .path = "s", .type = .string, .nullable = false } },
+    } };
+    const group = try operators.Grouped.create(a, &specs, .{ .groups = 1024, .bytes = 128 * 1024 * 1024 });
+    defer group.deinit();
+    const text = try a.alloc(u8, 64 * 1024);
+    defer a.free(text);
+    @memset(text, 'a');
+    const D = local.sql_scalar.Datum;
+    for (0..256) |row| try group.add(&.{D.json(.{ .integer = @intCast(row) })}, &.{ D.json(.{ .integer = 1 }), D.json(.{ .string = text }), D.json(.{ .string = text }) });
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    const out = output.allocator();
+    const refs = try publishCohort(a, out, &store, &.{ "stats.count", "stats.min", "stats.max" }, group, recipe, .none);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: CachedRead = .{ .cache = &cache, .scope = @splat(22), .context = .{ .io = std.testing.io } };
+    const count = try Reader.openWithCache(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] }, .none, cached);
+    defer count.cursor().close(count);
+    const counts = (try count.cursor().next(count, out, 256)).?;
+    try std.testing.expectEqual(@as(usize, 256), counts.len);
+    try std.testing.expectEqual(@as(usize, 1), count.typed_columns.len);
+    try std.testing.expectEqual(@as(usize, 1), count.typed_columns[0].value.decoded_states);
+    const minimum = try Reader.openWithCache(a, store, refs[1], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none, cached);
+    defer minimum.cursor().close(minimum);
+    const minima = (try minimum.cursor().next(minimum, out, 256)).?;
+    try std.testing.expectEqual(@as(usize, 1), minimum.typed_columns.len);
+    try std.testing.expectEqual(@as(usize, 1), minimum.typed_columns[0].value.decoded_states);
+    try std.testing.expect(count.block_metadata.?.value == minimum.block_metadata.?.value);
+    try std.testing.expect(minima[0].typed_states.?[0].selected.?.row.values[0].value.string.ptr == minima[255].typed_states.?[0].selected.?.row.values[0].value.string.ptr);
+    const warm = try Reader.openWithCache(a, store, refs[1], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none, cached);
+    defer warm.cursor().close(warm);
+    _ = try warm.cursor().next(warm, out, 1);
+    try std.testing.expect(warm.typed_columns[0].value == minimum.typed_columns[0].value);
 }

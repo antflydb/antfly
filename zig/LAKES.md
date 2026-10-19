@@ -1236,12 +1236,24 @@ current indexing/uploads. Extra input/decode memory and shared I/O admission are
 required; denied or unused speculation drains safely and ordinary streaming
 remains available. These refinements retain reader protocol 58 and metadata v5.
 
-Publication cohorts divide CPU execution admission while preserving shared I/O
-headroom, including the full eight-consumer default configuration. Native Parquet
-frames retain immutable page/dictionary owners and copy only view metadata when
-admitted; constrained frames and mutable projections keep copied/borrowed fallback.
-Aggregate serving blocks cache recipe-validated typed reducer states, so warm
-readers import exact partials without decoding aggregate cells again. Scope,
-recipe, logical-directory and current reader checks still apply. Expanded typed
-states remain bounded and can fall back to encoded blocks. These optimizations
-retain metadata v5 and reader protocol 58.
+Publication separates file rendezvous from CPU execution. Up to 64 independently
+budgeted configuration consumers share each file across bounded CPU waves (eight
+simultaneous CPU lanes by default); waiting for files/batches releases CPU slots
+and workspace so the producer can parallelize Parquet column decoding. A separate
+node-wide parked-task limit bounds consumer descriptors and reserves at most
+2 GiB of combined reducer/input/replay allowance by default. Statement admission
+independently bounds retained reducers and input buffers. Memory/task pressure still selects
+smaller groups and ordinary fallback; configurations beyond an admitted group may
+need another source pass. Native Parquet frames retain immutable page/dictionary
+owners and copy only view metadata when admitted; constrained frames and mutable
+projections keep copied/borrowed fallback.
+
+Aggregate serving caches only selected physical state columns and expands each
+checkpoint dictionary entry once. Readers with different logical recipes share
+the verified encoded block and independently reuse selected typed columns. Each
+column has a 16 MiB expansion allowance, and selected columns share a 32 MiB
+reader-page allowance. An entry exceeding its own allowance
+leaves a small cache hint and uses encoded state on subsequent reads. Transient
+allocator/loading pressure remains retryable. Scope, physical recipe/slot,
+logical-directory and current reader checks still apply. These optimizations
+retain metadata v5 and reader protocol 58 and require no new public options.

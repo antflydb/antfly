@@ -69,6 +69,12 @@ pub const Scheduler = struct {
     mutex: std.atomic.Mutex = .unlocked,
     max_workers: usize = 8,
     max_io_workers: usize = 32,
+    /// Parked pull operators retain independently budgeted statement state.
+    /// Bound their task descriptors separately from runnable CPU execution.
+    max_pull_workers: usize = 64,
+    pull_workers: usize = 0,
+    max_pull_bytes: usize = 2 * 1024 * 1024 * 1024,
+    pull_bytes: usize = 0,
     max_io_bytes: usize = 32 * 1024 * 1024,
     max_bytes: usize = 64 * 1024 * 1024,
     workers: usize = 0,
@@ -77,10 +83,27 @@ pub const Scheduler = struct {
     bytes: usize = 0,
     peak_workers: usize = 0,
     peak_io_workers: usize = 0,
+    peak_cpu_workers: usize = 0,
     peak_bytes: usize = 0,
     inline_tasks: usize = 0,
+    waiters: ?*Waiter = null,
     fn lock(self: *Scheduler) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    pub fn reservePull(self: *Scheduler, count: usize, bytes: usize) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        if (count > self.max_pull_workers -| self.pull_workers or bytes > self.max_pull_bytes -| self.pull_bytes) return false;
+        self.pull_workers += count;
+        self.pull_bytes += bytes;
+        return true;
+    }
+    pub fn releasePull(self: *Scheduler, count: usize, bytes: usize) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.pull_workers >= count and self.pull_bytes >= bytes);
+        self.pull_workers -= count;
+        self.pull_bytes -= bytes;
     }
     /// Cap an operator workspace by currently available shared admission.
     /// Larger statement quotas must not increase leases beyond node capacity.
@@ -118,6 +141,9 @@ pub const Scheduler = struct {
     fn acquireClassReserved(self: *Scheduler, class: Class, bytes: usize, reserve_io: bool) bool {
         self.lock();
         defer self.mutex.unlock();
+        return self.acquireLocked(class, bytes, reserve_io, true);
+    }
+    fn acquireLocked(self: *Scheduler, class: Class, bytes: usize, reserve_io: bool, record_inline: bool) bool {
         const cpu_full = reserve_io and bytes > (self.max_bytes - @min(self.max_io_bytes, self.max_bytes / 2)) -| (self.bytes - self.io_bytes);
         const slots_full = switch (class) {
             .cpu => self.workers - self.io_workers >= self.max_workers,
@@ -125,7 +151,7 @@ pub const Scheduler = struct {
         };
         const io_full = class == .io and bytes > @min(self.max_io_bytes, self.max_bytes / 2) -| self.io_bytes;
         if (cpu_full or slots_full or io_full or bytes > self.max_bytes -| self.bytes) {
-            self.inline_tasks += 1;
+            if (record_inline) self.inline_tasks += 1;
             return false;
         }
         self.workers += 1;
@@ -136,6 +162,7 @@ pub const Scheduler = struct {
         }
         self.bytes += bytes;
         self.peak_workers = @max(self.peak_workers, self.workers);
+        self.peak_cpu_workers = @max(self.peak_cpu_workers, self.workers - self.io_workers);
         self.peak_bytes = @max(self.peak_bytes, self.bytes);
         return true;
     }
@@ -153,6 +180,8 @@ pub const Scheduler = struct {
         } else std.debug.assert(self.workers > self.io_workers);
         self.workers -= 1;
         self.bytes -= bytes;
+        var next = self.waiters;
+        while (next) |waiter| : (next = waiter.next) waiter.ready.set(waiter.io);
     }
     /// Speculative tasks retain no result buffers outside independently bounded
     /// caches. Release execution admission at completion, while Task still owns
@@ -211,6 +240,64 @@ pub const Scheduler = struct {
         return .{ .scheduler = self, .bytes = bytes, .class = class, .future = future };
     }
 };
+const Waiter = struct {
+    io: std.Io,
+    ready: std.Io.Event = .unset,
+    next: ?*Waiter = null,
+};
+
+/// A pull operator's CPU workspace is distinct from its independently admitted
+/// retained state. Pause before a producer wait; resume only after dropping any
+/// producer locks. Waiting operators consume neither CPU slots nor CPU bytes.
+pub const Execution = struct {
+    scheduler: *Scheduler,
+    bytes: usize,
+    active: bool = false,
+    checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+    pub fn pause(self: *Execution) void {
+        if (!self.active) return;
+        self.active = false;
+        self.scheduler.releaseClass(.cpu, self.bytes);
+    }
+    pub fn enter(self: *Execution, io: std.Io) !void {
+        std.debug.assert(!self.active);
+        var waiter: Waiter = .{ .io = io };
+        const scheduler = self.scheduler;
+        if (self.checkpoint) |hook| try hook.check(hook.ptr);
+        scheduler.lock();
+        if (scheduler.acquireLocked(.cpu, self.bytes, true, false)) {
+            scheduler.mutex.unlock();
+            self.active = true;
+            return;
+        }
+        waiter.next = scheduler.waiters;
+        scheduler.waiters = &waiter;
+        scheduler.mutex.unlock();
+        defer {
+            scheduler.lock();
+            defer scheduler.mutex.unlock();
+            var link = &scheduler.waiters;
+            while (link.*.? != &waiter) link = &link.*.?.next;
+            link.* = waiter.next;
+        }
+        while (true) {
+            if (self.checkpoint) |hook| try hook.check(hook.ptr);
+            scheduler.lock();
+            waiter.ready.reset();
+            const acquired = scheduler.acquireLocked(.cpu, self.bytes, true, false);
+            scheduler.mutex.unlock();
+            if (acquired) {
+                self.active = true;
+                return;
+            }
+            waiter.ready.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                error.Timeout => {},
+                else => return err,
+            };
+        }
+    }
+};
+
 const Admission = struct {
     scheduler: *Scheduler,
     bytes: usize,
@@ -392,4 +479,80 @@ test "SQL aggregate CPU work preserves node IO headroom" {
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), scheduler.cpuWorkspaceBudget(128 * 1024 * 1024));
     try std.testing.expect(scheduler.acquireClass(.io, 16 * 1024 * 1024));
     scheduler.releaseClass(.io, 16 * 1024 * 1024);
+}
+
+test "SQL suspended pull operators release CPU workspace for producer decoders" {
+    const io = std.testing.io;
+    var scheduler: Scheduler = .{ .max_workers = 2, .max_bytes = 100, .max_pull_bytes = 100 };
+    try std.testing.expect(scheduler.reservePull(2, 100));
+    var first: Execution = .{ .scheduler = &scheduler, .bytes = 25 };
+    defer first.pause();
+    var second: Execution = .{ .scheduler = &scheduler, .bytes = 25 };
+    defer second.pause();
+    try first.enter(io);
+    try second.enter(io);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.workers);
+    first.pause();
+    second.pause();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    try std.testing.expectEqual(@as(usize, 100), scheduler.pull_bytes);
+    try std.testing.expect(!scheduler.reservePull(1, 1));
+    const Worker = struct {
+        fn decode() anyerror!usize {
+            return 42;
+        }
+    };
+    var decode = scheduler.submit(io, 50, Worker.decode, .{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 42), try decode.await(io));
+    try first.enter(io);
+    try second.enter(io);
+    first.pause();
+    second.pause();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    try std.testing.expect(scheduler.waiters == null);
+    scheduler.releasePull(2, 100);
+    try std.testing.expect(scheduler.reservePull(scheduler.max_pull_workers, scheduler.max_pull_bytes));
+    try std.testing.expect(!scheduler.reservePull(1, 1));
+    scheduler.releasePull(scheduler.max_pull_workers, scheduler.max_pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+    try std.testing.expect(!scheduler.reservePull(1, scheduler.max_pull_bytes + 1));
+}
+
+test "SQL cooperative CPU admission wakes waiters and cancels without leaking permits" {
+    const io = std.testing.io;
+    var scheduler: Scheduler = .{ .max_workers = 1, .max_bytes = 100 };
+    var occupied: Execution = .{ .scheduler = &scheduler, .bytes = 50 };
+    defer occupied.pause();
+    try occupied.enter(io);
+    const Worker = struct {
+        fn run(execution: *Execution, gate: *std.Io.Event) anyerror!void {
+            defer execution.pause();
+            gate.set(std.testing.io);
+            try execution.enter(std.testing.io);
+        }
+    };
+    for ([_]bool{ true, false }) |cancel| {
+        var waiting: Execution = .{ .scheduler = &scheduler, .bytes = 50 };
+        var gate: std.Io.Event = .unset;
+        var task = try io.concurrent(Worker.run, .{ &waiting, &gate });
+        try gate.wait(io);
+        while (true) {
+            scheduler.lock();
+            const registered = scheduler.waiters != null;
+            scheduler.mutex.unlock();
+            if (registered) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        if (cancel) {
+            _ = task.cancel(io) catch {};
+        } else {
+            occupied.pause();
+            try task.await(io);
+        }
+        try std.testing.expect(!waiting.active);
+        try std.testing.expect(scheduler.waiters == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
 }

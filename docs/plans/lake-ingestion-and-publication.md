@@ -2481,3 +2481,62 @@ server, CLI, formatting, license/Apache boundary, source/control and engine-erro
 catalog checks passed with Zig 0.17.0; the merged quickstart documentation checks
 also passed. Main is merged through `282ad33e4a`. Archive-scale latency/RSS gains
 remain unmeasured, and live-provider retention qualification remains deferred.
+
+
+### Cooperative publication execution and selective aggregate state
+
+File rendezvous is now independent of CPU concurrency. Up to 64 configuration
+consumers can share one canonical file stream across multiple CPU waves, removing
+the previous second archive pass for a ninth admitted configuration. All retained
+reducer allowances are included in statement working-set admission before launch;
+separate scheduler admission caps both parked pull tasks (64 by default) and
+their combined reducer/input/replay allowances (2 GiB by default) across
+publications. These reservations remain held while execution permits are paused. The CPU
+scheduler still runs at most eight default CPU lanes, and its I/O byte reserve is
+unchanged. Consumers release their execution permit before requesting a file or
+source batch, then reacquire it after dropping producer locks. Thus parked builders
+do not prevent the producer from scheduling parallel column decoders on the same
+node scheduler. Release wakes registered waiters; cancellation, source failure
+and deadlines remove waiter registrations and drain tasks before source/allocator
+owners retire. Memory pressure or exhausted parked-task admission still selects
+smaller groups, and configurations outside an admitted group may require another
+pass. This remains bounded streaming, without an archive-wide spool.
+
+Aggregate interpretation is cached per selected physical column, keyed by the
+full physical recipe fingerprint, column slot, immutable artifact identity,
+authorized store scope and expansion policy. The encoded column block is acquired
+and validated before interpreting selected columns, avoiding nested decode flights.
+Repeated checkpoint dictionary identities share one immutable decoded reducer;
+row headers borrow it and destination reducers still clone on import. Unselected
+MIN/MAX or DISTINCT payloads therefore incur no typed expansion for COUNT-only
+queries. Each selected column has a 16 MiB expansion cap within the existing shared
+decoded-cache budget; a reader also caps its complete selected page at 32 MiB,
+releasing partial leases and using encoded state if the combined allowance is
+exceeded. Reader-local declines do not poison reusable column entries. An expansion exceeding its own cap frees its partial arena
+and caches a small decline value, so warm readers take the encoded fallback without
+retrying that deterministic failure. Shared loading admission and backing-allocator
+failures never become negative hints. Decline values follow normal cache eviction
+and scope fencing; there is no unbounded side map. Every logical reader still
+checks block row counts, key/state widths and authenticated slot mapping, and warm
+reads keep current cancellation/deadline checks.
+
+The durable graph, metadata v5, reader protocol 58 and attachment/query UX remain
+unchanged. Regression coverage includes a real-Parquet nine-configuration build
+with the serving cache and production scheduler, a consumer at the highest
+rendezvous bit, cancellation of queued execution, deterministic versus transient
+cache declines, dictionary reducer sharing, and exact typed-state imports. Archive
+latency/RSS measurements and live-provider retention qualification remain separate
+follow-up qualification work.
+
+
+Qualification completed 328 native and 183 shared external-lake/scheduler test
+executions without failures or leaks. Concurrent external cache cleanup prevented
+the broad build runner from recording its completed result; fresh final focused
+qualification exited successfully with all 10 native refinement and eight scheduler
+tests, including combined page limits, retained-memory reservation during CPU
+suspension, cancellation and nine-configuration scan sharing. All 16 selected
+HTTP/pgwire E2Es passed against the final rebuilt server with isolated temporary
+storage, covering real Iceberg evolution/deletes, compact nullable Parquet V1/V2,
+NUMERIC materializations and source-unavailable aggregate reads after restart.
+The stripped Debug build, CLI, formatting, license/Apache boundary and source/error
+catalog checks passed with Zig 0.17.0. Main is merged through `f173b597ee`.

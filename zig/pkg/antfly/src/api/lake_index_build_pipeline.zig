@@ -24,7 +24,9 @@ const Binding = local.serverless_segment_source_binding.Binding;
 const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Self = @This();
-pub const width = 8;
+// Consumer rendezvous and CPU concurrency are independent. Resident reducer
+// admission can share one file across several CPU waves without an archive spool.
+pub const width = 64;
 const State = enum { running, waiting, granted, done };
 const Slot = struct { state: State = .done, file: usize = 0, shared: ?*Replay = null };
 replay: *Replay,
@@ -42,8 +44,8 @@ streaming: bool = false,
 buffered: bool = false,
 frame_limit: usize = 64 * 1024 * 1024,
 frames: [2]Frame = @splat(.{}),
-stream_members: u8 = 0,
-stream_pending: u8 = 0,
+stream_members: u64 = 0,
+stream_pending: u64 = 0,
 stream_generation: u64 = 0,
 stream_batch: ?local.storage_rowsource_types.ColumnBatch = null,
 stream_eof: bool = false,
@@ -58,6 +60,7 @@ mutex: std.Io.Mutex = .init,
 changed: std.Io.Condition = .init,
 source_mutex: std.Io.Mutex = .init,
 slots: [width]Slot = @splat(.{}),
+executions: [width]?*local.sql_parallel_scheduler.Execution = @splat(null),
 error_code: std.atomic.Value(u16) = .init(0),
 files: usize = 0,
 shared_consumers: usize = 0,
@@ -67,7 +70,7 @@ const Frame = struct {
     generation: u64 = 0,
     borrowed: bool = false,
     owner: ?local.storage_rowsource_types.ColumnOwner = null,
-    pending: u8 = 0,
+    pending: u64 = 0,
     batch: ?local.storage_rowsource_types.ColumnBatch = null,
 };
 fn activeReplay(self: *Self) *Replay {
@@ -154,6 +157,13 @@ fn wait(self: *Self) !void {
     try self.replay.provider.context.ensureActive();
 }
 pub fn request(self: *Self, slot: usize, file: usize, token: Token) !?*Replay {
+    if (slot >= width) return error.LakeReplayBusy;
+    if (self.executions[slot]) |execution| execution.pause();
+    const result = try self.requestInner(slot, file, token);
+    if (self.executions[slot]) |execution| try execution.enter(self.io);
+    return result;
+}
+fn requestInner(self: *Self, slot: usize, file: usize, token: Token) !?*Replay {
     try token.check();
     try self.mutex.lock(self.io);
     defer self.mutex.unlock(self.io);
@@ -247,7 +257,7 @@ fn driveInner(self: *Self, a: A, token: Token) !void {
             self.files += 1;
             for (&self.slots, 0..) |*slot, index| if (slot.state == .waiting and slot.file == request_.file) {
                 if (self.streaming) {
-                    self.stream_members |= @as(u8, 1) << @as(u3, @intCast(index));
+                    self.stream_members |= @as(u64, 1) << @as(u6, @intCast(index));
                 }
                 slot.shared = if (shared) target else null;
                 slot.state = .granted;
@@ -274,8 +284,15 @@ fn driveInner(self: *Self, a: A, token: Token) !void {
 /// permit bounded overlap; borrowed fallback pins the source until all readers
 /// release it, independently of file size or consumer skew.
 pub fn readStream(self: *Self, slot: usize, generation: *u64, token: Token) !?local.storage_rowsource_types.ColumnBatch {
+    if (slot >= width) return error.LakeReplayBusy;
+    if (self.executions[slot]) |execution| execution.pause();
+    const result = try self.readStreamInner(slot, generation, token);
+    if (self.executions[slot]) |execution| try execution.enter(self.io);
+    return result;
+}
+fn readStreamInner(self: *Self, slot: usize, generation: *u64, token: Token) !?local.storage_rowsource_types.ColumnBatch {
     if (!self.buffered) return self.readBorrowedStream(slot, generation, token);
-    const bit = @as(u8, 1) << @as(u3, @intCast(slot));
+    const bit = @as(u64, 1) << @as(u6, @intCast(slot));
     try self.mutex.lock(self.io);
     defer self.mutex.unlock(self.io);
     if (generation.* != 0) {
@@ -382,7 +399,7 @@ pub fn produceStream(self: *Self, token: Token) !void {
     }
 }
 fn readBorrowedStream(self: *Self, slot: usize, generation: *u64, token: Token) !?local.storage_rowsource_types.ColumnBatch {
-    const bit = @as(u8, 1) << @as(u3, @intCast(slot));
+    const bit = @as(u64, 1) << @as(u6, @intCast(slot));
     try self.mutex.lock(self.io);
     defer self.mutex.unlock(self.io);
     if (generation.* != 0 and generation.* == self.stream_generation) {
@@ -422,7 +439,7 @@ fn readBorrowedStream(self: *Self, slot: usize, generation: *u64, token: Token) 
 pub fn leaveStream(self: *Self, slot: usize) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
-    const bit = @as(u8, 1) << @as(u3, @intCast(slot));
+    const bit = @as(u64, 1) << @as(u6, @intCast(slot));
     self.stream_members &= ~bit;
     self.stream_pending &= ~bit;
     for (&self.frames) |*frame| frame.pending &= ~bit;
@@ -699,13 +716,15 @@ test "external lake streaming overlaps two owned batches and bounds slow consume
     };
     var source: local.serverless_query_lake_serving.ServingSource = undefined;
     var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
-    for ([_]bool{ false, true }) |tiny| {
+    for (0..3) |mode| {
+        const tiny = mode == 1;
+        const slow_slot: usize = if (mode == 2) width - 1 else 1;
         var fixture: Fixture = .{};
         var replay = Replay.init(std.testing.allocator, &provider, &.{"x"});
         defer replay.deinit();
         replay.live = .{ .kind = .external_parquet, .ctx = &fixture, .next_batch = Fixture.next, .deinit_fn = Fixture.close };
         replay.live_allocator = std.testing.allocator;
-        var pipeline: Self = .{ .replay = &replay, .io = std.testing.io, .streaming = true, .buffered = true, .stream_members = if (tiny) 1 else 3, .frame_limit = if (tiny) 1 else 64 * 1024 };
+        var pipeline: Self = .{ .replay = &replay, .io = std.testing.io, .streaming = true, .buffered = true, .stream_members = if (tiny) 1 else 1 | (@as(u64, 1) << @as(u6, @intCast(slow_slot))), .frame_limit = if (tiny) 1 else 64 * 1024 };
         defer pipeline.deinit();
         var task = try std.testing.io.concurrent(Producer.run, .{&pipeline});
         defer task.cancel(std.testing.io) catch {};
@@ -717,7 +736,7 @@ test "external lake streaming overlaps two owned batches and bounds slow consume
             try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
         } else {
             try fixture.second.wait(std.testing.io);
-            const borrowed = (try pipeline.readStream(1, &slow, .none)).?;
+            const borrowed = (try pipeline.readStream(slow_slot, &slow, .none)).?;
             try std.testing.expectEqual(first.columns[0].values.i64.ptr, borrowed.columns[0].values.i64.ptr);
         }
         try std.testing.expectEqual(@as(i64, 1), first.columns[0].values.i64[0]);
@@ -726,16 +745,16 @@ test "external lake streaming overlaps two owned batches and bounds slow consume
         if (!tiny) {
             try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
             try std.testing.expectEqual(@as(i64, 1), first.columns[0].values.i64[0]);
-            _ = (try pipeline.readStream(1, &slow, .none)).?;
+            _ = (try pipeline.readStream(slow_slot, &slow, .none)).?;
         }
         const third = (try pipeline.readStream(0, &fast, .none)).?;
         try std.testing.expectEqual(@as(i64, 3), third.columns[0].values.i64[0]);
-        if (!tiny) _ = (try pipeline.readStream(1, &slow, .none)).?;
+        if (!tiny) _ = (try pipeline.readStream(slow_slot, &slow, .none)).?;
         try std.testing.expect((try pipeline.readStream(0, &fast, .none)) == null);
         pipeline.leaveStream(0);
         if (!tiny) {
-            try std.testing.expect((try pipeline.readStream(1, &slow, .none)) == null);
-            pipeline.leaveStream(1);
+            try std.testing.expect((try pipeline.readStream(slow_slot, &slow, .none)) == null);
+            pipeline.leaveStream(slow_slot);
         }
         try task.await(std.testing.io);
         try std.testing.expectEqual(@as(usize, if (tiny) 3 else 0), pipeline.buffered_fallbacks);

@@ -6381,12 +6381,13 @@ def test_compact_parquet_encodings_attach_query_and_restart(
 
 
 def test_native_configuration_cohorts_and_group_directories_survive_restart(tmp_path):
-    """Two text configs and distinct aggregate keys publish from real delta pages."""
+    """Nine native consumers share real delta pages and survive source loss/restart."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / "lake"
     objects = root / "buckets" / "antfly" / "objects"
     objects.mkdir(parents=True)
+    text_names = ("words", "words_again", *(f"words_{i}" for i in range(5)))
     base = 9007199254740993
     expected = {k: [0, 0] for k in range(17)}
     originals = []
@@ -6477,7 +6478,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(tmp_
                             "field": "body",
                             "store_source": True,
                         }
-                        for name in ("words", "words_again")
+                        for name in text_names
                     },
                     "stats": {
                         "type": "algebraic",
@@ -6498,7 +6499,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(tmp_
             ddl=True,
         )
         deadline = time.monotonic() + 90
-        for name in ("words", "words_again", "stats"):
+        for name in (*text_names, "stats"):
             while True:
                 resource = call("GET", f"/tables/native_cohorts/indexes/{name}")
                 readiness = resource["status"]["readiness"]
@@ -6509,7 +6510,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(tmp_
                     break
                 assert time.monotonic() < deadline, str(resource) + server.debug_logs()
                 time.sleep(0.1)
-        for name in ("words", "words_again"):
+        for name in text_names:
             result = call(
                 "POST",
                 "/tables/native_cohorts/query",

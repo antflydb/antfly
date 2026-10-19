@@ -57,21 +57,28 @@ const Job = struct {
     pipeline: *Pipeline,
     start: *std.Io.Event,
     admitted: *bool,
-    parent_hook: @FieldType(local.serverless_query_lake_read_context.Context, "additional_checkpoint"),
+    execution: local.sql_parallel_scheduler.Execution,
     result: Result = .{},
     fn check(raw: *anyopaque) !void {
         const self: *Job = @ptrCast(@alignCast(raw));
-        if (self.parent_hook) |hook| try hook.check(hook.ptr);
+        try self.args.token.check();
+        try self.args.provider.context.ensureActive();
         try self.pipeline.check();
     }
     fn run(self: *Job) anyerror!void {
         defer self.pipeline.complete(self.slot);
+        defer self.execution.pause();
         try self.start.wait(self.pipeline.io);
         if (!self.admitted.*) return;
-        self.execute() catch |err| {
+        self.executeAdmitted() catch |err| {
             self.pipeline.stop(err);
             return err;
         };
+    }
+    fn executeAdmitted(self: *Job) !void {
+        self.execution.checkpoint = .{ .ptr = self, .check = check };
+        try self.execution.enter(self.pipeline.io);
+        try self.execute();
     }
     fn execute(self: *Job) !void {
         self.provider.context.additional_checkpoint = .{ .ptr = self, .check = check };
@@ -203,7 +210,9 @@ fn buildCohort(args_: Args, units: []const Unit) !?Result {
     // Reducer/input retention is admitted by the statement working set below.
     // Share the scheduler's CPU execution allowance across this cohort instead
     // of charging every lane the maximum and starving the producer's I/O lane.
-    const worker_bytes = scheduler.cpuWorkspaceBudget(units.len * 8 * 1024 * 1024) / units.len;
+    const lanes = @min(units.len, scheduler.max_workers);
+    if (lanes < 2) return null;
+    const worker_bytes = scheduler.cpuWorkspaceBudget(lanes * 8 * 1024 * 1024) / lanes;
     if (worker_bytes < 1024 * 1024) return null;
     // One input/decode workspace is shared under the source mutex, including
     // speculative reads. Scale the replay cache to actual remaining headroom.
@@ -223,6 +232,9 @@ fn buildCohort(args_: Args, units: []const Unit) !?Result {
     const stream_read_ahead = scan_workspace < available - workspace;
     if (stream_read_ahead) workspace += scan_workspace;
     const replay_limit = @min(replay.budget.limit, available - workspace);
+    const retained_bytes = std.math.add(usize, workspace, replay_limit) catch return null;
+    if (!scheduler.reservePull(units.len, retained_bytes)) return null;
+    defer scheduler.releasePull(units.len, retained_bytes);
     var projection_arena = std.heap.ArenaAllocator.init(args_.a);
     defer projection_arena.deinit();
     const projection = try projectionForUnits(args_, projection_arena.allocator(), units);
@@ -302,12 +314,13 @@ fn buildCohort(args_: Args, units: []const Unit) !?Result {
     var jobs: [Pipeline.width]Job = undefined;
     var initialized: [Pipeline.width]bool = @splat(false);
     defer for (initialized, 0..) |ready, slot| if (ready) jobs[slot].source.closeParallelView(args_.provider.source);
-    var tasks: [Pipeline.width]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
+    var tasks: [Pipeline.width]?std.Io.Future(anyerror!void) = @splat(null);
     defer {
         pipeline.stop(error.Canceled);
         start.set(io);
-        for (&tasks) |*task| if (task.*) |*running| if (running.future != null) {
+        for (&tasks) |*task| if (task.*) |*running| {
             running.cancel(io) catch {};
+            task.* = null;
         };
     }
     for (units, 0..) |unit, slot| {
@@ -317,17 +330,24 @@ fn buildCohort(args_: Args, units: []const Unit) !?Result {
         store.allocator = args.a;
         var job_args = args;
         job_args.table = unit.table;
-        jobs[slot] = .{ .args = job_args, .kind = unit.kind, .slot = slot, .provider = provider, .source = try args.provider.source.parallelView(args.a), .store = store, .pipeline = &pipeline, .start = &start, .admitted = &admitted, .parent_hook = provider.context.additional_checkpoint };
+        jobs[slot] = .{ .args = job_args, .kind = unit.kind, .slot = slot, .provider = provider, .source = try args.provider.source.parallelView(args.a), .store = store, .pipeline = &pipeline, .start = &start, .admitted = &admitted, .execution = .{ .scheduler = scheduler, .bytes = worker_bytes } };
         initialized[slot] = true;
         jobs[slot].provider.source = &jobs[slot].source;
         pipeline.activate(slot);
-        tasks[slot] = scheduler.submitWithIoReserve(io, worker_bytes, Job.run, .{&jobs[slot]});
-        if (tasks[slot] == null) return null;
+        pipeline.executions[slot] = &jobs[slot].execution;
+        // Reducers are bounded above by the statement working-set admission.
+        // CPU admission is acquired only while executing, never while waiting
+        // for the start barrier or a source file/batch.
+        tasks[slot] = io.concurrent(Job.run, .{&jobs[slot]}) catch return null;
     }
     admitted = true;
     start.set(io);
     try pipeline.drive(args.a, args.token);
-    for (&tasks) |*task| if (task.*) |*running| try running.await(io);
+    for (&tasks) |*task| if (task.*) |*running| {
+        const result = running.await(io);
+        task.* = null;
+        try result;
+    };
     var result: Result = .{};
     for (units, 0..) |_, slot| try merge(args.out, &result, jobs[slot].result);
     return result;
@@ -438,8 +458,8 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(u64, 12), ordered.page.?.records);
     const text = try @import("lake_index_native_text.zig").loadRootDirectory(out, store, result.text[0].artifact, .none, null);
     try std.testing.expectEqual(@as(u32, 12), text.collection.?.documents);
-    // Scheduler saturation admits smaller cohorts without repeating completed
-    // families. Five builders share pairs of scans with only two worker slots.
+    // CPU scheduling queues admitted consumers without repeating completed
+    // families. All admitted consumers share files through two CPU worker slots.
     var pairs: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 2 };
     args.scheduler = &pairs;
     const prior_captures = replay.captures;
@@ -519,9 +539,34 @@ test "external lake file-first publication shares one decode across five native 
     const hits_before_eight = replay.read_ahead_hits;
     const eight_result = (try build(args)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 3), eight_result.text.len);
-    try std.testing.expectEqual(@as(usize, 8), default_scheduler.peak_workers - default_scheduler.peak_io_workers);
+    try std.testing.expect(default_scheduler.peak_cpu_workers <= default_scheduler.max_workers);
     try std.testing.expect(default_scheduler.peak_io_workers > 0);
     try std.testing.expect(replay.read_ahead_hits > hits_before_eight);
     try std.testing.expectEqual(@as(usize, 3), replay.captures - captures_before_eight);
     try std.testing.expectEqual(@as(usize, 0), default_scheduler.bytes);
+    // More configurations than CPU lanes share the same file rendezvous. Use
+    // the production shared scheduler and serving cache (parallel column decode),
+    // rather than an isolated scheduler which could hide producer starvation.
+    replay.max_spill_bytes = 1024 * 1024 * 1024;
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    try source.attachCache(&cache, binding.binding, .{ .io = std.testing.io });
+    defer {
+        source.scanner.shared_reader.?.drain(true);
+        a.destroy(source.scanner.shared_reader.?);
+        source.scanner.shared_reader = null;
+    }
+    var nine = eight;
+    nine.indexes_json = try std.mem.concat(out, u8, &.{ eight.indexes_json[0 .. eight.indexes_json.len - 1], ",\"words4\":{\"type\":\"full_text\",\"field\":\"body\"}}" });
+    args.table = nine;
+    args.scheduler = null;
+    const captures_before_nine = replay.captures;
+    const nine_result = (try build(args)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 4), nine_result.text.len);
+    try std.testing.expectEqual(@as(usize, 3), replay.captures - captures_before_nine);
+    try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().workers);
+    try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().bytes);
+    try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().pull_workers);
+    try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().pull_bytes);
+    try std.testing.expect(local.sql_parallel_scheduler.global().peak_cpu_workers <= local.sql_parallel_scheduler.global().max_workers);
 }
