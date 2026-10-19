@@ -72,7 +72,6 @@ pub fn configureBrowserModule(
     mod.addImport("antfly_hash", hash_mod);
     mod.addImport("antfly_fst", fst_mod);
     mod.addImport("antfly_regex", regex_mod);
-    mod.addImport("antfly_grep_document", b.createModule(.{ .root_source_file = b.path("lib/grep_document/src/mod.zig"), .target = mod.resolved_target, .optimize = mod.optimize }));
     mod.addImport("antfly_sql_regex", sql_regex_mod);
     mod.addImport("antfly_image", image_mod);
     mod.addImport("antfly_font", font_mod);

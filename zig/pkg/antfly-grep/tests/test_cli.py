@@ -23,6 +23,7 @@ import json
 import math
 import struct
 import os
+import re
 import select
 import shutil
 import signal
@@ -265,11 +266,19 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 return doc["_source"].get("grep_trigrams_version") == query["term"]
             if "conjuncts" in query:
                 return all(candidate_matches(q, doc) for q in query["conjuncts"])
+            if query.get("field", "").endswith("._substring"):
+                content = doc["_source"]["grep"]["content"]
+                normalized = "".join(re.findall(r"[a-z0-9]+", content.lower()))
+                term = query.get("match", query.get("regexp", "").removesuffix(".*"))
+                return term in normalized
             if query.get("field") == "grep_trigrams":
                 return query["term"] in doc["_source"]["grep_trigrams"]
             return True
 
         docs = [doc for doc in docs if candidate_matches(body.get("filter_query"), doc)]
+        docs = [
+            doc for doc in docs if candidate_matches(body.get("full_text_search"), doc)
+        ]
         hits = docs[: body["limit"]]
         projected = []
         for hit in hits:
@@ -1265,6 +1274,79 @@ class CliTests(unittest.TestCase):
         self.assertTrue(rows[-1]["stats"]["complete"])
         self.assertNotIn(
             "grep.unused_payload", self.server.index_requests[0][2]["fields"]
+        )
+
+    def test_indexed_builtin_substring_query_pushdown(self):
+        docs = [
+            self.indexed_doc("a.py", "TARGET xyz\n"),
+            self.indexed_doc("b.py", "irrelevant\n"),
+            self.indexed_doc("c.py", "TAR-GET xyz\n"),
+            self.indexed_doc("d.py", "target xyz\n"),
+        ]
+        for flags in (
+            ["-F", "TARGET"],
+            ["TAR.*xyz"],
+            ["-F", "-e", "TARGET", "-e", "irrelevant"],
+        ):
+            baseline = self.raw_cli(
+                "--table-config", self.table_config(docs), *flags
+            ).stdout
+            config = self.table_config(
+                docs,
+                tables=[
+                    {
+                        "name": "source files",
+                        "content_index": {
+                            "field": "grep.content._substring",
+                            "full_text_index": "sources",
+                        },
+                    }
+                ],
+            )
+            self.server.index_requests.clear()
+            actual = self.raw_cli("--table-config", config, *flags)
+            self.assertEqual(actual.stdout, baseline)
+            body = self.server.index_requests[0][2]
+            self.assertIn("full_text_search", body)
+            self.assertEqual(body["full_text_index"], "sources")
+            self.assertNotIn("query", body)
+            self.assertNotIn("grep_scan", body)
+            self.assertEqual(body["order_by"], [{"field": "_id", "desc": False}])
+            if "-e" not in flags:
+                self.assertLess(len(self.server.index_requests), len(docs) + 1)
+        for flags in (
+            ["--json", "TARGET"],
+            ["--stats", "TARGET"],
+            ["-v", "TARGET"],
+            ["--files-without-match", "TARGET"],
+            ["--include-zero", "-c", "TARGET"],
+            ["-F", "!!!"],
+            ["-F", "-e", "TARGET", "-e", "ab"],
+            ["-Fi", "TARGET"],
+            ["-P", "(?<=T)ARGET"],
+            ["--encoding", "latin1", "TARGET"],
+        ):
+            self.server.index_requests.clear()
+            self.raw_cli(
+                "--table-config",
+                config,
+                *flags,
+                code=1 if flags == ["-F", "!!!"] else 0,
+            )
+            self.assertNotIn(
+                "full_text_search", self.server.index_requests[0][2], flags
+            )
+        self.server.index_requests.clear()
+        self.raw_cli(
+            "--table-config",
+            config,
+            "--table-filter",
+            '{"term":"active","field":"status"}',
+            "TARGET",
+        )
+        self.assertEqual(
+            self.server.index_requests[0][2]["filter_query"],
+            {"term": "active", "field": "status"},
         )
 
     def test_indexed_conservative_candidates_preserve_exact_results(self):

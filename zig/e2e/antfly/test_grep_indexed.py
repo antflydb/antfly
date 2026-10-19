@@ -68,7 +68,7 @@ def run_grep(
     token=None,
     page_size=1,
     candidate_index=None,
-    accounted_misses=False,
+    content_index=None,
 ):
     config = tmp_path / "tables.json"
     config.write_text(
@@ -80,7 +80,7 @@ def run_grep(
                 "tables": [
                     {
                         "name": table,
-                        "accounted_misses": accounted_misses,
+                        **({"content_index": content_index} if content_index else {}),
                         **(
                             {"candidate_index": candidate_index}
                             if candidate_index
@@ -144,7 +144,9 @@ def test_native_grep_pagination_large_regions_and_permissions(stateful_api, tmp_
     assert b"SECRET" not in result.stdout
 
 
-def forwarded_scan(tmp_path, api, table, first_page):
+def forwarded_scan(
+    tmp_path, api, table, first_page, *, pattern="needle", **grep_options
+):
     requests_seen = []
     failures = []
 
@@ -174,7 +176,11 @@ def forwarded_scan(tmp_path, api, table, first_page):
     thread = start_http_server(server)
     try:
         result = run_grep(
-            tmp_path, f"http://127.0.0.1:{server.server_port}", table, "needle"
+            tmp_path,
+            f"http://127.0.0.1:{server.server_port}",
+            table,
+            pattern,
+            **grep_options,
         )
         assert not failures, failures
         return result, requests_seen
@@ -472,103 +478,106 @@ def test_native_grep_json_projects_versioned_contract(stateful_api, tmp_path):
 
 
 @pytest.mark.parametrize("num_shards", [1, 3])
-def test_native_grep_accounted_misses_preserve_snapshot_stats_and_validation(
+def test_native_grep_builtin_substring_and_regex_candidates(
     stateful_api, tmp_path, num_shards
 ):
-    table = f"grep_accounted_{time.time_ns()}"
-    stateful_api.create_table(table, num_shards=num_shards)
-    denied = document("private.py", "private ordinary text\n")
-    denied["grep"]["permissions"] = {"public": False, "readers": ["other"]}
-    rows = {
-        "a": document("large.py", "ordinary text\n" * 16384),
-        "b": document("hit.py", "needle MATCH\n"),
-        "c": denied,
-        "d": document("binary.py", "ordinary\x00text\n"),
-        "e": document("another.py", "ordinary text\n" * 8192),
-    }
-    stateful_api.batch_write(table, inserts=rows, sync_level="full_text")
-    control = {
-        "version": 1,
-        "document_field": "grep",
-        "alternatives": ["needle"],
-        "max_content_bytes": 1000000,
-    }
-    query = {
-        "query": {"match_all": {}},
-        "order_by": [{"field": "_id", "desc": False}],
-        "limit": 1,
-        "grep_scan": control,
-    }
-    response = requests.post(
-        stateful_api.url + f"/tables/{table}/query", json=query, timeout=60
+    table = f"grep_text_candidates_{time.time_ns()}"
+    stateful_api.post(
+        f"/tables/{table}",
+        {
+            "num_shards": num_shards,
+            "schema": {
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "properties": {
+                                "grep": {
+                                    "type": "object",
+                                    "properties": {
+                                        "content": {
+                                            "type": "string",
+                                            "x-antfly-types": ["text", "substring"],
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    }
+                },
+            },
+        },
     )
-    assert response.status_code == 200, response.text
-    result = response.json()["responses"][0]
-    hit = result["hits"]["hits"][0]
-    proof = hit["_computed"]["antfly_grep_miss_v1"]
-    assert "content" not in hit["_source"]["grep"]
-    assert proof["content_bytes"] == len(rows["a"]["grep"]["content"].encode())
-    assert proof["snapshot"] == result["remote_snapshot"]
-    assert proof["document_id"] == "a" and proof["revision"] == "rev-original"
-    assert len(response.content) < len(rows["a"]["grep"]["content"].encode()) // 8
-    # The same retained cut must certify the old body after a concurrent write.
     stateful_api.batch_write(
         table,
-        inserts={"a": document("large.py", "needle NEW\n")},
+        inserts={
+            "a": document("exact.py", "TARGET xyz\n"),
+            "b": document("case.py", "target xyz\n"),
+            "c": document("punctuation.py", "TAR-GET xyz\n"),
+            "d": document("unicode.py", "雪TARGETxyz\n"),
+            "e": document("miss.py", "irrelevant\n" * 16384),
+            "f": document("lines.py", "TARGET\nxyz\n"),
+        },
         sync_level="full_text",
     )
-    query["remote_snapshot"] = result["remote_snapshot"]
-    frozen = requests.post(
-        stateful_api.url + f"/tables/{table}/query", json=query, timeout=60
-    )
-    assert frozen.status_code == 200, frozen.text
-    frozen_hit = frozen.json()["responses"][0]["hits"]["hits"][0]
-    assert "_computed" in frozen_hit, frozen.json()
-    assert frozen_hit["_computed"]["antfly_grep_miss_v1"] == proof
-    # Compare complete, fresh scans including client-side permission skips and
-    # binary fallback. Timing and independently issued snapshots vary by design.
-    ordinary = run_grep(
-        tmp_path, stateful_api.url, table, "--json", "needle", page_size=2
-    )
-    accounted = run_grep(
-        tmp_path,
-        stateful_api.url,
-        table,
-        "--json",
-        "needle",
-        page_size=2,
-        accounted_misses=True,
-    )
-    assert ordinary.returncode == accounted.returncode == 0, accounted.stderr.decode()
-    left, right = (
-        [json.loads(line) for line in run.stdout.splitlines()]
-        for run in (ordinary, accounted)
-    )
-    keys = (
-        "files",
-        "bytes",
-        "matches",
-        "occurrences",
-        "occurrences_exact",
-        "files_with_matches",
-        "skipped_paths",
-        "errors",
-        "complete",
-    )
-    assert {k: left[-1]["stats"][k] for k in keys} == {
-        k: right[-1]["stats"][k] for k in keys
+    index = {"field": "grep.content._substring"}
+    # Both supported predicates retrieve a conservative superset. Local
+    # matching rejects case/normalization and cross-line false positives.
+    for flags in (
+        ["-F", "TARGET"],
+        ["TAR.*xyz"],
+        ["-F", "-e", "TARGET", "-e", "irrelevant"],
+    ):
+        ordinary = run_grep(tmp_path, stateful_api.url, table, *flags, page_size=2)
+        candidates = run_grep(
+            tmp_path, stateful_api.url, table, *flags, page_size=2, content_index=index
+        )
+        assert ordinary.returncode == candidates.returncode == 0, (
+            candidates.stderr.decode()
+        )
+        assert ordinary.stdout == candidates.stdout
+    for flags in (["--json", "TARGET"], ["-v", "TARGET"], ["-F", "!!!"]):
+        result = run_grep(
+            tmp_path, stateful_api.url, table, *flags, content_index=index
+        )
+        assert result.returncode in (0, 1), result.stderr.decode()
+    url = stateful_api.url + f"/tables/{table}/query"
+    base = {
+        "query": {"match_all": {}},
+        "order_by": [{"field": "_id", "desc": False}],
+        "limit": 100,
     }
-    assert [r["data"] for r in left if r["type"] == "match"] == [
-        r["data"] for r in right if r["type"] == "match"
-    ]
-    malformed = document("bad.py", "ordinary\n")
-    malformed["grep"]["regions"] = [{"start_line": 1, "end_line": 999}]
-    stateful_api.batch_write(table, inserts={"f": malformed}, sync_level="full_text")
-    invalid = run_grep(
-        tmp_path, stateful_api.url, table, "--json", "needle", accounted_misses=True
+    full = requests.post(url, json=base, timeout=60)
+    selected = dict(base)
+    selected.pop("query")
+    selected["full_text_search"] = {"match": "target", "field": index["field"]}
+    filtered = requests.post(url, json=selected, timeout=60)
+    assert full.status_code == filtered.status_code == 200, filtered.text
+    assert len(filtered.content) < len(full.content) // 8
+    hits = filtered.json()["responses"][0]["hits"]["hits"]
+    assert {h["_id"] for h in hits} == {"a", "b", "c", "d", "f"}
+    assert all("content" in h["_source"]["grep"] for h in hits)
+
+    def update_miss():
+        stateful_api.batch_write(
+            table,
+            inserts={"e": document("miss.py", "TARGET NEW\n")},
+            sync_level="full_text",
+        )
+
+    frozen, seen = forwarded_scan(
+        tmp_path,
+        stateful_api,
+        table,
+        update_miss,
+        pattern="TARGET",
+        content_index=index,
     )
-    assert invalid.returncode == 2
-    assert (
-        b"InvalidDocumentRegions" in invalid.stderr
-        or b"InvalidDocumentRegions" in invalid.stdout
-    )
+    assert frozen.returncode == 0, frozen.stderr.decode()
+    assert b"NEW" not in frozen.stdout and b"exact.py" in frozen.stdout
+    assert len(seen) > 1
+    assert all(q["full_text_search"] == seen[0]["full_text_search"] for q in seen)
+    assert all("remote_snapshot" in q for q in seen[1:])
+    assert all("grep_scan" not in q for q in seen)

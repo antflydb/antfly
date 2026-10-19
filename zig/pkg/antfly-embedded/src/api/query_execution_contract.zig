@@ -3242,29 +3242,12 @@ pub fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequ
     return try encodeQueryRequestWithGraphWireMode(alloc, req, false, false, false);
 }
 
-/// Preserve response-only controls when the recipient owns the complete public
-/// response. Raw shard collection must continue requesting complete sources.
-pub fn encodeFinalizedQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
-    return try encodeQueryRequestMode(alloc, req, false, false, false, true);
-}
-
 pub fn encodeQueryRequestWithGraphWireMode(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
     allow_legacy_graph: bool,
     include_aggregations: bool,
     preserve_projection: bool,
-) ![]u8 {
-    return try encodeQueryRequestMode(alloc, req, allow_legacy_graph, include_aggregations, preserve_projection, false);
-}
-
-fn encodeQueryRequestMode(
-    alloc: std.mem.Allocator,
-    req: db_mod.types.SearchRequest,
-    allow_legacy_graph: bool,
-    include_aggregations: bool,
-    preserve_projection: bool,
-    finalize_response: bool,
 ) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
     if (req.dense != null and req.dense_queries.len > 0) return error.UnsupportedQueryRequest;
@@ -3327,12 +3310,6 @@ fn encodeQueryRequestMode(
     if (req.order_by.len > 0) try appendQueryOrderByField(alloc, &out, &first, req.order_by);
     if (req.search_after.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_after", req.search_after);
     if (req.search_before.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_before", req.search_before);
-    // Full physical/remote responses own certification. Raw shard collection
-    // retains bodies for its downstream merge/hydration response owner.
-    if (finalize_response and req.grep_scan_json.len != 0) {
-        try appendJsonFieldName(alloc, &out, &first, "grep_scan");
-        try out.appendSlice(alloc, req.grep_scan_json);
-    }
     if (req.document_authority_mode != .none) {
         try appendJsonFieldName(alloc, &out, &first, "_document_authority");
         const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .mode = req.document_authority_mode, .group = req.document_authority_group, .defer_stored_projection = req.defer_stored_projection }, .{});
@@ -3515,7 +3492,7 @@ pub fn encodeStorageKernelQueryRequestForExecution(alloc: std.mem.Allocator, req
     // these search semantics and defer finalization through execution options.
     // A complete physical query also encodes the final public response. Its
     // projection cannot be omitted as it is for coordinator-owned retrieval.
-    return try encodeQueryRequestMode(alloc, req, true, true, !raw_search_result, !raw_search_result);
+    return try encodeQueryRequestWithGraphWireMode(alloc, req, true, true, !raw_search_result);
 }
 
 pub const StorageKernelLookupWireRequest = struct {

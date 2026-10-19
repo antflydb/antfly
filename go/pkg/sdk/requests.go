@@ -120,21 +120,9 @@ const (
 	HierarchyGroupByLevelUnit                                = oapi.HierarchyGroupByLevelUnit
 )
 
-// GrepScan requests server-owned exact miss accounting on an ordered snapshot.
-// Necessary byte literals must cover every possible match of the client query.
-type GrepScan struct {
-	Alternatives    []string                         `json:"alternatives"`
-	DocumentField   string                           `json:"document_field"`
-	MaxContentBytes uint64                           `json:"max_content_bytes"`
-	Version         oapi.QueryRequestGrepScanVersion `json:"version"`
-}
-
 // QueryRequest represents a query request with strongly-typed query fields.
 // This is the SDK-friendly version of oapi.QueryRequest with Query types instead of json.RawMessage.
 type QueryRequest struct {
-	// GrepScan elides validated nonmatching content while retaining all ordered hits.
-	GrepScan GrepScan `json:"grep_scan,omitempty,omitzero"`
-
 	// Table name to query
 	Table string `json:"table,omitempty"`
 
@@ -251,7 +239,6 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 	}
 	// Convert SDK QueryRequest to oapi.QueryRequest
 	oapiReq := oapi.QueryRequest{
-		GrepScan:         q.GrepScan,
 		Table:            q.Table,
 		Analyses:         q.Analyses,
 		Count:            q.Count,
@@ -339,7 +326,6 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	}
 
 	// Copy simple fields
-	q.GrepScan = oapiReq.GrepScan
 	q.Table = oapiReq.Table
 	q.Analyses = oapiReq.Analyses
 	q.Count = oapiReq.Count

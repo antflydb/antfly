@@ -3576,43 +3576,35 @@ remain readable. `materialize()` remains an explicit whole-view operation. Valid
 view publication still precede reuse. Unknown files raise `KeyError`. Iteration
 pins a file's serialized payload and observation before yielding its rows.
 
-## Server-owned exact miss accounting
+## Indexed search uses the existing query API
 
-Set `accounted_misses: true` on a configured Antfly table to request the public
-`grep_scan` v1 contract for supported JSON/statistics lexical scans. The complete
-source-document contract now lives in `zig/lib/grep_document`; the CLI and native
-query server use the same validation code. This is response-body elision: the
-server still reads and validates content, and every document retains its ordered
-hit. It is not an ingestion-time synopsis or an index-level skipping guarantee.
+The design decision and safety contract are recorded in
+[the indexed query planning design](../../../docs/design/antfly-grep.md).
+Configure an existing built-in substring companion to avoid retrieving clear
+nonmatches:
 
-The request supplies a document field, bounded necessary byte-literal
-alternatives and a content-size bound. The server validates the complete v1
-contract against the retained source, including permissions, metadata shape and
-region ranges. Only a proven miss can omit content. Its server-owned
-`_computed.antfly_grep_miss_v1` record binds the request digest, retained snapshot,
-document ID, source revision, validator version and original content byte count.
-The result source retains metadata, path and permission fields. Storage workers
-keep full source bodies; the final response owner performs certification once,
-including column-backed and deferred-hydration responses. Source containers are
-copied only along the content path; retained source/cache objects are immutable.
+```json
+{"name":"sources","content_index":{"field":"grep.content._substring"}}
+```
 
-The client verifies the proof before accepting an omitted body, then applies
-its ordinary permission/path filters and accounts eligible files/original bytes.
-All ordered IDs still participate in document budgets and cursor checks.
-Malformed proofs fail explicitly. Invalid documents retain their bodies and
-ordinary errors. NUL-containing content, UTF-8 BOMs and unsupported encodings or
-modes retain full content. Finite source-byte budgets, multiline, decision,
-inverted, count/list, zero-count, sorted and early-stop searches do not request
-this optimization. Missing proofs with complete bodies retain ordinary scanning;
-unsupported-control errors and snapshot loss/expiry remain explicit. The feature
-is opt-in for server-version compatibility.
+Map the content field with `"x-antfly-types": ["text", "substring"]`. The companion
+must index complete content atomically with each stored revision. Optional
+`content_index.full_text_index` selects a named full-text index. The CLI uses
+ordinary `full_text_search` (`match` for literals, a safe `regexp` prefix for
+regex candidates), preserves `filter_query`, projects the source contract, and
+paginates by ascending ID in one retained snapshot. Returned content is always
+verified with the complete local matcher. No grep-specific server API or
+per-document miss proof is required.
 
-Caller-provided trigram markers remain insufficient for exact JSON pruning.
-A future ingestion-owned, revision-bound validation/synopsis index could avoid
-server content reads too, but must preserve the same logical validation,
-authorization, ordering and accounting contract. This implementation establishes
-the response contract without trusting caller-maintained certificates or adding
-a new persistent cache.
+Every OR branch needs a proven literal containing an ASCII alphanumeric run of
+at least three bytes. Candidate runs are lowercased and capped at the substring
+index's 32-byte limit. Case and separator normalization may produce extra
+candidates; local verification removes them. Unsafe branches, unsupported
+encodings and modes needing nonmatching documents retain ordinary full traversal.
+JSON/statistics retain exhaustive validation and their existing file/byte totals.
+Tables without an index declaration also use full traversal through the query
+API. `content_index` and legacy raw-trigram `candidate_index` are mutually
+exclusive. Query/index errors remain explicit.
 
 ### Qualification of namespace and tuple changes
 

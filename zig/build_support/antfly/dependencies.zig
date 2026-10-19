@@ -1263,7 +1263,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .casbin = casbin_mod,
         .fst = fst_mod,
         .regex = regex_mod,
-        .grep_document = b.createModule(.{ .root_source_file = b.path("lib/grep_document/src/mod.zig"), .target = target, .optimize = optimize }),
         .sql_regex = sql_regex_mod,
         .json = json_mod,
         .jsonschema = jsonschema_mod,

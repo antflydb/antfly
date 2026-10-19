@@ -2822,31 +2822,6 @@ pub fn parseQueryRequestWithDeadline(
             owned.req.defer_stored_projection = control.value.defer_stored_projection;
         };
     }
-    if (std.mem.indexOf(u8, body, "grep_scan") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
-        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-        defer raw.deinit();
-        if (raw.value == .object) if (raw.value.object.get("grep_scan")) |value| {
-            var parsed = std.json.parseFromValue(@import("antfly_grep_document").Scan, alloc, value, .{}) catch return error.InvalidQueryRequest;
-            defer parsed.deinit();
-            parsed.value.validate() catch return error.InvalidQueryRequest;
-            const req = owned.req;
-            if (!req.include_stored or req.count_only or req.graph_queries.len != 0 or req.evaluation_json.len != 0 or req.hierarchy_children != null or req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit or req.document_authority_mode != .none or req.order_by.len != 1 or !std.mem.eql(u8, req.order_by[0].field, "_id") or req.order_by[0].desc) return error.InvalidQueryRequest;
-            if (!req.include_all_fields) {
-                for (req.fields) |name| if (name.len != 0 and name[0] == '-') return error.InvalidQueryRequest;
-                for ([_][]const u8{ "version", "path", "content", "uri", "revision", "indexed_at", "permissions", "metadata", "regions", "modified_at", "created_at", "accessed_at" }) |suffix| {
-                    const needed = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ parsed.value.document_field, suffix });
-                    defer alloc.free(needed);
-                    var found = false;
-                    for (req.fields) |name| if (std.mem.eql(u8, name, needed) or std.mem.eql(u8, name, parsed.value.document_field) or std.mem.eql(u8, name, "*")) {
-                        found = true;
-                        break;
-                    };
-                    if (!found) return error.InvalidQueryRequest;
-                }
-            }
-            owned.req.grep_scan_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
-        };
-    }
     return owned;
 }
 
@@ -3971,7 +3946,6 @@ fn ColumnWireResult(comptime T: type) type {
         failure: *?anyerror,
         plan: ?*ColumnWirePlan = null,
         graph_wire: ?BorrowedGraphMap = null,
-        grep_scan: ?@import("antfly_grep_document").Scan = null,
         pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
             try w.beginObject();
             inline for (@typeInfo(T).@"struct".field_names) |name| {
@@ -3995,31 +3969,10 @@ fn ColumnWireResult(comptime T: type) type {
                         };
                         const hit = self.hits[hit_index];
                         _ = hit_arena.reset(.retain_capacity);
-                        var api_hit = if (hydrator != null) toOpenApiHit(hit_arena.allocator(), self.req, hit) catch |err| {
+                        const api_hit = if (hydrator != null) toOpenApiHit(hit_arena.allocator(), self.req, hit) catch |err| {
                             self.failure.* = err;
                             return error.WriteFailed;
                         } else base_hit;
-                        var accounted_miss = false;
-                        if (self.grep_scan != null) {
-                            if (hit.column_source) |source| {
-                                const value = source.value(&hit_arena) catch |err| {
-                                    self.failure.* = err;
-                                    return error.WriteFailed;
-                                };
-                                const projected = projectPublicSourceView(hit_arena.allocator(), value, .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields }) catch |err| {
-                                    self.failure.* = err;
-                                    return error.WriteFailed;
-                                };
-                                api_hit._source = takeOpenApiObjectMap(hit_arena.allocator(), projected) catch |err| {
-                                    self.failure.* = err;
-                                    return error.WriteFailed;
-                                };
-                            }
-                            accounted_miss = applyGrepMiss(hit_arena.allocator(), self.grep_scan, self.base.remote_snapshot orelse self.req.remote_snapshot, &api_hit) catch |err| {
-                                self.failure.* = err;
-                                return error.WriteFailed;
-                            };
-                        }
                         if (self.req.cancellation) |token| token.check() catch |err| {
                             self.failure.* = err;
                             return error.WriteFailed;
@@ -4027,8 +3980,7 @@ fn ColumnWireResult(comptime T: type) type {
                         try w.beginObject();
                         inline for (@typeInfo(@TypeOf(api_hit)).@"struct".field_names) |field| {
                             if (comptime std.mem.eql(u8, field, "_source")) {
-                                if (hit.column_source != null and !accounted_miss) {
-                                    const source = hit.column_source.?;
+                                if (hit.column_source) |source| {
                                     if (self.req.include_stored) {
                                         try w.objectField(field);
                                         const options: db_mod.types.LookupOptions = .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields };
@@ -4083,8 +4035,6 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
-    var scan = if (req.grep_scan_json.len != 0) try std.json.parseFromSlice(@import("antfly_grep_document").Scan, alloc, req.grep_scan_json, .{}) else null;
-    defer if (scan) |*parsed| parsed.deinit();
     const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     if (delivery) |sink| {
         var plan: ColumnWirePlan = undefined;
@@ -4109,7 +4059,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
                 }
             };
         }
-        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan, .grep_scan = if (scan) |parsed| parsed.value else null };
+        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
         std.json.Stringify.value(.{ .responses = &.{wrapped} }, options, &plan.writer) catch |err| return failure orelse (plan.failure orelse err);
         plan.writer.flush() catch |err| return plan.failure orelse err;
         // Every prepared fragment now belongs to residency or the spool.
@@ -4137,7 +4087,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
         delivered.* = plan.length;
         return empty;
     }
-    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure, .grep_scan = if (scan) |parsed| parsed.value else null };
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure };
     return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
 }
 
@@ -4165,13 +4115,10 @@ pub fn encodeQueryResponsesWithDelivery(
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    const grep_scan = if (req.grep_scan_json.len != 0) try std.json.parseFromSliceLeaky(@import("antfly_grep_document").Scan, arena, req.grep_scan_json, .{}) else null;
     const emitted_hits = if (req.count_only) result.hits[0..0] else result.hits;
-    const column_wire = hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false);
     const hits = try arena.alloc(metadata_openapi.QueryHit, emitted_hits.len);
     for (emitted_hits, 0..) |hit, i| {
         hits[i] = try toOpenApiHit(arena, req, hit);
-        if (!column_wire) _ = try applyGrepMiss(arena, grep_scan, meta.remote_snapshot orelse req.remote_snapshot, &hits[i]);
     }
 
     const graph_dialect = if (req.graph_queries.len > 0)
@@ -4302,26 +4249,6 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         .hierarchy = try searchHitHierarchyOpenApiValue(alloc, req, hit),
         ._highlights = try highlightsJsonValue(alloc, hit.highlights),
     };
-}
-
-fn applyGrepMiss(alloc: std.mem.Allocator, control: ?@import("antfly_grep_document").Scan, snapshot: ?[]const u8, hit: *metadata_openapi.QueryHit) !bool {
-    const scan = control orelse return false;
-    if (snapshot == null) return false;
-    const contract = @import("antfly_grep_document");
-    // Reserved computed keys can only originate here, never from stored data
-    // or user evaluation. No omitted body is accepted without a fresh proof.
-    if (hit._computed) |*computed| _ = computed.map.swapRemove("antfly_grep_miss_v1");
-    const source = hit._source orelse return false;
-    var object: std.json.ObjectMap = .empty;
-    var iter = source.map.iterator();
-    while (iter.next()) |entry| try object.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
-    const value: std.json.Value = .{ .object = object };
-    const miss = contract.certify(scan, value, hit._id, snapshot.?) orelse return false;
-    hit._source = try takeOpenApiObjectMap(alloc, try contract.withoutContent(alloc, value, scan.document_field));
-    const proof = try std.json.Stringify.valueAlloc(alloc, .{ .version = miss.version, .request = miss.request[0..], .snapshot = miss.snapshot, .document_id = miss.document_id, .revision = miss.revision, .content_bytes = miss.content_bytes }, .{});
-    if (hit._computed == null) hit._computed = .{};
-    try hit._computed.?.map.put(alloc, "antfly_grep_miss_v1", try ant_json.parseFromSliceLeaky(std.json.Value, alloc, proof, .{}));
-    return true;
 }
 
 /// Move an owned dynamic JSON object into the generated OpenAPI object-map
@@ -11166,7 +11093,6 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.index_name) |index_name| alloc.free(index_name);
     if (req.primary_text_index_name) |index_name| alloc.free(index_name);
     if (req.remote_snapshot) |snapshot| alloc.free(snapshot);
-    if (req.grep_scan_json.len > 0) alloc.free(req.grep_scan_json);
     if (req.evaluation_json.len > 0) alloc.free(req.evaluation_json);
     if (req.aggregations_json.len > 0) alloc.free(req.aggregations_json);
     if (req.filter_prefix.len > 0) alloc.free(req.filter_prefix);
@@ -19712,79 +19638,4 @@ test "public graph metric borrowed wire vector document authority supports full 
     }
     try std.testing.expectEqual(db_mod.types.document_authority.Mode.candidates, options.document_authority_mode);
     try std.testing.expectEqual(std.math.maxInt(u64), options.document_authority_group);
-}
-
-test "api query contract grep accounting validates complete source and binds the response snapshot" {
-    const a = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const sa = arena.allocator();
-    const raw = "{\"grep\":{\"version\":1,\"path\":\"a.py\",\"uri\":\"s3://bucket/a.py\",\"revision\":\"r1\",\"indexed_at\":1,\"permissions\":{\"public\":true,\"readers\":[]},\"content\":\"ordinary text\"}}";
-    const source = try ant_json.parseFromSliceLeaky(std.json.Value, sa, raw, .{ .parse_numbers = false });
-    const control: @import("antfly_grep_document").Scan = .{ .document_field = "grep", .alternatives = &.{"needle"}, .max_content_bytes = 1024 };
-    const req: db_mod.types.SearchRequest = .{ .include_stored = true, .include_all_fields = true, .grep_scan_json = try std.json.Stringify.valueAlloc(sa, control, .{}) };
-    var hit = try toOpenApiHit(sa, req, .{ .id = @constCast("a"), .source_value = source });
-    try std.testing.expect(!try applyGrepMiss(sa, control, null, &hit));
-    try std.testing.expect(try applyGrepMiss(sa, control, "snapshot-1", &hit));
-    const proof = hit._computed.?.map.get("antfly_grep_miss_v1").?;
-    try std.testing.expectEqualStrings("snapshot-1", proof.object.get("snapshot").?.string);
-    try std.testing.expectEqual(@as(i64, 13), proof.object.get("content_bytes").?.integer);
-    try std.testing.expect(hit._source.?.map.get("grep").?.object.get("content") == null);
-    try std.testing.expect(@import("antfly_grep_document").at(source, "grep.content") != null);
-
-    // Replayed multi-group snapshots are owned by the coordinator. Their
-    // column encoder has the retained request token but no new local cut/meta.
-    const rows = @import("../storage/rowsource/types.zig");
-    const refs = [_]rows.RowRef{.{ .relational_key = "a" }};
-    const body = try std.json.Stringify.valueAlloc(sa, source.object.get("grep").?, .{});
-    const columns = [_]rows.ColumnVector{.{ .name = "grep", .values = .{ .json = &.{body} } }};
-    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "retained" }, .row_refs = &refs, .columns = &columns }, &.{0});
-    defer page.release();
-    var column_hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "a"), .column_source = page.row(0) };
-    defer column_hit.deinit(a);
-    var column_hits = [_]db_mod.types.SearchHit{column_hit};
-    var replay = req;
-    replay.remote_snapshot = "snapshot-1";
-    var encoded = try encodeQueryResponses(a, "docs", replay, .{}, .{ .alloc = a, .hits = &column_hits, .total_hits = 1 });
-    defer encoded.deinit(a);
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded.json, .{});
-    defer parsed.deinit();
-    const emitted = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
-    try std.testing.expect(emitted.get("_computed") != null);
-    const replay_proof = emitted.get("_computed").?.object.get("antfly_grep_miss_v1").?.object;
-    try std.testing.expectEqualStrings("snapshot-1", replay_proof.get("snapshot").?.string);
-    try std.testing.expectEqual(@as(i64, 13), replay_proof.get("content_bytes").?.integer);
-    try std.testing.expect(emitted.get("_source").?.object.get("grep").?.object.get("content") == null);
-}
-
-test "api query contract grep accounting admits exact scans and rejects incomplete projections" {
-    const a = std.testing.allocator;
-    const body = "{\"query\":{\"match_all\":{}},\"order_by\":[{\"field\":\"_id\",\"desc\":false}],\"grep_scan\":{\"version\":1,\"document_field\":\"grep\",\"alternatives\":[\"needle\"],\"max_content_bytes\":1024}}";
-    var owned = try parseQueryRequest(a, null, "docs", body);
-    defer owned.deinit(a);
-    try std.testing.expect(owned.req.grep_scan_json.len != 0);
-    const invalid0 = "{\"query\":{\"match_all\":{}},\"order_by\":[{\"field\":\"_id\",\"desc\":false}],\"grep_scan\":{\"version\":1,\"document_field\":\"grep\",\"alternatives\":[\"needle\"],\"max_content_bytes\":1024},\"fields\":[\"grep.version\"]}";
-    if (parseQueryRequest(a, null, "docs", invalid0)) |accepted| {
-        var unexpected = accepted;
-        unexpected.deinit(a);
-        return error.TestUnexpectedResult;
-    } else |err| try std.testing.expect(err == error.InvalidQueryRequest or err == error.UnsupportedQueryRequest);
-    const invalid1 = "{\"query\":{\"match_all\":{}},\"order_by\":[],\"grep_scan\":{\"version\":1,\"document_field\":\"grep\",\"alternatives\":[\"needle\"],\"max_content_bytes\":1024}}";
-    if (parseQueryRequest(a, null, "docs", invalid1)) |accepted| {
-        var unexpected = accepted;
-        unexpected.deinit(a);
-        return error.TestUnexpectedResult;
-    } else |err| try std.testing.expect(err == error.InvalidQueryRequest or err == error.UnsupportedQueryRequest);
-    const invalid2 = "{\"query\":{\"match_all\":{}},\"order_by\":[{\"field\":\"_id\",\"desc\":false}],\"grep_scan\":{\"version\":2,\"document_field\":\"grep\",\"alternatives\":[\"needle\"],\"max_content_bytes\":1024}}";
-    if (parseQueryRequest(a, null, "docs", invalid2)) |accepted| {
-        var unexpected = accepted;
-        unexpected.deinit(a);
-        return error.TestUnexpectedResult;
-    } else |err| try std.testing.expect(err == error.InvalidQueryRequest or err == error.UnsupportedQueryRequest);
-    const invalid3 = "{\"query\":{\"match_all\":{}},\"order_by\":[{\"field\":\"_id\",\"desc\":false}],\"grep_scan\":{\"version\":1,\"document_field\":\"grep\",\"alternatives\":[],\"max_content_bytes\":1024}}";
-    if (parseQueryRequest(a, null, "docs", invalid3)) |accepted| {
-        var unexpected = accepted;
-        unexpected.deinit(a);
-        return error.TestUnexpectedResult;
-    } else |err| try std.testing.expect(err == error.InvalidQueryRequest or err == error.UnsupportedQueryRequest);
 }

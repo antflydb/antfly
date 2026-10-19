@@ -77,11 +77,31 @@
             },
             "description": "Complete raw-content byte trigrams encoded as lowercase hex keyword terms; atomic with the source revision. Opt-in acceleration only."
           },
-          "accounted_misses": {
-            "type": "boolean",
-            "default": false,
-            "description": "Request server-owned v1 exact miss proofs for supported JSON/statistics scans. Retains all ordered hits and logical accounting; unsupported documents carry full content."
+          "content_index": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "field"
+            ],
+            "properties": {
+              "field": {
+                "type": "string",
+                "minLength": 1
+              },
+              "full_text_index": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "description": "Built-in substring companion over complete stored content, indexed atomically with every revision. Ordinary full_text_search candidates are verified locally. Mutually exclusive with candidate_index."
           }
+        },
+        "not": {
+          "required": [
+            "candidate_index",
+            "content_index"
+          ]
         }
       }
     },

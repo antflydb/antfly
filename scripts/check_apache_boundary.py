@@ -241,7 +241,6 @@ SOURCE_MODULES = {
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
-    "antfly_grep_document": ("zig/lib/grep_document/src/mod.zig",),
     "antfly_grapheme": ("zig/lib/tokenizer/src/grapheme.zig",),
     "antfly_capture_regex": ("zig/lib/regex/src/captures.zig",),
     "antfly_sql_regex": ("zig/lib/sql_regex/src/mod.zig",),

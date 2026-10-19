@@ -45,7 +45,6 @@ if TYPE_CHECKING:
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
-    from ..models.query_request_grep_scan import QueryRequestGrepScan
     from ..models.query_request_query import QueryRequestQuery
     from ..models.query_string_query import QueryStringQuery
     from ..models.read_requirements import ReadRequirements
@@ -215,15 +214,6 @@ class QueryRequest:
             When omitted, Antfly uses the balanced default effort (`0.5`) unless
             lower-level vector search overrides are provided internally.
              Default: 0.5. Example: 0.5.
-        grep_scan (QueryRequestGrepScan | Unset): Opt-in v1 exact grep miss accounting for ascending _id snapshot scans.
-            Necessary UTF-8 byte literal alternatives permit the server to omit only
-            validated nonmatching content. Every document retains its ordered hit,
-            metadata and permissions. Server-owned _computed.antfly_grep_miss_v1
-            binds request identity, snapshot, ID, revision and original byte count.
-            Unsupported or malformed documents retain their complete bodies.
-            This reduces wire bytes, not storage scanning. Clients must verify the
-            accounting proof before skipping lexical evaluation. Requires stored
-            sources; incompatible with graph, hierarchy or evaluation queries.
         fields (list[str] | Unset): List of fields to include in the results. If not specified, all fields are returned.
             Use to reduce response size and improve performance. This field is required when
             hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
@@ -489,7 +479,6 @@ class QueryRequest:
     aggregations: QueryRequestAggregations | Unset = UNSET
     embeddings: QueryRequestEmbeddings | Unset = UNSET
     search_effort: float | Unset = 0.5
-    grep_scan: QueryRequestGrepScan | Unset = UNSET
     fields: list[str] | Unset = UNSET
     hierarchy: QueryHierarchy | Unset = UNSET
     highlight: QueryHighlight | Unset = UNSET
@@ -756,10 +745,6 @@ class QueryRequest:
 
         search_effort = self.search_effort
 
-        grep_scan: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.grep_scan, Unset):
-            grep_scan = self.grep_scan.to_dict()
-
         fields: list[str] | Unset = UNSET
         if not isinstance(self.fields, Unset):
             fields = self.fields
@@ -878,8 +863,6 @@ class QueryRequest:
             field_dict["embeddings"] = embeddings
         if search_effort is not UNSET:
             field_dict["search_effort"] = search_effort
-        if grep_scan is not UNSET:
-            field_dict["grep_scan"] = grep_scan
         if fields is not UNSET:
             field_dict["fields"] = fields
         if hierarchy is not UNSET:
@@ -967,7 +950,6 @@ class QueryRequest:
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
-        from ..models.query_request_grep_scan import QueryRequestGrepScan
         from ..models.query_request_query import QueryRequestQuery
         from ..models.query_string_query import QueryStringQuery
         from ..models.read_requirements import ReadRequirements
@@ -1767,13 +1749,6 @@ class QueryRequest:
 
         search_effort = d.pop("search_effort", UNSET)
 
-        _grep_scan = d.pop("grep_scan", UNSET)
-        grep_scan: QueryRequestGrepScan | Unset
-        if isinstance(_grep_scan, Unset):
-            grep_scan = UNSET
-        else:
-            grep_scan = QueryRequestGrepScan.from_dict(_grep_scan)
-
         fields = cast(list[str], d.pop("fields", UNSET))
 
         _hierarchy = d.pop("hierarchy", UNSET)
@@ -1901,7 +1876,6 @@ class QueryRequest:
             aggregations=aggregations,
             embeddings=embeddings,
             search_effort=search_effort,
-            grep_scan=grep_scan,
             fields=fields,
             hierarchy=hierarchy,
             highlight=highlight,

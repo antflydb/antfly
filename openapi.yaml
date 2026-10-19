@@ -22946,53 +22946,6 @@ components:
 
             lower-level vector search overrides are provided internally.
           example: 0.5
-        grep_scan:
-          type: object
-          additionalProperties: false
-          required:
-            - version
-            - document_field
-            - alternatives
-            - max_content_bytes
-          description: >
-            Opt-in v1 exact grep miss accounting for ascending _id snapshot scans.
-
-            Necessary UTF-8 byte literal alternatives permit the server to omit only
-
-            validated nonmatching content. Every document retains its ordered hit,
-
-            metadata and permissions. Server-owned _computed.antfly_grep_miss_v1
-
-            binds request identity, snapshot, ID, revision and original byte count.
-
-            Unsupported or malformed documents retain their complete bodies.
-
-            This reduces wire bytes, not storage scanning. Clients must verify the
-
-            accounting proof before skipping lexical evaluation. Requires stored
-
-            sources; incompatible with graph, hierarchy or evaluation queries.
-          properties:
-            version:
-              type: integer
-              enum:
-                - 1
-            document_field:
-              type: string
-              minLength: 1
-              maxLength: 1024
-            alternatives:
-              type: array
-              minItems: 1
-              maxItems: 16
-              items:
-                type: string
-                minLength: 1
-              description: Necessary byte literals; total UTF-8 bytes may not exceed 16384.
-            max_content_bytes:
-              type: integer
-              format: uint64
-              minimum: 0
         fields:
           x-go-type-skip-optional-pointer: false
           type: array

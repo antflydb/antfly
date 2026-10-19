@@ -111,7 +111,6 @@ pub const AntflyRootImports = struct {
     casbin: *std.Build.Module,
     fst: *std.Build.Module,
     regex: *std.Build.Module,
-    grep_document: *std.Build.Module,
     sql_regex: *std.Build.Module,
     json: *std.Build.Module,
     jsonschema: *std.Build.Module,
@@ -191,7 +190,6 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_casbin", .field = "casbin" },
         .{ .name = "antfly_fst", .field = "fst" },
         .{ .name = "antfly_regex", .field = "regex" },
-        .{ .name = "antfly_grep_document", .field = "grep_document" },
         .{ .name = "antfly_sql_regex", .field = "sql_regex" },
         .{ .name = "antfly-json", .field = "json" },
         .{ .name = "antfly_jsonschema", .field = "jsonschema" },
@@ -357,7 +355,6 @@ pub const AntflyRootImports = struct {
 
     /// Public local C API: no server provisioning, quorum observer, or routers.
     pub fn configureEmbedded(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
-        mod.addImport("antfly_grep_document", self.grep_document);
         self.configureDatabase(mod, link_libc);
         inline for (.{
             "casbin",           "extraction_openapi", "inference_config_openapi",
@@ -380,7 +377,6 @@ pub const AntflyRootImports = struct {
     }
 
     fn configureStorageDependencies(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
-        mod.addImport("antfly_grep_document", self.grep_document);
         self.configureDatabase(mod, link_libc);
         self.configureServerContracts(mod);
         inline for (storage_imports) |field| self.addImport(mod, field);
@@ -406,7 +402,6 @@ pub const AntflyRootImports = struct {
     }
 
     pub fn configureApi(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
-        mod.addImport("antfly_grep_document", self.grep_document);
         self.configureDatabase(mod, link_libc);
         self.configureServerContracts(mod);
         inline for (api_imports) |field| self.addImport(mod, field);
@@ -419,7 +414,6 @@ pub const AntflyRootImports = struct {
 
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         mod.addImport("antfly_resolver", self.resolver);
-        mod.addImport("antfly_grep_document", self.grep_document);
         self.configureDatabase(mod, link_libc);
         mod.addImport("antfly_provision_contract", self.provision_contract);
         inline for (object_runtime_imports) |field| self.addImport(mod, field);
