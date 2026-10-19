@@ -3233,6 +3233,53 @@ def test_sql_graph_statistics_use_consumer_certificates(graph_db):
         str(layers + 1),
         pytest.approx(average + 1, rel=1e-13),
     ]
+    endpoint_average = (sum(sums[1:]) + sum(depth * counts[depth] for depth in range(1, layers + 1))) / sum(counts[1:])
+    coefficient_average = sum(depth * sums[depth] for depth in range(1, layers + 1)) / sum(counts[1:])
+    for statement in (
+        f"SELECT min(hops+depth),max(hops+depth),avg(hops+depth) FROM {grouped}",
+        f"WITH t AS (SELECT depth+hops AS n,depth FROM {grouped} WHERE depth>0) SELECT min(n),max(n),avg(n) FROM t WHERE depth>0",
+        f"SELECT min(hops+depth),max(hops+depth),avg(hops+depth) FROM (SELECT hops,depth FROM {grouped} UNION ALL SELECT hops,depth FROM {grouped}) u",
+    ):
+        assert db.sql(statement)["rows"][0] == ["2", str(2 * layers), pytest.approx(endpoint_average, rel=1e-13)]
+    assert db.sql(f"SELECT min(hops*depth),max(hops*depth),avg(hops*depth) FROM {grouped}")["rows"][0] == [
+        "1",
+        str(layers * layers),
+        pytest.approx(coefficient_average, rel=1e-13),
+    ]
+    squared_average = (sum(sums[1:]) + sum(depth * depth * counts[depth] for depth in range(1, layers + 1))) / sum(
+        counts[1:]
+    )
+    statement = f"WITH t AS (SELECT depth*depth AS k,hops FROM {grouped}),u AS (SELECT hops+k AS n FROM t) SELECT min(n),max(n),avg(n) FROM u"
+    assert db.sql(statement)["rows"][0] == [
+        "2",
+        str(layers * layers + layers),
+        pytest.approx(squared_average, rel=1e-13),
+    ]
+    # Mixed endpoint/length guards remain conservative eager-error barriers.
+    # A length-only GRAPH_TABLE predicate can use the same range certificate.
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "ranged",
+            "definition": {
+                "labels": [
+                    {"name": "D", "table": "docs"},
+                    {"name": "Start", "table": "docs", "where": {"id": "start"}},
+                ],
+                "relationships": [
+                    {"name": "R", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
+                ],
+            },
+        }
+    )
+    length_only = (
+        "GRAPH_TABLE(ranged MATCH p=(s IS Start)-[rs IS R*]->(b IS D) WHERE length(p)>=2 COLUMNS(length(p) AS hops)) q"
+    )
+    assert db.sql(f"SELECT min(hops),max(hops),avg(hops) FROM {length_only}")["rows"][0] == [
+        "2",
+        str(layers),
+        pytest.approx(average, rel=1e-13),
+    ]
     query = f"WITH t AS (SELECT hops+1 AS n,depth FROM {grouped} WHERE depth>0) SELECT depth,min(n),max(n),avg(n) FROM t WHERE depth%4=0 GROUP BY depth ORDER BY depth"
     result = db.sql(query)["rows"]
     assert result == [
@@ -3278,6 +3325,14 @@ def test_sql_graph_statistics_use_consumer_certificates(graph_db):
     assert nonlinear == pytest.approx(sum(n * n * count for n, count in enumerate(paths, 1)) / sum(paths))
     with pytest.raises(SQLStateError, match="22003"):
         db.sql(f"SELECT avg((hops+9223372036854775807)-9223372036854775807) FROM {bounded}")
+    two_fields = bounded
+    nonlinear_joint = db.sql(f"SELECT avg((hops+depth)*(hops-depth)) FROM {two_fields}")["rows"][0][0]
+    ordinary = db.cypher_json(
+        "g", {"query": "MATCH p=(s:D {id:'short'})-[:R*1..]->(b:D) RETURN avg((length(p)+b.score)*(length(p)-b.score))"}
+    )["rows"][0][0]["value"]
+    assert nonlinear_joint == pytest.approx(ordinary, rel=1e-13)
+    with pytest.raises(SQLStateError, match="22003"):
+        db.sql(f"SELECT avg((hops+depth+9223372036854775807)-9223372036854775807) FROM {two_fields}")
     small = "GRAPH_TABLE(g MATCH p=(s IS D)-[rs IS R*3]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS hops,size(rs) AS segment)) q"
     assert db.sql(
         f"SELECT count(hops),sum(hops),avg(segment),min(hops),max(segment),count(DISTINCT hops) FROM {small}"
@@ -3357,3 +3412,47 @@ def test_invariant_and_branch_moments_avoid_length_histograms(graph_db):
         for row in rows:
             depth, low, high = [int(cell["value"]) for cell in row[:3]]
             assert (low, high) == ((depth + 1) // 2 + depth, 2 * depth)
+
+
+def test_endpoint_identity_and_length_ranges_keep_moments_compressed(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+2 CREATE (a)-[:R]->(b)"})
+    base = "MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 35000}
+    direct = db.cypher_json(
+        "g",
+        {
+            "query": base + "RETURN min(length(p)+b.score),max(length(p)+b.score),avg(length(p)+b.score)",
+            "limits": limits,
+        },
+    )
+    expected = [cell["value"] for cell in direct["rows"][0]]
+    for query in (
+        base + "WITH b,length(p) AS n RETURN min(n+b.score),max(n+b.score),avg(n+b.score)",
+        base
+        + "WITH b AS endpoint,length(p) AS n WITH endpoint AS x,n RETURN min(n+x.score),max(n+x.score),avg(n+x.score)",
+        "CALL { "
+        + base
+        + "RETURN b AS endpoint,length(p) AS n } RETURN min(n+endpoint.score),max(n+endpoint.score),avg(n+endpoint.score)",
+    ):
+        rows = db.cypher_json("g", {"query": query, "limits": limits})["rows"]
+        assert [cell["value"] for cell in rows[0]] == [expected[0], expected[1], pytest.approx(expected[2], rel=1e-13)]
+    for guard, quantified in (
+        ("length(p)>=1", "*1.."),
+        ("length(p)>=2", "*2.."),
+        ("2<=length(p)<=4", "*2..4"),
+        ("length(p)>=$minimum AND length(p)<=$maximum", "*2..4"),
+    ):
+        reduction = "RETURN min(length(p)),max(length(p)),avg(length(p))"
+        reference = db.cypher_json("g", {"query": base.replace("*1..", quantified) + reduction, "limits": limits})
+        result = db.cypher_json(
+            "g",
+            {
+                "query": base + "WHERE " + guard + " " + reduction,
+                "parameters": {"minimum": 2, "maximum": 4},
+                "limits": limits,
+            },
+        )
+        assert result["rows"] == reference["rows"]
+        assert result["stats"]["intermediate_states"] <= reference["stats"]["intermediate_states"] + 100

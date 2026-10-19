@@ -50,9 +50,74 @@ pub const Plan = struct {
             for (request.fields, fields) |field, *name| name.* = try a.dupe(u8, field);
             const invariants = try a.alloc([]const u8, request.invariants.len);
             for (request.invariants, invariants) |field, *name| name.* = try a.dupe(u8, field);
-            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| try a.dupe(u8, name) else null, .invariants = invariants };
+            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| try a.dupe(u8, name) else null, .invariants = invariants, .summaries = try ownCertificates(a, request.summaries) };
         }
         return initDepth(a, root, owned, cursors, 0);
+    }
+    fn ownCertificates(a: A, input: []const catalog.SummaryCertificate) ![]const catalog.SummaryCertificate {
+        const result = try a.alloc(catalog.SummaryCertificate, input.len);
+        for (input, result) |certificate, *out| {
+            const stable = try a.alloc([]const u8, certificate.invariants.len);
+            for (certificate.invariants, stable) |field, *owned| owned.* = try a.dupe(u8, field);
+            out.* = .{ .field = try a.dupe(u8, certificate.field), .invariants = stable };
+        }
+        return result;
+    }
+    fn certificates(a: A, request: catalog.AggregateWeight) ![]const catalog.SummaryCertificate {
+        if (request.summaries.len != 0) return request.summaries;
+        const field = request.summary orelse return &.{};
+        const result = try a.alloc(catalog.SummaryCertificate, 1);
+        result[0] = .{ .field = field, .invariants = request.invariants };
+        return result;
+    }
+    fn projectionInputs(a: A, fields: *Names, node: *const binding.Node, ordinal: usize) !void {
+        const query = node.operation.query;
+        const bound = query.binding.scalars;
+        if (ordinal < bound.projections.len) if (bound.projections[ordinal]) |program| {
+            try programFields(a, fields, program, bound.columns);
+            return;
+        };
+        try fields.put(a, query.statement.columns[ordinal].field, {});
+    }
+    fn projectCertificates(a: A, node: *const binding.Node, request: catalog.AggregateWeight, wanted: Names) ![]const catalog.SummaryCertificate {
+        const query = node.operation.query;
+        const bound = query.binding.scalars;
+        var result: std.ArrayList(catalog.SummaryCertificate) = .empty;
+        for (try certificates(a, request)) |certificate| {
+            const target = columnIndex(node, certificate.field) orelse continue;
+            const program = if (target < bound.projections.len) bound.projections[target] else null;
+            if (query.binding.columns[target].type != .integer) continue;
+            var common: Names = .empty;
+            if (bound.predicate) |predicate| try programFields(a, &common, predicate, bound.columns);
+            for (certificate.invariants) |field| try projectionInputs(a, &common, node, columnIndex(node, field) orelse return error.InvalidSqlBackendResponse);
+            // Unobserved computed outputs still run for their errors. Other
+            // demanded computations cannot observe this marginal either.
+            for (node.columns, 0..) |column, ordinal| {
+                if (ordinal == target or !wanted.contains(column.internal)) continue;
+                if (ordinal < bound.projections.len) if (bound.projections[ordinal]) |other| {
+                    const operation = other.instructions[other.root].operation;
+                    if (operation != .column and operation != .literal) try programFields(a, &common, other, bound.columns);
+                };
+            }
+            const direct = if (program == null) columnIndex(query.source, query.statement.columns[target].field) else null;
+            if (program == null and direct == null) continue;
+            const candidates: []const u32 = if (program) |p| p.required_columns else &.{@intCast(direct.?)};
+            if (candidates.len > 256) continue;
+            for (candidates) |candidate| {
+                const field = if (program) |p| blk: {
+                    if (!p.affineRelativeTo(candidate)) continue;
+                    break :blk bound.columns[candidate].name;
+                } else query.source.columns[candidate].internal;
+                var stable = try common.clone(a);
+                if (program) |p| for (p.required_columns) |ordinal| if (ordinal != candidate) try stable.put(a, bound.columns[ordinal].name, {});
+                if (stable.contains(field)) continue;
+                // Bound proof growth rather than building an exponential
+                // disjunction through nested projections. Declining is exact.
+                if (result.items.len >= 256) return &.{};
+                try result.append(a, .{ .field = field, .invariants = try names(a, stable) });
+            }
+        }
+        return result.items;
     }
     fn initDepth(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor, depth: usize) anyerror!?Plan {
         if (depth >= 64 or requests.len == 0) return null;
@@ -102,12 +167,9 @@ pub const Plan = struct {
                     if (columnIndex(node, field) == null) return null;
                     try wanted.put(a, field, {});
                 }
-                var summary: ?[]const u8 = null;
                 var dependencies: Names = .empty;
-                var stable: Names = .empty;
                 if (bound.predicate) |p| {
                     try programFields(a, &dependencies, p, bound.columns);
-                    try programFields(a, &stable, p, bound.columns);
                 }
                 for (node.columns, query.statement.columns, query.binding.columns, 0..) |column, projection, definition, index| {
                     const program = if (index < bound.projections.len) bound.projections[index] else null;
@@ -125,20 +187,8 @@ pub const Plan = struct {
                     // A demanded computed output is checked by its assigned
                     // reducer pass. Truly unused computations must still run;
                     // keep their error dependencies in every candidate pass.
-                    const is_summary = if (request.summary) |name| std.mem.eql(u8, name, column.internal) else false;
-                    if (is_summary) {
-                        if (program) |p| {
-                            if (p.affineColumn()) |source_index| summary = bound.columns[source_index].name;
-                        } else if (direct) summary = projection.field;
-                    }
                     if (!direct and !covered.contains(column.internal)) try wanted.put(a, column.internal, {});
                     if (!wanted.contains(column.internal)) continue;
-                    const stable_output = for (request.invariants) |field| {
-                        if (std.mem.eql(u8, field, column.internal)) break true;
-                    } else false;
-                    if (stable_output or (!direct and !is_summary)) {
-                        if (program) |p| try programFields(a, &stable, p, bound.columns) else try stable.put(a, projection.field, {});
-                    }
                     if (program) |p| {
                         try programFields(a, &dependencies, p, bound.columns);
                     } else {
@@ -147,7 +197,7 @@ pub const Plan = struct {
                     }
                 }
                 output.* = try names(a, wanted);
-                input.* = .{ .fields = try names(a, dependencies), .multiplicity = request.multiplicity, .summary = summary, .invariants = try names(a, stable) };
+                input.* = .{ .fields = try names(a, dependencies), .multiplicity = request.multiplicity, .summaries = try projectCertificates(a, node, request, wanted) };
             }
             try stages.append(a, .{ .node = node, .fields = outputs });
             width += node.columns.len;
@@ -234,7 +284,13 @@ pub const Plan = struct {
             }
             const invariants = try a.alloc([]const u8, request.invariants.len);
             for (request.invariants, invariants) |field, *name| name.* = node.operation.scan.source_columns[columnIndex(node, field) orelse return null];
-            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| node.operation.scan.source_columns[columnIndex(node, name) orelse return null] else null, .invariants = invariants };
+            const summaries = try a.alloc(catalog.SummaryCertificate, request.summaries.len);
+            for (request.summaries, summaries) |certificate, *mapped_certificate| {
+                const stable = try a.alloc([]const u8, certificate.invariants.len);
+                for (certificate.invariants, stable) |field, *name| name.* = node.operation.scan.source_columns[columnIndex(node, field) orelse return null];
+                mapped_certificate.* = .{ .field = node.operation.scan.source_columns[columnIndex(node, certificate.field) orelse return null], .invariants = stable };
+            }
+            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| node.operation.scan.source_columns[columnIndex(node, name) orelse return null] else null, .invariants = invariants, .summaries = summaries };
         }
         return .{ .source = node, .requests = requests, .stages = stages.items, .physical = physical, .width = width + node.columns.len };
     }
@@ -251,7 +307,13 @@ pub const Plan = struct {
             for (request.fields, fields) |field, *name| name.* = nested.columns[columnIndex(parent, field) orelse return error.InvalidSqlBackendResponse].internal;
             const invariants = try a.alloc([]const u8, request.invariants.len);
             for (request.invariants, invariants) |field, *name| name.* = nested.columns[columnIndex(parent, field) orelse return error.InvalidSqlBackendResponse].internal;
-            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| nested.columns[columnIndex(parent, name) orelse return error.InvalidSqlBackendResponse].internal else null, .invariants = invariants };
+            const summaries = try a.alloc(catalog.SummaryCertificate, request.summaries.len);
+            for (request.summaries, summaries) |certificate, *mapped_certificate| {
+                const stable = try a.alloc([]const u8, certificate.invariants.len);
+                for (certificate.invariants, stable) |field, *name| name.* = nested.columns[columnIndex(parent, field) orelse return error.InvalidSqlBackendResponse].internal;
+                mapped_certificate.* = .{ .field = nested.columns[columnIndex(parent, certificate.field) orelse return error.InvalidSqlBackendResponse].internal, .invariants = stable };
+            }
+            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| nested.columns[columnIndex(parent, name) orelse return error.InvalidSqlBackendResponse].internal else null, .invariants = invariants, .summaries = summaries };
         }
         return result;
     }

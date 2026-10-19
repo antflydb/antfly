@@ -189,7 +189,7 @@ pub const NodeCursor = struct {
             const name = item.alias orelse try self.engine.expressionName(item.expression);
             if (std.mem.eql(u8, name, field)) {
                 var names: Engine.MomentNames = .empty;
-                try names.put(self.engine.a, target, Engine.Affine.column(0));
+                try names.put(self.engine.a, target, .{ .scalar = Engine.Affine.column(0) });
                 const form = self.engine.momentArgument(item.expression, names) orelse return null;
                 if (form.field == null) return null;
                 found = true;
@@ -348,7 +348,8 @@ pub const NodeCursor = struct {
         var arena_moved = false;
         errdefer if (arena_moved) self.arena.deinit() else arena.deinit();
         const a = arena.allocator();
-        const owned_query = try @import("path_summaries.zig").lower(a, try std.json.parseFromSliceLeaky(ast.Query, a, try std.json.Stringify.valueAlloc(a, query, .{}), .{}));
+        const lowered_query = try @import("path_summaries.zig").lower(a, try std.json.parseFromSliceLeaky(ast.Query, a, try std.json.Stringify.valueAlloc(a, query, .{}), .{}));
+        const owned_query = try @import("length_constraints.zig").normalize(a, lowered_query, parameters);
         const owned_parameters = try a.alloc(v.Entry, parameters.len);
         for (parameters, owned_parameters) |parameter, *out| out.* = .{ .name = try a.dupe(u8, parameter.name), .value = try parameter.value.clone(a) };
         const engine = try a.create(Engine);
@@ -915,7 +916,7 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
         engine.stats.scanned_anchors = initial.scanned_anchors;
         engine.stats.explored_edges = initial.explored_edges;
     };
-    const query = if (writes) compiled.query else try @import("path_summaries.zig").lower(engine.a, compiled.query);
+    const query = if (writes) compiled.query else try @import("length_constraints.zig").normalize(engine.a, try @import("path_summaries.zig").lower(engine.a, compiled.query), parameters);
     const rows = try engine.run(query.clauses, &.{&.{}}, compiled.query.explain, false);
     var combined: std.ArrayList(Row) = .empty;
     try combined.appendSlice(engine.a, rows);
@@ -4342,9 +4343,10 @@ const Engine = struct {
     const MomentCall = enum { count, sum, avg, min, max };
     const DirectMoment = struct { kind: MomentCall, form: Affine, expression: *const ast.Expr };
     const Affine = @import("integer_affine.zig").Form;
-    // A null entry is a lexical shadow with no affine proof. Keeping it
-    // prevents an older input binding from being reused after WITH/UNWIND.
-    const MomentNames = std.StringHashMapUnmanaged(?Affine);
+    // Entity identity and opaque shadows are distinct proofs. A transparent
+    // alias keeps its original bag binding without reviving a shadowed value.
+    const MomentBinding = union(enum) { scalar: Affine, entity: []const u8, blocked };
+    const MomentNames = std.StringHashMapUnmanaged(MomentBinding);
     const SummaryTarget = struct { name: []const u8, edge: ?usize = null };
     const MomentStats = struct { sum: Count = Count.init(0), min: usize = 0, max: usize = 0 };
     /// The fields are independent marginals. Their joint distribution is never
@@ -4394,27 +4396,28 @@ const Engine = struct {
     };
     fn referencesAny(value: anytype, names: MomentNames) bool {
         var keys = names.keyIterator();
-        while (keys.next()) |key| if (names.get(key.*).?) |form| {
-            if (form.field != null and path_summaries.references(value, key.*)) return true;
-        };
+        while (keys.next()) |key| {
+            const binding = names.get(key.*).?;
+            if (binding == .scalar and binding.scalar.field != null and path_summaries.references(value, key.*)) return true;
+        }
         return false;
+    }
+    fn momentEntity(self: *Engine, expression: *const ast.Expr, names: MomentNames) ?[]const u8 {
+        if (expression.value != .variable) return null;
+        const name = expression.value.variable;
+        if (names.get(name)) |binding| return if (binding == .entity) binding.entity else null;
+        if (lookup(self.moment_input, name)) |value| {
+            if (value == .node or value == .map or value == .relationship) return name;
+            return null;
+        }
+        if (self.moment_endpoint) |endpoint| if (std.mem.eql(u8, endpoint, name)) return name;
+        return null;
     }
     fn momentArgument(self: *Engine, expression: *const ast.Expr, names: MomentNames) ?Affine {
         return switch (expression.value) {
-            .variable => |name| if (names.get(name)) |proof| proof else if (lookup(self.moment_input, name)) |value| (if (value == .integer) Affine.literal(value.integer) else null) else null,
+            .variable => |name| if (names.get(name)) |proof| (if (proof == .scalar) proof.scalar else null) else if (lookup(self.moment_input, name)) |value| (if (value == .integer) Affine.literal(value.integer) else null) else null,
             .parameter => |name| if (lookup(self.parameters, name)) |value| (if (value == .integer) Affine.literal(value.integer) else null) else null,
-            .property => |property| blk: {
-                // Property reads retain the ordinary policy projection even
-                // when their raw input is already bound at the anchor.
-                if (property.base.value == .variable) {
-                    if (names.contains(property.base.value.variable)) break :blk null;
-                    if (lookup(self.moment_input, property.base.value.variable) != null) break :blk Affine.invariant();
-                    if (self.moment_endpoint) |endpoint| {
-                        if (std.mem.eql(u8, endpoint, property.base.value.variable)) break :blk Affine.invariant();
-                    }
-                }
-                break :blk null;
-            },
+            .property => |property| if (self.momentEntity(property.base, names) != null) Affine.invariant() else null,
             .literal => |value| if (value == .integer) Affine.literal(value.integer) else null,
             .unary => |u| blk: {
                 const operand = self.momentArgument(u.operand, names) orelse return null;
@@ -4451,8 +4454,19 @@ const Engine = struct {
             .property => {
                 const form = optional orelse return;
                 if (form.symbolic) {
-                    for (self.moment_invariants.items) |prior| if (prior == expression) return;
-                    try self.moment_invariants.append(self.a, expression);
+                    // Admission uses the producer's binding; evaluation still
+                    // uses the original alias and ordinary read projection.
+                    const property = expression.value.property;
+                    const origin = self.momentEntity(property.base, names).?;
+                    for (self.moment_invariants.items) |prior| {
+                        const entry = prior.value.property;
+                        if (std.mem.eql(u8, entry.base.value.variable, origin) and std.mem.eql(u8, entry.name, property.name)) return;
+                    }
+                    const base = try self.a.create(ast.Expr);
+                    base.* = .{ .span = property.base.span, .value = .{ .variable = origin } };
+                    const admitted = try self.a.create(ast.Expr);
+                    admitted.* = .{ .span = expression.span, .value = .{ .property = .{ .base = base, .name = property.name } } };
+                    try self.moment_invariants.append(self.a, admitted);
                 }
                 return;
             },
@@ -4521,9 +4535,9 @@ const Engine = struct {
     }
     fn momentSafe(self: *Engine, value: anytype, names: MomentNames) anyerror!bool {
         const T = @TypeOf(value);
-        if (T == ast.MapSelector) if (value == .variable) return if (names.get(value.variable)) |proof| (if (proof) |form| form.field == null else true) else true;
+        if (T == ast.MapSelector) if (value == .variable) return if (names.get(value.variable)) |proof| (proof != .scalar or proof.scalar.field == null) else true;
         if (T == ast.Expr) {
-            if (value.value == .variable) return if (names.get(value.value.variable)) |proof| (if (proof) |form| form.field == null else true) else true;
+            if (value.value == .variable) return if (names.get(value.value.variable)) |proof| (proof != .scalar or proof.scalar.field == null) else true;
             if (value.value == .call) {
                 const invocation = value.value.call;
                 if (std.ascii.eqlIgnoreCase(invocation.name, "collect")) return false;
@@ -4557,11 +4571,12 @@ const Engine = struct {
         for (projection.items) |item| {
             if (self.momentArgument(item.expression, names)) |form| {
                 try self.retainMomentChecks(item.expression, names);
-                try next.put(self.a, item.alias orelse try self.expressionName(item.expression), form);
+                try next.put(self.a, item.alias orelse try self.expressionName(item.expression), .{ .scalar = form });
                 continue;
             }
             if (referencesAny(item.expression, names)) return null;
-            try next.put(self.a, item.alias orelse try self.expressionName(item.expression), null);
+            const binding: MomentBinding = if (self.momentEntity(item.expression, names)) |origin| .{ .entity = origin } else .blocked;
+            try next.put(self.a, item.alias orelse try self.expressionName(item.expression), binding);
         }
         if (referencesAny(projection.predicate, names) or referencesAny(projection.predicate, next)) return null;
         return next;
@@ -4586,7 +4601,7 @@ const Engine = struct {
                     }
                 }
                 names = try names.clone(self.a);
-                try names.put(self.a, u.alias, form);
+                try names.put(self.a, u.alias, if (form) |value| .{ .scalar = value } else .blocked);
             },
             .subquery => |inner| {
                 if (inner.len == 0 or inner[inner.len - 1].operation != .project or !inner[inner.len - 1].operation.project.final) return null;
@@ -4633,7 +4648,7 @@ const Engine = struct {
         const targets = try self.summaryTargets(path);
         if (targets.len == 0) return null;
         var names: MomentNames = .empty;
-        for (targets, 0..) |target, i| try names.put(self.a, target.name, Affine.column(i));
+        for (targets, 0..) |target, i| try names.put(self.a, target.name, .{ .scalar = Affine.column(i) });
         if (referencesAny(self.stream_predicate, names)) return null;
         if (self.weighted_sink) |_| {
             // External consumers negotiate this certificate before advancing.

@@ -2977,3 +2977,61 @@ test "invariant and affine choice proofs release failed allocations" {
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }
+
+test "endpoint entity proofs survive aliases wildcard and returning CALL" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH b,length(p) AS n RETURN min(n+b.rank),max(n+b.rank),avg(n+b.rank)=7.0/3", "[[1,3,true]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH b AS endpoint,length(p) AS n WITH endpoint AS x,n RETURN min(n+x.rank),max(n+x.rank)", "[[1,3]]");
+    try check("CALL { MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN b AS endpoint,length(p) AS n } RETURN min(n+endpoint.rank),max(n+endpoint.rank)", "[[1,3]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH *,b AS endpoint RETURN min(length(p)+endpoint.rank),max(length(p)+endpoint.rank)", "[[1,3]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH b AS endpoint,length(p) AS n WITH {rank:'x'} AS endpoint,n RETURN min(n+endpoint.rank),max(n+endpoint.rank)", "[[\"0x\",\"1x\"]]");
+}
+
+test "length guard bounds preserve empty optional and eager error semantics" {
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=1 RETURN count(*),min(length(p)),max(length(p))", "[[2,1,1]]");
+    try check("MATCH p=(a:Document {id:'a'})-[xs:CITES*0..1]->(b) WHERE 0<size(xs) AND size(xs)<=1 RETURN count(*),sum(size(xs))", "[[2,2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE 0<length(p)<=1 RETURN count(*)", "[[2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)<0 RETURN count(*),min(length(p))", "[[0,null]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=2 RETURN count(*)", "[[0]]");
+    try check("OPTIONAL MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=2 RETURN count(*),count(p)", "[[1,0]]");
+    for ([_][]const u8{
+        "MATCH p=(a:Document {id:'a'})-[:CITES*1..2]->(b:Document {rank:1/(b.rank-2)}) WHERE length(p)>=2 RETURN count(*)",
+        "MATCH p=(a:Document {rank:1/0})-[:CITES*0..1]->(b) WHERE length(p)>=2 RETURN count(*)",
+        "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=2 AND 1/0=0 RETURN count(*)",
+        "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE 1/0=0 AND length(p)>=2 RETURN count(*)",
+    }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "length bounds specialize each invocation without changing parameter semantics" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=$minimum RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    for ([_]v.Value{ .{ .integer = 0 }, .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = -2 }, .null, .{ .number = 0.5 }, .{ .integer = std.math.maxInt(i64) } }, [_]i64{ 3, 2, 0, 3, 0, 2, 0 }) |value, expected| {
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "minimum", .value = value }}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(expected, result.rows[0][0].integer);
+    }
+}
+
+test "endpoint aliases and range certificates release failed allocations" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var fixed: FixedAllocation = .{ .backing = backing };
+            const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "CALL { MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WHERE length(p)>=$minimum RETURN b AS endpoint,length(p) AS n } RETURN min(n+endpoint.rank),max(n+endpoint.rank),avg(n+endpoint.rank)", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "minimum", .value = .{ .integer = 1 } }}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 3), result.rows[0][1].integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}

@@ -1651,6 +1651,36 @@ duplicate geometry retention for long fixed-hop patterns. The same dependencies 
 typed renames and transparent CTE projections, so a filter cannot regain a
 certificate merely by moving into a subquery.
 
+SQL summary negotiation carries a bounded disjunction of certificates. Each
+alternative selects one varying integer input and names all inputs that must
+be constant within its bag. A scalar program may be affine relative to `hops`
+while its offset or coefficient depends on an endpoint column; the graph
+producer must prove those invariants before emitting synthetic representatives.
+Certificates retain their separate invariant sets through computed CTE
+projections, physical-column mappings and positional UNION ALL branches. They
+are never combined by assuming that a second observed marginal is constant.
+Nonlinear observations, predicate dependencies and computed error observations
+invalidate incompatible alternatives. Proof growth is bounded; unsupported
+shapes retain exact distribution execution.
+
+Endpoint identity has its own lineage, separate from scalar affinity and opaque
+lexical shadows. Transparent WITH aliases, wildcard projections and returning
+CALL exports retain the original producer binding for property type admission.
+The original expression still performs read-policy projection at evaluation;
+rebinding an alias to a map, scalar or another value cannot revive an earlier
+entity proof.
+
+After private path-summary lowering, read execution specializes total integer
+length guards for one ALL-path segment into its hop bounds. The same pass runs
+for native queries, returning CALL and UNION scopes, and SQL GRAPH_TABLE
+cursors. It accepts comparisons and conjunctions (including chained and
+reversed comparisons) with checked integer literals or invocation parameters.
+The complete predicate and pattern property expressions must certify:
+eager Boolean siblings or deferred pattern properties that can fail,
+noninteger/null bounds, post-projection filters, multiple segments and shortest
+selectors remain barriers. Contradictory ranges keep ordinary empty/optional
+semantics, and invocation-local copies leave cached query trees unchanged.
+
 Native and SQL scalar programs share checked integer affine lineage for unary
 signs, addition, subtraction and multiplication by constants. Every intermediate
 must remain affine in one marginal. Representative bags include both extrema,

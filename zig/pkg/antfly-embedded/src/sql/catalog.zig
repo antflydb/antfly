@@ -582,7 +582,10 @@ pub const ColumnPage = struct {
 /// their values must be constant within each compressed bag.
 /// Adapters must clear it whenever a filter, expression or barrier observes its
 /// distribution. Exact integer representative bags may preserve its statistics.
-pub const AggregateWeight = struct { fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null, invariants: []const []const u8 = &.{} };
+/// Each alternative names one varying marginal and every dependency that
+/// must be constant inside its bag. Alternatives are disjunctive, never merged.
+pub const SummaryCertificate = struct { field: []const u8, invariants: []const []const u8 = &.{} };
+pub const AggregateWeight = struct { fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null, invariants: []const []const u8 = &.{}, summaries: []const SummaryCertificate = &.{} };
 /// Borrowed snapshot-local costing evidence. Providers never perform I/O for
 /// optimizer statistics; absent fields remain unknown. Frequencies and hashes
 /// describe semantic equality keys, and are advisory rather than pruning proof.

@@ -322,23 +322,30 @@ pub const Program = struct {
     /// the emitted extrema preserves checked arithmetic failures as well.
     pub fn affineColumn(self: Program) ?u32 {
         if (self.output_type.kind != .integer) return null;
-        const form = self.affineInstruction(self.root, 0) orelse return null;
+        const form = self.affineInstruction(self.root, 0, null) orelse return null;
         return if (form.field) |field| @intCast(field) else null;
     }
-    fn affineInstruction(self: Program, index: u32, depth: usize) ?@import("cypher").integer_affine.Form {
+    /// Prove affinity in one candidate input. All other inputs are symbolic
+    /// invariants whose per-bag constancy must be certified by the producer.
+    pub fn affineRelativeTo(self: Program, column: u32) bool {
+        if (self.output_type.kind != .integer) return false;
+        const form = self.affineInstruction(self.root, 0, column) orelse return false;
+        return form.field == column;
+    }
+    fn affineInstruction(self: Program, index: u32, depth: usize, varying: ?u32) ?@import("cypher").integer_affine.Form {
         if (depth > 128 or index >= self.instructions.len) return null;
         const form = @import("cypher").integer_affine.Form;
         const instruction = self.instructions[index];
         if (instruction.input_function or instruction.type.kind != .integer) return null;
         return switch (instruction.operation) {
-            .column => |column| form.column(column),
+            .column => |column| if (varying != null and column != varying.?) form.invariant() else form.column(column),
             // Typed parameters are invocation invariants. This certificate is
             // structural; ordinary evaluation of integer bins retains their
             // actual coefficients, nulls and checked intermediate failures.
             .parameter => form.invariant(),
             .literal => |value| if (value == .integer) form.literal(value.integer) else null,
             .unary => |u| blk: {
-                const operand = self.affineInstruction(u.operand, depth + 1) orelse return null;
+                const operand = self.affineInstruction(u.operand, depth + 1, varying) orelse return null;
                 break :blk switch (u.op) {
                     .positive => operand,
                     .negative => operand.negative(),
@@ -346,8 +353,8 @@ pub const Program = struct {
                 };
             },
             .binary => |b| blk: {
-                const left = self.affineInstruction(b.left, depth + 1) orelse return null;
-                const right = self.affineInstruction(b.right, depth + 1) orelse return null;
+                const left = self.affineInstruction(b.left, depth + 1, varying) orelse return null;
+                const right = self.affineInstruction(b.right, depth + 1, varying) orelse return null;
                 break :blk switch (b.op) {
                     .add => form.combine(left, right, .add),
                     .subtract => form.combine(left, right, .subtract),

@@ -376,12 +376,26 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
             try invariant.put(a, (try table.column(bound.input.columns[ordinal].name)).path, {});
         };
         var summary: ?[]const u8 = null;
+        var summaries: std.ArrayList(catalog.SummaryCertificate) = .empty;
         if (!spec.distinct and
             (spec.kind == .count or spec.kind == .sum or spec.kind == .avg or spec.kind == .min or spec.kind == .max))
         {
             if (input) |slot| if (bound.input.projections[slot]) |program| {
-                if (program.affineColumn()) |column|
+                if (program.affineColumn()) |column| {
                     summary = (try table.column(bound.input.columns[column].name)).path;
+                } else if (program.required_columns.len <= 256) {
+                    for (program.required_columns) |candidate| {
+                        if (!program.affineRelativeTo(candidate)) continue;
+                        var dependencies = try invariant.clone(a);
+                        for (program.required_columns) |ordinal| if (ordinal != candidate) {
+                            try dependencies.put(a, (try table.column(bound.input.columns[ordinal].name)).path, {});
+                        };
+                        var stable_fields: std.ArrayList([]const u8) = .empty;
+                        var stable_inputs = dependencies.keyIterator();
+                        while (stable_inputs.next()) |key| try stable_fields.append(a, key.*);
+                        try summaries.append(a, .{ .field = (try table.column(bound.input.columns[candidate].name)).path, .invariants = stable_fields.items });
+                    }
+                }
             };
         }
         var invariants: std.ArrayList([]const u8) = .empty;
@@ -390,7 +404,7 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
             try invariants.append(a, key.*);
             if (!fields.contains(key.*)) try names.append(a, key.*);
         }
-        request.* = .{ .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary, .invariants = invariants.items };
+        request.* = .{ .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary, .invariants = invariants.items, .summaries = summaries.items };
     }
     return requests;
 }
