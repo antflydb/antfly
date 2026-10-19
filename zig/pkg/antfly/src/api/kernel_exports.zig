@@ -623,6 +623,10 @@ fn ManifestServer(comptime prefix: []const u8) type {
             try self.register(.post, path, handler);
         }
 
+        pub fn postStreamingRaw(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            try self.registerWithMetadata(.post, path, handler, .{ .request_body = .streaming_raw, .streaming_response = true });
+        }
+
         pub fn postResponseStreaming(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.registerWithMetadata(.post, path, handler, .{
                 .request_body = .buffered,
@@ -771,7 +775,7 @@ test "linked API route manifest preserves internal scan response streaming" {
     for (entries.?[0..len]) |entry| {
         if (entry.method != .post) continue;
         if (@import("inference_gateway.zig").ownsPath(entry.path.slice())) {
-            try std.testing.expectEqual(abi.RequestBodyMode.buffered, entry.request_body);
+            try std.testing.expectEqual(if (std.mem.endsWith(u8, entry.path.slice(), "/stream")) abi.RequestBodyMode.streaming_raw else abi.RequestBodyMode.buffered, entry.request_body);
             try std.testing.expectEqual(@as(u8, 1), entry.streaming_response);
             gateway_routes += 1;
         }

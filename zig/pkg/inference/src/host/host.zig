@@ -1938,6 +1938,7 @@ const RouteMetadata = struct {
 };
 
 fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
+    if (method == .post and std.mem.endsWith(u8, path, "/stream") and std.mem.indexOf(u8, path, "/transcription/sessions/") != null) return .{ .request_body = .streaming_raw, .streaming_response = true };
     const method_name = switch (method) {
         .get => "GET",
         .post => "POST",

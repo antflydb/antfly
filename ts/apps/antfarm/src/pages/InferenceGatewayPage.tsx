@@ -19,7 +19,7 @@ import { useApiConfig } from "@/hooks/use-api-config";
 import { inferenceGatewayRequest } from "@/lib/inference-gateway-request";
 
 const samples: Record<InferenceGatewayOperation, Record<string, unknown>> = {
-  "chat/completions": { messages: [{ role: "user", content: "Hello" }], stream: true },
+  "chat/completions": { messages: [{ role: "user", content: "Hello" }] },
   decisions: {
     input: "Please refund my order",
     questions: [
@@ -56,13 +56,63 @@ const taskOperation: Record<string, InferenceGatewayOperation> = {
   predict: "predict",
 };
 
+function sampleRequest(
+  operation: InferenceGatewayOperation,
+  model?: InferenceGatewayModel
+): string {
+  // Streaming requires affirmative gateway support; unknown includes manually
+  // entered IDs and catalog entries without capability metadata.
+  const sample =
+    operation === "chat/completions"
+      ? { ...samples[operation], stream: model?.gateway_capabilities?.streaming === "supported" }
+      : samples[operation];
+  return JSON.stringify(sample, null, 2);
+}
+
+type RequestDraft = {
+  model: string;
+  operation: InferenceGatewayOperation;
+  request: string;
+  automaticOperation: boolean;
+  requestIsSample: boolean;
+};
+
+function modelDefaults(
+  draft: RequestDraft,
+  model: string,
+  catalog: readonly InferenceGatewayModel[]
+): RequestDraft {
+  const target = catalog.find((entry) => entry.id === model);
+  const operation =
+    draft.automaticOperation && target?.task
+      ? (taskOperation[target.task] ?? draft.operation)
+      : draft.operation;
+  return {
+    ...draft,
+    model,
+    operation,
+    request: draft.requestIsSample ? sampleRequest(operation, target) : draft.request,
+  };
+}
+
 export default function InferenceGatewayPage() {
-  const { client } = useApiConfig();
   const [params] = useSearchParams();
+  const initialModel = params.get("model") ?? "";
+  // A different deep link starts a new draft and cancels the previous view's
+  // discovery/invocation. Ordinary catalog refreshes retain the current draft.
+  return <InferenceGatewayPlayground key={initialModel} initialModel={initialModel} />;
+}
+
+function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) {
+  const { client } = useApiConfig();
   const [models, setModels] = useState<InferenceGatewayModel[]>([]);
-  const [model, setModel] = useState(params.get("model") ?? "");
-  const [operation, setOperation] = useState<InferenceGatewayOperation>("chat/completions");
-  const [request, setRequest] = useState(JSON.stringify(samples["chat/completions"], null, 2));
+  const [{ model, operation, request }, setDraft] = useState<RequestDraft>(() => ({
+    model: initialModel,
+    operation: "chat/completions",
+    request: sampleRequest("chat/completions"),
+    automaticOperation: true,
+    requestIsSample: true,
+  }));
   const [output, setOutput] = useState("");
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
@@ -74,13 +124,11 @@ export default function InferenceGatewayPage() {
     client.inference
       .models(abort.signal)
       .then((catalog) => {
+        if (abort.signal.aborted) return;
         setModels(catalog.data);
-        const initial = catalog.data.find((entry) => entry.id === params.get("model"));
-        if (initial?.task && taskOperation[initial.task]) {
-          const value = taskOperation[initial.task];
-          setOperation(value);
-          setRequest(JSON.stringify(samples[value], null, 2));
-        }
+        // Reconcile against the latest draft, not the deep link or the state
+        // captured before discovery. Only untouched defaults may be replaced.
+        setDraft((draft) => modelDefaults(draft, draft.model, catalog.data));
       })
       .catch((err: unknown) => {
         if (!abort.signal.aborted) setError(err instanceof Error ? err.message : String(err));
@@ -89,7 +137,7 @@ export default function InferenceGatewayPage() {
       abort.abort();
       controller.current?.abort();
     };
-  }, [client, params]);
+  }, [client]);
   useEffect(
     () => () => {
       if (audio) URL.revokeObjectURL(audio);
@@ -98,14 +146,19 @@ export default function InferenceGatewayPage() {
   );
   const selected = models.find((entry) => entry.id === model);
   function selectOperation(value: InferenceGatewayOperation) {
-    setOperation(value);
-    setRequest(JSON.stringify(samples[value], null, 2));
+    setDraft((draft) => ({
+      ...draft,
+      operation: value,
+      automaticOperation: false,
+      request: sampleRequest(
+        value,
+        models.find((entry) => entry.id === draft.model)
+      ),
+      requestIsSample: true,
+    }));
   }
   function selectModel(value: string) {
-    setModel(value);
-    const task = models.find((entry) => entry.id === value)?.task;
-    if (operation !== "generate/batch" && task && taskOperation[task])
-      selectOperation(taskOperation[task]);
+    setDraft((draft) => modelDefaults(draft, value, models));
   }
   async function run() {
     controller.current?.abort();
@@ -238,7 +291,17 @@ export default function InferenceGatewayPage() {
             id="gateway-body"
             className="font-mono min-h-56"
             value={request}
-            onChange={(event) => setRequest(event.target.value)}
+            onChange={(event) => {
+              const value = event.target.value;
+              setDraft((draft) => ({
+                ...draft,
+                request: value,
+                requestIsSample: false,
+                // An edited body belongs to the current operation. Discovery
+                // must not reinterpret it as another task's request.
+                automaticOperation: false,
+              }));
+            }}
           />
           <div className="flex gap-2">
             <Button

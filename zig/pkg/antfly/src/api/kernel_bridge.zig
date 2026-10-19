@@ -438,6 +438,10 @@ const OpaqueHttpxHandler = struct {
                 .delete => .DELETE,
                 .patch => .PATCH,
             };
+            if (entry.request_body == .streaming_raw) {
+                try server.routeStreamingRawWithData(method, path, runtimeApiHttpHandler, route);
+                continue;
+            }
             if (method == .POST) {
                 if (@import("http_routes.zig").publicPostBodyLimit(path)) |limit| {
                     try server.routeWithDataAndBodyLimit(method, path, runtimeApiHttpHandler, route, limit);
@@ -512,7 +516,7 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     };
     var transport = runtime_http_bridge.Outbound{ .context = context };
     const borrowed_io = context.io;
-    const body_source = if (route.request_body == .buffered) transport.bodySource() else abi.RequestBodySource{};
+    const body_source = if (route.request_body != .none) transport.bodySource() else abi.RequestBodySource{};
     try callError(route.functions.handler_handle_http(&.{
         .abi_version = abi.abi_version,
         .route_handle = route.kernel_route_handle,

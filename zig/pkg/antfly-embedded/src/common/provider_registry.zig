@@ -27,6 +27,7 @@ pub const gateway = @import("inference_gateway.zig");
 test {
     _ = gateway;
     _ = @import("inference_telemetry.zig");
+    _ = @import("inference_stream.zig");
 }
 
 /// Tasks without an inline vendor adapter bind a runtime model to an existing

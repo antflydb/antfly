@@ -26022,27 +26022,9 @@ pub const InferenceGenerateResponse = struct {
     model: []const u8,
     /// List of completion choices (currently always 1)
     choices: []const InferenceGenerateChoice,
-    usage: ?InferenceGenerateUsage = null,
+    /// Provider-reported token usage, or null when the provider does not supply it.
+    usage: OpenApiOptionalNullable(InferenceGenerateUsage) = .absent,
     speculation: OpenApiOptionalNullable(InferenceGenerateSpeculationStatus) = .absent,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "id", "id", false },
-        .{ "object", "object", false },
-        .{ "created", "created", false },
-        .{ "model", "model", false },
-        .{ "choices", "choices", false },
-        .{ "usage", "usage", true },
-        .{ "speculation", "speculation", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -26056,9 +26038,16 @@ pub const InferenceGenerateResponse = struct {
         try jw.write(self.model);
         try jw.objectField("choices");
         try jw.write(self.choices);
-        if (self.usage) |value| {
-            try jw.objectField("usage");
-            try jw.write(value);
+        switch (self.usage) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("usage");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("usage");
+                try jw.write(value);
+            },
         }
         switch (self.speculation) {
             .absent => {},

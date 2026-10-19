@@ -77,18 +77,28 @@ pub fn session(server: anytype, ctx: *httpx.Context, principal: []const u8, meth
     const public_id = ctx.param("session_id");
     var requested: []const u8 = "transcription/session";
     var backend_model: ?[]const u8 = null;
+    var requested_ttl_ns: ?u64 = null;
     var connection: []const u8 = undefined;
     var operation: []const u8 = "transcription/sessions";
-    var body = (try ctx.body()) orelse "";
+    const raw_stream = std.mem.eql(u8, action, "/stream");
+    var body: []const u8 = "";
+    var lease: ?gateway.Sessions.Lease = null;
+    var appended = false;
+    defer if (lease) |*active| active.finish(@import("antfly_platform").time.monotonicNs(), appended);
     if (public_id) |id| {
-        const pinned = try server.inference_sessions.get(a, id, principal, now);
+        lease = try server.inference_sessions.acquire(a, id, principal, now);
+        const pinned = lease.?.session;
         connection = pinned.connection;
         // Backend IDs must be one path segment; they are never interpreted as
         // transport addresses or a second model selection.
         operation = try std.fmt.allocPrint(a, "transcription/sessions/{s}{s}", .{ pinned.backend_id, action });
     } else {
+        body = (try ctx.body()) orelse "";
         var request = try std.json.parseFromSliceLeaky(Json, a, body, .{});
         if (request != .object) return error.InvalidInferenceRequest;
+        if (request.object.get("ttl_seconds")) |ttl| if (ttl == .integer and ttl.integer >= 1 and ttl.integer <= 3600) {
+            requested_ttl_ns = @as(u64, @intCast(ttl.integer)) * std.time.ns_per_s;
+        };
         const model = try string(request.object.get("model") orelse return error.ModelRequired);
         requested = model;
         const named = try view(server);
@@ -113,6 +123,19 @@ pub fn session(server: anytype, ctx: *httpx.Context, principal: []const u8, meth
         try adapted.object.put(a, "model", .{ .string = backend });
         body = try std.json.Stringify.valueAlloc(a, adapted, .{});
     }
+    if (public_id != null and !raw_stream) body = (try ctx.body()) orelse "";
+    if (raw_stream) try validateSessionStream(ctx);
+    var reserved: ?gateway.Sessions.Reservation = null;
+    var reserved_id: ?[]const u8 = null;
+    if (public_id == null) {
+        var random: [24]u8 = undefined;
+        server.inferenceIo().random(&random);
+        const id = try a.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(random.len));
+        _ = std.base64.url_safe_no_pad.Encoder.encode(id, &random);
+        reserved = try server.inference_sessions.reserve(server.owner_alloc, id, principal, connection, now);
+        reserved_id = id;
+    }
+    defer if (reserved) |*reservation| reservation.release(server.owner_alloc);
     var observation = tasks.Observation{
         .allocator = a,
         .request_id = ctx.response.headers.get("x-request-id") orelse try requestId(server, ctx, a),
@@ -142,7 +165,7 @@ pub fn session(server: anytype, ctx: *httpx.Context, principal: []const u8, meth
             return context.isCancellationRequested();
         }
     }.cancelled);
-    var result = connections.invokeInferenceConnectionWithMethod(a, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, body, cancel, @min(connections.inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64)), if (streaming) session_sink.sink() else .{}, method) catch |err| {
+    var result = connections.invokeInferenceConnectionWithRequest(a, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, body, cancel, @min(connections.inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64)), if (streaming) session_sink.sink() else .{}, method, .{ .content_type = ctx.header("content-type") orelse "application/json", .query = if (raw_stream) ctx.request.uri.query else null, .body_source = if (raw_stream) transport.bodySource() else .{} }) catch |err| {
         observation.failure = @errorName(err);
         if (transport.started) return error.InferenceResponseCommitted;
         return err;
@@ -150,37 +173,98 @@ pub fn session(server: anytype, ctx: *httpx.Context, principal: []const u8, meth
     defer result.deinit(a);
     observation.status = result.status;
     observation.usage(result.body);
-    if (transport.started) return ctx.response.build();
+    if (transport.started) {
+        appended = raw_stream and result.status >= 200 and result.status < 300 and !ctx.isCancellationRequested();
+        return ctx.response.build();
+    }
     _ = ctx.status(result.status);
     if (result.content_type) |value| try ctx.setHeader("content-type", value);
     if (public_id == null and result.status >= 200 and result.status < 300) {
-        var response = try std.json.parseFromSliceLeaky(Json, a, result.body, .{});
-        const backend_id = try string(response.object.get("session_id") orelse response.object.get("id") orelse return error.InvalidInferenceResponse);
-        if (backend_id.len > 256 or std.mem.indexOfAny(u8, backend_id, "/?#%") != null) return error.InvalidInferenceResponse;
-        var random: [24]u8 = undefined;
-        server.inferenceIo().random(&random);
-        const id = try a.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(random.len));
-        _ = std.base64.url_safe_no_pad.Encoder.encode(id, &random);
-        const realtime_seconds: u64 = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s;
-        const ttl_seconds: u64 = if (response.object.get("expires_at")) |value| if (value == .integer and value.integer > 0 and @as(u64, @intCast(value.integer)) > realtime_seconds) @min(@as(u64, @intCast(value.integer)) - realtime_seconds, 86400) else 3600 else 3600;
-        const ttl_ns = ttl_seconds * std.time.ns_per_s;
-        try server.inference_sessions.put(server.owner_alloc, id, .{ .principal = principal, .connection = connection, .backend_id = backend_id, .expires_ns = now +| ttl_ns, .ttl_ns = ttl_ns }, now);
+        var response = try parseSessionResponse(a, result.body);
+        const backend_id = (try sessionResponseId(response)) orelse return error.InvalidInferenceResponse;
+        const id = reserved_id.?;
+        // Upstream creation can consume most of the request budget. Translate
+        // its wall-clock expiry using the clocks at publication, not admission.
+        const completed_ns = @import("antfly_platform").time.monotonicNs();
+        const lifetime = try sessionLifetime(response, completed_ns, @import("antfly_platform").time.realtimeNs(), requested_ttl_ns);
+        try reserved.?.commit(backend_id, lifetime.expires_ns, lifetime.ttl_ns);
         if (response.object.contains("session_id")) try response.object.put(a, "session_id", .{ .string = id });
         if (response.object.contains("id")) try response.object.put(a, "id", .{ .string = id });
         try ctx.setHeader("x-antfly-inference-affinity", id);
         return ctx.json(response);
     }
-    if (method == .delete and result.status >= 200 and result.status < 300) server.inference_sessions.remove(server.owner_alloc, public_id.?);
+    // Missing and gone are terminal deletion outcomes too. Release ownership
+    // even when the backend expired or removed the session before this request.
+    // Keep the original status for callers and retain ownership on retryable errors.
+    if (method == .delete and ((result.status >= 200 and result.status < 300) or result.status == 404 or result.status == 410)) server.inference_sessions.remove(server.owner_alloc, public_id.?);
     if (result.status >= 200 and result.status < 300 and result.body.len > 0) {
-        var response = try std.json.parseFromSliceLeaky(Json, a, result.body, .{});
-        if (response == .object) {
-            if (response.object.contains("session_id")) try response.object.put(a, "session_id", .{ .string = public_id.? });
-            if (response.object.contains("id")) try response.object.put(a, "id", .{ .string = public_id.? });
-        }
-        return ctx.json(response);
+        var response = try parseSessionResponse(a, result.body);
+        if (response.object.contains("session_id")) try response.object.put(a, "session_id", .{ .string = public_id.? });
+        if (response.object.contains("id")) try response.object.put(a, "id", .{ .string = public_id.? });
+        const reply = try ctx.json(response);
+        appended = method == .post and (raw_stream or std.mem.eql(u8, action, "/audio")) and !ctx.isCancellationRequested();
+        return reply;
     }
     _ = ctx.response.body(result.body);
+    appended = method == .post and result.status >= 200 and result.status < 300 and (raw_stream or std.mem.eql(u8, action, "/audio")) and !ctx.isCancellationRequested();
     return ctx.response.build();
+}
+
+const SessionLifetime = struct { expires_ns: u64, ttl_ns: u64 };
+
+fn sessionLifetime(response: Json, completed_ns: u64, realtime_ns: u64, requested_ttl_ns: ?u64) !SessionLifetime {
+    var ttl_ns: u64 = 3600 * std.time.ns_per_s;
+    if (response.object.get("expires_at")) |value| {
+        if (value != .integer or value.integer <= 0) return error.InvalidInferenceResponse;
+        const expiry_ns = @as(u128, @intCast(value.integer)) * std.time.ns_per_s;
+        if (expiry_ns <= realtime_ns) return error.InvalidInferenceResponse;
+        ttl_ns = @intCast(@min(expiry_ns - realtime_ns, 86400 * std.time.ns_per_s));
+    }
+    var renewal_ns = requested_ttl_ns orelse ttl_ns;
+    // The remaining lifetime may be shorter than the actual idle TTL because
+    // of transport latency and the wire timestamp's one-second precision.
+    if (response.object.get("created")) |created| if (response.object.get("expires_at")) |expiry| {
+        if (created == .integer and expiry == .integer and created.integer >= 0 and expiry.integer > created.integer) {
+            const seconds: u64 = @intCast(expiry.integer - created.integer);
+            renewal_ns = @as(u64, @min(seconds, 86400)) * std.time.ns_per_s;
+        }
+    };
+    return .{ .expires_ns = completed_ns +| ttl_ns, .ttl_ns = renewal_ns };
+}
+
+fn validateSessionStream(ctx: *const httpx.Context) !void {
+    if (ctx.query("format")) |value| if (!std.mem.eql(u8, value, "pcm16") and !std.mem.eql(u8, value, "pcm_f32")) return error.InvalidInferenceRequest;
+    if (ctx.query("sample_rate")) |value| {
+        const rate = std.fmt.parseInt(u32, value, 10) catch return error.InvalidInferenceRequest;
+        if (rate < 8000 or rate > 192000) return error.InvalidInferenceRequest;
+    }
+    if (ctx.query("commit")) |value| if (!std.ascii.eqlIgnoreCase(value, "true") and !std.ascii.eqlIgnoreCase(value, "false") and !std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "1")) return error.InvalidInferenceRequest;
+}
+
+// Upstream JSON is untrusted transport data, including on HTTP success. Keep
+// envelope and handle validation shared by creation and JSON follow-ups.
+fn parseSessionResponse(a: std.mem.Allocator, body: []const u8) !Json {
+    const value = std.json.parseFromSliceLeaky(Json, a, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidInferenceResponse,
+    };
+    if (value != .object) return error.InvalidInferenceResponse;
+    _ = try sessionResponseId(value);
+    return value;
+}
+
+fn sessionResponseId(value: Json) !?[]const u8 {
+    var id: ?[]const u8 = null;
+    for ([_][]const u8{ "session_id", "id" }) |field| {
+        const candidate = value.object.get(field) orelse continue;
+        if (candidate != .string or candidate.string.len == 0 or candidate.string.len > 256) return error.InvalidInferenceResponse;
+        const bytes = candidate.string;
+        if (std.mem.eql(u8, bytes, ".") or std.mem.eql(u8, bytes, "..")) return error.InvalidInferenceResponse;
+        for (bytes) |byte| if (byte <= 32 or byte == 127 or std.mem.indexOfScalar(u8, "/?#%\\", byte) != null) return error.InvalidInferenceResponse;
+        if (id) |existing| if (!std.mem.eql(u8, existing, bytes)) return error.InvalidInferenceResponse;
+        id = bytes;
+    }
+    return id;
 }
 
 pub fn view(server: anytype) !gateway.View {
@@ -370,7 +454,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 const streaming = if (request.object.get("stream")) |v| v.bool else false;
                 const observed = observation.stream(transport.stream());
                 var guard = tasks.FallbackSink{ .downstream = observed };
-                var response = executor.chat(a, name, messages, options, request, if (streaming) (if (fallback) guard.sink() else observed) else .{}) catch |err| {
+                var response = executor.chat(a, name, messages, options, request, if (std.mem.eql(u8, execution_options.operation orelse "generate", "generate")) .generate else .chat_completions, if (streaming) (if (fallback) guard.sink() else observed) else .{}) catch |err| {
                     if (transport.started or guard.committed) return error.InferenceResponseCommitted;
                     return guard.failure orelse err;
                 };
@@ -389,16 +473,23 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             if (request.object.get("stream")) |v| if (v.bool) return error.UnsupportedInferenceFeature;
             var result = try executor.generate(a, name, messages, options);
             defer result.deinit();
-            const Tool = struct { id: []const u8, type: []const u8 = "function", function: struct { name: []const u8, arguments: []const u8 } };
+            // Serialize through the same contract used by batch validation.
+            // Optional message fields must be omitted rather than emitted null.
+            const Api = @import("inference_api");
+            const Tool = std.meta.Elem(std.meta.Child(@FieldType(Api.GenerateMessage, "tool_calls")));
             const calls = try a.alloc(Tool, result.tool_calls.len);
-            for (result.tool_calls, calls) |call, *out| out.* = .{ .id = call.id, .function = .{ .name = call.name, .arguments = call.arguments } };
-            return ctx.json(.{
+            for (result.tool_calls, calls) |call, *out| out.* = .{ .id = call.id, .type = "function", .function = .{ .name = call.name, .arguments = call.arguments } };
+            return ctx.json(Api.GenerateResponse{
                 .id = try std.fmt.allocPrint(a, "chatcmpl-{d}", .{@import("antfly_platform").time.monotonicNs()}),
                 .object = "chat.completion",
-                .created = @as(u64, @intCast(@max(0, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s))),
+                .created = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_s),
                 .model = model,
-                .choices = .{.{ .index = 0, .message = .{ .role = "assistant", .content = result.content, .tool_calls = if (calls.len > 0) calls else null }, .finish_reason = if (calls.len > 0) "tool_calls" else "stop" }},
-                .usage = if (result.usage) |usage| .{ .prompt_tokens = usage.input_tokens, .completion_tokens = usage.output_tokens, .total_tokens = usage.input_tokens + usage.output_tokens } else null,
+                .choices = &.{.{ .index = 0, .message = .{ .role = .assistant, .content = .{ .value = result.content }, .tool_calls = if (calls.len > 0) calls else null }, .finish_reason = if (calls.len > 0) .tool_calls else .stop }},
+                .usage = if (result.usage) |usage| .{
+                    .prompt_tokens = std.math.cast(i64, usage.input_tokens) orelse return error.InvalidInferenceResponse,
+                    .completion_tokens = std.math.cast(i64, usage.output_tokens) orelse return error.InvalidInferenceResponse,
+                    .total_tokens = std.math.cast(i64, usage.total_tokens orelse (usage.input_tokens +| usage.output_tokens)) orelse return error.InvalidInferenceResponse,
+                } else null,
             });
         },
         .decide => {
@@ -750,62 +841,129 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
             }
         }.cancelled };
         var response = executeBounded(server, &item_context, .generate, a, options) catch |err| {
-            if (err == error.Canceled or err == error.Cancelled or err == error.Timeout) return err;
+            if (err == error.Canceled or err == error.Cancelled or err == error.Timeout or err == error.OutOfMemory) return err;
             result.@"error" = .{ .code = @errorName(err), .message = @errorName(err), .retryable = gateway.permitsFallback(.on_error, err) };
             continue;
         };
         defer response.deinit();
         if (response.status.code >= 200 and response.status.code < 300) {
-            result.response = try std.json.parseFromSliceLeaky(Json, a, response.body orelse return error.InvalidInferenceResponse, .{ .allocate = .alloc_always });
+            result.response = parseBatchItemResponse(a, response.body) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                result.@"error" = .{ .code = "InvalidInferenceResponse", .message = "Upstream returned an invalid generation response", .retryable = false };
+                continue;
+            };
             succeeded += 1;
         } else result.@"error" = .{ .code = "upstream_error", .message = "Inference request failed", .retryable = gateway.transientStatus(response.status.code) != null };
     }
     return ctx.json(.{ .object = "generate.batch", .data = results, .summary = .{ .total = results.len, .succeeded = succeeded, .failed = results.len - succeeded }, .execution = .{ .requested_items = results.len, .serial_items = results.len } });
 }
 
+fn parseBatchItemResponse(a: std.mem.Allocator, body: ?[]const u8) !Json {
+    const parsed = std.json.parseFromSliceLeaky(Json, a, body orelse return error.InvalidInferenceResponse, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidInferenceResponse,
+    };
+    if (parsed != .object) return error.InvalidInferenceResponse;
+    // Validate the shared generation contract, then return the original tree:
+    // provider extensions (including refusal and usage details) must survive.
+    const response = std.json.parseFromValue(@import("inference_api").GenerateResponse, a, parsed, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidInferenceResponse,
+    };
+    defer response.deinit();
+    if (!std.mem.eql(u8, response.value.object, "chat.completion")) return error.InvalidInferenceResponse;
+    return parsed;
+}
+
+fn discoveryContext(server: anytype, ctx: *httpx.Context) @import("antfly_inference_execution_context").RequestContext {
+    return .{ .io = server.inferenceIo(), .deadline_ns = ctx.application_deadline_ns, .cancellation = .{ .ptr = ctx, .is_cancelled_fn = struct {
+        fn cancelled(raw: *const anyopaque) bool {
+            const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+            return context.isCancellationRequested();
+        }
+    }.cancelled } };
+}
+
 pub fn predictors(server: anytype, ctx: *httpx.Context) !httpx.Response {
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 << 20 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
-    const a = arena.allocator();
+    return ctx.json(.{ .object = "list", .predictors = try predictorCatalog(arena.allocator(), server, discoveryContext(server, ctx)) });
+}
+
+// Both inventory surfaces publish the same validated native predictor schema.
+// A configured alias remains in OpenAI model data when its schema is offline,
+// but an absent schema never becomes evidence that a predictor is callable.
+fn predictorCatalog(a: std.mem.Allocator, server: anytype, control: @import("antfly_inference_execution_context").RequestContext) !Json {
+    try control.check();
     const named = try view(server);
     var result: Json = .{ .object = .empty };
     const config = server.cfg.node_config;
-    var client = httpx.Client.initWithConfig(a, server.inferenceIo(), .{ .keep_alive = false });
+    var client = httpx.Client.initWithConfig(a, control.io, .{ .keep_alive = false });
     defer client.deinit();
     const connections = @import("connections.zig");
-    const deadline = @min(@import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, ctx.application_deadline_ns orelse std.math.maxInt(u64));
-    var transports: std.StringArrayHashMapUnmanaged(Json) = .{};
-    // Preserve the native predictor inventory even when no aliases are configured.
-    const default_connection = if (server.cfg.local_inference_connection_target != null) "local-inference" else "default-inference";
-    if (connections.invokeInferenceConnectionWithMethod(a, &client, config, server.cfg.local_inference_connection_target, server.cfg.secret_store, default_connection, "ml/models", "", null, deadline, .{}, .get)) |response_value| {
-        var response = response_value;
+    const deadline = @min(@import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, control.deadline_ns orelse std.math.maxInt(u64));
+    const cancel = httpx.CancellationToken.fromCallback(&control, struct {
+        fn cancelled(raw: *const anyopaque) bool {
+            const context: *const @import("antfly_inference_execution_context").RequestContext = @ptrCast(@alignCast(raw));
+            context.check() catch return true;
+            return false;
+        }
+    }.cancelled);
+    var transports = try predictorTransports(a, named, config, if (server.cfg.local_inference_connection_target != null) "local-inference" else "default-inference");
+    for (transports.keys(), transports.values(), 0..) |connection, *items_by_name, index| {
+        try control.check();
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) break;
+        var response = connections.invokeInferenceConnectionWithMethod(a, &client, config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, "ml/models", "", cancel, deadline, .{}, .get) catch {
+            try control.check();
+            continue;
+        };
         defer response.deinit(a);
-        if (response.status == 200) {
-            const parsed = std.json.parseFromSliceLeaky(Json, a, response.body, .{ .allocate = .alloc_always }) catch .null;
-            if (parsed == .object) if (parsed.object.get("predictors")) |items| {
-                if (items == .object) {
-                    result = items;
-                    try transports.put(a, default_connection, items);
-                }
-            };
+        try control.check();
+        if (response.status != 200) continue;
+        const parsed = std.json.parseFromSliceLeaky(Json, a, response.body, .{ .allocate = .alloc_always }) catch continue;
+        if (parsed != .object) continue;
+        const items = parsed.object.get("predictors") orelse continue;
+        if (items != .object) continue;
+        for (items.object.keys(), items.object.values()) |name, info| {
+            const typed = std.json.parseFromValue(@import("inference_api").PredictorInfo, a, info, .{ .ignore_unknown_fields = true }) catch continue;
+            if (typed.value.num_features <= 0 or typed.value.num_outputs <= 0) continue;
+            if (typed.value.feature_names) |names| if (names.len != @as(u64, @intCast(typed.value.num_features))) continue;
+            try items_by_name.object.put(a, name, info);
+            if (index == 0) try result.object.put(a, name, info);
+            // Match the public identity used by general connection discovery.
+            const id = try std.fmt.allocPrint(a, "connections/{s}/models/{s}", .{ connection, name });
+            try result.object.put(a, id, info);
         }
-    } else |_| {}
+    }
     for (named.providers.predictor_configs.keys(), named.providers.predictor_configs.values()) |alias, binding| {
-        if (transports.count() >= 16 or @import("antfly_platform").time.monotonicNs() >= deadline) break;
-        const entry = try transports.getOrPut(a, binding.connection);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = .null;
-            var response = connections.invokeInferenceConnectionWithMethod(a, &client, config, server.cfg.local_inference_connection_target, server.cfg.secret_store, binding.connection, "ml/models", "", null, deadline, .{}, .get) catch continue;
-            defer response.deinit(a);
-            if (response.status != 200) continue;
-            const parsed = std.json.parseFromSliceLeaky(Json, a, response.body, .{ .allocate = .alloc_always }) catch continue;
-            if (parsed == .object) entry.value_ptr.* = parsed.object.get("predictors") orelse .null;
-        }
-        if (entry.value_ptr.* != .object) continue;
-        const info = entry.value_ptr.object.get(binding.model) orelse continue;
+        const items = transports.get(binding.connection) orelse continue;
+        const info = items.object.get(binding.model) orelse continue;
         try result.object.put(a, try std.fmt.allocPrint(a, "predictors/{s}", .{alias}), info);
     }
-    return ctx.json(.{ .object = "list", .predictors = result });
+    try control.check();
+    return result;
+}
+
+fn predictorTransports(a: std.mem.Allocator, named: gateway.View, config: ?*const sources.common_config.Config, default_connection: []const u8) !std.StringArrayHashMapUnmanaged(Json) {
+    const connections = @import("connections.zig");
+    // Select each transport once before doing I/O. Alias transports retain
+    // priority; explicit connections share the same sixteen-transport ceiling.
+    var transports: std.StringArrayHashMapUnmanaged(Json) = .{};
+    try transports.put(a, default_connection, .{ .object = .empty });
+    for (named.providers.predictor_configs.values()) |binding| {
+        if (transports.count() >= 16) break;
+        try transports.put(a, binding.connection, .{ .object = .empty });
+    }
+    if (config) |cfg| for (cfg.connections.keys(), cfg.connections.values()) |id, connection| {
+        if (transports.count() >= 16) break;
+        if (connection.kind != .inference) continue;
+        const inference = connection.inference orelse continue;
+        if (!std.mem.eql(u8, inference.provider, "antfly")) continue;
+        connections.requireInferenceCapability(connection.capabilities, "models.predict") catch continue;
+        if (!transports.contains(id)) try transports.put(a, id, .{ .object = .empty });
+    };
+    return transports;
 }
 
 pub fn localModels(a: std.mem.Allocator, server: anytype, task: gateway.Task) ![]const []const u8 {
@@ -820,6 +978,8 @@ pub fn localModels(a: std.mem.Allocator, server: anytype, task: gateway.Task) ![
 }
 
 pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
+    const control = discoveryContext(server, ctx);
+    try control.check();
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 << 20 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
@@ -851,12 +1011,12 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
         const category = if (target.configured.chain) "chains" else target.configured.task.namespace();
         var group = root.object.get(category) orelse Json{ .object = .empty };
         if (group != .object) return error.ModelInventoryUnavailable;
-        try group.object.put(a, id, item);
+        if (target.configured.task != .predict) try group.object.put(a, id, item);
         try root.object.put(a, category, group);
     }
     // Reuse connection discovery's bounded, credential-scoped cache and its
     // configured-model overlay. Listing failure never removes named aliases.
-    const connection_bytes = try server.listConnectionsJsonAlloc(a, "inference", "models", null);
+    const connection_bytes = try server.listConnectionsJsonAllocWithContext(a, "inference", "models", null, control);
     const connections = try std.json.parseFromSliceLeaky(Json, a, connection_bytes, .{});
     if (connections.object.get("connections")) |items| for (items.array.items) |connection| {
         const id = try string(connection.object.get("id") orelse continue);
@@ -877,6 +1037,12 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
                 try item.object.put(a, "owned_by", .{ .string = "antfly" });
                 try item.object.put(a, "connection", .{ .string = id });
                 try item.object.put(a, "backend_model", .{ .string = backend });
+                if (gateway.taskForCategory(group.key_ptr.*)) |task| {
+                    try item.object.put(a, "task", .{ .string = @tagName(task) });
+                    var tasks_list = std.array_list.Managed(Json).init(a);
+                    try tasks_list.append(.{ .string = @tagName(task) });
+                    try item.object.put(a, "tasks", .{ .array = tasks_list });
+                }
                 try item.object.put(a, "availability", connection.object.get("status") orelse .{ .string = "unknown" });
                 try item.object.put(a, "freshness", listed.object.get("freshness") orelse .{ .string = "cached" });
                 try item.object.put(a, "gateway_capabilities", try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, named.capabilities(.{ .connection = .{ .task = .generate, .connection = id, .model = backend } }), .{}), .{}));
@@ -888,6 +1054,9 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
             }
         }
     };
+    // ML groups contain native schemas, never generic model descriptors.
+    try root.object.put(a, "predictors", try predictorCatalog(a, server, control));
+    try control.check();
     try root.object.put(a, "object", .{ .string = "list" });
     try root.object.put(a, "data", data);
     return ctx.json(root);
@@ -896,10 +1065,36 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
 fn putCatalogItem(a: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(usize), data: *Json, item: Json) !void {
     const id = try string(item.object.get("id") orelse return error.ModelInventoryUnavailable);
     const entry = try seen.getOrPut(a, id);
-    if (entry.found_existing) data.array.items[entry.value_ptr.*] = item else {
+    if (entry.found_existing) {
+        const previous = data.array.items[entry.value_ptr.*];
+        var merged = item;
+        var supported = std.array_list.Managed(Json).init(a);
+        var roles: std.EnumSet(gateway.Task) = .empty;
+        for ([_]Json{ previous, item }) |descriptor| {
+            if (descriptor != .object) continue;
+            if (descriptor.object.get("tasks")) |list| if (list == .array) {
+                for (list.array.items) |role| try appendCatalogRole(&supported, &roles, role);
+            };
+            if (descriptor.object.get("task")) |role| try appendCatalogRole(&supported, &roles, role);
+        }
+        if (supported.items.len > 0) {
+            merged = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, item, .{}), .{});
+            try merged.object.put(a, "tasks", .{ .array = supported });
+            if (supported.items.len == 1) try merged.object.put(a, "task", supported.items[0]) else _ = merged.object.swapRemove("task");
+        }
+        data.array.items[entry.value_ptr.*] = merged;
+    } else {
         entry.value_ptr.* = data.array.items.len;
         try data.array.append(item);
     }
+}
+
+fn appendCatalogRole(supported: *std.array_list.Managed(Json), roles: *std.EnumSet(gateway.Task), value: Json) !void {
+    if (value != .string) return;
+    const task = std.meta.stringToEnum(gateway.Task, value.string) orelse return;
+    if (roles.contains(task)) return;
+    try supported.append(.{ .string = @tagName(task) });
+    roles.insert(task);
 }
 
 fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operation: []const u8, body: []const u8, fallback: bool, observation: *tasks.Observation, options: ExecutionOptions) !httpx.Response {
@@ -1052,4 +1247,150 @@ fn ownsLocalAdmission(server: anytype, named: gateway.View, task: gateway.Task, 
         },
         else => false,
     };
+}
+
+test "httpx inference gateway physical catalogs preserve task ambiguity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var seen: std.StringHashMapUnmanaged(usize) = .empty;
+    var data: Json = .{ .array = std.array_list.Managed(Json).init(a) };
+    const embed = try std.json.parseFromSliceLeaky(Json, a, "{\"id\":\"shared\",\"task\":\"embed\",\"tasks\":[\"embed\"]}", .{});
+    const generate = try std.json.parseFromSliceLeaky(Json, a, "{\"id\":\"shared\",\"task\":\"generate\",\"tasks\":[\"generate\"]}", .{});
+    try putCatalogItem(a, &seen, &data, embed);
+    try putCatalogItem(a, &seen, &data, generate);
+    try putCatalogItem(a, &seen, &data, embed);
+    try std.testing.expectEqual(@as(usize, 1), data.array.items.len);
+    const merged = data.array.items[0];
+    try std.testing.expect(!merged.object.contains("task"));
+    try std.testing.expectEqual(@as(usize, 2), merged.object.get("tasks").?.array.items.len);
+    try std.testing.expectEqualStrings("embed", embed.object.get("task").?.string);
+    try std.testing.expectEqualStrings("generate", generate.object.get("task").?.string);
+}
+
+test "httpx inference gateway validates successful session response envelopes and identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "[]",            "null",       "true",          "42",                    "\"session\"",     "{",                  "",
+        "{\"id\":null}", "{\"id\":1}", "{\"id\":\"\"}", "{\"id\":\"../other\"}", "{\"id\":\"..\"}", "{\"id\":\"a\\nb\"}", "{\"id\":\"session\",\"session_id\":\"other\"}",
+    }) |body| try std.testing.expectError(error.InvalidInferenceResponse, parseSessionResponse(a, body));
+    const response = try parseSessionResponse(a, "{\"id\":\"session-123\",\"session_id\":\"session-123\",\"expires_at\":100,\"extra\":true}");
+    try std.testing.expectEqualStrings("session-123", (try sessionResponseId(response)).?);
+    try std.testing.expect(response.object.get("extra").?.bool);
+    const audio = try parseSessionResponse(a, "{\"object\":\"list\",\"data\":[]}");
+    try std.testing.expectEqual(@as(?[]const u8, null), try sessionResponseId(audio));
+}
+
+test "httpx inference gateway opaque catalog roles cannot erase known tasks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const inputs = [_][]const u8{
+        "{\"id\":\"shared\",\"task\":\"embed\"}",
+        "{\"id\":\"shared\",\"task\":\"generate\",\"tasks\":[\"generate\",\"generate\",null]}",
+        "{\"id\":\"shared\"}",
+        "{\"id\":\"shared\",\"task\":\"legacy-classifier\",\"tasks\":[\"future\"]}",
+    };
+    for (0..inputs.len) |offset| {
+        var seen: std.StringHashMapUnmanaged(usize) = .empty;
+        var data: Json = .{ .array = std.array_list.Managed(Json).init(a) };
+        for (0..inputs.len) |index| {
+            const item = try std.json.parseFromSliceLeaky(Json, a, inputs[(offset + index) % inputs.len], .{});
+            try putCatalogItem(a, &seen, &data, item);
+        }
+        try std.testing.expectEqual(@as(usize, 1), data.array.items.len);
+        const item = data.array.items[0];
+        try std.testing.expect(!item.object.contains("task"));
+        const roles = item.object.get("tasks").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), roles.len);
+        for (roles) |role| try std.testing.expect(std.mem.eql(u8, role.string, "generate") or std.mem.eql(u8, role.string, "embed"));
+    }
+}
+
+test "httpx inference gateway session lifetime starts at publication with precise remaining expiry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const response = try parseSessionResponse(a, "{\"id\":\"backend\",\"expires_at\":102}");
+    const lifetime = try sessionLifetime(response, 500 * std.time.ns_per_s, 100 * std.time.ns_per_s + std.time.ns_per_s / 4, null);
+    try std.testing.expectEqual(@as(u64, 1750 * std.time.ns_per_ms), lifetime.ttl_ns);
+    try std.testing.expectEqual(@as(u64, 501750 * std.time.ns_per_ms), lifetime.expires_ns);
+    const fallback = try sessionLifetime(try parseSessionResponse(a, "{}"), 500, 100, null);
+    try std.testing.expectEqual(@as(u64, 3600 * std.time.ns_per_s), fallback.ttl_ns);
+    const capped = try sessionLifetime(response, std.math.maxInt(u64), 0, null);
+    try std.testing.expectEqual(std.math.maxInt(u64), capped.expires_ns);
+}
+
+test "httpx inference gateway predictor discovery bounds transports and respects connection capabilities" {
+    var config = try sources.common_config.Config.parseFromSlice(std.testing.allocator,
+        \\{"predictors":{"risk":{"model":"risk","connection":"remote"}},
+        \\ "connections":{"remote":{"kind":"inference","capabilities":["models.predict"],"inference":{"provider":"antfly","url":"http://remote"}},
+        \\ "denied":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"antfly","url":"http://denied"}},
+        \\ "vendor":{"kind":"inference","capabilities":["models.predict"],"inference":{"provider":"openai","url":"http://vendor"}}}}
+    );
+    defer config.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const named = gateway.View{ .providers = &config.registry };
+    var transports = try predictorTransports(a, named, &config, "default-inference");
+    try std.testing.expectEqual(@as(usize, 2), transports.count());
+    try std.testing.expectEqualStrings("default-inference", transports.keys()[0]);
+    try std.testing.expectEqualStrings("remote", transports.keys()[1]);
+    for (0..20) |index| {
+        const name = try std.fmt.allocPrint(std.testing.allocator, "extra-{d}", .{index});
+        try config.connections.put(std.testing.allocator, name, .{ .kind = .inference, .capabilities = try std.testing.allocator.dupe([]u8, &.{try std.testing.allocator.dupe(u8, "models.predict")}), .inference = .{ .provider = try std.testing.allocator.dupe(u8, "antfly") } });
+    }
+    transports = try predictorTransports(a, named, &config, "default-inference");
+    try std.testing.expectEqual(@as(usize, 16), transports.count());
+    try std.testing.expect(!transports.contains("denied"));
+    try std.testing.expect(!transports.contains("vendor"));
+}
+
+test "httpx inference gateway batch response decoder rejects invalid upstream envelopes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.InvalidInferenceResponse, parseBatchItemResponse(a, null));
+    for ([_][]const u8{ "", "invalid-json", "{", "[]", "null", "true", "1", "\"text\"", "{}", "{\"error\":{\"message\":\"backend failed\"}}", "{\"choices\":[]}" }) |body|
+        try std.testing.expectError(error.InvalidInferenceResponse, parseBatchItemResponse(a, body));
+    const valid_body = "{\"id\":\"response\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"backend\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"refusal\":\"provider refusal\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"provider_tokens\":2},\"provider_field\":true}";
+    const unavailable = try std.mem.replaceOwned(u8, a, valid_body, "{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"provider_tokens\":2}", "null");
+    try std.testing.expect((try parseBatchItemResponse(a, unavailable)).object.get("usage").? == .null);
+    const missing_usage = try std.mem.replaceOwned(u8, a, unavailable, ",\"usage\":null", "");
+    try std.testing.expectError(error.InvalidInferenceResponse, parseBatchItemResponse(a, missing_usage));
+    const valid = try parseBatchItemResponse(a, valid_body);
+    try std.testing.expect(valid.object.get("provider_field").?.bool);
+    try std.testing.expectEqualStrings("provider refusal", valid.object.get("choices").?.array.items[0].object.get("message").?.object.get("refusal").?.string);
+    for ([_][2][]const u8{ .{ "chat.completion", "chat.completion.chunk" }, .{ "\"created\":1", "\"created\":null" }, .{ "\"role\":\"assistant\"", "\"role\":123" }, .{ "\"finish_reason\":\"stop\"", "\"finish_reason\":null" }, .{ "\"prompt_tokens\":1", "\"prompt_tokens\":null" } }) |replacement| {
+        const invalid = try std.mem.replaceOwned(u8, a, valid_body, replacement[0], replacement[1]);
+        try std.testing.expectError(error.InvalidInferenceResponse, parseBatchItemResponse(a, invalid));
+    }
+    try std.testing.expectEqual(@as(i64, 2), valid.object.get("usage").?.object.get("total_tokens").?.integer);
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, parseBatchItemResponse(failing.allocator(), "{\"choices\":[]}"));
+}
+
+test "httpx inference gateway session renewal retains full idle TTL rather than transport remainder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const snapshot = try parseSessionResponse(a, "{\"id\":\"backend\",\"created\":100,\"expires_at\":102}");
+    const lifetime = try sessionLifetime(snapshot, 500 * std.time.ns_per_s, 101 * std.time.ns_per_s, null);
+    try std.testing.expectEqual(@as(u64, 501 * std.time.ns_per_s), lifetime.expires_ns);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), lifetime.ttl_ns);
+    const partial = try parseSessionResponse(a, "{\"id\":\"backend\",\"expires_at\":102}");
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), (try sessionLifetime(partial, 500, 101 * std.time.ns_per_s, 2 * std.time.ns_per_s)).ttl_ns);
+}
+
+test "httpx inference gateway rejects elapsed or malformed session expiries before publication" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "{\"expires_at\":99}", "{\"expires_at\":100}", "{\"expires_at\":0}", "{\"expires_at\":-1}", "{\"expires_at\":null}", "{\"expires_at\":\"102\"}" }) |body| {
+        const response = try parseSessionResponse(a, body);
+        try std.testing.expectError(error.InvalidInferenceResponse, sessionLifetime(response, 500, 100 * std.time.ns_per_s, 2 * std.time.ns_per_s));
+    }
 }

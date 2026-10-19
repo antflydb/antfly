@@ -1725,6 +1725,10 @@ pub const Server = struct {
         try self.router.addStreamingRaw(method, path, handler);
     }
 
+    pub fn routeStreamingRawWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
+        try self.router.addStreamingRawWithData(method, path, handler, data);
+    }
+
     /// Registers a route with borrowed opaque data copied into Context.
     pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);

@@ -1340,7 +1340,7 @@ pub const AntflyApiHandler = struct {
         try root_server.delete("/ai/v1/transcription/sessions/:session_id", httpx.Handler.bind(self, gatewaySessionDelete));
         try root_server.postResponseStreaming("/ai/v1/transcription/sessions/:session_id/audio", httpx.Handler.bind(self, gatewaySessionAudio));
         try root_server.get("/ai/v1/transcription/sessions/:session_id/events", httpx.Handler.bind(self, gatewaySessionEvents));
-        try root_server.postResponseStreaming("/ai/v1/transcription/sessions/:session_id/stream", httpx.Handler.bind(self, gatewaySessionStream));
+        try root_server.postStreamingRaw("/ai/v1/transcription/sessions/:session_id/stream", httpx.Handler.bind(self, gatewaySessionStream));
 
         const metadata_router = metadata_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try metadata_router.register(public_server);
@@ -9868,6 +9868,10 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
             try self.inner.post(prefix ++ path, handler_fn);
         }
 
+        pub fn postStreamingRaw(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
+            try self.inner.postStreamingRaw(prefix ++ path, handler_fn);
+        }
+
         pub fn postResponseStreaming(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
             try self.inner.postResponseStreaming(prefix ++ path, handler_fn);
         }
@@ -17597,7 +17601,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
         }
     };
     var upstream = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/ai/v1/chat/completions", .assert_request = Check.request, .respond = .{ .body = "{\"id\":\"upstream-id\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}" } },
+        .{ .method = .POST, .path = "/ai/v1/generate", .assert_request = Check.request, .respond = .{ .body = "{\"id\":\"upstream-id\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}" } },
         .{ .method = .POST, .path = "/ai/v1/decisions", .assert_request = Check.request, .respond = .{ .body = "{\"model\":\"backend\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
         .{ .method = .POST, .path = "/ai/v1/read", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"recognized\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}" } },
         .{ .method = .POST, .path = "/v1/embeddings", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2]}]}" } },
@@ -17919,4 +17923,157 @@ test "public graph metric borrowed wire owned HTTP responses keep buffers throug
     try std.testing.expectEqual(@as(usize, 0), owner.freed_bytes);
     response.releaseBody();
     try std.testing.expectEqual(owner.allocated_bytes, owner.freed_bytes);
+}
+
+test "httpx inference gateway session owner reserves before upstream creation and releases failures" {
+    const Target = struct {
+        calls: usize = 0,
+        malformed: bool = true,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.calls += 1;
+            const body = context.allocator.asStd().dupe(u8, if (self.malformed) "[]" else "{\"id\":\"backend-session\"}") catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    const a = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var target = Target{};
+    var server = ApiHttpServer.init(a, .{ .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    server.inference_sessions.capacity = 0;
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_]u16{ 429, 502, 200, 429 }, 0..) |status, index| {
+        if (index == 1) server.inference_sessions.capacity = 1;
+        if (index == 2) target.malformed = false;
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/transcription/sessions");
+        defer request.deinit();
+        request.body = "{\"model\":\"raw\"}";
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.gatewaySessionCreate(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(status, response.status.code);
+        try std.testing.expectEqual(@min(index, 2), target.calls);
+        try std.testing.expectEqual(@as(usize, if (index >= 2) 1 else 0), server.inference_sessions.entries.count());
+    }
+}
+
+test "httpx inference gateway session stream preserves transport and emits before reading audio" {
+    const State = struct {
+        opened: bool = false,
+        read_audio: bool = false,
+        closed: bool = false,
+        fn all(_: ?*anyopaque) !?[]const u8 {
+            return error.UnexpectedMaterialization;
+        }
+        fn read(raw: ?*anyopaque, dest: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!self.opened) return error.ResponseNotIncremental;
+            if (self.read_audio) return 0;
+            @memcpy(dest[0..4], "pcm!");
+            self.read_audio = true;
+            return 4;
+        }
+        fn start(_: ?*anyopaque, status: u16, content_type: []const u8, _: *const httpx.Headers) !void {
+            try std.testing.expectEqual(@as(u16, 200), status);
+            try std.testing.expectEqualStrings("text/event-stream", content_type);
+        }
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.indexOf(u8, bytes, "public-session") != null) self.opened = true;
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.closed = true;
+        }
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            check(context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn check(context: *const inference_connection_abi.InvokeContext) !void {
+            try std.testing.expectEqualStrings("transcription/sessions/backend/stream", context.operation.slice());
+            try std.testing.expectEqualStrings("format=pcm_f32&sample_rate=48000&commit=false", context.query.slice().?);
+            try std.testing.expectEqualStrings("application/octet-stream", context.content_type.slice().?);
+            try std.testing.expectEqual(@as(usize, 0), context.body.len);
+            const sink = context.stream;
+            try std.testing.expectEqual(@import("antfly_runtime_abi").http_abi.CallbackStatus.ok, sink.start.?(sink.context, 200, .init("text/event-stream"), .{}));
+            try std.testing.expectEqual(@import("antfly_runtime_abi").http_abi.CallbackStatus.ok, sink.write.?(sink.context, .init("data: {\"session_id\":\"backend\"}\n\n")));
+            var data: [16]u8 = undefined;
+            var count: usize = 0;
+            const body_source = context.body_source;
+            try std.testing.expectEqual(@import("antfly_runtime_abi").http_abi.CallbackStatus.ok, body_source.read.?(body_source.context, &data, data.len, &count));
+            try std.testing.expectEqualStrings("pcm!", data[0..count]);
+            try std.testing.expectEqual(@import("antfly_runtime_abi").http_abi.CallbackStatus.ok, body_source.read.?(body_source.context, &data, data.len, &count));
+            try std.testing.expectEqual(@as(usize, 0), count);
+            try std.testing.expectEqual(@import("antfly_runtime_abi").http_abi.CallbackStatus.ok, sink.close.?(sink.context));
+            context.out_response.* = .{ .status = 200 };
+        }
+    };
+    const a = std.testing.allocator;
+    var state: State = .{};
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{ .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &state, .invoke = State.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    const now = @import("antfly_platform").time.monotonicNs();
+    try server.inference_sessions.put(a, "public-session", .{ .principal = "anonymous", .connection = common_config.local_inference_connection_id, .backend_id = "backend", .expires_ns = now + std.time.ns_per_hour }, now);
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/transcription/sessions/public-session/stream?format=pcm_f32&sample_rate=48000&commit=false");
+    defer request.deinit();
+    try request.headers.set("content-type", "application/octet-stream");
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    ctx.params = &.{.{ .name = "session_id", .value = "public-session" }};
+    ctx.body_delegate = .{ .ptr = &state, .read_all = State.all, .read = State.read, .streaming = true };
+    ctx.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close };
+    var response = try handler.gatewaySessionStream(&ctx);
+    defer response.deinit();
+    try std.testing.expect(state.opened and state.read_audio and state.closed);
+}
+
+test "httpx inference gateway batch isolates malformed successful responses and continues later items" {
+    const Target = struct {
+        calls: usize = 0,
+        saw_stream: bool = false,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.calls += 1;
+            self.saw_stream = self.saw_stream or context.stream.start != null;
+            const body = context.allocator.asStd().dupe(u8, if (self.calls == 1) "invalid-json" else
+                \\{"id":"local","object":"chat.completion","created":1,"model":"raw","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+            ) catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var target = Target{};
+    var api_server = ApiHttpServer.init(alloc, .{ .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/generate/batch");
+    defer request.deinit();
+    request.body =
+        \\{"requests":[{"custom_id":"raw","body":{"model":"raw","messages":[{"role":"user","content":"hello"}]}},{"custom_id":"qualified","body":{"model":"connections/local-inference/models/raw","messages":[{"role":"user","content":"hello"}]}}]}
+    ;
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.gatewayBatch(&context);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("summary").?.object.get("succeeded").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("summary").?.object.get("failed").?.integer);
+    const items = parsed.value.object.get("data").?.array.items;
+    try std.testing.expectEqualStrings("raw", items[0].object.get("custom_id").?.string);
+    try std.testing.expectEqualStrings("InvalidInferenceResponse", items[0].object.get("error").?.object.get("code").?.string);
+    try std.testing.expect(!items[0].object.get("error").?.object.get("retryable").?.bool);
+    try std.testing.expectEqualStrings("qualified", items[1].object.get("custom_id").?.string);
+    try std.testing.expect(items[1].object.get("response").? == .object);
+    try std.testing.expectEqual(@as(usize, 2), target.calls);
+    try std.testing.expect(!target.saw_stream);
+    try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);
 }

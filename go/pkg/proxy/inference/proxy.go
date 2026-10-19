@@ -1432,7 +1432,18 @@ func extractModelOperations(r io.Reader) (map[string]map[OperationType]bool, err
 	}
 	for category, operations := range modelCategoryOperations {
 		if raw, ok := doc[category]; ok {
-			addFromCollection(raw, operations)
+			if category == "predictors" {
+				var schemas map[string]json.RawMessage
+				if json.Unmarshal(raw, &schemas) == nil {
+					for name, schema := range schemas {
+						if validPredictorSchema(schema) {
+							add(name, operations)
+						}
+					}
+				}
+			} else {
+				addFromCollection(raw, operations)
+			}
 		}
 	}
 	return result, nil
@@ -2804,6 +2815,13 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := inferenceRequestContext(r)
+	defer cancel()
+	r = r.WithContext(ctx)
+	if writeInferenceContextFailure(w, ctx) {
+		return
+	}
+
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	task := strings.TrimSpace(r.URL.Query().Get("task"))
 	operation := strings.TrimSpace(r.URL.Query().Get("operation"))
@@ -2833,12 +2851,13 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		routing.ExplicitPool = pool
 		cohort, err := p.prepareCatalogEndpointCohort(r.Context(), routing, model, taskScope.Operation)
 		if err != nil {
+			if writeInferenceContextFailure(w, ctx) {
+				return
+			}
 			if writeResolutionError(w, err) {
 				return
 			}
-			if r.Context().Err() != nil {
-				http.Error(w, "inference model catalog request canceled", http.StatusRequestTimeout)
-			} else {
+			if !writeInferenceContextFailure(w, ctx) {
 				p.logger.Warn("failed to prepare inference capability cohort", zap.Error(err))
 				http.Error(w, "inference capability cohort activation unavailable", http.StatusServiceUnavailable)
 			}
@@ -2915,6 +2934,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := p.catalogAdmission.Acquire(r.Context(), catalogBytes); err != nil {
+		if writeInferenceContextFailure(w, ctx) {
+			return
+		}
 		status := http.StatusServiceUnavailable
 		if !errors.Is(err, errByteAdmissionRequestTooLarge) {
 			status = http.StatusRequestTimeout
@@ -2955,6 +2977,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 				if authorization != "" {
 					request.Header.Set("Authorization", authorization)
 				}
+				setInferenceHopBudgets(request)
 				response, err := p.registry.client.Do(request)
 				if err != nil {
 					results <- catalogResult{err: err}
@@ -3032,6 +3055,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// Drain all workers before returning admission, even when canceled. Their
+	// transports share ctx, so expired requests cannot mint partial leases.
+	if writeInferenceContextFailure(w, ctx) {
+		return
+	}
 	if mergedTooLarge {
 		http.Error(w, "merged inference model catalog is too large", http.StatusBadGateway)
 		return
@@ -3045,6 +3073,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if model != "" && taskScope.Category == "predictors" && !canonicalCatalogContainsTaskModel(categories, taskScope, model) {
+		http.Error(w, "predictor schema is incompatible across inference endpoints", http.StatusServiceUnavailable)
+		return
+	}
 	response := make(map[string]any, len(categories)+1)
 	for category, models := range categories {
 		response[category] = models
@@ -3054,9 +3086,31 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		names = append(names, model)
 	}
 	sort.Strings(names)
-	data := make([]map[string]string, 0, len(names))
+	data := make([]map[string]any, 0, len(names))
 	for _, model := range names {
-		data = append(data, map[string]string{"id": model})
+		item := map[string]any{"id": model}
+		var tasks []string
+		// Derive task identity from the merged task collections so physical
+		// models retain it through the proxy. Multiple roles remain explicit.
+		for _, entry := range []struct{ category, task string }{
+			{"generators", "generate"}, {"chains", "generate"}, {"embedders", "embed"},
+			{"readers", "read"}, {"rerankers", "rerank"}, {"chunkers", "chunk"},
+			{"extractors", "extract"}, {"deciders", "decide"}, {"rewriters", "rewrite"},
+			{"transcribers", "transcribe"}, {"synthesizers", "synthesize"}, {"predictors", "predict"},
+		} {
+			if descriptor, ok := categories[entry.category][model]; ok && (entry.category != "predictors" || validPredictorSchema(descriptor)) {
+				if len(tasks) == 0 || tasks[len(tasks)-1] != entry.task {
+					tasks = append(tasks, entry.task)
+				}
+			}
+		}
+		if len(tasks) > 0 {
+			item["tasks"] = tasks
+		}
+		if len(tasks) == 1 {
+			item["task"] = tasks[0]
+		}
+		data = append(data, item)
 	}
 	response["data"] = data
 	responseBody, err := json.Marshal(response)
@@ -3069,6 +3123,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	// silently escape the process admission contract.
 	if len(responseBody) > maxMergedModelCatalogBytes {
 		http.Error(w, "merged inference model catalog is too large", http.StatusBadGateway)
+		return
+	}
+	if writeInferenceContextFailure(w, ctx) {
 		return
 	}
 	descriptorDigest := sha256.Sum256(responseBody)
@@ -3443,11 +3500,16 @@ func canonicalCatalogModel(category, model string) string {
 
 func catalogModelDescriptor(models map[string]json.RawMessage, category, model string) (json.RawMessage, bool) {
 	canonical := canonicalCatalogModel(category, model)
-	if descriptor, ok := models[canonical]; ok {
+	if descriptor, ok := models[canonical]; ok && (category != "predictors" || validPredictorSchema(descriptor)) {
 		return descriptor, true
 	}
+	// Only chunk names have alternate spellings. Other task collections use
+	// exact keys, keeping merged task metadata construction linear in models.
+	if category != "chunkers" {
+		return nil, false
+	}
 	for candidate, descriptor := range models {
-		if canonicalCatalogModel(category, candidate) == canonical {
+		if canonicalCatalogModel(category, candidate) == canonical && (category != "predictors" || validPredictorSchema(descriptor)) {
 			return descriptor, true
 		}
 	}
@@ -3493,6 +3555,9 @@ func mergeCanonicalCatalogModel(
 	descriptor json.RawMessage,
 	modelNames map[string]bool,
 ) int {
+	if category == "predictors" && !validPredictorSchema(descriptor) {
+		descriptor = json.RawMessage(`{"unavailable":true}`)
+	}
 	added := 0
 	models := target[category]
 	if models == nil {
@@ -3524,7 +3589,7 @@ func mergeCanonicalCatalogModel(
 	if !modelNames[model] {
 		modelNames[model] = true
 		// Compatibility data item: comma + {"id":<escaped model>}.
-		added = catalogSizeAdd(added, 1+len(`{"id":}`))
+		added = catalogSizeAdd(added, 1+len(`{"id":}`)+256)
 		added = catalogSizeAdd(added, catalogJSONQuotedUpperBound(model))
 	}
 	return added
@@ -4354,6 +4419,11 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		return
 	}
 
+	if _, pinned := r.Context().Value(proxySessionContextKey{}).(proxySession); pinned && strings.HasSuffix(r.URL.Path, "/stream") {
+		p.proxySessionStream(w, r, operation, start, routing)
+		return
+	}
+
 	// Parse request to get model
 	if r.ContentLength > p.maxRequestBodyBytes {
 		http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
@@ -4750,9 +4820,6 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if r.URL.Path == "/ai/v1/transcription/sessions" {
-		r = r.WithContext(context.WithValue(r.Context(), proxySessionModelKey{}, model))
-	}
 	lease, err := p.acquireRequestResolution(r.Context(), OperationType(operation), model, routing)
 	if err != nil {
 		if writeResolutionError(w, err) {
@@ -4787,6 +4854,21 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 		lease.Release()
 		http.Error(w, "inference attempt budget exhausted", http.StatusTooManyRequests)
 		return
+	}
+	if operation == "transcription.sessions" && r.URL.Path == "/ai/v1/transcription/sessions" {
+		reservation, err := p.reserveSession(r, model, resolution.Endpoint, routingPayload)
+		if err != nil {
+			lease.Release()
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, errSessionCapacity) {
+				status = http.StatusTooManyRequests
+			}
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "session owner capacity unavailable", status)
+			return
+		}
+		defer reservation.release()
+		r = r.WithContext(context.WithValue(r.Context(), proxySessionReservationKey{}, reservation))
 	}
 	spillReservation := int64(0)
 	if attempts > 1 {
@@ -6000,14 +6082,7 @@ func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody,
 		outReq.URL.Path = "/ai/v1/decisions"
 		outReq.URL.RawPath = ""
 	}
-	outReq.Header.Set("X-Antfly-Inference-Attempts-Remaining", "1")
-	if deadline, ok := attemptCtx.Deadline(); ok {
-		remaining := time.Until(deadline).Milliseconds()
-		if remaining < 1 {
-			remaining = 1
-		}
-		outReq.Header.Set("X-Antfly-Inference-Timeout-Ms", strconv.FormatInt(remaining, 10))
-	}
+	setInferenceHopBudgets(outReq)
 	outReq.Host = targetURL.Host
 	outReq.RequestURI = ""
 	body, err := replay.Open()
@@ -6016,13 +6091,18 @@ func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody,
 	}
 	outReq.Body = body
 	outReq.GetBody = nil
+	if _, duplex := body.(*proxySessionUpload); duplex {
+		outReq.Header.Del("Expect")
+	}
 	outReq.ContentLength = replay.Len()
 	if authorization := p.upstreamAuthorizationForRequest(r); authorization != "" {
 		outReq.Header.Set("Authorization", authorization)
 	}
 
 	resp, err := p.registry.client.Do(outReq)
-	_ = body.Close()
+	if _, duplex := body.(*proxySessionUpload); !duplex {
+		_ = body.Close()
+	}
 	finishUpload := func(retry bool) error {
 		if finalizer, ok := body.(interface {
 			Finish(context.Context, bool) error
@@ -6112,7 +6192,21 @@ func (b *forwardingBody) Close() error {
 	return err
 }
 
-func copyResponse(w io.Writer, resp *http.Response) error {
+type proxyFlushingWriter struct{ writer http.ResponseWriter }
+
+func (w proxyFlushingWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	if err == nil {
+		err = http.NewResponseController(w.writer).Flush()
+	}
+	return n, err
+}
+
+func copyResponse(w io.Writer, resp *http.Response) (result error) {
+	// Retain the original observer when SSE flushing wraps the writer.
+	if recorder, ok := w.(interface{ recordProxyTransportError(error) }); ok {
+		defer func() { recorder.recordProxyTransportError(result) }()
+	}
 	if writer, ok := w.(http.ResponseWriter); ok {
 		if metadataWriter, ok := writer.(interface{ copyProxyResponseMetadata(http.Header) }); ok {
 			metadataWriter.copyProxyResponseMetadata(resp.Header)
@@ -6124,6 +6218,13 @@ func copyResponse(w io.Writer, resp *http.Response) error {
 			}
 		}
 		writer.WriteHeader(resp.StatusCode)
+		if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+			if err := http.NewResponseController(writer).Flush(); err != nil {
+				_ = resp.Body.Close()
+				return err
+			}
+			w = proxyFlushingWriter{writer: writer}
+		}
 	}
 
 	var copyErr error
@@ -6131,14 +6232,11 @@ func copyResponse(w io.Writer, resp *http.Response) error {
 		_, copyErr = io.Copy(w, resp.Body)
 	}
 	closeErr := resp.Body.Close()
-	result := copyErr
+	result = copyErr
 	if result == nil {
 		result = closeErr
 	} else if closeErr != nil {
 		result = errors.Join(copyErr, closeErr)
-	}
-	if recorder, ok := w.(interface{ recordProxyTransportError(error) }); ok {
-		recorder.recordProxyTransportError(result)
 	}
 	return result
 }
@@ -6191,7 +6289,32 @@ func (p *Proxy) waitForQueuedDestination(ctx context.Context, route *Route, req 
 	}
 }
 
+// A task descriptor is not a native predictor schema. Only complete schemas
+// may advertise prediction or participate in a capability lease.
+func validPredictorSchema(raw json.RawMessage) bool {
+	var schema struct {
+		Task          string   `json:"task"`
+		NumFeatures   int64    `json:"num_features"`
+		NumOutputs    int64    `json:"num_outputs"`
+		FeatureNames  []string `json:"feature_names"`
+		ModelIdentity *string  `json:"model_identity"`
+		Unavailable   bool     `json:"unavailable"`
+	}
+	if json.Unmarshal(raw, &schema) != nil || schema.Unavailable || schema.NumFeatures <= 0 || schema.NumOutputs <= 0 {
+		return false
+	}
+	switch schema.Task {
+	case "regression", "binary_classification", "multiclass", "ranking":
+	default:
+		return false
+	}
+	return schema.FeatureNames == nil || int64(len(schema.FeatureNames)) == schema.NumFeatures
+}
+
 func equalPredictorSchema(left, right json.RawMessage) bool {
+	if !validPredictorSchema(left) || !validPredictorSchema(right) {
+		return false
+	}
 	var a, b map[string]json.RawMessage
 	if json.Unmarshal(left, &a) != nil || json.Unmarshal(right, &b) != nil {
 		return false

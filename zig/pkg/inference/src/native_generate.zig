@@ -7223,26 +7223,24 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
 
     print("{s}\n", .{choice.message.content.valueOrNull() orelse ""});
     if (opts.print_finish_reason or opts.print_token_count) {
-        if (opts.print_finish_reason and opts.print_token_count) {
-            print("finish_reason={s} tokens={d}\n", .{ @tagName(choice.finish_reason), parsed.value.usage.completion_tokens });
-        } else if (opts.print_finish_reason) {
-            print("finish_reason={s}\n", .{@tagName(choice.finish_reason)});
-        } else {
-            print("tokens={d}\n", .{parsed.value.usage.completion_tokens});
+        if (opts.print_finish_reason) print("finish_reason={s}", .{@tagName(choice.finish_reason)});
+        if (opts.print_token_count) {
+            if (opts.print_finish_reason) print(" ", .{});
+            if (parsed.value.usage) |usage| print("tokens={d}", .{usage.completion_tokens}) else print("tokens=unknown", .{});
         }
+        print("\n", .{});
     }
     if (opts.print_timing) {
         const total_ms = durationMillis(started_at, finished_at);
-        const tokens_per_sec: f64 = if (total_ms > 0)
-            @as(f64, @floatFromInt(parsed.value.usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms))
-        else
-            0;
         if (parsed.value.speculation.valueOrNull()) |status| {
             const summary = try formatServerSpeculationStatus(allocator, status);
             defer allocator.free(summary);
             print("{s}\n", .{summary});
         }
-        print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
+        if (parsed.value.usage) |usage| {
+            const tokens_per_sec: f64 = if (total_ms > 0) @as(f64, @floatFromInt(usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms)) else 0;
+            print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
+        } else print("timing_ms: server_request={d} total={d} tokens_per_sec=unknown\n", .{ total_ms, total_ms });
     }
 }
 

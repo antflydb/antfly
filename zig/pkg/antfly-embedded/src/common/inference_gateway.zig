@@ -51,6 +51,14 @@ pub const Task = enum {
     }
 };
 
+/// Known discovery groups carry task identity; unclassified provider models
+/// remain unclassified instead of being guessed to be chat generators.
+pub fn taskForCategory(category: []const u8) ?Task {
+    if (std.mem.eql(u8, category, "chains")) return .generate;
+    inline for (std.meta.tags(Task)) |task| if (std.mem.eql(u8, category, task.namespace())) return task;
+    return null;
+}
+
 pub const Support = enum { unknown, unsupported, supported };
 pub const Capabilities = struct {
     streaming: Support = .unknown,
@@ -413,17 +421,23 @@ test "provider registry gateway runtime task bindings retain qualified transport
 pub const Sessions = struct {
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.StringArrayHashMapUnmanaged(Session) = .{},
+    capacity: usize = 4096,
+    next_generation: u64 = 1,
     pub const Session = struct {
         principal: []const u8,
         connection: []const u8,
         backend_id: []const u8,
         expires_ns: u64,
         ttl_ns: u64 = @import("std").time.ns_per_hour,
+        pending: bool = false,
+        active: usize = 0,
+        generation: u64 = 0,
+        backend_buffer: ?[]u8 = null,
     };
     fn free(a: std.mem.Allocator, value: Session) void {
         a.free(value.principal);
         a.free(value.connection);
-        a.free(value.backend_id);
+        if (value.backend_buffer) |buffer| a.free(buffer) else a.free(value.backend_id);
     }
     pub fn deinit(self: *Sessions, a: std.mem.Allocator) void {
         for (self.entries.keys(), self.entries.values()) |key, value| {
@@ -432,40 +446,123 @@ pub const Sessions = struct {
         }
         self.entries.deinit(a);
     }
-    pub fn put(self: *Sessions, a: std.mem.Allocator, id: []const u8, value: Session, now: u64) !void {
+    /// A reserved entry owns capacity and all publication storage before the
+    /// upstream side effect. Pending handles cannot be read or expire mid-call.
+    pub const Reservation = struct {
+        owner: ?*Sessions,
+        id: []const u8,
+        pub fn release(self: *Reservation, a: std.mem.Allocator) void {
+            const owner = self.owner orelse return;
+            self.owner = null;
+            @import("antfly_platform").sync.lockYielding(&owner.mutex);
+            defer owner.mutex.unlock();
+            const index = owner.entries.getIndex(self.id) orelse return;
+            if (!owner.entries.values()[index].pending) return;
+            a.free(owner.entries.keys()[index]);
+            free(a, owner.entries.values()[index]);
+            owner.entries.swapRemoveAt(index);
+        }
+        pub fn commit(self: *Reservation, backend_id: []const u8, expires_ns: u64, ttl_ns: u64) !void {
+            const owner = self.owner orelse return error.InvalidInferenceSessionReservation;
+            @import("antfly_platform").sync.lockYielding(&owner.mutex);
+            defer owner.mutex.unlock();
+            const entry = owner.entries.getPtr(self.id) orelse return error.InvalidInferenceSessionReservation;
+            if (!entry.pending or backend_id.len == 0 or backend_id.len > 256) return error.InvalidInferenceSessionReservation;
+            const buffer = entry.backend_buffer.?;
+            @memcpy(buffer[0..backend_id.len], backend_id);
+            entry.backend_id = buffer[0..backend_id.len];
+            entry.expires_ns = expires_ns;
+            entry.ttl_ns = ttl_ns;
+            entry.pending = false;
+            self.owner = null;
+        }
+    };
+    pub fn reserve(self: *Sessions, a: std.mem.Allocator, id: []const u8, principal_id: []const u8, connection_id: []const u8, now: u64) !Reservation {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         var index: usize = 0;
         while (index < self.entries.count()) {
-            if (self.entries.values()[index].expires_ns <= now) {
+            const value = self.entries.values()[index];
+            if (!value.pending and value.active == 0 and value.expires_ns <= now) {
                 a.free(self.entries.keys()[index]);
-                free(a, self.entries.values()[index]);
+                free(a, value);
                 self.entries.swapRemoveAt(index);
             } else index += 1;
         }
-        if (self.entries.count() >= 4096) return error.InferenceCapacityUnavailable;
+        if (self.entries.count() >= self.capacity) return error.InferenceCapacityUnavailable;
+        if (self.entries.contains(id)) return error.InvalidInferenceSessionReservation;
         const key = try a.dupe(u8, id);
         errdefer a.free(key);
-        const principal = try a.dupe(u8, value.principal);
+        const principal = try a.dupe(u8, principal_id);
         errdefer a.free(principal);
+        const connection = try a.dupe(u8, connection_id);
+        errdefer a.free(connection);
+        const backend = try a.alloc(u8, 256);
+        errdefer a.free(backend);
+        const generation = self.next_generation;
+        self.next_generation = std.math.add(u64, generation, 1) catch return error.InferenceCapacityUnavailable;
+        try self.entries.putNoClobber(a, key, .{ .principal = principal, .connection = connection, .backend_id = backend, .backend_buffer = backend, .expires_ns = 0, .pending = true, .generation = generation });
+        return .{ .owner = self, .id = key };
+    }
+    pub fn put(self: *Sessions, a: std.mem.Allocator, id: []const u8, value: Session, now: u64) !void {
+        var reservation = try self.reserve(a, id, value.principal, value.connection, now);
+        defer reservation.release(a);
+        try reservation.commit(value.backend_id, value.expires_ns, value.ttl_ns);
+    }
+    /// The request owns copied identity storage; owner records may be deleted
+    /// independently. Generation checks prevent completion from reviving or
+    /// decrementing a replacement record, even if its public ID is reused.
+    pub const Lease = struct {
+        owner: ?*Sessions,
+        id: []const u8,
+        generation: u64,
+        session: Session,
+
+        pub fn finish(self: *Lease, now: u64, renew: bool) void {
+            const owner = self.owner orelse return;
+            self.owner = null;
+            @import("antfly_platform").sync.lockYielding(&owner.mutex);
+            defer owner.mutex.unlock();
+            const stored = owner.entries.getPtr(self.id) orelse return;
+            if (stored.generation != self.generation) return;
+            std.debug.assert(stored.active > 0);
+            stored.active -= 1;
+            if (renew) stored.expires_ns = @max(stored.expires_ns, now +| stored.ttl_ns);
+        }
+    };
+
+    fn copy(a: std.mem.Allocator, value: Session) !Session {
         const connection = try a.dupe(u8, value.connection);
         errdefer a.free(connection);
         const backend_id = try a.dupe(u8, value.backend_id);
-        errdefer a.free(backend_id);
-        try self.entries.putNoClobber(a, key, .{ .principal = principal, .connection = connection, .backend_id = backend_id, .expires_ns = value.expires_ns, .ttl_ns = value.ttl_ns });
+        return .{ .principal = &.{}, .connection = connection, .backend_id = backend_id, .expires_ns = value.expires_ns, .ttl_ns = value.ttl_ns };
     }
-    /// Copies while locked so deletion or expiry cannot invalidate borrowers.
+
+    fn visible(value: Session, principal: []const u8, now: u64) bool {
+        return !value.pending and (value.active > 0 or value.expires_ns > now) and std.mem.eql(u8, value.principal, principal);
+    }
+
+    /// Lookup is read-only: polling and failed requests cannot extend idle TTL.
     pub fn get(self: *Sessions, a: std.mem.Allocator, id: []const u8, principal: []const u8, now: u64) !Session {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        const stored = self.entries.get(id) orelse return error.InferenceSessionNotFound;
+        if (!visible(stored, principal, now)) return error.InferenceSessionNotFound;
+        return copy(a, stored);
+    }
+
+    pub fn acquire(self: *Sessions, a: std.mem.Allocator, id: []const u8, principal: []const u8, now: u64) !Lease {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
         const stored = self.entries.getPtr(id) orelse return error.InferenceSessionNotFound;
-        const value = stored.*;
-        if (value.expires_ns <= now or !std.mem.eql(u8, value.principal, principal)) return error.InferenceSessionNotFound;
-        const connection = try a.dupe(u8, value.connection);
-        errdefer a.free(connection);
-        const backend_id = try a.dupe(u8, value.backend_id);
-        stored.expires_ns = now +| value.ttl_ns;
-        return .{ .principal = &.{}, .connection = connection, .backend_id = backend_id, .expires_ns = stored.expires_ns, .ttl_ns = value.ttl_ns };
+        if (!visible(stored.*, principal, now)) return error.InferenceSessionNotFound;
+        const snapshot = try copy(a, stored.*);
+        errdefer a.free(snapshot.connection);
+        errdefer a.free(snapshot.backend_id);
+        const owned_id = try a.dupe(u8, id);
+        errdefer a.free(owned_id);
+        stored.active = std.math.add(usize, stored.active, 1) catch return error.InferenceCapacityUnavailable;
+        return .{ .owner = self, .id = owned_id, .generation = stored.generation, .session = snapshot };
     }
     pub fn remove(self: *Sessions, a: std.mem.Allocator, id: []const u8) void {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
@@ -539,4 +636,113 @@ test "provider registry gateway chain discovery describes reachable fallback and
         try std.testing.expectEqual(case.attempts, descriptor.execution_policy.max_attempts);
         try std.testing.expectEqual(case.fallback, descriptor.execution_policy.cross_model_fallback);
     }
+}
+
+test "provider registry gateway discovery categories have explicit task identities" {
+    try std.testing.expectEqual(Task.embed, taskForCategory("embedders").?);
+    try std.testing.expectEqual(Task.generate, taskForCategory("chains").?);
+    try std.testing.expectEqual(Task.predict, taskForCategory("predictors").?);
+    try std.testing.expectEqual(@as(?Task, null), taskForCategory("unknown"));
+}
+
+test "provider registry gateway session reservations count pending handles and activate without allocation" {
+    const a = std.testing.allocator;
+    var sessions: Sessions = .{ .capacity = 1 };
+    defer sessions.deinit(a);
+    var first = try sessions.reserve(a, "first", "principal", "runtime", 1);
+    defer first.release(a);
+    try std.testing.expectError(error.InferenceSessionNotFound, sessions.get(a, "first", "principal", 2));
+    try std.testing.expectError(error.InferenceCapacityUnavailable, sessions.reserve(a, "second", "principal", "runtime", 2));
+    // Pending calls cannot be collected as expired while still creating upstream.
+    try std.testing.expectError(error.InferenceCapacityUnavailable, sessions.reserve(a, "second", "principal", "runtime", std.math.maxInt(u64)));
+    first.release(a);
+    first.release(a);
+    var second = try sessions.reserve(a, "second", "principal", "runtime", 3);
+    defer second.release(a);
+    try second.commit("backend", 10, 5);
+    second.release(a);
+    const active = try sessions.get(a, "second", "principal", 4);
+    defer a.free(active.connection);
+    defer a.free(active.backend_id);
+    try std.testing.expectEqualStrings("backend", active.backend_id);
+    // Active expired entries are reclaimed before admitting a replacement.
+    var replacement = try sessions.reserve(a, "replacement", "principal", "runtime", 10);
+    defer replacement.release(a);
+    try std.testing.expectEqual(@as(usize, 1), sessions.entries.count());
+}
+
+test "provider registry gateway reservation failures release every allocation before upstream work" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var sessions: Sessions = .{ .capacity = 1 };
+            defer sessions.deinit(a);
+            var reservation = try sessions.reserve(a, "handle", "principal", "runtime", 1);
+            defer reservation.release(a);
+            try reservation.commit("backend", 100, 99);
+            try std.testing.expectEqual(@as(usize, 1), sessions.entries.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "provider registry gateway session leases protect active requests and renew only on success" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const request_a = arena.allocator();
+    var sessions: Sessions = .{ .capacity = 1 };
+    defer sessions.deinit(a);
+    try sessions.put(a, "handle", .{ .principal = "owner", .connection = "runtime", .backend_id = "backend", .expires_ns = 10, .ttl_ns = 10 }, 0);
+    var append = try sessions.acquire(request_a, "handle", "owner", 1);
+    try std.testing.expectError(error.InferenceSessionNotFound, sessions.acquire(request_a, "handle", "other", 2));
+    try std.testing.expectError(error.InferenceCapacityUnavailable, sessions.reserve(a, "new", "owner", "runtime", 20));
+    var watcher = try sessions.acquire(request_a, "handle", "owner", 20);
+    append.finish(25, true);
+    watcher.finish(26, false);
+    try std.testing.expectEqual(@as(u64, 35), sessions.entries.get("handle").?.expires_ns);
+    append.finish(30, true);
+    try std.testing.expectEqual(@as(u64, 35), sessions.entries.get("handle").?.expires_ns);
+    var failed = try sessions.acquire(request_a, "handle", "owner", 30);
+    failed.finish(50, false);
+    try std.testing.expectError(error.InferenceSessionNotFound, sessions.get(request_a, "handle", "owner", 50));
+    var next = try sessions.reserve(a, "new", "owner", "runtime", 50);
+    next.release(a);
+    try std.testing.expectEqual(@as(usize, 0), sessions.entries.count());
+}
+
+test "provider registry gateway stale session completion cannot renew a deleted or replaced handle" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var sessions: Sessions = .{};
+    defer sessions.deinit(a);
+    const value = Sessions.Session{ .principal = "owner", .connection = "runtime", .backend_id = "backend", .expires_ns = 100, .ttl_ns = 10 };
+    try sessions.put(a, "handle", value, 0);
+    var old = try sessions.acquire(arena.allocator(), "handle", "owner", 1);
+    sessions.remove(a, "handle");
+    try sessions.put(a, "handle", value, 2);
+    var replacement = try sessions.acquire(arena.allocator(), "handle", "owner", 3);
+    old.finish(500, true);
+    try std.testing.expectEqual(@as(usize, 1), sessions.entries.get("handle").?.active);
+    try std.testing.expectEqual(@as(u64, 100), sessions.entries.get("handle").?.expires_ns);
+    sessions.remove(a, "handle");
+    replacement.finish(600, true);
+    try std.testing.expectEqual(@as(usize, 0), sessions.entries.count());
+}
+
+test "provider registry gateway session acquisition allocation failures release all storage and pins" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var sessions: Sessions = .{};
+            defer sessions.deinit(std.testing.allocator);
+            try sessions.put(std.testing.allocator, "handle", .{ .principal = "owner", .connection = "runtime", .backend_id = "backend", .expires_ns = 100 }, 0);
+            defer std.debug.assert(sessions.entries.get("handle").?.active == 0);
+            var lease = try sessions.acquire(a, "handle", "owner", 1);
+            defer a.free(lease.id);
+            defer a.free(lease.session.connection);
+            defer a.free(lease.session.backend_id);
+            defer lease.finish(2, false);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

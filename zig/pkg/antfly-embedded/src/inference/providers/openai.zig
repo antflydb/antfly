@@ -255,6 +255,7 @@ pub const Provider = struct {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
         const Response = struct {
+            usage: std.json.Value = .null,
             choices: []const struct {
                 message: struct {
                     content: ?[]const u8 = null,
@@ -298,6 +299,7 @@ pub const Provider = struct {
                 return .{
                     .content = try alloc.dupe(u8, content),
                     .tool_calls = tool_calls,
+                    .usage = inference.GenerationUsage.fromValue(parsed.value.usage, "prompt_tokens", "completion_tokens", "total_tokens"),
                     .allocator = alloc,
                 };
             }
@@ -305,6 +307,7 @@ pub const Provider = struct {
                 return .{
                     .content = try alloc.dupe(u8, ""),
                     .tool_calls = tool_calls,
+                    .usage = inference.GenerationUsage.fromValue(parsed.value.usage, "prompt_tokens", "completion_tokens", "total_tokens"),
                     .allocator = alloc,
                 };
             }

@@ -52,7 +52,7 @@ pub const GeneratorFactory = lib.GeneratorFactory;
 pub const default_max_tokens = lib.default_max_tokens;
 pub const parseConfigFromSlice = lib.parseConfigFromSlice;
 
-test "embedded canonical generation preserves tool definitions returned calls and cancellation" {
+test "provider registry gateway embedded canonical generation preserves tools usage and cancellation" {
     const Fake = struct {
         fn generate(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
             try std.testing.expect(context != null);
@@ -60,7 +60,7 @@ test "embedded canonical generation preserves tool definitions returned calls an
             try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0") != null);
             return alloc.dupe(u8,
-                \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"search","arguments":"{\"query_index\":0}"}}]}}]}
+                \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"search","arguments":"{\"query_index\":0}"}}]}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":5}}
             );
         }
     };
@@ -79,6 +79,7 @@ test "embedded canonical generation preserves tool definitions returned calls an
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
     try std.testing.expectEqualStrings("call-1", result.tool_calls[0].id);
+    try std.testing.expectEqual(@as(?u64, 5), result.usage.?.total_tokens);
 }
 pub const parseConfigFromValue = lib.parseConfigFromValue;
 
@@ -594,6 +595,7 @@ const BackendState = struct {
         }
         return .{
             .content = content,
+            .usage = result.usage,
             .tool_calls = calls,
             .google_parts_json = if (result.google_parts_json) |parts| try alloc.dupe(u8, parts) else null,
             .allocator = alloc,
@@ -1563,7 +1565,8 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
         .remote_antfly => |provider| provider.base_url,
         else => return error.UnsupportedInferenceFeature,
     };
-    const url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{std.mem.trimEnd(u8, base, "/")});
+    const operation = if (cfg.provider == .antfly and request.operation == .generate) "generate" else "chat/completions";
+    const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ std.mem.trimEnd(u8, base, "/"), operation });
     defer alloc.free(url);
     const authorization = if (state.api_key) |*key| try optionalBearerAuthHeaderOwned(state, alloc, key) else null;
     defer if (authorization) |value| alloc.free(value);

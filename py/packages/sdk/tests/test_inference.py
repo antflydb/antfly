@@ -393,3 +393,18 @@ def test_chunk_embedding_stream_preserves_provenance_and_requires_terminal(termi
             with pytest.raises(AntflyException, match="before terminal coverage"):
                 next(results)
     assert stream.closed
+
+
+@pytest.mark.parametrize("usage", [None, {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 5}])
+def test_generated_generation_response_preserves_unknown_and_measured_usage(usage) -> None:
+    from antfly.client_generated.models import InferenceGenerateResponse
+
+    body = {
+        "id": "generation",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "google",
+        "choices": [],
+        "usage": usage,
+    }
+    assert InferenceGenerateResponse.from_dict(body).to_dict()["usage"] == usage

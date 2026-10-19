@@ -4896,12 +4896,27 @@ pub const ApiHttpServer = struct {
         include_param: ?[]const u8,
         refresh_param: ?[]const u8,
     ) ![]u8 {
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        return self.listConnectionsJsonAllocWithContext(alloc, types_param, include_param, refresh_param, null);
+    }
+
+    pub fn listConnectionsJsonAllocWithContext(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        types_param: ?[]const u8,
+        include_param: ?[]const u8,
+        refresh_param: ?[]const u8,
+        request_context: ?@import("antfly_inference_execution_context").RequestContext,
+    ) ![]u8 {
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
 
-        var snapshot_opt = self.source.cachedAdminSnapshot() catch null;
-        if (snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
+        if (request_context) |context| try context.check();
+        // Inference inventory has no table/replication status dependency. Do
+        // not put an unrelated metadata snapshot RPC on its request lifetime.
+        const inference_only = if (types_param) |types| std.mem.eql(u8, types, "inference") else false;
+        var snapshot_opt = if (inference_only) null else self.source.cachedAdminSnapshot() catch null;
+        if (!inference_only and snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
         defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
 
         const node_config = self.cfg.node_config;
@@ -4915,6 +4930,7 @@ pub const ApiHttpServer = struct {
             .network_io = self.sharedApiNetworkIo(),
             .filesystem_io = self.sharedApiFilesystemIo(),
         }, &self.connections_cache, .{
+            .request_context = request_context,
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
             .refresh = if (refresh_param) |value| std.mem.eql(u8, value, "true") else false,

@@ -842,6 +842,7 @@ pub const Provider = struct {
 
     pub fn parseGenerationResponse(alloc: std.mem.Allocator, body: []const u8, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) !inference.GenerateResult {
         const Response = struct {
+            usage: std.json.Value = .null,
             choices: []const struct {
                 message: struct {
                     content: ?[]const u8 = null,
@@ -867,6 +868,7 @@ pub const Provider = struct {
         return .{
             .content = try alloc.dupe(u8, content),
             .tool_calls = tool_calls,
+            .usage = inference.GenerationUsage.fromValue(parsed.value.usage, "prompt_tokens", "completion_tokens", "total_tokens"),
             .allocator = alloc,
         };
     }

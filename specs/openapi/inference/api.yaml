@@ -3640,7 +3640,11 @@ components:
             $ref: '#/components/schemas/GenerateChoice'
           description: List of completion choices (currently always 1)
         usage:
-          $ref: '#/components/schemas/GenerateUsage'
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          description: Provider-reported token usage, or null when the provider does not supply it.
+          allOf:
+            - $ref: '#/components/schemas/GenerateUsage'
         speculation:
           x-go-type-skip-optional-pointer: false
           nullable: true

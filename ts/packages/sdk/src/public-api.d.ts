@@ -19849,7 +19849,8 @@ export interface components {
             model: string;
             /** @description List of completion choices (currently always 1) */
             choices: components["schemas"]["InferenceGenerateChoice"][];
-            usage?: components["schemas"]["InferenceGenerateUsage"];
+            /** @description Provider-reported token usage, or null when the provider does not supply it. */
+            usage?: components["schemas"]["InferenceGenerateUsage"] | null;
             speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
         };
         /** @description Effective speculative-decoding decision for this completion. */

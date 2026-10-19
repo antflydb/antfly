@@ -140,7 +140,15 @@ The TypeScript `AntflyClient.inference` API shares database authentication.
 live response, including SSE or audio, and issues each mutation once. The
 existing typed `InferenceClient` and generated API client remain available.
 Antfarm's **Models → Gateway** playground lists the same IDs and supports
-cancellation, streamed output and synthesized audio.
+cancellation, streamed output and synthesized audio. Chat samples enable streaming
+only when the selected model explicitly advertises gateway streaming support.
+Delayed discovery and catalog refreshes preserve edited JSON and explicit operation
+choices; opening a different model deep link starts a fresh draft.
+
+Session streams rewrite public handles after assembling complete SSE events,
+including multiline `data` fields. Both the native gateway and proxy preserve
+SSE metadata and limit each event to 1 MiB. Incomplete events at EOF are discarded.
+Session creation rejects an upstream expiry that has already elapsed.
 
 ## Fallback, limits and telemetry
 
@@ -153,6 +161,11 @@ switch models. Headers or any emitted SSE data permanently commit the target.
 Retries and fallback share at most eight attempts and one total deadline.
 
 Batches inherit the caller's attempt cap for every item and one total deadline.
+Malformed successful upstream responses become non-retryable errors for their
+individual items; subsequent items still execute and retain their IDs. Validation
+uses the generation response contract and preserves provider extension fields.
+Generation usage is null when the provider supplies no counts; measured usage,
+including the provider's total token count, is retained through batch execution.
 Each item executes with a buffered response, including local and qualified
 connection targets; only the completed batch envelope is sent to the client.
 
@@ -170,12 +183,38 @@ Descriptors include task, executor, backend identity, limits, execution policy,
 `gateway_capabilities`, availability and freshness. The legacy capability-name
 array retains its existing shape. Chain execution policy reports the reachable
 attempt bound, capped at eight, and whether those attempts can select a
-different backend model. `/db/v1/connections?include=models` uses the
+different backend model. Native `generate` operations remain `generate` across
+remote Antfly aliases and chains, including streaming calls. Vendor executors use
+their chat protocol for the supported common subset.
+`/db/v1/connections?include=models` uses the
 same registry view and bounded connection-discovery cache. `named-inference` is
 a reserved virtual connection for configured aliases. Qualified vendor
 connections use their task adapters and connection-scoped credentials; a
 capability denial cannot be bypassed through a model alias. Public descriptors
 exclude credentials and upstream URLs.
+
+Physical model entries retain known task roles in `tasks`. A single role also
+sets `task`, allowing Antfarm to select its operation; multiple roles require an
+explicit operation choice. The proxy preserves these roles in its merged list.
+The `predictors` group contains native ML schemas, including ordered feature
+names and input/output counts, on both AI and ML inventory routes. Incompatible
+schemas across a proxy pool cannot receive a prediction capability lease.
+
+Discovery shares the caller's deadline and cancellation through proxy route
+preparation, admission, fan-out, cache waits, provider batches, and model
+transports. Proxy hops forward the remaining budget. Expired callers do not
+populate the provider failure cache. Native decision models retain the `deciders`
+role independently of legacy `classifiers`. Out-of-range remote dimension
+metadata remains unknown and cannot overflow the public dimension type.
+Unclassified catalog entries cannot erase known task roles for the same model.
+Remote discovery merges native task groups (including chains, synthesizers, and
+predictors) with task-qualified OpenAI `data` descriptors, preserving distinct
+roles and deduplicating each model/task pair.
+Predictor schema discovery has an
+additional five-second family ceiling and queries at most sixteen distinct
+transports. Prediction-capable Antfly connections participate alongside alias
+transports. Their schemas retain the same `connections/<id>/models/<model>`
+identities used by general discovery and proxy capability leases.
 
 `X-Request-Id` identifies the gateway invocation;
 `X-Antfly-Upstream-Request-Id` preserves upstream correlation when supplied.
@@ -185,6 +224,13 @@ provider token usage when present. Prompts, media, tool arguments, secrets and
 billing estimates are excluded. Refusals have a distinct `DecisionRefused` code;
 abstention and empty selections retain their decision semantics.
 
+Streaming telemetry shares SSE event framing with session rewriting, including
+multiline data and CR/LF line endings, and reuses bounded JSON parsing storage
+for each attempt. Oversized usage records are omitted from telemetry while their response bytes
+continue downstream. Worker audio reads run in cancellable tasks, so deadlines,
+cancellation, and response events remain active while a client is idle. Cleanup
+joins the reader before releasing the request.
+
 ## Session affinity
 
 A transcription session is bound to its authenticated credential, one gateway
@@ -192,15 +238,32 @@ owner, one connection and one proxy endpoint incarnation. Public handles replace
 backend session IDs in ordinary responses and incremental session events.
 Sessions never fail over, including when an endpoint is replaced at the same
 address. JSON and framed audio requests use the same pinned identity; upload
-metadata cannot select another endpoint or model. Unknown or expired handles
-fail closed.
+metadata cannot select another endpoint or model. Framed appends retain their
+attachment content type. Raw `/stream` uploads preserve `format`, `sample_rate`,
+and `commit` and forward bounded audio chunks while returning events before
+upload EOF, through both proxy and gateway, including the local worker boundary.
+Unknown or expired handles
+fail closed. Session lifetime is translated from the backend expiry when
+creation completes, so upstream creation latency does not consume the new
+handle’s remaining lifetime.
+
+Session creation and JSON follow-ups validate upstream envelopes before accessing
+fields or rewriting handles. Malformed successful responses return a gateway
+error and cannot create an affinity handle.
 
 With multiple gateway or proxy replicas, configure sticky routing to the owner
 that created the session, using the returned
 `X-Antfly-Inference-Affinity` handle or a load-balancer affinity cookie. Each
 layer must preserve its own owner. Handles are process-local; there is no implied
 shared session store or recovery after process restart. The bounded owner maps
-hold at most 4096 sessions and discard expired entries. Use a single replica
+hold at most 4096 sessions, including pending creations and handles held by
+in-flight requests. Expiry sweeps skip in-flight handles. Successful audio
+appends and raw streams renew the full idle TTL at completion; polling and
+failed requests do not renew it. Deletion invalidates a handle immediately, and
+stale completions cannot revive it or modify a replacement.
+Creation reserves an unpublished handle before contacting the upstream. Failed
+calls release their reservation; successful calls activate the reserved handle.
+The native owner preallocates publication storage, so activation does not allocate. Use a single replica
 when owner-affinity routing is unavailable.
 
 The proxy serves canonical `/ai/v1/decisions`; `/ai/v1/decide` remains a legacy

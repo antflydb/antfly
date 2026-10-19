@@ -2825,6 +2825,8 @@ export interface InferenceGatewayModel {
   id: string;
   object: "model";
   task?: string;
+  /** Known supported tasks; task is omitted when discovery is ambiguous. */
+  tasks?: string[];
   connection?: string;
   backend_model?: string;
   availability?: string;

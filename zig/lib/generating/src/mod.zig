@@ -79,13 +79,29 @@ pub const ChatMessage = struct {
     responses_output_json: ?[]const u8 = null,
 };
 
+/// Provider-reported token counts. Absence is distinct from a measured zero.
+pub const GenerationUsage = struct {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: ?u64 = null,
+
+    pub fn fromValue(value: std.json.Value, input: []const u8, output: []const u8, total: []const u8) ?GenerationUsage {
+        if (value != .object) return null;
+        return .{ .input_tokens = count(value, input) orelse return null, .output_tokens = count(value, output) orelse return null, .total_tokens = count(value, total) };
+    }
+    fn count(value: std.json.Value, name: []const u8) ?u64 {
+        const number = value.object.get(name) orelse return null;
+        return if (number == .integer and number.integer >= 0) @intCast(number.integer) else null;
+    }
+};
+
 pub const GenerateResult = struct {
     content: []const u8,
     tool_calls: []ToolCall = &.{},
     google_parts_json: ?[]const u8 = null,
     /// Opaque Responses output items, replayed only by Responses adapters.
     responses_output_json: ?[]const u8 = null,
-    usage: ?struct { input_tokens: u64, output_tokens: u64 } = null,
+    usage: ?GenerationUsage = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {
@@ -625,8 +641,12 @@ pub fn getDefaultChain(alloc: std.mem.Allocator) ![]ChainLink {
 /// Rich generation retains the validated wire options and genuine stream
 /// callbacks. Completed-only adapters leave this entrypoint absent explicitly.
 pub const ChatRequest = struct {
+    pub const Operation = enum { chat_completions, generate };
     messages: []const ChatMessage,
     body_json: []const u8,
+    /// Preserve the public operation for Antfly hops; vendor adapters continue
+    /// using their chat endpoint for the common subset.
+    operation: Operation = .chat_completions,
     stream: ?ChatStream = null,
 };
 pub const ChatStream = struct {

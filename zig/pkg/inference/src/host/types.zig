@@ -24,6 +24,7 @@ pub const MediaContent = generating.MediaContent;
 pub const ContentPart = generating.ContentPart;
 pub const ChatMessageContent = generating.ChatMessageContent;
 pub const ToolCall = generating.ToolCall;
+pub const GenerationUsage = generating.GenerationUsage;
 pub const ChatMessage = generating.ChatMessage;
 
 /// Request-scoped local generation controls. Keep these in the provider
@@ -365,6 +366,7 @@ pub const SparseEmbedResult = struct {
 
 pub const GenerateResult = struct {
     content: []const u8,
+    usage: ?GenerationUsage = null,
     tool_calls: []ToolCall = &.{},
     google_parts_json: ?[]const u8 = null,
     allocator: std.mem.Allocator,

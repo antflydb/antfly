@@ -38,6 +38,7 @@ const runtime_memory_abi = @import("runtime_memory_abi");
 const backups_api = @import("backups.zig");
 
 const Allocator = std.mem.Allocator;
+const RequestContext = @import("antfly_inference_execution_context").RequestContext;
 
 pub const ConnectionKind = enum {
     inference,
@@ -244,6 +245,13 @@ pub fn invokeInferenceConnection(
     return invokeInferenceConnectionWithMethod(alloc, http, node_config, local_target, secret_store, connection_id, operation, body, cancellation, deadline_ns, stream, .post);
 }
 
+/// Request transport metadata is separate from operation identity and JSON.
+pub const InvocationRequest = struct {
+    content_type: []const u8 = "application/json",
+    query: ?[]const u8 = null,
+    body_source: runtime_http_abi.RequestBodySource = .{},
+};
+
 pub fn invokeInferenceConnectionWithMethod(
     alloc: Allocator,
     http: ?*httpx.Client,
@@ -257,6 +265,24 @@ pub fn invokeInferenceConnectionWithMethod(
     deadline_ns: u64,
     stream: runtime_http_abi.StreamSink,
     method: runtime_http_abi.HttpMethod,
+) !InvokeResult {
+    return invokeInferenceConnectionWithRequest(alloc, http, node_config, local_target, secret_store, connection_id, operation, body, cancellation, deadline_ns, stream, method, .{});
+}
+
+pub fn invokeInferenceConnectionWithRequest(
+    alloc: Allocator,
+    http: ?*httpx.Client,
+    node_config: ?*const common_config.Config,
+    local_target: ?LocalInferenceConnectionTarget,
+    secret_store: ?*common_secrets.FileStore,
+    connection_id: []const u8,
+    operation: []const u8,
+    body: []const u8,
+    cancellation: ?httpx.CancellationToken,
+    deadline_ns: u64,
+    stream: runtime_http_abi.StreamSink,
+    method: runtime_http_abi.HttpMethod,
+    request: InvocationRequest,
 ) !InvokeResult {
     const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
     if (resolved == .local) {
@@ -286,6 +312,9 @@ pub fn invokeInferenceConnectionWithMethod(
             .stream = stream,
             .out_response = &response,
             .method = method,
+            .query = .init(request.query),
+            .content_type = .init(request.content_type),
+            .body_source = request.body_source,
         });
         if (!status.isOk()) {
             response.deinit(&abi_alloc);
@@ -310,7 +339,9 @@ pub fn invokeInferenceConnectionWithMethod(
     const base = std.mem.trimEnd(u8, raw_url, "/");
     const prefix = try inferenceApiBaseAlloc(alloc, remote);
     defer alloc.free(prefix);
-    const url = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "{s}/ml/v1/{s}", .{ std.mem.trimEnd(u8, base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/ai/v1")) @as(usize, 6) else 0)], "/"), operation[3..] }) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
+    const operation_url = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "{s}/ml/v1/{s}", .{ std.mem.trimEnd(u8, base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/ai/v1")) @as(usize, 6) else 0)], "/"), operation[3..] }) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
+    defer alloc.free(operation_url);
+    const url = if (request.query) |query| try std.fmt.allocPrint(alloc, "{s}?{s}", .{ operation_url, query }) else try alloc.dupe(u8, operation_url);
     defer alloc.free(url);
 
     const resolved_key = try resolveInferenceApiKey(alloc, secret_store, remote.api_key);
@@ -322,10 +353,10 @@ pub fn invokeInferenceConnectionWithMethod(
     defer alloc.free(timeout_header);
     const headers = if (auth) |value| &[_][2][]const u8{
         .{ "Authorization", value },
-        .{ "Content-Type", "application/json" },
+        .{ "Content-Type", request.content_type },
         .{ "X-Antfly-Inference-Attempts-Remaining", "1" },
         .{ "X-Antfly-Inference-Timeout-Ms", timeout_header },
-    } else &[_][2][]const u8{ .{ "Content-Type", "application/json" }, .{ "X-Antfly-Inference-Attempts-Remaining", "1" }, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header } };
+    } else &[_][2][]const u8{ .{ "Content-Type", request.content_type }, .{ "X-Antfly-Inference-Attempts-Remaining", "1" }, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header } };
     if (stream.start != null and stream.write != null and stream.close != null) {
         var writer = @import("antfly_local_sources").common_provider_registry.tasks.StreamWriter{ .sink = stream };
         var response = try (http orelse return error.InferenceTransportUnavailable).requestToWriter(switch (method) {
@@ -336,7 +367,8 @@ pub fn invokeInferenceConnectionWithMethod(
             .patch => .PATCH,
         }, url, .{
             .headers = headers,
-            .body = body,
+            .borrowed_body = if (request.body_source.read == null) body else null,
+            .body_stream = if (request.body_source.read != null) .{ .context = @constCast(&request.body_source), .read = readInvocationBody } else null,
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
             .max_retries = 0,
@@ -380,6 +412,22 @@ pub fn invokeInferenceConnectionWithMethod(
         .retry_after = retry_after,
         .content_type = content_type,
     };
+}
+
+fn readInvocationBody(raw: *anyopaque, dest: []u8) !usize {
+    const source: *const runtime_http_abi.RequestBodySource = @ptrCast(@alignCast(raw));
+    var count: usize = 0;
+    switch (source.read.?(source.context, dest.ptr, dest.len, &count)) {
+        .ok => {},
+        .canceled => return error.Canceled,
+        .timeout => return error.Timeout,
+        .body_too_large => return error.BodyTooLarge,
+        .body_capacity_exceeded => return error.BodyCapacityExceeded,
+        .end_of_stream => return 0,
+        .failed => return error.BodyReadFailed,
+    }
+    if (count > dest.len) return error.BodyReadFailed;
+    return count;
 }
 
 pub fn inferenceInvocationDeadlineNs() u64 {
@@ -510,6 +558,8 @@ pub const Sources = struct {
 };
 
 pub const BuildOptions = struct {
+    /// One caller-owned lifetime covers cache waits and every model-list job.
+    request_context: ?RequestContext = null,
     include_models: bool = false,
     refresh: bool = false,
     cached_err_name: ?[]const u8 = null,
@@ -671,15 +721,41 @@ const ModelsJob = struct {
     refresh: bool = false,
     cached_err_name: ?[]const u8 = null,
     io: ?std.Io = null,
+    request_context: ?RequestContext = null,
 
     fn run(job: *ModelsJob) std.Io.Cancelable!void {
+        job.runControlled() catch |err| {
+            job.err = err;
+        };
+    }
+
+    fn check(job: *const ModelsJob) !void {
+        if (job.request_context) |context| try context.check();
+    }
+
+    fn cancelled(raw: *const anyopaque) bool {
+        const job: *const ModelsJob = @ptrCast(@alignCast(raw));
+        job.check() catch return true;
+        return false;
+    }
+
+    fn runControlled(job: *ModelsJob) !void {
+        try job.check();
         const alloc = job.arena_state.allocator();
         const key_lock = if (job.io) |io|
             if (job.cache) |cache| .{ .lock = cache.keyLock(job.cache_key), .io = io } else null
         else
             null;
-        if (key_lock) |guard| guard.lock.lockUncancelable(guard.io);
+        if (key_lock) |guard| {
+            if (job.request_context != null) {
+                while (!guard.lock.tryLock()) {
+                    try job.check();
+                    try guard.io.sleep(.fromMilliseconds(5), .awake);
+                }
+            } else try guard.lock.lock(guard.io);
+        }
         defer if (key_lock) |guard| guard.lock.unlock(guard.io);
+        try job.check();
         if (job.cache) |cache| {
             const now = platform_time.monotonicNs();
             if (cache.lookupCopy(alloc, job.cache_key, now, job.ttl_ns) catch null) |entry| {
@@ -697,9 +773,16 @@ const ModelsJob = struct {
         var fallback_io_impl: ?std.Io.Threaded = if (job.io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
         defer if (fallback_io_impl) |*io_impl| io_impl.deinit();
         const io = job.io orelse fallback_io_impl.?.io();
-        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        var client = httpx.Client.initWithConfig(alloc, io, .{
+            .keep_alive = false,
+            .retry_policy = .{ .max_retries = 0 },
+            .request_cancellation = if (job.request_context != null) httpx.CancellationToken.fromCallback(job, cancelled) else null,
+        });
         defer client.deinit();
-        job.result = list_models.listModels(alloc, &client, job.ep, job.timeout_ms) catch |err| {
+        const timeout_ms = if (job.request_context) |context| @min(if (job.timeout_ms == 0) @as(u64, 5000) else job.timeout_ms, (try context.remainingTimeoutMs()) orelse job.timeout_ms) else job.timeout_ms;
+        job.result = list_models.listModels(alloc, &client, job.ep, timeout_ms) catch |err| {
+            // A caller deadline/cancellation says nothing about provider health.
+            try job.check();
             job.err = err;
             if (job.cache) |cache| cache.store(job.cache_key, .{
                 .captured_at_ns = platform_time.monotonicNs(),
@@ -708,6 +791,7 @@ const ModelsJob = struct {
             }) catch {};
             return;
         };
+        try job.check();
         if (job.cache) |cache| cache.store(job.cache_key, .{
             .captured_at_ns = platform_time.monotonicNs(),
             .ok = true,
@@ -723,6 +807,7 @@ pub fn buildConnectionsResponse(
     cache: ?*Cache,
     opts: BuildOptions,
 ) !ConnectionsResponse {
+    if (opts.request_context) |context| try context.check();
     var kinds: std.EnumSet(ConnectionKind) = .full;
     if (opts.types_filter) |filter| kinds = parseKindFilter(filter);
     const effective_opts = opts;
@@ -777,6 +862,7 @@ pub fn buildConnectionsResponse(
             });
         }
     };
+    if (opts.request_context) |context| try context.check();
     return .{ .connections = connections.items };
 }
 
@@ -1209,8 +1295,10 @@ fn resolveModels(
 
     // Pending live fetches after cache lookups and local fast paths.
     var pending = std.ArrayListUnmanaged(struct { index: usize, job: *ModelsJob }).empty;
+    defer for (pending.items) |item| item.job.arena_state.deinit();
 
     for (instances, 0..) |instance, i| {
+        if (opts.request_context) |context| try context.check();
         if (instance.provider == .mock) {
             const result = try list_models.listModels(arena, undefined, .{ .provider = .mock }, opts.timeout_ms);
             outcomes[i] = .{ .ok = true, .models = result.models };
@@ -1277,6 +1365,7 @@ fn resolveModels(
             .ttl_ns = opts.ttl_ns,
             .refresh = opts.refresh,
             .io = sources.network_io,
+            .request_context = opts.request_context,
         };
         try pending.append(arena, .{ .index = i, .job = job });
     }
@@ -1288,9 +1377,11 @@ fn resolveModels(
     const max_workers = @min(@max(opts.max_workers, 1), 64);
     var offset: usize = 0;
     while (offset < pending.items.len) {
+        if (opts.request_context) |context| try context.check();
         const end = @min(pending.items.len, offset + max_workers);
         if (sources.network_io) |io| {
             var group: std.Io.Group = .init;
+            defer group.cancel(io);
             for (pending.items[offset..end]) |item| {
                 group.concurrent(io, ModelsJob.run, .{item.job}) catch |err| {
                     item.job.err = err;
@@ -1304,9 +1395,9 @@ fn resolveModels(
         }
         offset = end;
     }
+    if (opts.request_context) |context| try context.check();
 
     for (pending.items) |item| {
-        const instance = instances[item.index];
         var outcome: ModelsOutcome = undefined;
         if (item.job.result) |result| {
             // Copy out of the job arena into the response arena.
@@ -1323,19 +1414,7 @@ fn resolveModels(
         } else {
             outcome = .{ .ok = false, .err_name = item.job.cached_err_name orelse @errorName(item.job.err orelse error.Unknown) };
         }
-        item.job.arena_state.deinit();
         outcomes[item.index] = outcome;
-
-        if (cache) |c| {
-            c.store(instance.key, .{
-                .captured_at_ns = now_ns,
-                .ok = outcome.ok,
-                .err_name = @constCast(outcome.err_name),
-                .models = @constCast(outcome.models),
-            }) catch |err| {
-                std.log.warn("connections: cache store failed err={}", .{err});
-            };
-        }
     }
 
     return outcomes;
@@ -2388,4 +2467,95 @@ test "httpx inference gateway transcription API bases retain explicit mount path
         defer a.free(base);
         try std.testing.expectEqualStrings(case.expected, base);
     }
+}
+
+test "httpx inference gateway discovery lock waits honor caller lifetime without poisoning cache" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const lock = cache.keyLock("deadline-test");
+    try lock.lock(io);
+    defer lock.unlock(io);
+    var job: ModelsJob = .{
+        .ep = .{ .provider = .mock },
+        .timeout_ms = 5000,
+        .arena_state = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .cache = &cache,
+        .cache_key = "deadline-test",
+        .io = io,
+        .request_context = .{ .io = io, .deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_ms },
+    };
+    defer job.arena_state.deinit();
+    try std.testing.expectError(error.Timeout, job.runControlled());
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+    job.request_context.?.deadline_ns = null;
+    job.request_context.?.cancellation = .{ .ptr = &job, .is_cancelled_fn = struct {
+        fn cancelled(_: *const anyopaque) bool {
+            return true;
+        }
+    }.cancelled };
+    try std.testing.expectError(error.Cancelled, job.runControlled());
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+    // Vertex performs credential discovery before its model GET. The shared
+    // cancellation must reach that phase too, before reading credentials.
+    var cancelled = std.atomic.Value(bool).init(true);
+    var client = httpx.Client.initWithConfig(std.testing.allocator, io, .{ .request_cancellation = httpx.CancellationToken.fromAtomic(&cancelled) });
+    defer client.deinit();
+    try std.testing.expectError(error.Cancelled, list_models.listModels(std.testing.allocator, &client, .{
+        .provider = .vertex,
+        .project_id = "test-project",
+        .credentials_path = "/missing/discovery-credentials.json",
+    }, 5000));
+}
+
+test "httpx inference gateway native decision inventory retains its task independently of classifiers" {
+    var result = try list_models.parseAntflyModels(std.testing.allocator,
+        \\{"deciders":{"shared":{}},"classifiers":{"shared":{}},"embedders":{"embedding":{"dimensions":32}}}
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), result.models.len);
+    var deciders: usize = 0;
+    var classifiers: usize = 0;
+    for (result.models) |model| {
+        if (model.kind == .decider) {
+            try std.testing.expectEqualStrings("deciders", model.kind.groupKey());
+            try std.testing.expectEqualStrings("shared", model.name);
+            deciders += 1;
+        }
+        if (model.kind == .classifier) classifiers += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), deciders);
+    try std.testing.expectEqual(@as(usize, 1), classifiers);
+}
+
+test "httpx inference gateway remote dimension metadata cannot overflow its public type" {
+    var result = try list_models.parseAntflyModels(std.testing.allocator,
+        \\{"embedders":{"valid":{"dimensions":32},"max":{"dimensions":4294967295},"overflow":{"dimensions":4294967296},"huge":{"dimensions":9223372036854775807},"zero":{"dimensions":0},"negative":{"dimensions":-1}}}
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 6), result.models.len);
+    for (result.models) |model| {
+        if (std.mem.eql(u8, model.name, "valid")) {
+            try std.testing.expectEqual(@as(?u32, 32), model.dimensions);
+        } else if (std.mem.eql(u8, model.name, "max")) {
+            try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), model.dimensions);
+        } else try std.testing.expectEqual(@as(?u32, null), model.dimensions);
+    }
+}
+
+test "httpx inference gateway discovers remote chains synthesis and data only task roles" {
+    var result = try list_models.parseAntflyModels(std.testing.allocator,
+        \\{"chains":{"chains/fallback":{}},"synthesizers":{"synthesizers/voice":{}},
+        \\ "data":[{"id":"chains/fallback","task":"generate"},
+        \\ {"id":"synthesizers/voice","task":"synthesize"},
+        \\ {"id":"multi","tasks":["generate","embed"]}]}
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), result.models.len);
+    try std.testing.expectEqualStrings("chains", result.models[0].kind.groupKey());
+    try std.testing.expectEqualStrings("synthesizers", result.models[1].kind.groupKey());
+    try std.testing.expectEqualStrings("generators", result.models[2].kind.groupKey());
+    try std.testing.expectEqualStrings("embedders", result.models[3].kind.groupKey());
 }

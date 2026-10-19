@@ -1276,3 +1276,19 @@ func TestClient_Generate_PreservesUnifiedAuthAndRemoteContentErrors(t *testing.T
 		})
 	}
 }
+
+func TestGenerateResponsePreservesUnknownAndMeasuredUsage(t *testing.T) {
+	for _, usage := range []string{"null", `{"prompt_tokens":2,"completion_tokens":1,"total_tokens":5}`} {
+		t.Run(usage, func(t *testing.T) {
+			body := `{"id":"generation","object":"chat.completion","created":1,"model":"google","choices":[],"usage":` + usage + `}`
+			var response oapi.InferenceGenerateResponse
+			require.NoError(t, json.Unmarshal([]byte(body), &response))
+			if usage == "null" {
+				require.Nil(t, response.Usage)
+			} else {
+				require.NotNil(t, response.Usage)
+				require.Equal(t, 5, response.Usage.TotalTokens)
+			}
+		})
+	}
+}

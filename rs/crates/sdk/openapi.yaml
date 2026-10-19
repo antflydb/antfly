@@ -12248,6 +12248,70 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+  /ml/v1/predictors:
+    get:
+      operationId: listGatewayPredictors
+      summary: List predictor feature schemas through the gateway
+      responses:
+        '200':
+          description: Predictor schemas keyed by callable model ID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferencePredictorsResponse'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/synthesize:
+    post:
+      operationId: synthesizeSpeech
+      summary: Synthesize speech using a named text-to-speech configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceSynthesisRequest'
+      responses:
+        '200':
+          description: Synthesized audio in the requested format; usage is reported only when supplied
+            by the provider.
+          content:
+            audio/mpeg:
+              schema:
+                type: string
+                format: binary
+            audio/wav:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid or unsupported synthesis options
+        '502':
+          description: Upstream synthesis failure
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /extensions/v1/packages:
     get:
       tags:
@@ -14780,6 +14844,9 @@ components:
             - $ref: '#/components/schemas/CohereEmbedderConfig'
             - $ref: '#/components/schemas/AntflyEmbedderConfig'
         - properties:
+            sparse:
+              type: boolean
+              description: This named embedder produces sparse index/value vectors.
             rate_limit:
               x-go-type-skip-optional-pointer: false
               $ref: '#/components/schemas/RateLimitConfig'
@@ -15125,6 +15192,9 @@ components:
         - reader
         - transcriber
         - extractor
+        - decider
+        - synthesizer
+        - predictor
         - other
       description: >
         Model task type. Mirrors the inference registry taxonomy; "other" is
@@ -15140,6 +15210,15 @@ components:
         name:
           type: string
           description: Model identifier as reported by the provider.
+        id:
+          type: string
+          description: Canonical public gateway identity when available.
+        availability:
+          type: string
+          description: Availability observation independent of capability support.
+        freshness:
+          type: string
+          description: Whether metadata is configured, live, or cached.
         display_name:
           type: string
           description: Human-readable model name when the provider reports one.
@@ -15159,7 +15238,8 @@ components:
           $ref: '#/components/schemas/InferenceProviderType'
         url:
           type: string
-          description: Resolved endpoint URL when applicable.
+          description: Transport endpoint. Omitted from public inference discovery to keep server-owned
+            URLs private.
         region:
           type: string
           description: Cloud region (Bedrock).
@@ -37028,7 +37108,6 @@ components:
         - object
         - data
         - model
-        - usage
       properties:
         model_identity:
           type: string
@@ -37313,7 +37392,6 @@ components:
         - object
         - data
         - model
-        - usage
       properties:
         object:
           type: string
@@ -37514,7 +37592,6 @@ components:
         - object
         - data
         - model
-        - usage
       properties:
         object:
           type: string
@@ -37571,6 +37648,10 @@ components:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for
+            transcribe, on for dictate).
         diarization:
           type: boolean
           description: Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`)
@@ -37582,7 +37663,6 @@ components:
         - object
         - data
         - model
-        - usage
       properties:
         object:
           type: string
@@ -37672,6 +37752,10 @@ components:
           type: string
           description: Force the transcript language (ISO 639-1). Omit for automatic detection.
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for
+            transcribe, on for dictate).
         cleanup_model:
           type: string
           description: Generator model from models_dir/generators/ that rewrites the transcript. Omit
@@ -37780,7 +37864,6 @@ components:
         - model
         - transcript
         - text
-        - usage
       properties:
         object:
           type: string
@@ -38716,7 +38799,6 @@ components:
         - created
         - model
         - choices
-        - usage
       properties:
         id:
           type: string
@@ -38740,7 +38822,11 @@ components:
             $ref: '#/components/schemas/InferenceGenerateChoice'
           description: List of completion choices (currently always 1)
         usage:
-          $ref: '#/components/schemas/InferenceGenerateUsage'
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          description: Provider-reported token usage, or null when the provider does not supply it.
+          allOf:
+            - $ref: '#/components/schemas/InferenceGenerateUsage'
         speculation:
           x-go-type-skip-optional-pointer: false
           nullable: true
@@ -39737,6 +39823,34 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used
+    InferenceSynthesisRequest:
+      type: object
+      required:
+        - model
+        - text
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+          description: Canonical synthesizers/name target or qualified connection model.
+        text:
+          type: string
+          minLength: 1
+        voice:
+          type: string
+        format:
+          type: string
+          enum:
+            - mp3
+            - wav
+            - opus
+            - aac
+            - flac
+            - pcm
+        speed:
+          type: number
+          minimum: 0.25
+          maximum: 4
     PackageKind:
       type: string
       enum:

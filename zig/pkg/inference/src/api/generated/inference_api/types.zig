@@ -2536,8 +2536,28 @@ pub const GenerateResponse = struct {
     model: []const u8,
     /// List of completion choices (currently always 1)
     choices: []const GenerateChoice,
-    usage: GenerateUsage,
+    /// Provider-reported token usage, or null when the provider does not supply it.
+    usage: ?GenerateUsage,
     speculation: OpenApiOptionalNullable(GenerateSpeculationStatus) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "choices", "choices", false },
+        .{ "usage", "usage", false },
+        .{ "speculation", "speculation", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();

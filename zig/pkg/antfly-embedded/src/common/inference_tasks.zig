@@ -73,7 +73,7 @@ pub const Executor = struct {
         return generator.generate(a, cfg.model, messages);
     }
 
-    pub fn chat(self: Executor, a: std.mem.Allocator, name: []const u8, messages: []const generating.ChatMessage, overrides: GenerationOptions, request: Json, sink: @import("antfly_runtime_abi").http_abi.StreamSink) !@import("antfly_generating").ChatResponse {
+    pub fn chat(self: Executor, a: std.mem.Allocator, name: []const u8, messages: []const generating.ChatMessage, overrides: GenerationOptions, request: Json, operation: @import("antfly_generating").ChatRequest.Operation, sink: @import("antfly_runtime_abi").http_abi.StreamSink) !@import("antfly_generating").ChatResponse {
         var cfg = try self.generatorConfig(a, name);
         cfg = try withGenerationOptions(cfg, overrides);
         const body = try chatBody(a, cfg, request);
@@ -119,7 +119,7 @@ pub const Executor = struct {
                 try check(target.close.?(target.context));
             }
         };
-        return generator.chat(a, .{ .messages = messages, .body_json = body, .stream = if (sink.start != null) .{ .context = &borrowed, .start = Forwarder.start, .write = Forwarder.write, .close = Forwarder.close } else null });
+        return generator.chat(a, .{ .messages = messages, .body_json = body, .operation = operation, .stream = if (sink.start != null) .{ .context = &borrowed, .start = Forwarder.start, .write = Forwarder.write, .close = Forwarder.close } else null });
     }
 
     pub fn decide(self: Executor, a: std.mem.Allocator, name: []const u8, input: []const u8, questions: Json) !Json {

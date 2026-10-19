@@ -38822,7 +38822,11 @@ components:
             $ref: '#/components/schemas/InferenceGenerateChoice'
           description: List of completion choices (currently always 1)
         usage:
-          $ref: '#/components/schemas/InferenceGenerateUsage'
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          description: Provider-reported token usage, or null when the provider does not supply it.
+          allOf:
+            - $ref: '#/components/schemas/InferenceGenerateUsage'
         speculation:
           x-go-type-skip-optional-pointer: false
           nullable: true
