@@ -37347,10 +37347,31 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         for (waves.vectors) |vector| for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
         std.debug.print("embeddinggemma2 audio_wave_schedule clips=6 gate_validation=true parity=true\n", .{});
     }
+    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_COMPACT_FFN")) {
+        const architecture = @import("../architectures/embedding_gemma2.zig");
+        const control = node.extractionExecutionControl(null);
+        const gate = loaded.embeddingExecutionLock();
+        if (gate) |mutex| try control.lock(mutex);
+        defer if (gate) |mutex| mutex.unlock();
+        var managed = try session_factory.getManagedComputeBackend(loaded.session, a, null, control);
+        defer managed.deinit();
+        const cb = &managed.backend;
+        const cfg = session_factory.getEmbeddingGemma2Config(loaded.session).?;
+        try architecture.qualifyCompactPooled(cb, a, cfg);
+        try architecture.qualifyTiledFFN(cb, a, cfg);
+    }
     if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_PREPARED_EXECUTION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_FOLLOWUP"))) {
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
             extern "c" fn unsetenv([*:0]const u8) c_int;
+            fn mediaCounters(allocator: std.mem.Allocator, loaded_model: anytype, control: anytype) ![2]u64 {
+                if (comptime !@import("build_options").enable_metal) return @splat(0);
+                var managed = try session_factory.getManagedComputeBackend(loaded_model.session, allocator, null, control);
+                defer managed.deinit();
+                const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(managed.backend.ptr));
+                const state = compute.provider_impl.embedding_bindings orelse return @splat(0);
+                return .{ state.template_hits, state.compose_dispatches };
+            }
             fn median(values: [12]u64) u64 {
                 var sorted = values;
                 std.mem.sort(u64, &sorted, {}, std.sort.asc(u64));
@@ -37386,7 +37407,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                 _ = Env.unsetenv(arena_flag);
             }
         }
-        const components = [_][]const u8{ "all", "workspace", "packed_qkv", "head", "templates" };
+        const components = [_][]const u8{ "all", "workspace", "packed_qkv", "head", "templates", "resident_templates" };
         const component_flags = [_][*:0]const u8{ "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_WORKSPACE", "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV", "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD", "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES" };
         var saved_flags: [4]?[:0]u8 = @splat(null);
         defer for (component_flags, saved_flags) |flag, saved| {
@@ -37402,6 +37423,8 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         };
         const component_count: usize = if (only_followup and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_COMPONENTS")) components.len else 1;
         for (components[0..component_count]) |component| {
+            const resident_api = std.mem.eql(u8, component, "resident_templates");
+            const route_before = if (resident_api) try Env.mediaCounters(a, loaded, node.extractionExecutionControl(null)) else @as([2]u64, @splat(0));
             var singleton: [2][12]u64 = undefined;
             var cohort: [2][12]u64 = undefined;
             // Pair routes per iteration (AB/BA), reversing on the next round.
@@ -37412,13 +37435,18 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                 try std.testing.expect(Env.setenv(backbone_flag, if (!only_followup and route == 0) "1" else "0", 1) == 0);
                 try std.testing.expect(Env.setenv(arena_flag, if (!only_followup and route == 0) "1" else "0", 1) == 0);
                 try std.testing.expect(Env.setenv(followup_flag, if (only_followup and route == 0) "1" else "0", 1) == 0);
-                for (component_flags, components[1..]) |flag, feature| {
-                    const disabled = only_followup and route != 0 and !std.mem.eql(u8, component, "all") and !std.mem.eql(u8, component, feature);
+                for (component_flags, components[1..5]) |flag, feature| {
+                    const disabled = only_followup and route != 0 and !std.mem.eql(u8, component, "all") and !std.mem.eql(u8, if (resident_api) "templates" else component, feature);
                     try std.testing.expect(Env.setenv(flag, if (disabled) "1" else "0", 1) == 0);
                 }
                 {
                     const start = platform.time.monotonicNs();
-                    const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                    const result = if (resident_api) resident: {
+                        const audio_result = try grouped.embedAudios(a, loaded.session, loaded.getTokenizer(), &.{.{ .bytes = audio_bytes }}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                        defer a.free(audio_result.vectors);
+                        defer a.free(audio_result.input_tokens);
+                        break :resident grouped.Result{ .vector = audio_result.vectors[0], .input_tokens = audio_result.input_tokens[0] };
+                    } else try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
                     defer a.free(result.vector);
                     const elapsed = platform.time.monotonicNs() -| start;
                     for (result.vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
@@ -37426,7 +37454,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                 }
                 {
                     const start = platform.time.monotonicNs();
-                    const result = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
+                    const result = if (resident_api) try grouped.embedAudios(a, loaded.session, loaded.getTokenizer(), &.{ .{ .bytes = audio_bytes }, .{ .bytes = audio_bytes } }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors) else try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
                     defer {
                         freeDirectDenseVectors(a, result.vectors);
                         a.free(result.input_tokens);
@@ -37439,6 +37467,12 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                     if (iteration >= 14) cohort[route][round * 6 + iteration - 14] = elapsed;
                 }
             };
+            if (resident_api) {
+                const after = try Env.mediaCounters(a, loaded, node.extractionExecutionControl(null));
+                try std.testing.expect(after[0] > route_before[0]);
+                try std.testing.expect(after[1] > route_before[1]);
+                std.debug.print("embeddinggemma2 resident_template_route template_hits={d} compose_dispatches={d}\n", .{ after[0] - route_before[0], after[1] - route_before[1] });
+            }
             std.debug.print("embeddinggemma2 {s} old_singleton_ns={d} new_singleton_ns={d} old_cohort_ns={d} new_cohort_ns={d} samples=12 parity=true component={s}\n", .{ if (only_followup) "metal_followup_execution" else "prepared_execution", Env.median(singleton[0]), Env.median(singleton[1]), Env.median(cohort[0]), Env.median(cohort[1]), component });
         }
     }

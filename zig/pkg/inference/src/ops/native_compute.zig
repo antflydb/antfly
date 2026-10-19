@@ -36439,16 +36439,17 @@ fn embeddingHeadPrepareOp(ctx: *anyopaque, input: CT, weight: ?CT, gather: ?CT, 
     defer self.allocator.free(positions);
     for (0..p.rows) |row| {
         if (self.io) |io| try io.checkCancel();
-        const src_row = if (ids) |values| blk: {
+        const index = if (ids) |values| blk: {
             const value = values[row];
-            if (!std.math.isFinite(value) or value < 0 or value >= @as(f32, @floatFromInt(p.source_rows)) or @trunc(value) != value) return error.InvalidTensorShape;
+            if (!std.math.isFinite(value) or value < 0 or value >= @as(f32, @floatFromInt(if (p.gather == 2) p.sequence else p.source_rows)) or @trunc(value) != value) return error.InvalidTensorShape;
             break :blk @as(usize, @intFromFloat(value));
         } else row;
+        const src_row = if (p.gather == 2) row else index;
         if (src_row >= p.source_rows) return error.InvalidTensorShape;
         for (0..p.heads) |h| {
             const src = src_row * p.stride + p.start + h / (p.heads / p.source_heads) * p.dim;
             @memcpy(out[(row * p.heads + h) * p.dim ..][0..p.dim], source[src..][0..p.dim]);
-            if (p.rotate != 0) positions[row * p.heads + h] = src_row % p.sequence;
+            if (p.rotate != 0) positions[row * p.heads + h] = if (p.gather == 2) index else src_row % p.sequence;
         }
     }
     const ones: [512]f32 = @splat(1);

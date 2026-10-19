@@ -736,9 +736,13 @@ keyed by row count and projection geometry. Six non-overlapping projection
 lifetimes share one range; scratch norms, attention/FFN residuals and alternating
 hidden rows have separate ranges. Normal and global-attention QKV shapes retain
 separate descriptors over the shared projection range. Each layout is capped at
-64 MiB; oversized or denied layouts keep the existing allocation path, and
-transient admission denial retries after eight forward visits. Model pressure
-releases layouts before language matrix slots. Request outputs remain independent.
+64 MiB for full projections. Longer contexts use 512-row projection tiles and
+full-row norm views, capped at 96 MiB and 8192 rows. Denied layouts keep the
+existing allocation path; transient admission denial retries after eight forward
+visits. Model pressure
+releases layouts before language matrix slots. A replacement that lacks spare
+budget reclaims its inactive victim before retrying; encoded or submitted
+consumers prevent reclamation. Request outputs remain independent.
 Unsupported fused-kernel capabilities decline before encoding to the existing
 device path. Reusable private outputs do not retain host readback snapshots;
 planned writes invalidate any mirror populated by a host fallback. These are
@@ -771,3 +775,18 @@ policy for qualification; this policy participates in audio schedule identity.
 `ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_FOLLOWUP=1` adds the completed alternating-route
 comparison to the ReleaseFast pretrained ordered-media oracle, retaining the
 previous prepared bindings and audio arenas on both routes.
+
+Metal pooled inference compacts masked rows before backbone execution. Explicit
+original positions preserve RoPE and sliding windows across holes; per-item
+ranges isolate attention, and segmented pooling restores output order without
+reintroducing padded activations. Token-level outputs retain rectangular layout.
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_ROWS=1` selects the rectangular reference.
+Long-context FFNs project into a reusable 512-row tile and immediately consume
+its GELU product into final product rows, avoiding the full packed gate/up
+activation. Ordinary MPS projections remain the capability fallback.
+
+General mixed-media and video composition also uses compact wrapper lookups and
+indexed composition. A single resident media tensor is consumed directly;
+multiple media tensors are packed once into one admitted request output instead
+of repeatedly concatenating a growing table. Original tokenizer IDs are committed
+to video IDs only after successful composition.

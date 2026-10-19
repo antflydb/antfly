@@ -788,13 +788,14 @@ pub const EmbeddingHeadParams = extern struct {
     stride: u32,
     start: u32,
     rotate: u32,
+    /// 0: identity rows; 1: source row IDs; 2: identity rows, explicit positions.
     gather: u32,
     weighted: u32,
     eps: f32,
     theta: f32,
     scale: f32,
     pub fn validate(self: EmbeddingHeadParams) !void {
-        if (self.source_rows == 0 or self.rows == 0 or self.source_heads == 0 or self.heads == 0 or self.heads % self.source_heads != 0 or self.dim == 0 or self.dim > 512 or self.dim % 2 != 0 or self.sequence == 0 or self.rotate > 1 or self.gather > 1 or self.weighted > 1 or !std.math.isFinite(self.scale) or !std.math.isFinite(self.theta) or self.theta <= 0 or !std.math.isFinite(self.eps) or self.eps <= 0 or @as(usize, self.start) + @as(usize, self.source_heads) * self.dim > self.stride or (self.gather == 0 and self.rows > self.source_rows)) return error.InvalidTensorShape;
+        if (self.source_rows == 0 or self.rows == 0 or self.source_heads == 0 or self.heads == 0 or self.heads % self.source_heads != 0 or self.dim == 0 or self.dim > 512 or self.dim % 2 != 0 or self.sequence == 0 or self.rotate > 1 or self.gather > 2 or self.weighted > 1 or !std.math.isFinite(self.scale) or !std.math.isFinite(self.theta) or self.theta <= 0 or !std.math.isFinite(self.eps) or self.eps <= 0 or @as(usize, self.start) + @as(usize, self.source_heads) * self.dim > self.stride or (self.gather != 1 and self.rows > self.source_rows)) return error.InvalidTensorShape;
     }
 };
 
@@ -2062,6 +2063,7 @@ pub const ComputeBackend = struct {
         embeddingModelVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingModelVisibility = null,
         embeddingWorkspacePrepare: ?*const fn (ctx: *anyopaque, spec: EmbeddingWorkspaceSpec) anyerror!void = null,
         embeddingWorkspaceNorm: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelWeight, input: CT, residual: ?CT, dim: usize, eps: f32, scale: f32) anyerror!?CT = null,
+        maskedMeanSegments: ?*const fn (ctx: *anyopaque, input: CT, offsets: []const usize, width: usize) anyerror!?CT = null,
         maskedMeanBatch: ?*const fn (ctx: *anyopaque, input: CT, mask: ?[]const i64, batch: usize, sequence: usize, width: usize, dimensions: usize, normalize: bool) anyerror!?CT = null,
         embeddingComposeRows: ?*const fn (ctx: *anyopaque, wrappers: ?CT, media: CT, map: []const i32, width: usize) anyerror!?CT = null,
         embeddingMediaTemplate: ?*const fn (ctx: *anyopaque, key: u64, ids: ?[]const i64, mask: ?[]const i64) anyerror!?EmbeddingMediaTemplate = null,
@@ -2099,6 +2101,8 @@ pub const ComputeBackend = struct {
         /// Y = activation(gate) * up for decoder-runtime activation kinds.
         /// Backends may fuse the common gated-FFN activation/multiply pair.
         /// Consume row-packed [gelu gate; up] without materializing either half.
+        /// Optional bounded projection/GELU pipeline; avoids full packed FFN output.
+        embeddingGatedFFN: ?*const fn (ctx: *anyopaque, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize) anyerror!?CT = null,
         packedGeluMultiply: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
         activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
 

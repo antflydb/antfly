@@ -1405,9 +1405,13 @@ keyed by row count and projection geometry. Six non-overlapping projection
 lifetimes share one range; scratch norms, attention/FFN residuals and alternating
 hidden rows have separate ranges. Normal and global-attention QKV shapes retain
 separate descriptors over the shared projection range. Each layout is capped at
-64 MiB; oversized or denied layouts keep the existing allocation path, and
-transient admission denial retries after eight forward visits. Model pressure
-releases layouts before language matrix slots. Request outputs remain independent.
+64 MiB for full projections. Longer contexts use 512-row projection tiles and
+full-row norm views, capped at 96 MiB and 8192 rows. Denied layouts keep the
+existing allocation path; transient admission denial retries after eight forward
+visits. Model pressure
+releases layouts before language matrix slots. A replacement that lacks spare
+budget reclaims its inactive victim before retrying; encoded or submitted
+consumers prevent reclamation. Request outputs remain independent.
 Unsupported fused-kernel capabilities decline before encoding to the existing
 device path. Reusable private outputs do not retain host readback snapshots;
 planned writes invalidate any mirror populated by a host fallback. These are
@@ -1442,21 +1446,64 @@ comparison to the ReleaseFast pretrained ordered-media oracle, retaining the
 previous prepared bindings and audio arenas on both routes.
 
 `ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_COMPONENTS=1` expands the follow-up comparison
-to workspace reuse, packed QKV, the batched head and token templates separately.
+to workspace reuse, packed QKV, the batched head, general composition and a
+separate public-audio template route. The public route asserts increasing
+template-hit and compositor-dispatch counters.
 Diagnostic controls are `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_WORKSPACE`,
 `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV`,
 `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD`, and
 `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES`. Packed-QKV policy also
 participates in audio schedule identity. Controls are restored after qualification.
 
-On an M4 Max, the ReleaseFast ordered-media fixture measured completed median
-singleton latency of 23.089 ms with the previous policy and 22.626 ms with all
-four changes; the two-clip cohort measured 24.956 ms and 24.166 ms respectively
-(about 2% and 3% lower). Each route uses 12 measured samples after warmup, with
-paired AB/BA ordering, GPU completion, readback and reference-vector checks.
-Individual component measurements vary: the batched head and templates slightly
-increased singleton latency in this run while reducing cohort latency. These
-fixture results do not establish broad workload speedups or PyTorch parity.
-Qualification includes 270 passing Metal checks (50 skipped), 35 portable checks
-from a CUDA-enabled Linux build, and the pretrained ordered-media oracle; Linux
-CUDA device execution was not exercised.
+On an M4 Max, completed ReleaseFast median latencies measured:
+
+| Fixture | Reference | Optimized |
+|---|---:|---:|
+| Audio singleton, all execution changes | 23.271 ms | 22.952 ms |
+| Two-clip cohort, all execution changes | 24.834 ms | 24.174 ms |
+| Masked backbone, 512 rectangular / 448 active rows | 34.498 ms | 31.757 ms |
+| 3000-row FFN projection/GELU | 7.616 ms | 7.105 ms |
+| Public audio singleton, template/composition only | 22.901 ms | 22.811 ms |
+| Public two-clip audio, template/composition only | 23.944 ms | 23.946 ms |
+
+Audio comparisons use 12 samples per route after warmup with paired AB/BA order;
+compact and FFN comparisons use seven samples after two warmups. All include GPU
+completion, readback and parity checks. The compact backbone removes 12.5% of rows
+and reduces this fixture's latency about 8%. The FFN replaces a 46.9-MiB packed
+projection with an 8-MiB tile. Public-audio counters establish 120 template hits
+and 80 compositor dispatches during the dedicated comparison. Individual
+component timings vary, and general composition alone slightly increased latency
+in this run; these results do not establish broad workload speedups or PyTorch
+parity. Qualification includes 271 passing Metal checks (51 skipped), 37 portable
+checks from a CUDA-enabled Linux build, and the pretrained ordered-media oracle.
+Linux CUDA device execution was not exercised.
+
+Metal pooled inference compacts masked rows before backbone execution. Explicit
+original positions preserve RoPE and sliding windows across holes; per-item
+ranges isolate attention, and segmented pooling restores output order without
+reintroducing padded activations. Token-level outputs retain rectangular layout.
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_ROWS=1` selects the rectangular reference.
+Long-context FFNs project into a reusable 512-row tile and immediately consume
+its GELU product into final product rows, avoiding the full packed gate/up
+activation. Ordinary MPS projections remain the capability fallback.
+
+General mixed-media and video composition also uses compact wrapper lookups and
+indexed composition. A single resident media tensor is consumed directly;
+multiple media tensors are packed once into one admitted request output instead
+of repeatedly concatenating a growing table. Original tokenizer IDs are committed
+to video IDs only after successful composition.
+
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_COMPACT_FFN=1` adds checkpoint comparisons for
+compact masked execution (including non-finite padding) and a 3000-row tiled
+FFN. `ANTFLY_EMBEDDINGGEMMA2_BENCH_FFN_PRECISION=1` enables the separate
+`BF16 storage candidate completed projection comparison` test. Its exactly
+BF16-representable synthetic weights compare F32 MPS against native BF16 weight
+storage with F32 activations/accumulation at 1, 128 and 512 rows. Both comparisons
+complete GPU work and read back results; serving precision remains unchanged.
+
+
+The BF16 storage candidate measured 0.391 versus 0.561 ms for F32 MPS at one
+row, but 1.247 versus 1.159 ms at 128 rows and 4.226 versus 3.498 ms at 512 rows.
+Although BF16 halves the tested weight payload, it was slower for the measured
+media-sized GEMMs. F32 MPS therefore remains the serving policy. This synthetic
+projection comparison does not qualify a new checkpoint precision recipe.

@@ -35,6 +35,7 @@ pub const State = struct {
     templates: [8]?*Template = @splat(null),
     template_clock: u64 = 0,
     template_hits: u64 = 0,
+    compose_dispatches: u64 = 0,
     pub fn deinit(self: *State) void {
         for (self.workspaces) |entry| if (entry) |workspace| {
             workspace.owner.deinit();
@@ -79,6 +80,7 @@ pub const Geometry = struct {
 pub const Workspace = struct {
     owner: tape.Plan = .{ .host_bytes = @sizeOf(Workspace), .metadata_bytes = @sizeOf(Workspace) },
     spec: ops.EmbeddingWorkspaceSpec,
+    projection_rows: usize,
     stamp: u64,
     views: [12]?ops.CT = @splat(null),
     pub fn projection(kind: ops.EmbeddingModelProjection) ?usize {

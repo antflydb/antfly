@@ -1531,6 +1531,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
     for (ids, tokens.ids[0..count]) |*dest, id| dest.* = id;
     for (mask, tokens.attention_mask[0..count]) |*dest, m| dest.* = m;
     if (media.items.len == 0) return .{ .ids = ids, .mask = mask, .embeddings = null };
+    if (try composeCompactMedia(a, cb, ids, media.items)) |tensor| return .{ .ids = ids, .mask = mask, .embeddings = null, .tensor = tensor, .backend = cb };
     const ew = try cb.getWeight("language_model.embed_tokens.weight");
     defer cb.free(ew);
     const raw = try cb.embeddingLookup(ew, ids, count, 512);
@@ -1572,6 +1573,55 @@ fn compositionRows(a: std.mem.Allocator, ids: []i64, media: []const SoftTokens) 
     }
     if (media_index != media.len or soft_index != 0) return error.InvalidEmbeddingGroup;
     return rows;
+}
+
+/// Compact wrappers and media share the same indexed compositor for single,
+/// mixed and video groups. Multiple media owners are packed once, not by a
+/// sequence of growing concatenations. Preserve tokenizer IDs until success.
+fn composeCompactMedia(a: std.mem.Allocator, cb: *const ComputeBackend, ids: []i64, media: []const SoftTokens) !?CT {
+    if (cb.kind() != .metal or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES")) return null;
+    const compose = cb.vtable.embeddingComposeRows orelse return null;
+    const rewritten = try a.dupe(i64, ids);
+    defer a.free(rewritten);
+    const sources = try compositionRows(a, rewritten, media);
+    defer a.free(sources);
+    const map = try a.alloc(i32, ids.len);
+    defer a.free(map);
+    var wrapper_count: usize = 0;
+    var media_count: usize = 0;
+    for (media) |item| media_count = try std.math.add(usize, media_count, item.tokens);
+    for (sources, map, 0..) |source, *dest, i| {
+        if (source == i) {
+            dest.* = std.math.cast(i32, wrapper_count) orelse return error.InvalidTensorShape;
+            wrapper_count += 1;
+        } else dest.* = -(std.math.cast(i32, @as(usize, @intCast(source)) - ids.len + 1) orelse return error.InvalidTensorShape);
+    }
+    const selected = try a.alloc(i64, wrapper_count);
+    defer a.free(selected);
+    for (sources, ids, 0..) |source, id, i| if (source == i) {
+        selected[@intCast(map[i])] = id;
+    };
+    const weight = try cb.getWeight("language_model.embed_tokens.weight");
+    defer cb.free(weight);
+    const raw: ?CT = if (selected.len > 0) try cb.embeddingLookup(weight, selected, selected.len, 512) else null;
+    defer if (raw) |tensor| cb.free(tensor);
+    const scaled: ?CT = if (raw) |tensor| (try cb.multiplyScalar(tensor, @sqrt(@as(f32, 512)))) orelse return error.ResidentImageOperationUnavailable else null;
+    defer if (scaled) |tensor| cb.free(tensor);
+    const direct = media.len == 1 and media[0].tensor != null;
+    const pixels = if (direct) media[0].tensor.? else (try cb.allocUninitF32Shape(&.{ @intCast(media_count), 512 })) orelse return null;
+    defer if (!direct) cb.free(pixels);
+    if (!direct) {
+        var offset: usize = 0;
+        for (media) |item| {
+            const tensor = item.tensor orelse try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(item.embeddings, &.{ @intCast(item.tokens), 512 }));
+            defer if (item.tensor == null) cb.free(tensor);
+            if (!try cb.copyRows2D(a, pixels, offset, tensor, 0, item.tokens, 512)) return error.ResidentImageOperationUnavailable;
+            offset += item.tokens;
+        }
+    }
+    const result = (try compose(cb.ptr, scaled, pixels, map, 512)) orelse return null;
+    @memcpy(ids, rewritten);
+    return result;
 }
 
 fn composeDeviceTokens(a: std.mem.Allocator, cb: *const ComputeBackend, text: CT, ids: []i64, media: []const SoftTokens) !CT {

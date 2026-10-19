@@ -12476,8 +12476,8 @@ static NSString *termite_metal_shader_source(void) {
            "    output[gid] = source < 0 ? media[uint(-source - 1) * p.y + col] : wrappers[uint(source) * p.y + col];\n"
            "}\n"
            "kernel void antfly_masked_mean_batch(device const float *input [[buffer(0)]], device const long *mask [[buffer(1)]], device float *output [[buffer(2)]], constant uint4 &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    if (gid >= p.z * p.w) return; uint b = gid / p.z, d = gid % p.z; float sum = 0.0f; float count = float(mask[p.x * p.w + b]);\n"
-           "    for (uint r = 0; r < p.x; ++r) if (mask[b * p.x + r] != 0) sum += input[(b * p.x + r) * p.y + d] / count;\n"
+           "    bool segmented = (p.w & 0x80000000u) != 0; uint batch = p.w & 0x7fffffffu; if (gid >= p.z * batch) return; uint b = gid / p.z, d = gid % p.z; uint start = segmented ? uint(mask[2u * b]) : b * p.x, end = segmented ? uint(mask[2u * b + 1u]) : start + p.x; float sum = 0.0f; float count = segmented ? float(end - start) : float(mask[p.x * batch + b]);\n"
+           "    for (uint r = start; r < end; ++r) if (segmented || mask[r] != 0) sum += input[r * p.y + d] / count;\n"
            "    output[gid] = sum;\n"
            "}\n"
            "kernel void termite_masked_mean_rows(device const float *input [[buffer(0)]], device const long *mask [[buffer(1)]], device float *output [[buffer(2)]], constant uint4 &p [[buffer(3)]], uint d [[thread_position_in_grid]]) {\n"
@@ -13779,7 +13779,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_embedding_head_params { uint source_rows, rows, source_heads, heads, dim, sequence, stride, start, rotate, gather, weighted; float eps, theta, scale; };\n"
            "kernel void termite_embedding_head_prepare(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]], device const int *ids [[buffer(2)]], device float *y [[buffer(3)]], constant termite_embedding_head_params &p [[buffer(4)]], uint head [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {\n"
            "    uint row = head / p.heads, h = head % p.heads;\n"
-           "    uint src_row = p.gather ? uint(ids[row]) : row;\n"
+           "    uint src_row = p.gather == 1u ? uint(ids[row]) : row;\n"
            "    uint base = src_row * p.stride + p.start + (h / (p.heads / p.source_heads)) * p.dim;\n"
            "    float sum = 0.0f;\n"
            "    for (uint d = lane; d < p.dim; d += 32u) { float v = x[base + d]; sum += v * v; }\n"
@@ -13789,7 +13789,7 @@ static NSString *termite_metal_shader_source(void) {
            "        float value = x[base + d] * inv * (p.weighted ? w[d] : 1.0f);\n"
            "        if (p.rotate) {\n"
            "            uint left = d % half_dim, right = left + half_dim;\n"
-           "            float frequency = 1.0f / pow(p.theta, float(2u * left) / float(p.dim)); float angle = float(src_row % p.sequence) * frequency;\n"
+           "            float frequency = 1.0f / pow(p.theta, float(2u * left) / float(p.dim)); float angle = float(p.gather == 2u ? uint(ids[row]) : src_row % p.sequence) * frequency;\n"
            "            float a = x[base + left] * inv * (p.weighted ? w[left] : 1.0f);\n"
            "            float b = x[base + right] * inv * (p.weighted ? w[right] : 1.0f);\n"
            "            value = d < half_dim ? a * cos(angle) - b * sin(angle) : a * sin(angle) + b * cos(angle);\n"
@@ -49425,16 +49425,16 @@ int antfly_metal_compose_rows(termite_metal_decode_runtime *runtime, void *wrapp
     }
 }
 
-int antfly_metal_masked_mean_batch(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, const int64_t *mask, size_t rows, size_t width, size_t dimensions, size_t batch, void *output_handle, size_t output_offset, bool normalize) {
-    if (runtime == NULL || runtime->masked_mean_batch_pipeline == nil || input_handle == NULL || output_handle == NULL || mask == NULL || batch == 0 || batch > 64 || rows == 0 || dimensions == 0 || dimensions > width || rows > UINT32_MAX || width > UINT32_MAX || rows > UINT32_MAX / width / batch) return -1;
+int antfly_metal_masked_mean_batch(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, const int64_t *mask, size_t rows, size_t width, size_t dimensions, size_t batch, void *output_handle, size_t output_offset, bool normalize, bool segmented) {
+    if (runtime == NULL || runtime->masked_mean_batch_pipeline == nil || input_handle == NULL || output_handle == NULL || mask == NULL || batch == 0 || batch > 64 || rows == 0 || dimensions == 0 || dimensions > width || rows > UINT32_MAX || width > UINT32_MAX || rows > UINT32_MAX / width / (segmented ? 1 : batch)) return -1;
     if (normalize && (runtime->normalize_embedding_pipeline == nil || runtime->normalize_embedding_pipeline.maxTotalThreadsPerThreadgroup == 0)) return -1;
     @autoreleasepool {
         bool frame_owned = runtime->active_frame_cb == nil;
         id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle, output = (__bridge id<MTLBuffer>)output_handle;
-        const size_t input_bytes = batch * rows * width * sizeof(float), output_bytes = batch * dimensions * sizeof(float);
+        const size_t input_bytes = (segmented ? 1 : batch) * rows * width * sizeof(float), output_bytes = batch * dimensions * sizeof(float);
         if (input_offset > input.length || input_bytes > input.length - input_offset || output_offset > output.length || output_bytes > output.length - output_offset) return -2;
         termite_metal_host_staging_slice staged = { nil, 0 };
-        if (termite_metal_decode_runtime_stage_host_bytes(runtime, mask, (batch * rows + batch) * sizeof(int64_t), frame_owned, &staged) != 0) return -3;
+        if (termite_metal_decode_runtime_stage_host_bytes(runtime, mask, (segmented ? 2 * batch : batch * rows + batch) * sizeof(int64_t), frame_owned, &staged) != 0) return -3;
         id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (cb == nil) return -4;
         termite_metal_planned_encoder_range accesses[2];
@@ -49442,7 +49442,7 @@ int antfly_metal_masked_mean_batch(termite_metal_decode_runtime *runtime, void *
         BOOL owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_EMBEDDING, &owned);
         if (encoder == nil) return -6;
-        uint32_t p[4] = { (uint32_t)rows, (uint32_t)width, (uint32_t)dimensions, (uint32_t)batch };
+        uint32_t p[4] = { (uint32_t)rows, (uint32_t)width, (uint32_t)dimensions, (uint32_t)batch | (segmented ? 0x80000000u : 0u) };
         [encoder setComputePipelineState:runtime->masked_mean_batch_pipeline]; [encoder setBuffer:input offset:input_offset atIndex:0]; [encoder setBuffer:staged.buffer offset:staged.offset atIndex:1]; [encoder setBuffer:output offset:output_offset atIndex:2]; [encoder setBytes:p length:sizeof(p) atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(batch * dimensions, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->masked_mean_batch_pipeline, dimensions), 1, 1)];
         if (normalize) {
