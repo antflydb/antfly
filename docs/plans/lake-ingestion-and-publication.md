@@ -2330,3 +2330,53 @@ Formatting, whitespace, license, Apache boundary, source/control catalog and pin
 compiler engine-error checks passed. `origin/main` is merged through `bdd7bc0113`.
 Archive-scale latency/RSS measurements and live-provider retention qualification
 remain outstanding.
+
+### Configuration cohorts, overlapped batches, and shared aggregate proofs (protocol 58)
+
+Publication schedules configurations rather than one whole family per worker.
+Text and vector configurations, groups of up to eight ordered definitions, and
+up to 64 compatible aggregate recipes become independent scan consumers. At most
+eight consumers enter one cohort; admission accounts for each consumer's workspace
+and its projection. Multiple configurations in one family now consume each active
+file together. Additional cohorts or serial work handle scheduler saturation and
+larger configuration sets without an archive spool. Aggregate contribution lookup,
+root registration, seed discovery and legacy retention synchronize their mutable
+build-local owners when multiple aggregate consumers run together.
+
+When headroom permits, the coordinator produces two independently owned native
+batches while consumers build indexes. These batches preserve physical dictionaries,
+exact decimal coefficients, validity and row identities. Per-frame budgets bound
+ownership; the slowest consumer pins at most two frames. A batch exceeding its
+frame admission falls back to borrowed single-batch backpressure until every
+consumer releases it. Smaller working sets retain the original borrowed path.
+Producer cancellation and departures wake blocked waiters before request owners
+are released. No additional worker slot is needed for the producer.
+
+Aggregate metadata version 5 adds a shared immutable cohort descriptor. It commits
+to each logical root and a bounded immediate-child identity/physical-slot map.
+Readers verify the logical-root commitment on open; roots sharing that descriptor
+fuse without walking descendant directories. Child identity, depth, group count
+and exact recipe/slot compatibility are checked when that child is consumed.
+Different descriptors decline fast fusion; older metadata retains the complete
+recursive proof path, including atomic mismatch handling. Descriptors are reused
+through the ordinary authorized immutable read cache. GC marks their references,
+and reader protocol 58 fences collectors that do not know these new edges.
+
+Qualification includes a seven-consumer real-Parquet regression (two text indexes,
+two aggregate key sets and the other native families), full/tiny queue admission,
+slow-reader skew, cancellation, typed batch fault injection, metadata-only fusion,
+logical-root tampering and recursive GC. A public E2E uses independent delta-encoded
+Parquet, multiple configurations and exact COUNT/SUM state after restart with source
+payloads made unreadable. Archive-scale latency, requests, bytes and peak RSS still
+need measurement before asserting workload speedups.
+
+Protocol 58 qualification passed 321 native and 175 shared external-lake tests
+without failures or leaks. Final focused checks cover owned/borrowed frame
+transitions, undefined NULL payloads, allocation failures, cancellation, reordered
+physical aggregate slots, descriptor tampering, exact recursive sums and GC.
+All 12 selected public HTTP E2Es passed against the final rebuilt server, including
+the new nullable delta-page/multiple-configuration restart flow, independent
+Parquet V1/V2 mixed/NULL-only files, real Iceberg evolution/deletes, signed decimal
+pruning and NUMERIC materializations. The complete stripped Debug server, CLI
+version, formatting, license/Apache boundary, source catalog and pinned Zig 0.17.0
+engine-error catalog checks passed. `origin/main` is merged through `3584896882`.

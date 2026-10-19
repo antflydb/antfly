@@ -395,8 +395,10 @@ pub const Collector = struct {
             .algebraic_segment => {
                 if (!artifacts.supportsMetadataVersion(ref.metadata_version)) return error.InvalidNativeLakeGcReference;
                 if (@import("lake_index_aggregate_artifact.zig").isPartitioned(ref.metadata_version)) {
-                    try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len *| 3);
-                    for (try artifacts.partitionChildren(a, self.store, ref, self.cancellation())) |child| {
+                    try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+                    const references = try artifacts.partitionReferences(a, self.store, ref, self.cancellation());
+                    if (references.cohort) |descriptor| _ = try self.mark(descriptor);
+                    for (references.children) |child| {
                         if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
                     }
                     return;

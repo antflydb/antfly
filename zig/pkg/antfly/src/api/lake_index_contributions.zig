@@ -23,6 +23,10 @@ const stores = @import("../serverless/artifacts/store.zig");
 const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 pub const Index = struct {
+    io: ?std.Io = null,
+    metadata_mutex: std.Io.Mutex = .init,
+    lookup_mutex: std.Io.Mutex = .init,
+    retention_mutex: std.Io.Mutex = .init,
     a: A,
     root: ?tree.Ref,
     store: stores.ArtifactStore,
@@ -58,6 +62,8 @@ pub const Index = struct {
         self.cache.deinit();
     }
     pub fn lookup(self: *Index, a: A, key: [32]u8) !?catalog.FileContribution {
+        if (self.io) |io| try self.lookup_mutex.lock(io);
+        defer if (self.io) |io| self.lookup_mutex.unlock(io);
         var cursor = try tree.Cursor.init(std.heap.page_allocator, self.cache.store(), self.root, &key, null);
         defer cursor.deinit();
         const entry = try cursor.next() orelse return null;
@@ -67,6 +73,11 @@ pub const Index = struct {
         if (!std.mem.eql(u8, &key, &identity(value))) return error.InvalidLakeIndexCatalog;
         return value;
     }
+    pub fn recordDeltaReduction(self: *Index) !void {
+        if (self.io) |io| try self.metadata_mutex.lock(io);
+        defer if (self.io) |io| self.metadata_mutex.unlock(io);
+        self.delta_reductions += 1;
+    }
     pub fn acceptsDelta(self: *const Index, delta: @import("lake_source_navigation.zig").Delta) bool {
         const prior = self.predecessor orelse return false;
         return self.counted and !self.migrating and delta.prior_snapshot != null and
@@ -75,6 +86,8 @@ pub const Index = struct {
     }
     /// Borrowed recipe-root metadata remains valid until this Index is deinitialized.
     pub fn reductionRoot(self: *Index, _: A, recipe: catalog.Digest, name: []const u8, count: usize) !?catalog.FileContribution {
+        if (self.io) |io| try self.metadata_mutex.lock(io);
+        defer if (self.io) |io| self.metadata_mutex.unlock(io);
         if (!self.seeds_loaded) {
             for (self.prior_roots) |key| {
                 const value = (try self.lookup(self.seed_arena.allocator(), key)) orelse return error.InvalidLakeIndexCatalog;
@@ -99,6 +112,8 @@ pub const Index = struct {
         // A counted generation retains descendants through existing incoming
         // edges. Only publication roots and changed edges need adjustment.
         if (self.counted) return self.bridge.cancellation.check();
+        if (self.io) |io| try self.retention_mutex.lock(io);
+        defer if (self.io) |io| self.retention_mutex.unlock(io);
         return self.retainAt(key, 0);
     }
     fn retainAt(self: *Index, key: [32]u8, depth: usize) anyerror!void {
@@ -113,6 +128,8 @@ pub const Index = struct {
         self.retained.getPtr(key).?.* = true;
     }
     pub fn includeRoot(self: *Index, key: catalog.Digest) !void {
+        if (self.io) |io| try self.metadata_mutex.lock(io);
+        defer if (self.io) |io| self.metadata_mutex.unlock(io);
         if (self.roots.count() >= catalog.max_directory_artifacts and !self.roots.contains(key)) return error.InvalidLakeIndexCatalog;
         try self.roots.put(self.a, key, {});
     }

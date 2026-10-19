@@ -1215,3 +1215,12 @@ immutable source batch with backpressure, using a projection limited to their
 families. Streaming avoids a whole-file replay spool; serial/repeated passes retain
 bounded spill replay. Logical checkpoint commitments survive upload-attempt page
 rewrites, and zero-row updates preserve pending-file progress.
+
+Reader protocol 58 schedules bounded configuration cohorts within and across native
+index families. Admitted two-batch production overlaps decoding with indexing;
+smaller budgets and oversized batches keep borrowed backpressure. Dictionaries,
+exact decimal values and physical row identities survive the ownership boundary.
+Aggregate metadata v5 binds logical roots to a shared immediate-child cohort
+proof, so fused queries avoid a recursive startup metadata walk. Readers validate
+child identities and recipe slots as consumed; GC retains shared descriptors and
+legacy formats remain readable. No new attachment or query options are required.

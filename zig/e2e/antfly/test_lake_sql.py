@@ -6378,3 +6378,172 @@ def test_compact_parquet_encodings_attach_query_and_restart(
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_native_configuration_cohorts_and_group_directories_survive_restart(tmp_path):
+    """Two text configs and distinct aggregate keys publish from real delta pages."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    base = 9007199254740993
+    expected = {k: [0, 0] for k in range(17)}
+    originals = []
+    for part in range(3):
+        ids = list(range(part * 512, (part + 1) * 512))
+        path = tmp_path / "part.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "k": pa.array([i % 17 for i in ids], type=pa.int64()),
+                    "amount": pa.array(
+                        [None if i % 19 == 0 else base + i % 7 for i in ids],
+                        type=pa.int64(),
+                    ),
+                    "body": [None if i % 13 == 0 else f"quasar item {i}" for i in ids],
+                }
+            ),
+            path,
+            compression="snappy",
+            use_dictionary=False,
+            data_page_version="2.0",
+            row_group_size=128,
+            column_encoding={
+                "k": "DELTA_BINARY_PACKED",
+                "amount": "DELTA_BINARY_PACKED",
+                "body": "DELTA_BYTE_ARRAY",
+            },
+        )
+        payload = path.read_bytes()
+        header = (
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+        )
+        target = objects / f"part-{part}.parquet"
+        target.write_bytes(header + payload)
+        originals.append((target, header, payload))
+        for i in ids:
+            expected[i % 17][0] += 1
+            expected[i % 17][1] += 0 if i % 19 == 0 else base + i % 7
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, route, body=None, *, ddl=False):
+            response = _request_with_idle_ddl_retry(
+                server, method, route, body, retry_ddl=ddl
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json() if response.content else None
+
+        call(
+            "POST",
+            "/tables/native_cohorts",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "native-cohorts",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "k": {"type": "integer"},
+                                    "amount": {"type": "integer"},
+                                    "body": {"type": "string"},
+                                },
+                                "additionalProperties": False,
+                            }
+                        }
+                    },
+                },
+                "indexes": {
+                    **{
+                        name: {
+                            "type": "full_text",
+                            "field": "body",
+                            "store_source": True,
+                        }
+                        for name in ("words", "words_again")
+                    },
+                    "stats": {
+                        "type": "algebraic",
+                        "derive_from_schema": True,
+                        "aggregates": [
+                            {"name": "global_rows", "op": "count"},
+                            {"name": "counts", "op": "count", "group_by": ["k"]},
+                            {
+                                "name": "sums",
+                                "op": "sum",
+                                "measure": "amount",
+                                "group_by": ["k"],
+                            },
+                        ],
+                    },
+                },
+            },
+            ddl=True,
+        )
+        deadline = time.monotonic() + 90
+        for name in ("words", "words_again", "stats"):
+            while True:
+                resource = call("GET", f"/tables/native_cohorts/indexes/{name}")
+                readiness = resource["status"]["readiness"]
+                assert readiness["state"] != "failed", (
+                    str(resource) + server.debug_logs()
+                )
+                if readiness["queryable"]:
+                    break
+                assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+                time.sleep(0.1)
+        for name in ("words", "words_again"):
+            result = call(
+                "POST",
+                "/tables/native_cohorts/query",
+                {
+                    "full_text_search": {"match": "quasar", "field": "body"},
+                    "full_text_index": name,
+                    "limit": 5,
+                },
+            )["responses"][0]
+            assert len(result["hits"]["hits"]) == 5, result
+        statement = (
+            "SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k ORDER BY k"
+        )
+        rows = [
+            [str(k), str(count), str(total)]
+            for k, (count, total) in sorted(expected.items())
+        ]
+        assert call("POST", "/sql", {"statement": statement})["rows"] == rows
+        server.pause()
+        for target, header, payload in originals:
+            footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+            target.write_bytes(
+                header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:]
+            )
+        for cached in server.root.rglob("lake-ranges"):
+            if cached.is_dir():
+                shutil.rmtree(cached)
+        server.resume()
+        # Source payloads cannot satisfy this query: the durable directory and
+        # exact shared COUNT/SUM states must remain sufficient after restart.
+        assert call("POST", "/sql", {"statement": statement})["rows"] == rows
+        assert call(
+            "POST", "/sql", {"statement": "SELECT COUNT(*) FROM native_cohorts"}
+        )["rows"] == [["1536"]]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

@@ -777,7 +777,7 @@ const Reduction = struct {
         }.less);
         const root = try self.editBatch(previous, batch, 0);
         if (root == null or root.?.range.?.files != delta.count()) return error.InvalidLakeIndexCatalog;
-        index.delta_reductions += 1;
+        try index.recordDeltaReduction();
         return root;
     }
     fn splitRefs(self: *@This(), refs: []const local.serverless_manifest_artifact_ref.ArtifactRef, depth: u8) ![]const local.serverless_manifest_artifact_ref.ArtifactRef {
@@ -1401,7 +1401,7 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
             const recipe = try artifacts.loadRecipe(output.allocator(), store, declaration.artifact, .none);
             const reader = try artifacts.Reader.open(a, store, declaration.artifact, recipe, .none);
             defer reader.cursor().close(reader);
-            try std.testing.expectEqual(@as(u16, 4), declaration.artifact.metadata_version);
+            try std.testing.expectEqual(@as(u16, 5), declaration.artifact.metadata_version);
             if (phase == 1) {
                 const before = try artifacts.loadPartitions(output.allocator(), store, previous.declarations[slot].artifact, recipe, .none);
                 const after = try artifacts.loadPartitions(output.allocator(), store, declaration.artifact, recipe, .none);
@@ -1481,7 +1481,7 @@ test "external lake recursive group partitions retain sibling artifacts on a sin
     const before_root = try artifacts.loadPartitions(out, store, prior[0], single, .none);
     const after_root = try artifacts.loadPartitions(out, store, merged[0], single, .none);
     try std.testing.expectEqual(@as(usize, 1), before_root.len);
-    try std.testing.expectEqual(@as(u16, 4), before_root[0].artifact.metadata_version);
+    try std.testing.expectEqual(@as(u16, 5), before_root[0].artifact.metadata_version);
     const before = try artifacts.loadPartitions(out, store, before_root[0].artifact, single, .none);
     const after = try artifacts.loadPartitions(out, store, after_root[0].artifact, single, .none);
     var reused: usize = 0;
@@ -1493,6 +1493,9 @@ test "external lake recursive group partitions retain sibling artifacts on a sin
     var collector: @import("lake_index_gc.zig").Collector = .{ .a = out, .table = 4, .authority = undefined, .store = store, .identity = @splat(9), .context = .{}, .token = @splat(7), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 16 * 1024 * 1024 };
     try collector.markArtifact(out, merged[0]);
     try std.testing.expect(collector.marked.contains(merged[0].artifact_id));
+    const graph = try artifacts.partitionReferences(out, store, merged[0], .none);
+    try std.testing.expect(graph.cohort != null);
+    try std.testing.expect(collector.marked.contains(graph.cohort.?.artifact_id));
     for (after) |part| try std.testing.expect(collector.marked.contains(part.artifact.artifact_id));
     var index: @import("lake_index_contributions.zig").Index = undefined;
     try index.init(a, store, null, .none);

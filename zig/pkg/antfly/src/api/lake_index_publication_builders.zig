@@ -25,7 +25,7 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Contribution = local.metadata_lake_index_catalog.FileContribution;
 const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
-const Kind = enum { aggregate, ordered, text, sparse, dense };
+pub const Kind = enum { aggregate, ordered, text, sparse, dense };
 pub const Result = struct {
     native: aggregates.BuildResult = .{ .declarations = &.{}, .contributions = &.{} },
     ordered: []const Declared = &.{},
@@ -99,111 +99,121 @@ fn executeFamily(args: Args, kind: Kind, provider: *Provider, store: *stores.Art
     }
     return result;
 }
-fn allowance(slot: usize) usize {
-    return switch (@as(Kind, @fromBackingInt(@intCast(slot)))) {
+pub const Unit = struct { kind: Kind, table: local.common_topology_records.TableRecord };
+fn allowance(kind: Kind) usize {
+    return switch (kind) {
         .aggregate, .ordered => 8 * 1024 * 1024,
         .text => 64 * 1024 * 1024,
         .sparse, .dense => 256 * 1024 * 1024,
     };
 }
-fn merge(result: *Result, part: Result, enabled: [Pipeline.width]bool) void {
-    if (enabled[0]) result.native = part.native;
-    if (enabled[1]) result.ordered = part.ordered;
-    if (enabled[2]) result.text = part.text;
-    if (enabled[3]) result.sparse = part.sparse;
-    if (enabled[4]) result.dense = part.dense;
+fn append(comptime T: type, a: A, left: []const T, right: []const T) ![]const T {
+    if (right.len == 0) return left;
+    if (left.len == 0) return right;
+    const joined = try std.mem.concat(a, T, &.{ left, right });
+    a.free(left);
+    a.free(right);
+    return joined;
 }
-
-/// Choose the largest admitted cohort, reducing expensive families first.
-/// Failed admission starts no builder; completed cohorts are never repeated.
-pub fn build(args_: Args) !?Result {
-    _ = args_.provider.replay orelse return null;
-    _ = args_.provider.context.io orelse return null;
-    var enabled: [Pipeline.width]bool = @splat(false);
-    const rebuild = @import("../serverless/build/lake_rebuild.zig");
-    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(args_.a, args_.base, args_.provider.source.inventory, .{ .table_name = args_.table.name, .schema_json = args_.table.schema_json, .indexes_json = args_.table.indexes_json });
-    defer desired.deinit(args_.a);
-    for (desired.artifacts) |artifact| switch (artifact.kind) {
-        .algebraic_segment => enabled[@backingInt(Kind.aggregate)] = true,
-        .text_segment => enabled[@backingInt(Kind.text)] = true,
-        .sparse_segment => enabled[@backingInt(Kind.sparse)] = true,
-        .vector_segment => enabled[@backingInt(Kind.dense)] = true,
-        else => {},
-    };
-    var parsed = try local.schema_mod.parseValidatedTableSchema(args_.a, args_.table.schema_json);
-    defer parsed.deinit(args_.a);
-    var planning = std.heap.ArenaAllocator.init(args_.a);
-    defer planning.deinit();
-    if (try parsed.relationalIndexDefinitions(planning.allocator())) |definitions| {
-        enabled[@backingInt(Kind.ordered)] = definitions.len != 0;
+fn merge(a: A, result: *Result, part: Result) !void {
+    result.native.declarations = try append(Declared, a, result.native.declarations, part.native.declarations);
+    result.native.contributions = try append(Contribution, a, result.native.contributions, part.native.contributions);
+    result.ordered = try append(Declared, a, result.ordered, part.ordered);
+    result.text = try append(Declared, a, result.text, part.text);
+    result.sparse = try append(Declared, a, result.sparse, part.sparse);
+    result.dense = try append(Declared, a, result.dense, part.dense);
+}
+fn projectionForUnits(args: Args, out: A, units: []const Unit) ![]const []const u8 {
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(args.a);
+    for (units) |unit| {
+        var enabled: [5]bool = @splat(false);
+        enabled[@backingInt(unit.kind)] = true;
+        var provider = args.provider.*;
+        for (try replay_api.columnsForFamilies(args.a, out, unit.table, &provider, args.base, enabled)) |name| try names.put(args.a, name, {});
     }
-    var remaining: usize = 0;
-    for (enabled) |active| remaining += @intFromBool(active);
-    if (remaining < 2) return null;
-    var result: Result = .{};
+    const columns = try out.alloc([]const u8, names.count());
+    var keys = names.keyIterator();
+    for (columns) |*column| column.* = keys.next().?.*;
+    return columns;
+}
+/// Configuration units share files even within the same family. Admission
+/// bounds workers, projections and reducer memory independently of index count.
+pub fn build(args: Args) !?Result {
+    _ = args.provider.replay orelse return null;
+    _ = args.provider.context.io orelse return null;
+    var arena = std.heap.ArenaAllocator.init(args.a);
+    defer arena.deinit();
+    const units = try @import("lake_index_build_units.zig").plan(args.a, arena.allocator(), args.table, args.provider.context.io.?);
+    if (units.len < 2) return null;
+    const pending = try arena.allocator().alloc(bool, units.len);
+    @memset(pending, true);
+    var remaining = units.len;
     var completed = false;
+    var result: Result = .{};
     while (remaining >= 2) {
-        var cohort = enabled;
-        var size = remaining;
+        var cohort: [Pipeline.width]Unit = undefined;
+        var indexes: [Pipeline.width]usize = undefined;
+        var size: usize = 0;
+        for (units, pending, 0..) |unit, active, index| if (active) {
+            cohort[size] = unit;
+            indexes[size] = index;
+            size += 1;
+            if (size == cohort.len) break;
+        };
         while (size >= 2) {
-            if (try buildCohort(args_, cohort)) |part| {
-                merge(&result, part, cohort);
-                for (cohort, 0..) |active, slot| if (active) {
-                    enabled[slot] = false;
-                };
+            if (try buildCohort(args, cohort[0..size])) |part| {
+                try merge(args.out, &result, part);
+                for (indexes[0..size]) |index| pending[index] = false;
                 remaining -= size;
                 completed = true;
                 break;
             }
-            var heaviest: ?usize = null;
-            for (cohort, 0..) |active, slot| if (active and (heaviest == null or allowance(slot) >= allowance(heaviest.?))) {
+            var heaviest: usize = 0;
+            for (cohort[0..size], 0..) |unit, slot| if (allowance(unit.kind) >= allowance(cohort[heaviest].kind)) {
                 heaviest = slot;
             };
-            cohort[heaviest.?] = false;
             size -= 1;
+            cohort[heaviest] = cohort[size];
+            indexes[heaviest] = indexes[size];
         }
         if (size < 2) break;
     }
     if (!completed) return null;
-    for (enabled, 0..) |active, slot| if (active) {
-        var single: [Pipeline.width]bool = @splat(false);
-        single[slot] = true;
-        merge(&result, try executeProjected(args_, @fromBackingInt(@intCast(slot)), single), single);
+    for (units, pending) |unit, active| if (active) {
+        const replay = args.provider.replay.?;
+        const columns = try projectionForUnits(args, arena.allocator(), &.{unit});
+        try replay.reset();
+        const original = replay.columns;
+        replay.columns = columns;
+        defer {
+            replay.reset() catch unreachable;
+            replay.columns = original;
+        }
+        var single = args;
+        single.table = unit.table;
+        try merge(args.out, &result, try executeFamily(single, unit.kind, args.provider, args.store));
     };
     return result;
 }
-fn executeProjected(args: Args, kind: Kind, enabled: [Pipeline.width]bool) !Result {
-    const replay = args.provider.replay.?;
-    var arena = std.heap.ArenaAllocator.init(args.a);
-    defer arena.deinit();
-    var provider = args.provider.*;
-    const columns = try replay_api.columnsForFamilies(args.a, arena.allocator(), args.table, &provider, args.base, enabled);
-    try replay.reset();
-    const original = replay.columns;
-    replay.columns = columns;
-    defer {
-        replay.reset() catch unreachable;
-        replay.columns = original;
-    }
-    return executeFamily(args, kind, args.provider, args.store);
-}
-fn buildCohort(args_: Args, enabled: [Pipeline.width]bool) !?Result {
+fn buildCohort(args_: Args, units: []const Unit) !?Result {
     const replay = args_.provider.replay.?;
     const io = args_.provider.context.io.?;
     // One input/decode workspace is shared under the source mutex, including
     // speculative reads. Scale the replay cache to actual remaining headroom.
     const decoded = std.math.mul(usize, args_.provider.limits.max_decoded_bytes, 2) catch return null;
     var workspace = std.math.add(usize, args_.provider.limits.max_input_bytes, decoded) catch return null;
-    for (enabled, 0..) |active, slot| if (active) {
-        workspace = std.math.add(usize, workspace, allowance(slot)) catch return null;
-    };
+    for (units) |unit| workspace = std.math.add(usize, workspace, allowance(unit.kind)) catch return null;
     const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(args_.a) orelse return null;
     if (workspace >= available or available - workspace < 1024 * 1024) return null;
+    const frame_limit = std.math.mul(usize, args_.provider.limits.max_decoded_bytes, 2) catch return null;
+    const queue_bytes = std.math.mul(usize, frame_limit, 2) catch return null;
+    const buffered = queue_bytes < available - workspace;
+    if (buffered) workspace += queue_bytes;
     const replay_limit = @min(replay.budget.limit, available - workspace);
     var projection_arena = std.heap.ArenaAllocator.init(args_.a);
     defer projection_arena.deinit();
-    var projection_provider = args_.provider.*;
-    const projection = try replay_api.columnsForFamilies(args_.a, projection_arena.allocator(), args_.table, &projection_provider, args_.base, enabled);
+    const projection = try projectionForUnits(args_, projection_arena.allocator(), units);
     try replay.reset();
     const original_columns = replay.columns;
     replay.columns = projection;
@@ -219,6 +229,8 @@ fn buildCohort(args_: Args, enabled: [Pipeline.width]bool) !?Result {
     const budget_parent = replay.budget.backing;
     const limit_parent = replay.budget.limit;
     replay.budget.limit = replay_limit;
+    const index_io = args.index.io;
+    args.index.io = io;
     const index_parent = args.index.a;
     const seed_parent = args.index.seed_arena.child_allocator;
     const index_store_parent = args.index.store.allocator;
@@ -233,6 +245,7 @@ fn buildCohort(args_: Args, enabled: [Pipeline.width]bool) !?Result {
         replay.arena.child_allocator = arena_parent;
         replay.budget.backing = budget_parent;
         replay.budget.limit = limit_parent;
+        args.index.io = index_io;
         args.index.a = index_parent;
         args.index.seed_arena.child_allocator = seed_parent;
         args.index.store.allocator = index_store_parent;
@@ -262,7 +275,7 @@ fn buildCohort(args_: Args, enabled: [Pipeline.width]bool) !?Result {
     replay.budget.limit = replay_limit / 2;
     ahead.budget.limit = replay_limit / 2;
     ahead.max_spill_bytes = disk_limit / 2;
-    var pipeline: Pipeline = .{ .replay = replay, .spare = &ahead, .io = io, .scheduler = args.scheduler, .streaming = true };
+    var pipeline: Pipeline = .{ .replay = replay, .spare = &ahead, .io = io, .scheduler = args.scheduler, .streaming = true, .buffered = buffered, .frame_limit = frame_limit };
     defer pipeline.deinit();
     defer replay.reset() catch unreachable;
     ahead.pipeline = &pipeline;
@@ -284,32 +297,26 @@ fn buildCohort(args_: Args, enabled: [Pipeline.width]bool) !?Result {
             running.cancel(io) catch {};
         };
     }
-    for (enabled, 0..) |active, slot| if (active) {
+    for (units, 0..) |unit, slot| {
         var provider = args.provider.*;
         provider.replay_consumer = slot;
         var store = args.store.*;
         store.allocator = args.a;
-        jobs[slot] = .{ .args = args, .kind = @fromBackingInt(@intCast(slot)), .slot = slot, .provider = provider, .source = try args.provider.source.parallelView(args.a), .store = store, .pipeline = &pipeline, .start = &start, .admitted = &admitted, .parent_hook = provider.context.additional_checkpoint };
+        var job_args = args;
+        job_args.table = unit.table;
+        jobs[slot] = .{ .args = job_args, .kind = unit.kind, .slot = slot, .provider = provider, .source = try args.provider.source.parallelView(args.a), .store = store, .pipeline = &pipeline, .start = &start, .admitted = &admitted, .parent_hook = provider.context.additional_checkpoint };
         initialized[slot] = true;
         jobs[slot].provider.source = &jobs[slot].source;
         pipeline.activate(slot);
         tasks[slot] = (args.scheduler orelse local.sql_parallel_scheduler.global()).submit(io, 8 * 1024 * 1024, Job.run, .{&jobs[slot]});
         if (tasks[slot] == null) return null;
-    };
+    }
     admitted = true;
     start.set(io);
     try pipeline.drive(args.a, args.token);
     for (&tasks) |*task| if (task.*) |*running| try running.await(io);
     var result: Result = .{};
-    for (enabled, 0..) |active, slot| if (active) {
-        switch (jobs[slot].kind) {
-            .aggregate => result.native = jobs[slot].result.native,
-            .ordered => result.ordered = jobs[slot].result.ordered,
-            .text => result.text = jobs[slot].result.text,
-            .sparse => result.sparse = jobs[slot].result.sparse,
-            .dense => result.dense = jobs[slot].result.dense,
-        }
-    };
+    for (units, 0..) |_, slot| try merge(args.out, &result, jobs[slot].result);
     return result;
 }
 
@@ -361,7 +368,7 @@ test "external lake file-first publication shares one decode across five native 
     defer inventory.deinit(a);
     const base = try binding.binding.toManifestBaseSource(source.inventory.snapshot_id, inventory.artifact_id);
     const table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = schema_json, .indexes_json =
-        \\{"dense":{"type":"embeddings","external":true,"dimension":2},"sparse":{"type":"embeddings","external":true,"sparse":true},"words":{"type":"full_text","field":"body"},"stats":{"type":"algebraic","materializations":[{"name":"total","op":"sum","measure":"amount"},{"name":"rows","op":"count"}]}}
+        \\{"dense":{"type":"embeddings","external":true,"dimension":2},"sparse":{"type":"embeddings","external":true,"sparse":true},"words":{"type":"full_text","field":"body"},"words2":{"type":"full_text","field":"body"},"stats":{"type":"algebraic","materializations":[{"name":"total","op":"sum","measure":"amount"},{"name":"rows","op":"count"},{"name":"by_body","op":"count","group_by":["body"]}]}}
     };
     const columns = try replay_api.columnsForBuild(a, out, table, &provider, base);
     const light = try replay_api.columnsForFamilies(a, out, table, &provider, base, .{ true, true, true, false, false });
@@ -394,9 +401,9 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(usize, 3), replay.captures);
     try std.testing.expect(replay.streamed_batches != 0);
     try std.testing.expectEqual(@as(usize, 0), replay.readers);
-    try std.testing.expectEqual(@as(usize, 2), result.native.declarations.len);
+    try std.testing.expectEqual(@as(usize, 3), result.native.declarations.len);
     try std.testing.expectEqual(@as(usize, 1), result.ordered.len);
-    try std.testing.expectEqual(@as(usize, 1), result.text.len);
+    try std.testing.expectEqual(@as(usize, 2), result.text.len);
     try std.testing.expectEqual(@as(usize, 1), result.sparse.len);
     try std.testing.expectEqual(@as(usize, 1), result.dense.len);
     const ordered = try @import("lake_index_ordered_rows.zig").loadRootLazy(out, store, result.ordered[0].artifact, .none, null);
@@ -409,7 +416,7 @@ test "external lake file-first publication shares one decode across five native 
     args.scheduler = &pairs;
     const prior_captures = replay.captures;
     const paired = (try build(args)) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(replay.captures - prior_captures <= 9);
+    try std.testing.expect(replay.captures - prior_captures <= 15);
     try std.testing.expectEqual(@as(usize, 0), pairs.workers);
     try std.testing.expectEqual(@as(usize, 1), paired.ordered.len);
     try std.testing.expectEqual(@as(usize, 1), paired.dense.len);
@@ -432,7 +439,7 @@ test "external lake file-first publication shares one decode across five native 
         }
         const limited = (try build(args)) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(usize, 1), limited.ordered.len);
-        try std.testing.expect(limited_replay.captures < 15);
+        try std.testing.expect(limited_replay.captures < 21);
     }
     try std.testing.expectEqual(@as(usize, 0), modest.live_bytes);
     // A file larger than replay admission streams ordinarily. Every consumer

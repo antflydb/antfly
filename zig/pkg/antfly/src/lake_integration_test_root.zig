@@ -41,6 +41,8 @@ test {
     _ = @import("api/lake_index_build_replay.zig");
     _ = @import("api/lake_index_publication_builders.zig");
     _ = @import("api/lake_index_build_pipeline.zig");
+    _ = @import("api/lake_index_build_units.zig");
+    _ = @import("api/lake_index_owned_batch.zig");
     _ = @import("api/lake_index_store.zig");
     _ = @import("api/lake_index_coordinator.zig");
     _ = @import("api/lake_index_selection.zig");

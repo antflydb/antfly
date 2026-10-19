@@ -24,7 +24,7 @@ const Binding = local.serverless_segment_source_binding.Binding;
 const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Self = @This();
-pub const width = 5;
+pub const width = 8;
 const State = enum { running, waiting, granted, done };
 const Slot = struct { state: State = .done, file: usize = 0, shared: ?*Replay = null };
 replay: *Replay,
@@ -37,12 +37,16 @@ order: ?@import("lake_index_native_state.zig").ScanOrder = null,
 peek: ?usize = null,
 prefetched: usize = 0,
 streaming: bool = false,
+buffered: bool = false,
+frame_limit: usize = 64 * 1024 * 1024,
+frames: [2]Frame = @splat(.{}),
 stream_members: u8 = 0,
 stream_pending: u8 = 0,
 stream_generation: u64 = 0,
 stream_batch: ?local.storage_rowsource_types.ColumnBatch = null,
 stream_eof: bool = false,
 stream_batches: usize = 0,
+buffered_fallbacks: usize = 0,
 stream_arena: ?std.heap.ArenaAllocator = null,
 candidates: ?[]usize = null,
 candidate_visits: usize = 0,
@@ -54,7 +58,20 @@ slots: [width]Slot = @splat(.{}),
 error_code: std.atomic.Value(u16) = .init(0),
 files: usize = 0,
 shared_consumers: usize = 0,
+const Frame = struct {
+    budget: local.sql_memory_budget = undefined,
+    arena: ?std.heap.ArenaAllocator = null,
+    generation: u64 = 0,
+    borrowed: bool = false,
+    pending: u8 = 0,
+    batch: ?local.storage_rowsource_types.ColumnBatch = null,
+};
 pub fn deinit(self: *Self) void {
+    for (&self.frames) |*frame| if (frame.arena) |*arena| {
+        arena.deinit();
+        frame.arena = null;
+        std.debug.assert(frame.budget.live == 0);
+    };
     if (self.stream_arena) |*arena| arena.deinit();
     self.stream_arena = null;
 }
@@ -204,6 +221,11 @@ fn driveInner(self: *Self, a: A, token: Token) !void {
             self.stream_generation = 0;
             self.stream_batch = null;
             self.stream_eof = false;
+            for (&self.frames) |*frame| {
+                frame.generation = 0;
+                frame.pending = 0;
+                frame.batch = null;
+            }
             break :live true;
         } else prepared orelse try self.capture(a, target, capture_binding, request_.file, token);
         {
@@ -220,6 +242,7 @@ fn driveInner(self: *Self, a: A, token: Token) !void {
             };
             self.changed.broadcast(self.io);
         }
+        if (self.streaming and self.buffered) try self.produceStream(token);
         if (!self.streaming) if (self.spare) |spare| if (try self.nextFile(a, request_.file)) |next| {
             const inactive = if (target == self.replay) spare else self.replay;
             self.prefetch_target = inactive;
@@ -232,6 +255,80 @@ fn driveInner(self: *Self, a: A, token: Token) !void {
 /// consumer must acknowledge it before the cursor advances. Backpressure keeps
 /// ownership bounded by one source batch, independent of file size or skew.
 pub fn readStream(self: *Self, slot: usize, generation: *u64, token: Token) !?local.storage_rowsource_types.ColumnBatch {
+    if (!self.buffered) return self.readBorrowedStream(slot, generation, token);
+    const bit = @as(u8, 1) << @as(u3, @intCast(slot));
+    try self.mutex.lock(self.io);
+    defer self.mutex.unlock(self.io);
+    if (generation.* != 0) {
+        const old = &self.frames[(generation.* - 1) % 2];
+        if (old.generation == generation.*) old.pending &= ~bit;
+        self.changed.broadcast(self.io);
+    }
+    while (true) {
+        try token.check();
+        try self.check();
+        const frame = &self.frames[generation.* % 2];
+        if (frame.generation == generation.* + 1) {
+            generation.* += 1;
+            return frame.batch;
+        }
+        if (self.stream_eof and generation.* == self.stream_generation) return null;
+        try self.wait();
+    }
+}
+/// The coordinator produces two independently owned batches. A slow consumer
+/// pins only those two frames; required work never needs another scheduler slot.
+pub fn produceStream(self: *Self, token: Token) !void {
+    while (true) {
+        const frame = &self.frames[self.stream_generation % 2];
+        {
+            try self.mutex.lock(self.io);
+            defer self.mutex.unlock(self.io);
+            const prior = &self.frames[(self.stream_generation -| 1) % 2];
+            while ((frame.pending != 0 or (self.stream_generation != 0 and prior.borrowed and prior.pending != 0)) and self.stream_members != 0) {
+                try self.wait();
+                try token.check();
+            }
+            try self.check();
+            if (self.stream_members == 0) return;
+        }
+        if (frame.arena == null) {
+            frame.budget = .{ .backing = self.replay.live_allocator, .limit = self.frame_limit };
+            frame.arena = .init(frame.budget.allocator());
+        }
+        _ = frame.arena.?.reset(.free_all);
+        frame.budget.exhausted = false;
+        frame.borrowed = false;
+        if (self.stream_arena) |*arena| _ = arena.reset(.free_all);
+        const batch = input: {
+            try self.source_mutex.lock(self.io);
+            defer self.source_mutex.unlock(self.io);
+            const raw = try self.replay.live.?.next(self.replay.live_allocator) orelse break :input null;
+            break :input @import("lake_index_owned_batch.zig").copy(frame.arena.?.allocator(), raw) catch |err| {
+                if (err != error.OutOfMemory or !frame.budget.isLocallyExhausted()) return err;
+                _ = frame.arena.?.reset(.free_all);
+                frame.borrowed = true;
+                self.buffered_fallbacks += 1;
+                break :input try self.immutableBatch(raw);
+            };
+        };
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.check();
+        if (batch == null) {
+            self.stream_eof = true;
+            self.changed.broadcast(self.io);
+            return;
+        }
+        self.stream_generation += 1;
+        frame.batch = batch;
+        frame.generation = self.stream_generation;
+        frame.pending = self.stream_members;
+        self.stream_batches += 1;
+        self.changed.broadcast(self.io);
+    }
+}
+fn readBorrowedStream(self: *Self, slot: usize, generation: *u64, token: Token) !?local.storage_rowsource_types.ColumnBatch {
     const bit = @as(u8, 1) << @as(u3, @intCast(slot));
     try self.mutex.lock(self.io);
     defer self.mutex.unlock(self.io);
@@ -275,6 +372,7 @@ pub fn leaveStream(self: *Self, slot: usize) void {
     const bit = @as(u8, 1) << @as(u3, @intCast(slot));
     self.stream_members &= ~bit;
     self.stream_pending &= ~bit;
+    for (&self.frames) |*frame| frame.pending &= ~bit;
     self.changed.broadcast(self.io);
 }
 fn binding(self: *Self) !Binding {
@@ -518,4 +616,118 @@ test "external lake streaming freezes mutable encoded page evidence once" {
     fixture.text[0] = 'z';
     try std.testing.expectEqualStrings("a", stable.columns[0].values.bytes[0]);
     try std.testing.expectEqualStrings("b", stable.columns[0].values.bytes[1]);
+}
+
+test "external lake streaming overlaps two owned batches and bounds slow consumer skew" {
+    const rows = local.storage_rowsource_types;
+    const Fixture = struct {
+        value: [1]i64 = .{0},
+        columns: [1]rows.ColumnVector = undefined,
+        calls: std.atomic.Value(usize) = .init(0),
+        second: std.Io.Event = .unset,
+        fn next(raw: *anyopaque, _: A) !?rows.ColumnBatch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const n = self.calls.fetchAdd(1, .acq_rel);
+            if (n == 3) return null;
+            self.value[0] = @intCast(n + 1);
+            self.columns[0] = .{ .name = "x", .values = .{ .i64 = &self.value } };
+            if (n == 1) self.second.set(std.testing.io);
+            return .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "a" }}, .columns = &self.columns };
+        }
+        fn close(_: *anyopaque, _: A) void {}
+    };
+    const Producer = struct {
+        fn run(p: *Self) anyerror!void {
+            p.produceStream(.none) catch |err| {
+                p.stop(err);
+                return err;
+            };
+        }
+    };
+    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+    for ([_]bool{ false, true }) |tiny| {
+        var fixture: Fixture = .{};
+        var replay = Replay.init(std.testing.allocator, &provider, &.{"x"});
+        defer replay.deinit();
+        replay.live = .{ .kind = .external_parquet, .ctx = &fixture, .next_batch = Fixture.next, .deinit_fn = Fixture.close };
+        replay.live_allocator = std.testing.allocator;
+        var pipeline: Self = .{ .replay = &replay, .io = std.testing.io, .streaming = true, .buffered = true, .stream_members = if (tiny) 1 else 3, .frame_limit = if (tiny) 1 else 64 * 1024 };
+        defer pipeline.deinit();
+        var task = try std.testing.io.concurrent(Producer.run, .{&pipeline});
+        defer task.cancel(std.testing.io) catch {};
+        errdefer pipeline.stop(error.Canceled);
+        var fast: u64 = 0;
+        var slow: u64 = 0;
+        const first = (try pipeline.readStream(0, &fast, .none)).?;
+        if (tiny) {
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+        } else {
+            try fixture.second.wait(std.testing.io);
+            const borrowed = (try pipeline.readStream(1, &slow, .none)).?;
+            try std.testing.expectEqual(first.columns[0].values.i64.ptr, borrowed.columns[0].values.i64.ptr);
+        }
+        try std.testing.expectEqual(@as(i64, 1), first.columns[0].values.i64[0]);
+        const second = (try pipeline.readStream(0, &fast, .none)).?;
+        try std.testing.expectEqual(@as(i64, 2), second.columns[0].values.i64[0]);
+        if (!tiny) {
+            try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
+            try std.testing.expectEqual(@as(i64, 1), first.columns[0].values.i64[0]);
+            _ = (try pipeline.readStream(1, &slow, .none)).?;
+        }
+        const third = (try pipeline.readStream(0, &fast, .none)).?;
+        try std.testing.expectEqual(@as(i64, 3), third.columns[0].values.i64[0]);
+        if (!tiny) _ = (try pipeline.readStream(1, &slow, .none)).?;
+        try std.testing.expect((try pipeline.readStream(0, &fast, .none)) == null);
+        pipeline.leaveStream(0);
+        if (!tiny) {
+            try std.testing.expect((try pipeline.readStream(1, &slow, .none)) == null);
+            pipeline.leaveStream(1);
+        }
+        try task.await(std.testing.io);
+        try std.testing.expectEqual(@as(usize, if (tiny) 3 else 0), pipeline.buffered_fallbacks);
+        try std.testing.expectEqual(@as(usize, 3), pipeline.stream_batches);
+    }
+}
+
+test "external lake streaming wakes a full producer on cancellation and consumer departure" {
+    const rows = local.storage_rowsource_types;
+    const Fixture = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        second: std.Io.Event = .unset,
+        fn next(raw: *anyopaque, _: A) !?rows.ColumnBatch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.calls.fetchAdd(1, .acq_rel) == 1) self.second.set(std.testing.io);
+            return .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "a" }}, .columns = &.{.{ .name = "x", .values = .{ .i64 = &.{1} } }} };
+        }
+        fn close(_: *anyopaque, _: A) void {}
+    };
+    const Producer = struct {
+        fn run(p: *Self) anyerror!void {
+            try p.produceStream(.none);
+        }
+    };
+    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+    for ([_]bool{ false, true }) |cancel| {
+        var fixture: Fixture = .{};
+        var replay = Replay.init(std.testing.allocator, &provider, &.{"x"});
+        defer replay.deinit();
+        replay.live = .{ .kind = .external_parquet, .ctx = &fixture, .next_batch = Fixture.next, .deinit_fn = Fixture.close };
+        replay.live_allocator = std.testing.allocator;
+        var pipeline: Self = .{ .replay = &replay, .io = std.testing.io, .streaming = true, .buffered = true, .stream_members = 1 };
+        defer pipeline.deinit();
+        var task = try std.testing.io.concurrent(Producer.run, .{&pipeline});
+        defer task.cancel(std.testing.io) catch {};
+        errdefer pipeline.stop(error.Canceled);
+        try fixture.second.wait(std.testing.io);
+        if (cancel) {
+            pipeline.stop(error.DeadlineExceeded);
+            try std.testing.expectError(error.DeadlineExceeded, task.await(std.testing.io));
+        } else {
+            pipeline.leaveStream(0);
+            try task.await(std.testing.io);
+        }
+        try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
+    }
 }
