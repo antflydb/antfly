@@ -3444,3 +3444,96 @@ Evidence: [final source/binary/report/archive qualification](bench/results/trans
 [Linux paired trials](bench/results/transport-linux.json),
 [historical Linux witness experiment](bench/results/transport-linux-expanded-witness-prototype.json), and
 [generated oracle comparisons](bench/results/transport-differential.json).
+
+### Linear framing and bounded encoder/capture work
+
+The reference consumer now tracks a newline-search watermark independently of
+its consumed-record cursor. Fragmented oversized JSON records require one scan
+of each buffered byte; compaction adjusts both positions. Large records copy
+directly from a temporary buffer view, avoiding an intermediate bytearray copy.
+Small records retain their cheaper slice operation. Canonical JSON objects use
+the cached stdlib raw decoder with an explicit end-of-input check; legal
+surrounding whitespace retains the ordinary decoder path. UTF-8 validation,
+malformed/trailing-data rejection and response allowances remain enforced.
+
+V3 encodes typed events directly into one reusable, precisely allocated 32 KiB
+body, using the existing byte-equivalent static-field serializer. An overflow
+can only modify an unpublished suffix. The encoder flushes its complete prefix
+and retries once; an oversized event uses ordinary streaming output. This
+removes the per-row 32 KiB scratch array and encoded-row copy. Batch count,
+body bounds, file/control boundaries and opt-in negotiation stay unchanged.
+
+On macOS, capture amortizes empty source-watcher polls across 64 admissions only
+for never-used slots. Watches are still registered before reads. Identity reuse
+and recycled slots drain events before admission; Linux retains its existing
+drain behavior. Capture still drains the kernel queue at its final publication
+barrier. Deferred writes invalidate their tokens, and overflow/failure still
+uses conservative fallback. A regression covers writes during admission and
+slot reuse. This optimization does not reduce descriptor coverage or weaken
+freshness certification.
+
+Qualification compares product source `687cf045a2` with PR head `168a2b04e1`.
+The transport driver rotates old/new binaries in both v2 and v3 modes for nine
+warm trials, verifies complete decoded results outside timing, records consumer
+profiles, and repeats watched process startup nine times. Separate native
+encoding controls drain buffered bytes and decode only control records during
+timing; each of three rotated controls runs 128 requests, after full decoded
+result verification. Producer CPU includes workers and amortizes the 10 ms
+process-counter resolution. Raw-drain elapsed is a diagnostic, not application
+latency. The framing control mocks transport with identical 64 KiB chunks and
+uses each revision's reader/decoder; its CPU is entirely consumer work.
+
+Reproduce from the repository root (use the pinned Zig compiler to build the
+two product binaries first):
+
+```sh
+python3 zig/pkg/antfly-grep/bench/framing.py --baseline=168a2b04e1 --output=framing.json
+python3 zig/pkg/antfly-grep/bench/encoding.py BASELINE CURRENT encoding.json
+python3 zig/pkg/antfly-grep/bench/transport_compare.py CURRENT BASELINE transport.json --profile --capture-rounds=9
+```
+
+| Control, previous → current | macOS | Two-CPU ARM64 Linux VM |
+|---|---:|---:|
+| Watched 6K-file startup, median elapsed | 300.29 → 175.74 ms | 687.87 → 663.59 ms |
+| Same startup, producer CPU | 210 → 170 ms | 160 → 150 ms |
+| Native v3 encoding CPU/request, 20K matches | 8.203 → 7.344 ms | 7.813 → 6.875 ms |
+| Native v2 encoding CPU/request, same fixture | 8.281 → 8.438 ms | 8.594 → 8.750 ms |
+| Decoded dense v2 delivery, median elapsed | 72.20 → 74.42 ms | 47.32 → 45.92 ms |
+| Decoded dense v3 delivery, median elapsed | 41.34 → 40.20 ms | 29.89 → 30.29 ms |
+
+The isolated macOS reader control measures 20K small synthetic frames at
+23.82 → 20.70 ms CPU. A 16 MiB record costs 60.05 → 19.57 ms CPU, and a 64 MiB
+record costs 752.13 → 67.68 ms CPU. Oversized inputs must still fit the configured
+response allowance. Native v3 encoding uses about 10–12% less CPU in the raw
+controls; decoded delivery remains largely consumer-bound. Default-v2 results
+are mixed, with approximately 2% higher CPU in the raw controls and 6% higher
+producer CPU in the macOS decoded control. There is no general v2 speedup claim.
+An encoder-function-splitting prototype did not establish a consistent v2
+benefit and was discarded. No new regex/JIT path was justified by these profiles.
+
+The host is shared, filesystem caches are warm, and the Linux VM shares that
+host. Startup is a cold-process measurement, not cold storage. RSS snapshots
+exclude kernel watch storage and do not establish peak-memory improvement.
+All trials are retained. Independent Linux hardware, cold caches and Windows
+runtime remain unqualified. Checks pass 249 CLI cases per platform (two/three
+expected skips), 107 package tests with one skip each, all 16 ReleaseSafe
+conformance/hardening steps, 23 tooling cases (one skip), Windows cross-compilation,
+release archive exactness, licensing and toolchain/compatibility checks.
+
+Exact JSON candidate pruning remains **unimplemented**. Its server contract
+must bind the authorized, path-filtered logical input set and validation outcome
+to a retained snapshot, document revision and validator/schema version. Totals
+must account for excluded documents without suppressing malformed-document
+errors, source/file budgets, permissions, or ordering. Certificates must be
+server-owned and atomically tied to source revisions; caller-provided trigram
+markers alone cannot provide that proof. Missing support, incomplete coverage,
+expired snapshots or incompatible options require a full exact scan or an
+explicit error. This pass preserves the existing guard; it adds no server
+protocol or indexed-pruning performance claim.
+
+Evidence: [qualification and release identities](bench/results/linear-validation.json),
+[macOS transport/profiles](bench/results/linear-macos.json),
+[Linux transport/profiles](bench/results/linear-linux.json),
+[macOS native encoding](bench/results/linear-encoding-macos.json),
+[Linux native encoding](bench/results/linear-encoding-linux.json), and
+[fragmented reader controls](bench/results/linear-framing.json).
