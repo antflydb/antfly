@@ -17,6 +17,8 @@ const std = @import("std");
 const Type = @import("backend.zig").Type;
 const Column = @import("backend.zig").Column;
 const Parameter = @import("backend.zig").Parameter;
+const temporal = @import("antfly_local_sources").sql_temporal_value;
+const temporal_text = @import("antfly_local_sources").sql_temporal_text;
 
 pub fn parameterOid(descriptor: Parameter) !u32 {
     try @import("antfly_local_sources").sql_scalar.validateParameterType(descriptor);
@@ -186,7 +188,7 @@ pub fn encodeCellInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Colu
     var bounded: BoundedWriter = .{ .destination = writer, .remaining = wire_bytes };
     if (cell.array) |array| {
         if (column.type != .array or column.element_type != array.element_type) return error.InvalidResult;
-        if (format == 0) sources.sql_array_text.encode(array.*, &bounded.writer, .{ .wire_bytes = wire_bytes }) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err else sources.sql_array_binary.encode(array.*, &bounded.writer, .{ .wire_bytes = wire_bytes }) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err;
+        if (format == 0) sources.sql_array_text.encode(a, array.*, &bounded.writer, .{ .wire_bytes = wire_bytes }) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err else sources.sql_array_binary.encode(a, array.*, &bounded.writer, .{ .wire_bytes = wire_bytes }) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err;
     } else if (cell.numeric) |number| {
         if (column.type != .number or column.element_type != .numeric) return error.InvalidResult;
         var context: sources.sql_numeric_value.Context = .{ .alloc = a, .max_output_bytes = wire_bytes };
@@ -222,9 +224,9 @@ fn encodeColumnUnchecked(a: std.mem.Allocator, writer: *std.Io.Writer, column: C
     var view = try sources.sql_array_wire.decodeBorrowed(a, column.element_type orelse return error.InvalidResult, value, .{});
     defer view.deinit();
     if (format == 0)
-        try sources.sql_array_text.encode(view.value, writer, .{ .wire_bytes = wire_bytes })
+        try sources.sql_array_text.encode(a, view.value, writer, .{ .wire_bytes = wire_bytes })
     else
-        try sources.sql_array_binary.encode(view.value, writer, .{ .wire_bytes = wire_bytes });
+        try sources.sql_array_binary.encode(a, view.value, writer, .{ .wire_bytes = wire_bytes });
 }
 
 pub fn fromOid(value: u32) !Type {
@@ -254,16 +256,22 @@ pub fn typeSize(kind: Type) i16 {
 /// Region-owned typed ingress. PostgreSQL arrays and NUMERIC stay native;
 /// JSON/JSONB remains a JSON datum, including a non-SQL-null JSON null.
 pub fn decodeNative(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8) !@import("antfly_local_sources").sql_scalar.Datum {
+    var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = alloc };
+    return decodeNativeWithContext(alloc, param_oid, format, bytes, &context);
+}
+
+pub fn decodeNativeWithContext(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8, parent: *@import("antfly_local_sources").sql_numeric_value.Context) !@import("antfly_local_sources").sql_scalar.Datum {
+    try parent.charge(0);
     const src = @import("antfly_local_sources");
     const descriptor = try parameterFromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
     if (param_oid == 700 or param_oid == 701) {
-        var work: src.sql_array_value.Budget = .{};
+        var work: src.sql_array_value.Budget = .{ .shared = parent };
         const kind: src.sql_array_value.ElementType = if (param_oid == 700) .float32 else .float64;
         return if (format == 0) src.sql_array_text.decodeElementLeaky(alloc, kind, bytes, &work) else src.sql_array_binary.decodeElementLeaky(alloc, kind, bytes, &work);
     }
     if (param_oid == 1700) {
-        var context: src.sql_numeric_value.Context = .{ .alloc = alloc };
+        var context: src.sql_numeric_value.Context = .{ .alloc = alloc, .parent = parent };
         const number = if (format == 0) try src.sql_numeric_value.parse(&context, bytes) else try src.sql_numeric_binary.decode(&context, bytes, .{});
         const value = try alloc.create(src.sql_numeric_value.Value);
         value.* = number.value;
@@ -271,33 +279,62 @@ pub fn decodeNative(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes
     }
     if (descriptor.kind == .array) {
         const kind = descriptor.element_type orelse return error.UnsupportedParameterType;
-        const array = if (format == 0) (try src.sql_array_text.decodeLeaky(alloc, kind, bytes, .{ .compact = true })).value else (try src.sql_array_binary.decodeLeaky(alloc, kind, bytes, .{ .compact = true })).value;
+        const array = if (format == 0) (try src.sql_array_text.decodeLeaky(alloc, kind, bytes, .{ .compact = true, .context = parent })).value else (try src.sql_array_binary.decodeLeaky(alloc, kind, bytes, .{ .compact = true, .context = parent })).value;
         const value = try alloc.create(src.sql_array_value.Value);
         value.* = array;
         return src.sql_scalar.Datum.typedArray(value);
     }
     // Timestamp decoding already normalizes PostgreSQL epoch/precision. The
     // SQL frame consumes canonical text, not the transport's integer sentinel.
-    const raw = try decode(alloc, param_oid, format, bytes);
-    return src.sql_scalar.Datum.json(if (descriptor.kind == .datetime and raw != .string) .{ .string = try src.storage_schema.formatDateTimeNsAlloc(alloc, try timestampNanos(raw)) } else raw);
+    const raw = try decodeWithContext(alloc, param_oid, format, bytes, parent);
+    if (descriptor.kind == .datetime) {
+        const value = try alloc.create(temporal.Value);
+        value.* = .{ .timestamp_tz = try timestampFromValue(raw) };
+        return src.sql_scalar.Datum.typedTemporal(value);
+    }
+    return src.sql_scalar.Datum.json(raw);
 }
 
 pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8) !std.json.Value {
+    var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = alloc };
+    return decodeWithContext(alloc, param_oid, format, bytes, &context);
+}
+
+/// One Bind owner is shared by all parameters and every nested typed codec.
+/// Neither a new parameter nor conversion into the backend envelope renews it.
+/// The allocator belongs to the retained portal region, never to this context.
+pub fn decodeWithContext(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8, context: *@import("antfly_local_sources").sql_numeric_value.Context) !std.json.Value {
+    try context.charge(0);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = offset + @min(bytes.len - offset, 256);
+        try context.charge(end - offset);
+        offset = end;
+    }
     const kind = try fromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
+    if (param_oid == 3802) {
+        const sources = @import("antfly_local_sources");
+        var work: sources.sql_array_value.Budget = .{ .shared = context };
+        const datum = if (format == 0)
+            try sources.sql_array_text.decodeElementLeaky(alloc, .jsonb, bytes, &work)
+        else
+            try sources.sql_array_binary.decodeElementLeaky(alloc, .jsonb, bytes, &work);
+        return datum.value;
+    }
     if (param_oid == 1700) {
         const sources = @import("antfly_local_sources");
-        var context: sources.sql_numeric_value.Context = .{ .alloc = alloc };
-        var number = if (format == 0) try sources.sql_numeric_value.parse(&context, bytes) else try sources.sql_numeric_binary.decode(&context, bytes, .{});
+        var numeric: sources.sql_numeric_value.Context = .{ .alloc = alloc, .parent = context };
+        var number = if (format == 0) try sources.sql_numeric_value.parse(&numeric, bytes) else try sources.sql_numeric_binary.decode(&numeric, bytes, .{});
         defer number.deinit();
-        return .{ .number_string = try sources.sql_numeric_value.format(&context, number.value) };
+        return .{ .number_string = try sources.sql_numeric_value.format(&numeric, number.value) };
     }
     if (kind == .array) {
         const sources = @import("antfly_local_sources");
         const element = (try parameterFromOid(param_oid)).element_type orelse return error.UnsupportedParameterType;
-        var decoded = if (format == 0) try sources.sql_array_text.decode(alloc, element, bytes, .{}) else try sources.sql_array_binary.decode(alloc, element, bytes, .{});
+        var decoded = if (format == 0) try sources.sql_array_text.decode(alloc, element, bytes, .{ .context = context }) else try sources.sql_array_binary.decode(alloc, element, bytes, .{ .context = context });
         defer decoded.deinit();
-        return sources.sql_array_wire.toJsonLeaky(alloc, decoded.value, .{});
+        return sources.sql_array_wire.toJsonLeaky(alloc, decoded.value, .{ .context = context });
     }
     if (format == 0) {
         if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidParameter;
@@ -325,13 +362,10 @@ pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []co
         700 => if (bytes.len == 4) try finite(@as(f32, @bitCast(std.mem.readInt(u32, bytes[0..4], .big)))) else error.InvalidParameter,
         701 => if (bytes.len == 8) try finite(@as(f64, @bitCast(std.mem.readInt(u64, bytes[0..8], .big)))) else error.InvalidParameter,
         1184 => blk: {
-            if (bytes.len != 8) return error.InvalidParameter;
-            const micros = std.mem.readInt(i64, bytes[0..8], .big);
-            const nanos = std.math.cast(u64, (@as(i128, micros) + 946684800000000) * 1000) orelse return error.InvalidParameter;
-            break :blk try timestampValue(alloc, nanos);
+            const value = temporal.decode(.timestamp_tz, bytes) catch return error.InvalidParameter;
+            break :blk try timestampEnvelope(alloc, value.timestamp_tz);
         },
         114 => try parseJson(alloc, bytes),
-        3802 => if (bytes.len > 0 and bytes[0] == 1) try parseJson(alloc, bytes[1..]) else error.InvalidParameter,
         2950 => if (bytes.len == 16) .{ .string = blk: {
             const canonical = @import("antfly_local_sources").common_uuid.format(bytes[0..16].*);
             break :blk try alloc.dupe(u8, &canonical);
@@ -402,7 +436,10 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         .boolean => if (value == .bool) try alloc.dupe(u8, if (value.bool) "t" else "f") else error.InvalidResult,
         .integer => try std.fmt.allocPrint(alloc, "{d}", .{try integer(value)}),
         .datetime => try timestampText(alloc, value),
-        .json => try std.json.Stringify.valueAlloc(alloc, value, .{}),
+        .json => blk: {
+            var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+            break :blk try @import("antfly_local_sources").sql_jsonb_text.format(alloc, value, 16 * 1024 * 1024, &work);
+        },
         .uuid => if (value == .string) @import("antfly_local_sources").common_uuid.canonicalAlloc(alloc, value.string) catch |err| switch (err) {
             error.InvalidUuid => return error.InvalidResult,
             else => return err,
@@ -424,12 +461,11 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
             break :blk try encodeInteger(alloc, @bitCast(number));
         },
         .datetime => blk: {
-            const nanos = try timestampNanos(value);
-            if (@mod(nanos, 1000) != 0) return error.UnsupportedResultPrecision;
-            break :blk try encodeInteger(alloc, @as(i64, @intCast(nanos / 1000)) - 946684800000000);
+            break :blk try encodeInteger(alloc, (try timestampFromValue(value)).micros);
         },
         .json => blk: {
-            const json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+            const json = try @import("antfly_local_sources").sql_jsonb_text.format(alloc, value, 16 * 1024 * 1024, &work);
             defer alloc.free(json);
             break :blk try std.mem.concat(alloc, u8, &.{ &.{1}, json });
         },
@@ -443,7 +479,8 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
 }
 
 /// Append a cell directly to a reusable DataRow buffer. Primitive and JSON
-/// values require no intermediate encoded allocation.
+/// values require no intermediate encoded allocation; JSONB owns only its
+/// canonical key-ordering scratch, not a second complete encoded payload.
 pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, format: u16, value: std.json.Value) !void {
     if (kind == .array) return error.InvalidResult;
     if (format > 1) return error.UnsupportedResultFormat;
@@ -455,16 +492,18 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
             },
             .integer => try writer.print("{d}", .{try integer(value)}),
             .datetime => {
-                const text = try timestampText(a, value);
-                defer a.free(text);
-                try writer.writeAll(text);
+                var text: [temporal_text.output_capacity]u8 = undefined;
+                try writer.writeAll(try temporal_text.format(.{ .timestamp_tz = try timestampFromValue(value) }, &text));
             },
             .uuid => {
                 if (value != .string) return error.InvalidResult;
                 const canonical = @import("antfly_local_sources").common_uuid.format(@import("antfly_local_sources").common_uuid.parse(value.string) catch return error.InvalidResult);
                 try writer.writeAll(&canonical);
             },
-            .json => try std.json.Stringify.value(value, .{}, writer),
+            .json => {
+                var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+                try @import("antfly_local_sources").sql_jsonb_text.write(a, value, writer, 16 * 1024 * 1024, &work, 0);
+            },
             else => if (value == .string) try writer.writeAll(value.string) else try std.json.Stringify.value(value, .{}, writer),
         }
         return;
@@ -487,13 +526,12 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
             try writer.writeInt(u64, @bitCast(number), .big);
         },
         .datetime => {
-            const nanos = try timestampNanos(value);
-            if (@mod(nanos, 1000) != 0) return error.UnsupportedResultPrecision;
-            try writer.writeInt(i64, @as(i64, @intCast(nanos / 1000)) - 946684800000000, .big);
+            try writer.writeInt(i64, (try timestampFromValue(value)).micros, .big);
         },
         .json => {
             try writer.writeByte(1);
-            try std.json.Stringify.value(value, .{}, writer);
+            var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+            try @import("antfly_local_sources").sql_jsonb_text.write(a, value, writer, 16 * 1024 * 1024, &work, 0);
         },
         .uuid => {
             if (value != .string) return error.InvalidResult;
@@ -515,36 +553,60 @@ fn encodeInteger(alloc: std.mem.Allocator, value: i64) ![]const u8 {
 }
 
 fn timestampText(alloc: std.mem.Allocator, value: std.json.Value) ![]const u8 {
-    // ISO strings remain strings; integer cells are the native nanosecond
-    // representation, not PostgreSQL's microseconds-since-2000 wire value.
-    if (value == .string and std.mem.indexOfScalar(u8, value.string, 'T') != null)
-        return alloc.dupe(u8, value.string);
-    const ns = try timestampNanos(value);
-    if (@mod(ns, 1000) != 0) return error.UnsupportedResultPrecision;
-    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(@divTrunc(ns, std.time.ns_per_s)) };
-    const year_day = epoch.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const seconds = epoch.getDaySeconds();
-    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z", .{
-        year_day.year,                                                    month_day.month.numeric(),    month_day.day_index + 1,
-        seconds.getHoursIntoDay(),                                        seconds.getMinutesIntoHour(), seconds.getSecondsIntoMinute(),
-        @as(u32, @intCast(@divTrunc(@mod(ns, std.time.ns_per_s), 1000))),
-    });
+    var text: [temporal_text.output_capacity]u8 = undefined;
+    return alloc.dupe(u8, try temporal_text.format(.{ .timestamp_tz = try timestampFromValue(value) }, &text));
 }
 
-/// The protocol carries exact native unsigned nanoseconds until the native
-/// adapter normalizes typed parameters to the engine's canonical ISO string.
-pub fn timestampNanos(value: std.json.Value) !u64 {
+/// Exact signed transport nanoseconds, not the PostgreSQL binary epoch.
+/// i128 covers every finite PostgreSQL timestamp; infinities stay distinct.
+pub fn timestampNanos(value: std.json.Value) !i128 {
     return switch (value) {
-        .integer => |ns| std.math.cast(u64, ns) orelse error.InvalidResult,
-        .number_string => |text| std.fmt.parseUnsigned(u64, text, 10) catch error.InvalidResult,
+        .integer => |ns| ns,
+        .number_string => |text| std.fmt.parseInt(i128, text, 10) catch error.InvalidResult,
         else => error.InvalidResult,
     };
 }
 
-pub fn timestampValue(alloc: std.mem.Allocator, nanos: u64) !std.json.Value {
+pub fn timestampValue(alloc: std.mem.Allocator, nanos: i128) !std.json.Value {
     if (std.math.cast(i64, nanos)) |signed| return .{ .integer = signed };
     return .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{nanos}) };
+}
+
+pub fn timestampEnvelope(alloc: std.mem.Allocator, value: temporal.Timestamp) !std.json.Value {
+    _ = try temporal.Timestamp.init(value.micros);
+    if (value.unixNanoseconds()) |ns| return timestampValue(alloc, ns);
+    return .{ .string = try alloc.dupe(u8, if (value.infinity() < 0) "-infinity" else "infinity") };
+}
+
+fn timestampFromNanos(ns: i128) !temporal.Timestamp {
+    return temporal.Timestamp.fromUnixNanoseconds(ns) catch |err| switch (err) {
+        error.TemporalPrecisionLoss => error.UnsupportedResultPrecision,
+        else => error.InvalidResult,
+    };
+}
+
+/// Canonical PostgreSQL UTC text and the existing native RFC3339 boundary
+/// share one exact value. This is not a general SQL timestamp literal parser.
+pub fn timestampFromValue(value: std.json.Value) !temporal.Timestamp {
+    if (value == .string) {
+        if (temporal_text.parseCanonical(.timestamp_tz, value.string)) |parsed| return parsed.timestamp_tz else |_| {}
+        const ns = @import("antfly_local_sources").datetime.parseDateTimeToSignedNs(value.string) orelse return error.InvalidResult;
+        return timestampFromNanos(ns);
+    }
+    return timestampFromNanos(try timestampNanos(value));
+}
+
+/// Normalize a result without narrowing finite time or converting infinity
+/// into a SQL NULL. Legacy sub-microsecond cells remain exact until the wire
+/// encoder explicitly refuses unsupported precision.
+pub fn timestampResult(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    if (value == .null) return value;
+    if (value == .string) {
+        if (temporal_text.parseCanonical(.timestamp_tz, value.string)) |parsed| return timestampEnvelope(alloc, parsed.timestamp_tz) else |_| {}
+        const ns = @import("antfly_local_sources").datetime.parseDateTimeToSignedNs(value.string) orelse return error.InvalidResult;
+        return timestampValue(alloc, ns);
+    }
+    return timestampValue(alloc, try timestampNanos(value));
 }
 
 test "pgwire real special results preserve PostgreSQL text and binary representations" {
@@ -609,6 +671,68 @@ test "SQL pgwire scalar builtin descriptors match binary widths and round trip v
     }
 }
 
+test "pgwire Bind admission shares cumulative work and sticky cancellation across typed codecs" {
+    const a = std.testing.allocator;
+    const Context = @import("antfly_local_sources").sql_numeric_value.Context;
+    var wide: [1026]u8 = undefined;
+    @memset(&wide, 'a');
+    wide[0] = '"';
+    wide[wide.len - 1] = '"';
+    const sources = @import("antfly_local_sources");
+    var source = try sources.sql_array_text.decode(a, .jsonb, "{1.20,null,NULL}", .{});
+    defer source.deinit();
+    var binary: std.Io.Writer.Allocating = .init(a);
+    defer binary.deinit();
+    try sources.sql_array_binary.encode(a, source.value, &binary.writer, .{});
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = 0,
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    for ([_]struct { oid: u32, format: u16 = 0, bytes: []const u8 }{
+        .{ .oid = 20, .format = 1, .bytes = "\x00\x00\x00\x00\x00\x00\x00\x01" },
+        .{ .oid = 25, .bytes = "leaf" },
+        .{ .oid = 1700, .bytes = "1.20" },
+        .{ .oid = 3802, .bytes = "{\"k\":1.20}" },
+        .{ .oid = 3802, .format = 1, .bytes = "\x01{\"k\":1.20}" },
+        .{ .oid = 3802, .bytes = &wide },
+        .{ .oid = 3807, .bytes = "{1.20,null,NULL}" },
+        .{ .oid = 3807, .format = 1, .bytes = binary.written() },
+        .{ .oid = 1231, .bytes = "{1.20,NULL}" },
+    }) |case| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        var observed: Control = .{};
+        var parent: Context = .{ .alloc = arena.allocator(), .remaining = 1024 * 1024, .checkpoint = Control.check, .ptr = &observed };
+        var child: Context = .{ .alloc = arena.allocator(), .remaining = parent.remaining, .parent = &parent };
+        _ = try decodeWithContext(arena.allocator(), case.oid, case.format, case.bytes, &child);
+        const spent = 1024 * 1024 - parent.remaining;
+        try std.testing.expect(spent >= case.bytes.len);
+        try std.testing.expectEqual(parent.remaining, child.remaining);
+        var limited: Context = .{ .alloc = arena.allocator(), .remaining = spent * 2 - 1 };
+        _ = try decodeWithContext(arena.allocator(), case.oid, case.format, case.bytes, &limited);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, decodeWithContext(arena.allocator(), case.oid, case.format, case.bytes, &limited));
+        const remaining = limited.remaining;
+        try std.testing.expectError(error.SqlProgramLimitExceeded, decodeWithContext(.failing, case.oid, case.format, case.bytes, &limited));
+        try std.testing.expectEqual(remaining, limited.remaining);
+        for (1..observed.polls + 1) |cut| {
+            var control: Control = .{ .fail_at = cut };
+            var canceled: Context = .{ .alloc = arena.allocator(), .checkpoint = Control.check, .ptr = &control };
+            try std.testing.expectError(error.QueryCanceled, decodeWithContext(arena.allocator(), case.oid, case.format, case.bytes, &canceled));
+            const left = canceled.remaining;
+            try std.testing.expectError(error.QueryCanceled, decodeWithContext(.failing, case.oid, case.format, case.bytes, &canceled));
+            try std.testing.expectEqual(left, canceled.remaining);
+        }
+    }
+    var healthy: Context = .{ .alloc = .failing };
+    try std.testing.expectError(error.OutOfMemory, decodeWithContext(.failing, 3802, 0, "{\"k\":1}", &healthy));
+    try std.testing.expect(healthy.failure == null);
+}
+
 test "pgwire NUMERIC preserves scalar array OIDs scale and exact binary payloads" {
     const a = std.testing.allocator;
     const sources = @import("antfly_local_sources");
@@ -632,6 +756,22 @@ test "pgwire NUMERIC preserves scalar array OIDs scale and exact binary payloads
     output.writer.end = 0;
     try std.testing.expectError(error.SqlProgramLimitExceeded, encodeColumnInto(a, &output.writer, column, 1, .{ .string = decoded.number_string }, 1));
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
+}
+
+test "pgwire Bind fixed width admission scales without decoder allocations" {
+    const Context = @import("antfly_local_sources").sql_numeric_value.Context;
+    for ([_]usize{ 1, 16, 256 }) |count| {
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..1000) |_| {
+            var work: Context = .{ .alloc = .failing, .remaining = count * 8 };
+            for (0..count) |_| {
+                const value = try decodeWithContext(.failing, 20, 1, "\x00\x00\x00\x00\x00\x00\x00\x01", &work);
+                try std.testing.expectEqual(@as(i64, 1), value.integer);
+            }
+            try std.testing.expectEqual(@as(u64, 0), work.remaining);
+        }
+        std.debug.print("pgwire fixed-width admission: parameters={d} iterations=1000 work_per_bind={d} decoder_allocations=0 elapsed_ns={d}\n", .{ count, count * 8, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+    }
 }
 
 test "pgwire typed parameters preserve exact integers and reject binary guesses" {
@@ -670,7 +810,7 @@ test "pgwire JSON parameter nesting is bounded independently of frame bytes" {
     var bytes: [130]u8 = undefined;
     @memset(bytes[0..65], '[');
     @memset(bytes[65..], ']');
-    try std.testing.expectError(error.InvalidParameter, decode(arena.allocator(), 3802, 0, &bytes));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decode(arena.allocator(), 3802, 0, &bytes));
     try std.testing.expectEqualStrings("[{]}", (try decode(arena.allocator(), 3802, 0, "\"[{]}\"")).string);
 }
 
@@ -679,21 +819,112 @@ test "pgwire timestamp conversion uses postgres epoch and refuses precision loss
     defer arena.deinit();
     const alloc = arena.allocator();
     const value = std.json.Value{ .integer = 946684800000000000 };
-    try std.testing.expectEqualStrings("2000-01-01T00:00:00.000000Z", try encode(alloc, .datetime, 0, value));
+    try std.testing.expectEqualStrings("2000-01-01 00:00:00+00", try encode(alloc, .datetime, 0, value));
     const binary = try encode(alloc, .datetime, 1, value);
     try std.testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, binary[0..8], .big));
     try std.testing.expectEqual(value.integer, (try decode(alloc, 1184, 1, binary)).integer);
     try std.testing.expectError(error.UnsupportedResultPrecision, encode(alloc, .datetime, 0, .{ .integer = value.integer + 1 }));
-    try std.testing.expectError(error.InvalidParameter, decode(alloc, 1184, 1, &.{ 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }));
+    try std.testing.expectEqualStrings("infinity", (try decode(alloc, 1184, 1, &.{ 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff })).string);
     var before_epoch: [8]u8 = undefined;
     std.mem.writeInt(i64, &before_epoch, -946684800000001, .big);
-    try std.testing.expectError(error.InvalidParameter, decode(alloc, 1184, 1, &before_epoch));
+    try std.testing.expectEqual(@as(i128, -1000), try timestampNanos(try decode(alloc, 1184, 1, &before_epoch)));
     const high_nanos = std.math.maxInt(u64) / 1000 * 1000;
     const high = try timestampValue(alloc, high_nanos);
     try std.testing.expect(high == .number_string);
     const high_binary = try encode(alloc, .datetime, 1, high);
-    try std.testing.expectEqual(high_nanos, try timestampNanos(try decode(alloc, 1184, 1, high_binary)));
+    try std.testing.expectEqual(@as(i128, high_nanos), try timestampNanos(try decode(alloc, 1184, 1, high_binary)));
     try std.testing.expectError(error.UnsupportedResultPrecision, encode(alloc, .datetime, 1, try timestampValue(alloc, std.math.maxInt(u64))));
+}
+
+test "pgwire timestamp codecs match full-domain PostgreSQL fixtures with allocation-free streaming" {
+    const Entry = struct { kind: temporal.Kind, binary: []const u8, text: []const u8 };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, std.testing.allocator, @import("antfly_local_sources").sql_temporal_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    const Run = struct {
+        fn run(a: std.mem.Allocator, entries: []const Entry) !void {
+            const alloc = a;
+            var count: usize = 0;
+            for (entries) |entry| {
+                if (entry.kind != .timestamp_tz) continue;
+                count += 1;
+                var frame: [8]u8 = undefined;
+                const expected = try std.fmt.hexToBytes(&frame, entry.binary);
+                const value = try decode(alloc, 1184, 1, expected);
+                defer switch (value) {
+                    .string, .number_string => |bytes| alloc.free(bytes),
+                    else => {},
+                };
+                const encoded_binary = try encode(alloc, .datetime, 1, value);
+                defer alloc.free(encoded_binary);
+                try std.testing.expectEqualSlices(u8, expected, encoded_binary);
+                const encoded_text = try encode(alloc, .datetime, 0, value);
+                defer alloc.free(encoded_text);
+                try std.testing.expectEqualStrings(entry.text, encoded_text);
+                const canonical = try timestampResult(alloc, .{ .string = entry.text });
+                defer switch (canonical) {
+                    .string, .number_string => |bytes| alloc.free(bytes),
+                    else => {},
+                };
+                const canonical_binary = try encode(alloc, .datetime, 1, canonical);
+                defer alloc.free(canonical_binary);
+                try std.testing.expectEqualSlices(u8, expected, canonical_binary);
+                try std.testing.expectEqual((try temporal.decode(.timestamp_tz, expected)).timestamp_tz.micros, (try timestampFromValue(value)).micros);
+                var none = std.heap.FixedBufferAllocator.init(&.{});
+                var storage: [128]u8 = undefined;
+                var output = std.Io.Writer.fixed(&storage);
+                try encodeColumnInto(none.allocator(), &output, .{ .name = "v", .type = .datetime }, 0, value, entry.text.len);
+                try std.testing.expectEqualStrings(entry.text, output.buffered());
+                output.end = 0;
+                try encodeColumnInto(none.allocator(), &output, .{ .name = "v", .type = .datetime }, 1, value, 8);
+                try std.testing.expectEqualSlices(u8, expected, output.buffered());
+                output.end = 0;
+                try std.testing.expectError(error.ProgramLimitExceeded, encodeColumnInto(none.allocator(), &output, .{ .name = "v", .type = .datetime }, 0, value, entry.text.len - 1));
+                try std.testing.expectEqual(@as(usize, 0), output.buffered().len);
+                for (0..8) |length| try std.testing.expectError(error.InvalidParameter, decode(alloc, 1184, 1, expected[0..length]));
+            }
+            try std.testing.expectEqual(@as(usize, 36), count);
+        }
+    };
+    try Run.run(std.testing.allocator, fixture.value.entries);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{fixture.value.entries});
+    var invalid: [8]u8 = undefined;
+    std.mem.writeInt(i64, &invalid, temporal.end_timestamp, .big);
+    try std.testing.expectError(error.InvalidParameter, decode(std.testing.allocator, 1184, 1, &invalid));
+    for ([_]std.json.Value{ .{ .integer = -1 }, .{ .number_string = "946684800000000001" }, .{ .string = "2000-01-01T00:00:00.000000001Z" } }) |value| {
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var storage: [128]u8 = @splat(0xa5);
+        var output = std.Io.Writer.fixed(&storage);
+        for ([_]u16{ 0, 1 }) |format| {
+            try std.testing.expectError(error.UnsupportedResultPrecision, encodeInto(none.allocator(), &output, .datetime, format, value));
+            try std.testing.expectEqual(@as(usize, 0), output.buffered().len);
+            for (storage) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+        }
+    }
+}
+
+test "pgwire timestamp streaming throughput uses fixed caller storage without heap" {
+    const cases = [_]std.json.Value{
+        .{ .integer = 946684800000000000 },
+        .{ .integer = -1000 },
+        .{ .number_string = "18000000000123456000" },
+        .{ .string = "infinity" },
+        .{ .string = "0001-01-01 00:00:00+00 BC" },
+        .{ .string = "294276-12-31 23:59:59.999999+00" },
+    };
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var storage: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&storage);
+    var checksum: u64 = 0;
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..100_000) |index| {
+        for ([_]u16{ 0, 1 }) |format| {
+            output.end = 0;
+            try encodeInto(none.allocator(), &output, .datetime, format, cases[index % cases.len]);
+            checksum +%= output.buffered()[0];
+        }
+    }
+    try std.testing.expect(checksum != 0);
+    std.debug.print("pgwire timestamp streaming: values=100000 cell_encodes=200000 buffer_bytes=128 heap_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
 }
 
 test "pgwire direct cell encoding matches allocated text and binary formats" {
@@ -715,6 +946,65 @@ test "pgwire direct cell encoding matches allocated text and binary formats" {
         try encodeInto(a, &out.writer, case.kind, format, case.value);
         try std.testing.expectEqualSlices(u8, expected, out.written());
     };
+}
+
+test "pgwire JSONB parameter admission shares scalar and array domain errors" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    for ([_]struct { input: []const u8, code: []const u8 }{
+        .{ .input = "1e131072", .code = "22003" },
+        .{ .input = "0e-16384", .code = "22003" },
+        .{ .input = "{\"k\":1e131072,\"k\":2}", .code = "22003" },
+        .{ .input = "{\"k\":\"\\u0000\",\"k\":2}", .code = "22P05" },
+        .{ .input = "01", .code = "22P02" },
+    }) |entry| for ([_]u16{ 0, 1 }) |format| {
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        const r = region.allocator();
+        var binary: std.Io.Writer.Allocating = .init(r);
+        try binary.writer.writeByte(1);
+        try binary.writer.writeAll(entry.input);
+        const input = if (format == 0) entry.input else binary.written();
+        if (decode(r, 3802, format, input)) |_| return error.ExpectedPostgresRejection else |err| try std.testing.expectEqualStrings(entry.code, sources.sql_errors.describe(err).code);
+    };
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const value = try decode(region.allocator(), 3802, 0, "{\"k\":1,\"\\u006b\":1.20}");
+    try std.testing.expectEqual(@as(usize, 1), value.object.count());
+    try std.testing.expectEqualStrings("1.20", value.object.get("k").?.number_string);
+    try std.testing.expectError(error.SqlProtocolViolation, decode(region.allocator(), 3802, 1, ""));
+    try std.testing.expectError(error.SqlJsonbUnsupportedVersion, decode(region.allocator(), 3802, 1, "\x02null"));
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, decode(region.allocator(), 3802, 1, "\x01"));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, decode(region.allocator(), 3802, 1, "\x01\"\xff\""));
+}
+
+test "pgwire JSONB array columns emit exact PostgreSQL display and binary payloads" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const owned = region.allocator();
+    // Independently captured in sql_jsonb_array_storage_reference.json.
+    const text = "[-2:0]={1.20,\"null\",NULL}";
+    const hex = "000000010000000100000eda00000003fffffffe0000000501312e323000000005016e756c6cffffffff";
+    var source = try sources.sql_array_text.decode(a, .jsonb, text, .{});
+    defer source.deinit();
+    const envelope = try sources.sql_array_wire.toJsonLeaky(owned, source.value, .{});
+    const column: Column = .{ .name = "j", .type = .array, .element_type = .jsonb };
+    try std.testing.expectEqual(@as(u32, 3807), try columnOid(column));
+    const bytes = try a.alloc(u8, hex.len / 2);
+    defer a.free(bytes);
+    _ = try std.fmt.hexToBytes(bytes, hex);
+    for ([_]u16{ 0, 1 }) |format| {
+        const expected = if (format == 0) text else bytes;
+        var actual: std.Io.Writer.Allocating = .init(a);
+        defer actual.deinit();
+        try encodeColumnInto(a, &actual.writer, column, format, envelope, expected.len);
+        try std.testing.expectEqualSlices(u8, expected, actual.written());
+        actual.writer.end = 0;
+        try std.testing.expectError(error.SqlProgramLimitExceeded, encodeColumnInto(a, &actual.writer, column, format, envelope, expected.len - 1));
+        try std.testing.expectEqual(@as(usize, 0), actual.written().len);
+    }
 }
 
 test "pgwire array columns retain element OIDs and lossless text and binary payloads" {
@@ -743,13 +1033,13 @@ test "pgwire array columns retain element OIDs and lossless text and binary payl
         for ([_]u16{ 0, 1 }) |format| {
             var expected: std.Io.Writer.Allocating = .init(a);
             defer expected.deinit();
-            if (format == 0) try sources.sql_array_text.encode(value.value, &expected.writer, .{}) else try sources.sql_array_binary.encode(value.value, &expected.writer, .{});
+            if (format == 0) try sources.sql_array_text.encode(a, value.value, &expected.writer, .{}) else try sources.sql_array_binary.encode(a, value.value, &expected.writer, .{});
             const parameter = try decode(owner.allocator(), case.oid, format, expected.written());
             var parameter_view = try sources.sql_array_wire.decode(a, case.kind, parameter, .{});
             defer parameter_view.deinit();
             var parameter_wire: std.Io.Writer.Allocating = .init(a);
             defer parameter_wire.deinit();
-            if (format == 0) try sources.sql_array_text.encode(parameter_view.value, &parameter_wire.writer, .{}) else try sources.sql_array_binary.encode(parameter_view.value, &parameter_wire.writer, .{});
+            if (format == 0) try sources.sql_array_text.encode(a, parameter_view.value, &parameter_wire.writer, .{}) else try sources.sql_array_binary.encode(a, parameter_view.value, &parameter_wire.writer, .{});
             try std.testing.expectEqualSlices(u8, expected.written(), parameter_wire.written());
             var actual: std.Io.Writer.Allocating = .init(a);
             defer actual.deinit();
@@ -825,7 +1115,7 @@ test "pgwire native parameter decoding keeps arrays NUMERIC and JSON null typed"
             const json = try decodeNative(owned, 3802, 1, "\x01null");
             try std.testing.expect(json.value == .null and !json.sql_null);
             var bytes: std.Io.Writer.Allocating = .init(owned);
-            @import("antfly_local_sources").sql_array_binary.encode(array.array.?.*, &bytes.writer, .{}) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+            @import("antfly_local_sources").sql_array_binary.encode(owned, array.array.?.*, &bytes.writer, .{}) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
             const binary = try decodeNative(owned, 1016, 1, bytes.written());
             var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
             try std.testing.expectEqual(std.math.Order.eq, try array.array.?.compare(binary.array.?.*, &work));
@@ -850,7 +1140,7 @@ test "pgwire native parameter decoding avoids public array envelope allocations"
     const array: src.sql_array_value.Value = .{ .element_type = .int64, .dimensions = &.{.{ .length = 32768 }}, .elements = elements };
     var wire_bytes: std.Io.Writer.Allocating = .init(a);
     defer wire_bytes.deinit();
-    try src.sql_array_binary.encode(array, &wire_bytes.writer, .{});
+    try src.sql_array_binary.encode(a, array, &wire_bytes.writer, .{});
     var peaks: [2]usize = undefined;
     for ([_]bool{ false, true }, &peaks) |native, *peak| {
         var nr: test_alloc.NoResizeAllocator = .{ .backing = a };

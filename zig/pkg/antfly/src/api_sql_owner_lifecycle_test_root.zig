@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Linked-control owner composition for mounted SQL primary-key rewrites.
+//! Linked-control owner composition for mounted SQL catalog lifecycle.
 
 const sql_primary_key_rewrite_integration_test = @import("api/sql_primary_key_rewrite_integration_test.zig");
 
@@ -27,6 +27,22 @@ pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
     _ = sql_primary_key_rewrite_integration_test;
+    _ = @import("api/sql_catalog.zig");
+    _ = @import("api/sql_nullability_lifecycle_integration_test.zig");
+    _ = @import("api/sql_schema_lifecycle_integration_test.zig");
+    _ = @import("api/sql_policy_lifecycle_integration_test.zig");
+    _ = @import("api/sql_index_lifecycle_integration_test.zig");
+    _ = @import("api/sql_view_lifecycle_integration_test.zig");
+    _ = @import("api/sql_view_document_integration_test.zig");
+    _ = @import("api/sql_expression_index_lifecycle_integration_test.zig");
+    _ = @import("api/sql_default_lifecycle_integration_test.zig");
+    _ = @import("api/sql_table_creation_integration_test.zig");
+    _ = @import("metadata/schema_migration_finalization.zig");
+    _ = @import("metadata/relation_publication_fence.zig");
+    _ = @import("metadata/relation_reconciliation_worker.zig");
+    _ = @import("metadata/http_client.zig");
+    _ = @import("metadata/storage/raft_apply_store.zig");
+    _ = @import("data/raft_batch.zig").consumer_tests;
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

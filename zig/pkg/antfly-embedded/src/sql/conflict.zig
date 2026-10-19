@@ -28,6 +28,8 @@ pub const Bound = struct {
     assignments: []const ?scalar.Program,
     // Dense target ordinals eliminate assignment-name scans for every row.
     column_assignments: []const ?usize,
+    document_assignment: ?usize = null,
+    required_cells: []const bool = &.{},
     deferred: []const ?Deferred = &.{},
     predicate: ?scalar.Program,
     arbiter_conditions: []const catalog.Condition = &.{},
@@ -50,9 +52,12 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
     // Secondary unique arbiters require a native unique-key reservation, not
     // a scan of a possibly partial index. Refuse them until that authority is
     // exposed by the native coordinator.
-    if (!primary(clause)) {
-        if (backend.vtable.resolve_conflict_owners == null) return error.UnsupportedSqlShape;
+    if (!physicalArbiter(table, clause)) {
         for (clause.columns) |column| _ = try table.column(column);
+        // Undefined fields remain binding errors even on a provider without
+        // unique-owner admission. Document properties are never unique claims.
+        if (table.storage_mode == .document) return error.ConflictArbiterNotFound;
+        if (backend.vtable.resolve_conflict_owners == null) return error.UnsupportedSqlShape;
     }
     const arbiter_conditions = if (clause.arbiter_predicate) |predicate| try bindArbiterPredicate(alloc, table, predicate) else &.{};
     const arbiter_expressions = try alloc.alloc(catalog.ConflictExpression, clause.expressions.len);
@@ -64,11 +69,12 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
             out.* = .{ .json = try std.json.Stringify.valueAlloc(alloc, lowered.expression, .{}), .result_type = lowered.type };
         }
     }
-    const count = table.columns.len + 1;
+    const virtual = table.virtualColumns();
+    const count = table.columns.len + virtual.len;
     const columns = try alloc.alloc(scalar.Column, count * 3 + clause.capture_count);
     for (0..count) |i| {
-        const column = if (i == table.columns.len) try table.column("_id") else table.columns[i];
-        columns[i] = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+        const column = if (i < table.columns.len) table.columns[i] else virtual[i - table.columns.len];
+        columns[i] = .{ .name = column.name, .type = column.type, .ambiguous = true, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
         columns[count + i] = .{ .name = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ name.table, column.name }), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
         if (!aliased) {
             const scope = table.scope orelse if (name.namespace) |namespace| catalog.Table.Scope{ .database = name.database orelse "", .namespace = namespace, .name = name.table, .revision = 0 } else null;
@@ -87,10 +93,18 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
     var pass: usize = 0;
     const column_assignments = try alloc.alloc(?usize, table.columns.len);
     @memset(column_assignments, null);
+    var document_assignment: ?usize = null;
     for (clause.assignments, 0..) |assignment, assignment_index| {
         const target = try table.column(assignment.field);
         if (target.generated and !assignment.use_default) return error.SqlGeneratedColumnWrite;
         if (std.mem.eql(u8, target.name, "_id")) return error.UnsupportedSqlShape;
+        if (table.isDocumentRoot(target.name)) {
+            if (document_assignment != null) return error.DuplicateSqlColumn;
+            if (clause.assignments.len != 1) return error.UnsupportedSqlShape;
+            if (assignment.use_default) return error.SqlNotNullViolation;
+            document_assignment = assignment_index;
+            continue;
+        }
         const ordinal = for (table.columns, 0..) |column, index| {
             if (std.mem.eql(u8, column.name, target.name)) break index;
         } else return error.InvalidSqlBackendResponse;
@@ -139,7 +153,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
             binding.* = try @import("describe.zig").bind(alloc, backend, &compiled, parameters);
             if (binding.columns.len != 1) return error.InvalidSqlParameters;
             const target = try table.column(assignment.field);
-            if (binding.columns[0].type != target.type and !(binding.columns[0].type == .integer and target.type == .number)) return error.SqlTypeMismatch;
+            if (binding.columns[0].type != target.type and !@import("builtin_cast.zig").numericAssignmentAllowed(binding.columns[0].type, target.type)) return error.SqlTypeMismatch;
             later.* = .{ .query = query, .binding = binding };
             continue;
         }
@@ -157,7 +171,41 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
                 try scalar.bindExpectedWithSettings(alloc, root, columns, parameters, column.type, .{ .assignment = true }, backend.settings_view);
         }
     }
-    return .{ .columns = columns, .row_width = count, .assignments = assignments, .column_assignments = column_assignments, .deferred = deferred, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation }, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
+    var result: Bound = .{ .columns = columns, .row_width = count, .assignments = assignments, .column_assignments = column_assignments, .document_assignment = document_assignment, .deferred = deferred, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation }, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
+    const required = try alloc.alloc(bool, columns.len);
+    @memset(required, false);
+    for (assignments) |optional| if (optional) |program| for (program.required_columns) |ordinal| {
+        if (ordinal >= required.len) return error.InvalidSqlBackendResponse;
+        required[ordinal] = true;
+    };
+    if (result.predicate) |program| for (program.required_columns) |ordinal| {
+        if (ordinal >= required.len) return error.InvalidSqlBackendResponse;
+        required[ordinal] = true;
+    };
+    if (table.storage_mode == .relational) {
+        for (table.columns, column_assignments, 0..) |column, assignment, ordinal| {
+            if (!column.generated and assignment == null) required[ordinal] = true;
+        }
+    } else if (needsOldDocument(table, clause, result)) required[table.columns.len + 1] = true;
+    result.required_cells = required;
+    return result;
+}
+
+fn assignmentIdentity(binding: Bound, assignment: ast.Assignment, index: usize) !?@import("array_value.zig").ElementType {
+    if (binding.assignments[index]) |program| return program.output_type.element_type;
+    if (assignment.deferred_scalar) {
+        if (index >= binding.deferred.len) return error.InvalidSqlBackendResponse;
+        const deferred = binding.deferred[index] orelse return error.InvalidSqlBackendResponse;
+        if (deferred.binding.columns.len != 1) return error.InvalidSqlBackendResponse;
+        return deferred.binding.columns[0].element_type;
+    }
+    if (assignment.capture_ordinal) |ordinal| {
+        const base = std.math.mul(usize, binding.row_width, 3) catch return error.InvalidSqlBackendResponse;
+        const slot = std.math.add(usize, base, ordinal) catch return error.InvalidSqlBackendResponse;
+        if (slot >= binding.columns.len) return error.InvalidSqlBackendResponse;
+        return binding.columns[slot].element_type;
+    }
+    return error.InvalidSqlBackendResponse;
 }
 
 fn bindArbiterPredicate(alloc: std.mem.Allocator, table: catalog.Table, expression: *const ast.Scalar) ![]const catalog.Condition {
@@ -226,8 +274,19 @@ pub fn primary(clause: ast.Conflict) bool {
     return clause.constraint_name == null and clause.expressions.len == 0 and clause.columns.len == 1 and std.mem.eql(u8, clause.columns[0], "_id");
 }
 
+fn physicalArbiter(table: catalog.Table, clause: ast.Conflict) bool {
+    // Document mode has no relational unique generations. Targetless NOTHING
+    // therefore arbitrates the same native physical key, not a property scan.
+    return primary(clause) or (table.storage_mode == .document and clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0 and clause.assignments.len == 0 and clause.arbiter_predicate == null);
+}
+
 pub fn allowsDuplicateKeys(clause: ast.Conflict) bool {
     return clause.assignments.len == 0 and (primary(clause) or (clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0));
+}
+
+pub fn duplicateRowError(clause: ?ast.Conflict) error{ DuplicateSqlRow, SqlConflictCardinalityViolation } {
+    if (clause) |value| if (value.assignments.len != 0) return error.SqlConflictCardinalityViolation;
+    return error.DuplicateSqlRow;
 }
 
 /// A retained point snapshot plus an atomic version predicate is optimistic
@@ -236,13 +295,13 @@ pub fn allowsDuplicateKeys(clause: ast.Conflict) bool {
 pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation, captured: []const []const scalar.Datum) ![]const catalog.Mutation {
     if (clause.capture_count != 0 and captured.len != proposed.len) return error.InvalidSqlBackendResponse;
     if (!context.backend.predicate_only_mutations) return error.UnsupportedSqlExecution;
-    if (table.storage_mode != .relational) return error.UnsupportedSqlExecution;
+    if (table.storage_mode == .document and !physicalArbiter(table, clause)) return error.ConflictArbiterNotFound;
     const prepare = context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
     const normalized = try prepare(context.backend.ptr, context.arena, table, proposed);
     if (normalized.len != proposed.len) return error.InvalidSqlBackendResponse;
-    const owners = if (!primary(clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.alloc, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, normalized) else null;
+    const owners = if (!physicalArbiter(table, clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.alloc, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, normalized) else null;
     if (owners) |items| if (items.len != normalized.len) return error.InvalidSqlBackendResponse;
-    if (clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0) {
+    if (table.storage_mode == .relational and clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0) {
         for (proposed, normalized) |original, value| {
             if (!std.mem.eql(u8, original.key, value.key) or value.row == null or value.expected_version != 0) return error.InvalidSqlBackendResponse;
         }
@@ -270,7 +329,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         }
         const identity = if (owner) |item| item.identity orelse mutation.key else mutation.key;
         if ((try seen.getOrPut(context.arena, identity)).found_existing) {
-            if (clause.assignments.len != 0) return error.DuplicateSqlRow;
+            if (clause.assignments.len != 0) return duplicateRowError(clause);
             continue;
         }
         if (owner) |item| {
@@ -282,19 +341,13 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         count += 1;
     }
     const result = buffer[0..count];
+    const include_document = needsOldDocument(table, clause, binding);
     var fields: std.ArrayList([]const u8) = .empty;
     if (clause.assignments.len != 0) for (table.columns, 0..) |column, ordinal| {
         // Preserve ordinary columns for replacement; generated columns are
         // recomputed natively and fetched only if old-row expressions need one.
-        const replaced = binding.column_assignments[ordinal] != null;
-        var needed = !column.generated and !replaced;
         const width = binding.row_width;
-        for (binding.assignments) |program| if (program) |bound_program| for (bound_program.required_columns) |required| {
-            if (required < width * 2 and required % width == ordinal) needed = true;
-        };
-        if (binding.predicate) |program| for (program.required_columns) |required| {
-            if (required < width * 2 and required % width == ordinal) needed = true;
-        };
+        const needed = binding.required_cells.len == 0 or binding.required_cells[ordinal] or binding.required_cells[width + ordinal];
         if (needed) try fields.append(context.arena, column.path);
     };
     // The conflict-resolution scan-page budget belongs to the whole mutation
@@ -324,7 +377,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         defer page_arena.deinit();
         const page_alloc = page_arena.allocator();
         const open = context.backend.vtable.open_scan orelse return error.SqlStatementSnapshotRequired;
-        const cursor = (try open(context.backend.ptr, cursor_arena.allocator(), table, .{ .fields = fields.items, .primary_key = lookup_key, .limit = 1, .include_primary_digest = true })) orelse return error.SqlStatementSnapshotRequired;
+        const cursor = (try open(context.backend.ptr, cursor_arena.allocator(), table, .{ .fields = fields.items, .primary_key = lookup_key, .limit = 1, .include_document = include_document, .include_primary_digest = true })) orelse return error.SqlStatementSnapshotRequired;
         defer cursor.close(cursor.ptr);
         var page = try cursor.next(cursor.ptr, page_alloc, 2);
         defer page.deinit();
@@ -348,6 +401,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         }
         const previous = page.rows[0];
         if (!std.mem.eql(u8, previous.id, lookup_key)) return error.InvalidSqlBackendResponse;
+        if (table.storage_mode == .document and previous.version != 0 and previous.expected_content_digest == null) return error.InvalidSqlBackendResponse;
         // excluded._id retains the proposed identity, but the actual update
         // addresses the native unique claim's physical owner.
         const proposed_key = mutation.key;
@@ -364,12 +418,17 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         const width = binding.row_width;
         const cells = try page_alloc.alloc(scalar.Datum, binding.columns.len);
         for (0..width) |i| {
-            const cell = try previous.cell(binding.columns[i].name);
-            const column = if (i < table.columns.len) table.columns[i] else try table.column("_id");
-            cells[i] = try @import("document_row.zig").declaredCell(page_alloc, column, cell);
+            const column = if (i < table.columns.len) table.columns[i] else table.virtualColumns()[i - table.columns.len];
+            const old_needed = binding.required_cells.len == 0 or binding.required_cells[i] or binding.required_cells[width + i];
+            cells[i] = if (old_needed) try @import("document_row.zig").declaredCell(page_alloc, column, try previous.cell(column.name)) else .{};
             cells[width + i] = cells[i];
-            const value = if (std.mem.eql(u8, binding.columns[i].name, "_id")) std.json.Value{ .string = proposed_key } else mutation.row.?.object.get(binding.columns[i].name) orelse .null;
+            if (binding.required_cells.len != 0 and !binding.required_cells[width * 2 + i]) {
+                cells[width * 2 + i] = .{};
+                continue;
+            }
+            const value = if (std.mem.eql(u8, column.name, "_id")) std.json.Value{ .string = proposed_key } else if (table.isDocumentRoot(column.name)) mutation.row.? else mutation.row.?.object.get(column.path) orelse .null;
             var sql_null = value == .null;
+            if (table.storage_mode == .document and column.type == .json and mutation.row.?.object.contains(column.path)) sql_null = false;
             for (mutation.json_null_fields) |field| if (std.mem.eql(u8, field, binding.columns[i].name)) {
                 sql_null = false;
                 break;
@@ -382,7 +441,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             // bounded decision page, then resolve predicates and assignments
             // together before releasing it. Mutation fences remain unchanged.
             const scratch = decision_arena.allocator();
-            const retained = try retainDecisionRow(scratch, mutation, previous, cells, table.columns);
+            const retained = try retainDecisionRow(scratch, mutation, previous, cells, table.columns, width);
             try pending.append(context.arena, retained);
             if (try page_budget.add(retained.cells)) {
                 try applyDecisionConflicts(context, scratch, table, clause, binding, pending.items, deferred_cache);
@@ -403,35 +462,26 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             mutation.json_null_fields = &.{};
             continue;
         }
-        var row: std.json.ObjectMap = .empty;
-        var nulls: std.ArrayList([]const u8) = .empty;
-        for (table.columns, 0..) |column, column_index| {
-            if (column.generated) continue;
-            var datum = cells[column_index];
-            var assigned = false;
-            if (binding.column_assignments[column_index]) |assignment_index| {
-                const assignment = clause.assignments[assignment_index];
-                // Omission, not NULL: native preparation owns DEFAULT and
-                // generated values, only after this owner passed WHERE.
-                if (assignment.use_default) continue;
-                const program = binding.assignments[assignment_index];
-                datum = if (assignment.capture_ordinal != null and assignment.capture_expression == null) blk: {
-                    const ordinal = assignment.capture_ordinal.?;
-                    if (ordinal >= captured_row.len) return error.InvalidSqlBackendResponse;
-                    break :blk captured_row[ordinal];
-                } else if (assignment.deferred_scalar) blk: {
-                    const deferred = binding.deferred[assignment_index] orelse return error.InvalidSqlBackendResponse;
-                    if (deferred_cache[assignment_index] == null) deferred_cache[assignment_index] = try context.deferredScalar(deferred.query, deferred.binding);
-                    break :blk deferred_cache[assignment_index].?;
-                } else try @import("decision_eval.zig").evaluateWithLimits(page_alloc, context.backend.decision_provider, &(program orelse return error.InvalidSqlBackendResponse), cells, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
-                assigned = true;
+        const values = try page_alloc.alloc(scalar.Datum, clause.assignments.len);
+        for (clause.assignments, values, 0..) |assignment, *out, index| {
+            if (assignment.use_default) {
+                out.* = .{};
+            } else if (assignment.capture_ordinal != null and assignment.capture_expression == null) {
+                const ordinal = assignment.capture_ordinal.?;
+                if (ordinal >= captured_row.len) return error.InvalidSqlBackendResponse;
+                out.* = captured_row[ordinal];
+            } else if (assignment.deferred_scalar) {
+                const deferred = binding.deferred[index] orelse return error.InvalidSqlBackendResponse;
+                if (deferred_cache[index] == null) deferred_cache[index] = try context.deferredScalar(deferred.query, deferred.binding);
+                out.* = deferred_cache[index].?;
+            } else {
+                const program = binding.assignments[index] orelse return error.InvalidSqlBackendResponse;
+                out.* = try decision_eval.evaluateWithLimits(page_alloc, context.backend.decision_provider, &program, cells, context.parameters, decision_eval.limitsFor(context.backend));
             }
-            if (!assigned and !try previous.hasField(column.name)) continue;
-            if (column.type == .json and datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.name);
-            try row.put(context.arena, column.name, try context.storageDatum(datum, column));
         }
-        mutation.row = .{ .object = row };
-        mutation.json_null_fields = nulls.items;
+        const presence = try page_alloc.alloc(bool, table.columns.len);
+        for (table.columns, presence) |column, *present| present.* = try previous.hasField(column.name);
+        try installPostimage(context, table, clause, binding, mutation, cells, presence, values);
     }
     if (pending.items.len != 0) try applyDecisionConflicts(context, decision_arena.allocator(), table, clause, binding, pending.items, deferred_cache);
     return result;
@@ -442,8 +492,7 @@ const DecisionConflictRow = struct { mutation: *catalog.Mutation, presence: []co
 /// Point pages retire before the external decision batch runs. Copy each old
 /// payload once, sharing qualified aliases; only presence metadata is needed
 /// from the original row. Do not retain a second complete preimage or directory.
-fn retainDecisionRow(alloc: std.mem.Allocator, mutation: *catalog.Mutation, previous: catalog.Row, cells: []const scalar.Datum, columns: []const catalog.Column) !DecisionConflictRow {
-    const width = columns.len + 1;
+fn retainDecisionRow(alloc: std.mem.Allocator, mutation: *catalog.Mutation, previous: catalog.Row, cells: []const scalar.Datum, columns: []const catalog.Column, width: usize) !DecisionConflictRow {
     if (cells.len < width * 3) return error.InvalidSqlBackendResponse;
     const presence = try alloc.alloc(bool, columns.len);
     const owned = try alloc.alloc(scalar.Datum, cells.len);
@@ -506,26 +555,69 @@ fn applyDecisionConflicts(context: anytype, scratch: std.mem.Allocator, table: c
             output.* = try decision_eval.evaluateBatchWithLimits(scratch, context.backend.decision_provider, &program, cells.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
         }
     }
+    const values = try scratch.alloc(scalar.Datum, clause.assignments.len);
     for (selected.items, 0..) |candidate, row_index| {
         try context.checkpoint();
-        var row: std.json.ObjectMap = .empty;
-        var nulls: std.ArrayList([]const u8) = .empty;
-        for (table.columns, 0..) |column, column_index| {
-            if (column.generated) continue;
-            var datum = candidate.cells[column_index];
-            var assigned = false;
-            if (binding.column_assignments[column_index]) |index| {
-                if (clause.assignments[index].use_default) continue;
-                datum = assignment_values[index][row_index];
-                assigned = true;
-            }
-            if (!assigned and !candidate.presence[column_index]) continue;
-            if (column.type == .json and datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.name);
-            try row.put(context.arena, column.name, try context.storageDatum(datum, column));
-        }
-        candidate.mutation.row = .{ .object = row };
-        candidate.mutation.json_null_fields = nulls.items;
+        for (clause.assignments, values, 0..) |assignment, *value, index| value.* = if (assignment.use_default) .{} else assignment_values[index][row_index];
+        try installPostimage(context, table, clause, binding, candidate.mutation, candidate.cells, candidate.presence, values);
     }
+}
+
+fn needsOldDocument(table: catalog.Table, clause: ast.Conflict, binding: Bound) bool {
+    if (table.storage_mode != .document or clause.assignments.len == 0) return false;
+    if (binding.document_assignment == null) return true;
+    const ordinal = table.columns.len + 1;
+    for (binding.assignments) |optional| if (optional) |program| for (program.required_columns) |required| {
+        if (required < binding.row_width * 2 and required % binding.row_width == ordinal) return true;
+    };
+    if (binding.predicate) |program| for (program.required_columns) |required| {
+        if (required < binding.row_width * 2 and required % binding.row_width == ordinal) return true;
+    };
+    return false;
+}
+
+/// Scalar and batched decision evaluation publish the same owned postimage.
+/// The old root is copied once only for property updates. Full replacements
+/// own just the assigned value, never the discarded old document.
+fn installPostimage(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, mutation: *catalog.Mutation, cells: []const scalar.Datum, presence: []const bool, values: []const scalar.Datum) !void {
+    if (values.len != clause.assignments.len or presence.len != table.columns.len) return error.InvalidSqlBackendResponse;
+    if (binding.document_assignment) |index| {
+        const column = try table.column("_doc");
+        if (values[index].sql_null) return error.SqlNotNullViolation;
+        const root = try context.storageDatumTyped(values[index], column, try assignmentIdentity(binding, clause.assignments[index], index));
+        if (root != .object) return error.SqlTypeMismatch;
+        mutation.row = root;
+        mutation.json_null_fields = try table.documentRootNulls(context.arena, root);
+        return;
+    }
+    const document = table.storage_mode == .document;
+    var row: std.json.ObjectMap = .empty;
+    if (document) {
+        const ordinal = table.columns.len + 1;
+        if (ordinal >= cells.len or cells[ordinal].sql_null or cells[ordinal].value != .object) return error.InvalidSqlBackendResponse;
+        row = (try @import("../storage/typed_json.zig").clone(context.arena, cells[ordinal].value)).object;
+    }
+    var nulls: std.ArrayList([]const u8) = .empty;
+    for (table.columns, 0..) |column, ordinal| {
+        const assigned = binding.column_assignments[ordinal];
+        if (column.generated or (assigned != null and clause.assignments[assigned.?].use_default)) {
+            // Omission, not NULL: native preparation owns defaults/generated
+            // values, only after this owner passed the conflict predicate.
+            if (document) _ = row.swapRemove(column.path);
+            continue;
+        }
+        if (document and assigned == null) {
+            if (column.type == .json) if (row.get(column.path)) |value| if (value == .null) try nulls.append(context.arena, column.path);
+            continue;
+        }
+        if (assigned == null and !presence[ordinal]) continue;
+        const datum = if (assigned) |index| values[index] else cells[ordinal];
+        const identity = if (assigned) |index| try assignmentIdentity(binding, clause.assignments[index], index) else column.element_type;
+        if (column.type == .json and datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.path);
+        try row.put(context.arena, column.path, try context.storageDatumTyped(datum, column, identity));
+    }
+    mutation.row = .{ .object = row };
+    mutation.json_null_fields = nulls.items;
 }
 
 fn conflictArrayOwnershipScenario(backing: std.mem.Allocator) !void {
@@ -566,7 +658,7 @@ fn conflictArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     @memcpy(cells[width .. width * 2], cells[0..width]);
     @memcpy(cells[width * 2 ..], cells[0..width]);
     var mutation: catalog.Mutation = .{ .key = "identity", .expected_version = 7, .row = null };
-    const retained = try retainDecisionRow(alloc, &mutation, previous, cells, table.columns);
+    const retained = try retainDecisionRow(alloc, &mutation, previous, cells, table.columns, width);
     try std.testing.expect(retained.cells[0].array == retained.cells[width].array);
     try std.testing.expect(retained.cells[0].array != cells[0].array);
     input.deinit();
@@ -599,6 +691,170 @@ fn conflictArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     try std.testing.expect(json_array.value.flatCell(0).value == .null);
     try std.testing.expect(!json_array.value.flatCell(0).sql_null);
     try std.testing.expect(json_array.value.flatCell(1).sql_null);
+}
+
+const DocumentConflictFixture = struct {
+    const Self = @This();
+    const Cursor = struct {
+        alloc: std.mem.Allocator,
+        owner: *Self,
+        request: catalog.Scan,
+        delivered: bool = false,
+        fn next(raw: *anyopaque, a: std.mem.Allocator, _: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.delivered) return .{ .rows = &.{} };
+            self.delivered = true;
+            if (!std.mem.eql(u8, self.request.primary_key.?, "doc:a")) return .{ .rows = &.{} };
+            const table = try Self.resolve(self.owner, a, undefined, .write);
+            const root = try @import("../storage/typed_json.zig").clone(a, self.owner.root);
+            const rows = try a.alloc(catalog.Row, 1);
+            rows[0] = try @import("document_row.zig").projectValue(a, table, "doc:a", 9, root, self.request.fields);
+            rows[0].expected_content_digest = @splat(7);
+            if (self.request.include_document) rows[0].document = root;
+            return .{ .rows = rows };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.owner.closed += 1;
+            self.alloc.destroy(self);
+        }
+    };
+    root: std.json.Value,
+    opened: usize = 0,
+    closed: usize = 0,
+    root_captures: usize = 0,
+    physical_fields: usize = 0,
+    effective: usize = 0,
+    fences: usize = 0,
+    race: bool = false,
+    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+        return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{ .{ .name = "title", .path = "title", .type = .string }, .{ .name = "metadata", .path = "metadata", .type = .json, .element_type = .jsonb } } };
+    }
+    fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+        return error.UnexpectedBackendCall;
+    }
+    fn open(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+        const self: *Self = @ptrCast(@alignCast(raw));
+        try std.testing.expect(request.primary_key != null and request.include_primary_digest);
+        for (request.fields) |field| try std.testing.expect(!std.mem.eql(u8, field, "_doc"));
+        const cursor = try a.create(Cursor);
+        cursor.* = .{ .alloc = a, .owner = self, .request = request };
+        self.opened += 1;
+        self.root_captures += @intFromBool(request.include_document);
+        self.physical_fields += request.fields.len;
+        return .{ .ptr = cursor, .next = Cursor.next, .close = Cursor.close };
+    }
+    fn prepare(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
+        return input;
+    }
+    fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+        const self: *Self = @ptrCast(@alignCast(raw));
+        try std.testing.expectEqual(self.opened, self.closed);
+        for (input) |mutation| {
+            try std.testing.expectEqual(@as(u64, 9), mutation.expected_version);
+            try std.testing.expectEqual(@as(?[32]u8, @splat(7)), mutation.expected_content_digest);
+            try std.testing.expect(!mutation.unique_absence);
+            if (mutation.row) |row| if (row.object.get("metadata")) |value| if (value == .null) {
+                const marked = for (mutation.json_null_fields) |field| {
+                    if (std.mem.eql(u8, field, "metadata")) break true;
+                } else false;
+                try std.testing.expect(marked);
+            };
+        }
+        if (self.race) return error.SqlWriteConflict;
+        for (input) |mutation| {
+            if (mutation.predicate_only) self.fences += 1 else self.effective += 1;
+        }
+        return .committed;
+    }
+    fn checkpoint(_: *anyopaque) !void {}
+    fn backend(self: *Self) catalog.Backend {
+        return .{ .ptr = self, .predicate_only_mutations = true, .vtable = &.{ .resolve = Self.resolve, .scan = scan, .open_scan = open, .prepare_mutations = prepare, .mutate = mutate, .mutate_prepared = mutate, .checkpoint = checkpoint } };
+    }
+};
+
+fn documentConflictOwnershipScenario(a: std.mem.Allocator, decision: bool) !void {
+    var root = try std.json.parseFromSlice(std.json.Value, a, "{\"title\":\"before\",\"metadata\":null,\"unknown\":{\"n\":9007199254740993.1250,\"null\":null}}", .{ .parse_numbers = false });
+    defer root.deinit();
+    var fixture: DocumentConflictFixture = .{ .root = root.value };
+    defer if (fixture.opened != fixture.closed) @panic("document conflict cursor leaked");
+    var provider: decision_eval.testing.Provider = .{};
+    var backend = fixture.backend();
+    backend.decision_provider = provider.provider();
+    const sql = if (decision)
+        "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO UPDATE SET _doc=jsonb_set(docs._doc,'{title}',to_jsonb(excluded.title),true) WHERE ai_probability(docs.title,'Allow?','local')>0.5 RETURNING _doc"
+    else
+        "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO UPDATE SET title=excluded.title RETURNING _doc";
+    var compiled = try @import("compiler.zig").compile(a, sql, .{});
+    defer compiled.deinit();
+    var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.effective);
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    const postimage = result.output.rows[0][0];
+    try std.testing.expectEqual(@as(usize, 3), postimage.object.count());
+    try std.testing.expect(postimage.object.get("metadata").? == .null);
+    try std.testing.expectEqualStrings("after", postimage.object.get("title").?.string);
+    try std.testing.expectEqualStrings("9007199254740993.1250", postimage.object.get("unknown").?.object.get("n").?.number_string);
+    try std.testing.expect(postimage.object.get("unknown").?.object.get("null").? == .null);
+    try std.testing.expectEqual(@as(usize, @intFromBool(decision)), provider.calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.root_captures);
+}
+
+test "SQL document conflict postimages own unknown values across scalar and decision page retirement" {
+    try documentConflictOwnershipScenario(std.testing.allocator, false);
+    try documentConflictOwnershipScenario(std.testing.allocator, true);
+}
+
+test "SQL document conflict ownership unwinds every preparation allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, documentConflictOwnershipScenario, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, documentConflictOwnershipScenario, .{true});
+}
+
+test "SQL document conflict root replacements avoid cold preimages and skipped rows retain race fences" {
+    var root = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"title\":\"before\",\"unknown\":true}", .{});
+    defer root.deinit();
+    for ([_]struct { sql: []const u8, effective: usize, captures: usize }{
+        .{ .sql = "INSERT INTO docs(_id,_doc) VALUES('doc:a','{\"title\":\"after\"}') ON CONFLICT(_id) DO UPDATE SET _doc=excluded._doc RETURNING _doc", .effective = 1, .captures = 0 },
+        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO NOTHING RETURNING _doc", .effective = 0, .captures = 0 },
+        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT DO NOTHING RETURNING _doc", .effective = 0, .captures = 0 },
+        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO UPDATE SET title=excluded.title WHERE docs.title='absent' RETURNING _doc", .effective = 0, .captures = 1 },
+    }) |case| for ([_]bool{ false, true }) |race| {
+        var fixture: DocumentConflictFixture = .{ .root = root.value, .race = race };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        if (race) {
+            try std.testing.expectError(error.SqlWriteConflict, @import("runtime.zig").execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+            try std.testing.expectEqual(@as(usize, 0), fixture.effective + fixture.fences);
+        } else {
+            var result = try @import("runtime.zig").execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(case.effective, result.output.rows.len);
+            try std.testing.expectEqual(case.effective, fixture.effective);
+            try std.testing.expectEqual(@as(usize, 1) - case.effective, fixture.fences);
+            if (case.effective != 0) {
+                try std.testing.expectEqual(@as(usize, 1), result.output.rows[0][0].object.count());
+                try std.testing.expectEqualStrings("after", result.output.rows[0][0].object.get("title").?.string);
+            }
+        }
+        try std.testing.expectEqual(fixture.opened, fixture.closed);
+        try std.testing.expectEqual(case.captures, fixture.root_captures);
+        try std.testing.expectEqual(@as(usize, if (case.captures == 1) 1 else 0), fixture.physical_fields);
+    };
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(missing) DO NOTHING", .failure = error.UndefinedColumn },
+        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(title) DO NOTHING", .failure = error.ConflictArbiterNotFound },
+        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO UPDATE SET _doc='[]'", .failure = error.SqlTypeMismatch },
+        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO UPDATE SET _doc=NULL", .failure = error.SqlNotNullViolation },
+        .{ .sql = "INSERT INTO docs(_id,title) VALUES('doc:a','after') ON CONFLICT(_id) DO UPDATE SET _doc=DEFAULT", .failure = error.SqlNotNullViolation },
+    }) |case| {
+        var fixture: DocumentConflictFixture = .{ .root = root.value };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, @import("runtime.zig").execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.effective + fixture.fences);
+        try std.testing.expectEqual(fixture.opened, fixture.closed);
+    }
 }
 
 test "SQL conflict decision batches own arrays once across page retirement and unwind every allocation failure" {

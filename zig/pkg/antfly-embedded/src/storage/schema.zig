@@ -292,6 +292,23 @@ pub const TableSchema = struct {
     /// Constructor bytecode is newer than array comparisons and identity casts.
     /// Fence readers even when its array result is consumed by a scalar CHECK.
     requires_array_constructors: bool = false,
+    /// Constant partial-index membership is a new public/native predicate
+    /// variant. Readers must understand it even without typed expressions.
+    requires_constant_index_predicates: bool = false,
+    /// Bounded literal text functions in durable scalar programs.
+    requires_text_expressions: bool = false,
+    /// Typed numeric functions, independently of physical numeric columns.
+    requires_numeric_functions: bool = false,
+    /// Physical JSON keeps PostgreSQL numeric display scale independently of
+    /// semantic content hashing. Readers must understand both representations.
+    requires_jsonb_display: bool = false,
+    /// Typed JSON literals/operands in durable programs require capability 30,
+    /// independently of the display-preserving physical JSON storage policy.
+    requires_json_expressions: bool = false,
+    /// JSONB array elements preserve display scale independently of logical hashes.
+    requires_jsonb_array_display: bool = false,
+    /// Declared CHECK validity is independent of future-write enforcement.
+    requires_deferred_check_validation: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -314,7 +331,236 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 25;
+pub const storage_format_version: u32 = @import("../common/schema_readers.zig").current_encoding_version;
+
+/// A reader's two independent ceilings. Zero/zero is an unknown legacy
+/// observation, never evidence that a schema may be installed or restored.
+/// This describes implementation support, not a schema identity or owner ACK.
+pub const ReaderCapabilities = @import("../common/schema_readers.zig").ReaderCapabilities;
+
+/// A monotonic cluster floor over all admitted schema identities, including
+/// historical layouts. Zero/zero means inactive, not a schema requirement.
+pub const ReaderFloor = @import("../common/schema_readers.zig").ReaderFloor;
+
+/// Requirements attached to one immutable schema identity. Semantic feature
+/// support and physical frame decoding are separate admission decisions.
+pub const ReaderRequirements = @import("../common/schema_readers.zig").ReaderRequirements;
+
+pub fn readerRequirementsForSchema(schema: TableSchema) ReaderRequirements {
+    return .{ .semantic_version = requiredReaderVersion(schema), .encoding_version = schema.decoded_format_version };
+}
+
+test "relational index system schema reader floor joins independent dimensions without regression" {
+    const inactive: ReaderFloor = .{};
+    try std.testing.expect(inactive.valid());
+    try std.testing.expect(!inactive.active());
+    try std.testing.expect(inactive.admits(.{}, 0));
+    const first = try inactive.include(.{ .semantic_version = 30, .encoding_version = 17 });
+    const joined = try first.include(.{ .semantic_version = 13, .encoding_version = 31 });
+    try std.testing.expectEqualDeep(@as(ReaderFloor, .{ .semantic_version = 30, .encoding_version = 31 }), joined);
+    try std.testing.expectEqualDeep(joined, try joined.include(.{ .semantic_version = 13, .encoding_version = 11 }));
+    try std.testing.expect(joined.covers(.{ .semantic_version = 30, .encoding_version = 31 }));
+    try std.testing.expect(!joined.covers(.{ .semantic_version = 31, .encoding_version = 31 }));
+    try std.testing.expect(!joined.admits(.{}, 7));
+    try std.testing.expect(!joined.admits(ReaderCapabilities.current, 0));
+    try std.testing.expect(joined.admits(ReaderCapabilities.current, 7));
+    try std.testing.expect(!joined.admits(.{ .semantic_ceiling = 29, .encoding_ceiling = 31 }, 7));
+    try std.testing.expect(!joined.admits(.{ .semantic_ceiling = 31, .encoding_ceiling = 30 }, 7));
+    for ([_]ReaderRequirements{
+        .{ .semantic_version = 0, .encoding_version = 0 },
+        .{ .semantic_version = 30, .encoding_version = 0 },
+        .{ .semantic_version = 0, .encoding_version = 31 },
+        .{ .semantic_version = 10, .encoding_version = 31 },
+        .{ .semantic_version = 33, .encoding_version = 31 },
+        .{ .semantic_version = 30, .encoding_version = 33 },
+    }) |bad| {
+        try std.testing.expectError(error.InvalidSchemaReaderRequirements, joined.include(bad));
+        try std.testing.expect(!joined.covers(bad));
+    }
+    const corrupt: ReaderFloor = .{ .semantic_version = 30 };
+    try std.testing.expect(!corrupt.valid());
+    try std.testing.expect(!corrupt.admits(ReaderCapabilities.current, 7));
+}
+
+test "relational index system schema reader capabilities distinguish semantics frames and unknown reporters" {
+    const current = ReaderCapabilities.current;
+    try std.testing.expect(current.validForReporter(42));
+    try std.testing.expect(!current.validForReporter(0));
+    const unknown: ReaderCapabilities = .{};
+    try std.testing.expect(unknown.validForReporter(0));
+    try std.testing.expect(!unknown.known());
+    const requirement: ReaderRequirements = .{ .semantic_version = 30, .encoding_version = 31 };
+    try std.testing.expect(current.supports(requirement));
+    try std.testing.expect(!unknown.supports(requirement));
+    const profiles = [_]ReaderCapabilities{
+        .{ .semantic_ceiling = 29, .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 31, .encoding_ceiling = 30 },
+    };
+    for (profiles) |profile| {
+        try std.testing.expect(profile.validForReporter(42));
+        try std.testing.expect(!profile.supports(requirement));
+    }
+    const invalid = [_]ReaderCapabilities{
+        .{ .semantic_ceiling = 31 },
+        .{ .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 10, .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 31, .encoding_ceiling = 10 },
+        .{ .semantic_ceiling = 33, .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 31, .encoding_ceiling = 33 },
+    };
+    for (invalid) |profile| {
+        try std.testing.expect(profile.known());
+        try std.testing.expect(!profile.validForReporter(42));
+        try std.testing.expect(!profile.supports(requirement));
+    }
+    try std.testing.expect(!current.supports(.{ .semantic_version = 0, .encoding_version = 31 }));
+    try std.testing.expect(!current.supports(.{ .semantic_version = 30, .encoding_version = 0 }));
+}
+
+/// Minimum schema capability needed to preserve this layout's semantics.
+/// This is not a row/schema authentication token or a promise that a reader
+/// can decode an arbitrary physical frame: transported ASCH bytes must also
+/// satisfy their declared encoding version. Callers must validate the schema
+/// before treating its requirements as authority.
+pub fn requiredReaderVersion(schema: TableSchema) u32 {
+    var version: u32 = 11;
+    if (schema.declared_fields.len != 0 or schema.exact_fields.len != 0) version = 12;
+    if (schema.storage_mode != .document or schema.requires_public_schema or schema.relational_columns.len != 0) version = 13;
+    for (schema.full_text_documents) |document| {
+        if (document.declared_paths.len != 0 or document.unindexed_paths.len != 0) version = @max(version, 14);
+    }
+    if (schema.external_base_source != null) version = @max(version, 15);
+    inline for (.{
+        .{ "requires_typed_expressions", 18 },
+        .{ "requires_predicate_expressions", 19 },
+        .{ "requires_exact_numeric_expressions", 21 },
+        .{ "requires_exact_numeric_validation", 22 },
+        .{ "requires_numeric_modifiers", 23 },
+        .{ "requires_array_expressions", 24 },
+        .{ "requires_array_constructors", 25 },
+        .{ "requires_constant_index_predicates", 26 },
+        .{ "requires_text_expressions", 27 },
+        .{ "requires_numeric_functions", 28 },
+        .{ "requires_jsonb_display", 29 },
+        .{ "requires_json_expressions", 30 },
+        .{ "requires_jsonb_array_display", 31 },
+        .{ "requires_deferred_check_validation", 32 },
+    }) |requirement| {
+        if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
+    }
+    for (schema.relational_columns) |column| {
+        if (column.sql_element_type != null) version = @max(version, 16);
+        if (column.column_type == .sql_array) version = @max(version, 17);
+        if (column.column_type == .numeric or column.sql_element_type == .numeric) version = @max(version, 20);
+        if (column.numeric_modifier != null) version = @max(version, 23);
+        if (column.column_type == .sql_array and column.sql_element_type == .jsonb) version = @max(version, 31);
+    }
+    return version;
+}
+
+test "relational index system schema reader requirements cover every durable expression gate" {
+    const a = std.testing.allocator;
+    // Independent expected floors: adding another requires_* field must extend
+    // this contract, not silently default to a predecessor reader profile.
+    comptime {
+        var fields: usize = 0;
+        for (@typeInfo(TableSchema).@"struct".field_names) |name| {
+            if (std.mem.startsWith(u8, name, "requires_")) fields += 1;
+        }
+        if (fields != 14) @compileError("extend the independent schema reader capability contract for every requires_* field");
+    }
+    inline for (.{
+        .{ "requires_typed_expressions", 18 },
+        .{ "requires_predicate_expressions", 19 },
+        .{ "requires_exact_numeric_expressions", 21 },
+        .{ "requires_exact_numeric_validation", 22 },
+        .{ "requires_numeric_modifiers", 23 },
+        .{ "requires_array_expressions", 24 },
+        .{ "requires_array_constructors", 25 },
+        .{ "requires_constant_index_predicates", 26 },
+        .{ "requires_text_expressions", 27 },
+        .{ "requires_numeric_functions", 28 },
+        .{ "requires_jsonb_display", 29 },
+        .{ "requires_json_expressions", 30 },
+        .{ "requires_jsonb_array_display", 31 },
+        .{ "requires_deferred_check_validation", 32 },
+    }) |expected| {
+        var schema: TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true };
+        @field(schema, expected[0]) = true;
+        if (comptime std.mem.eql(u8, expected[0], "requires_array_constructors")) schema.requires_array_expressions = true;
+        if (comptime std.mem.eql(u8, expected[0], "requires_exact_numeric_validation")) schema.relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric }};
+        try std.testing.expectEqual(@as(u32, expected[1]), requiredReaderVersion(schema));
+        try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, schema, expected[1] - 1));
+        const bytes = try serializeSchemaFormat(a, schema, expected[1]);
+        defer a.free(bytes);
+        const restored = try deserializeSchema(a, bytes);
+        defer freeSchema(a, restored);
+        try std.testing.expectEqual(@as(u32, expected[1]), requiredReaderVersion(restored));
+        try std.testing.expectEqual(@as(u32, expected[1]), restored.decoded_format_version);
+    }
+}
+
+test "relational index system schema reader requirements keep text projection independent from row authority" {
+    const a = std.testing.allocator;
+    const relational: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true, .requires_jsonb_display = true };
+    try std.testing.expectEqual(@as(u32, 30), requiredReaderVersion(relational));
+    const projected = try serializeTextProjectionSchema(a, relational);
+    defer a.free(projected);
+    const restored = try deserializeSchema(a, projected);
+    defer freeSchema(a, restored);
+    try std.testing.expectEqual(StorageMode.document, restored.storage_mode);
+    try std.testing.expect(!restored.requires_public_schema);
+    try std.testing.expect(!restored.requires_json_expressions);
+    try std.testing.expect(!restored.requires_jsonb_display);
+    try std.testing.expectEqual(@as(u32, 11), requiredReaderVersion(restored));
+    const document: TableSchema = .{};
+    const expected = try serializeTextProjectionSchema(a, document);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, projected);
+}
+
+test "relational index system schema reader requirements preserve precise column and frame identity" {
+    const a = std.testing.allocator;
+    const unknown: ReaderRequirements = .{ .semantic_version = 0, .encoding_version = 0 };
+    try std.testing.expect(!unknown.canInterpret(storage_format_version));
+    try std.testing.expect(!unknown.canDecodeFrame(storage_format_version, storage_format_version));
+    const unknown_frame: ReaderRequirements = .{ .semantic_version = 13, .encoding_version = 0 };
+    try std.testing.expect(unknown_frame.canInterpret(13));
+    try std.testing.expect(!unknown_frame.canDecodeFrame(storage_format_version, storage_format_version));
+    for ([_]struct { column: RelationalColumn, version: u32 }{
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .integer }, .version = 13 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .integer, .sql_element_type = .int16 }, .version = 16 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .sql_array, .sql_element_type = .text }, .version = 17 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .numeric, .sql_element_type = .numeric }, .version = 20 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .sql_array, .sql_element_type = .numeric }, .version = 20 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = -2 } }, .version = 23 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .sql_array, .sql_element_type = .jsonb }, .version = 31 },
+    }) |expected| {
+        const schema: TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_modifiers = expected.column.numeric_modifier != null, .relational_columns = &.{expected.column} };
+        try std.testing.expectEqual(expected.version, requiredReaderVersion(schema));
+        const bytes = try serializeSchemaFormat(a, schema, expected.version);
+        defer a.free(bytes);
+        const restored = try deserializeSchema(a, bytes);
+        defer freeSchema(a, restored);
+        try std.testing.expectEqual(expected.version, requiredReaderVersion(restored));
+        // The same semantic layout can occupy a newer ASCH frame. A receiver
+        // must check the frame decoder ceiling as well as semantic capability.
+        const current_bytes = try serializeSchema(a, schema);
+        defer a.free(current_bytes);
+        const current = try deserializeSchema(a, current_bytes);
+        defer freeSchema(a, current);
+        try std.testing.expectEqual(expected.version, requiredReaderVersion(current));
+        try std.testing.expectEqual(storage_format_version, current.decoded_format_version);
+        const original_requirements = readerRequirementsForSchema(restored);
+        try std.testing.expect(original_requirements.canDecodeFrame(expected.version, expected.version));
+        try std.testing.expect(!original_requirements.canInterpret(expected.version - 1));
+        const current_requirements = readerRequirementsForSchema(current);
+        try std.testing.expect(current_requirements.canInterpret(expected.version));
+        try std.testing.expect(current_requirements.canDecodeFrame(storage_format_version, expected.version));
+        if (expected.version < storage_format_version) try std.testing.expect(!current_requirements.canDecodeFrame(expected.version, expected.version));
+        try std.testing.expect(!current_requirements.canDecodeFrame(storage_format_version, expected.version - 1));
+    }
+}
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -344,7 +590,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_check_validation) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -409,6 +655,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     var projection_schema = schema;
     projection_schema.declared_fields = &.{};
     projection_schema.storage_mode = .document;
+    projection_schema.requires_public_schema = false;
     projection_schema.external_base_source = null;
     projection_schema.relational_columns = &.{};
     projection_schema.requires_typed_expressions = false;
@@ -418,6 +665,13 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_numeric_modifiers = false;
     projection_schema.requires_array_expressions = false;
     projection_schema.requires_array_constructors = false;
+    projection_schema.requires_constant_index_predicates = false;
+    projection_schema.requires_text_expressions = false;
+    projection_schema.requires_numeric_functions = false;
+    projection_schema.requires_jsonb_display = false;
+    projection_schema.requires_json_expressions = false;
+    projection_schema.requires_jsonb_array_display = false;
+    projection_schema.requires_deferred_check_validation = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -441,7 +695,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         return error.InvalidSchema;
     }
     if (format_version < 13 and
-        (schema.storage_mode != .document or schema.relational_columns.len != 0))
+        (schema.storage_mode != .document or schema.requires_public_schema or schema.relational_columns.len != 0))
     {
         return error.InvalidSchema;
     }
@@ -450,22 +704,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
             if (doc.declared_paths.len != 0 or doc.unindexed_paths.len != 0) return error.InvalidSchema;
         }
     }
-    if (format_version < 16) for (schema.relational_columns) |column| {
-        if (column.sql_element_type != null) return error.UnsupportedVersion;
-    };
-    if (format_version < 17) for (schema.relational_columns) |column| {
-        if (column.column_type == .sql_array) return error.UnsupportedVersion;
-    };
-    if (format_version < 18 and schema.requires_typed_expressions) return error.UnsupportedVersion;
-    if (format_version < 19 and schema.requires_predicate_expressions) return error.UnsupportedVersion;
-    if (format_version < 21 and schema.requires_exact_numeric_expressions) return error.UnsupportedVersion;
-    if (format_version < 22 and schema.requires_exact_numeric_validation) return error.UnsupportedVersion;
-    if (format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedVersion;
-    if (format_version < 24 and schema.requires_array_expressions) return error.UnsupportedVersion;
-    if (format_version < 25 and schema.requires_array_constructors) return error.UnsupportedVersion;
-    if (format_version < 20) for (schema.relational_columns) |column| {
-        if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedVersion;
-    };
+    if (format_version < requiredReaderVersion(schema)) return error.UnsupportedVersion;
 
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
@@ -613,6 +852,13 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 23) try buf.append(alloc, @intFromBool(schema.requires_numeric_modifiers));
     if (format_version >= 24) try buf.append(alloc, @intFromBool(schema.requires_array_expressions));
     if (format_version >= 25) try buf.append(alloc, @intFromBool(schema.requires_array_constructors));
+    if (format_version >= 26) try buf.append(alloc, @intFromBool(schema.requires_constant_index_predicates));
+    if (format_version >= 27) try buf.append(alloc, @intFromBool(schema.requires_text_expressions));
+    if (format_version >= 28) try buf.append(alloc, @intFromBool(schema.requires_numeric_functions));
+    if (format_version >= 29) try buf.append(alloc, @intFromBool(schema.requires_jsonb_display));
+    if (format_version >= 30) try buf.append(alloc, @intFromBool(schema.requires_json_expressions));
+    if (format_version >= 31) try buf.append(alloc, @intFromBool(schema.requires_jsonb_array_display));
+    if (format_version >= 32) try buf.append(alloc, @intFromBool(schema.requires_deferred_check_validation));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -860,168 +1106,14 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
     const full_text_documents: []FullTextDocument = if (fmt_version >= 2) blk: {
         const doc_count = readU32(data, &pos);
         const docs = try alloc.alloc(FullTextDocument, doc_count);
-        var docs_initialized: usize = 0;
+        var initialized: usize = 0;
         errdefer {
-            for (docs[0..docs_initialized]) |doc| {
-                alloc.free(doc.name);
-                for (doc.fields) |field| {
-                    alloc.free(field.path);
-                    alloc.free(field.emitted_name);
-                    alloc.free(field.analyzer);
-                }
-                if (doc.fields.len > 0) alloc.free(doc.fields);
-                for (doc.dynamic_rules) |rule| {
-                    alloc.free(rule.parent_path);
-                    if (rule.segment_pattern) |pattern| alloc.free(pattern);
-                    alloc.free(rule.relative_path);
-                    for (rule.variants) |variant| {
-                        alloc.free(variant.suffix);
-                        alloc.free(variant.analyzer);
-                    }
-                    if (rule.variants.len > 0) alloc.free(rule.variants);
-                }
-                if (doc.dynamic_rules.len > 0) alloc.free(doc.dynamic_rules);
-                for (doc.open_dynamic_paths) |open_path| alloc.free(open_path);
-                if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
-                for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
-                if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
-                freeOwnedPaths(alloc, doc.declared_paths);
-                freeOwnedPaths(alloc, doc.unindexed_paths);
-            }
+            for (docs[0..initialized]) |doc| freeFullTextDocument(alloc, doc);
             alloc.free(docs);
         }
-
         for (docs) |*doc| {
-            const name = try alloc.dupe(u8, readStr(data, &pos));
-            errdefer alloc.free(name);
-
-            const field_count = readU32(data, &pos);
-            const fields = try alloc.alloc(FullTextField, field_count);
-            var fields_initialized: usize = 0;
-            errdefer {
-                for (fields[0..fields_initialized]) |field| {
-                    alloc.free(field.path);
-                    alloc.free(field.emitted_name);
-                    alloc.free(field.analyzer);
-                }
-                alloc.free(fields);
-            }
-            for (fields) |*field| {
-                field.* = .{
-                    .path = try alloc.dupe(u8, readStr(data, &pos)),
-                    .emitted_name = try alloc.dupe(u8, readStr(data, &pos)),
-                    .analyzer = try alloc.dupe(u8, readStr(data, &pos)),
-                    .include_in_all = data[pos] == 1,
-                };
-                pos += 1;
-                fields_initialized += 1;
-            }
-
-            doc.* = .{
-                .name = name,
-                .fields = fields,
-                .dynamic_rules = &.{},
-                .open_dynamic_paths = &.{},
-                .infer_type_dynamic_paths = &.{},
-            };
-            if (fmt_version >= 3) {
-                const dynamic_rule_count = readU32(data, &pos);
-                const dynamic_rules = try alloc.alloc(FullTextDynamicRule, dynamic_rule_count);
-                var dynamic_rules_initialized: usize = 0;
-                errdefer {
-                    for (dynamic_rules[0..dynamic_rules_initialized]) |rule| {
-                        alloc.free(rule.parent_path);
-                        if (rule.segment_pattern) |pattern| alloc.free(pattern);
-                        alloc.free(rule.relative_path);
-                        for (rule.variants) |variant| {
-                            alloc.free(variant.suffix);
-                            alloc.free(variant.analyzer);
-                        }
-                        if (rule.variants.len > 0) alloc.free(rule.variants);
-                    }
-                    alloc.free(dynamic_rules);
-                }
-                for (dynamic_rules) |*rule| {
-                    const parent_path = try alloc.dupe(u8, readStr(data, &pos));
-                    errdefer alloc.free(parent_path);
-                    const has_segment_pattern = if (fmt_version >= 5) data[pos] == 1 else false;
-                    if (fmt_version >= 5) pos += 1;
-                    const segment_pattern = if (has_segment_pattern)
-                        try alloc.dupe(u8, readStr(data, &pos))
-                    else
-                        null;
-                    errdefer if (segment_pattern) |pattern| alloc.free(pattern);
-                    const relative_path = if (fmt_version >= 4)
-                        try alloc.dupe(u8, readStr(data, &pos))
-                    else
-                        try alloc.dupe(u8, "");
-                    errdefer alloc.free(relative_path);
-
-                    const variant_count = readU32(data, &pos);
-                    const variants = try alloc.alloc(FullTextDynamicVariant, variant_count);
-                    var variants_initialized: usize = 0;
-                    errdefer {
-                        for (variants[0..variants_initialized]) |variant| {
-                            alloc.free(variant.suffix);
-                            alloc.free(variant.analyzer);
-                        }
-                        alloc.free(variants);
-                    }
-                    for (variants) |*variant| {
-                        variant.* = .{
-                            .suffix = try alloc.dupe(u8, readStr(data, &pos)),
-                            .analyzer = try alloc.dupe(u8, readStr(data, &pos)),
-                            .include_in_all = data[pos] == 1,
-                        };
-                        pos += 1;
-                        variants_initialized += 1;
-                    }
-
-                    rule.* = .{
-                        .parent_path = parent_path,
-                        .segment_pattern = segment_pattern,
-                        .relative_path = relative_path,
-                        .variants = variants,
-                    };
-                    dynamic_rules_initialized += 1;
-                }
-                doc.dynamic_rules = dynamic_rules;
-            }
-            if (fmt_version >= 6) {
-                const open_dynamic_path_count = readU32(data, &pos);
-                const open_dynamic_paths = try alloc.alloc([]const u8, open_dynamic_path_count);
-                var open_dynamic_paths_initialized: usize = 0;
-                errdefer {
-                    for (open_dynamic_paths[0..open_dynamic_paths_initialized]) |open_path| alloc.free(open_path);
-                    alloc.free(open_dynamic_paths);
-                }
-                for (open_dynamic_paths) |*open_path| {
-                    open_path.* = try alloc.dupe(u8, readStr(data, &pos));
-                    open_dynamic_paths_initialized += 1;
-                }
-                doc.open_dynamic_paths = open_dynamic_paths;
-            }
-            if (fmt_version >= 8) {
-                const infer_type_dynamic_path_count = readU32(data, &pos);
-                const infer_type_dynamic_paths = try alloc.alloc([]const u8, infer_type_dynamic_path_count);
-                var infer_type_dynamic_paths_initialized: usize = 0;
-                errdefer {
-                    for (infer_type_dynamic_paths[0..infer_type_dynamic_paths_initialized]) |infer_path| alloc.free(infer_path);
-                    alloc.free(infer_type_dynamic_paths);
-                }
-                for (infer_type_dynamic_paths) |*infer_path| {
-                    infer_path.* = try alloc.dupe(u8, readStr(data, &pos));
-                    infer_type_dynamic_paths_initialized += 1;
-                }
-                doc.infer_type_dynamic_paths = infer_type_dynamic_paths;
-            }
-            if (fmt_version >= 14) {
-                const declared_paths = try readOwnedPaths(alloc, data, &pos);
-                errdefer freeOwnedPaths(alloc, declared_paths);
-                doc.unindexed_paths = try readOwnedPaths(alloc, data, &pos);
-                doc.declared_paths = declared_paths;
-            }
-            docs_initialized += 1;
+            doc.* = try readFullTextDocument(alloc, data, &pos, fmt_version);
+            initialized += 1;
         }
         break :blk docs;
     } else &.{};
@@ -1143,6 +1235,13 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk columns;
     } else &.{};
 
+    errdefer {
+        for (relational_columns) |column| {
+            alloc.free(column.name);
+            alloc.free(column.path);
+        }
+        if (relational_columns.len > 0) alloc.free(relational_columns);
+    }
     const external = if (fmt_version >= 15 and data[pos] == 1) blk: {
         pos += 1;
         const bytes = readStr(data, &pos);
@@ -1174,6 +1273,13 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_numeric_modifiers = if (fmt_version >= 23) data[pos + 4] == 1 else false,
         .requires_array_expressions = if (fmt_version >= 24) data[pos + 5] == 1 else false,
         .requires_array_constructors = if (fmt_version >= 25) data[pos + 6] == 1 else false,
+        .requires_constant_index_predicates = if (fmt_version >= 26) data[pos + 7] == 1 else false,
+        .requires_text_expressions = if (fmt_version >= 27) data[pos + 8] == 1 else false,
+        .requires_numeric_functions = if (fmt_version >= 28) data[pos + 9] == 1 else false,
+        .requires_jsonb_display = if (fmt_version >= 29) data[pos + 10] == 1 else false,
+        .requires_json_expressions = if (fmt_version >= 30) data[pos + 11] == 1 else false,
+        .requires_jsonb_array_display = if (fmt_version >= 31) data[pos + 12] == 1 else false,
+        .requires_deferred_check_validation = if (fmt_version >= 32) data[pos + 13] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1398,6 +1504,7 @@ fn validateSerializedSchema(data: []const u8) !void {
                 const sql_tag = try cursor.readU8();
                 if (sql_tag > std.meta.fieldNames(@import("../common/sql_builtin_type.zig").Type).len) return error.InvalidSchema;
                 if (sql_tag == @backingInt(@import("../common/sql_builtin_type.zig").Type.numeric) + 1 and format_version < 20) return error.UnsupportedVersion;
+                if (column_tag == @backingInt(RelationalColumnType.sql_array) and sql_tag == @backingInt(@import("../common/sql_builtin_type.zig").Type.jsonb) + 1 and format_version < 31) return error.UnsupportedVersion;
             }
             if (format_version >= 23) {
                 const present = try cursor.readU8();
@@ -1425,10 +1532,24 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 23) try cursor.readBool();
     if (format_version >= 24) try cursor.readBool();
     if (format_version >= 25) try cursor.readBool();
+    if (format_version >= 26) try cursor.readBool();
+    if (format_version >= 27) try cursor.readBool();
+    if (format_version >= 28) try cursor.readBool();
+    if (format_version >= 29) try cursor.readBool();
+    if (format_version >= 30) try cursor.readBool();
+    if (format_version >= 31) try cursor.readBool();
+    if (format_version >= 32) try cursor.readBool();
     try cursor.finish();
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    if (schema.requires_jsonb_array_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_deferred_check_validation and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_json_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_jsonb_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_numeric_functions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_text_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_constant_index_predicates and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_array_constructors and !schema.requires_array_expressions) return error.InvalidSchema;
     if (schema.requires_array_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema))
         return error.InvalidSchema;
@@ -1534,34 +1655,119 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     if (s.index_sort.len > 0) alloc.free(s.index_sort);
 }
 
+fn freeFullTextRule(alloc: Allocator, rule: FullTextDynamicRule) void {
+    alloc.free(rule.parent_path);
+    if (rule.segment_pattern) |pattern| alloc.free(pattern);
+    alloc.free(rule.relative_path);
+    for (rule.variants) |variant| {
+        alloc.free(variant.suffix);
+        alloc.free(variant.analyzer);
+    }
+    if (rule.variants.len > 0) alloc.free(rule.variants);
+}
+
+fn freeFullTextDocument(alloc: Allocator, doc: FullTextDocument) void {
+    alloc.free(doc.name);
+    for (doc.fields) |field| {
+        alloc.free(field.path);
+        alloc.free(field.emitted_name);
+        alloc.free(field.analyzer);
+    }
+    if (doc.fields.len > 0) alloc.free(doc.fields);
+    for (doc.dynamic_rules) |rule| freeFullTextRule(alloc, rule);
+    if (doc.dynamic_rules.len > 0) alloc.free(doc.dynamic_rules);
+    freeOwnedPaths(alloc, doc.open_dynamic_paths);
+    freeOwnedPaths(alloc, doc.infer_type_dynamic_paths);
+    freeOwnedPaths(alloc, doc.declared_paths);
+    freeOwnedPaths(alloc, doc.unindexed_paths);
+}
+
 fn freeFullTextDocuments(alloc: Allocator, documents: []const FullTextDocument) void {
-    for (documents) |doc| {
-        alloc.free(doc.name);
-        for (doc.fields) |field| {
-            alloc.free(field.path);
-            alloc.free(field.emitted_name);
-            alloc.free(field.analyzer);
-        }
-        if (doc.fields.len > 0) alloc.free(doc.fields);
-        for (doc.dynamic_rules) |rule| {
-            alloc.free(rule.parent_path);
-            if (rule.segment_pattern) |pattern| alloc.free(pattern);
-            alloc.free(rule.relative_path);
-            for (rule.variants) |variant| {
+    for (documents) |doc| freeFullTextDocument(alloc, doc);
+    if (documents.len > 0) alloc.free(documents);
+}
+
+/// Completed children transfer to their parent immediately. The parent then
+/// owns cleanup if a later child fails; partially built children stay local.
+fn readFullTextRule(alloc: Allocator, data: []const u8, pos: *usize, version: u32) !FullTextDynamicRule {
+    var rule: FullTextDynamicRule = .{ .parent_path = try alloc.dupe(u8, readStr(data, pos)) };
+    errdefer freeFullTextRule(alloc, rule);
+    const has_pattern = if (version >= 5) data[pos.*] == 1 else false;
+    if (version >= 5) pos.* += 1;
+    if (has_pattern) rule.segment_pattern = try alloc.dupe(u8, readStr(data, pos));
+    rule.relative_path = if (version >= 4) try alloc.dupe(u8, readStr(data, pos)) else try alloc.dupe(u8, "");
+    rule.variants = variants: {
+        const count = readU32(data, pos);
+        const variants = try alloc.alloc(FullTextDynamicVariant, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (variants[0..initialized]) |variant| {
                 alloc.free(variant.suffix);
                 alloc.free(variant.analyzer);
             }
-            if (rule.variants.len > 0) alloc.free(rule.variants);
+            alloc.free(variants);
         }
-        if (doc.dynamic_rules.len > 0) alloc.free(doc.dynamic_rules);
-        for (doc.open_dynamic_paths) |open_path| alloc.free(open_path);
-        if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
-        for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
-        if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
-        freeOwnedPaths(alloc, doc.declared_paths);
-        freeOwnedPaths(alloc, doc.unindexed_paths);
+        for (variants) |*variant| {
+            const suffix = try alloc.dupe(u8, readStr(data, pos));
+            errdefer alloc.free(suffix);
+            const analyzer = try alloc.dupe(u8, readStr(data, pos));
+            variant.* = .{ .suffix = suffix, .analyzer = analyzer, .include_in_all = data[pos.*] == 1 };
+            pos.* += 1;
+            initialized += 1;
+        }
+        break :variants variants;
+    };
+    return rule;
+}
+
+fn readFullTextDocument(alloc: Allocator, data: []const u8, pos: *usize, version: u32) !FullTextDocument {
+    var doc: FullTextDocument = .{ .name = try alloc.dupe(u8, readStr(data, pos)) };
+    errdefer freeFullTextDocument(alloc, doc);
+    doc.fields = fields: {
+        const count = readU32(data, pos);
+        const fields = try alloc.alloc(FullTextField, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (fields[0..initialized]) |field| {
+                alloc.free(field.path);
+                alloc.free(field.emitted_name);
+                alloc.free(field.analyzer);
+            }
+            alloc.free(fields);
+        }
+        for (fields) |*field| {
+            const path = try alloc.dupe(u8, readStr(data, pos));
+            errdefer alloc.free(path);
+            const emitted_name = try alloc.dupe(u8, readStr(data, pos));
+            errdefer alloc.free(emitted_name);
+            const analyzer = try alloc.dupe(u8, readStr(data, pos));
+            field.* = .{ .path = path, .emitted_name = emitted_name, .analyzer = analyzer, .include_in_all = data[pos.*] == 1 };
+            pos.* += 1;
+            initialized += 1;
+        }
+        break :fields fields;
+    };
+    if (version >= 3) doc.dynamic_rules = rules: {
+        const count = readU32(data, pos);
+        const rules = try alloc.alloc(FullTextDynamicRule, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (rules[0..initialized]) |rule| freeFullTextRule(alloc, rule);
+            alloc.free(rules);
+        }
+        for (rules) |*rule| {
+            rule.* = try readFullTextRule(alloc, data, pos, version);
+            initialized += 1;
+        }
+        break :rules rules;
+    };
+    if (version >= 6) doc.open_dynamic_paths = try readOwnedPaths(alloc, data, pos);
+    if (version >= 8) doc.infer_type_dynamic_paths = try readOwnedPaths(alloc, data, pos);
+    if (version >= 14) {
+        doc.declared_paths = try readOwnedPaths(alloc, data, pos);
+        doc.unindexed_paths = try readOwnedPaths(alloc, data, pos);
     }
-    if (documents.len > 0) alloc.free(documents);
+    return doc;
 }
 
 fn readOwnedPaths(alloc: Allocator, data: []const u8, pos: *usize) ![]const []const u8 {
@@ -1689,6 +1895,11 @@ pub fn encodedSchemaMetadataUnchanged(
     return true;
 }
 
+/// Optional validateBefore(txn) observes the durable predecessor inside the
+/// SAME write transaction, before schema/metadata puts or deletes. stage(txn)
+/// then observes the proposed schema and stages dependent effects. Both are
+/// fallible; every failure aborts all effects, including version-history puts.
+/// Runtime publication remains the caller's non-fallible post-commit step.
 pub fn saveEncodedSchemaWithMetadataAndStage(
     store: anytype,
     alloc: Allocator,
@@ -1750,6 +1961,13 @@ pub fn saveEncodedSchemaWithMetadataAndStage(
 
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+    if (comptime @TypeOf(participant) != @TypeOf(null)) {
+        const Participant = switch (@typeInfo(@TypeOf(participant))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(participant),
+        };
+        if (comptime @hasDecl(Participant, "validateBefore")) try participant.validateBefore(&txn);
+    }
     if (schema_changed) {
         if (previous_versioned_data) |encoded| {
             const previous_versioned_key = try schemaVersionKeyAlloc(alloc, previous_version.?);
@@ -3098,6 +3316,230 @@ test "relational index system exact NUMERIC programs fence readers without NUMER
     try std.testing.expectError(error.InvalidSchema, deserializeSchema(a, malformed));
 }
 
+test "relational index system JSONB display capability fences readers and validates its wire flag" {
+    const a = std.testing.allocator;
+    var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 28));
+    const bytes = try serializeSchemaFormat(a, current, 29);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_jsonb_display);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    for (0..bytes.len) |length| {
+        const truncated = deserializeSchema(a, bytes[0..length]) catch continue;
+        freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const corrupt = try a.dupe(u8, bytes);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] = 2;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(none.allocator(), corrupt));
+    const projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(projection);
+    current.requires_jsonb_display = false;
+    const ordinary = try serializeTextProjectionSchema(a, current);
+    defer a.free(ordinary);
+    try std.testing.expectEqualSlices(u8, projection, ordinary);
+    const old = try serializeSchemaFormat(a, current, 28);
+    defer a.free(old);
+    const loaded = try deserializeSchema(a, old);
+    defer freeSchema(a, loaded);
+    try std.testing.expect(!loaded.requires_jsonb_display);
+    current.requires_jsonb_display = true;
+    current.requires_public_schema = false;
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(a, current));
+}
+
+test "relational index system JSONB array display fences schemas and catalog readers" {
+    const a = std.testing.allocator;
+    var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_array_display = true };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 30));
+    const bytes = try serializeSchema(a, current);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_jsonb_array_display);
+    try std.testing.expect(!decoded.requires_json_expressions);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    for (0..bytes.len) |length| {
+        const truncated = deserializeSchema(a, bytes[0..length]) catch continue;
+        freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const malformed = try a.dupe(u8, bytes);
+    defer a.free(malformed);
+    malformed[malformed.len - 1] = 2;
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(Allocator.failing, malformed));
+    var catalog: @import("db/table_catalog.zig").Catalog = .{ .mode_initialized = true, .storage_mode = .relational, .schema_format_version = 30 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(current));
+    catalog.schema_format_version = storage_format_version;
+    try catalog.validateForSchema(current);
+    const projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(projection);
+    current.requires_jsonb_array_display = false;
+    const ordinary = try serializeTextProjectionSchema(a, current);
+    defer a.free(ordinary);
+    try std.testing.expectEqualSlices(u8, projection, ordinary);
+    // Native-only layouts also require the physical codec, even without the
+    // public program flag. Forged old wire layouts fail before allocation.
+    current.requires_public_schema = false;
+    current.relational_columns = &.{.{ .name = "j", .path = "j", .column_type = .sql_array, .sql_element_type = .jsonb }};
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 30));
+    const native = try serializeSchema(a, current);
+    defer a.free(native);
+    std.mem.writeInt(u32, native[4..8], 30, .little);
+    try std.testing.expectError(error.UnsupportedVersion, deserializeSchema(Allocator.failing, native[0 .. native.len - 1]));
+    catalog.schema_format_version = 30;
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(current));
+}
+
+test "relational index system JSON expression capability is independent of physical JSON display" {
+    const a = std.testing.allocator;
+    var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 29));
+    const bytes = try serializeSchemaFormat(a, current, 30);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_json_expressions);
+    try std.testing.expect(!decoded.requires_jsonb_display);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    for (0..bytes.len) |length| {
+        const truncated = deserializeSchema(a, bytes[0..length]) catch continue;
+        freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const malformed = try a.dupe(u8, bytes);
+    defer a.free(malformed);
+    malformed[malformed.len - 1] = 2;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(none.allocator(), malformed));
+    const projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(projection);
+    current.requires_json_expressions = false;
+    const ordinary = try serializeTextProjectionSchema(a, current);
+    defer a.free(ordinary);
+    try std.testing.expectEqualSlices(u8, projection, ordinary);
+    const old = try serializeSchemaFormat(a, current, 29);
+    defer a.free(old);
+    const previous = try deserializeSchema(a, old);
+    defer freeSchema(a, previous);
+    try std.testing.expect(!previous.requires_json_expressions);
+    current.requires_json_expressions = true;
+    current.requires_public_schema = false;
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(a, current));
+}
+
+test "relational index system SQL durable numeric functions fence old schema readers" {
+    const a = std.testing.allocator;
+    var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_functions = true };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 27));
+    const bytes = try serializeSchema(a, current);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_numeric_functions);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    for (0..bytes.len) |length| {
+        const truncated = deserializeSchema(a, bytes[0..length]) catch continue;
+        freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const corrupt = try a.dupe(u8, bytes);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] = 2;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(none.allocator(), corrupt));
+    const projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(projection);
+    current.requires_numeric_functions = false;
+    const ordinary_projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(ordinary_projection);
+    try std.testing.expectEqualSlices(u8, projection, ordinary_projection);
+    const old = try serializeSchemaFormat(a, current, 27);
+    defer a.free(old);
+    const loaded = try deserializeSchema(a, old);
+    defer freeSchema(a, loaded);
+    try std.testing.expect(!loaded.requires_numeric_functions);
+    current.requires_numeric_functions = true;
+    current.requires_public_schema = false;
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(a, current));
+}
+
+test "relational index system SQL durable text expressions fence old schema readers" {
+    const a = std.testing.allocator;
+    var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_text_expressions = true };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 26));
+    const bytes = try serializeSchema(a, current);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_text_expressions);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    for (0..bytes.len) |length| {
+        const truncated = deserializeSchema(a, bytes[0..length]) catch continue;
+        freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const corrupt = try a.dupe(u8, bytes);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] = 2;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(none.allocator(), corrupt));
+    const projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(projection);
+    current.requires_text_expressions = false;
+    const ordinary_projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(ordinary_projection);
+    try std.testing.expectEqualSlices(u8, projection, ordinary_projection);
+    const old = try serializeSchemaFormat(a, current, 26);
+    defer a.free(old);
+    const loaded = try deserializeSchema(a, old);
+    defer freeSchema(a, loaded);
+    try std.testing.expect(!loaded.requires_text_expressions);
+    current.requires_text_expressions = true;
+    current.requires_public_schema = false;
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(a, current));
+}
+
+test "relational index system SQL immutable index constant membership fences old schema readers" {
+    const a = std.testing.allocator;
+    var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_constant_index_predicates = true };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 25));
+    const bytes = try serializeSchema(a, current);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_constant_index_predicates);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    for (0..bytes.len) |length| {
+        const truncated = deserializeSchema(a, bytes[0..length]) catch continue;
+        freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const corrupt = try a.dupe(u8, bytes);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] = 2;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(none.allocator(), corrupt));
+    const typed_projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(typed_projection);
+    current.requires_constant_index_predicates = false;
+    const ordinary_projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(ordinary_projection);
+    try std.testing.expectEqualSlices(u8, typed_projection, ordinary_projection);
+    const ordinary = try serializeSchemaFormat(a, current, 25);
+    defer a.free(ordinary);
+    const old = try deserializeSchema(a, ordinary);
+    defer freeSchema(a, old);
+    try std.testing.expect(!old.requires_constant_index_predicates);
+    current.requires_constant_index_predicates = true;
+    current.requires_public_schema = false;
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(a, current));
+}
+
 test "relational index system array constructors independently fence old readers and survive immutable schemas" {
     const a = std.testing.allocator;
     var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_array_expressions = true, .requires_array_constructors = true };
@@ -3471,7 +3913,18 @@ test "schema deserialization cleans initialized mappings on allocation failure" 
         }},
         .storage_mode = .relational,
         .relational_columns = &.{.{ .name = "title", .path = "title", .column_type = .string }},
-        .full_text_documents = &.{.{ .name = "row", .fields = &.{} }},
+        .full_text_documents = &.{
+            .{
+                .name = "row",
+                .fields = &.{.{ .path = "title", .emitted_name = "title.keyword", .analyzer = "keyword", .include_in_all = true }},
+                .dynamic_rules = &.{.{ .parent_path = "meta", .segment_pattern = "*", .relative_path = "value", .variants = &.{.{ .suffix = "keyword", .analyzer = "keyword", .include_in_all = true }} }},
+                .open_dynamic_paths = &.{"meta.open"},
+                .infer_type_dynamic_paths = &.{"meta.inferred"},
+                .declared_paths = &.{"title"},
+                .unindexed_paths = &.{"private"},
+            },
+            .{ .name = "second", .fields = &.{.{ .path = "title", .emitted_name = "title", .analyzer = "standard" }} },
+        },
         .index_sort = &.{.{ .field = "title.keyword", .desc = false }},
     });
     defer alloc.free(encoded);
@@ -3480,9 +3933,12 @@ test "schema deserialization cleans initialized mappings on allocation failure" 
         fn run(failing_alloc: Allocator, data: []const u8) !void {
             const schema = try deserializeSchema(failing_alloc, data);
             defer freeSchema(failing_alloc, schema);
+            const roundtrip = try serializeSchema(failing_alloc, schema);
+            defer failing_alloc.free(roundtrip);
+            try std.testing.expectEqualSlices(u8, data, roundtrip);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{encoded});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{encoded});
 }
 
 test "schema save/load via DocStore" {

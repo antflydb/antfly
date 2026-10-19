@@ -105,7 +105,7 @@ fn projectMutation(alloc: std.mem.Allocator, a: std.mem.Allocator, kind: domain.
         .namespace => response(alloc, status, Namespace{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = result.database_name orelse return error.InvalidCatalogRecord, .name = resource.name, .tablespace_name = result.tablespace_name }),
         .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
         .query_source => response(alloc, status, try sourceValue(a, resource)),
-        .table => error.InvalidCatalogMutation,
+        .table, .view => error.InvalidCatalogMutation,
     };
 }
 
@@ -133,7 +133,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             .namespace => response(alloc, status, try namespaceValue(&index, resource)),
             .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
             .query_source => response(alloc, status, try sourceValue(a, resource)),
-            .table => failure(alloc, error.InvalidCatalogMutation),
+            .table, .view => failure(alloc, error.InvalidCatalogMutation),
         };
     }
     switch (route.kind) {
@@ -172,7 +172,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             for (state.resources) |r| if (r.kind == .query_source) try out.append(a, try sourceValue(a, r));
             return response(alloc, status, out.items);
         },
-        .table => return failure(alloc, error.InvalidCatalogMutation),
+        .table, .view => return failure(alloc, error.InvalidCatalogMutation),
     }
 }
 

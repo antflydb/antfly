@@ -25,6 +25,9 @@ pub const Kind = enum(u8) {
     restore_batch = 3,
     primary_effect = 4,
     row_policy = 5,
+    /// Ordered owner metadata controls always retain their local obligation,
+    /// including when ordinary row/schema mirrors use asynchronous policy.
+    metadata_control = 6,
 };
 
 pub const replication_batch_outbox_key = "\x00\x00__metadata__:ha_batch_outbox_v1";
@@ -90,6 +93,7 @@ pub fn durableReplicationOutboxKindFromKey(key: []const u8) !Kind {
         @backingInt(Kind.restore_batch) => .restore_batch,
         @backingInt(Kind.primary_effect) => .primary_effect,
         @backingInt(Kind.row_policy) => .row_policy,
+        @backingInt(Kind.metadata_control) => .metadata_control,
         else => error.InvalidHAOutbox,
     };
 }

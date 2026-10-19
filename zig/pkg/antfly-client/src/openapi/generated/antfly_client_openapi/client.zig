@@ -2009,6 +2009,27 @@ pub const Client = struct {
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Observe an exact index publication in an explicit namespace
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication
+    pub fn getNamespaceTableIndexPublication(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, x_antfly_index_publication_token: []const u8) !ApiResponse(types.IndexPublicationStatus) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}/publication", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Index-Publication-Token", x_antfly_index_publication_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.IndexPublicationStatus).fromResponse(self.allocator, &resp);
+    }
+
     /// Repair an index generation
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair
     pub fn repairNamespaceIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
@@ -3065,6 +3086,23 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Observe an exact index publication
+    /// GET /db/v1/tables/{tableName}/indexes/{indexName}/publication
+    pub fn getIndexPublication(self: *@This(), table_name: []const u8, index_name: []const u8, x_antfly_index_publication_token: []const u8) !ApiResponse(types.IndexPublicationStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/publication", .{ self.base_url, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Index-Publication-Token", x_antfly_index_publication_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.IndexPublicationStatus).fromResponse(self.allocator, &resp);
     }
 
     /// Repair an index generation

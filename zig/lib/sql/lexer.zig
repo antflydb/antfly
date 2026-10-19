@@ -626,6 +626,37 @@ fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usi
     var i = start;
     var has_decimal_point = false;
 
+    // PostgreSQL nondecimal integers allow one underscore after the prefix
+    // and between digits, but never an empty body or a trailing separator.
+    if (sql[i] == '0' and i + 1 < sql.len) {
+        const radix: u8 = switch (sql[i + 1]) {
+            'x', 'X' => 16,
+            'o', 'O' => 8,
+            'b', 'B' => 2,
+            else => 0,
+        };
+        if (radix != 0) {
+            i += 2;
+            if (i < sql.len and sql[i] == '_') i += 1;
+            const first_digit = i;
+            while (i < sql.len) {
+                const digit = hexDigit(sql[i]) orelse break;
+                if (digit >= radix) break;
+                i += 1;
+                if (i + 1 < sql.len and sql[i] == '_') {
+                    if (hexDigit(sql[i + 1])) |next| {
+                        if (next < radix) i += 1;
+                    }
+                }
+            }
+            if (i == first_digit or (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] == '$' or sql[i] >= 0x80))) {
+                const end = if (i < sql.len and sql[i] >= 0x80) i + try utf8SequenceWidthAt(sql, i, diagnostic) else @min(i + 1, sql.len);
+                return lexError(diagnostic, .malformed_numeric_literal, start, end);
+            }
+            return i;
+        }
+    }
+
     if (sql[i] == '.') {
         has_decimal_point = true;
         i += 1;
@@ -891,12 +922,12 @@ test "sql adapter lexer rejects unterminated dollar quoted literals" {
 
 test "sql adapter lexer handles PostgreSQL numeric literal forms" {
     const alloc = std.testing.allocator;
-    const sql = "SELECT .5, 1., 1e2, 1.25E-3, 1_0, .5_6, 1_0., 1.2_3, 1e1_0";
+    const sql = "SELECT .5, 1., 1e2, 1.25E-3, 1_0, .5_6, 1_0., 1.2_3, 1e1_0, 0x6, 0x_6, 0x6e0, 0XFF_FF, 0o_6, 0b_110";
 
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
 
-    const expected = [_][]const u8{ ".5", "1.", "1e2", "1.25E-3", "1_0", ".5_6", "1_0.", "1.2_3", "1e1_0" };
+    const expected = [_][]const u8{ ".5", "1.", "1e2", "1.25E-3", "1_0", ".5_6", "1_0.", "1.2_3", "1e1_0", "0x6", "0x_6", "0x6e0", "0XFF_FF", "0o_6", "0b_110" };
     var number_index: usize = 0;
     for (tokens.items) |token| {
         if (token.kind != .number) continue;
@@ -922,6 +953,12 @@ test "sql adapter lexer rejects malformed numeric literals" {
         "SELECT 1._0",
         "SELECT 1e_2",
         "SELECT .5_",
+        "SELECT 0x",
+        "SELECT 0x_",
+        "SELECT 0x__6",
+        "SELECT 0x6_",
+        "SELECT 0b2",
+        "SELECT 0o8",
     };
     for (invalid) |sql| {
         try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, sql));

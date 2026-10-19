@@ -188,10 +188,22 @@ pub const Session = struct {
                     if (!explicit) _ = value.object.orderedRemove(column.path);
                 };
             };
-            if (self.schema) |view| if (view.validator()) |validator| try validator.prepareValue(temporary, temporary, &value);
+            var authoritative_nulls: ?[]const []const u8 = null;
+            if (self.schema) |view| if (view.validator()) |validator| {
+                const prepared = try validator.prepareTypedValueWithNulls(temporary, temporary, &value, write.json_null_fields, false);
+                authoritative_nulls = prepared.fields;
+            };
+            var null_set: std.StringHashMapUnmanaged(void) = .empty;
+            if (authoritative_nulls) |names| for (names) |name| try null_set.put(temporary, name, {});
             var json_nulls: std.ArrayList([]const u8) = .empty;
             for (self.table.columns) |column| if (column.type == .json) {
-                if (value.object.get(column.path)) |cell| if (cell == .null) try json_nulls.append(alloc, try alloc.dupe(u8, column.path));
+                if (value.object.get(column.path)) |cell| if (cell == .null) {
+                    if (authoritative_nulls != null and !null_set.contains(column.path)) {
+                        // Generated SQL NULL remains absence in document
+                        // storage, not an accidental JSON null datum.
+                        _ = value.object.orderedRemove(column.path);
+                    } else try json_nulls.append(alloc, try alloc.dupe(u8, column.path));
+                };
             };
             const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
             total = std.math.add(usize, total, bytes.len +| write.key.len) catch return error.RelationalRowResultTooLarge;

@@ -33,6 +33,9 @@ const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const reranking = @import("../reranking/mod.zig");
 const restore_jobs = @import("../api/restore_jobs.zig");
+const index_worker = @import("relational_index_worker.zig");
+const index_execution = @import("../api/relational_index_owner_execution.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
 const raft = @import("../raft/mod.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
@@ -113,6 +116,11 @@ pub const MetadataServer = struct {
     owned_admin_listener: ?*MetadataAdminHttpRuntime = null,
     restore_supervisor_owner_id: u64 = 0,
     restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
+    index_reconciliation: index_worker.Coordinator = .{},
+    index_supervisor_owner_id: u64 = 0,
+    index_supervisor_stop: std.atomic.Value(bool) = .init(false),
+    index_service_secret: ?[]const u8 = null,
+    index_service_issuer: ?[]const u8 = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -133,6 +141,7 @@ pub const MetadataServer = struct {
             .auth_enabled = cfg.api_server_cfg.auth_enabled,
         };
         var http_config = cfg.http;
+        http_config.http.executor.max_response_bytes = @max(http_config.http.executor.max_response_bytes, @import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire.max_wire_bytes + 4096);
         if (online_capabilities != null) {
             http_config.http.executor.max_response_bytes = @max(http_config.http.executor.max_response_bytes, @import("antfly_local_sources").storage_db_online_merge_io_contract.max_response_bytes);
         }
@@ -402,6 +411,8 @@ pub const MetadataServer = struct {
             .http_observer_lease = http_observer_lease,
             .owned_http_runtime = owned_http_runtime,
             .owned_admin_listener = owned_admin_listener,
+            .index_service_secret = cfg.api_server_cfg.internal_service_secret,
+            .index_service_issuer = cfg.api_server_cfg.internal_service_issuer,
         };
     }
 
@@ -418,6 +429,8 @@ pub const MetadataServer = struct {
     }
 
     pub fn deinitWithDeadline(self: *MetadataServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        self.stopIndexSupervisor();
+        if (self.svc.backend_runtime) |runtime| if (runtime.io()) |io| self.index_reconciliation.deinit(io);
         self.stopRestoreSupervisor();
         if (self.transition_ops_registration) |*registration| registration.deinit();
         self.transition_ops_registration = null;
@@ -471,6 +484,7 @@ pub const MetadataServer = struct {
             return err;
         };
         errdefer self.svc.stop();
+        errdefer self.stopIndexSupervisor();
         if (self.owned_admin_listener) |listener| {
             listener.start() catch |err| {
                 std.log.err("metadata server start failed step=admin_listener_start err={}", .{err});
@@ -478,6 +492,21 @@ pub const MetadataServer = struct {
             };
             errdefer listener.stop();
         }
+        if (self.index_service_secret) |secret| if (secret.len != 0) {
+            const runtime = try self.svc.ensureBackendRuntime();
+            if (runtime.threaded_jobs != null and runtime.io() != null) {
+                self.index_supervisor_stop.store(false, .release);
+                self.index_reconciliation.closing.store(false, .release);
+                self.index_supervisor_owner_id = try runtime.allocOwnerId();
+                try runtime.durable_jobs.submit(.{
+                    .owner_id = self.index_supervisor_owner_id,
+                    .class = .maintenance,
+                    .ptr = self,
+                    .run = indexSupervisorRun,
+                    .deinit = restoreSupervisorDeinit,
+                });
+            }
+        };
         if (self.owned_admin_mux != null) {
             const runtime = try self.svc.ensureBackendRuntime();
             if (runtime.threaded_jobs != null and runtime.io() != null) {
@@ -501,6 +530,7 @@ pub const MetadataServer = struct {
 
     pub fn stopWithDeadline(self: *MetadataServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         if (self.owned_admin_listener) |listener| listener.stopWithDeadline(deadline);
+        self.stopIndexSupervisor();
         self.stopRestoreSupervisor();
         self.svc.stop();
     }
@@ -516,6 +546,136 @@ pub const MetadataServer = struct {
 
     pub fn httpRuntime(self: *MetadataServer) ?*httpx.HttpRuntime {
         return self.owned_http_runtime;
+    }
+
+    const IndexWorkHost = struct {
+        server: *MetadataServer,
+        incarnation: [32]u8,
+        expected: ?index_worker.Authority = null,
+
+        pub fn currentAuthority(self: *const @This()) !?index_worker.Authority {
+            const server = self.server;
+            if (server.index_supervisor_stop.load(.acquire)) return null;
+            const svc = server.svc;
+            const term = svc.localMetadataLeadershipTerm();
+            svc.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+            defer svc.reconcile_lease_mutex.unlock(std.Options.debug_io);
+            return index_worker.Authority.metadataLease(self.incarnation, svc.metadata_group_id, svc.raft.host.http_host.host.cfg.local_node_id, term, svc.reconcile_lease.stats(), svc.reconcile_lease.nowMs());
+        }
+
+        fn requireCurrent(self: *const @This()) !void {
+            const actual = try self.currentAuthority();
+            if (actual == null or !std.meta.eql(actual, self.expected)) return error.NotLeader;
+        }
+
+        fn canceled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.requireCurrent() catch return true;
+            return false;
+        }
+
+        pub fn workJson(self: *@This(), alloc: std.mem.Allocator, query: @import("relational_index_work.zig").Query) ![]u8 {
+            try self.requireCurrent();
+            return self.server.svc.relationalIndexWorkJson(alloc, .{
+                .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s,
+                .cancellation = .{ .ptr = self, .is_cancelled_fn = canceled },
+                .index_publication_authority = true,
+            }, query);
+        }
+
+        pub fn systemCatalog(self: *@This(), alloc: std.mem.Allocator, context: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try self.requireCurrent();
+            return public_api_http_server.StatusSource.fromMetadataHttpService(self.server.svc).systemCatalog(alloc, context, call);
+        }
+    };
+
+    const IndexTransport = struct {
+        host: *IndexWorkHost,
+        client: @import("../api/http_client.zig").ApiHttpClient,
+
+        fn route(self: *@This(), alloc: std.mem.Allocator, group: u64, input: api_operation.RequestContext) !api_table_router.GroupRoute {
+            try self.host.requireCurrent();
+            const context = try input.platformDeadline();
+            try context.ensureActive();
+            return (try api_table_router.resolveGroupRoute(alloc, api_table_catalog.CatalogSource.fromMetadataHttpService(self.host.server.svc), metadataDataBearingStoreGroupRouter(self.host.server.svc).withBudget(.{
+                .clock = .{ .deadline_ns = context.deadline_ns, .cancellation = context.cancellation },
+            }), group, .prefer_leader)) orelse error.NoAvailableReplica;
+        }
+
+        pub fn control(self: *@This(), alloc: std.mem.Allocator, table: []const u8, request: index_execution.Request, context: api_operation.RequestContext) !std.json.Parsed(index_execution.ControlResponse) {
+            var selected = try self.route(alloc, request.group_id, context);
+            defer selected.deinit(alloc);
+            if (selected != .remote) return error.NoAvailableReplica;
+            var client = self.client;
+            client.alloc = alloc;
+            return client.fetchRelationalIndexControl(selected.remote.base_uri, request.group_id, table, request, context);
+        }
+
+        pub fn claims(self: *@This(), alloc: std.mem.Allocator, table: []const u8, request: index_execution.ClaimRequest, context: api_operation.RequestContext) !std.json.Parsed(index_execution.ClaimResponse) {
+            var selected = try self.route(alloc, request.group_id, context);
+            defer selected.deinit(alloc);
+            if (selected != .remote) return error.NoAvailableReplica;
+            var client = self.client;
+            client.alloc = alloc;
+            return client.fetchRelationalIndexClaims(selected.remote.base_uri, request.group_id, table, request, context);
+        }
+    };
+
+    fn indexSupervisorRun(ptr: *anyopaque) !void {
+        const self: *MetadataServer = @ptrCast(@alignCast(ptr));
+        const io = (try self.svc.ensureBackendRuntime()).io() orelse return error.MissingBackendRuntimeIo;
+        var last_error: ?anyerror = null;
+        while (!self.index_supervisor_stop.load(.acquire)) {
+            const advanced = self.reconcileIndexQuantum(io) catch |err| blk: {
+                const retryable = metadata_authority.isRetryableError(err) or switch (err) {
+                    error.UnsupportedNativeIndexOwner,
+                    error.GenerationPublicationChanged,
+                    error.GenerationAdmissionPending,
+                    error.IndexOwnerReceiptChanged,
+                    error.PrivateIndexRootRecoveryRequired,
+                    error.ConnectionRefused,
+                    error.ConnectionResetByPeer,
+                    error.Canceled,
+                    error.Cancelled,
+                    error.DeadlineExceeded,
+                    error.Timeout,
+                    => true,
+                    else => false,
+                };
+                if (!retryable) {
+                    if (last_error == null or last_error.? != err) std.log.err("metadata index reconciliation retry failed err={s}", .{@errorName(err)});
+                    last_error = err;
+                }
+                break :blk false;
+            };
+            if (advanced) {
+                continue;
+            }
+            io.sleep(.fromMilliseconds(250), .awake) catch |err| switch (err) {
+                error.Canceled => return,
+            };
+        }
+    }
+
+    fn reconcileIndexQuantum(self: *MetadataServer, io: std.Io) !bool {
+        // Incarnation reads can touch storage; never perform them while the
+        // coordinator holds its short scheduling lane.
+        const incarnation = try self.svc.metadataIncarnation() orelse return false;
+        var host: IndexWorkHost = .{ .server = self, .incarnation = incarnation };
+        host.expected = try host.currentAuthority();
+        var transport: IndexTransport = .{ .host = &host, .client = @import("../api/http_client.zig").ApiHttpClient.init(self.alloc, self.svc.raft.host.http_host.request_executor) };
+        _ = transport.client.withInternalServiceAuth(self.index_service_secret, self.index_service_issuer);
+        const manager = if (self.owned_public_http_server) |api| api.cfg.resource_manager else null;
+        return self.index_reconciliation.step(io, self.alloc, manager, &host, &transport, @import("antfly_platform").time.monotonicNs());
+    }
+
+    fn stopIndexSupervisor(self: *MetadataServer) void {
+        self.index_supervisor_stop.store(true, .release);
+        self.index_reconciliation.closing.store(true, .release);
+        if (self.index_supervisor_owner_id != 0) {
+            if (self.svc.backend_runtime) |runtime| runtime.durable_jobs.closeOwner(self.index_supervisor_owner_id);
+        }
+        self.index_supervisor_owner_id = 0;
     }
 
     fn restoreSupervisorRun(ptr: *anyopaque) !void {

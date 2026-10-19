@@ -27,6 +27,209 @@ const httpx = @import("httpx");
 const wire = @import("antfly_metadata_openapi").types;
 const A = std.mem.Allocator;
 
+// Unlike Owner below, this adapter delegates readiness, leader admission and
+// guarded mutation to the production metadata service. It deliberately has
+// no schema-mutation or data-readiness callbacks that could bypass authority.
+const NativeOwner = struct {
+    svc: *@import("../metadata/service.zig").MetadataService,
+    resolutions: usize = 0,
+    mutations: usize = 0,
+
+    fn source(self: *NativeOwner) server_mod.StatusSource {
+        return .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = run, .supports_query_definitions = true } };
+    }
+    fn status(raw: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+        const self: *NativeOwner = @ptrCast(@alignCast(raw));
+        return self.svc.status();
+    }
+    fn run(raw: *anyopaque, a: A, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        const self: *NativeOwner = @ptrCast(@alignCast(raw));
+        switch (call) {
+            .resolve_many => self.resolutions += 1,
+            .relation_schema_mutate => self.mutations += 1,
+            .snapshot => return error.UnexpectedCatalogSnapshot,
+            else => {},
+        }
+        return @import("../system_catalog/operations.zig").call(self.svc, a, context, call);
+    }
+};
+
+fn adoptNativeSources(svc: *@import("../metadata/service.zig").MetadataService) !void {
+    const protocol = @import("../metadata/topology_protocol.zig");
+    const control = @import("../metadata/relation_reconciliation_command.zig");
+    // Tracking adoption is a durable, membership-fenced migration step, not
+    // implied by CREATE's topology readiness or a local decoder version.
+    const floor = if (protocol.current_version >= protocol.constraint_occupancy_version) protocol.constraint_occupancy_version else protocol.relation_reconciliation_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, floor);
+    const proof: protocol.Activation = .{
+        // The wire proof names this command's decoder, not a newer admitted
+        // cluster floor. Membership identity still comes from readiness.
+        .version = floor,
+        .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
+        .member_count = readiness.protected_member_count,
+        .membership_fingerprint = readiness.protected_membership_fingerprint,
+    };
+    // Readiness is an observation, not durable activation. The production
+    // worker commits this fence before adoption; this explicit campaign must
+    // do the same through leader admission, not rely on CREATE's older floor.
+    const activation_bytes = try std.json.Stringify.valueAlloc(svc.alloc, proof, .{});
+    defer svc.alloc.free(activation_bytes);
+    const activation_receipt = try svc.proposeTopologyActivationWithReceipt(activation_bytes, readiness);
+    try svc.waitForTransitionApplied(activation_receipt);
+    const bytes = try (control.Command{ .adopt = proof }).encodeAlloc(svc.alloc);
+    defer svc.alloc.free(bytes);
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_relation_reconciliation = bytes });
+    try svc.waitForTransitionApplied(receipt);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const work = try store.relationReconciliationWork(svc.metadata_group_id);
+    if (work.epoch == null) return error.SourceAdoptionNotApplied;
+}
+
+fn settleNativeOwner(svc: *@import("../metadata/service.zig").MetadataService, stage: []const u8) !void {
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    for (0..32) |_| {
+        svc.relation_reconciliation_worker.next_round_at_ns = 0;
+        try svc.runRound();
+        const work = try store.relationReconciliationWork(svc.metadata_group_id);
+        if (work.current) |current| if (work.epoch != null and current.epoch.eql(work.epoch.?) and
+            current.phase == .ready and current.failure == .none and work.garbage == null and
+            work.root != null and work.root.?.eql(local.system_catalog_relation_reconciliation.Generation.of(&current))) return;
+    }
+    const work = try store.relationReconciliationWork(svc.metadata_group_id);
+    std.debug.print("native catalog reconciliation did not converge ({s}): source={d}, phase={any}, failure={any}, root={any}, garbage={any}, pending={any}\n", .{
+        stage,
+        if (work.epoch) |epoch| epoch.revision else 0,
+        if (work.current) |current| current.phase else null,
+        if (work.current) |current| current.failure else null,
+        work.root,
+        work.garbage != null,
+        svc.relation_reconciliation_worker.pending,
+    });
+    return error.ReconciliationDidNotConverge;
+}
+
+fn resolveNativeOwner(a: A, svc: *@import("../metadata/service.zig").MetadataService) !domain.ResolvedMany {
+    try svc.ensureLinearizableReadWithContext(.{});
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.resolveSystemCatalogIdentities(a, svc.metadata_group_id, .{ .relations = &.{.{ .name = "usage_records" }}, .include_query_definitions = true });
+}
+
+test "httpx SQL catalog original null uniqueness declarations use real leader admission and restart" {
+    // This is single-voter metadata recovery, not quorum failover or data-owner
+    // activation qualification. Original cases receive no completion credit.
+    const a = std.testing.allocator;
+    const raft = @import("raft_engine");
+    const host = @import("../raft/host.zig");
+    const service = @import("../metadata/service.zig");
+    const Factory = struct {
+        alloc: A,
+        store: *raft.core.MemoryStorage,
+        fn iface(self: *@This()) host.ReplicaDescriptorFactory {
+            return .{ .ptr = self, .vtable = &.{ .build_descriptor = build, .free_descriptor = free } };
+        }
+        fn build(raw: *anyopaque, record: host.catalog.ReplicaRecord) !raft.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .group = .{
+                .group_id = record.group_id,
+                .local_node_id = record.local_node_id,
+                .raft_config = .{ .id = record.local_node_id, .group_id = record.group_id, .peers = try self.alloc.dupe(raft.core.types.NodeId, &.{record.local_node_id}), .election_tick = 5, .heartbeat_tick = 1, .pre_vote = false, .check_quorum = true },
+                .storage = self.store.storage(),
+            }, .bootstrap = if (record.bootstrap_mode == .empty) .empty else .persisted };
+        }
+        fn free(raw: *anyopaque, _: A, descriptor: *raft.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.alloc.free(descriptor.group.raft_config.peers);
+        }
+    };
+    var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    for ([_][]const u8{ "sql-0692", "sql-0706", "sql-0731" }, [_]bool{ true, false, false }) |id, not_distinct| {
+        const original = try corpus.get(id);
+        try std.testing.expectEqual(@as(usize, 0), original.params.len);
+        var directory = try local.common_test_directory.TestDirectory.init("sql-catalog-native-owner");
+        defer directory.cleanup();
+        const catalog_path = try std.fmt.allocPrint(a, "{s}/replicas.txt", .{directory.path()});
+        defer a.free(catalog_path);
+        var raft_store = raft.core.MemoryStorage.init(a);
+        defer raft_store.deinit();
+        var factory: Factory = .{ .alloc = a, .store = &raft_store };
+        const config: @import("../raft/managed_host.zig").ManagedHostConfig = .{
+            .host = .{ .local_node_id = 1, .metadata_group_id = 1941, .replica_root_dir = directory.path(), .replica_catalog_path = catalog_path },
+        };
+        var svc = try service.MetadataService.init(a, config, .{ .host = .{ .host = .{ .descriptor_factory = factory.iface() } } }, .{ .observe_local_replica_root = false });
+        var open = true;
+        defer if (open) svc.deinit();
+        _ = try svc.ensureMetadataReplica(.{ .group_id = 1941, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
+        try svc.campaignMetadataGroup();
+        for (0..8) |_| try svc.runRound();
+        // Anonymous CREATE constraints need a verified namespace cut, even
+        // when the namespace is empty. Bootstrap through actual leader and
+        // all-voter admission before accepting the first named declaration.
+        try adoptNativeSources(&svc);
+        try settleNativeOwner(&svc, "before first anonymous CREATE");
+        var owner: NativeOwner = .{ .svc = &svc };
+        var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr() }, owner.source(), null, null);
+        defer server.deinit();
+        var handler: handler_mod.AntflyApiHandler = .{ .api_server = &server };
+        const initial_version: i64 = blk: {
+            var created = try request(a, &handler, "CREATE TABLE usage_records (id BIGINT PRIMARY KEY, email TEXT)");
+            defer created.deinit();
+            try std.testing.expectEqual(@as(u16, 202), created.status.code);
+            const result = try std.json.parseFromSlice(wire.SQLResponse, a, created.body.?, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(wire.SQLMutationOutcome.committed_pending, result.value.mutation_outcome.?);
+            try std.testing.expectEqualStrings("DDL PENDING", result.value.command_tag);
+            try std.testing.expectEqual(.pending, result.value.ddl_receipt.?.state);
+            try std.testing.expectEqual(@as(i64, 0), result.value.rows_affected);
+            try std.testing.expect(result.value.ddl_receipt.?.schema_version >= 0);
+            try std.testing.expect(result.value.ddl_receipt.?.schema_version < std.math.maxInt(u32));
+            break :blk result.value.ddl_receipt.?.schema_version;
+        };
+        try settleNativeOwner(&svc, "after CREATE and source adoption");
+        const resolutions = owner.resolutions;
+        const mutations = owner.mutations;
+        var response = try request(a, &handler, original.sql);
+        defer response.deinit();
+        if (response.status.code != 202) std.debug.print("native catalog {s}: {s}\n", .{ id, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 202), response.status.code);
+        const result = try std.json.parseFromSlice(wire.SQLResponse, a, response.body.?, .{});
+        defer result.deinit();
+        // Without data-owner readiness, committed declarations must retain a
+        // pending receipt rather than claim the unique index is usable.
+        try std.testing.expectEqual(wire.SQLMutationOutcome.committed_pending, result.value.mutation_outcome.?);
+        try std.testing.expectEqual(.pending, result.value.ddl_receipt.?.state);
+        try std.testing.expectEqual(initial_version + 1, result.value.ddl_receipt.?.schema_version);
+        try std.testing.expectEqual(resolutions + 1, owner.resolutions);
+        try std.testing.expectEqual(mutations + 1, owner.mutations);
+        try settleNativeOwner(&svc, "after ALTER");
+        var before = try resolveNativeOwner(a, &svc);
+        defer before.deinit(a);
+        const table = before.relations[0].?;
+        var parsed = try local.schema_mod.parseValidatedTableSchema(a, table.table.query_definition.?.schema_json);
+        defer parsed.deinit(a);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const definitions = try parsed.relationalUniqueDefinitions(arena.allocator());
+        try std.testing.expectEqual(@as(usize, 2), definitions.len);
+        try std.testing.expectEqual(not_distinct, definitions[1].nulls_not_distinct);
+        svc.deinit();
+        open = false;
+        svc = try service.MetadataService.init(a, config, .{ .host = .{ .host = .{ .descriptor_factory = factory.iface() } } }, .{ .observe_local_replica_root = false });
+        open = true;
+        _ = try svc.ensureMetadataReplica(.{ .group_id = 1941, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted });
+        try svc.campaignMetadataGroup();
+        for (0..8) |_| try svc.runRound();
+        try settleNativeOwner(&svc, "after restart");
+        var recovered = try resolveNativeOwner(a, &svc);
+        defer recovered.deinit(a);
+        try std.testing.expect(table.owner.eql(recovered.relations[0].?.owner));
+        try std.testing.expectEqualStrings(table.table.query_definition.?.schema_json, recovered.relations[0].?.table.query_definition.?.schema_json);
+        try std.testing.expectEqualSlices(u8, &before.relation_epoch.?.incarnation, &recovered.relation_epoch.?.incarnation);
+    }
+}
+
 const Case = struct {
     id: []const u8,
     setup: []const []const u8,
@@ -172,7 +375,7 @@ fn parent(kind: domain.Kind) u64 {
     return switch (kind) {
         .database, .tablespace, .query_source => 0,
         .namespace => domain.default_database_id,
-        .table => domain.default_namespace_id,
+        .table, .view => domain.default_namespace_id,
     };
 }
 

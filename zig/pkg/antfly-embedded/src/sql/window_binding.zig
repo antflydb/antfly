@@ -24,7 +24,7 @@ const compiler = @import("compiler.zig");
 const Allocator = std.mem.Allocator;
 pub const Kind = enum { row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, count, sum, avg, min, max, bool_and, bool_or };
 pub const Sort = struct { partition: []const usize, order: []const usize, directions: []const @import("operators.zig").Order };
-pub const Spec = struct { kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, star: bool };
+pub const Spec = struct { kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, integer_numeric_result: bool = false, star: bool };
 pub const Bound = struct {
     input: *const describe.BoundStatement,
     statement: ast.Select,
@@ -262,6 +262,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         var input_type = if (nargs != 0) input.columns[pending.arguments[0]].type else ast.ColumnType.integer;
         var input_element = if (nargs != 0) input.columns[pending.arguments[0]].element_type else null;
         if (first_null) input_type = switch (kind) {
+            .ntile => .integer,
             .sum, .avg => .number,
             .bool_and, .bool_or => .boolean,
             .lag, .lead => if (nargs == 3 and !default_null) input.columns[pending.arguments[2]].type else input_type,
@@ -271,7 +272,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         switch (kind) {
             .sum, .avg => if (input_type != .integer and input_type != .number) return error.SqlTypeMismatch,
             .bool_and, .bool_or => if (input_type != .boolean) return error.SqlTypeMismatch,
-            .ntile => if (input_type != .integer) return error.SqlTypeMismatch,
+            .ntile => {
+                if (input_type != .integer) return error.SqlTypeMismatch;
+                if (!first_null and input_element != .int16 and input_element != .int32) return error.UndefinedSqlFunction;
+            },
             .lag, .lead, .nth_value => {
                 if (nargs > 1 and input.columns[pending.arguments[1]].type != .integer) return error.SqlTypeMismatch;
                 if (nargs == 3 and !default_null) {
@@ -293,25 +297,31 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
             else => {},
         }
         if (call.filter != null and @backingInt(kind) < @backingInt(Kind.count)) return error.UnsupportedSqlShape;
-        const result_type: ast.ColumnType = switch (kind) {
+        const sum_type = @import("operators.zig").Aggregate.sumType(.{ .kind = input_type, .element_type = input_element });
+        const average_type = @import("operators.zig").Aggregate.averageType(.{ .kind = input_type, .element_type = input_element });
+        const integer_numeric_result = input_type == .integer and (kind == .avg or (kind == .sum and sum_type.element_type == .numeric));
+        const result_type: ast.ColumnType = if (integer_numeric_result) .number else switch (kind) {
             .row_number, .rank, .dense_rank, .ntile, .count => .integer,
             .avg, .percent_rank, .cume_dist => .number,
             .bool_and, .bool_or => .boolean,
             else => input_type,
         };
-        const result_element = switch (kind) {
-            .row_number, .rank, .dense_rank, .ntile, .count => @import("array_value.zig").ElementType.int64,
-            .avg => if (input_element == .numeric) @import("array_value.zig").ElementType.numeric else .float64,
+        const result_element = if (integer_numeric_result) @import("array_value.zig").ElementType.numeric else switch (kind) {
+            .row_number, .rank, .dense_rank, .count => @import("array_value.zig").ElementType.int64,
+            .ntile => @import("array_value.zig").ElementType.int32,
+            .avg => average_type.element_type,
             .percent_rank, .cume_dist => @import("array_value.zig").ElementType.float64,
             .bool_and, .bool_or => @import("array_value.zig").ElementType.boolean,
-            .sum => if (result_type == .integer) @import("array_value.zig").ElementType.int64 else input_element,
+            .sum => sum_type.element_type,
             else => input_element,
         };
         if (pending.filter) |filter| if (input.columns[filter].type != .boolean) return error.SqlTypeMismatch;
         if (call.window.?.frame) |frame| if (frame.mode == .groups and call.window.?.order.len == 0) return error.InvalidSqlSyntax;
         if (call.window.?.frame) |frame| if (frame.mode == .range and (frame.start == .preceding or frame.start == .following or frame.end == .preceding or frame.end == .following)) {
             const sort = builder.sorts.items[pending.sort];
-            if (sort.order.len != 1) return error.UnsupportedSqlShape;
+            // Validate after named-window expansion. This is an invalid
+            // window definition, not a missing execution capability.
+            if (sort.order.len != 1) return error.SqlWindowingError;
             const order_type = input.columns[sort.order[0]].type;
             if (order_type != .integer and order_type != .number) return error.SqlTypeMismatch;
         };
@@ -328,7 +338,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
                 } else slot.* = .integer;
             };
         };
-        spec.* = .{ .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .element_type = result_element, .star = call.star };
+        spec.* = .{ .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .element_type = result_element, .integer_numeric_result = integer_numeric_result, .star = call.star };
         column.* = .{ .name = try std.fmt.allocPrint(alloc, "$window_{d}", .{index}), .type = result_type, .element_type = result_element };
     }
     const output_programs = try alloc.alloc(scalar.Program, outputs.len);

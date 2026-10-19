@@ -112,8 +112,9 @@ pub const Catalog = struct {
         // replayed after a later re-enable at the same generation.
         if ((catalog.row_policy_generation == 0) != (catalog.row_policy_catalog_epoch == 0) or
             (catalog.row_policy_phase != .disabled and catalog.row_policy_generation == 0)) return error.InvalidTableCatalog;
-        if (catalog.row_policy_phase != .disabled and
-            (catalog.storage_mode != .relational or catalog.active_schema_version == 0)) return error.InvalidTableCatalog;
+        // Zero is the initial, durable relational schema epoch, not absence.
+        // Generation/catalog epoch above still fence installed policy state.
+        if (catalog.row_policy_phase != .disabled and catalog.storage_mode != .relational) return error.InvalidTableCatalog;
         if (version == format_version) for (data[49..56]) |reserved| {
             if (reserved != 0) return error.InvalidTableCatalog;
         };
@@ -135,22 +136,7 @@ pub const Catalog = struct {
             if (!self.mode_initialized or self.storage_mode != schema.storage_mode or
                 self.active_schema_version != schema.version)
                 return error.TableCatalogSchemaMismatch;
-            if (self.schema_format_version < 16) for (schema.relational_columns) |column| {
-                if (column.sql_element_type != null) return error.UnsupportedTableCapabilityVersion;
-            };
-            if (self.schema_format_version < 17) for (schema.relational_columns) |column| {
-                if (column.column_type == .sql_array) return error.UnsupportedTableCapabilityVersion;
-            };
-            if (self.schema_format_version < 18 and schema.requires_typed_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 19 and schema.requires_predicate_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 21 and schema.requires_exact_numeric_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 22 and schema.requires_exact_numeric_validation) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 24 and schema.requires_array_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 25 and schema.requires_array_constructors) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 20) for (schema.relational_columns) |column| {
-                if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedTableCapabilityVersion;
-            };
+            if (self.schema_format_version < schema_mod.requiredReaderVersion(schema)) return error.UnsupportedTableCapabilityVersion;
             return;
         }
         if (self.storage_mode != .document or self.active_schema_version != 0)
@@ -179,6 +165,71 @@ test "relational index system catalog fences exact NUMERIC programs with integra
     const table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_exact_numeric_expressions = true };
     var catalog: Catalog = .{ .schema_format_version = 20, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
     try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    catalog.schema_format_version = schema_mod.storage_format_version;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system SQL durable text catalog fences expression readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_text_expressions = true };
+    var catalog: Catalog = .{ .schema_format_version = 26, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_text_expressions = false;
+    try catalog.validateForSchema(table);
+    table.requires_text_expressions = true;
+    catalog.schema_format_version = 27;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system JSON expression capability fences catalog readers independently of storage" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true };
+    var catalog: Catalog = .{ .schema_format_version = 29, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_json_expressions = false;
+    try catalog.validateForSchema(table);
+    table.requires_json_expressions = true;
+    catalog.schema_format_version = 30;
+    try catalog.validateForSchema(table);
+    const loaded = try Catalog.decode(&catalog.encode());
+    try loaded.validateForSchema(table);
+}
+
+test "relational index system JSONB display capability fences catalog readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true };
+    var catalog: Catalog = .{ .schema_format_version = 28, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_jsonb_display = false;
+    try catalog.validateForSchema(table);
+    table.requires_jsonb_display = true;
+    catalog.schema_format_version = 29;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system SQL durable numeric functions fence catalog readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_functions = true };
+    var catalog: Catalog = .{ .schema_format_version = 27, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_numeric_functions = false;
+    try catalog.validateForSchema(table);
+    table.requires_numeric_functions = true;
+    catalog.schema_format_version = 28;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system SQL immutable index catalog fences constant predicate readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_constant_index_predicates = true };
+    var catalog: Catalog = .{ .schema_format_version = 25, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_constant_index_predicates = false;
+    try catalog.validateForSchema(table);
+    table.requires_constant_index_predicates = true;
     catalog.schema_format_version = schema_mod.storage_format_version;
     try catalog.validateForSchema(table);
     const restored = try Catalog.decode(&catalog.encode());
@@ -311,6 +362,16 @@ test "table catalog has a stable canonical representation" {
     const preparing: Catalog = .{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 3, .row_policy_phase = .preparing, .row_policy_generation = 11, .row_policy_catalog_epoch = 19 };
     const preparing_bytes = preparing.encode();
     try std.testing.expectEqual(preparing, try Catalog.decode(&preparing_bytes));
+    var initial = preparing;
+    initial.active_schema_version = 0;
+    for ([_]RowPolicyPhase{ .preparing, .active }) |phase| {
+        initial.row_policy_phase = phase;
+        const initial_bytes = initial.encode();
+        try std.testing.expectEqual(initial, try Catalog.decode(&initial_bytes));
+    }
+    initial.storage_mode = .document;
+    const invalid_mode = initial.encode();
+    try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(&invalid_mode));
     var revoked = preparing;
     revoked.row_policy_phase = .disabled;
     revoked.row_policy_generation += 1;

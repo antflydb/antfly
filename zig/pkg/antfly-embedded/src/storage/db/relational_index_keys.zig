@@ -374,50 +374,61 @@ pub const TuplePlan = struct {
         return .{ .alloc = alloc, .plan = self, .batch = batch, .inputs = inputs, .values = values, .scratch = .init(alloc), .external_values = external_values };
     }
 
+    /// Shared UNIQUE equality encoding for mutations and private backfills.
+    /// NULLS DISTINCT retains an exact row witness; it must not alias another
+    /// NULL-containing row or silently disappear from MATCH PARTIAL coverage.
+    pub fn appendUnique(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), row: rows.OrdinalRowView, nulls_not_distinct: bool, row_key: []const u8) !void {
+        const start = out.items.len;
+        errdefer out.shrinkRetainingCapacity(start);
+        const has_null = try self.append(alloc, out, row);
+        if (!has_null or nulls_not_distinct) return;
+        try out.appendSlice(alloc, "partial-null-witness-v1");
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, std.math.cast(u32, row_key.len) orelse return error.TransactionTooLarge, .big);
+        try out.appendSlice(alloc, &length);
+        try out.appendSlice(alloc, row_key);
+    }
+
     /// Append into the transaction's region or a reusable scratch buffer.
     /// Failure restores the original length, including on late corrupt cells.
     pub fn append(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), row: rows.OrdinalRowView) !bool {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var budget: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(scratch.allocator(), &budget);
+        return self.appendWithExecution(alloc, out, row, &execution);
+    }
+
+    /// All component expressions and encoding share the caller's work and
+    /// cancellation identity. Results live in execution.alloc until encoded.
+    pub fn appendWithExecution(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), row: rows.OrdinalRowView, execution: *expressions.Execution) !bool {
+        try execution.charge(0);
         if (row.layout != self.layout or row.table_schema.relational_columns.ptr != self.columns.ptr or
             row.table_schema.relational_columns.len != self.columns.len)
             return error.RelationalRowSchemaMismatch;
         const start = out.items.len;
         errdefer out.shrinkRetainingCapacity(start);
         var has_null = false;
-        var scratch = std.heap.ArenaAllocator.init(alloc);
-        defer scratch.deinit();
-        var expression_budget: usize = expressions.max_allocated_bytes;
+        var input: expressions.PreparedInput = undefined;
+        try input.initBoundRow(execution, row);
+        defer input.deinit();
         for (self.keys) |key| {
             if (key.expression) |expression| {
                 // The tuple's layout/column-pointer fence above certifies the
                 // expression compiler's ordinals, including cold projections.
-                const value = (try expression.plan.evaluateBoundRowWithBudget(scratch.allocator(), row, &expression_budget)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
-                // Borrowed column/literal results allocate nothing in the
-                // evaluator but still expand the physical key. Charge that
-                // output before appending, including worst-case escaping.
-                const encoded_bound: usize = switch (value) {
-                    .string, .blob => |bytes| blk: {
-                        if (bytes.len > expressions.max_output_bytes) return error.RelationalExpressionBudgetExceeded;
-                        break :blk bytes.len * 2 + 3;
-                    },
-                    .null => 1,
-                    .datetime => 17,
-                    .boolean => 2,
-                    else => 9,
-                };
-                if (encoded_bound > expression_budget) return error.RelationalExpressionBudgetExceeded;
-                expression_budget -= encoded_bound;
+                const value = (try expression.plan.evaluatePreparedWithExecution(execution, &input)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
                 has_null = has_null or value == .null;
-                try appendValue(alloc, out, start, self.encoded_bytes_limit, key, value);
+                try appendExecutionValue(alloc, out, start, self.encoded_bytes_limit, key, value, execution, true);
                 continue;
             }
             const cell = try row.findCell(key.ordinal);
             if (cell == null or cell.?.is_null) {
                 has_null = true;
-                try appendValue(alloc, out, start, self.encoded_bytes_limit, key, .null);
+                try appendExecutionValue(alloc, out, start, self.encoded_bytes_limit, key, .null, execution, false);
                 continue;
             }
             const value = cell.?.value;
-            try appendValue(alloc, out, start, self.encoded_bytes_limit, key, switch (key.column_type) {
+            try appendExecutionValue(alloc, out, start, self.encoded_bytes_limit, key, switch (key.column_type) {
                 .string => .{ .string = value.bytes_val },
                 .blob => .{ .blob = value.bytes_val },
                 .boolean => .{ .boolean = value.bool_val },
@@ -426,7 +437,7 @@ pub const TuplePlan = struct {
                 .number => .{ .number = value.f64_val },
                 .numeric => .{ .numeric = value.bytes_val },
                 else => unreachable,
-            });
+            }, execution, false);
         }
         return has_null;
     }
@@ -489,19 +500,54 @@ pub const BatchKeys = struct {
         self.* = undefined;
     }
     pub fn append(self: *BatchKeys, alloc: Allocator, out: *std.ArrayList(u8), row: usize) !bool {
+        if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
+        var budget: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(self.scratch.allocator(), &budget);
+        return self.appendWithExecution(alloc, out, row, &execution);
+    }
+
+    /// The caller owns execution.alloc and retires its row-local results.
+    /// Never reset that owner or mint a new CPU budget for another key.
+    pub fn appendWithExecution(self: *BatchKeys, alloc: Allocator, out: *std.ArrayList(u8), row: usize, execution: *expressions.Execution) !bool {
+        try execution.charge(0);
         if (row >= self.batch.rowCount()) return error.RowSourceColumnLengthMismatch;
-        _ = self.scratch.reset(.retain_capacity);
         const start = out.items.len;
         errdefer out.shrinkRetainingCapacity(start);
         // Only bound dependencies are decoded; unrelated wide columns stay in
         // their physical vectors. NULL slots are checked before dictionary IDs.
+        var roots: @import("../../sql/row_value.zig").JsonRow = undefined;
+        var roots_initialized = false;
+        defer if (roots_initialized) roots.deinit();
         for (self.inputs, self.plan.columns, self.values) |input, column, *value| {
+            try execution.charge(1);
             value.* = if (input) |index| blk: {
                 const vector = self.batch.columns[index];
                 // Array dependencies are logical operands, not ordered keys.
                 // The pinned schema owns element identity; payloads borrow the
                 // retained batch. NULLs must precede dictionary addressing.
                 if (vector.nulls.isNull(row)) break :blk .null;
+                if (column.column_type == .json) {
+                    // The schema supplies JSON identity, not the vector's
+                    // byte shape. Decode only selected dependencies, once per
+                    // row; all component programs borrow the same root owner.
+                    const bytes = switch (vector.values) {
+                        .json => |values| values[row],
+                        .bytes, .dictionary_bytes => try vector.bytesAt(row),
+                        else => return error.RowSourceColumnKindMismatch,
+                    };
+                    if (!roots_initialized) {
+                        roots.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+                        roots_initialized = true;
+                        try roots.bindAdmission(execution.bytes);
+                    }
+                    const root = roots.decodePinned(@intCast(index), bytes) catch |err| return switch (err) {
+                        error.SqlProgramLimitExceeded => execution.limit(),
+                        error.SqlInvalidTextRepresentation => error.InvalidRelationalExpressionInput,
+                        error.InvalidSqlNumber, error.SqlNumericOutOfRange => error.RelationalExpressionOverflow,
+                        else => err,
+                    };
+                    break :blk .{ .json = root };
+                }
                 if (column.column_type == .sql_array) break :blk .{ .sql_array = .{
                     .element_type = column.sql_element_type orelse return error.RelationalIndexColumnTypeMismatch,
                     .bytes = try vector.bytesAt(row),
@@ -525,33 +571,32 @@ pub const BatchKeys = struct {
                         .bytes, .dictionary_bytes => .{ .string = try vector.bytesAt(row) },
                         else => return error.RowSourceColumnKindMismatch,
                     };
-                    var context: NumericContext = .{ .alloc = self.scratch.allocator() };
-                    break :blk .{ .numeric = try @import("../../sql/numeric_storage.zig").encodeJsonWithModifier(&context, raw, null) };
+                    var memory: @import("../../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true };
+                    defer execution.bytes.* -|= memory.footprint();
+                    var context: NumericContext = .{
+                        .alloc = memory.allocator(),
+                        .parent = &execution.numeric,
+                        .max_input_bytes = execution.numeric.max_input_bytes,
+                        .max_output_bytes = execution.numeric.max_output_bytes,
+                        .max_groups = execution.numeric.max_groups,
+                    };
+                    const bytes = @import("../../sql/numeric_storage.zig").encodeJsonWithModifier(&context, raw, null) catch |err| {
+                        if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and memory.isExhausted())) return execution.limit();
+                        return err;
+                    };
+                    break :blk .{ .numeric = bytes };
                 }
                 break :blk expressions.Value.fromScalar(try vectorValue(vector, column.column_type, row));
             } else .null;
         }
-        var budget: usize = expressions.max_allocated_bytes;
         var has_null = false;
         for (self.plan.keys) |key| {
             const value = if (key.expression) |expression|
-                (try expression.plan.evaluateWithBudget(self.scratch.allocator(), self.values, &budget)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn
+                (try expression.plan.evaluateWithExecution(execution, self.values)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn
             else
                 self.values[key.ordinal].scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
-            const bytes: usize = switch (value) {
-                .string, .blob => |s| s.len *| 2 +| 3,
-                .numeric => |s| s.len +| 1,
-                .null => 1,
-                .datetime => 17,
-                .boolean => 2,
-                else => 9,
-            };
-            if (key.expression != null) {
-                if (bytes > budget) return error.RelationalExpressionBudgetExceeded;
-                budget -= bytes;
-            }
             has_null = has_null or value == .null;
-            try appendValue(alloc, out, start, self.plan.encoded_bytes_limit, key, value);
+            try appendExecutionValue(alloc, out, start, self.plan.encoded_bytes_limit, key, value, execution, key.expression != null);
         }
         return has_null;
     }
@@ -585,7 +630,18 @@ fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, ma
     return appendValueWithContext(alloc, out, tuple_start, max_bytes, key, value, null);
 }
 
+fn appendExecutionValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, max_bytes: usize, key: BoundKey, value: Value, execution: *expressions.Execution, expression: bool) !void {
+    appendAdmittedValue(alloc, out, tuple_start, max_bytes, key, value, &execution.numeric, if (expression) execution.bytes else null) catch |err| {
+        if (err == error.SqlProgramLimitExceeded) return execution.limit();
+        return err;
+    };
+}
+
 fn appendValueWithContext(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, max_bytes: usize, key: BoundKey, value: Value, context: ?*NumericContext) !void {
+    return appendAdmittedValue(alloc, out, tuple_start, max_bytes, key, value, context, null);
+}
+
+fn appendAdmittedValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, max_bytes: usize, key: BoundKey, value: Value, context: ?*NumericContext, expression_bytes: ?*usize) !void {
     if (context) |work| try work.charge(1);
     var numeric_budget: NumericBudget = .{ .shared = context };
     var numeric_source: ?NumericKeys.Source = null;
@@ -605,6 +661,13 @@ fn appendValueWithContext(alloc: Allocator, out: *std.ArrayList(u8), tuple_start
         else => 9,
     };
     if (out.items.len - tuple_start +| encoded_size > max_bytes) return error.RelationalIndexKeyTooLarge;
+    // Admit the actual physical size once, before allocating output. This
+    // covers borrowed expression results and variable-size NUMERIC keys,
+    // without decoding numeric coefficients again just to reserve space.
+    if (expression_bytes) |budget| {
+        if (encoded_size > budget.*) return context.?.limit();
+        budget.* -= encoded_size;
+    }
     if (value != .numeric) if (context) |work| try work.charge(encoded_size);
     if (value == .null) {
         try out.append(alloc, if (key.nulls_first) @as(u8, 0) else 0xff);
@@ -1076,6 +1139,158 @@ test "relational index system array dependent scalar keys share cold dictionary 
     }
 }
 
+test "relational index system JSON dependent scalar keys share projected and pinned row semantics" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            const sources = @import("../rowsource/types.zig");
+            const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+                .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+                .{ .name = "unused", .path = "unused", .column_type = .json, .is_json = true, .json_kind = .any },
+            } };
+            var layout = try rows.PhysicalLayout.init(a, table);
+            defer layout.deinit();
+            var plan = try TuplePlan.init(a, table, &layout, &.{
+                .{ .expression_json = "{\"op\":\"jsonb_extract_path_text\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"n\"}]}", .result_type = .string },
+                .{ .expression_json = "{\"op\":\"jsonb_typeof\",\"args\":[{\"op\":\"column\",\"column\":\"j\"}]}", .result_type = .string },
+                .{ .expression_json = "{\"op\":\"jsonb_array_length\",\"args\":[{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"}]}]}", .result_type = .integer },
+            });
+            defer plan.deinit();
+            if (TuplePlan.init(a, table, &layout, &.{.{ .column = "j" }})) |result| {
+                var unexpected = result;
+                unexpected.deinit();
+                return error.TestUnexpectedResult;
+            } else |err| if (err != error.UnsupportedRelationalIndexColumn) return err;
+            const payloads: []const []const u8 = &.{ "{\"n\":1.20,\"a\":[null,true]}", "null", "ignored SQL NULL", "{\"n\":-0.00,\"a\":[]}" };
+            for (0..3) |representation| {
+                const vector: sources.ColumnValues = switch (representation) {
+                    0 => .{ .json = payloads },
+                    1 => .{ .bytes = payloads },
+                    else => .{ .dictionary_bytes = .{ .values = &.{ payloads[0], payloads[1], payloads[3] }, .indices = &.{ 0, 1, std.math.maxInt(u32), 2 } } },
+                };
+                const batch: sources.ColumnBatch = .{
+                    .snapshot = .{ .table_id = "json", .snapshot_id = "one" },
+                    .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" }, .{ .relational_key = "three" }, .{ .relational_key = "four" } },
+                    .columns = &.{
+                        .{ .name = "unused", .values = .{ .json = &.{ "invalid", "invalid", "invalid", "invalid" } } },
+                        .{ .name = "j", .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } }, .values = vector },
+                    },
+                };
+                inline for (.{ false, true }) |external| {
+                    var bound = try if (external) plan.bindExternalBatch(a, batch) else plan.bindBatch(a, batch);
+                    defer bound.deinit();
+                    var out: std.ArrayList(u8) = .empty;
+                    defer out.deinit(a);
+                    for (0..4) |i| {
+                        out.clearRetainingCapacity();
+                        const actual_null = try bound.append(a, &out, i);
+                        var parsed = try std.json.parseFromSlice(std.json.Value, a, if (i == 2) "null" else payloads[i], .{ .parse_numbers = false });
+                        defer parsed.deinit();
+                        const canonical = try @import("document_content_hash.zig").canonicalJsonStorageValueAlloc(a, parsed.value);
+                        defer a.free(canonical);
+                        const cells = [_]rows.Cell{.{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .is_null = i == 2, .value = .{ .bytes_val = canonical } }};
+                        const encoded = try rows.serializePreparedOrdinalWithLayout(a, table.version, table.relational_columns, &cells, @splat(0), &layout);
+                        defer a.free(encoded);
+                        var expected = try plan.encodeAlloc(a, try rows.ordinalRowView(encoded, table, &layout));
+                        defer expected.deinit(a);
+                        try std.testing.expectEqual(expected.has_null, actual_null);
+                        try std.testing.expectEqualSlices(u8, expected.bytes, out.items);
+                    }
+                }
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Fixture.run, .{});
+}
+
+test "relational index system projected JSON keys share sticky work cancellation and memory admission" {
+    const a = std.testing.allocator;
+    const sources = @import("../rowsource/types.zig");
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{
+        .{ .expression_json = "{\"op\":\"jsonb_extract_path_text\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"n\"}]}", .result_type = .string },
+        .{ .expression_json = "{\"op\":\"jsonb_typeof\",\"args\":[{\"op\":\"column\",\"column\":\"j\"}]}", .result_type = .string },
+    });
+    defer plan.deinit();
+    const text: [1024]u8 = @splat('x');
+    const payload = "{\"n\":\"" ++ text ++ "\"}";
+    const batch: sources.ColumnBatch = .{
+        .snapshot = .{ .table_id = "json", .snapshot_id = "faults" },
+        .row_refs = &.{ .{ .relational_key = "valid" }, .{ .relational_key = "invalid" } },
+        .columns = &.{.{ .name = "j", .values = .{ .json = &.{ payload, "invalid" } } }},
+    };
+    var bound = try plan.bindBatch(a, batch);
+    defer bound.deinit();
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn poll(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.Canceled;
+        }
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.ensureTotalCapacity(a, 4096);
+    try out.appendSlice(a, "keep");
+    var polls: usize = 0;
+    var used: usize = 0;
+    var work: u64 = 0;
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        var control: Control = .{};
+        execution.numeric.checkpoint = Control.poll;
+        execution.numeric.ptr = &control;
+        try std.testing.expect(!try bound.appendWithExecution(a, &out, 0, &execution));
+        polls = control.polls;
+        used = expressions.max_allocated_bytes - bytes;
+        work = 8 * 1024 * 1024 - execution.numeric.remaining;
+        try std.testing.expect(polls > 2);
+        try std.testing.expect(used > text.len);
+    }
+    out.shrinkRetainingCapacity(4);
+    for (1..polls + 1) |cut| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        var control: Control = .{ .fail_at = cut };
+        execution.numeric.checkpoint = Control.poll;
+        execution.numeric.ptr = &control;
+        try std.testing.expectError(error.Canceled, bound.appendWithExecution(a, &out, 0, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+        execution.numeric.checkpoint = null;
+        try std.testing.expectError(error.Canceled, bound.appendWithExecution(a, &out, 1, &execution));
+    }
+    for ([_]bool{ false, true }) |memory| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = if (memory) used - 1 else expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        if (!memory) execution.numeric.remaining = work - 1;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, bound.appendWithExecution(a, &out, 0, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, bound.appendWithExecution(a, &out, 1, &execution));
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        try std.testing.expectError(error.InvalidRelationalExpressionInput, bound.appendWithExecution(a, &out, 1, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+    }
+}
+
 test "relational tuple definition identity tracks semantics instead of epoch placement" {
     const alloc = std.testing.allocator;
     const columns = [_]schema.RelationalColumn{
@@ -1167,6 +1382,221 @@ test "relational index system shared tuple admission preserves prefixes on late 
     try std.testing.expectEqualStrings("keep", out.items);
     context.checkpoint = null;
     try std.testing.expectError(error.Canceled, plan.appendValuesWithContext(a, &out, &values, &context));
+}
+
+test "relational index system composite expressions share physical and batch execution admission" {
+    const a = std.testing.allocator;
+    const sources = @import("../rowsource/types.zig");
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "n", .path = "n", .column_type = .integer },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{
+        .{ .column = "n" },
+        .{ .expression_json = "{\"op\":\"column\",\"column\":\"n\"}", .result_type = .integer },
+        .{ .expression_json = "{\"op\":\"add\",\"args\":[{\"op\":\"column\",\"column\":\"n\"},{\"op\":\"literal\",\"type\":\"integer\",\"value\":1}]}", .result_type = .integer },
+    });
+    defer plan.deinit();
+    const encoded = try rows.serializeOrdinal(a, table.version, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "n", .value_type = .i64_val, .value = .{ .i64_val = 7 } },
+    }, @splat(0));
+    defer a.free(encoded);
+    const physical = try rows.ordinalRowView(encoded, table, &layout);
+    const batch: sources.ColumnBatch = .{
+        .snapshot = .{ .table_id = "numbers", .snapshot_id = "one" },
+        .row_refs = &.{.{ .relational_key = "one" }},
+        .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{7} } }},
+    };
+    var bound = try plan.bindBatch(a, batch);
+    defer bound.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.ensureTotalCapacity(a, 64);
+    var expected: ?[]u8 = null;
+    defer if (expected) |bytes| a.free(bytes);
+    inline for (.{ false, true }) |columnar| {
+        out.clearRetainingCapacity();
+        try out.appendSlice(a, "keep");
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(std.testing.failing_allocator, &bytes);
+        try std.testing.expect(!try if (columnar)
+            bound.appendWithExecution(a, &out, 0, &execution)
+        else
+            plan.appendWithExecution(a, &out, physical, &execution));
+        const work = 8 * 1024 * 1024 - execution.numeric.remaining;
+        try std.testing.expect(work > 20);
+        if (expected) |key| {
+            try std.testing.expectEqualSlices(u8, key, out.items);
+        } else expected = try a.dupe(u8, out.items);
+        // Every work cut, including a late component or output encoding, must
+        // roll back the whole tuple and preserve the same sticky owner failure.
+        for (0..work) |cut| {
+            out.shrinkRetainingCapacity(4);
+            bytes = expressions.max_allocated_bytes;
+            execution = expressions.Execution.init(std.testing.failing_allocator, &bytes);
+            execution.numeric.remaining = cut;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, if (columnar)
+                bound.appendWithExecution(a, &out, 0, &execution)
+            else
+                plan.appendWithExecution(a, &out, physical, &execution));
+            try std.testing.expectEqualStrings("keep", out.items);
+            execution.numeric.remaining = 8 * 1024 * 1024;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, if (columnar)
+                bound.appendWithExecution(a, &out, 0, &execution)
+            else
+                plan.appendWithExecution(a, &out, physical, &execution));
+        }
+        bytes = 17; // Two expression components require 18 output bytes.
+        execution = expressions.Execution.init(std.testing.failing_allocator, &bytes);
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, if (columnar)
+            bound.appendWithExecution(a, &out, 0, &execution)
+        else
+            plan.appendWithExecution(a, &out, physical, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+        bytes = expressions.max_allocated_bytes;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, execution.charge(0));
+    }
+}
+
+test "relational index system numeric expression keys admit exact physical size without coefficient allocation" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{
+        .{ .expression_json = "{\"op\":\"column\",\"column\":\"n\"}", .result_type = .numeric },
+    });
+    defer plan.deinit();
+    const wire = try @import("../../sql/numeric_storage.zig").encodeJsonAlloc(a, .{ .string = "1234567890123456789012345678901234567890.2500" });
+    defer a.free(wire);
+    const encoded = try rows.serializeOrdinal(a, table.version, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "n", .value_type = .bytes_val, .is_numeric = true, .value = .{ .bytes_val = wire } },
+    }, @splat(0));
+    defer a.free(encoded);
+    const physical = try rows.ordinalRowView(encoded, table, &layout);
+    const sources = @import("../rowsource/types.zig");
+    const batch: sources.ColumnBatch = .{
+        .snapshot = .{ .table_id = "numbers", .snapshot_id = "canonical" },
+        .row_refs = &.{.{ .relational_key = "one" }},
+        .columns = &.{.{ .name = "n", .values = .{ .bytes = &.{wire} } }},
+    };
+    var bound = try plan.bindBatch(a, batch);
+    defer bound.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.ensureTotalCapacity(a, 128);
+    var context: NumericContext = .{ .alloc = std.testing.failing_allocator };
+    const source = try @import("../../sql/numeric_key.zig").prepareStored(&context, wire);
+    const size = source.encodedSize() + 1;
+    try std.testing.expect(size > 9);
+    inline for (.{ false, true }) |columnar| {
+        out.clearRetainingCapacity();
+        var bytes = size;
+        var execution = expressions.Execution.init(std.testing.failing_allocator, &bytes);
+        try std.testing.expect(!try if (columnar)
+            bound.appendWithExecution(a, &out, 0, &execution)
+        else
+            plan.appendWithExecution(a, &out, physical, &execution));
+        try std.testing.expectEqual(size, out.items.len);
+        try std.testing.expectEqual(@as(usize, 0), bytes);
+        out.clearRetainingCapacity();
+        try out.appendSlice(a, "keep");
+        bytes = size - 1;
+        execution = expressions.Execution.init(std.testing.failing_allocator, &bytes);
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, if (columnar)
+            bound.appendWithExecution(a, &out, 0, &execution)
+        else
+            plan.appendWithExecution(a, &out, physical, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+    }
+}
+
+test "relational index system external numeric tuple admission includes conversion and retained capacity" {
+    const a = std.testing.allocator;
+    const sources = @import("../rowsource/types.zig");
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{.{ .column = "n" }});
+    defer plan.deinit();
+    const text: [1024]u8 = @splat('7');
+    const batch: sources.ColumnBatch = .{
+        .snapshot = .{ .table_id = "numbers", .snapshot_id = "external" },
+        .row_refs = &.{.{ .relational_key = "one" }},
+        .columns = &.{.{ .name = "n", .values = .{ .bytes = &.{&text} } }},
+    };
+    var bound = try plan.bindExternalBatch(a, batch);
+    defer bound.deinit();
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn poll(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.Canceled;
+        }
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.ensureTotalCapacity(a, 1024);
+    try out.appendSlice(a, "keep");
+    var polls: usize = 0;
+    var used: usize = 0;
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        var control: Control = .{};
+        execution.numeric.checkpoint = Control.poll;
+        execution.numeric.ptr = &control;
+        try std.testing.expect(!try bound.appendWithExecution(a, &out, 0, &execution));
+        polls = control.polls;
+        used = expressions.max_allocated_bytes - bytes;
+        try std.testing.expect(polls > 2);
+        try std.testing.expect(used > text.len);
+    }
+    out.shrinkRetainingCapacity(4);
+    // External decimal parsing cannot escape the row's cancellation owner.
+    for (1..polls + 1) |cut| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        var control: Control = .{ .fail_at = cut };
+        execution.numeric.checkpoint = Control.poll;
+        execution.numeric.ptr = &control;
+        try std.testing.expectError(error.Canceled, bound.appendWithExecution(a, &out, 0, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+        execution.numeric.checkpoint = null;
+        try std.testing.expectError(error.Canceled, bound.appendWithExecution(a, &out, 0, &execution));
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = used - 1;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, bound.appendWithExecution(a, &out, 0, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+        bytes = expressions.max_allocated_bytes;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, bound.appendWithExecution(a, &out, 0, &execution));
+    }
+    inline for (.{ "max_input_bytes", "max_output_bytes", "max_groups" }) |limit| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        @field(execution.numeric, limit) = 1;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, bound.appendWithExecution(a, &out, 0, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+        @field(execution.numeric, limit) = 1024 * 1024;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, bound.appendWithExecution(a, &out, 0, &execution));
+    }
 }
 
 test "relational index system NUMERIC composite tuples match PostgreSQL ranks and borrow canonical coefficients" {

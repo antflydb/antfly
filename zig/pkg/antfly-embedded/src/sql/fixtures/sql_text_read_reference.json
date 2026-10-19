@@ -1,0 +1,1123 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "format": 1,
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "keyword"
+              },
+              "name": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword",
+                "nullable": true
+              },
+              "organization_id": {
+                "type": "keyword"
+              },
+              "email": {
+                "type": "keyword",
+                "nullable": true
+              },
+              "amount": {
+                "type": "integer",
+                "x-antfly-sql-type": "int32"
+              },
+              "quantity": {
+                "type": "integer"
+              },
+              "tenant_id": {
+                "type": "keyword"
+              },
+              "customer_id": {
+                "type": "keyword"
+              },
+              "created_at": {
+                "type": "keyword"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "kind": {
+                "type": "keyword"
+              },
+              "tags": {
+                "type": "json"
+              },
+              "metadata": {
+                "type": "json"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "text-00",
+        "value": {
+          "id": "text-00",
+          "name": "Ada",
+          "status": "op_A",
+          "organization_id": "org-0",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 65,
+          "quantity": 1,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-01",
+        "value": {
+          "id": "text-01",
+          "name": "Ada",
+          "status": "op%active",
+          "organization_id": "org-1",
+          "email": "grace@example.test",
+          "amount": 66,
+          "quantity": 2,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-02T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-02",
+        "value": {
+          "id": "text-02",
+          "name": "Ada",
+          "status": "ACTIVE12",
+          "organization_id": "org-2",
+          "email": "other@example.test",
+          "amount": 233,
+          "quantity": 3,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-03T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-03",
+        "value": {
+          "id": "text-03",
+          "name": "Ada",
+          "status": "ACTIVE2",
+          "organization_id": "org-0",
+          "email": null,
+          "amount": 128512,
+          "quantity": 4,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-04T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-04",
+        "value": {
+          "id": "text-04",
+          "name": "Ada",
+          "status": "atest",
+          "organization_id": "org-1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 67,
+          "quantity": 5,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-05T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-05",
+        "value": {
+          "id": "text-05",
+          "name": "Ada",
+          "status": "\u00e9test",
+          "organization_id": "org-2",
+          "email": "grace@example.test",
+          "amount": 68,
+          "quantity": 6,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-06T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-06",
+        "value": {
+          "id": "text-06",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org-0",
+          "email": "other@example.test",
+          "amount": 69,
+          "quantity": 7,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-07T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-07",
+        "value": {
+          "id": "text-07",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org-1",
+          "email": null,
+          "amount": 70,
+          "quantity": 8,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-08T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-08",
+        "value": {
+          "id": "text-08",
+          "name": "Ada",
+          "status": "",
+          "organization_id": "org-2",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 0,
+          "quantity": 9,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-09T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-09",
+        "value": {
+          "id": "text-09",
+          "name": "Ada",
+          "status": null,
+          "organization_id": "org-0",
+          "email": "grace@example.test",
+          "amount": 0,
+          "quantity": 10,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-10T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-10",
+        "value": {
+          "id": "text-10",
+          "name": "Ada",
+          "status": "active",
+          "organization_id": "org-1",
+          "email": "other@example.test",
+          "amount": 71,
+          "quantity": 11,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-11T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "text-11",
+        "value": {
+          "id": "text-11",
+          "name": "Ada",
+          "status": "ready",
+          "organization_id": "org-2",
+          "email": null,
+          "amount": 72,
+          "quantity": 12,
+          "tenant_id": "text-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-12T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "entries": [
+    {
+      "id": "sql-0190",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-11"
+        ],
+        [
+          "text-10"
+        ],
+        [
+          "text-09"
+        ],
+        [
+          "text-08"
+        ],
+        [
+          "text-07"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0194",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-11"
+        ],
+        [
+          "text-10"
+        ],
+        [
+          "text-09"
+        ],
+        [
+          "text-08"
+        ],
+        [
+          "text-07"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0210",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-00"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0211",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-00"
+        ],
+        [
+          "text-01"
+        ],
+        [
+          "text-06"
+        ],
+        [
+          "text-07"
+        ],
+        [
+          "text-11"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0212",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-00"
+        ],
+        [
+          "text-01"
+        ],
+        [
+          "text-06"
+        ],
+        [
+          "text-07"
+        ],
+        [
+          "text-11"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0213",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-06"
+        ],
+        [
+          "text-07"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0217",
+      "columns": [
+        "id",
+        "status_token"
+      ],
+      "rows": [
+        [
+          "text-02",
+          "ACTIVE"
+        ],
+        [
+          "text-03",
+          "ACTIVE"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0219",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-01"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0252",
+      "columns": [
+        "status_prefix"
+      ],
+      "rows": [
+        [
+          "ate"
+        ],
+        [
+          "\u00e9te"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0260",
+      "columns": [
+        "first_code",
+        "amount_char"
+      ],
+      "rows": [
+        [
+          111,
+          "A"
+        ],
+        [
+          111,
+          "B"
+        ],
+        [
+          97,
+          "C"
+        ],
+        [
+          233,
+          "D"
+        ],
+        [
+          111,
+          "E"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        23,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0280",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-00"
+        ],
+        [
+          "text-01"
+        ],
+        [
+          "text-02"
+        ],
+        [
+          "text-04"
+        ],
+        [
+          "text-05"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0283",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-02"
+        ],
+        [
+          "text-06"
+        ],
+        [
+          "text-10"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0285",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-00"
+        ],
+        [
+          "text-01"
+        ],
+        [
+          "text-04"
+        ],
+        [
+          "text-05"
+        ],
+        [
+          "text-08"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0286",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-00"
+        ],
+        [
+          "text-01"
+        ],
+        [
+          "text-02"
+        ],
+        [
+          "text-04"
+        ],
+        [
+          "text-05"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0287",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-00"
+        ],
+        [
+          "text-04"
+        ],
+        [
+          "text-08"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0295",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-10"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0296",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "text-10"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1236",
+      "columns": [
+        "organization_id",
+        "record_count",
+        "quantity_sum"
+      ],
+      "rows": [
+        [
+          "org-2",
+          4,
+          30
+        ],
+        [
+          "org-1",
+          4,
+          26
+        ],
+        [
+          "org-0",
+          4,
+          22
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20,
+        1700
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1374",
+      "columns": [
+        "tenant_id",
+        "id",
+        "row_num"
+      ],
+      "rows": [
+        [
+          "text-tenant",
+          "text-07",
+          1
+        ],
+        [
+          "text-tenant",
+          "text-06",
+          2
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        20
+      ],
+      "affected": 0
+    }
+  ],
+  "excluded": [],
+  "server_version": 180006
+}

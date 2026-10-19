@@ -25,6 +25,69 @@ const reads = @import("antfly_local_sources").api_table_read_source;
 const time = @import("antfly_platform").time;
 
 pub const max_request_bytes = 4 << 20;
+
+/// SQL validation keeps its public diagnostic; operational failures retain
+/// the shared runtime class instead of becoming an unknown SQL/internal error.
+pub fn normalizationFailureHttpStatus(err: anyerror) u16 {
+    const diagnostic = @import("antfly_local_sources").sql_errors.describe(err);
+    if (!std.mem.eql(u8, diagnostic.code, "XX000")) return diagnostic.httpStatus();
+    const errors = @import("antfly_runtime_abi").error_abi;
+    const code = std.enums.fromInt(errors.Code, errors.statusFromError(err).code) orelse return 500;
+    return switch (code) {
+        .invalid_argument => 400,
+        .not_found => 404,
+        .already_exists, .conflict => 409,
+        .unauthorized => 401,
+        .forbidden => 403,
+        .unavailable, .retryable => 503,
+        .timeout => 504,
+        .cancelled => 408,
+        .unsupported => 501,
+        .ok, .out_of_memory, .corrupt, .internal => 500,
+    };
+}
+
+test "retained read admission is independent of RLS primary lookup and fails closed without a barrier" {
+    const Fake = struct {
+        admissions: usize = 0,
+        raw_reads: usize = 0,
+        fn admit(raw: *anyopaque, _: std.mem.Allocator, route: @import("../metadata/api.zig").CatalogRouteFence, group: u64, table: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(route.route.group_id, group);
+            try std.testing.expectEqualStrings("rows", table);
+            self.admissions += 1;
+        }
+        fn lookup(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.raw_reads += 1;
+            return error.RowPolicyAuthenticationRequired;
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: Fake = .{};
+    var resources = try registry.Registry.init(a, std.testing.io, 1, 8, 8, std.time.ns_per_s);
+    defer resources.deinit();
+    var owner: owner_mod.Owner = .{ .registry = &resources, .source = .{
+        .ptr = &fixture,
+        .route_fence = .{
+            .metadata_group_id = 1,
+            .catalog_revision = 1,
+            .table_id = 2,
+            .topology_epoch = 4,
+            .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } },
+        },
+        .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined, .admit_statement_read_group_local_routed = Fake.admit },
+    } };
+    const scope: registry.Scope = .{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 0 };
+    const response = try execute(a, owner, scope, "rows", .{ .operation = .admit, .schema_version = 0 });
+    defer a.free(response);
+    try std.testing.expectEqual(@as(usize, 1), fixture.admissions);
+    try std.testing.expectEqual(@as(usize, 0), fixture.raw_reads);
+    owner.source.vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined };
+    try std.testing.expectError(error.SqlStatementSnapshotRequired, execute(a, owner, scope, "rows", .{ .operation = .admit, .schema_version = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), fixture.raw_reads);
+}
+
 pub const max_response_bytes = 32 << 20;
 pub const max_lease_ms: u32 = 30_000;
 pub const Request = struct {
@@ -92,12 +155,9 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
             return encode(alloc, .{});
         },
         .admit => {
-            // A bounded point probe establishes the owner read-index barrier
-            // without retaining any mutation fence or row data.
-            if (try owner.source.lookupGroupLocal(alloc, scope.group_id, table, "", .{}, .read_index)) |value| {
-                var found = value;
-                found.deinit(alloc);
-            }
+            // This establishes only quorum/topology readiness. Row-policy
+            // proofs belong to open; admission must never perform a raw read.
+            try owner.source.admitStatementReadGroupLocal(alloc, scope.group_id, table);
             return encode(alloc, .{});
         },
         .capture => {

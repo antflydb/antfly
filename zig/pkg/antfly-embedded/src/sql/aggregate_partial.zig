@@ -67,6 +67,7 @@ fn kindId(kind: operators.Aggregate.Kind) u8 {
         .bool_and => 6,
         .bool_or => 7,
         .pattern_set => 8,
+        .array_agg => 9,
     };
 }
 fn typeId(type_: ?@import("ast.zig").ColumnType) u8 {
@@ -112,9 +113,10 @@ const Encoder = struct {
         try self.raw(value);
     }
     fn datum(self: *Encoder, value: Datum) !void {
-        if (value.patterns != null) return error.InvalidSqlSpill;
+        try value.validateTemporal();
+        if (value.patterns() != null) return error.InvalidSqlSpill;
         if (value.sql_null) return self.raw(&.{0});
-        if (value.array != null or value.numeric != null) {
+        if (value.array != null or value.numeric != null or value.temporal() != null) {
             // Reuse the portable typed-block codec; a typed value's scalar
             // JSON placeholder is not its value or its element identity.
             const encoded = try @import("spill.zig").encodeColumnarBlockAlloc(self.a, &.{.{ .values = &.{value}, .keys = &.{}, .ordinal = 0 }}, 16 << 20);
@@ -190,7 +192,7 @@ const Decoder = struct {
                 const block = try @import("spill.zig").decodeColumnarBlockInArena(self.a, try self.text(), 16 << 20);
                 if (block.count() != 1 or block.values.len != 1 or block.keys.len != 0) return error.InvalidSqlSpill;
                 const value = try block.cell(0, 0);
-                if (value.sql_null or (value.array == null and value.numeric == null)) return error.InvalidSqlSpill;
+                if (value.sql_null or (value.array == null and value.numeric == null and value.temporal() == null)) return error.InvalidSqlSpill;
                 break :blk value;
             },
             else => error.InvalidSqlSpill,
@@ -219,8 +221,13 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
         try reducer.state.encode(&context, &writer);
     }
     try encoder.datum(if (state.selected) |v| v.row.values[0] else .{});
-    try encoder.integer(u64, @intCast(state.distinct_values.items.len));
-    for (state.distinct_values.items) |entry| try encoder.datum(entry.row.row.values[0]);
+    if (state.collection) |collection| {
+        try encoder.integer(u64, @intCast(collection.values.items.len));
+        for (collection.values.items) |value| try encoder.datum(value);
+    } else {
+        try encoder.integer(u64, @intCast(state.distinct_values.items.len));
+        for (state.distinct_values.items) |entry| try encoder.datum(entry.row.row.values[0]);
+    }
     const null_position: u64 = if (state.patterns) |patterns| blk: {
         for (patterns.values.items, 0..) |value, index| if (value == .null) break :blk @intCast(index);
         break :blk std.math.maxInt(u64);
@@ -237,7 +244,7 @@ pub fn fixedEligible(spec: operators.AggregateSpec) bool {
 }
 pub fn decodeFixed(a: A, value: Datum, spec: operators.AggregateSpec) !?Fixed {
     if (!fixedEligible(spec)) return null;
-    if (value.sql_null or value.value != .string or value.patterns != null or value.array != null or value.numeric != null) return error.InvalidSqlSpill;
+    if (value.sql_null or value.value != .string or value.extension != null or value.array != null or value.numeric != null) return error.InvalidSqlSpill;
     var decoder: Decoder = .{ .a = a, .bytes = value.value.string };
     if (!std.mem.eql(u8, try decoder.raw(4), magic)) return error.InvalidSqlSpill;
     const signature = try decoder.raw(5);
@@ -289,7 +296,7 @@ pub fn decodeFixed(a: A, value: Datum, spec: operators.AggregateSpec) !?Fixed {
 }
 
 pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggregate {
-    if (value.sql_null or value.patterns != null or value.value != .string) return error.InvalidSqlSpill;
+    if (value.sql_null or value.patterns() != null or value.value != .string) return error.InvalidSqlSpill;
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const sql_floating = spec.input_element == .float32 or spec.input_element == .float64;
@@ -304,6 +311,25 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     for (&numbers, 0..) |*v, i| {
         v.* = @bitCast(try decoder.integer(u64));
         if (!std.math.isFinite(v.*) and !(sql_floating and ((i == 0 and spec.kind == .sum) or (i == 2 and spec.kind == .avg)))) return error.InvalidSqlSpill;
+    }
+    if (operators.Aggregate.integerAverage(spec.kind, spec.input_type, spec.input_element)) {
+        // Integer AVG checkpoints carry only an exact sum/count. Reject a
+        // floating transition or an impossible width/count combination rather
+        // than silently interpreting another reducer's bytes as a zero mean.
+        for (numbers) |number| if (number != 0) return error.InvalidSqlSpill;
+        const lower: i128 = switch (spec.input_element.?) {
+            .int16 => std.math.minInt(i16),
+            .int32 => std.math.minInt(i32),
+            .int64 => std.math.minInt(i64),
+            else => unreachable,
+        };
+        const upper: i128 = switch (spec.input_element.?) {
+            .int16 => std.math.maxInt(i16),
+            .int32 => std.math.maxInt(i32),
+            .int64 => std.math.maxInt(i64),
+            else => unreachable,
+        };
+        if (sum < lower * count or sum > upper * count) return error.InvalidSqlSpill;
     }
     if (spec.kind == .sum and spec.input_element == .float32) {
         const rounded: f32 = @floatCast(numbers[0]);
@@ -327,8 +353,9 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
             .integer => selected.value == .integer,
             .number => selected.numeric != null or selected.value == .integer or selected.value == .float,
             .boolean => selected.value == .bool,
-            .string, .datetime, .uuid => selected.value == .string,
-            .json => true,
+            .string, .uuid => selected.value == .string,
+            .datetime => selected.value == .string or (selected.temporal() != null and selected.temporal().?.kind() == .timestamp_tz),
+            .json => selected.temporal() == null,
             .array => selected.array != null,
         };
         if (!valid) return error.InvalidSqlSpill;
@@ -349,7 +376,7 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
         std.mem.copyBackwards(std.json.Value, items[index + 1 ..], items[index .. items.len - 1]);
         items[index] = .null;
     }
-    if (spec.distinct) {
+    if (spec.distinct or spec.kind == .array_agg) {
         if (state.count != count or state.integer_sum != sum or state.number_sum != numbers[0] or state.compensation != numbers[1] or state.mean != numbers[2] or state.boolean != (signature[3] == 1)) return error.InvalidSqlSpill;
     } else if (members != 0) return error.InvalidSqlSpill;
     if (checkpoint) |incoming| {
@@ -486,6 +513,10 @@ test "SQL NUMERIC aggregate extrema partials retain exact values and display sca
 /// numeric states merge without narrowing intermediate sums.
 pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
     if (target.kind != source.kind or target.input_type != source.input_type or target.input_element != source.input_element or target.distinct != source.distinct) return error.InvalidSqlSpill;
+    if (source.collection) |collection| {
+        for (collection.values.items) |value| try target.update(value);
+        return;
+    }
     if (source.distinct) {
         if (source.patterns) |patterns| {
             for (patterns.values.items) |value| try target.update(if (value == .null) Datum{} else Datum.json(value));
@@ -521,7 +552,9 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
                 try operators.Aggregate.addFloatSum(&target.number_sum, &target.compensation, value);
             }
         },
-        .avg => {
+        .avg => if (operators.Aggregate.integerAverage(target.kind, target.input_type, target.input_element)) {
+            target.integer_sum = std.math.add(i128, target.integer_sum, source.integer_sum) catch return error.SqlNumericOutOfRange;
+        } else {
             const fraction = @as(f64, @floatFromInt(source.count)) / @as(f64, @floatFromInt(total));
             const delta = source.mean - target.mean;
             if (target.count == 0) {
@@ -536,7 +569,7 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
         .bool_and => target.boolean = target.boolean and source.boolean,
         .bool_or => target.boolean = target.boolean or source.boolean,
         .min, .max => try target.update(source.selected.?.row.values[0]),
-        .pattern_set => return error.InvalidSqlSpill,
+        .pattern_set, .array_agg => return error.InvalidSqlSpill,
     }
     target.count = total;
 }

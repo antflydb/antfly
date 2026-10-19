@@ -79,11 +79,13 @@ const Fixture = struct {
     calls: usize = 0,
     cancel: bool = false,
     ordered: bool = false,
+    layout: ?[]const catalog.Column = null,
     fn backend(self: *Fixture) catalog.Backend {
         return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .mutate = mutate, .checkpoint = checkpoint } };
     }
-    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
-        return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer }} };
+    fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = self.layout orelse &.{.{ .name = "n", .path = "n", .type = .integer }} };
     }
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
         return error.UnexpectedStatelessScan;
@@ -118,6 +120,144 @@ const Fixture = struct {
         self.closed += 1;
     }
 };
+
+test "SQL statement clock admission pins runtime cursors fallback and child views" {
+    const Clock = catalog.Clock;
+    const Fake = struct {
+        calls: usize = 0,
+        nanos: i128 = 20_000_000_123,
+        failed: bool = false,
+        fn sample(raw: ?*anyopaque) !i128 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.failed) return error.TestClockUnavailable;
+            const value = self.nanos;
+            self.nanos += 1_000_000_000;
+            return value;
+        }
+        fn source(self: *@This()) Clock.Source {
+            return .{ .callback = .{ .ptr = self, .now = sample } };
+        }
+    };
+    const Run = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var fake: Fake = .{};
+            var fixture: Fixture = .{ .count = 21 };
+            var backend = fixture.backend();
+            backend.clock_source = fake.source();
+            backend.transaction_start = try Clock.Instant.fromUnixMicroseconds(10_000_000);
+            var compiled = try compiler.compile(a, "SELECT n + 1, now() AS txn, CURRENT_TIMESTAMP(6) AS rounded FROM docs", .{});
+            defer compiled.deinit();
+            var binding_arena = std.heap.ArenaAllocator.init(a);
+            defer binding_arena.deinit();
+            _ = try describe.bind(binding_arena.allocator(), backend, &compiled, &.{});
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            var pinned = try backend.pinStatementClock();
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            const view = pinned.statement_clock.?;
+            try std.testing.expectEqual(@as(?i128, 20_000_000_000), view.statement.unixNanoseconds());
+            try std.testing.expectEqual(backend.transaction_start.?.micros, view.transaction.micros);
+            const owner_frame = try Clock.Frame.init(view);
+            pinned.clock_values = &owner_frame;
+            for (0..1000) |_| {
+                const inherited = try pinned.pinStatementClock();
+                const limits = @import("decision_eval.zig").limitsFor(inherited);
+                try std.testing.expectEqual(view.statement.micros, limits.clock_values.?.view.statement.micros);
+                try std.testing.expect(limits.clock_values.? == &owner_frame);
+            }
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            const stream = (try Stream.open(a, pinned, &compiled, &.{}, .{ .page_rows = 3, .result_rows = 32 })).?;
+            defer stream.close();
+            const stream_frame = stream.context.backend.clock_values.?;
+            try std.testing.expect(stream_frame != &owner_frame);
+            try std.testing.expect(stream_frame == &stream.clock_values.?);
+            const borrowed = try stream_frame.value(.transaction, 6);
+            try @import("scalar.zig").Datum.typedTemporal(borrowed).validateTemporal();
+            var seen: usize = 0;
+            while (true) {
+                var page = try stream.next(2);
+                defer page.deinit();
+                seen += page.output.rows.len;
+                for (page.output.rows) |row| {
+                    try std.testing.expectEqualStrings("1970-01-01 00:00:10+00", row[1].string);
+                    try std.testing.expectEqualStrings(row[1].string, row[2].string);
+                }
+                try std.testing.expectEqual(view.statement.micros, stream.context.backend.statement_clock.?.statement.micros);
+                try std.testing.expectEqual(view.transaction.micros, stream.context.backend.statement_clock.?.transaction.micros);
+                const limits = @import("decision_eval.zig").limitsFor(stream.context.backend);
+                try std.testing.expect(limits.clock_values.? == stream_frame);
+                try std.testing.expect(borrowed == try limits.clock_values.?.value(.transaction, 6));
+                if (page.exhausted) break;
+            }
+            try std.testing.expectEqual(@as(usize, 21), seen);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            fixture.offset = 0;
+            var derived = try compiler.compile(a, "SELECT now() AS txn, n FROM (SELECT n FROM docs) AS q", .{});
+            defer derived.deinit();
+            var result = try runtime.execute(a, pinned, &derived, &.{}, .{ .result_rows = 32, .page_rows = 3 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 21), result.output.rows.len);
+            for (result.output.rows) |row| try std.testing.expectEqualStrings("1970-01-01 00:00:10+00", row[0].string);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            fixture.offset = 0;
+            // An unsupported blocking stream declines before row reads. Its
+            // materializing fallback must retain the ingress statement cut.
+            var ordered = try compiler.compile(a, "SELECT n, now() AS txn FROM docs ORDER BY n DESC", .{});
+            defer ordered.deinit();
+            try std.testing.expect((try Stream.open(a, pinned, &ordered, &.{}, .{ .result_rows = 32 })) == null);
+            var fallback = try runtime.execute(a, pinned, &ordered, &.{}, .{ .result_rows = 32 });
+            defer fallback.deinit();
+            try std.testing.expectEqual(@as(usize, 21), fallback.output.rows.len);
+            for (fallback.output.rows) |row| try std.testing.expectEqualStrings("1970-01-01 00:00:10+00", row[1].string);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            const next_statement = try backend.pinStatementClock();
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            try std.testing.expect(next_statement.statement_clock.?.statement.micros != view.statement.micros);
+            try std.testing.expectEqual(view.transaction.micros, next_statement.statement_clock.?.transaction.micros);
+            // Realtime is not monotonic, but an existing statement cut is.
+            fake.nanos = -1;
+            try std.testing.expectEqual(@as(?i128, -1000), (try view.value(.wall, 6)).unixNanoseconds());
+            try std.testing.expectEqual(@as(?i128, 20_000_000_000), view.statement.unixNanoseconds());
+        }
+        fn fault(a: std.mem.Allocator) !void {
+            // Keep every injected allocation cut reproducible when arena
+            // growth would otherwise depend on host allocator placement.
+            // The normal run above still exercises resize/remap support.
+            var vtable = a.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            try run(.{ .ptr = a.ptr, .vtable = &vtable });
+        }
+    };
+    try Run.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.fault, .{});
+    var fake: Fake = .{ .failed = true };
+    var fixture: Fixture = .{};
+    var backend = fixture.backend();
+    backend.clock_source = fake.source();
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT n FROM docs", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.TestClockUnavailable, runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+    try std.testing.expectError(error.TestClockUnavailable, Stream.open(std.testing.allocator, backend, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.opened);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    backend.clock_source = null;
+    backend.transaction_start = try Clock.Instant.fromUnixMicroseconds(0);
+    try std.testing.expectError(error.SqlClockUnavailable, backend.pinStatementClock());
+    backend.statement_clock = .{ .source = fake.source(), .transaction = try Clock.Instant.fromUnixMicroseconds(1), .statement = try Clock.Instant.fromUnixMicroseconds(2) };
+    try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
+    backend.transaction_start = null;
+    backend.statement_clock.?.statement = try Clock.Instant.init(std.math.maxInt(i64));
+    try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
+    backend.statement_clock = .{ .source = fake.source(), .transaction = try Clock.Instant.init(0), .statement = try Clock.Instant.init(0) };
+    const frame = try Clock.Frame.init(backend.statement_clock.?);
+    backend.clock_values = &frame;
+    backend.statement_clock.?.statement = try Clock.Instant.init(1);
+    try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
+    backend.statement_clock = null;
+    try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
 
 test "SQL regex materialized statements retain one owner through derived source lowering" {
     const a = std.testing.allocator;
@@ -162,6 +302,54 @@ test "SQL regex cursor reuses statement patterns across released pages" {
     try std.testing.expectEqual(@as(u64, 999), stats.replacement_hits);
     try std.testing.expectEqual(@as(usize, 0), stats.active);
     try std.testing.expect(stream.budget.peak <= stream.budget.limit);
+}
+
+test "SQL COPY native read stream pins implicit nongenerated columns and refuses eager execution" {
+    for ([_][]const u8{ "COPY docs TO STDOUT", "COPY docs(n) TO STDOUT", "COPY (SELECT n FROM docs) TO STDOUT" }) |sql| {
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var fixture: Fixture = .{ .count = 5000, .layout = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "derived", .path = "derived", .type = .string, .generated = true } } };
+        try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.opened);
+        const stream = (try Stream.open(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{ .result_rows = std.math.maxInt(usize), .page_rows = 73, .retained_bytes = 256 * 1024 })).?;
+        defer stream.close();
+        try std.testing.expectEqual(@as(usize, 1), stream.context.binding.columns.len);
+        try std.testing.expectEqualStrings("n", stream.context.binding.columns[0].name);
+        var seen: usize = 0;
+        while (true) {
+            var page = try stream.next(73);
+            defer page.deinit();
+            for (page.output.rows) |row| {
+                try std.testing.expectEqual(@as(i64, @intCast(seen)), row[0].integer);
+                seen += 1;
+            }
+            if (page.exhausted) break;
+        }
+        try std.testing.expectEqual(@as(usize, 5000), seen);
+        try std.testing.expectEqual(@as(usize, 1), fixture.opened);
+        try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+        try std.testing.expect(stream.budget.peak < 256 * 1024);
+    }
+}
+
+test "SQL COPY query streams constant typed cells without inventing a table read" {
+    var compiled = try compiler.compile(std.testing.allocator, "COPY (SELECT 42::bigint AS n,true AS b,ARRAY[1,NULL,3]::bigint[] AS a,123.4500::numeric AS d) TO STDOUT (FORMAT binary)", .{});
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var backend = fixture.backend();
+    backend.execution_io = std.testing.io;
+    const stream = (try Stream.open(std.testing.allocator, backend, &compiled, &.{}, .{ .result_rows = std.math.maxInt(usize) })).?;
+    defer stream.close();
+    var page = try stream.nextBatch(2);
+    defer page.deinit();
+    try std.testing.expect(page.exhausted);
+    try std.testing.expectEqual(@as(usize, 1), page.values.len());
+    const a = page.arena.allocator();
+    try std.testing.expectEqual(@as(i64, 42), (try page.values.cell(a, 0, 0)).value.integer);
+    try std.testing.expect((try page.values.cell(a, 0, 1)).value.bool);
+    try std.testing.expect((try page.values.cell(a, 0, 2)).array != null);
+    try std.testing.expect((try page.values.cell(a, 0, 3)).numeric != null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.opened);
 }
 
 test "SQL pull stream releases pages and streams beyond materialized result limit" {
@@ -592,6 +780,9 @@ const ParallelScan = struct {
                 .credit = credit,
                 .stream = .{
                     .budget = .{ .backing = a, .limit = workspace },
+                    // Immutable clock values borrow the parent cursor owner,
+                    // which joins all producer lanes before releasing them.
+                    .clock_values = null,
                     // Context borrows the parent cursor's aggregate regex owner.
                     .regex_execution = .init(a, 0),
                     .arena = undefined,
@@ -738,6 +929,7 @@ const ParallelScan = struct {
 
 pub const Stream = struct {
     budget: Budget,
+    clock_values: ?catalog.Clock.Frame,
     regex_execution: @import("regex_execution.zig"),
     arena: std.heap.ArenaAllocator,
     settings: ?*@import("setting_catalog.zig").View = null,
@@ -769,7 +961,7 @@ pub const Stream = struct {
     /// selects the bounded materializing executor for unsupported shapes or
     /// when spilling is unavailable. No row reads occur on that decline path.
     pub fn open(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: runtime.Limits) !?*Stream {
-        if (compiled.statement != .select) return null;
+        if (compiled.statement != .select and compiled.statement != .copy_to) return null;
         if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
         if (limits.execution_batch_rows == 0 or limits.execution_batch_rows > 4096 or limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0 or limits.scan_pages == 0) return error.InvalidSqlLimit;
         try backend.vtable.checkpoint(backend.ptr);
@@ -802,7 +994,9 @@ pub const Stream = struct {
         errdefer if (self.settings) |view| view.deinit();
         errdefer if (self.parameter_invocation) |invocation| invocation.deinitFrame();
         const arena = self.arena.allocator();
-        var statement_backend = backend;
+        var statement_backend = try backend.pinStatementClock();
+        self.clock_values = if (statement_backend.statement_clock) |view| try catalog.Clock.Frame.init(view) else null;
+        statement_backend.clock_values = if (self.clock_values) |*frame| frame else null;
         statement_backend.regex_execution = &self.regex_execution;
         statement_backend.parameter_fallback_types = try runtime.parameterFallbackTypesNative(arena, parameters, limits.parameter_cells);
         if (backend.setting_capture) |capture| {
@@ -811,13 +1005,15 @@ pub const Stream = struct {
             self.settings = view;
             statement_backend.settings_view = view;
         }
-        const binding = try describe.bind(arena, statement_backend, compiled, &.{});
+        const copy_read = if (compiled.statement == .copy_to) try describe.copyRead(arena, statement_backend, compiled) else null;
+        const executable = if (copy_read) |*read| &read.compiled else compiled;
+        const binding = try describe.bind(arena, if (copy_read) |read| read.binding_backend else statement_backend, executable, &.{});
         if (statement_backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, self.budget.allocator(), binding);
         statement_backend.execution_binding_validator = null;
         self.parameter_invocation = binding.parameter_invocation;
         statement_backend.parameter_invocation = binding.parameter_invocation;
         if (self.parameter_invocation) |invocation| try invocation.prepareNativeOrJson(self.budget.allocator(), parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = limits.error_context, .payload_owner = limits.parameter_owner });
-        const statement = if (binding.relation) |relation| relation.statement else compiled.statement.select;
+        const statement = if (binding.relation) |relation| relation.statement else executable.statement.select;
         var execution_limits = limits;
         // The frame owns or leases its payloads; never retain transport parameter
         // pointers in a cursor that may outlive its opening request.
@@ -850,7 +1046,7 @@ pub const Stream = struct {
             var iterator = needed.keyIterator();
             for (names) |*name| name.* = iterator.next().?.*;
             const row_goal: ?u64 = if (statement.limit != null and predicates.complete) (try self.context.count(statement.offset, 0)) +| (try self.context.count(statement.limit, 0)) else null;
-            const request: catalog.Scan = .{ .row_goal = row_goal, .fields = names, .order = requested_order, .conditions = predicates.terms.items, .primary_key = predicates.primary_key, .limit = limits.page_rows };
+            const request: catalog.Scan = .{ .row_goal = row_goal, .fields = names, .order = requested_order, .conditions = predicates.terms.items, .expression_equalities = try self.context.expressionEqualities(table, predicates.primary_key == null and !predicates.empty), .primary_key = predicates.primary_key, .limit = limits.page_rows };
             if (backend.vtable.open_scan) |open_scan| {
                 const candidate = try open_scan(backend.ptr, self.budget.allocator(), table, request);
                 if (candidate) |cursor| {
@@ -866,7 +1062,7 @@ pub const Stream = struct {
             };
             if (binding.aggregate) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (binding.window) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
-            if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
+            if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or (binding.table == null and compiled.statement != .copy_to)) {
                 if (self.parameter_invocation) |invocation| invocation.deinitFrame();
                 if (self.settings) |view| view.deinit();
                 self.arena.deinit();
@@ -892,7 +1088,7 @@ pub const Stream = struct {
             self.context.spill = manager;
             self.context.sink = .{ .ptr = owner, .append = Spool.append, .append_batch = Spool.appendBatch, .take_sorted = Spool.takeSorted };
             self.context.limits.result_rows = limits.scan_rows;
-            const output = try self.context.select(compiled.statement.select);
+            const output = try self.context.select(executable.statement.select);
             // Constant/count and bounded fallback paths return ordinary rows.
             for (output.rows, 0..) |row, index| {
                 var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
@@ -948,7 +1144,7 @@ pub const Stream = struct {
         self.failed = false;
         self.exhausted = predicates.empty or self.remaining == 0;
         self.cursor = preferred;
-        self.request = .{ .row_goal = if (statement.limit != null and predicates.complete) self.skip +| self.remaining else null, .order = requested_order, .fields = needed.items, .primary_order = binding.primary_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = limits.page_rows };
+        self.request = .{ .row_goal = if (statement.limit != null and predicates.complete) self.skip +| self.remaining else null, .order = requested_order, .fields = needed.items, .primary_order = binding.primary_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .expression_equalities = try self.context.expressionEqualities(table, !binding.primary_order and predicates.primary_key == null and !self.exhausted), .limit = limits.page_rows };
         errdefer if (self.stream_manager) |manager| {
             manager.deinit();
             self.budget.allocator().destroy(manager);

@@ -38,6 +38,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
         "data runtime ordered artifact upload handoff",
+        "data runtime schema reader",
         "data runtime hosted FK retirement",
         "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
@@ -123,6 +124,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft document apply identity prevents non-idempotent restart replay",
         "data raft replica retirement removes only retired group apply state",
         "data raft apply records transaction conflicts without stopping replica progress",
+        "data raft rejected prepare snapshot preserves the native mutation gap",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears dirty bit for terminal degraded index load",
@@ -184,17 +186,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "restore publication recovers a cold owner through Raft admission",
         "data raft stable placement refreshes changed peer transport endpoints",
         "raft batch round trips table batch payload",
+        "raft schema control log",
+        "data raft schema controls",
         "raft batch round trips guarded graph owner replay afterimages",
         "raft batch round trips deterministic transaction begin",
         "raft batch round trips deterministic storage owner descriptor",
         "raft batch round trips binary initial owner range",
         "raft protocol barrier is fail closed for legacy batch parsers",
         "raft protocol barrier rejects unsupported future versions",
+        "raft protocol barrier rejects noninteger and out of range tokens",
         "raft proposal materializes a default batch timestamp exactly once",
         "online merge admission distinguishes unsupported peers and fences leader authority",
         "distributed online merge admission declines both owners and direct source proposals",
         "data raft raw topology rejection advances delegate with exact typed outcome",
         "raft batch protocol preflight fingerprint fences every applying replica set",
+        "raft index owner controls require their decoder but cannot bypass metadata admission",
+        "raft index owner observation crosses the compiled storage boundary",
+        "raft index owner scope binds actual leadership and leased roots",
         "raft batch protocol plan resolves only current group applying peers",
         "raft batch protocol cache reuses only short lived negative evidence",
         "raft batch protocol activation is reusable only in its accepted leader term",
@@ -248,6 +256,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
         "remote metadata deadline ",
+        "native index claims data receiver",
+        "boundary dispatcher preserves native index claim",
     };
     const lib_data_runtime_tests = @import("linked_tests.zig").add(b, .{
         .name = "data-runtime-tests",
@@ -275,7 +285,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const private_initial_owner_predicate_tests = b.addTest(.{
         .name = "data-private-initial-owner-predicate-tests",
         .root_module = options.data_implementation_module,
-        .filters = &.{"ordinary unpublished placement does not require a private initial FK owner snapshot"},
+        .filters = &.{ "ordinary unpublished placement does not require a private initial FK owner snapshot", "initial FK private owner" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-data-private-initial-owner-predicate-test", "Verify hidden initial-FK owner preflight excludes ordinary unpublished placements")
@@ -336,6 +346,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db split successor bootstrap atomically replaces stale destination generation",
         "data raft apply store applies delete operations into group state",
         "data raft protocol barrier persists and transfers in snapshots",
+        "data raft schema controls",
         "data raft protocol request observation never waits for generation preparation",
         "data raft apply store prepared snapshot retains its MVCC view across later writes",
         "data raft apply store orders independent groups through separate shards",

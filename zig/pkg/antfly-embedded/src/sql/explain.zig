@@ -32,6 +32,8 @@ const Plan = struct {
     relation: ?[]const u8 = null,
     join_kind: ?[]const u8 = null,
     index: ?[]const u8 = null,
+    index_selection: ?[]const u8 = null,
+    declared_indexes: ?[]const []const u8 = null,
     source_format: ?[]const u8 = null,
     snapshot_mode: ?[]const u8 = null,
     table_id: ?u64 = null,
@@ -40,6 +42,13 @@ const Plan = struct {
     functions: ?[]const []const u8 = null,
     plans: []const Plan = &.{},
 };
+
+fn declaredIndexes(alloc: Allocator, table: catalog.Table) !?[]const []const u8 {
+    if (table.external_base_source != null or table.index_definitions.len == 0) return null;
+    const names = try alloc.alloc([]const u8, table.index_definitions.len);
+    for (names, table.index_definitions) |*name, definition| name.* = definition.name;
+    return names;
+}
 
 fn wrap(alloc: Allocator, name: []const u8, child: Plan) !Plan {
     return .{ .node_type = name, .plans = try alloc.dupe(Plan, &.{child}) };
@@ -128,6 +137,7 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
         .prepared_rows => .{ .node_type = "Prepared Mutation Images" },
         .recursive_ref => .{ .node_type = "Recursive Reference" },
         .outer_ref => .{ .node_type = "Outer Reference" },
+        .unnest => |function| .{ .node_type = "Unnest", .plans = try alloc.dupe(Plan, &.{try relationPlan(alloc, bound, function.source, verbose, depth + 1, remaining)}) },
         .apply => |apply| blk: {
             const source: Plan = .{ .node_type = if (apply.demand != null) "Masked Apply" else "Lateral Apply", .join_kind = @tagName(apply.kind), .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, apply.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, apply.right, verbose, depth + 1, remaining) }) };
             var functions: std.ArrayList([]const u8) = .empty;
@@ -141,7 +151,9 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
             if (scan.index >= bound.scans.len) return error.InvalidSqlBackendResponse;
             const source = bound.scans[scan.index];
             break :blk .{
-                .node_type = if (source.table.external_base_source != null) "Lake Scan" else if (source.request.index_equality != null) "Index Scan" else "Table Scan",
+                .node_type = if (source.table.external_base_source != null) "Lake Scan" else if (source.request.index_equality != null) "Index Scan" else if (source.table.index_definitions.len != 0) "Native Table Access" else "Table Scan",
+                .index_selection = if (source.table.external_base_source == null and source.request.index_equality == null and source.table.index_definitions.len != 0) "snapshot-local" else null,
+                .declared_indexes = if (source.request.index_equality == null) try declaredIndexes(alloc, source.table) else null,
                 .source_format = if (verbose) if (source.table.external_base_source) |lake| @tagName(lake.binding.format) else null else null,
                 .snapshot_mode = if (verbose) if (source.table.external_base_source) |lake| @tagName(lake.binding.snapshot_mode) else null else null,
                 .relation = try displayName(alloc, source.table),
@@ -191,6 +203,8 @@ fn statementPlan(alloc: Allocator, statement: ast.Statement, bound: describe.Bou
     else if (if (statement == .insert) null else bound.table) |table|
         try alloc.dupe(Plan, &.{.{
             .node_type = if (table.external_base_source != null) "Lake Scan" else "Native Table Access",
+            .index_selection = if (table.external_base_source == null and table.index_definitions.len != 0) "snapshot-local" else null,
+            .declared_indexes = try declaredIndexes(alloc, table),
             .source_format = if (verbose) if (table.external_base_source) |lake| @tagName(lake.binding.format) else null else null,
             .snapshot_mode = if (verbose) if (table.external_base_source) |lake| @tagName(lake.binding.snapshot_mode) else null else null,
             .relation = try displayName(alloc, table),
@@ -245,6 +259,15 @@ fn appendText(alloc: Allocator, out: *std.ArrayList(u8), plan: Plan, depth: usiz
     if (plan.join_kind) |kind| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " ({s})", .{kind}));
     if (plan.relation) |name| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " on {s}", .{name}));
     if (plan.index) |name| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " using {s}", .{name}));
+    if (plan.index_selection) |selection| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [index selection: {s}]", .{selection}));
+    if (plan.declared_indexes) |names| {
+        try out.appendSlice(alloc, " [declared indexes:");
+        for (names) |name| {
+            try out.append(alloc, ' ');
+            try out.appendSlice(alloc, name);
+        }
+        try out.append(alloc, ']');
+    }
     if (plan.schema_version) |version| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [schema {d}]", .{version}));
     if (plan.source_format) |format| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [format {s}]", .{format}));
     if (plan.snapshot_mode) |mode| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [snapshot {s}]", .{mode}));
@@ -258,4 +281,25 @@ pub fn render(alloc: Allocator, explanation: @FieldType(ast.Statement, "explain"
     var out: std.ArrayList(u8) = .empty;
     try appendText(alloc, &out, plan, 0);
     return out.toOwnedSlice(alloc);
+}
+
+test "SQL EXPLAIN distinguishes declared indexes from snapshot-local physical choice" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const statement: ast.Statement = .{ .select = .{} };
+    const bound: describe.BoundStatement = .{
+        .table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{}, .index_definitions = &.{.{ .name = "email_key", .keys = &.{}, .include_columns = &.{}, .where = &.{} }} },
+        .action = .read,
+        .columns = &.{},
+        .parameter_types = &.{},
+        .json_literals = .empty,
+    };
+    const text = try render(a, .{ .statement = &statement }, bound);
+    try std.testing.expect(std.mem.indexOf(u8, text, "index selection: snapshot-local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "declared indexes: email_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Index Scan") == null);
+    const json = try render(a, .{ .statement = &statement, .format = .json }, bound);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"index_selection\":\"snapshot-local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"declared_indexes\":[\"email_key\"]") != null);
 }

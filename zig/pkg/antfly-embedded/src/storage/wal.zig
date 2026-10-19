@@ -468,6 +468,41 @@ pub const WAL = struct {
         return BackendStore.init(self);
     }
 
+    /// Allocation-free static admission for one ordinary append. This is not
+    /// a capacity reservation: transient retention pressure and I/O failures
+    /// still belong to append/recovery. Reject permanently impossible sizes
+    /// before a caller commits an obligation to publish them.
+    pub fn admitAppendBytes(self: *const WAL, data_len: usize) !void {
+        if (data_len > std.math.maxInt(u32) - 8) return error.WalRecordTooLarge;
+        const value_len = try std.math.add(usize, data_len, 8);
+        const Length = struct { len: usize };
+        const Entry = struct { namespace_name: ?[]const u8 = null, key: Length, value: Length };
+        const State = struct {
+            value_len: usize,
+            pub fn entryCount(_: @This()) usize {
+                return 2;
+            }
+            pub fn entryAt(state: @This(), index: usize) Entry {
+                return if (index == 0)
+                    .{ .key = .{ .len = 8 }, .value = .{ .len = state.value_len } }
+                else
+                    .{ .key = .{ .len = meta_next_lsn_key.len }, .value = .{ .len = 8 } };
+            }
+        };
+        // Check arithmetic before the physical codec's length-only walk.
+        _ = try std.math.add(usize, value_len, 128);
+        const encoded = lsm_backend.wal.encodedStateRecordLen(State{ .value_len = value_len });
+        switch (self.store_owner) {
+            .lsm => |handle| {
+                const opts = handle.backend.options;
+                if (opts.backend.read_only) return error.ReadOnly;
+                if (opts.wal_enabled and handle.backend.root_dir != null and
+                    opts.wal_hard_limit_bytes != 0 and encoded > opts.wal_hard_limit_bytes)
+                    return error.WalRecordTooLarge;
+            },
+        }
+    }
+
     /// Append opaque data. Returns assigned LSN. Durable after return.
     pub fn append(self: *WAL, data: []const u8) !u64 {
         const result = try self.appendBatch(&.{data});

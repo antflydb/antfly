@@ -24,7 +24,7 @@ pub const default_database_id: u64 = 1;
 pub const default_namespace_id: u64 = 2;
 pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
-pub const Kind = enum { database, namespace, tablespace, table, query_source };
+pub const Kind = enum { database, namespace, tablespace, table, query_source, view };
 
 /// Request-owned query preparation data, excluding topology and unrelated
 /// tables. Read schema and index generations are captured together.
@@ -304,6 +304,10 @@ pub const StateIndex = struct {
         try self.names.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         try self.ids.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         for (state.resources) |r| {
+            if (r.kind == .table or r.kind == .view) {
+                const other: Kind = if (r.kind == .table) .view else .table;
+                if (self.names.contains(.{ .kind = other, .parent = r.parent_id, .name = r.name })) return error.InvalidCatalogRecord;
+            }
             const name = try self.names.getOrPut(alloc, .{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
             if (name.found_existing) return error.InvalidCatalogRecord;
             name.value_ptr.* = r;
@@ -605,7 +609,7 @@ pub const MutableState = struct {
     }
 };
 
-fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
+pub fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
     var r = source;
     r.name = try alloc.dupe(u8, source.name);
     errdefer alloc.free(r.name);
@@ -654,6 +658,9 @@ pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, requ
 /// Physical table deletion is admitted only alongside an atomic topology
 /// mutation. Its identity is resolved by the authority, never the caller.
 pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool) !Delta {
+    // View definitions require attribute/dependency admission. Generic resource
+    // mutation must never publish an opaque caller-provided view payload.
+    if (request.kind == .view) return error.CatalogViewAdmissionRequired;
     try validateResourceName(request.kind, request.name);
     try validateName(request.database);
     try validateName(request.namespace);
@@ -672,7 +679,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     const parent_id: u64 = switch (request.kind) {
         .database, .tablespace, .query_source => 0,
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
-        .table => (try reader.namespaceFor(request.database, request.namespace)).id,
+        .table, .view => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
     var found = try reader.lookup(request.kind, parent_id, request.name);
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
@@ -688,6 +695,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     switch (request.action) {
         .create => {
             if (found != null) return error.CatalogAlreadyExists;
+            if (request.kind == .table and try reader.lookup(.view, parent_id, request.name) != null) return error.CatalogAlreadyExists;
             if (request.new_name != null) return error.InvalidCatalogMutation;
             const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
@@ -720,6 +728,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 if ((existing.kind == .database and existing.id == default_database_id) or (existing.kind == .namespace and existing.id == default_namespace_id)) return error.ProtectedCatalogResource;
                 if (request.action == .rename) {
                     const name = request.new_name orelse return error.InvalidCatalogMutation;
+                    if (existing.kind == .table and try reader.lookup(.view, parent_id, name) != null) return error.CatalogAlreadyExists;
                     if (try reader.lookup(existing.kind, parent_id, name)) |other| if (other.id != existing.id) return error.CatalogAlreadyExists;
                     if (existing.kind == .table and parent_id == default_namespace_id) if (try reader.physicalByName(name)) |table| {
                         if (try reader.byId(.table, table.id) == null) return error.CatalogAlreadyExists;
@@ -733,12 +742,17 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                             const namespaces = try reader.children(.namespace, existing.id, 0);
                             for (namespaces) |namespace| {
                                 if ((try reader.children(.table, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
+                                if ((try reader.children(.view, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 try removes.append(alloc, namespace);
                             }
                         },
-                        .namespace => if ((try reader.children(.table, existing.id, 1)).len != 0) return error.NamespaceNotEmpty,
+                        .namespace => {
+                            if ((try reader.children(.table, existing.id, 1)).len != 0 or
+                                (try reader.children(.view, existing.id, 1)).len != 0) return error.NamespaceNotEmpty;
+                        },
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
                         .query_source => {},
+                        .view => unreachable,
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
@@ -826,6 +840,29 @@ pub fn validateName(name: []const u8) !void {
     for (name[1..]) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return error.InvalidCatalogName;
 }
 
+test "SQL view catalog namespace ownership blocks generic view writes and conflicting table names" {
+    const a = std.testing.allocator;
+    // Ownership-only fixtures; opaque view definitions are admitted separately.
+    const rows = [_]Resource{
+        .{ .kind = .view, .id = 3, .parent_id = default_namespace_id, .name = "stored" },
+        .{ .kind = .table, .id = 7, .parent_id = default_namespace_id, .name = "rows", .storage_name = "table:7" },
+    };
+    const state: State = .{ .resources = &rows, .next_id = 8 };
+    try std.testing.expectError(error.CatalogViewAdmissionRequired, plan(a, state, .{ .action = .create, .kind = .view, .name = "new" }, &.{}));
+    try std.testing.expectError(error.CatalogAlreadyExists, plan(a, state, .{ .action = .create, .kind = .table, .name = "stored", .table_id = 8, .storage_name = "table:8" }, &.{}));
+    try std.testing.expectError(error.CatalogAlreadyExists, plan(a, state, .{ .action = .rename, .kind = .table, .name = "rows", .new_name = "stored" }, &.{}));
+    const scoped = [_]Resource{
+        .{ .kind = .database, .id = 5, .name = "warehouse" },
+        .{ .kind = .namespace, .id = 4, .parent_id = 5, .name = "app" },
+        .{ .kind = .view, .id = 3, .parent_id = 4, .name = "stored" },
+    };
+    try std.testing.expectError(error.NamespaceNotEmpty, plan(a, .{ .resources = &scoped, .next_id = 8 }, .{ .action = .drop, .kind = .namespace, .name = "app", .database = "warehouse" }, &.{}));
+    try std.testing.expectError(error.DatabaseNotEmpty, plan(a, .{ .resources = &scoped, .next_id = 8 }, .{ .action = .drop, .kind = .database, .name = "warehouse" }, &.{}));
+    var conflicting = rows;
+    conflicting[1].name = "stored";
+    try std.testing.expectError(error.InvalidCatalogRecord, StateIndex.init(a, .{ .resources = &conflicting }));
+}
+
 test "catalog rename preserves IDs and tablespace binding inheritance" {
     const alloc = std.testing.allocator;
     const resources = [_]Resource{
@@ -866,6 +903,13 @@ pub const Request = struct {
     create_table_json: ?[]const u8 = null,
     /// Trusted ingress allocates identity before sealing durable destinations.
     physical_name: ?[]const u8 = null,
+    /// Trusted SQL compiler provenance; not a public schema JSON attribute.
+    generated_constraint_names: []const []const u8 = &.{},
+
+    pub fn jsonStringify(self: Request, writer: anytype) !void {
+        if (self.generated_constraint_names.len == 0) return writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name });
+        try writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names });
+    }
 };
 
 /// Relation names share a namespace with tables, indexes and constraint indexes.
@@ -902,12 +946,27 @@ pub const RelationMutationGuard = struct {
     logical_table: []const u8,
     owner: @import("relation_names.zig").Owner,
     incarnation: [16]u8,
+    constraint_name_admission: ?@import("constraint_names.zig").Admission = null,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.constraint_name_admission == null) return writer.write(.{ .target = self.target, .logical_table = self.logical_table, .owner = self.owner, .incarnation = self.incarnation });
+        try writer.write(.{ .target = self.target, .logical_table = self.logical_table, .owner = self.owner, .incarnation = self.incarnation, .constraint_name_admission = self.constraint_name_admission });
+    }
 
     pub fn validate(self: @This()) !void {
         try self.target.validate();
         try (Target{ .database = self.target.database, .namespace = self.target.namespace, .table = self.logical_table }).validate();
         try self.owner.validate();
         if (self.owner.phase != .active or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidCatalogMutation;
+        if (self.constraint_name_admission) |admission| {
+            // One additive ALTER constraint fits the existing bounded guard
+            // frame. Multi-action DDL requires its own bounded plan contract.
+            if (self.owner.kind != .table or !std.mem.eql(u8, self.target.name, self.logical_table) or
+                admission.namespace_id == 0 or admission.names.len != 1) return error.InvalidCatalogMutation;
+            const name = admission.names[0].name;
+            if (name.len == 0 or name.len > @import("constraint_names.zig").max_name_bytes or
+                std.mem.indexOfScalar(u8, name, 0) != null or !std.unicode.utf8ValidateSlice(name)) return error.InvalidCatalogMutation;
+        }
     }
 
     pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
@@ -915,6 +974,7 @@ pub const RelationMutationGuard = struct {
         alloc.free(self.target.namespace);
         alloc.free(self.target.name);
         alloc.free(self.logical_table);
+        if (self.constraint_name_admission) |*admission| admission.deinitOwned(alloc);
         self.* = undefined;
     }
 
@@ -926,11 +986,115 @@ pub const RelationMutationGuard = struct {
         errdefer alloc.free(namespace);
         const name = try alloc.dupe(u8, self.target.name);
         errdefer alloc.free(name);
-        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation };
+        const logical_table = try alloc.dupe(u8, self.logical_table);
+        errdefer alloc.free(logical_table);
+        const admission = if (self.constraint_name_admission) |value| try value.dupe(alloc) else null;
+        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = logical_table, .owner = self.owner, .incarnation = self.incarnation, .constraint_name_admission = admission };
+    }
+};
+
+fn relationGuardOwnershipCase(a: std.mem.Allocator) !void {
+    const guard: RelationMutationGuard = .{
+        .target = .{ .name = "items" },
+        .logical_table = "items",
+        .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table },
+        .incarnation = @splat(1),
+        .constraint_name_admission = .{ .namespace_id = 2, .names = &.{.{ .name = "items_id_check", .kind = .check }} },
+    };
+    var owned = try guard.clone(a);
+    defer owned.deinitOwned(a);
+    try std.testing.expect(owned.constraint_name_admission.?.names.ptr != guard.constraint_name_admission.?.names.ptr);
+    try std.testing.expect(owned.constraint_name_admission.?.names[0].name.ptr != guard.constraint_name_admission.?.names[0].name.ptr);
+    const bytes = try std.json.Stringify.valueAlloc(a, owned, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(RelationMutationGuard, a, bytes, .{});
+    defer parsed.deinit();
+    try parsed.value.validate();
+    try std.testing.expectEqualStrings("items_id_check", parsed.value.constraint_name_admission.?.names[0].name);
+}
+
+test "system catalog relation guard owns additive name predicates across decoding and allocation faults" {
+    try relationGuardOwnershipCase(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, relationGuardOwnershipCase, .{});
+}
+
+test "system catalog relation guard preserves legacy JSON and rejects oversized additive proofs" {
+    const a = std.testing.allocator;
+    var guard: RelationMutationGuard = .{
+        .target = .{ .name = "items" },
+        .logical_table = "items",
+        .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table },
+        .incarnation = @splat(1),
+    };
+    const legacy = try std.json.Stringify.valueAlloc(a, .{ .target = guard.target, .logical_table = guard.logical_table, .owner = guard.owner, .incarnation = guard.incarnation }, .{});
+    defer a.free(legacy);
+    const bytes = try std.json.Stringify.valueAlloc(a, guard, .{});
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings(legacy, bytes);
+    const selected = @import("constraint_names.zig").Selected{ .name = "items_id_check", .kind = .check };
+    guard.constraint_name_admission = .{ .namespace_id = 2, .names = &.{ selected, selected } };
+    try std.testing.expectError(error.InvalidCatalogMutation, guard.validate());
+    guard.constraint_name_admission = .{ .namespace_id = 2, .names = &.{selected} };
+    guard.owner.kind = .index;
+    try std.testing.expectError(error.InvalidCatalogMutation, guard.validate());
+}
+
+pub const ConstraintNamePrepareRequest = struct {
+    guard: RelationMutationGuard,
+    fragment_json: []const u8,
+    generated_name: []const u8,
+};
+
+pub const ConstraintNamePreparation = union(enum) {
+    create: struct { expected_revision: u64, namespace_id: u64, logical_name: []const u8, schema_json: []const u8, generated_names: []const []const u8 },
+    addition: ConstraintNamePrepareRequest,
+};
+
+pub const ConstraintNamePrepared = struct {
+    /// ALTER already owns its candidate; only CREATE needs normalized bytes.
+    schema_json: ?[]const u8 = null,
+    admission: @import("constraint_names.zig").Admission,
+};
+
+/// Read-only validation of an already selected name. Metadata loads the
+/// predecessor itself; callers cannot substitute its physical definition.
+pub const ConstraintNameCheck = struct {
+    guard: RelationMutationGuard,
+    schema_json: []const u8,
+};
+
+/// SQL distinguishes stored views from physical tables; a logical view must
+/// never be represented by a fabricated table routing identity.
+pub const SqlSourceLookup = union(enum) { name: Target, table_id: u64, view_id: u64 };
+pub const SqlSource = struct {
+    target: Target,
+    value: union(enum) {
+        table: struct { binding: ResolvedTable, column_identities_json: ?[]const u8 = null },
+        view: Resource,
+    },
+
+    pub fn deinit(self: SqlSource, alloc: std.mem.Allocator) void {
+        alloc.free(self.target.database);
+        alloc.free(self.target.namespace);
+        alloc.free(self.target.table);
+        switch (self.value) {
+            .table => |value| {
+                value.binding.deinit(alloc);
+                if (value.column_identities_json) |bytes| alloc.free(bytes);
+            },
+            .view => |value| {
+                alloc.free(value.name);
+                alloc.free(value.storage_name);
+                alloc.free(value.location_json);
+                alloc.free(value.source_json);
+                if (value.placement_policy.placement_role) |bytes| alloc.free(bytes);
+            },
+        }
     }
 };
 
 pub const ResolveMany = struct {
+    sql_sources: []const SqlSourceLookup = &.{},
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.
     /// Captured with forward bindings in the same immutable catalog read.
@@ -944,6 +1108,7 @@ pub const ResolveMany = struct {
     expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.sql_sources.len != 0) return jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .sql_sources = self.sql_sources });
         if (self.relations.len != 0 or self.expected_relation_epoch != null) {
             try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
         } else {
@@ -954,6 +1119,8 @@ pub const ResolveMany = struct {
 };
 
 pub const ResolvedMany = struct {
+    sql_sources: []const ?SqlSource = &.{},
+    sql_sources_resolved: bool = false,
     revision: u64,
     tables: []const ?ResolvedTable,
     logical_names: []const ?[]const u8 = &.{},
@@ -965,6 +1132,7 @@ pub const ResolvedMany = struct {
     relation_names_only: bool = false,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.sql_sources_resolved) return jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .sql_sources = self.sql_sources, .sql_sources_resolved = true });
         if (self.relation_epoch != null or self.relations.len != 0) {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
         } else {
@@ -995,6 +1163,8 @@ pub const ResolvedMany = struct {
     }
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        for (self.sql_sources) |source| if (source) |value| value.deinit(alloc);
+        alloc.free(self.sql_sources);
         for (self.tables) |table| if (table) |value| value.deinit(alloc);
         alloc.free(self.tables);
         for (self.logical_names) |name| if (name) |value| alloc.free(value);
@@ -1031,7 +1201,7 @@ pub const Read = struct {
 /// Selected resources plus the related records needed to render their labels.
 /// Values borrow the index; the caller owns only the returned slice.
 pub fn projectRead(alloc: std.mem.Allocator, index: *const StateIndex, request: Read) ![]Resource {
-    if (request.kind == .table) return error.InvalidCatalogMutation;
+    if (request.kind == .table or request.kind == .view) return error.InvalidCatalogMutation;
     const parent = if (request.kind == .namespace) (index.find(.database, 0, request.database) orelse return error.DatabaseNotFound).id else 0;
     var out: std.ArrayListUnmanaged(Resource) = .empty;
     errdefer out.deinit(alloc);
@@ -1079,22 +1249,45 @@ pub const TableStatusTarget = union(enum) {
 
 pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
+        error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists => 409,
+        error.ProgramLimitExceeded => 400,
+        error.CatalogOccupancyNotReady => 503,
         error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound => 404,
         error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.ForeignKeyGenerationPublicationRequired, error.RowPolicyCatalogChanged, error.RowPolicyInstallationPending, error.RowPolicyReadersActive, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
         error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidGenerationPublication, error.InvalidInitialFkRetirementPage, error.InvalidRowPolicyPublication, error.InvalidRowPolicyRecord, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge, error.RowPolicyLimitExceeded => 413,
         error.TableTopologyProtocolUpgradeRequired, error.TableTopologyUpgradeRequired, error.RowPolicyUnsupported => 426,
         error.ExtensionOwnedObject => 405,
+        error.UnsupportedNativeIndexOwner => 501,
         error.CatalogPublicationProofPending => 503,
         error.Forbidden => 403,
         error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,
-        error.StoreRootEnrollmentChanged => 409,
+        error.StoreRootEnrollmentChanged, error.IndexOwnerReceiptChanged => 409,
+        error.InvalidIndexOwnerReceipt => 400,
         error.InvalidStoreRootEnrollment, error.InvalidInitialFkRetirementAck => 400,
         error.InitialChildRootReceiptChanged, error.InitialFkRetirementReporterChanged, error.InitialFkRetirementWorkChanged, error.InitialFkRetirementPublicationChanged, error.InitialFkRetirementReservationChanged => 409,
         error.UnsupportedOperation, error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.ResourceTemporarilyUnavailable => 503,
         error.MetadataMutationOutcomeUnknown, error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,
     };
+}
+
+/// Only call after the transport has established a definite not-proposed
+/// mutation outcome. Unknown/committed responses must never become retryable
+/// admission failures merely because their bodies resemble these names.
+pub fn definiteNamingError(status: u16, body: []const u8) ?anyerror {
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady }) |err| {
+        if (status == httpStatus(err) and std.mem.eql(u8, body, @errorName(err))) return err;
+    }
+    return null;
+}
+
+test "system catalog definite naming diagnostics require exact status and error identity" {
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady }) |err| {
+        try std.testing.expectEqual(err, definiteNamingError(httpStatus(err), @errorName(err)).?);
+        try std.testing.expect(definiteNamingError(200, @errorName(err)) == null);
+    }
+    try std.testing.expect(definiteNamingError(409, "SqlIndexAlreadyExists suffix") == null);
 }
 
 test "invalid initial FK retirement page is a client error" {
@@ -1267,7 +1460,7 @@ pub fn validateTableName(name: []const u8) !void {
 }
 
 pub fn validateResourceName(kind: Kind, name: []const u8) !void {
-    if (kind == .table) return validateTableName(name);
+    if (kind == .table or kind == .view) return validateTableName(name);
     return validateName(name);
 }
 

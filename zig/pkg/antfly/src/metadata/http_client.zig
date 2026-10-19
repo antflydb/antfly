@@ -750,17 +750,27 @@ pub const MetadataHttpClient = struct {
     /// apply the subsequent registration. Absent/upgrade-required routes are
     /// a safe legacy registration verdict; all other failures remain errors.
     pub fn storeRootReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
-        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_readiness, topology_protocol.store_root_uuid_decoder_version);
+        return self.storeDecoderReadiness(base_uri, routes.Routes.internal_store_root_readiness, topology_protocol.store_root_uuid_decoder_version);
     }
 
     /// Separate authenticated v18 admission. Old leaders do not expose this
     /// route, so callers omit the public key rather than appending a command
     /// their followers cannot decode.
     pub fn storeRootSigningReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
-        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_signing_readiness, topology_protocol.store_root_signing_decoder_version);
+        return self.storeDecoderReadiness(base_uri, routes.Routes.internal_store_root_signing_readiness, topology_protocol.store_root_signing_decoder_version);
     }
 
-    fn storeRootCapabilityReadiness(self: *MetadataHttpClient, base_uri: []const u8, route: []const u8, required_version: u16) !bool {
+    /// Absence is a safe rolling-upgrade verdict; transient/ambiguous failures
+    /// are not permission to discard a capability already enrolled.
+    pub fn schemaReaderReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
+        return self.storeDecoderReadiness(base_uri, routes.Routes.internal_schema_reader_readiness, topology_protocol.schema_reader_capability_version) catch |err| switch (err) {
+            error.InvalidStoreRootReadinessResponse => error.InvalidSchemaReaderReadinessResponse,
+            error.StoreRootReadinessUnavailable => error.SchemaReaderReadinessUnavailable,
+            else => err,
+        };
+    }
+
+    fn storeDecoderReadiness(self: *MetadataHttpClient, base_uri: []const u8, route: []const u8, required_version: u16) !bool {
         const uri = try join(self.alloc, base_uri, route);
         defer self.alloc.free(uri);
         var response = try self.executeWithRetry(.{
@@ -1123,6 +1133,104 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
+    pub fn relationalIndexOwnerAck(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").Ack, remaining_ms: u32) !@import("relational_index_publication.zig").AckStatus {
+        const publication = @import("relational_index_publication.zig");
+        if (remaining_ms == 0) return error.Timeout;
+        try request.validate();
+        const bytes = try self.forwardSystemCatalog(base_uri, .{ .relational_index_owner_ack = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false);
+        defer self.alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len > publication.max_ack_status_bytes) return error.MetadataMutationOutcomeUnknown;
+        var parsed = std.json.parseFromSlice(publication.AckStatus, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer parsed.deinit();
+        if (!(parsed.value.isAcknowledged(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        return parsed.value;
+    }
+
+    pub fn acceptRelationalIndexSource(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").Request, remaining_ms: u32) !@import("relational_index_delivery_journal.zig").Status {
+        return self.acceptRelationalIndexSourceControlled(base_uri, request, remaining_ms, null);
+    }
+    pub fn acceptRelationalIndexSourceControlled(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_delivery_journal.zig").Status {
+        const journal = @import("relational_index_delivery_journal.zig");
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        if (remaining_ms == 0) return error.Timeout;
+        try request.signed.verify();
+        const bytes = try self.forwardSystemCatalogControlled(base_uri, .{ .relational_index_source_accept = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false, cancellation);
+        defer self.alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len > 16 * 1024) return error.MetadataMutationOutcomeUnknown;
+        var parsed = std.json.parseFromSlice(journal.Status, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer parsed.deinit();
+        if (!(parsed.value.isAccepted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        return parsed.value;
+    }
+    pub fn relationalIndexSourceAcceptanceStatus(self: *MetadataHttpClient, base_uri: []const u8, query: @import("relational_index_delivery_journal.zig").Query, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_delivery_journal.zig").Status {
+        const journal = @import("relational_index_delivery_journal.zig");
+        if (remaining_ms == 0) return error.Timeout;
+        try query.validate();
+        const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_source_accept_status = query }, remaining_ms, cancellation);
+        defer observed.deinit(self.alloc);
+        if (observed.body.len == 0 or observed.body.len > 16 * 1024) return error.MetadataMutationOutcomeUnknown;
+        var parsed = try std.json.parseFromSlice(journal.Status, self.alloc, observed.body, .{});
+        defer parsed.deinit();
+        if (!std.meta.eql(parsed.value.query, query)) return error.InvalidGenerationPublication;
+        if (parsed.value.head) |head| {
+            if (!std.mem.eql(u8, &head.metadata_incarnation, &observed.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+            _ = try head.encode();
+        }
+        return parsed.value;
+    }
+    pub fn completeRelationalIndexSourceControlled(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").CompletionRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_delivery_journal.zig").Status {
+        const journal = @import("relational_index_delivery_journal.zig");
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        if (remaining_ms == 0) return error.Timeout;
+        try request.validate();
+        const bytes = try self.forwardSystemCatalogControlled(base_uri, .{ .relational_index_source_complete = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false, cancellation);
+        defer self.alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len > journal.max_completion_bytes) return error.MetadataMutationOutcomeUnknown;
+        var parsed = std.json.parseFromSlice(journal.Status, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer parsed.deinit();
+        if (!(parsed.value.isCompleted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        return parsed.value;
+    }
+
+    pub fn relationalIndexStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").StatusRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AdmissionStatus {
+        const publication = @import("relational_index_publication.zig");
+        try request.validate();
+        const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_status = request }, remaining_ms, cancellation);
+        defer observed.deinit(self.alloc);
+        if (!std.mem.eql(u8, &observed.metadata_incarnation, &request.admission.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        if (observed.body.len == 0 or observed.body.len > publication.AdmissionStatus.max_wire_bytes) return error.InvalidCatalogRecord;
+        var parsed = try std.json.parseFromSlice(publication.AdmissionStatus, self.alloc, observed.body, .{});
+        defer parsed.deinit();
+        _ = try parsed.value.isAdmitted(request.admission);
+        return parsed.value;
+    }
+
+    pub fn relationalIndexAdmissionStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").AdmissionRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AdmissionStatus {
+        const publication = @import("relational_index_publication.zig");
+        try request.validate();
+        const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_admission_status = request }, remaining_ms, cancellation);
+        defer observed.deinit(self.alloc);
+        if (!std.mem.eql(u8, &observed.metadata_incarnation, &request.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        if (observed.body.len == 0 or observed.body.len > publication.AdmissionStatus.max_wire_bytes) return error.InvalidCatalogRecord;
+        var parsed = try std.json.parseFromSlice(publication.AdmissionStatus, self.alloc, observed.body, .{});
+        defer parsed.deinit();
+        _ = try parsed.value.isAdmitted(request);
+        return parsed.value;
+    }
+
+    pub fn relationalIndexOwnerAckStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").Ack, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AckStatus {
+        const publication = @import("relational_index_publication.zig");
+        try request.validate();
+        const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_owner_ack_status = request }, remaining_ms, cancellation);
+        defer observed.deinit(self.alloc);
+        if (!std.mem.eql(u8, &observed.metadata_incarnation, &request.signed.proof.identity.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        if (observed.body.len == 0 or observed.body.len > publication.max_ack_status_bytes) return error.InvalidCatalogRecord;
+        var parsed = try std.json.parseFromSlice(publication.AckStatus, self.alloc, observed.body, .{});
+        defer parsed.deinit();
+        _ = try parsed.value.isAcknowledged(request);
+        return parsed.value;
+    }
+
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
     pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
@@ -1148,10 +1256,16 @@ pub const MetadataHttpClient = struct {
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
-        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
+        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation, .max_response_bytes = catalogResponseLimit(input) }, self.internal_service);
         defer response.deinit(self.alloc);
+        if ((input == .fk_initial_create_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
+            if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
+            if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
+        }
+        if (input.isRelationalIndexOwnerCall()) if (@import("relational_index_publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
         if (response.status != 200) return switch (response.status) {
             400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .relational_index_owner_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "InvalidGenerationPublication"))
@@ -1165,11 +1279,13 @@ pub const MetadataHttpClient = struct {
             else if (input == .policy_publication_status and std.mem.eql(u8, response.body, "RowPolicyCatalogChanged"))
                 error.RowPolicyCatalogChanged
             else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .relational_index_owner_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "GenerationPublicationNotFound"))
                 error.GenerationPublicationNotFound
             else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .relational_index_owner_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "GenerationPublicationChanged"))
@@ -1194,6 +1310,10 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
+        return self.forwardSystemCatalogControlled(base_uri, input, forwarding, setting_admin, null);
+    }
+    pub fn forwardSystemCatalogControlled(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (input.requiresAdministrativeGrant() != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
@@ -1203,7 +1323,7 @@ pub const MetadataHttpClient = struct {
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
         const authority = @import("../system_catalog/setting_authority.zig");
-        const grant = if (setting_admin) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        const grant = if (setting_admin or input.requiresSettingAuthorityReadGrant()) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, if (setting_admin) .admin else .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
         defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}) },
@@ -1212,7 +1332,7 @@ pub const MetadataHttpClient = struct {
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var delivery: http_common.RequestDeliveryTracker = .{};
-        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery }, self.internal_service) catch |err| {
+        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery, .cancellation = cancellation, .max_response_bytes = catalogResponseLimit(input) }, self.internal_service) catch |err| {
             if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) return error.RaftMutationRequestNotSent;
             return error.MetadataMutationOutcomeUnknown;
         };
@@ -1224,6 +1344,8 @@ pub const MetadataHttpClient = struct {
         if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_unknown)) return error.MetadataMutationOutcomeUnknown;
         if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
         if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
+        if (input.isRelationalIndexOwnerCall()) if (@import("relational_index_publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
+        if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
         return switch (response.status) {
             400 => if (input == .store_root_enroll and std.mem.eql(u8, response.body, "InvalidStoreRootEnrollment"))
                 error.InvalidStoreRootEnrollment
@@ -2578,6 +2700,38 @@ fn consumerTests() type {
                 } else {
                     try std.testing.expectEqual(case.result.?, try client.storeRootSigningReadiness("http://127.0.0.1:9000"));
                 }
+            }
+        }
+
+        test "system catalog schema reader readiness client rejects incomplete and ambiguous replies" {
+            const Executor = struct {
+                status: u16,
+                body: []const u8,
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, routes.Routes.internal_schema_reader_readiness));
+                    try std.testing.expectEqualStrings("", request.body);
+                    return .{ .status = self.status, .content_type = try a.dupe(u8, "application/json"), .body = try a.dupe(u8, self.body) };
+                }
+            };
+            const cases = [_]struct { status: u16, body: []const u8, result: ?bool = null, err: ?anyerror = null }{
+                .{ .status = 200, .body = "{\"activated_version\":37}", .result = true },
+                .{ .status = 200, .body = "{\"activated_version\":38}", .result = true },
+                .{ .status = 404, .body = "", .result = false },
+                .{ .status = 405, .body = "", .result = false },
+                .{ .status = 426, .body = "", .result = false },
+                .{ .status = 503, .body = "", .err = error.SchemaReaderReadinessUnavailable },
+                .{ .status = 200, .body = "{\"activated_version\":36}", .err = error.InvalidSchemaReaderReadinessResponse },
+                .{ .status = 200, .body = "not json", .err = error.InvalidSchemaReaderReadinessResponse },
+                .{ .status = 200, .body = z17RepeatString("x", 1025), .err = error.InvalidSchemaReaderReadinessResponse },
+            };
+            for (cases) |case| {
+                var executor: Executor = .{ .status = case.status, .body = case.body };
+                var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+                if (case.err) |expected| {
+                    try std.testing.expectError(expected, client.schemaReaderReadiness("http://127.0.0.1:9000"));
+                } else try std.testing.expectEqual(case.result.?, try client.schemaReaderReadiness("http://127.0.0.1:9000"));
             }
         }
 
@@ -4524,6 +4678,201 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
     try std.testing.expectError(error.StoreRootEnrollmentChanged, client.readSystemCatalog("http://metadata.invalid", .{ .store_root_enrollment_status = identity }, 25, null));
 }
 
+test "system catalog index prepare unsupported owner returns after one request" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        calls: usize = 0,
+        status: u16 = 501,
+        body: []const u8 = "UnsupportedNativeIndexOwner",
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("index-authority-test-secret", "index-authority-test");
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .relational_index_prepare = .{
+        .guard = .{ .target = .{ .name = "usage_records" }, .logical_table = "usage_records", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table }, .incarnation = @splat(1) },
+        .index_name = "expression_unique",
+    } };
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    executor.body = "UnsupportedNativeIndexOwner suffix";
+    try std.testing.expectError(error.RemoteUnavailable, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    executor.body = "UnsupportedNativeIndexOwner";
+    executor.status = 503;
+    try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    executor.status = 501;
+    try std.testing.expectError(error.RemoteUnavailable, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+}
+
+fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call) ?usize {
+    const publication = @import("relational_index_publication.zig");
+    return switch (input) {
+        .relational_index_prepare => publication.PrepareCut.max_wire_bytes,
+        .relational_index_status, .relational_index_begin, .relational_index_admission_status => publication.AdmissionStatus.max_wire_bytes,
+        .relational_index_publish_decide, .relational_index_publish_status => publication.DecisionStatus.max_wire_bytes,
+        .relational_index_cancel, .relational_index_cancel_status => publication.CancellationStatus.max_wire_bytes,
+        .relational_index_source_accept, .relational_index_source_accept_status, .relational_index_source_complete => 16 * 1024,
+        else => null,
+    };
+}
+
+test "relational index publication ACK client binds read grants and never retries an ambiguous mutation" {
+    const alloc = std.testing.allocator;
+    const publication = @import("relational_index_publication.zig");
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        body: []const u8,
+        status: u16 = 200,
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_committed,
+        calls: usize = 0,
+        wrong_cluster: bool = false,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            var call = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, a, request.body, .{});
+            defer call.deinit();
+            try authority.verify("index-ack-secret", "index-ack", if (call.value.requiresAdministrativeGrant()) .admin else .read, request.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            const mutation = call.value.isMutation();
+            try std.testing.expect(call.value.isRelationalIndexOwnerCall());
+            if (call.value == .relational_index_prepare) try std.testing.expectEqual(@as(?usize, publication.PrepareCut.max_wire_bytes), request.max_response_bytes);
+            if (call.value == .relational_index_status or call.value == .relational_index_begin or call.value == .relational_index_admission_status) try std.testing.expectEqual(@as(?usize, publication.AdmissionStatus.max_wire_bytes), request.max_response_bytes);
+            if (call.value == .relational_index_source_accept_status or call.value == .relational_index_source_accept or call.value == .relational_index_source_complete) try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
+            if (call.value == .relational_index_publish_status or call.value == .relational_index_publish_decide) try std.testing.expectEqual(@as(?usize, publication.DecisionStatus.max_wire_bytes), request.max_response_bytes);
+            if (call.value == .relational_index_cancel_status or call.value == .relational_index_cancel) try std.testing.expectEqual(@as(?usize, publication.CancellationStatus.max_wire_bytes), request.max_response_bytes);
+            var response: http_common.HttpResponse = .{ .status = self.status, .body = try a.dupe(u8, self.body) };
+            errdefer response.deinit(a);
+            const headers = try a.alloc(http_common.Header, if (mutation) 1 else 2);
+            var count: usize = 0;
+            errdefer {
+                for (headers[0..count]) |*header| header.deinit(a);
+                a.free(headers);
+            }
+            const names = [_][]const u8{ if (mutation) routes.Routes.raft_mutation_outcome_header else "x-antfly-catalog-metadata-group", "x-antfly-catalog-metadata-incarnation" };
+            const values = [_][]const u8{ if (mutation) self.outcome else "13", if (self.wrong_cluster) "22222222222222222222222222222222" else "11111111111111111111111111111111" };
+            for (headers, 0..) |*header, i| {
+                const name = try a.dupe(u8, names[i]);
+                errdefer a.free(name);
+                header.* = .{ .name = name, .value = try a.dupe(u8, values[i]) };
+                count += 1;
+            }
+            response.headers = headers;
+            return response;
+        }
+    };
+    const request = try publication.testing.fencedAck();
+    const pending = publication.testing.pendingAckStatus(request);
+    const complete = try std.json.Stringify.valueAlloc(alloc, try publication.testing.completeAckStatus(request), .{});
+    defer alloc.free(complete);
+    const absent = try std.json.Stringify.valueAlloc(alloc, pending, .{});
+    defer alloc.free(absent);
+    var executor: Executor = .{ .body = complete };
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("index-ack-secret", "index-ack");
+    _ = client.withInternalServiceAuth("index-ack-service-secret-0123456789", "index-ack");
+    try std.testing.expect(try (try client.relationalIndexOwnerAck("http://metadata.invalid", request, 25)).isAcknowledged(request));
+    executor.body = absent;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.relationalIndexOwnerAck("http://metadata.invalid", request, 25));
+    executor.status = 409;
+    executor.body = "IndexOwnerReceiptChanged";
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.relationalIndexOwnerAck("http://metadata.invalid", request, 25));
+    executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, client.relationalIndexOwnerAck("http://metadata.invalid", request, 25));
+    try std.testing.expectError(error.Timeout, client.relationalIndexOwnerAck("http://metadata.invalid", request, 0));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    executor.status = 200;
+    executor.body = absent;
+    try std.testing.expect(!try (try client.relationalIndexOwnerAckStatus("http://metadata.invalid", request, 25, null)).isAcknowledged(request));
+    executor.wrong_cluster = true;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.relationalIndexOwnerAckStatus("http://metadata.invalid", request, 25, null));
+    try std.testing.expectEqual(@as(usize, 6), executor.calls);
+    // Synthetic accepted head qualifies transport ownership and cluster binding,
+    // not delivery authority or a durable metadata acceptance transaction.
+    const journal = @import("relational_index_delivery_journal.zig");
+    var accepted_head: journal.Head = .{ .metadata_incarnation = @splat('1'), .binding_digest = @splat(2), .scope_digest = @splat(3), .ordinal = 1, .rows = 0, .batch_rows = 0, .source_sequence = 4, .batch_digest = @splat(5), .logical_digest = @splat(6), .previous_decision = @splat(0), .decision_digest = @splat(0), .accepted_root = @splat(7), .provenance = @splat(0), .previous_rows = 0, .previous_provenance = @splat(0), .state = .ready };
+    accepted_head.decision_digest = accepted_head.accepted().computedDigest();
+    var provenance = std.crypto.hash.Blake3.init(.{});
+    provenance.update("antfly/private-unique-accepted-provenance/v1");
+    provenance.update(&accepted_head.previous_provenance);
+    provenance.update(&accepted_head.decision_digest);
+    provenance.update(&accepted_head.accepted_root);
+    provenance.final(&accepted_head.provenance);
+    _ = try accepted_head.encode();
+    const query: journal.Query = .{ .table_id = request.table_id, .group_id = request.signed.receipt.owner.group_id, .id = request.signed.receipt.owner.plan_id };
+    const status_bytes = try std.json.Stringify.valueAlloc(alloc, journal.Status{ .query = query, .head = accepted_head }, .{});
+    defer alloc.free(status_bytes);
+    executor.body = status_bytes;
+    executor.wrong_cluster = false;
+    const source_status = try client.relationalIndexSourceAcceptanceStatus("http://metadata.invalid", query, 25, null);
+    try std.testing.expectEqual(accepted_head.decision_digest, source_status.head.?.decision_digest);
+    executor.wrong_cluster = true;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.relationalIndexSourceAcceptanceStatus("http://metadata.invalid", query, 25, null));
+    var canceled: http_common.RequestCancellation = .{};
+    canceled.cancel();
+    const before = executor.calls;
+    try std.testing.expectError(error.Cancelled, client.acceptRelationalIndexSourceControlled("http://metadata.invalid", undefined, 25, &canceled));
+    try std.testing.expectError(error.Cancelled, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_source_accept = undefined }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, &canceled));
+    try std.testing.expectError(error.Cancelled, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_publish_decide = undefined }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, &canceled));
+    try std.testing.expectError(error.Cancelled, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_publish_status = undefined }, 25, &canceled));
+    try std.testing.expectError(error.Cancelled, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_admission_status = undefined }, 25, &canceled));
+    try std.testing.expectError(error.Cancelled, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_cancel_status = undefined }, 25, &canceled));
+    try std.testing.expectError(error.Cancelled, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_cancel = undefined }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, &canceled));
+    try std.testing.expectEqual(before, executor.calls);
+    executor.wrong_cluster = false;
+    executor.outcome = routes.Routes.raft_mutation_outcome_committed;
+    executor.body = "{}";
+    const decision: publication.DecidePublish = .{ .table_id = request.table_id, .id = request.signed.receipt.owner.plan_id, .expected_revision = 1 };
+    const admission: publication.AdmissionRequest = .{ .table_id = decision.table_id, .id = decision.id, .plan_digest = request.signed.receipt.owner.plan_digest, .metadata_incarnation = @splat('1') };
+    const admission_bytes = try std.json.Stringify.valueAlloc(alloc, publication.AdmissionStatus{ .metadata_incarnation = admission.metadata_incarnation }, .{});
+    defer alloc.free(admission_bytes);
+    executor.body = admission_bytes;
+    const admission_status = try client.relationalIndexAdmissionStatus("http://metadata.invalid", admission, 25, null);
+    try std.testing.expect(!try admission_status.isAdmitted(admission));
+    executor.wrong_cluster = true;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.relationalIndexAdmissionStatus("http://metadata.invalid", admission, 25, null));
+    executor.wrong_cluster = false;
+    executor.body = "{}";
+    const decision_status = try client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_publish_status = decision }, 25, null);
+    defer decision_status.deinit(alloc);
+    const decision_reply = try client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_publish_decide = decision }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null);
+    defer alloc.free(decision_reply);
+    const cancel: publication.CancelDecision = .{ .table_id = decision.table_id, .id = decision.id, .expected_revision = decision.expected_revision, .failure = .requested };
+    const cancel_status = try client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_cancel_status = cancel }, 25, null);
+    defer cancel_status.deinit(alloc);
+    const cancel_reply = try client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_cancel = cancel }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null);
+    defer alloc.free(cancel_reply);
+    var plan_arena = std.heap.ArenaAllocator.init(alloc);
+    defer plan_arena.deinit();
+    const beginning: publication.BeginRequest = .{ .metadata_incarnation = @splat('1'), .begin = .{ .plan = try publication.testing.plan(plan_arena.allocator()) } };
+    const begin_call: @import("../system_catalog/server_call.zig").Call = .{ .relational_index_begin = beginning };
+    const begin_calls_before = executor.calls;
+    try std.testing.expectError(error.Forbidden, client.forwardSystemCatalogControlled("http://metadata.invalid", begin_call, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null));
+    try std.testing.expectEqual(begin_calls_before, executor.calls);
+    const begin_reply = try client.forwardSystemCatalogControlled("http://metadata.invalid", begin_call, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, true, null);
+    defer alloc.free(begin_reply);
+    const prepare_reply = try client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_prepare = .{ .guard = beginning.begin.plan.table_guard, .index_name = beginning.begin.plan.index_name } }, 25, null);
+    defer prepare_reply.deinit(alloc);
+    const scoped: publication.StatusRequest = .{ .guard = beginning.begin.plan.table_guard, .index_name = beginning.begin.plan.index_name, .admission = admission };
+    executor.body = admission_bytes;
+    try std.testing.expect(!try (try client.relationalIndexStatus("http://metadata.invalid", scoped, 25, null)).isAdmitted(admission));
+    executor.wrong_cluster = true;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.relationalIndexStatus("http://metadata.invalid", scoped, 25, null));
+    executor.wrong_cluster = false;
+    executor.status = 409;
+    executor.body = "MetadataReplicationPending";
+    executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
+    try std.testing.expectError(error.MetadataReplicationPending, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_publish_decide = decision }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null));
+    try std.testing.expectError(error.MetadataReplicationPending, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_publish_status = decision }, 25, null));
+    try std.testing.expectError(error.MetadataReplicationPending, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_cancel = cancel }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null));
+    try std.testing.expectError(error.MetadataReplicationPending, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_cancel_status = cancel }, 25, null));
+}
+
 test "system catalog relation replacement preserves private grants and definitive ownership rejection" {
     const alloc = std.testing.allocator;
     const authority = @import("../system_catalog/setting_authority.zig");
@@ -4635,6 +4984,57 @@ test "system catalog FK decision preserves absent publication for initial-parent
     executor.body = "InvalidGenerationPublication";
     try std.testing.expectError(error.InvalidGenerationPublication, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
     try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+}
+
+test "system catalog hidden FK prepare preserves definite naming diagnostics" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        status: u16 = 409,
+        body: []const u8 = "SqlIndexAlreadyExists",
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("fk-name-test-secret", "fk-name-test");
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .fk_initial_create_prepare = .{
+        .namespace_id = 2,
+        .logical_name = "t",
+        .candidate = .{ .table_id = 0, .name = "", .schema_json = "{}" },
+        .generated_constraint_names = &.{"anonymous"},
+    } };
+    try std.testing.expectError(error.SqlIndexAlreadyExists, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    executor.body = "SqlConstraintAlreadyExists";
+    try std.testing.expectError(error.SqlConstraintAlreadyExists, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.status = 400;
+    executor.body = "ProgramLimitExceeded";
+    try std.testing.expectError(error.ProgramLimitExceeded, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    executor.status = 503;
+    executor.body = "CatalogOccupancyNotReady";
+    try std.testing.expectError(error.CatalogOccupancyNotReady, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    const addition: @import("../system_catalog/server_call.zig").Call = .{ .constraint_name_prepare = .{
+        .guard = .{ .target = .{ .name = "t" }, .logical_table = "t", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table }, .incarnation = @splat(1) },
+        .fragment_json = "{}",
+        .generated_name = "anonymous",
+    } };
+    try std.testing.expectError(error.CatalogOccupancyNotReady, client.readSystemCatalog("http://metadata.invalid", addition, 25, null));
+    executor.status = 409;
+    executor.body = "SqlIndexAlreadyExists";
+    try std.testing.expectError(error.SqlIndexAlreadyExists, client.readSystemCatalog("http://metadata.invalid", addition, 25, null));
+    const check: @import("../system_catalog/server_call.zig").Call = .{ .constraint_name_check = .{ .guard = addition.constraint_name_prepare.guard, .schema_json = "{}" } };
+    try std.testing.expectError(error.SqlIndexAlreadyExists, client.readSystemCatalog("http://metadata.invalid", check, 25, null));
+    executor.status = 405;
+    executor.body = "ExtensionOwnedObject";
+    for ([_]@import("../system_catalog/server_call.zig").Call{ call, addition, check }) |request| {
+        try std.testing.expectError(error.ExtensionOwnedObject, client.readSystemCatalog("http://metadata.invalid", request, 25, null));
+    }
+    try std.testing.expectError(error.RemoteUnavailable, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.body = "other service rejected this method";
+    try std.testing.expectError(error.RemoteUnavailable, client.readSystemCatalog("http://metadata.invalid", check, 25, null));
 }
 
 test "system catalog initial FK retirement page requires a store-bound transport" {

@@ -163,14 +163,14 @@ pub fn validateCanonicalValueForSchemaAndLayout(
         std.debug.assert(count == cells.len);
         for (cells) |cell| {
             if (!cell.is_json or cell.is_null) continue;
-            try validateCanonicalJsonCell(alloc, cell.value.bytes_val);
+            try validateCanonicalJsonCell(alloc, cell.value.bytes_val, table_schema.requires_jsonb_display);
         }
         std.mem.sort(row_codec.Cell, cells, table_schema.relational_columns, struct {
             fn lessThan(columns: []const schema.RelationalColumn, lhs: row_codec.Cell, rhs: row_codec.Cell) bool {
                 return std.mem.lessThan(u8, columns[lhs.ordinal].name, columns[rhs.ordinal].name);
             }
         }.lessThan);
-        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonical(cells, table_schema);
+        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonical(alloc, cells, table_schema);
         if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
         return;
     }
@@ -179,14 +179,14 @@ pub fn validateCanonicalValueForSchemaAndLayout(
     defer alloc.free(cells);
     @memset(cells, null);
     while (try iterator.next()) |cell| cells[cell.ordinal] = cell;
-    // The cell hash intentionally consumes canonical JSON bytes directly on
-    // this hot validation path. Establish that physical invariant before
-    // comparing the logical digest so equivalent-but-noncanonical JSON is
-    // diagnosed as a physical representation error, not content corruption.
+    // The cell hash consumes authenticated physical JSON syntax and normalizes
+    // only numeric scale for semantic identity. Establish canonical syntax
+    // before hashing so alternate bytes are a representation error rather
+    // than being accepted because their logical digest matches.
     for (cells) |maybe_cell| {
         const cell = maybe_cell orelse continue;
         if (!cell.is_json or cell.is_null) continue;
-        try validateCanonicalJsonCell(alloc, cell.value.bytes_val);
+        try validateCanonicalJsonCell(alloc, cell.value.bytes_val, table_schema.requires_jsonb_display);
     }
     const computed_hash = try document_content_hash.hashRelationalCellsWithOrdinals(
         alloc,
@@ -197,10 +197,10 @@ pub fn validateCanonicalValueForSchemaAndLayout(
     if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
 }
 
-fn validateCanonicalJsonCell(alloc: Allocator, encoded: []const u8) !void {
+fn validateCanonicalJsonCell(alloc: Allocator, encoded: []const u8, preserve_display: bool) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .parse_numbers = false });
     defer parsed.deinit();
-    const canonical = try document_content_hash.canonicalJsonValueAlloc(alloc, parsed.value);
+    const canonical = if (preserve_display) try document_content_hash.canonicalJsonStorageValueAlloc(alloc, parsed.value) else try document_content_hash.canonicalJsonValueAlloc(alloc, parsed.value);
     defer alloc.free(canonical);
     if (!std.mem.eql(u8, canonical, encoded)) return error.NonCanonicalRelationalRow;
 }

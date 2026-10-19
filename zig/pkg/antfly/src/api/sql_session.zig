@@ -18,6 +18,7 @@
 const std = @import("std");
 const sql = @import("antfly_local_sources").sql_session;
 const transactions = @import("transactions.zig");
+const clock = @import("antfly_local_sources").sql_catalog.Clock;
 const http = @import("http_server.zig");
 const operation = @import("antfly_local_sources").api_operation;
 const connections = @import("sql_connections.zig");
@@ -147,7 +148,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         // Stronger isolation requires native retained snapshots + range
         // validation, not a label on an ordinary staged transaction.
-        if (options.isolation != .read_committed and !self.supports_range_guards) return error.UnsupportedSqlExecution;
+        if (options.isolation != .read_committed and !self.supports_range_guards) return error.SqlRangeTrackingRequired;
         const txn_id = transactions.newSessionTxnId(self.node_id);
         if (self.connection_id) |connection| try self.connectionMutation(scope, .{ .begin = .{
             .id = connection,
@@ -171,14 +172,14 @@ pub const Adapter = struct {
                 self.connectionMutation(scope, .{ .abort_begin = .{ .id = connection, .txn_id = info.txn_id } }) catch {};
             return err;
         };
-        return .{ .id = info.txn_id, .state = .active, .isolation = options.isolation, .mode = options.mode };
+        return .{ .id = info.txn_id, .state = .active, .isolation = options.isolation, .mode = options.mode, .started_at = try clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, info.begin_timestamp), 1000)) };
     }
 
     fn inspect(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) !sql.Transaction {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        return .{ .id = id, .isolation = state.metadata.isolation, .mode = state.metadata.mode, .savepoints = state.savepoints, .state = if (state.terminal_abort) .aborted else if (state.terminal != null) .committed else if (state.execution_started) .uncertain else if (state.metadata.failed) .failed else .active };
+        return .{ .id = id, .isolation = state.metadata.isolation, .mode = state.metadata.mode, .savepoints = state.savepoints, .started_at = try clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, state.begin_timestamp), 1000)), .state = if (state.terminal_abort) .aborted else if (state.terminal != null) .committed else if (state.execution_started) .uncertain else if (state.metadata.failed) .failed else .active };
     }
 
     fn commit(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) !sql.CommitResult {
@@ -260,8 +261,10 @@ test "SQL native session owns durable savepoint and failure state" {
     var adapter = Adapter{ .alloc = alloc, .registry = &registry, .node_id = 1, .commit_context = &ignored, .commit_fn = Commit.run };
     var session = sql.Session{ .owner = adapter.owner(), .scope = .{ .principal = "alice" } };
     defer session.deinit();
-    try std.testing.expectError(error.UnsupportedSqlExecution, session.execute(.{ .begin = .{} }));
+    try std.testing.expectError(error.SqlRangeTrackingRequired, session.execute(.{ .begin = .{} }));
     _ = try session.execute(.{ .begin = .{ .isolation = .read_committed } });
+    const started = (try session.statement(false)).started_at.?;
+    try std.testing.expectEqual(@as(?i128, @as(i128, registry.getInfo(session.transaction_id.?).?.begin_timestamp / 1000) * 1000), started.unixNanoseconds());
     _ = try session.execute(.{ .savepoint = "one" });
     try session.statementFailed();
     try std.testing.expectEqual(sql.Status.failed, try session.status());
@@ -271,6 +274,7 @@ test "SQL native session owns durable savepoint and failure state" {
     var state = (try registry.getSqlState(alloc, session.transaction_id.?)).?;
     defer state.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), state.savepoints);
+    try std.testing.expectEqual(started.micros, (try session.statement(false)).started_at.?.micros);
     var other = sql.Session{ .owner = adapter.owner(), .scope = .{ .principal = "bob" } };
     try std.testing.expectError(error.SqlTransactionNotActive, other.attach(session.transaction_id.?));
     _ = try session.execute(.rollback);

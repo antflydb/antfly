@@ -25,6 +25,10 @@ const Json = std.json.Value;
 const operators = @import("operators.zig");
 const Datum = @import("scalar.zig").Datum;
 
+test {
+    _ = @import("explain.zig");
+}
+
 pub const resource_limits = @import("resource_limits.zig");
 
 pub const Limits = struct {
@@ -87,7 +91,7 @@ pub const Result = struct {
     state: *State,
     output: Output,
 
-    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig") };
+    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig"), clock_values: ?catalog.Clock.Frame };
 
     /// Includes retained result arena capacity and transient native page data.
     pub fn peakMemoryBytes(self: Result) usize {
@@ -112,6 +116,7 @@ pub const Result = struct {
 
     pub fn empty(alloc: std.mem.Allocator, command_tag: []const u8) !Result {
         const state = try alloc.create(State);
+        state.clock_values = null;
         state.budget = .{ .backing = alloc, .limit = (Limits{}).retained_bytes };
         state.regex_execution = .init(state.budget.allocator(), 16 * 1024 * 1024);
         state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
@@ -144,21 +149,29 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     try backend.vtable.checkpoint(backend.ptr);
     var pinned_settings: ?@import("setting_catalog.zig").View = null;
     defer if (pinned_settings) |*view| view.deinit();
-    var statement_backend = backend;
+    var statement_backend = try backend.pinStatementClock();
     if (limits.error_context) |context| statement_backend.error_context = context;
     if (parameters.len > 1024) return error.InvalidSqlParameters;
     if (backend.setting_capture) |capture| {
         pinned_settings = try @import("setting_catalog.zig").View.capture(alloc, capture.owner, capture.scope, capture.overlay);
+        try pinned_settings.?.pinSqlUser(capture.sql_user);
         statement_backend.settings_view = &pinned_settings.?;
     }
     const memory = try limits.workingMemory();
     const state = try alloc.create(Result.State);
+    errdefer alloc.destroy(state);
+    state.clock_values = if (statement_backend.statement_clock) |view| try catalog.Clock.Frame.init(view) else null;
     state.budget = .{ .backing = alloc, .limit = memory };
     state.regex_execution = .init(state.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
     statement_backend.regex_execution = &state.regex_execution;
     state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
     var result = Result{ .state = state, .output = undefined };
-    errdefer result.deinit();
+    errdefer {
+        state.regex_execution.deinit();
+        state.arena.deinit();
+        std.debug.assert(state.budget.live == 0);
+    }
+    statement_backend.clock_values = if (state.clock_values) |*frame| frame else null;
     const arena = state.arena.allocator();
     statement_backend.parameter_fallback_types = try parameterFallbackTypesNative(arena, parameters, limits.parameter_cells);
     result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
@@ -201,6 +214,9 @@ fn parameterFallbackType(value: Json) ?ast.ColumnType {
 }
 
 fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits, sink: ?RowSink) !Output {
+    // COPY has a streaming protocol contract, not a JSON SELECT result. Only
+    // the retained read-stream entry point may execute its underlying query.
+    if (compiled.statement == .copy_to) return error.UnsupportedSqlShape;
     if (compiled.statement == .explain) {
         const explanation = compiled.statement.explain;
         const inner: compiler.Compiled = .{ .arena = undefined, .statement = explanation.statement.*, .parameter_count = compiled.parameter_count };
@@ -275,6 +291,42 @@ const ProjectedBatch = struct {
         return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .count = self.selection.len, .width = self.columns.len } };
     }
 };
+test "SQL native document version conditions remain typed residuals not stored properties" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const context: Context = .{
+        .alloc = a,
+        .arena = a,
+        .backend = undefined,
+        .binding = .{ .table = null, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty },
+        .parameters = &.{},
+        .limits = .{},
+    };
+    var table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{} };
+    for ([_]ast.Comparison{ .eq, .neq, .lt, .lte, .gt, .gte }) |op| {
+        const predicate: ast.Predicate = .{ .comparison = .{ .field = "_version", .op = op, .value = .{ .integer = 42 } } };
+        const bound = try context.conditions(table, &predicate);
+        try std.testing.expectEqual(@as(usize, 0), bound.terms.items.len);
+        try std.testing.expect(!bound.complete);
+        try std.testing.expect(@import("bound_scalars.zig").needsResidual(table, &predicate));
+    }
+    for ([_]bool{ false, true }) |negated| {
+        const predicate: ast.Predicate = .{ .is_null = .{ .field = "_version", .negated = negated } };
+        const bound = try context.conditions(table, &predicate);
+        try std.testing.expectEqual(!negated, bound.empty);
+        try std.testing.expectEqual(@as(usize, 0), bound.terms.items.len);
+    }
+    // A genuine relational user column with this name keeps ordinary native
+    // pushdown. This metadata rule must not become an unqualified-name hack.
+    table.storage_mode = .relational;
+    table.columns = &.{.{ .name = "_version", .path = "_version", .type = .integer }};
+    const real: ast.Predicate = .{ .comparison = .{ .field = "_version", .op = .eq, .value = .{ .integer = 42 } } };
+    const pushed = try context.conditions(table, &real);
+    try std.testing.expectEqual(@as(usize, 1), pushed.terms.items.len);
+    try std.testing.expect(pushed.complete);
+}
+
 pub const Context = struct {
     sink: ?RowSink = null,
     spill: ?*@import("spill.zig").Manager = null,
@@ -377,6 +429,17 @@ pub const Context = struct {
         try self.backend.vtable.checkpoint(self.backend.ptr);
     }
 
+    fn expressionAccessCheckpoint(raw: ?*anyopaque) !void {
+        const self: *const Context = @ptrCast(@alignCast(raw.?));
+        try self.checkpoint();
+    }
+
+    pub fn expressionEqualities(self: Context, table: catalog.Table, eligible: bool) ![]const @import("../storage/relational_index.zig").ExpressionEqualityHint {
+        if (!eligible or !self.backend.supports_expression_access_hints) return &.{};
+        const program = if (self.binding.scalars.predicate) |*predicate| predicate else return &.{};
+        return @import("index_access.zig").prepareEqualities(self.arena, self.alloc, table, program, self.binding.scalars.columns, self.parameters, .{ .ptr = @constCast(&self), .checkpoint = expressionAccessCheckpoint, .clock_values = self.backend.clock_values });
+    }
+
     /// Evaluate one owner-demanded scalar on the active statement cut. The
     /// native backend owns the cut and accumulates every point/range proof in
     /// the same transaction as the eventual mutation. Bound output is typed;
@@ -418,7 +481,10 @@ pub const Context = struct {
                 var checked = try describe.coerceDatum(self.arena, value_, column.type, column.element_type);
                 // Pattern callbacks belong to execution frames. Transports
                 // consume their value representation after those frames close.
-                checked.patterns = null;
+                if (checked.patterns() != null) {
+                    checked.extension_kind = .none;
+                    checked.extension = null;
+                }
                 cell.* = try operators.cloneDatum(self.arena, checked);
             }
             return .{ .json = &.{}, .nulls = &.{}, .native = cells };
@@ -470,7 +536,7 @@ pub const Context = struct {
             const values = try scratch.allocator().alloc(Datum, row.len);
             for (row, values, self.binding.columns, 0..) |value_, *cell, column, ordinal| {
                 if (column.type == .array) return error.InvalidSqlBackendResponse;
-                cell.* = try describe.coerceDatum(scratch.allocator(), .{ .value = value_, .sql_null = if (output.sql_nulls) |flags| flags[index][ordinal] else value_ == .null, .patterns = if (output.pattern_sources) |sources| sources[index][ordinal] else null }, column.type, column.element_type);
+                cell.* = try describe.coerceDatum(scratch.allocator(), Datum.fromParts(value_, if (output.sql_nulls) |flags| flags[index][ordinal] else value_ == .null, if (output.pattern_sources) |sources| sources[index][ordinal] else null), column.type, column.element_type);
             }
             try sink.append(sink.ptr, values);
         }
@@ -495,6 +561,10 @@ pub const Context = struct {
     /// Arrays are owned envelopes and NUMERIC values are exact decimal text,
     /// never their JSON-null placeholders.
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
+        if (datum.temporal() != null) {
+            var text: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+            return .{ .string = try self.arena.dupe(u8, try @import("scalar.zig").formatTimestampResult(datum, kind, &text)) };
+        }
         if (kind == .array) {
             const checked = try describe.coerceDatum(self.arena, datum, .array, element_type);
             if (checked.sql_null) return .null;
@@ -514,7 +584,11 @@ pub const Context = struct {
     /// cell. Arrays remain typed until here; their null JSON placeholder must
     /// never be mistaken for either a SQL NULL or a JSONB null write.
     pub fn storageDatum(self: Context, datum: Datum, column: catalog.Column) !Json {
-        return encodeStorageDatum(self.arena, datum, column, self.limits.retained_bytes) catch |err| {
+        return self.storageDatumTyped(datum, column, null);
+    }
+
+    pub fn storageDatumTyped(self: Context, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType) !Json {
+        return encodeStorageDatumTyped(self.arena, datum, column, source_identity, self.limits.retained_bytes) catch |err| {
             if (err == error.SqlNotNullViolation) return @import("errors.zig").notNull(self.backend.error_context, column.name);
             return err;
         };
@@ -652,7 +726,7 @@ pub const Context = struct {
                 // Native condition values cannot carry typed arrays or exact
                 // NUMERIC limbs. Keep these comparisons in the typed residual
                 // instead of interpreting their JSON placeholder as SQL NULL.
-                if (column.type == .array or column.element_type == .numeric) {
+                if (column.type == .array or column.element_type == .numeric or table_def.isDocumentRoot(column.name) or table_def.isDocumentVersion(column.name)) {
                     output.complete = false;
                     return;
                 }
@@ -715,6 +789,10 @@ pub const Context = struct {
             },
             .is_null => |test_null| {
                 const column = try table_def.column(test_null.field);
+                if (table_def.isDocumentVersion(column.name)) {
+                    if (!test_null.negated) output.empty = true;
+                    return;
+                }
                 if (column.type == .json) {
                     output.complete = false;
                     return;
@@ -818,7 +896,8 @@ pub const Context = struct {
         var scan_state: ScanState = .{};
         defer scan_state.deinit();
         const requested_order = if (!self.binding.primary_order and !statement.count_all) try @import("describe.zig").scanOrder(self.arena, self.binding, statement) else &.{};
-        const scan_request: catalog.Scan = .{ .row_goal = if (statement.limit != null and predicates.complete and !statement.count_all) offset +| limit else null, .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = @intCast(self.limits.page_rows) };
+        const expression_equalities = try self.expressionEqualities(table_def, !self.binding.primary_order and predicates.primary_key == null and !predicates.empty and limit != 0);
+        const scan_request: catalog.Scan = .{ .row_goal = if (statement.limit != null and predicates.complete and !statement.count_all) offset +| limit else null, .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .expression_equalities = expression_equalities, .limit = @intCast(self.limits.page_rows) };
         var ordered_source = false;
         if (self.backend.vtable.supports_scan_order and requested_order.len != 0 and limit != 0 and !predicates.empty) {
             try scan_state.open(self, table_def, scan_request);
@@ -1238,6 +1317,7 @@ pub const Context = struct {
     fn insert(self: Context, statement: ast.Insert) !Output {
         if (statement.source) |source| return self.insertSelect(statement, source.*);
         const table_def = self.binding.table orelse return error.InvalidSqlBackendResponse;
+        try table_def.validateDocumentWriteColumns(statement.columns);
         if (statement.rows.len > self.limits.mutation_rows) return error.SqlProgramLimitExceeded;
         const columns = try self.arena.alloc(catalog.Column, statement.columns.len);
         var key_index: ?usize = null;
@@ -1264,14 +1344,20 @@ pub const Context = struct {
                 const key = try clone(self.arena, key_datum.value);
                 if (key_datum.sql_null or key != .string or key.string.len == 0) return error.SqlRowIdentityRequired;
                 if (!std.unicode.utf8ValidateSlice(key.string)) return error.SqlTypeMismatch;
-                if ((try keys.getOrPut(self.arena, key.string)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
+                if ((try keys.getOrPut(self.arena, key.string)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return @import("conflict.zig").duplicateRowError(statement.conflict);
                 var object: std.json.ObjectMap = .empty;
                 var json_null_fields: std.ArrayList([]const u8) = .empty;
                 for (columns, row, 0..) |column, item, i| {
                     if (key_index != null and i == key_index.?) continue;
                     if (statement.isDefault(row_index, i)) continue;
                     const datum = try self.insertValue(item, column, row_index, i, page.values[row_index - first][i]);
-                    const typed = try self.storageDatum(datum, column);
+                    const typed = try self.storageDatumTyped(datum, column, column.element_type);
+                    if (table_def.isDocumentRoot(column.name)) {
+                        if (datum.sql_null or typed != .object) return error.SqlTypeMismatch;
+                        object = typed.object;
+                        try json_null_fields.appendSlice(self.arena, try table_def.documentRootNulls(self.arena, typed));
+                        continue;
+                    }
                     const json_null = column.type == .json and typed == .null and !datum.sql_null;
                     if (json_null) try json_null_fields.append(self.arena, column.path);
                     try putField(self.arena, &object, column.path, typed);
@@ -1291,6 +1377,7 @@ pub const Context = struct {
 
     fn insertSelect(self: Context, statement: ast.Insert, source: ast.Select) !Output {
         const table = self.binding.table orelse return error.InvalidSqlBackendResponse;
+        try table.validateDocumentWriteColumns(statement.columns);
         const bound = self.binding.insert_source orelse return error.InvalidSqlBackendResponse;
         const target_columns = try self.arena.alloc(catalog.Column, statement.columns.len);
         for (statement.columns, target_columns) |name, *column| column.* = try table.column(name);
@@ -1330,12 +1417,16 @@ pub const Context = struct {
             var key: ?[]const u8 = null;
             for (target_columns, bound.columns[0..statement.columns.len], row[0..statement.columns.len], 0..) |target, source_column, value_, cell_index| {
                 if (statement.isDefault(row_index, cell_index)) continue;
-                if (!value_.sql_null and source_column.type != target.type and !(source_column.type == .integer and target.type == .number) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
-                const typed = try self.storageDatum(value_, target);
+                if (!value_.sql_null and source_column.type != target.type and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, target.type) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
+                const typed = try self.storageDatumTyped(value_, target, source_column.element_type);
                 if (std.mem.eql(u8, target.name, "_id")) {
                     if (value_.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(typed.string)) return error.SqlTypeMismatch;
                     key = typed.string;
+                } else if (table.isDocumentRoot(target.name)) {
+                    if (value_.sql_null or typed != .object) return error.SqlTypeMismatch;
+                    object = typed.object;
+                    try json_null_fields.appendSlice(self.arena, try table.documentRootNulls(self.arena, typed));
                 } else {
                     if (target.type == .json and !value_.sql_null and typed == .null) try json_null_fields.append(self.arena, target.path);
                     try putField(self.arena, &object, target.path, typed);
@@ -1343,7 +1434,7 @@ pub const Context = struct {
             }
             const identity = key orelse try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena);
             if (identity.len == 0 or !std.unicode.utf8ValidateSlice(identity)) return error.InvalidSqlBackendResponse;
-            if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
+            if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return @import("conflict.zig").duplicateRowError(statement.conflict);
             retained = std.math.add(usize, retained, jsonSize(.{ .object = object }) + identity.len) catch return error.SqlProgramLimitExceeded;
             if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
             try self.validateInsertRequired(table, object);
@@ -1404,11 +1495,11 @@ pub const Context = struct {
     fn insertValue(self: Context, literal: ast.Value, column: catalog.Column, row: usize, cell: usize, evaluated: ?Datum) !Datum {
         if (self.binding.scalars.insert_rows.len != 0 and self.binding.scalars.insert_rows[row][cell] != null) {
             const result = evaluated orelse return error.InvalidSqlProgram;
-            return describe.coerceDatum(self.arena, result, column.type, column.element_type);
+            return describe.assignDatum(self.arena, result, self.binding.scalars.insert_rows[row][cell].?.output_type.element_type, column.type, column.element_type, .{ .output_bytes = self.limits.retained_bytes });
         }
         if (literal == .parameter) {
             if (literal.parameter == 0) return error.InvalidSqlParameters;
-            return describe.coerceDatum(self.arena, try self.parameterDatum(literal.parameter - 1), column.type, column.element_type);
+            return describe.assignDatum(self.arena, try self.parameterDatum(literal.parameter - 1), self.binding.parameter_descriptors[literal.parameter - 1].element_type, column.type, column.element_type, .{ .output_bytes = self.limits.retained_bytes });
         }
         const result = try self.value(literal, column);
         return .{ .value = result, .sql_null = result == .null and !(column.type == .json and literal == .string) };
@@ -1461,6 +1552,11 @@ pub const Context = struct {
     fn change(self: Context, _: ast.Name, predicate: ?*const ast.Predicate, assignments: ?[]const ast.Assignment, requested_returning: ?[]const ast.Projection) !Output {
         const returning = if (requested_returning != null) self.binding.returning_projections else null;
         const table_def = self.binding.table orelse return error.InvalidSqlBackendResponse;
+        var root_assignment = false;
+        if (assignments) |items| {
+            for (items) |item| root_assignment = root_assignment or table_def.isDocumentRoot(item.field);
+            if (root_assignment and items.len != 1) return error.UnsupportedSqlShape;
+        }
         const predicates = try self.conditions(table_def, predicate);
         // Validate assignments before reading or staging any row.
         const Assignment = struct { column: catalog.Column, value: Json, sql_null: bool, program: ?@import("scalar.zig").Program = null };
@@ -1473,12 +1569,12 @@ pub const Context = struct {
             var program = if (i < self.binding.scalars.assignments.len) self.binding.scalars.assignments[i] else null;
             var typed: Json = .null;
             var sql_null = true;
-            if (program != null and item.expression == null and (item.value == .parameter or (column.type == .array and item.value == .string))) {
-                // A direct parameter assignment borrows the invocation frame,
-                // not row scratch. Retain it once, as on the literal path;
-                // do not clone a wide prepared payload for every target row.
+            if (program != null and item.expression == null) {
+                // Prepared literals and direct parameters are statement
+                // constants. Retain their typed value once, not per row;
+                // exact NUMERIC literals must never use coarse JSON coercion.
                 const value_ = try self.evaluate(self.arena, program.?, &.{});
-                typed = try self.storageDatum(value_, column);
+                typed = try self.storageDatumTyped(value_, column, program.?.output_type.element_type);
                 sql_null = value_.sql_null;
                 program = null;
             } else if (program == null) {
@@ -1570,7 +1666,7 @@ pub const Context = struct {
                     var json_null_fields: std.ArrayList([]const u8) = .empty;
                     if (assignments != null) {
                         var copy: Json = .{ .object = .empty };
-                        if (table_def.storage_mode == .document) {
+                        if (table_def.storage_mode == .document and !root_assignment) {
                             const original = row.document orelse return error.InvalidSqlBackendResponse;
                             if (original != .object or (row.expected_content_digest == null and row.version != 0)) return error.InvalidSqlBackendResponse;
                             var members = original.object.iterator();
@@ -1588,7 +1684,7 @@ pub const Context = struct {
                             if (try row.hasField(column.path)) {
                                 const cell = try row.cell(column.path);
                                 if (column.type == .json and cell.value == .null and !cell.sql_null) try json_null_fields.append(self.arena, column.path);
-                                try putField(self.arena, &copy.object, column.path, try self.storageDatum(cell, column));
+                                try putField(self.arena, &copy.object, column.path, try self.storageDatumTyped(cell, column, column.element_type));
                             }
                         }
                         for (bound_assignments, 0..) |bound, assignment_index| {
@@ -1596,12 +1692,16 @@ pub const Context = struct {
                                 const assigned = if (evaluated) |batch| batch.assignments[assignment_index].?[batch.positions[row_index].?] else try self.evaluate(scratch, program, expression_cells);
                                 if (assigned.sql_null and !bound.column.nullable) return @import("errors.zig").notNull(self.backend.error_context, bound.column.name);
                                 if (bound.column.type == .json and !assigned.sql_null and assigned.value == .null) try json_null_fields.append(self.arena, bound.column.path);
-                                break :blk try self.storageDatum(assigned, bound.column);
+                                break :blk try self.storageDatumTyped(assigned, bound.column, program.output_type.element_type);
                             } else blk: {
                                 if (bound.column.type == .json and !bound.sql_null and bound.value == .null) try json_null_fields.append(self.arena, bound.column.path);
                                 break :blk bound.value;
                             };
-                            try putField(self.arena, &copy.object, bound.column.path, assigned_value);
+                            if (table_def.isDocumentRoot(bound.column.name)) {
+                                if (assigned_value != .object) return error.SqlTypeMismatch;
+                                copy = assigned_value;
+                                try json_null_fields.appendSlice(self.arena, try table_def.documentRootNulls(self.arena, assigned_value));
+                            } else try putField(self.arena, &copy.object, bound.column.path, assigned_value);
                         }
                         document = copy;
                     }
@@ -1742,10 +1842,23 @@ pub const Context = struct {
         // No iterator may borrow the captured cut past publication. Native
         // proof/version fences have already joined the atomic write read-set.
         if (self.statement_capture) |capture| capture.release();
-        const committed = if (fences.items.len == 0) prepared else blk: {
+        const committed_base = if (fences.items.len == 0) prepared else blk: {
             try fences.appendSlice(self.arena, prepared);
             break :blk fences.items;
         };
+        // Provenance belongs to each effective mutation, not the enclosing
+        // batch: ON CONFLICT and MERGE can mix inserts, updates and deletes.
+        const committed = try self.arena.dupe(catalog.Mutation, committed_base);
+        for (committed) |*mutation| {
+            if (mutation.predicate_only) continue;
+            const select_required = if (mutation.unique_absence) returning != null or self.binding.returning != null else table.sql_select_required;
+            mutation.row_policy_requirement = if (mutation.row == null)
+                (if (select_required) .delete_select else .delete)
+            else if (mutation.unique_absence)
+                (if (select_required) .insert_select else .insert)
+            else
+                (if (select_required) .update_select else .update);
+        }
         // Commit-only wire buffers have their own lifetime. Growing them in
         // the result arena amplifies retained preimages and cannot reclaim
         // serialization capacity before the statement result is released.
@@ -1787,7 +1900,7 @@ pub const Context = struct {
                 if (!nulls[index] or (try self.table.column(name)).type != .json) return error.InvalidSqlBackendResponse;
                 nulls[index] = false;
             }
-            return self.projection.adaptBorrowed(a, self.layout, .{ .id = mutation.key, .version = mutation.expected_version, .value = datum, .sql_nulls = nulls });
+            return self.projection.adaptBorrowed(a, self.layout, .{ .id = mutation.key, .version = mutation.expected_version, .value = datum, .sql_nulls = nulls, .document = if (self.table.storage_mode == .document) datum else null });
         }
     };
 
@@ -1855,8 +1968,15 @@ fn putField(arena: std.mem.Allocator, object: *std.json.ObjectMap, path: []const
 /// independently prepared MERGE images. Never encode a typed array's JSON
 /// placeholder or retain payloads borrowed from an evaluator's scratch arena.
 pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, retained_bytes: usize) !Json {
-    const assigned = if (column.type == .array) try @import("scalar.zig").assignArray(arena, datum, column.element_type orelse return error.SqlAssignmentTypeMismatch, .{ .output_bytes = retained_bytes }) else datum;
-    const checked = try describe.coerceDatum(arena, assigned, column.type, column.element_type);
+    return encodeStorageDatumTyped(arena, datum, column, null, retained_bytes);
+}
+
+pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType, retained_bytes: usize) !Json {
+    if (datum.temporal() != null) {
+        try datum.validateTemporal();
+        return error.UnsupportedRelationalValueType; // requires schema/layout capability activation
+    }
+    const checked = try describe.assignDatum(arena, datum, source_identity, column.type, column.element_type, .{ .output_bytes = retained_bytes });
     if (checked.sql_null) {
         if (!column.nullable) return error.SqlNotNullViolation;
         return .null;
@@ -1866,7 +1986,31 @@ pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalo
         var context: @import("numeric_value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
         return .{ .string = try @import("numeric_value.zig").format(&context, value.*) };
     }
+    // Scalar floating storage is currently finite-only. Never let JSON
+    // serialization turn a valid SQL special value into a persisted SQL NULL.
+    if (checked.value == .float and !std.math.isFinite(checked.value.float)) return error.SqlNonFiniteScalarStorage;
     return clone(arena, checked.value);
+}
+
+test "SQL scalar floating storage rejects specials without serializing nullable NULLs" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    for ([_]@import("array_value.zig").ElementType{ .float32, .float64 }) |kind| {
+        const column: catalog.Column = .{ .name = "n", .path = "n", .type = .number, .element_type = kind, .nullable = true };
+        for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |number| try std.testing.expectError(error.SqlNonFiniteScalarStorage, encodeStorageDatumTyped(scratch, Datum.json(.{ .float = number }), column, kind, 1 << 20));
+        for ([_][]const u8{ "NaN", "Infinity", "-Infinity" }) |text| {
+            var context: @import("numeric_value.zig").Context = .{ .alloc = scratch };
+            var number = try @import("numeric_value.zig").parse(&context, text);
+            defer number.deinit();
+            try std.testing.expectError(error.SqlNonFiniteScalarStorage, encodeStorageDatumTyped(scratch, Datum.typedNumeric(&number.value), column, .numeric, 1 << 20));
+            // NUMERIC has a canonical special-value representation already;
+            // the finite-only floating barrier must not erase that capability.
+            const exact = try encodeStorageDatumTyped(scratch, Datum.typedNumeric(&number.value), .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }, .numeric, 1 << 20);
+            try std.testing.expectEqualStrings(text, exact.string);
+        }
+    }
 }
 
 pub fn clone(arena: std.mem.Allocator, value: Json) error{ OutOfMemory, SqlProgramLimitExceeded }!Json {
@@ -1967,6 +2111,85 @@ test "SQL NUMERIC executes exact scalar projections through public result metada
     }
 }
 
+test "SQL expression access shares materialized and streaming hints while preserving residual row goals" {
+    const Fixture = struct {
+        table: catalog.Table,
+        hinted: bool,
+        scans: usize = 0,
+        offset: usize = 0,
+        request: catalog.Scan = undefined,
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.table;
+        }
+        fn scan(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.scans += 1;
+            try std.testing.expectEqual(@as(usize, @intFromBool(self.hinted)), request.expression_equalities.len);
+            try std.testing.expect(request.row_goal == null);
+            if (self.hinted) try std.testing.expectEqualStrings("owner", request.expression_equalities[0].value.string);
+            const rows = try a.alloc(catalog.Row, 2);
+            // Simulate the legitimate unavailable-index fallback. SQL must
+            // reject its first row before applying LIMIT, not trust the hint.
+            for (rows, [_][]const u8{ "Other", "Owner" }) |*row, label| {
+                var object: std.json.ObjectMap = .empty;
+                try object.put(a, "email", .{ .string = label });
+                row.* = .{ .id = label, .version = 1, .value = .{ .object = object } };
+            }
+            return .{ .rows = rows };
+        }
+        fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.request = request;
+            self.offset = 0;
+            return .{ .ptr = raw, .next = next, .close = close };
+        }
+        fn next(raw: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var page = try scan(raw, a, self.table, self.request);
+            const end = @min(page.rows.len, self.offset + limit);
+            const total = page.rows.len;
+            page.rows = page.rows[self.offset..end];
+            self.offset = end;
+            page.after = if (end < total) "Other" else null;
+            return page;
+        }
+        fn close(_: *anyopaque) void {}
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{.{ .name = "email", .path = "email", .type = .string, .element_type = .text }} };
+    var key: catalog.IndexDefinition.Key = .{ .column = "", .expression = try std.json.parseFromSliceLeaky(Json, owned,
+        \\{"op":"lower_ascii","args":[{"op":"column","column":"email"}]}
+    , .{}), .result_type = .string, .collation = null, .direction = .asc, .nulls = .default };
+    key.identity = try key.bindIdentity(owned, try table.expressionSchemaLeaky(owned));
+    const keys = [_]catalog.IndexDefinition.Key{key};
+    table.index_definitions = &.{.{ .name = "email_lower", .keys = &keys, .include_columns = &.{}, .where = &.{} }};
+    var compiled = try compiler.compile(a, "SELECT email FROM items WHERE lower(email)=$1 LIMIT 1", .{});
+    defer compiled.deinit();
+    for ([_]bool{ false, true }) |enabled| {
+        var fixture: Fixture = .{ .table = table, .hinted = enabled };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .supports_expression_access_hints = enabled, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .open_scan = Fixture.open, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
+        var result = try execute(a, backend, &compiled, &.{.{ .string = "owner" }}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("Owner", result.output.rows[0][0].string);
+        const stream = (try @import("read_stream.zig").Stream.open(a, backend, &compiled, &.{.{ .string = "owner" }}, .{})).?;
+        defer stream.close();
+        var matched_page = try stream.next(32);
+        defer matched_page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), matched_page.output.rows.len);
+        try std.testing.expectEqualStrings("Owner", matched_page.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 3), fixture.scans);
+    }
+}
+
 test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads and mutations" {
     const Fixture = struct {
         mutations: usize = 0,
@@ -2020,6 +2243,31 @@ test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
         try std.testing.expectEqualStrings(if (index == 1) "9007199254740994.1200" else "9007199254740993.1200", result.output.rows[0][0].string);
+        if (index == 0) {
+            var token_result = try execute(a, backend, &compiled, &.{.{ .number_string = "9007199254740993.1200" }}, .{});
+            defer token_result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), token_result.output.rows.len);
+            try std.testing.expectEqualStrings("9007199254740993.1200", token_result.output.rows[0][0].string);
+            for ([_][]const u8{
+                "SELECT q.n FROM docs q WHERE q.n=$1",
+                "SELECT q.n FROM (SELECT n FROM docs) q WHERE q.n=$1",
+            }) |aliased_sql| {
+                var aliased = try compiler.compile(a, aliased_sql, .{});
+                defer aliased.deinit();
+                var aliased_backend = backend;
+                var aliased_callbacks = backend.vtable.*;
+                aliased_callbacks.open_scan = Fixture.open;
+                aliased_backend.vtable = &aliased_callbacks;
+                var aliased_result = try execute(a, aliased_backend, &aliased, &.{.{ .number_string = "9007199254740993.1200" }}, .{});
+                defer aliased_result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), aliased_result.output.rows.len);
+                try std.testing.expectEqualStrings("9007199254740993.1200", aliased_result.output.rows[0][0].string);
+                aliased_backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .float64 }};
+                var aliased_floating = try execute(a, aliased_backend, &aliased, &.{.{ .float = 9007199254740994 }}, .{});
+                defer aliased_floating.deinit();
+                try std.testing.expectEqual(@as(usize, 2), aliased_floating.output.rows.len);
+            }
+        }
         try std.testing.expectEqual(@as(usize, @intFromBool(index != 0)), fixture.mutations);
         if (index == 0) {
             var floating_backend = backend;
@@ -2709,7 +2957,13 @@ test "SQL result boundary preserves array ownership descriptors and NULL provena
     try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(Datum.typedArray(&integers.value), .json, null));
 }
 
+test {
+    _ = @import("view_lateral_test.zig");
+}
+
 const TestBackend = struct {
+    const stored_tag_elements = [_]Datum{ Datum.fromJson(.{ .string = "urgent" }), .{}, Datum.fromJson(.{ .string = "vip" }) };
+    stored_arrays: bool = false,
     estimate_scans: bool = false,
     enable_dynamic_filters: bool = false,
     dynamic_filters: usize = 0,
@@ -2790,8 +3044,13 @@ const TestBackend = struct {
         backend.statement_scan_count = scans.len;
         return .{ .ptr = owner, .cursors = cursors, .close = Statement.close };
     }
-    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
-        return .{ .id = 19, .physical_name = "table:stable", .schema_version = 7, .columns = &.{.{ .name = "id", .path = "id", .type = .integer, .nullable = false }} };
+    fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+        const self: *TestBackend = @ptrCast(@alignCast(ptr));
+        const columns: []const catalog.Column = &.{
+            .{ .name = "id", .path = "id", .type = .integer, .nullable = false },
+            .{ .name = "tags", .path = "tags", .type = .array, .element_type = .text },
+        };
+        return .{ .id = 19, .physical_name = "table:stable", .schema_version = 7, .columns = if (self.stored_arrays) columns else columns[0..1] };
     }
     fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table_def: catalog.Table, request: catalog.Scan) !catalog.Page {
         const self: *TestBackend = @ptrCast(@alignCast(ptr));
@@ -2808,6 +3067,15 @@ const TestBackend = struct {
             var object: std.json.ObjectMap = .empty;
             try object.put(alloc, "id", if (self.group_modulo) |modulo| .{ .integer = @intCast(index % modulo) } else if (self.group_every) |every| .{ .integer = @intCast(index / every) } else .{ .number_string = "9007199254740993" });
             row.* = .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{index}), .version = 99, .value = .{ .object = object } };
+            if (self.stored_arrays) {
+                const elements: []const Datum = if (index == 0) &stored_tag_elements else &.{};
+                const dimensions = try alloc.alloc(@import("array_value.zig").Dimension, 1);
+                dimensions[0] = .{ .length = @intCast(elements.len) };
+                const array = try alloc.create(@import("array_value.zig").Value);
+                array.* = try @import("array_value.zig").Value.init(.text, dimensions, elements, .{});
+                row.* = try catalog.Row.fromDatums(alloc, row.id, try catalog.Row.TypedLayout.init(alloc, &.{ "id", "tags" }), &.{ Datum.fromJson(object.get("id").?), if (index == 2) .{} else Datum.typedArray(array) });
+                row.version = 99;
+            }
         }
         return .{ .rows = rows, .after = if (request.primary_key == null and from + count_rows < self.row_count) try std.fmt.allocPrint(alloc, "{d}", .{from + count_rows}) else null };
     }
@@ -2827,6 +3095,32 @@ const TestBackend = struct {
         if (self.cancelled) return error.Cancelled;
     }
 };
+
+test "SQL INSERT hands exact JSONB display tokens to mutation preparation" {
+    const Provider = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 19, .physical_name = "table:stable", .schema_version = 7, .columns = &.{
+                .{ .name = "payload", .path = "payload", .type = .json, .element_type = .jsonb },
+            } };
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) ![]const catalog.Mutation {
+            const payload = mutations[0].row.?.object.get("payload").?;
+            try std.testing.expectEqualStrings("1.2300e2", payload.object.get("source").?.number_string);
+            return mutations;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            try std.testing.expectEqualStrings("1.2300e2", mutations[0].row.?.object.get("payload").?.object.get("source").?.number_string);
+            return .committed;
+        }
+    };
+    var provider: TestBackend = .{};
+    const backend: catalog.Backend = .{ .ptr = &provider, .vtable = &.{ .resolve = Provider.resolve, .scan = TestBackend.scan, .mutate = Provider.mutate, .mutate_prepared = Provider.mutate, .prepare_mutations = Provider.prepare, .checkpoint = TestBackend.checkpoint } };
+    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO things (_id,payload) VALUES ('one','{\"source\":1.2300e2}'::jsonb)", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows_affected);
+}
 
 test "SQL commit serialization is released before the statement result" {
     const Provider = struct {
@@ -3159,6 +3453,194 @@ test "SQL grouped aggregation streams pages then applies HAVING ORDER OFFSET and
     try std.testing.expectEqualStrings("3", result.output.rows[0][2].string);
 }
 
+test "SQL JSON record projections preserve typed arrays paths and NULLs through lateral relations" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{};
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]Case{
+        .{
+            .sql = "SELECT r.title,r.metadata->>'plan' AS plan,array_to_string(r.tags,'|','<null>') AS tags,cardinality(r.tags) AS n FROM jsonb_to_record('{\"title\":\"alpha\",\"metadata\":{\"plan\":\"pro\"},\"tags\":[\"urgent\",null,\"vip\"]}') AS r(title TEXT,metadata JSONB,tags TEXT[])",
+            .expected = "[[\"alpha\",\"pro\",\"urgent|<null>|vip\",\"3\"]]",
+        },
+        .{ .sql = "SELECT cardinality(r.tags),r.extra FROM jsonb_to_record('{\"tags\":[]}') AS r(tags TEXT[],extra BIGINT)", .expected = "[[\"0\",null]]" },
+        .{ .sql = "SELECT r.a,r.b FROM jsonb_to_record(NULL::jsonb) AS r(a JSONB,b TEXT[])", .expected = "[[null,null]]" },
+        .{ .sql = "SELECT r.a,r.b FROM jsonb_to_record('{\"a\":null,\"b\":null}') AS r(a JSONB,b TEXT[])", .expected = "[[null,null]]" },
+        .{ .sql = "SELECT r.n,cardinality(r.tags) FROM (VALUES('{\"n\":1,\"tags\":[\"x\"]}'::jsonb),('{\"n\":2,\"tags\":[]}'::jsonb)) d(body),jsonb_to_record(d.body) AS r(n BIGINT,tags TEXT[]) ORDER BY r.n", .expected = "[[\"1\",\"1\"],[\"2\",\"0\"]]" },
+        .{ .sql = "SELECT t.tag,t.n FROM jsonb_to_record('{\"tags\":[\"urgent\",null,\"vip\"]}') AS r(tags TEXT[]),LATERAL UNNEST(r.tags) WITH ORDINALITY AS t(tag,n) ORDER BY t.n", .expected = "[[\"urgent\",\"1\"],[null,\"2\"],[\"vip\",\"3\"]]" },
+        .{ .sql = "SELECT r.n,r.b FROM pg_catalog.jsonb_to_record('{\"n\":\"9007199254740993\",\"b\":\"yes\"}') AS r(n BIGINT,b BOOLEAN)", .expected = "[[\"9007199254740993\",true]]" },
+        .{ .sql = "SELECT array_ndims(r.a),array_length(r.a,1),array_length(r.a,2),array_to_string(r.a,',','NULL') FROM jsonb_to_record('{\"a\":[[1,2],[3,null]]}') AS r(a BIGINT[])", .expected = "[[\"2\",\"2\",\"2\",\"1,2,3,NULL\"]]" },
+    }) |case| {
+        errdefer std.debug.print("JSON record projection: {s}\n", .{case.sql});
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const json = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+        defer a.free(json);
+        try std.testing.expectEqualStrings(case.expected, json);
+    }
+    for ([_]struct { sql: []const u8, code: []const u8 }{
+        .{ .sql = "SELECT COUNT(*) FROM jsonb_to_record('[1]') AS r(id BIGINT)", .code = "22023" },
+        .{ .sql = "SELECT COUNT(*) FROM jsonb_to_record('{\"n\":\"bad\"}') AS r(n BIGINT)", .code = "22P02" },
+        .{ .sql = "SELECT 1 FROM jsonb_to_record('{\"n\":\"bad\"}') AS r(n BIGINT)", .code = "22P02" },
+        .{ .sql = "SELECT * FROM jsonb_to_record('null') AS r(id BIGINT)", .code = "22023" },
+        .{ .sql = "SELECT * FROM jsonb_to_record('{\"a\":[[1],[2,3]]}') AS r(a BIGINT[])", .code = "2202E" },
+        .{ .sql = "SELECT * FROM jsonb_to_record(7) AS r(a BIGINT)", .code = "42883" },
+    }) |case| {
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = execute(a, backend.iface(), &compiled, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(case.code, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        result.deinit();
+        return error.ExpectedJsonRecordFailure;
+    }
+}
+
+test "SQL current_user preserves authenticated SQL identity instead of API key settings scope" {
+    const Settings = @import("setting_catalog.zig");
+    const Owner = struct {
+        fn load(_: *anyopaque, _: std.mem.Allocator, scope: Settings.Scope) !Settings.RawSnapshot {
+            return .{ .scope = scope, .epoch = 1, .definitions = &.{} };
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var backend = fixture.iface();
+    backend.setting_capture = .{
+        .owner = .{ .ptr = &fixture, .load = Owner.load },
+        .scope = .{ .principal = "api-key:credential-123", .database = "default" },
+        .sql_user = "alice",
+    };
+    var compiled = try compiler.compile(a, "SELECT CURRENT_USER", .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.uses_current_setting);
+    var result = try execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("alice", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("current_user", result.output.columns[0].name);
+    try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(a, "SELECT CURRENT_USER()", .{}));
+}
+
+test "SQL stored views execute derived plans in isolated scopes and preserve security barriers" {
+    const Fixture = struct {
+        rows: TestBackend = .{},
+        query: *const ast.Select,
+        expose_alias: bool = false,
+        row_filter: ?catalog.ViewRowFilter = null,
+        fn iface(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{
+                .resolve_read = read,
+                .resolve = resolve,
+                .scan = scan,
+                .open_statement = open,
+                .mutate = mutate,
+                .checkpoint = checkpoint,
+            } };
+        }
+        fn read(raw: *anyopaque, a: std.mem.Allocator, name: ast.Name) !catalog.ReadRelation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, name.table, "stored")) {
+                var scoped = self.iface();
+                scoped.binding_scope = @intFromPtr(self.query);
+                return .{ .view = .{
+                    .id = 51,
+                    .generation = 1,
+                    .query = self.query,
+                    .backend = scoped,
+                    .security_barrier = true,
+                    .columns = &.{.{ .name = "id", .path = "id", .type = .integer, .element_type = .int64 }},
+                    .exposure = if (self.expose_alias) &.{.{ .ordinal = 0, .name = "frozen" }} else null,
+                    .row_filter = self.row_filter,
+                } };
+            }
+            return .{ .table = try resolve(raw, a, name, .read) };
+        }
+        fn resolve(raw: *anyopaque, a: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, name.table, "things")) return error.TableNotFound;
+            var table = try TestBackend.resolve(&self.rows, a, name, action);
+            table.read_authority = raw;
+            return table;
+        }
+        fn scan(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Outer equality demand cannot cross a barrier to become an
+            // owner-side source filter without a leakproof-expression proof.
+            try std.testing.expectEqual(@as(usize, 0), request.conditions.len);
+            return TestBackend.scan(&self.rows, a, table, request);
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.Forbidden;
+        }
+        fn open(raw: *anyopaque, a: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (scans) |request| {
+                try std.testing.expectEqual(@as(usize, 0), request.request.conditions.len);
+                try std.testing.expect(request.table.read_authority == raw);
+            }
+            return TestBackend.openStatement(&self.rows, a, scans);
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var body = try compiler.compile(a, "SELECT id FROM things", .{});
+    defer body.deinit();
+    var fixture: Fixture = .{ .query = &body.statement.select };
+    for ([_][]const u8{
+        "SELECT id FROM stored WHERE id = 9007199254740993",
+        "WITH things AS (SELECT 0::BIGINT AS id) SELECT id FROM stored",
+        "SELECT s.id FROM stored s JOIN stored other ON s.id=other.id LIMIT 2",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqualStrings("9007199254740993", result.output.rows[0][0].string);
+    }
+    fixture.expose_alias = true;
+    {
+        var exposed = try compiler.compile(a, "SELECT frozen FROM stored", .{});
+        defer exposed.deinit();
+        var result = try execute(a, fixture.iface(), &exposed, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqualStrings("9007199254740993", result.output.rows[0][0].string);
+    }
+    fixture.expose_alias = false;
+    {
+        const SelectLast = struct {
+            fn matches(raw: *const anyopaque, _: std.mem.Allocator, cells: []const Datum) !bool {
+                const last: *const i64 = @ptrCast(@alignCast(raw));
+                return cells[0].value.integer == last.*;
+            }
+        };
+        var numbered = try compiler.compile(a, "SELECT CAST(_id AS BIGINT) AS id FROM things", .{});
+        defer numbered.deinit();
+        const last: i64 = 8191;
+        fixture.query = &numbered.statement.select;
+        fixture.rows.row_count = 8192;
+        fixture.row_filter = .{ .ptr = &last, .matches = SelectLast.matches };
+        var filtered = try compiler.compile(a, "SELECT id FROM stored LIMIT 1", .{});
+        defer filtered.deinit();
+        var result = try execute(a, fixture.iface(), &filtered, &.{}, .{ .retained_bytes = 2 * 1024 * 1024 });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("8191", result.output.rows[0][0].string);
+        var counted = try compiler.compile(a, "SELECT count(*) FROM stored", .{});
+        defer counted.deinit();
+        var count_result = try execute(a, fixture.iface(), &counted, &.{}, .{ .retained_bytes = 2 * 1024 * 1024 });
+        defer count_result.deinit();
+        try std.testing.expectEqualStrings("1", count_result.output.rows[0][0].string);
+    }
+    fixture.row_filter = null;
+    var recursive = try compiler.compile(a, "SELECT id FROM stored", .{});
+    defer recursive.deinit();
+    fixture.query = &recursive.statement.select;
+    try std.testing.expectError(error.SqlViewCycle, execute(a, fixture.iface(), &recursive, &.{}, .{}));
+}
+
 test "SQL high fanout join bounds candidate allocation churn" {
     // Every row shares a hash key; the residual must inspect 65,536 pairs.
     // Aggregation keeps result materialization out of the allocation measurement.
@@ -3211,6 +3693,160 @@ test "SQL CTE aliases feed hash joins and grouped projection without stringifyin
     try std.testing.expectEqualStrings("2", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("1", result.output.rows[0][1].string);
     try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+}
+
+test "SQL window ranks and ntile preserve PostgreSQL builtin widths and admission" {
+    var backend: TestBackend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT row_number() OVER (), rank() OVER (), dense_rank() OVER (), ntile(2::smallint) OVER (), ntile(NULL) OVER () FROM (VALUES (1),(2),(3)) v(n)", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+    defer result.deinit();
+    for (result.output.columns, [_]@import("array_value.zig").ElementType{ .int64, .int64, .int64, .int32, .int32 }) |column, expected| try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, expected), column.element_type);
+    for (result.output.rows) |row| try std.testing.expect(row[4] == .null);
+    for ([_][]const u8{ "SELECT ntile(2147483648) OVER ()", "SELECT ntile(2::bigint) OVER ()" }) |sql| {
+        var rejected = try compiler.compile(std.testing.allocator, sql, .{});
+        defer rejected.deinit();
+        var empty: TestBackend = .{};
+        try std.testing.expectError(error.UndefinedSqlFunction, execute(std.testing.allocator, empty.coordinated(), &rejected, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), empty.statement_opens);
+    }
+    for ([_][]const u8{ "SELECT ntile(0) OVER ()", "SELECT ntile(-1) OVER ()" }) |sql| {
+        var rejected = try compiler.compile(std.testing.allocator, sql, .{});
+        defer rejected.deinit();
+        try std.testing.expectError(error.SqlInvalidNtileArgument, execute(std.testing.allocator, backend.coordinated(), &rejected, &.{}, .{}));
+    }
+}
+
+test "SQL integer AVG preserves numeric signatures scale filters sliding exclusions and symbolic types" {
+    const Case = struct { sql: []const u8, values: []const ?[]const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT avg(n) FROM (VALUES (1::bigint),(1),(2)) v(n)", .values = &.{"1.3333333333333333"} },
+        .{ .sql = "SELECT avg(n) FROM (VALUES (9223372036854775807::bigint),(9223372036854775807)) v(n)", .values = &.{"9223372036854775807"} },
+        .{ .sql = "SELECT avg(n) FROM (VALUES (9007199254740993::bigint),(9007199254740994)) v(n)", .values = &.{"9007199254740993.5000"} },
+        .{ .sql = "SELECT avg(n) FROM (VALUES (0::integer),(0)) v(n)", .values = &.{"0.00000000000000000000"} },
+        .{ .sql = "SELECT avg(n) FROM (VALUES (-1::smallint),(2::smallint)) v(n)", .values = &.{"0.50000000000000000000"} },
+        .{ .sql = "SELECT avg(DISTINCT n) FILTER (WHERE n>0) FROM (VALUES (1),(2),(2),(NULL),(-1)) v(n)", .values = &.{"1.5000000000000000"} },
+        .{ .sql = "SELECT avg(n) FILTER (WHERE false) FROM (VALUES (1::bigint)) v(n)", .values = &.{null} },
+        .{ .sql = "SELECT avg(n) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (0,9007199254740993::bigint),(1,9007199254740994::bigint),(2,NULL),(3,0::bigint)) v(i,n) ORDER BY i", .values = &.{ "9007199254740993.0000", "9007199254740993.5000", "9007199254740994.0000", "0.00000000000000000000" } },
+        .{ .sql = "SELECT avg(n) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM (VALUES (0,1),(1,2),(2,3)) v(i,n) ORDER BY i", .values = &.{ "2.5000000000000000", "2.0000000000000000", "1.5000000000000000" } },
+        .{ .sql = "SELECT CASE WHEN true THEN avg(n) ELSE 0 END AS x FROM (VALUES (1),(2)) v(n) UNION SELECT 1.5::numeric", .values = &.{"1.5000000000000000"} },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(ast.ColumnType.number, result.output.columns[0].type);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .numeric), result.output.columns[0].element_type);
+        try std.testing.expectEqual(case.values.len, result.output.rows.len);
+        for (case.values, result.output.rows) |expected, row| {
+            if (expected) |text| try std.testing.expectEqualStrings(text, row[0].string) else try std.testing.expect(row[0] == .null);
+        }
+    }
+}
+
+test "SQL bigint SUM preserves exact numeric outputs through grouped and window plans" {
+    const Case = struct { sql: []const u8, values: []const ?[]const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT sum(n) FROM (VALUES (9223372036854775807::bigint),(9223372036854775807::bigint)) v(n)", .values = &.{"18446744073709551614"} },
+        .{ .sql = "SELECT sum(DISTINCT n) FILTER (WHERE n>0) FROM (VALUES (9223372036854775807::bigint),(9223372036854775807::bigint),(-1::bigint)) v(n)", .values = &.{"9223372036854775807"} },
+        .{ .sql = "SELECT sum(n) FILTER (WHERE false) FROM (VALUES (1::bigint)) v(n)", .values = &.{null} },
+        .{ .sql = "SELECT sum(n) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (0,9223372036854775807::bigint),(1,9223372036854775807::bigint),(2,-9223372036854775807::bigint)) v(i,n) ORDER BY i", .values = &.{ "9223372036854775807", "18446744073709551614", "0" } },
+        .{ .sql = "SELECT sum(n) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM (VALUES (0,9223372036854775807::bigint),(1,9223372036854775807::bigint),(2,-9223372036854775807::bigint)) v(i,n) ORDER BY i", .values = &.{ "0", "0", "18446744073709551614" } },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(ast.ColumnType.number, result.output.columns[0].type);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .numeric), result.output.columns[0].element_type);
+        try std.testing.expectEqual(case.values.len, result.output.rows.len);
+        for (case.values, result.output.rows) |expected, row| {
+            if (expected) |text| try std.testing.expectEqualStrings(text, row[0].string) else try std.testing.expect(row[0] == .null);
+        }
+    }
+}
+
+test "SQL recursive type conflicts fail before physical statement admission" {
+    var backend: TestBackend = .{ .row_count = 0 };
+    var compiled = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT id::integer FROM things UNION ALL SELECT n+2147483648 FROM r WHERE false) SELECT n FROM r", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlRecursiveTypeMismatch, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    try std.testing.expectEqual(@as(usize, 0), backend.pages);
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+}
+
+test "SQL set and VALUES preserve PostgreSQL integer literal builtin widths" {
+    const Case = struct { sql: []const u8, width: @import("array_value.zig").ElementType, rows: usize = 2 };
+    for ([_]Case{
+        .{ .sql = "SELECT n FROM (VALUES (1),(2),(NULL)) v(n)", .width = .int32, .rows = 3 },
+        .{ .sql = "SELECT n FROM (VALUES (1),(2147483648)) v(n)", .width = .int64 },
+        .{ .sql = "SELECT n FROM (VALUES (1),(9223372036854775807)) v(n)", .width = .int64 },
+        .{ .sql = "SELECT 1 AS n UNION ALL SELECT 2", .width = .int32 },
+        .{ .sql = "SELECT 1::smallint AS n UNION ALL SELECT 2::smallint", .width = .int16 },
+        .{ .sql = "SELECT 1::smallint AS n UNION ALL SELECT 2", .width = .int32 },
+        .{ .sql = "SELECT 1 AS n UNION ALL SELECT 2147483648", .width = .int64 },
+        .{ .sql = "SELECT NULL AS n UNION ALL SELECT 1", .width = .int32 },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.rows, result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.output.columns.len);
+        try std.testing.expectEqualStrings("n", result.output.columns[0].name);
+        try std.testing.expectEqual(ast.ColumnType.integer, result.output.columns[0].type);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, case.width), result.output.columns[0].element_type);
+    }
+}
+
+test "SQL materialized prefix replay preserves LIMIT errors through nested CTE owners" {
+    for ([_][]const u8{
+        "WITH q AS MATERIALIZED (SELECT 10 / (1-id) AS v FROM things) SELECT v FROM q LIMIT 1",
+        "WITH q AS MATERIALIZED (SELECT 10 / (1-id) AS v FROM things), nested AS MATERIALIZED (SELECT v FROM q) SELECT v FROM nested LIMIT 1",
+    }) |sql| {
+        var backend: TestBackend = .{ .row_count = 4096, .group_every = 1 };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 16, .scan_pages = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("10", result.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 1), backend.pages);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+    }
+    var backend: TestBackend = .{ .row_count = 4096, .group_every = 1 };
+    var compiled = try compiler.compile(std.testing.allocator, "WITH q AS MATERIALIZED (SELECT 10 / (1-id) AS v FROM things) SELECT v FROM q LIMIT 2", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 16, .scan_pages = 1 }));
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+}
+
+test "SQL scoped materialized prefix replay retires outer epochs without draining invariant storage" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var backend: TestBackend = .{ .row_count = 4096, .group_every = 1 };
+            defer std.debug.assert(backend.statement_opens == backend.statement_closes);
+            // The final relation has two rows, while the invariant native
+            // producer supplies only its first row once across both epochs.
+            var result = try execute(a, backend.coordinated(), compiled, &.{}, .{ .page_rows = 16, .scan_pages = 1, .scan_rows = 2 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            for (result.output.rows, [_][]const u8{ "1", "2" }) |row, expected| {
+                try std.testing.expectEqualStrings(expected, row[0].string);
+                try std.testing.expectEqualStrings(expected, row[1].string);
+            }
+            try std.testing.expectEqual(@as(usize, 1), backend.pages);
+            try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT p.n, q.v FROM (VALUES (1),(2)) p(n) CROSS JOIN LATERAL (WITH c AS MATERIALIZED (SELECT id+p.n AS v FROM things), nested AS MATERIALIZED (SELECT v FROM c) SELECT v FROM nested LIMIT 1) q", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
 }
 
 test "SQL CTE materialization shares one bounded producer while inline hints retain independent scans" {
@@ -3329,6 +3965,371 @@ test "SQL derived joins preserve JSON null independently of outer SQL null" {
     try std.testing.expect(result.output.sql_nulls.?[1][1]);
     try std.testing.expect(result.output.rows[0][1] == .null);
     try std.testing.expect(result.output.rows[1][1] == .null);
+}
+
+test "SQL USING joins merge outer keys while preserving qualified input columns" {
+    for ([_]struct { kind: []const u8, expected: []const []const u8 }{
+        .{ .kind = "INNER", .expected = &.{"1"} },
+        .{ .kind = "LEFT", .expected = &.{ "0", "1" } },
+        .{ .kind = "RIGHT", .expected = &.{ "1", "2" } },
+        .{ .kind = "FULL", .expected = &.{ "0", "1", "2" } },
+    }) |case| {
+        var backend: TestBackend = .{ .row_count = 3 };
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT k, a.k, b.k, m.k FROM (SELECT _id AS k FROM things WHERE _id != '2') a {s} JOIN (SELECT _id AS k FROM things WHERE _id != '0') b USING (k) AS m ORDER BY 1", .{case.kind});
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.expected.len, result.output.rows.len);
+        for (result.output.rows, result.output.sql_nulls.?, case.expected) |row, flags, expected| {
+            try std.testing.expectEqualStrings(expected, row[0].string);
+            try std.testing.expectEqualStrings(expected, row[3].string);
+            try std.testing.expectEqual(std.mem.eql(u8, expected, "2"), flags[1]);
+            try std.testing.expectEqual(std.mem.eql(u8, expected, "0"), flags[2]);
+        }
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+    }
+}
+
+test "SQL USING and NATURAL retain star order composite keys bags and empty key products" {
+    for ([_][]const u8{
+        "SELECT count(*) FROM (SELECT id AS k, id AS z FROM things) a JOIN (SELECT id AS k, id AS z FROM things) b USING (z, k)",
+        "SELECT count(*) FROM things a NATURAL JOIN things b",
+        "SELECT count(*) FROM (SELECT _id FROM things) a NATURAL JOIN things b",
+    }) |sql| {
+        var backend: TestBackend = .{ .row_count = 2 };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        // All visible logical cells are equal; hidden physical _id differs.
+        try std.testing.expectEqualStrings("4", result.output.rows[0][0].string);
+    }
+    {
+        var backend: TestBackend = .{ .row_count = 2 };
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT *, a.*, b.* FROM (SELECT _id AS k, id AS x FROM things) a JOIN (SELECT _id AS k, id AS y FROM things) b USING (k) ORDER BY 1", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        const names = [_][]const u8{ "k", "x", "y", "k", "x", "k", "y" };
+        try std.testing.expectEqual(names.len, result.output.columns.len);
+        for (result.output.columns, names) |column, name| try std.testing.expectEqualStrings(name, column.name);
+        for (result.output.rows) |row| {
+            try std.testing.expectEqualStrings(row[0].string, row[3].string);
+            try std.testing.expectEqualStrings(row[0].string, row[5].string);
+        }
+    }
+    {
+        var backend: TestBackend = .{ .row_count = 2 };
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM (SELECT _id AS x FROM things) a NATURAL FULL JOIN (SELECT _id AS y FROM things) b", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("4", result.output.rows[0][0].string);
+    }
+}
+
+test "SQL USING rejects missing ambiguous and duplicate keys before capture" {
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "SELECT * FROM things a JOIN things b USING (absent)", .failure = error.UndefinedColumn },
+        .{ .sql = "SELECT * FROM things a JOIN things b USING (id, id)", .failure = error.DuplicateSqlColumn },
+        .{ .sql = "SELECT * FROM things a JOIN things b USING (id) AS a", .failure = error.DuplicateSqlAlias },
+        .{ .sql = "SELECT * FROM things a CROSS JOIN things a", .failure = error.DuplicateSqlAlias },
+        .{ .sql = "SELECT * FROM things a JOIN things a USING (id)", .failure = error.DuplicateSqlAlias },
+        .{ .sql = "SELECT * FROM (SELECT id AS k, id AS k FROM things) a JOIN (SELECT id AS k FROM things) b USING (k)", .failure = error.AmbiguousSqlColumn },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    }
+}
+
+test "SQL USING common types null keys and chained merged namespaces" {
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT k FROM (SELECT 1::integer AS k) a FULL JOIN (SELECT 2::bigint AS k) b USING(k) ORDER BY k", .expected = "[[\"1\"],[\"2\"]]" },
+        .{ .sql = "SELECT k, a.k, b.k FROM (SELECT NULL::bigint AS k) a FULL JOIN (SELECT NULL::bigint AS k) b USING(k)", .expected = "[[null,null,null],[null,null,null]]" },
+        .{ .sql = "SELECT k, a.k, b.k, c.k FROM (SELECT 1 AS k) a FULL JOIN (SELECT 2 AS k) b USING(k) FULL JOIN (SELECT 2 AS k) c USING(k) ORDER BY 1", .expected = "[[\"1\",\"1\",null,null],[\"2\",null,\"2\",\"2\"]]" },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectEqualStrings(case.expected, json);
+    }
+}
+
+test "SQL USING closes one coordinated capture across every allocation failure" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var backend: TestBackend = .{ .row_count = 3 };
+            defer std.debug.assert(backend.statement_opens == backend.statement_closes);
+            var result = try execute(alloc, backend.coordinated(), compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+            try std.testing.expectEqualStrings("0", result.output.rows[0][0].string);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT k, a.k, b.k FROM (SELECT _id AS k FROM things WHERE _id != '2') a FULL JOIN (SELECT _id AS k FROM things WHERE _id != '0') b USING(k) ORDER BY 1 LIMIT 1", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+}
+
+test "SQL UNNEST streams typed arrays with storage order zip padding and ordinality" {
+    const a = std.testing.allocator;
+    const Case = struct { id: []const u8, sql: []const u8, columns: []const []const u8, column_oids: []const u32, rows: []const []const std.json.Value, sql_nulls: []const []const bool };
+    var reference = try std.json.parseFromSlice(struct { format: u8, reference: []const u8, entries: []const Case }, a, @embedFile("fixtures/sql_array_expansion_reference.json"), .{});
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(u8, 1), reference.value.format);
+    try std.testing.expectEqualStrings("PostgreSQL exact SQL", reference.value.reference);
+    try std.testing.expectEqual(@as(usize, 17), reference.value.entries.len);
+    for (reference.value.entries) |case| for ([_]u32{ 1, 3, 64 }) |page_rows| {
+        var backend: TestBackend = .{ .row_count = 3, .stored_arrays = true };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = page_rows });
+        defer result.deinit();
+        const expected = try std.json.Stringify.valueAlloc(a, case.rows, .{});
+        defer a.free(expected);
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectEqualStrings(expected, json);
+        try std.testing.expectEqual(case.columns.len, result.output.columns.len);
+        for (result.output.columns, case.columns, case.column_oids) |column, name, oid| {
+            try std.testing.expectEqualStrings(name, column.name);
+            const actual = if (column.element_type) |element| element.oid() else switch (column.type) {
+                .integer => @as(u32, 20),
+                .number => 701,
+                .string => 25,
+                .uuid => 2950,
+                .boolean => 16,
+                .json => 3802,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(oid, actual);
+        }
+        try std.testing.expectEqual(case.sql_nulls.len, result.output.sql_nulls.?.len);
+        for (case.sql_nulls, result.output.sql_nulls.?) |want, actual| try std.testing.expectEqualSlices(bool, want, actual);
+        try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+    };
+}
+
+test "SQL UNNEST implicit lateral inputs retain one capture and outer NULL extension" {
+    for ([_][]const u8{ ", unnest", " CROSS JOIN LATERAL unnest", " JOIN LATERAL unnest" }, 0..) |syntax, index| {
+        var backend: TestBackend = .{ .row_count = 3 };
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT d._id, tag FROM things d{s}(string_to_array(d._id || ' urgent', ' ')) AS tag{s} WHERE tag = 'urgent' ORDER BY d._id", .{ syntax, if (index == 2) " ON true" else "" });
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.rows, [_][]const u8{ "0", "1", "2" }) |row, expected| {
+            try std.testing.expectEqualStrings(expected, row[0].string);
+            try std.testing.expectEqualStrings("urgent", row[1].string);
+        }
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+    }
+    {
+        var backend: TestBackend = .{ .row_count = 3 };
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT d._id, t.v, t.n FROM things d LEFT JOIN unnest(CASE WHEN d._id = '1' THEN ARRAY[]::text[] ELSE ARRAY[NULL]::text[] END) WITH ORDINALITY t(v,n) ON true ORDER BY d._id", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.sql_nulls.?, 0..) |flags, index| {
+            try std.testing.expect(flags[1]);
+            try std.testing.expectEqual(index == 1, flags[2]);
+        }
+        try std.testing.expectEqualStrings("1", result.output.rows[0][2].string);
+    }
+}
+
+test "SQL UNNEST validates array inputs and lateral scope before capture" {
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "SELECT * FROM unnest(1)", .failure = error.SqlUndefinedFunction },
+        .{ .sql = "SELECT * FROM pg_catalog.unnest(ARRAY[1],ARRAY[2])", .failure = error.SqlUndefinedFunction },
+        .{ .sql = "SELECT * FROM unnest(NULL)", .failure = error.SqlAmbiguousFunction },
+        .{ .sql = "SELECT * FROM unnest(ARRAY[1]) t(x,y)", .failure = error.InvalidSqlParameters },
+        .{ .sql = "SELECT * FROM things d RIGHT JOIN unnest(ARRAY[d.id]) t ON true", .failure = error.InvalidLateralReference },
+        .{ .sql = "SELECT t.unnest FROM unnest(ARRAY[1],ARRAY[2]) t", .failure = error.AmbiguousSqlColumn },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    }
+}
+
+test "SQL UNNEST demand admission and allocation failures never materialize expanded inputs" {
+    const cells = try std.testing.allocator.alloc([]const u8, 10001);
+    defer std.testing.allocator.free(cells);
+    @memset(cells, "x");
+    const joined = try std.mem.join(std.testing.allocator, ",", cells);
+    defer std.testing.allocator.free(joined);
+    const array_text = try std.fmt.allocPrint(std.testing.allocator, "{{{s}}}", .{joined});
+    defer std.testing.allocator.free(array_text);
+    for ([_][]const u8{
+        "SELECT v FROM unnest($1::text[]) t(v) LIMIT 1",
+        "SELECT v FROM things d CROSS JOIN unnest($1::text[]) t(v) LIMIT 1",
+        "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM unnest($1::text[]) t(v)) q LIMIT 1",
+        "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM unnest($1::text[]) t(v) WHERE v = 'x') q LIMIT 1",
+    }) |sql| {
+        var backend: TestBackend = .{ .row_count = 3 };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{.{ .string = array_text }}, .{ .scan_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("x", result.output.rows[0][0].string);
+    }
+    {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM unnest(ARRAY[1,2,3])", .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlProgramLimitExceeded, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .scan_rows = 2 }));
+    }
+    const Check = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var backend: TestBackend = .{ .row_count = 3 };
+            defer std.debug.assert(backend.statement_opens == backend.statement_closes);
+            var result = try execute(a, backend.coordinated(), compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT d._id, t.v, t.n FROM things d LEFT JOIN unnest(ARRAY[d._id, NULL]) WITH ORDINALITY t(v,n) ON true ORDER BY d._id, t.n LIMIT 3", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+}
+
+test "SQL captured prefix replay defers later errors without reopening physical storage" {
+    const sql = "SELECT p.n, q.v FROM (VALUES (1)) p(n) CROSS JOIN LATERAL (SELECT 10 / (1-id) AS v FROM things) q LIMIT 1";
+    var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+    defer compiled.deinit();
+    var backend: TestBackend = .{ .row_count = 4096, .group_every = 1 };
+    var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 16, .scan_pages = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("10", result.output.rows[0][1].string);
+    try std.testing.expectEqual(@as(usize, 1), backend.pages);
+    try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+
+    backend = .{ .row_count = 4096, .group_every = 1 };
+    var second = try compiler.compile(std.testing.allocator, "SELECT p.n, q.v FROM (VALUES (1)) p(n) CROSS JOIN LATERAL (SELECT 10 / (1-id) AS v FROM things) q LIMIT 2", .{});
+    defer second.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, execute(std.testing.allocator, backend.coordinated(), &second, &.{}, .{ .page_rows = 16, .scan_pages = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), backend.pages);
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+}
+
+test "SQL captured prefix replay shares one captured iterator across lateral consumers and allocation faults" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var backend: TestBackend = .{ .row_count = 2, .group_every = 1 };
+            defer std.debug.assert(backend.statement_opens == backend.statement_closes);
+            var result = try execute(a, backend.coordinated(), compiled, &.{}, .{ .page_rows = 16 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 4), result.output.rows.len);
+            for (result.output.rows, [_][]const u8{ "1", "1", "2", "2" }, [_][]const u8{ "0", "1", "0", "1" }) |row, parent, value| {
+                try std.testing.expectEqualStrings(parent, row[0].string);
+                try std.testing.expectEqualStrings(value, row[1].string);
+            }
+            try std.testing.expectEqual(@as(usize, 1), backend.pages);
+            try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT p.n, q.v FROM (VALUES (1),(2)) p(n) CROSS JOIN LATERAL (SELECT id AS v FROM things) q", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+}
+
+test "SQL expansion replay policy distinguishes restartable wrappers from capture and volatility" {
+    for ([_]struct { sql: []const u8, expected: @import("relation_binding.zig").Node.ReplayPolicy }{
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM unnest(ARRAY[1,2]) t(v)) q", .expected = .streaming },
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM things s CROSS JOIN unnest(ARRAY[1,2]) t(v)) q", .expected = .captured },
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT ai_probability(v, 'Refund?', 'local') AS v FROM unnest(ARRAY['input']) t(v)) q", .expected = .captured },
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL unnest(ARRAY[ai_probability('input', 'Refund?', 'local')]) q(v)", .expected = .captured },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var parameters: [0]?ast.ColumnType = .{};
+        const bound = try @import("relation_binding.zig").bind(arena.allocator(), backend.coordinated(), compiled.statement.select, &parameters);
+        try std.testing.expect(bound.root.operation == .apply);
+        try std.testing.expectEqual(case.expected, bound.root.operation.apply.right.replay_policy);
+        try std.testing.expectEqual(@import("relation_binding.zig").Node.ReplayPolicy.captured, bound.root.operation.apply.left.replay_policy);
+        try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    }
+}
+
+test "SQL expansion demand preserves residual filtering and errors beyond delivered prefixes" {
+    for ([_]struct { sql: []const u8, expected: []const u8, rows: usize, native_rows: usize }{
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT 10 / v AS v FROM unnest(ARRAY[2,0]) t(v)) q LIMIT 1", .expected = "5", .rows = 1, .native_rows = 1 },
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM unnest(ARRAY[0,1]) t(v) WHERE v = 1) q LIMIT 1", .expected = "1", .rows = 2, .native_rows = 3 },
+    }) |case| {
+        var backend: TestBackend = .{ .row_count = case.native_rows };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .scan_rows = case.rows, .page_rows = 64 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+    }
+    // One parent makes requesting the zero-divisor row deterministic even
+    // when PostgreSQL changes join orientation for an unordered LIMIT.
+    var backend: TestBackend = .{ .row_count = 1 };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT 10 / v AS v FROM unnest(ARRAY[2,0]) t(v)) q LIMIT 2", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 64 }));
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+}
+
+test "SQL USING retains composite hash extraction and bounded fanout allocations" {
+    {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT k FROM (SELECT id AS k, id AS z FROM things) a JOIN (SELECT id AS k, id AS z FROM things) b USING(z, k)", .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var parameters: [0]?ast.ColumnType = .{};
+        const bound = try @import("relation_binding.zig").bind(arena.allocator(), backend.coordinated(), compiled.statement.select, &parameters);
+        try std.testing.expect(bound.root.operation == .query);
+        const join = bound.root.operation.query.source.operation.join;
+        try std.testing.expectEqual(@as(usize, 2), join.left_keys.len);
+        try std.testing.expectEqual(@as(usize, 2), join.right_keys.len);
+    }
+    var allocations: [2]usize = undefined;
+    for ([_][]const u8{
+        "SELECT count(*) FROM things a JOIN things b ON a.id = b.id",
+        "SELECT count(*) FROM things a JOIN things b USING(id)",
+    }, &allocations) |sql, *count| {
+        var backend: TestBackend = .{ .row_count = 256 };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var result = try execute(counting.allocator(), backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("65536", result.output.rows[0][0].string);
+        count.* = counting.allocations;
+    }
+    // The extra projection is batched, not a per-pair arena allocation.
+    try std.testing.expect(allocations[1] < 4096);
+    try std.testing.expect(allocations[1] <= allocations[0] * 2 + 512);
 }
 
 test "SQL relation cursors close on early limit quota failure and every allocation failure" {
@@ -5898,9 +6899,182 @@ test "SQL native transport does not retain execution pattern callbacks" {
     var marker: u8 = 0;
     var patterns: @import("scalar.zig").PatternSet = .{ .ptr = &marker, .count = 1, .next = Poison.next, .close = Poison.close };
     const context: Context = .{ .alloc = a, .arena = arena.allocator(), .backend = undefined, .binding = undefined, .parameters = &.{}, .limits = .{ .native_result = true } };
-    const row = try context.resultRow(&.{.{ .value = .{ .string = "retained" }, .sql_null = false, .patterns = &patterns }}, &.{.{ .name = "p", .type = .string }});
-    try std.testing.expect(row.native.?[0].patterns == null);
+    const row = try context.resultRow(&.{@import("scalar.zig").Datum.fromParts(.{ .string = "retained" }, false, &patterns)}, &.{.{ .name = "p", .type = .string }});
+    try std.testing.expect(row.native.?[0].patterns() == null);
     try std.testing.expectEqualStrings("retained", row.native.?[0].value.string);
+}
+
+test "SQL document root reads replacements and source inserts share typed preparation" {
+    const Fixture = struct {
+        const Self = @This();
+        const Cursor = struct {
+            alloc: std.mem.Allocator,
+            fixture: *Self,
+            request: catalog.Scan,
+            delivered: bool = false,
+            fn next(raw: *anyopaque, a: std.mem.Allocator, _: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.delivered) return .{ .rows = &.{} };
+                self.delivered = true;
+                return Self.scan(self.fixture, a, undefined, self.request);
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.alloc.destroy(self);
+            }
+        };
+        const Captured = struct {
+            alloc: std.mem.Allocator,
+            cursors: []catalog.Cursor,
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                for (self.cursors) |cursor| cursor.close(cursor.ptr);
+                self.alloc.free(self.cursors);
+                self.alloc.destroy(self);
+            }
+        };
+        root: Json,
+        prepared: usize = 0,
+        writes: usize = 0,
+        last: ?Json = null,
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{ .{ .name = "title", .path = "title", .type = .string }, .{ .name = "metadata", .path = "metadata", .type = .json } } };
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn open(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const cursor = try a.create(Cursor);
+            cursor.* = .{ .alloc = a, .fixture = @ptrCast(@alignCast(raw)), .request = request };
+            return .{ .ptr = cursor, .next = Cursor.next, .close = Cursor.close };
+        }
+        fn capture(raw: *anyopaque, a: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const owner = try a.create(Captured);
+            errdefer a.destroy(owner);
+            const cursors = try a.alloc(catalog.Cursor, scans.len);
+            errdefer a.free(cursors);
+            var opened: usize = 0;
+            errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
+            for (scans, cursors) |input, *cursor| {
+                cursor.* = (try open(raw, a, input.table, input.request)).?;
+                opened += 1;
+            }
+            owner.* = .{ .alloc = a, .cursors = cursors };
+            return .{ .ptr = owner, .cursors = cursors, .close = Captured.close };
+        }
+        fn scan(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (request.after != null) return .{ .rows = &.{} };
+            const rows = try a.alloc(catalog.Row, 1);
+            rows[0] = .{ .id = "doc:a", .version = 1, .value = self.root, .document = self.root, .expected_content_digest = @splat(1) };
+            return .{ .rows = rows };
+        }
+        fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) ![]const catalog.Mutation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.prepared += mutations.len;
+            for (mutations) |mutation| if (mutation.row) |root| {
+                try std.testing.expect(root == .object);
+                try std.testing.expect(!root.object.contains("_doc"));
+                if (root.object.get("metadata")) |value| if (value == .null) {
+                    const marked = for (mutation.json_null_fields) |field| {
+                        if (std.mem.eql(u8, field, "metadata")) break true;
+                    } else false;
+                    try std.testing.expect(marked);
+                };
+            };
+            return mutations;
+        }
+        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.writes += mutations.len;
+            if (mutations.len != 0) self.last = mutations[0].row;
+            return .committed;
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .atomic_statement_read_set = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = capture, .prepare_mutations = prepare, .mutate = mutate, .mutate_prepared = mutate, .checkpoint = checkpoint } };
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(Json, a, "{\"title\":\"before\",\"unknown\":{\"exact\":9007199254740993.1250,\"null\":null}}", .{ .parse_numbers = false });
+    for ([_][]const u8{
+        "SELECT _doc FROM docs WHERE _id='doc:a'",
+        "WITH c AS (SELECT _doc FROM docs) SELECT _doc FROM c",
+        "SELECT d._doc FROM docs AS d CROSS JOIN (VALUES(1)) AS n(v)",
+    }) |sql| {
+        var fixture: Fixture = .{ .root = root };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expect(result.output.rows[0][0] == .object);
+        try std.testing.expectEqual(@as(usize, 0), fixture.writes);
+    }
+    for ([_][]const u8{
+        "INSERT INTO docs (_id,_doc) VALUES ('doc:b','{\"title\":\"after\"}') RETURNING _id,_doc",
+        "INSERT INTO docs (_id,_doc) SELECT 'doc:b',_doc FROM docs WHERE _id='doc:a' RETURNING _doc",
+        "UPDATE docs SET _doc=jsonb_set(_doc,'{title}','\"after\"',true) WHERE _id='doc:a' RETURNING _doc",
+        "UPDATE docs d SET _doc='{\"title\":\"joined\"}' FROM (VALUES('doc:a')) s(id) WHERE d._id=s.id RETURNING d._doc",
+        "MERGE INTO docs d USING (VALUES('doc:a')) s(id) ON d._id=s.id WHEN MATCHED THEN UPDATE SET _doc='{\"title\":\"merged\"}' RETURNING d._doc",
+        "MERGE INTO docs d USING (VALUES('doc:b')) s(id) ON d._id=s.id WHEN NOT MATCHED THEN INSERT (_id,_doc) VALUES(s.id,'{\"title\":\"inserted\"}') RETURNING _doc",
+        "MERGE INTO docs d USING (VALUES('doc:a')) s(id) ON d._id=s.id WHEN MATCHED THEN UPDATE SET _doc='{\"title\":\"null-merged\",\"metadata\":null}' RETURNING d._doc",
+    }, [_][]const u8{ "after", "before", "after", "joined", "merged", "inserted", "null-merged" }, [_]bool{ false, true, true, false, false, false, false }) |sql, title, preserves_unknown| {
+        var fixture: Fixture = .{ .root = root };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+        try std.testing.expectEqual(@as(usize, 1), fixture.prepared);
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expect(!fixture.last.?.object.contains("_doc"));
+        try std.testing.expectEqualStrings(title, fixture.last.?.object.get("title").?.string);
+        const expected_fields: usize = if (preserves_unknown or std.mem.eql(u8, title, "null-merged")) 2 else 1;
+        try std.testing.expectEqual(expected_fields, fixture.last.?.object.count());
+        const returned = result.output.rows[0][result.output.rows[0].len - 1];
+        try std.testing.expectEqualStrings(title, returned.object.get("title").?.string);
+        try std.testing.expectEqual(fixture.last.?.object.count(), returned.object.count());
+        if (preserves_unknown) try std.testing.expectEqualStrings("9007199254740993.1250", returned.object.get("unknown").?.object.get("exact").?.number_string);
+        if (std.mem.eql(u8, title, "null-merged")) try std.testing.expect(returned.object.get("metadata").? == .null);
+    }
+    {
+        var fixture: Fixture = .{ .root = root };
+        var compiled = try compiler.compile(a, "MERGE INTO docs d USING docs s ON d._id=s._id WHEN MATCHED THEN UPDATE SET _doc='{\"title\":\"merged\"}' RETURNING d._doc,s._doc", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+        try std.testing.expectEqualStrings("merged", fixture.last.?.object.get("title").?.string);
+        try std.testing.expectEqualStrings("merged", result.output.rows[0][0].object.get("title").?.string);
+        try std.testing.expectEqualStrings("before", result.output.rows[0][1].object.get("title").?.string);
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows[0][1].object.count());
+    }
+    {
+        var fixture: Fixture = .{ .root = root };
+        var compiled = try compiler.compile(a, "MERGE INTO docs d USING (VALUES('doc:a')) s(id) ON d._id=s.id WHEN MATCHED THEN DELETE RETURNING d._doc", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+        try std.testing.expect(fixture.last == null);
+        try std.testing.expectEqualStrings("before", result.output.rows[0][0].object.get("title").?.string);
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows[0][0].object.count());
+    }
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "INSERT INTO docs (_id,_doc,title) VALUES ('doc:b','{}','mixed')", .failure = error.UnsupportedSqlShape },
+        .{ .sql = "INSERT INTO docs (_id,_doc) VALUES ('doc:b','[]')", .failure = error.SqlTypeMismatch },
+        .{ .sql = "INSERT INTO docs (_id,_doc) VALUES ('doc:b',NULL)", .failure = error.SqlNotNullViolation },
+        .{ .sql = "INSERT INTO docs (_id,_doc) VALUES ('doc:b',DEFAULT)", .failure = error.SqlNotNullViolation },
+        .{ .sql = "UPDATE docs SET _doc='{}',title='mixed' WHERE _id='doc:a'", .failure = error.UnsupportedSqlShape },
+        .{ .sql = "UPDATE docs SET _doc='[]' WHERE _id='doc:a'", .failure = error.SqlTypeMismatch },
+        .{ .sql = "INSERT INTO docs (_id,_doc) VALUES ('doc:a','{}') ON CONFLICT(_id) DO UPDATE SET _doc=excluded._doc,title='mixed'", .failure = error.UnsupportedSqlShape },
+    }) |case| {
+        var fixture: Fixture = .{ .root = root };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.writes);
+    }
 }
 
 test "SQL native transport parameters retain arrays numeric JSON null and source ownership" {

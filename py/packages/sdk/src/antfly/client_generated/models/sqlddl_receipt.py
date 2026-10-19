@@ -13,12 +13,15 @@ T = TypeVar("T", bound="SQLDDLReceipt")
 
 @_attrs_define
 class SQLDDLReceipt:
-    """Durable DDL declaration receipt. admission_unknown means admission has
-    not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
-    Pending or invalid means the declaration
-    committed but validation has not established an active constraint. Do not
-    replay it. Inspect table constraint status using this immutable table
-    identity and schema generation; a later generation supersedes this receipt.
+    """Durable DDL operation receipt. admission_unknown means admission has
+    not been confirmed; retain the matching restore job, FK publication ID, or
+    index publication token and reconcile its status without replaying DDL.
+    Pending means a durable operation was admitted, not necessarily that its
+    successor schema is published. Invalid means declaration validation failed.
+    Do not replay either. For an index build, observe the exact publication
+    token; otherwise inspect its restore job or table constraint status using
+    this immutable table identity and schema generation. A later generation
+    may supersede the completed operation.
 
         Attributes:
             database (str):
@@ -33,6 +36,12 @@ class SQLDDLReceipt:
                 must not be replayed.
             idempotency_key (str | Unset): Durable retry identity for an admitted or uncertain schema rewrite. Retain it
                 with restore_job_id when reconciling admission; do not replay the DDL.
+            fk_generation_publication_id (str | Unset): Immutable FK-generation publication identity. Retain it when
+                admission is unknown or activation remains pending; do not replay DDL.
+            index_publication_token (str | Unset): Opaque versioned recovery handle binding a metadata incarnation,
+                immutable table identity, publication ID and plan commitment. This is not authentication or permission to
+                execute, cancel, adopt a root or replay DDL. Retain it before admission and use current table authorization when
+                observing the publication.
     """
 
     database: str
@@ -44,6 +53,8 @@ class SQLDDLReceipt:
     diagnostic: str | Unset = UNSET
     restore_job_id: str | Unset = UNSET
     idempotency_key: str | Unset = UNSET
+    fk_generation_publication_id: str | Unset = UNSET
+    index_publication_token: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         database = self.database
@@ -64,6 +75,10 @@ class SQLDDLReceipt:
 
         idempotency_key = self.idempotency_key
 
+        fk_generation_publication_id = self.fk_generation_publication_id
+
+        index_publication_token = self.index_publication_token
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -82,6 +97,10 @@ class SQLDDLReceipt:
             field_dict["restore_job_id"] = restore_job_id
         if idempotency_key is not UNSET:
             field_dict["idempotency_key"] = idempotency_key
+        if fk_generation_publication_id is not UNSET:
+            field_dict["fk_generation_publication_id"] = fk_generation_publication_id
+        if index_publication_token is not UNSET:
+            field_dict["index_publication_token"] = index_publication_token
 
         return field_dict
 
@@ -106,6 +125,10 @@ class SQLDDLReceipt:
 
         idempotency_key = d.pop("idempotency_key", UNSET)
 
+        fk_generation_publication_id = d.pop("fk_generation_publication_id", UNSET)
+
+        index_publication_token = d.pop("index_publication_token", UNSET)
+
         sqlddl_receipt = cls(
             database=database,
             namespace=namespace,
@@ -116,6 +139,8 @@ class SQLDDLReceipt:
             diagnostic=diagnostic,
             restore_job_id=restore_job_id,
             idempotency_key=idempotency_key,
+            fk_generation_publication_id=fk_generation_publication_id,
+            index_publication_token=index_publication_token,
         )
 
         return sqlddl_receipt

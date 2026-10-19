@@ -1936,6 +1936,7 @@ pub const SessionRegistry = struct {
 
     pub const SqlState = struct {
         metadata: SqlMetadata,
+        begin_timestamp: u64,
         setting_active: SettingEntries = .empty,
         connection_id: ?[32]u8 = null,
         owner_node_id: u64,
@@ -1958,7 +1959,7 @@ pub const SessionRegistry = struct {
         if (self.sessions.getPtr(txn_id)) |existing| {
             defer self.mutex.unlock();
             const metadata = existing.sql orelse return null;
-            var result: SqlState = .{ .metadata = try metadata.clone(alloc), .connection_id = existing.connection_id, .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .terminal_abort = existing.terminal_abort, .savepoints = existing.savepoints.count() };
+            var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = existing.begin_timestamp, .connection_id = existing.connection_id, .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .terminal_abort = existing.terminal_abort, .savepoints = existing.savepoints.count() };
             errdefer result.deinit(alloc);
             result.setting_active = try cloneSettingEntries(alloc, existing.setting_active.items);
             return result;
@@ -1968,7 +1969,7 @@ pub const SessionRegistry = struct {
         var loaded = (try durable.load(txn_id)) orelse return null;
         defer loaded.deinit(durable.alloc);
         const metadata = loaded.sql orelse return null;
-        var result: SqlState = .{ .metadata = try metadata.clone(alloc), .connection_id = loaded.connection_id, .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .terminal_abort = loaded.terminal_abort, .savepoints = loaded.savepoints.count() };
+        var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = loaded.begin_timestamp, .connection_id = loaded.connection_id, .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .terminal_abort = loaded.terminal_abort, .savepoints = loaded.savepoints.count() };
         errdefer result.deinit(alloc);
         result.setting_active = try cloneSettingEntries(alloc, loaded.setting_active.items);
         return result;
@@ -3987,6 +3988,7 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
                     .version = try std.fmt.bufPrint(&version_buf, "{d}", .{predicate.expected_version}),
                     .digest = predicate.expected_content_digest,
                     .unique_absence = predicate.unique_absence,
+                    .row_policy_requirement = predicate.row_policy_requirement,
                 }, .{});
                 defer alloc.free(encoded);
                 try out.appendSlice(alloc, encoded);
@@ -4257,7 +4259,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
             const table = for (request.tables) |*table| {
                 if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
             } else return error.InvalidTransactionSessionRecord;
-            const Stored = struct { key: []const u8, version: []const u8, digest: ?[32]u8, unique_absence: bool = false };
+            const Stored = struct { key: []const u8, version: []const u8, digest: ?[32]u8, unique_absence: bool = false, row_policy_requirement: @import("../usermgr/mod.zig").row_policy_authority.MutationRequirement = .native };
             var parsed = try std.json.parseFromValue([]const Stored, alloc, entry.value_ptr.*, .{});
             defer parsed.deinit();
             const predicates = try alloc.alloc(db_mod.types.TransactionVersionPredicate, parsed.value.len);
@@ -4267,6 +4269,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
                 .expected_version = try parseVersionString(stored.version),
                 .expected_content_digest = stored.digest,
                 .unique_absence = stored.unique_absence,
+                .row_policy_requirement = stored.row_policy_requirement,
             };
             try appendPredicates(alloc, &table.predicates, predicates);
         }
@@ -4516,6 +4519,7 @@ fn clonePredicatesInto(
             .expected_version = predicate.expected_version,
             .expected_content_digest = predicate.expected_content_digest,
             .unique_absence = predicate.unique_absence,
+            .row_policy_requirement = predicate.row_policy_requirement,
         });
     }
 }
@@ -4905,6 +4909,8 @@ fn appendPredicates(
                 if (predicate.expected_content_digest) |next| if (!std.mem.eql(u8, &digest, &next)) return error.VersionConflict;
             } else previous.expected_content_digest = predicate.expected_content_digest;
             previous.unique_absence = previous.unique_absence or predicate.unique_absence;
+            if (predicate.row_policy_requirement != .native)
+                previous.row_policy_requirement = predicate.row_policy_requirement;
             continue;
         }
         predicates.appendAssumeCapacity(.{
@@ -4912,6 +4918,7 @@ fn appendPredicates(
             .expected_version = predicate.expected_version,
             .expected_content_digest = predicate.expected_content_digest,
             .unique_absence = predicate.unique_absence,
+            .row_policy_requirement = predicate.row_policy_requirement,
         });
         by_key.putAssumeCapacity(predicates.items[predicates.items.len - 1].key, predicates.items.len - 1);
     }
@@ -6832,6 +6839,35 @@ test "durable SQL session rejects malformed connection id without leaking princi
     try std.testing.expectError(error.InvalidTransactionSessionRecord, decodeSessionRecord(alloc, info.txn_id, invalid));
 }
 
+test "SQL statement clock retains the authoritative transaction start across registry reload" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/sql-statement-clock" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    var id: db_mod.types.TxnId = undefined;
+    var started: u64 = undefined;
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        const info = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, 9, "alice");
+        id = info.txn_id;
+        started = info.begin_timestamp;
+        var state = (try registry.getSqlState(alloc, id)).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(started, state.begin_timestamp);
+    }
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), registry.sessions.count());
+    var loaded = (try registry.getSqlState(alloc, id)).?;
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(started, loaded.begin_timestamp);
+    try std.testing.expectEqualStrings("app", loaded.metadata.database);
+    try std.testing.expectEqual(@as(u64, 9), loaded.owner_node_id);
+}
+
 test "SQL session metadata and schema fences survive durable records" {
     const alloc = std.testing.allocator;
     var registry = SessionRegistry.init(null);
@@ -6912,7 +6948,11 @@ test "distributed txn SQL range guards survive durability and savepoint rollback
             try std.testing.expect(std.mem.indexOf(u8, public, "range_guards") == null);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    // Arena growth must expose the same allocation boundaries in the baseline
+    // and every fault run. In-place resize/remap success depends on heap state;
+    // force their allocation fallback without disabling any allocation fault.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Case.run, .{});
 }
 
 test "distributed txn SQL conflict guards retain first native observation through clone and durable round trip" {

@@ -607,8 +607,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_root_mod,
-        // Storage-backed Mach-O Debug codegen measured 13.51 GB.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        // Merged native macOS Debug SQL C API codegen peaked at 16,480,550,912
+        // bytes. 20 GiB reserves at least 25% headroom for that measured root;
+        // retain the existing reservations for other profiles.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos and optimize == .debug) 20 else if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .filters = selectTestFilters(b, &capi_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -616,6 +618,18 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         },
     });
     const run_capi_tests = addFilteredTestRunArtifact(b, capi_tests);
+    if (options.server_integration_tests) {
+        const native_index_owner_tests = b.addTest(.{
+            .root_module = capi_root_mod,
+            .filters = &.{ "storage owner native index", "storage owner Raft index", "storage owner runtime status" },
+            .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        });
+        const index_owner_run = addFilteredTestRunArtifact(b, native_index_owner_tests);
+        b.step("native-index-owner-capi-test", "Verify private native index controls and Raft owner observations through the C ABI")
+            .dependOn(&index_owner_run.step);
+        b.step("index-owner-capi-test", "Verify authority-specific index owner contracts through the C ABI")
+            .dependOn(&index_owner_run.step);
+    }
     const lake_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lake_test_root.zig"),
         .target = target,

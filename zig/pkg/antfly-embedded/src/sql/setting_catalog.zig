@@ -236,11 +236,18 @@ pub fn parseValue(kind: Kind, raw: []const u8) !Value {
 pub const View = struct {
     arena: std.heap.ArenaAllocator,
     scope: Scope,
+    /// SQL expression identity is not the credential-scoped settings/session
+    /// owner (API keys retain their own durable session identity).
+    sql_user: ?[]const u8 = null,
     epoch: u64,
     definitions: []const Definition,
     values: []const Value,
     by_id: std.AutoHashMapUnmanaged(u64, usize),
     by_name: std.StringHashMapUnmanaged(usize),
+
+    pub fn pinSqlUser(self: *View, name: ?[]const u8) !void {
+        self.sql_user = if (name) |value| try self.arena.allocator().dupe(u8, value) else null;
+    }
 
     pub fn capture(backing: std.mem.Allocator, owner: Owner, scope: Scope, overlay: []const OverlayEntry) !View {
         var arena = std.heap.ArenaAllocator.init(backing);

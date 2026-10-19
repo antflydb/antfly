@@ -58,6 +58,7 @@ pub const capi_dependencies = struct {
     pub const sql_mutation_images = @import("sql/mutation_images.zig");
     pub const sql_execution_batch = @import("sql/execution_batch.zig");
     pub const sql_document_row = @import("sql/document_row.zig");
+    pub const sql_search_cursor = @import("sql/search_cursor.zig");
     pub const storage_row_identity = @import("storage/row_identity.zig");
     pub const api_relational_integrity_commit = @import("api/relational_integrity_commit.zig");
     pub const api_relational_activation_worker = @import("api/relational_activation_worker.zig");

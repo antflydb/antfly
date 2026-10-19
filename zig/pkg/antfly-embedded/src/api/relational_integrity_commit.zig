@@ -58,6 +58,17 @@ fn boundedControl(request: RequestContext) !RequestContext {
     return result;
 }
 
+fn authorizedLookupOptions(control: RequestContext, alloc: Allocator, table: []const u8, options: types.LookupOptions) !types.LookupOptions {
+    var result = options;
+    if (options.include_primary_digest) if (control.row_policy_integrity_read) |authority| {
+        if (try authority.authorize(authority.ptr, alloc, table)) |proof| {
+            result.row_policy_principal_proof = proof.token;
+            result.row_policy_database = proof.database;
+        }
+    };
+    return result;
+}
+
 pub fn requiresCoordination(alloc: Allocator, schema_json: []const u8) !bool {
     if (schema_json.len == 0) return false;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
@@ -72,9 +83,12 @@ pub fn requiresActivation(alloc: Allocator, schema_json: []const u8) !bool {
     if (schema_json.len == 0) return false;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
-    return (if (parsed.unique_constraints) |values| values.value.len != 0 else false) or
-        (if (parsed.foreign_keys) |values| values.value.len != 0 else false) or
-        (if (parsed.checks) |values| values.value.len != 0 else false);
+    if ((if (parsed.unique_constraints) |values| values.value.len != 0 else false) or
+        (if (parsed.foreign_keys) |values| values.value.len != 0 else false)) return true;
+    if (parsed.checks) |values| for (values.value) |check| {
+        if (!(check.not_valid orelse false)) return true;
+    };
+    return false;
 }
 
 /// Public schema epochs are fences, not evidence that dependency expansion
@@ -303,6 +317,7 @@ const Builder = struct {
         opts.execution_deadline_ns = self.control.deadline_ns;
         opts.execution_io = self.control.deadline_io;
         opts.cancellation = self.control.cancellation;
+        opts = try authorizedLookupOptions(self.control, self.alloc, table, opts);
         return self.source.lookup(self.alloc, table, key, opts, .read_index) catch |err| {
             if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs())) std.log.warn("preparation lookup failed catalog={} jobs={} work={d} class={s}", .{ opts.relational_integrity_catalog, opts.relational_integrity_jobs_json.len != 0, self.work.items.len, @errorName(err) });
             return err;
@@ -534,7 +549,11 @@ const Builder = struct {
             row: ?reads.LookupResponse = null,
             failure: ?anyerror = null,
             fn run(slot: *@This(), source: reads.TableReadSource, name: []const u8, key: []const u8, control: RequestContext) void {
-                slot.row = source.lookup(slot.arena.allocator(), name, key, .{ .include_primary_digest = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }, .read_index) catch |err| {
+                const options = authorizedLookupOptions(control, slot.arena.allocator(), name, .{ .include_primary_digest = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }) catch |err| {
+                    slot.failure = err;
+                    return;
+                };
+                slot.row = source.lookup(slot.arena.allocator(), name, key, options, .read_index) catch |err| {
                     slot.failure = err;
                     return;
                 };
@@ -938,7 +957,7 @@ const Builder = struct {
         var schema_digest: planner.storage.Digest = undefined;
         std.crypto.hash.Blake3.hash(native_schema, &schema_digest, .{});
         if (!std.mem.eql(u8, &schema_digest, &bindings.schema_digest)) return error.PreparedGenerationChanged;
-        const checks_digest: [32]u8 = if (view.validator().?.execution.checks) |checks| checks.fingerprint() else @splat(0);
+        const checks_digest: [32]u8 = if (view.validator().?.execution.checks) |checks| checks.validationFingerprint() else @splat(0);
         if (!std.mem.eql(u8, &checks_digest, &bindings.checks_digest)) return error.PreparedGenerationChanged;
         const expected = try declarations.definitionFingerprints(self.alloc, view.validator().?.schema, view.tableSchema().*);
         defer declarations.freeDefinitions(self.alloc, expected);
@@ -1330,7 +1349,7 @@ test "distributed txn constraint timing excludes index ownership without native 
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
-pub const BackfillRow = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 = null };
+pub const BackfillRow = @import("../storage/db/relational_integrity_activation_contract.zig").Row;
 
 /// Request-owned arbiter proof. SQL carries this opaque envelope to its native
 /// commit adapter; only this existing integrity authority understands claims.
@@ -1844,15 +1863,47 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
     for (plan.foreign) |binding| try selected_fields.appendSlice(builder.alloc, binding.definition.child_columns);
     var validation_failure: ?[]const u8 = null;
     var backfill_partial = false;
+    const expressions = @import("../schema/relational_expression.zig");
+    var expression_bytes: usize = expressions.max_allocated_bytes;
+    var execution = expressions.Execution.init(builder.alloc, &expression_bytes);
+    execution.numeric.ptr = &builder.control;
+    execution.numeric.checkpoint = struct {
+        fn poll(ptr: ?*anyopaque) anyerror!void {
+            const control: *RequestContext = @ptrCast(@alignCast(ptr.?));
+            try control.ensureActive();
+        }
+    }.poll;
     for (rows) |row| {
+        try builder.control.ensureActive();
         try builder.charge(row.key.len + row.json.len);
         if (row.expected_content_digest == null) return error.MissingPrimaryObservation;
         try builder.appendPredicate(row_table_index, row.key, row.version, row.expected_content_digest);
         if (phase == .check) {
             const checks = table.view.validator().?.execution.checks orelse return error.ConstraintNotFound;
-            var parsed = try std.json.parseFromSlice(std.json.Value, builder.alloc, row.json, .{ .allocate = .alloc_always, .parse_numbers = false });
+            // Retained parent-arena capacity and work are admitted across the
+            // whole page, not reset for each projected row or CHECK plan.
+            var scratch: expressions.ExecutionScratch = undefined;
+            scratch.init(&execution);
+            defer scratch.deinit();
+            try execution.charge(row.json.len);
+            var parsed = std.json.parseFromSlice(std.json.Value, execution.alloc, row.json, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| return scratch.failure(err);
             defer parsed.deinit();
-            if (try checks.firstFailureJson(builder.alloc, parsed.value)) |failure| {
+            if (parsed.value != .object) return error.InvalidBatchRequest;
+            const columns = table.view.tableSchema().relational_columns;
+            for (row.json_null_fields) |name| {
+                try execution.charge(1 +| name.len);
+                try builder.charge(name.len +| @sizeOf([]const u8));
+                const ordinal = table.view.physicalLayout().ordinalForName(columns, name) orelse return error.InvalidBatchRequest;
+                if (columns[ordinal].column_type != .json) return error.InvalidBatchRequest;
+                const value = parsed.value.object.get(name) orelse return error.InvalidBatchRequest;
+                if (value != .null) return error.InvalidBatchRequest;
+            }
+            var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+            nulls.initRegion(execution.alloc, expression_bytes, &execution.numeric);
+            defer nulls.deinit();
+            nulls.bindAdmission(&expression_bytes) catch |err| return scratch.failure(err);
+            nulls.import(row.json_null_fields) catch |err| return if (err == error.InvalidSqlProgram) error.InvalidBatchRequest else scratch.failure(err);
+            if (try checks.firstFailureTypedJsonWithExecution(&execution, parsed.value, &nulls)) |failure| {
                 validation_failure = try std.fmt.allocPrint(builder.alloc, "CHECK {s}: {s}", .{ checks.definitions[failure.index].name, @errorName(failure.reason) });
                 break;
             }
@@ -2139,7 +2190,7 @@ pub fn testCatalogEnvelope(alloc: Allocator, table_id: u64, json: []const u8) ![
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
     const definitions = try declarations.definitionFingerprints(alloc, parsed, runtime);
     defer declarations.freeDefinitions(alloc, definitions);
-    var update = try catalog.prepare(alloc, null, try catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions);
+    var update = try catalog.prepareWithChecks(alloc, null, try catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions, try declarations.checksFingerprint(alloc, parsed));
     defer update.deinit();
     const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(update.value.len));
     defer alloc.free(encoded);
@@ -2521,6 +2572,69 @@ test "distributed txn expression partial unique declarations bind activation ret
         defer declarations.freeDefinitions(alloc, changed_definitions);
         try std.testing.expect(!std.mem.eql(u8, &changed_definitions[0].fingerprint, &loaded.catalog.find(.unique, "email_key").?.definition.fingerprint));
     }
+}
+
+test "distributed txn CHECK activation authenticates projected JSON nulls and shares page admission" {
+    const a = std.testing.allocator;
+    const declaration =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"j":{"type":"json"},"unrelated":{"type":"integer"}},"required":["n","unrelated"],"additionalProperties":false}}}}
+    ;
+    const envelope = try testCatalogEnvelope(a, 1, declaration);
+    defer a.free(envelope);
+    const Fixture = struct {
+        envelope: []const u8,
+        fn lookup(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!opts.relational_integrity_catalog) return error.UnexpectedNativeRead;
+            return .{ .json = try alloc.dupe(u8, self.envelope), .version = 0 };
+        }
+    };
+    var fixture: Fixture = .{ .envelope = envelope };
+    const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } };
+    const metadata = [_]TableRecord{.{ .table_id = 1, .name = "rows", .schema_json = declaration }};
+    const good: BackfillRow = .{ .key = "r", .json = "{\"n\":1,\"j\":null}", .version = 7, .expected_content_digest = @splat(9), .json_null_fields = &.{"j"} };
+    const Run = struct {
+        fn run(alloc: Allocator, reader: reads.TableReadSource, tables: []const TableRecord, row: BackfillRow) !void {
+            var prepared = try prepareBackfill(alloc, reader, tables, "rows", &.{row}, .check);
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(?[]const u8, null), prepared.validation_failure);
+            try std.testing.expectEqual(@as(usize, 1), prepared.tables[0].predicates.len);
+            try std.testing.expectEqual(@as(u64, 7), prepared.tables[0].predicates[0].expected_version);
+            try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(9)), &prepared.tables[0].predicates[0].expected_content_digest.?);
+            try std.testing.expectEqual(@as(usize, 0), prepared.tables[0].writes.len);
+        }
+    };
+    try Run.run(a, source, &metadata, good);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ source, &metadata, good });
+    for ([_][]const []const u8{ &.{"missing"}, &.{"n"}, &.{ "j", "j" } }) |markers| {
+        var bad = good;
+        bad.json_null_fields = markers;
+        try std.testing.expectError(error.InvalidBatchRequest, prepareBackfill(a, source, &metadata, "rows", &.{bad}, .check));
+    }
+    var nonnull = good;
+    nonnull.json = "{\"n\":1,\"j\":{}}";
+    try std.testing.expectError(error.InvalidBatchRequest, prepareBackfill(a, source, &metadata, "rows", &.{nonnull}, .check));
+    var violated = good;
+    violated.json = "{\"n\":-1,\"j\":null}";
+    var invalid = try prepareBackfill(a, source, &metadata, "rows", &.{violated}, .check);
+    defer invalid.deinit();
+    try std.testing.expectEqualStrings("CHECK positive: RelationalCheckViolation", invalid.validation_failure.?);
+    try std.testing.expectEqual(@as(usize, 1), invalid.tables[0].predicates.len);
+    // Each row fits independently, but accumulated retained parse/cache
+    // capacity cannot repeatedly spend a fresh 4 MiB allowance on one page.
+    const text = try a.alloc(u8, 128 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    const large_json = try std.fmt.allocPrint(a, "{{\"n\":1,\"j\":\"{s}\"}}", .{text});
+    defer a.free(large_json);
+    var large = good;
+    large.json = large_json;
+    large.json_null_fields = &.{};
+    try Run.run(a, source, &metadata, large);
+    var page: [48]BackfillRow = undefined;
+    @memset(&page, large);
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, prepareBackfill(a, source, &metadata, "rows", &page, .check));
 }
 
 test "distributed txn activation projection validates selected fields without full row required fields" {

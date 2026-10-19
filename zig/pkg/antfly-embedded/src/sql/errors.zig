@@ -115,12 +115,17 @@ pub fn describe(err: anyerror) Diagnostic {
         error.InvalidLateralReference => .{ .code = "42P10", .message = "Invalid lateral reference in an outer join.", .hint = "Use an INNER, CROSS, or LEFT join for a correlated lateral query." },
         error.DeferrableConflictArbiter => .{ .code = "55000", .message = "ON CONFLICT does not support deferrable unique constraints as arbiters.", .retryable = false },
         error.RetainedReadRestartRequired, error.RetainedReadExpired, error.RetainedReadNotFound, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch => .{ .code = "40001", .message = "The retained statement snapshot is no longer available.", .hint = "Restart the complete read statement; do not replay an individual page.", .retryable = true },
-        error.SqlIndexAlreadyExists => .{ .code = "42P07", .message = "The index already exists.", .retryable = false },
+        error.SqlIndexAlreadyExists => .{ .code = "42P07", .message = "The index already exists.", .hint = "Inspect the existing index definition or choose a distinct index name.", .retryable = false },
         error.SqlSearchUncommittedWrites => .{ .code = "0A000", .message = "Search indexes cannot rank uncommitted writes to the searched table.", .hint = "Commit those writes before searching their indexes.", .retryable = false },
         error.SqlAmbiguousIndex => .{ .code = "42725", .message = "The index name matches more than one table. Specify ON table.", .retryable = false },
         error.IndexNotFound, error.EmbeddingIndexNotFound, error.SqlIndexNotFound => .{ .code = "42704", .message = "The index does not exist.", .retryable = false },
         error.SqlWrongObjectType => .{ .code = "42809", .message = "The named relation has an incompatible object type.", .retryable = false },
-        error.SqlConstraintAlreadyExists => .{ .code = "42710", .message = "The constraint already exists.", .retryable = false },
+        error.SqlWindowingError => .{ .code = "42P20", .message = "A RANGE frame with offset PRECEDING or FOLLOWING requires exactly one ORDER BY column.", .retryable = false },
+        error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped => .{ .code = "42P16", .message = "The replacement view must preserve existing output column names, order, and types.", .hint = "Keep the existing output prefix unchanged; new columns may be appended.", .retryable = false },
+        error.SqlDependentObjectsExist => .{ .code = "2BP01", .message = "A stored view depends on this relation or column.", .hint = "Remove the dependent views explicitly before changing their referenced columns or dropping the relation.", .retryable = false },
+        error.InvalidSqlViewRecord => .{ .code = "XX001", .message = "The stored view catalog or its dependency records are inconsistent.", .retryable = false },
+        error.SqlViewCycle => .{ .code = "42P17", .message = "Infinite recursion detected while expanding a stored view.", .hint = "Remove the dependency cycle or use a recursive query within the view.", .retryable = false },
+        error.SqlConstraintAlreadyExists => .{ .code = "42710", .message = "The constraint already exists.", .hint = "Inspect the existing table constraint or choose a distinct constraint name.", .retryable = false },
         error.SqlConstraintNotFound => .{ .code = "42704", .message = "The constraint does not exist.", .retryable = false },
         error.ConstraintNotDeferrable => .{ .code = "55000", .message = "The constraint is not deferrable.", .retryable = false },
         error.SqlDependentConstraint => .{ .code = "2BP01", .message = "A foreign key depends on this constraint or table.", .hint = "Drop dependent foreign keys explicitly before removing their target.", .retryable = false },
@@ -131,11 +136,13 @@ pub fn describe(err: anyerror) Diagnostic {
         error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => .{ .code = "22023", .message = "The proposed SQL schema is invalid for the native storage types or constraints.", .retryable = false },
         error.SchemaVersionChanged, error.TableGenerationChanged => .{ .code = "40001", .message = "The schema changed before this DDL could commit.", .retryable = true },
         error.TableTopologyProtocolUpgradeRequired, error.TableTopologyUpgradeRequired => .{ .code = "53300", .message = "The metadata cluster is not yet ready for coordinated catalog publication.", .hint = "No schema change was admitted. Upgrade all metadata voters and learners, then retry the complete DDL.", .retryable = true },
-        error.CatalogPublicationProofPending => .{ .code = "53300", .message = "The relation catalog publication is not ready to authorize this DDL.", .hint = "No schema change was admitted. Wait for catalog publication, then retry the complete DDL.", .retryable = true },
+        error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => .{ .code = "53300", .message = "The relation catalog publication is not ready to authorize this DDL.", .hint = "No schema change was admitted. Wait for catalog publication, then retry the complete DDL.", .retryable = true },
         error.SettingAuthorityUnavailable => .{ .code = "53300", .message = "The metadata setting authority is not configured for this SQL operation.", .hint = "Ask an operator to configure trusted setting authority, then inspect schema state before resubmitting DDL. Do not automatically replay a mutation.", .retryable = false },
         error.SqlNumericOutOfRange => .{ .code = "22003", .message = "A numeric expression exceeds its supported range.", .retryable = false },
-        error.SqlInvalidParameterValue => .{ .code = "22023", .message = "The SQL type modifier is outside its supported range.", .hint = "NUMERIC precision must be 1..1000 and scale -1000..1000.", .retryable = false },
+        error.SqlNonFiniteScalarStorage => .{ .code = "0A000", .message = "Scalar floating-point storage currently requires finite values.", .hint = "Use NUMERIC for stored NaN or Infinity values." },
+        error.SqlInvalidParameterValue => .{ .code = "22023", .message = "An SQL option or type modifier has an invalid value.", .hint = "Check option values and format compatibility. NUMERIC precision must be 1..1000 and scale -1000..1000.", .retryable = false },
         error.SqlSubstringError => .{ .code = "22011", .message = "The substring start or length is invalid.", .retryable = false },
+        error.SqlInvalidNtileArgument => .{ .code = "22014", .message = "The argument of ntile must be greater than zero.", .retryable = false },
         error.InvalidSqlCharacterCode => .{ .code = "54000", .message = "The character code is not a nonzero Unicode scalar value.", .retryable = false },
         error.InvalidSqlDateTime => .{ .code = "22007", .message = "The datetime is invalid or outside the supported UTC nanosecond range.", .hint = "Use a valid ISO date or RFC3339 timestamp representable as unsigned epoch nanoseconds.", .retryable = false },
         error.SqlGroupingError => .{ .code = "42803", .message = "A grouped expression references an ungrouped column or invalid aggregate.", .hint = "Group every non-aggregate column and avoid nested aggregate functions.", .retryable = false },
@@ -147,7 +154,15 @@ pub fn describe(err: anyerror) Diagnostic {
         error.UnknownSqlArrayType => .{ .code = "42P18", .message = "The array element type cannot be inferred.", .hint = "Provide an explicit array element type." },
         error.SqlCannotCoerce => .{ .code = "42846", .message = "The source type cannot be cast to the requested type.", .hint = "Use compatible builtin types or an explicit intermediate conversion." },
         error.SqlUndefinedOperator => .{ .code = "42883", .message = "No operator matches the operand types.", .hint = "Use explicit casts to compatible operand types." },
+        error.SqlSetTypeMismatch => .{ .code = "42804", .message = "Set operation columns have incompatible types.", .hint = "Use explicit casts to compatible types in corresponding output columns.", .retryable = false },
+        error.SqlSetColumnCountMismatch => .{ .code = "42601", .message = "Each branch of a set operation must have the same number of output columns.", .hint = "Select matching column counts in every UNION, INTERSECT or EXCEPT branch.", .retryable = false },
         error.SqlUndefinedFunction => .{ .code = "42883", .message = "No function matches the argument types.", .hint = "Use explicit casts to compatible argument types." },
+        error.SqlDistinctOrderMismatch => .{ .code = "42P10", .message = "For SELECT DISTINCT, ORDER BY expressions must appear in the select list." },
+        error.SqlDistinctOnOrderMismatch => .{ .code = "42P10", .message = "SELECT DISTINCT ON expressions must match initial ORDER BY expressions." },
+        error.SqlEntropyUnavailable => .{ .code = "55000", .message = "Secure entropy is unavailable for this execution.", .hint = "Execute UUID generation through an I/O-capable invocation." },
+        error.SqlArrayAggregateNull => .{ .code = "22004", .message = "Cannot accumulate null arrays." },
+        error.SqlArrayAggregateEmpty => .{ .code = "2202E", .message = "Cannot accumulate empty arrays." },
+        error.SqlArrayAggregateDimensions => .{ .code = "2202E", .message = "Cannot accumulate arrays of different dimensionality." },
         error.SqlArrayAppendDimensions => .{ .code = "22000", .message = "Appending or prepending requires an empty or one-dimensional array.", .hint = "Use array_cat for compatible multidimensional slices." },
         error.SqlArrayConcatenationDimensions => .{ .code = "2202E", .message = "Array dimensions are incompatible for concatenation.", .hint = "Match the element dimensions and lower bounds of the concatenated slices." },
         error.SqlInvalidEscapeSequence => .{ .code = "22025", .message = "A pattern ends with an escape character.", .hint = "Escape the final backslash or supply a complete pattern." },
@@ -156,7 +171,11 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlArraySubscriptError => .{ .code = "2202E", .message = "Array dimensions or bounds do not match.", .hint = "Use valid bounds and rectangular subarrays with matching dimensions." },
         error.SqlArrayConstructorTypeMismatch => .{ .code = "42804", .message = "Array constructor element types cannot be matched.", .hint = "Use compatible scalar elements or compatible subarrays." },
         error.SqlAssignmentTypeMismatch => .{ .code = "42804", .message = "The expression type cannot be assigned to this column.", .hint = "Use a compatible value or an explicit cast to the column type." },
+        error.SqlRecursiveTypeMismatch => .{ .code = "42804", .message = "The recursive term changes a column's builtin type or type modifier.", .hint = "Cast the nonrecursive term to the desired final type and use compatible recursive expressions." },
         error.SqlInvalidGenerationExpression => .{ .code = "42P17", .message = "A generated column cannot reference itself or another generated column.", .hint = "Use base columns in the generation expression." },
+        error.SqlMutableGenerationExpression => .{ .code = "42P17", .message = "A generation expression must be immutable.", .hint = "Use immutable operations on base columns; transaction/session values cannot define stored generated values." },
+        error.SqlMutableIndexExpression => .{ .code = "42P17", .message = "Functions in an index expression must be immutable.", .hint = "Use immutable operations; transaction/session values cannot define stored index keys." },
+        error.SqlMutableIndexPredicate => .{ .code = "42P17", .message = "Functions in an index predicate must be immutable.", .hint = "Use immutable operations; transaction/session values cannot define index membership." },
         error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => .{ .code = "22P02", .message = "A value has invalid input syntax for the requested type.", .hint = "Check the value and the target type." },
         error.SqlNullValueNotAllowed => .{ .code = "22004", .message = "A required SQL argument or JSON path element is null.", .hint = "Supply non-null values for required arguments and path elements." },
         error.SqlTransactionAlreadyActive => .{ .code = "25001", .message = "A transaction is already active in this session.", .retryable = false },
@@ -174,14 +193,18 @@ pub fn describe(err: anyerror) Diagnostic {
         error.ExternalLakeReadOnly => .{ .code = "25006", .message = "External lake tables are read-only.", .retryable = false },
         error.ExternalLakeSnapshotMismatch => .{ .code = "40001", .message = "The pinned external lake snapshot changed.", .retryable = true },
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape => .{ .code = "0A000", .message = "This SQL statement or expression is not supported.", .hint = "Use a supported relational SELECT, INSERT, UPDATE, or DELETE statement." },
+        error.UnsupportedNativeIndexOwner => .{ .code = "0A000", .message = "This table's owners cannot execute atomic index publication.", .hint = "Use owners with the required index publication capabilities; no index build was admitted.", .retryable = false },
         error.SqlSchemaRewriteRequiresMetadataOwner => .{ .code = "0A000", .message = "This schema rewrite requires the metadata-owned SQL endpoint.", .hint = "Submit the DDL to the metadata API; no rewrite job was admitted on this data node.", .retryable = false },
         error.RowPolicyUnsupported, error.RowPolicyTopologyUnsupported => .{ .code = "0A000", .message = "Row policy publication is not supported for this table shape.", .hint = "Remove unsupported indexes or topology features before enabling the policy; no publication was started.", .retryable = false },
+        error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => .{ .code = "42501", .message = "The row security policy does not authorize this operation.", .retryable = false },
+        error.RowPolicyCatalogChanged => .{ .code = "40001", .message = "The row security policy changed before this statement completed.", .hint = "Retry the complete statement after the policy generation has finished publishing.", .retryable = true },
         error.ForeignKeyGenerationPublicationRequired => .{ .code = "0A000", .message = "This foreign-key definition requires parent-owner generation publication.", .hint = "Use a deployment with coordinated foreign-key publication; no schema change was admitted.", .retryable = false },
         error.ForeignKeyPartialSupportIndexRequired => .{ .code = "0A000", .message = "Initial MATCH PARTIAL foreign keys require atomic parent support-index publication.", .hint = "Create the table without that constraint, then add it with ALTER TABLE. No table publication was admitted.", .retryable = false },
         error.SqlRowIdentityRequired => .{ .code = "0A000", .message = "This mutation requires an explicit row identity.", .hint = "Provide a non-null _id for each inserted row." },
         error.SqlStatementSnapshotRequired => .{ .code = "0A000", .message = "This query requires a consistent statement snapshot that is not available.", .hint = "Narrow the query to one bounded page or use a runtime with statement snapshots." },
         error.SqlRangeTrackingRequired => .{ .code = "0A000", .message = "This transaction requires activated, owner-fenced range protection.", .hint = "Use a runtime that supports the requested isolation level; isolation was not downgraded.", .retryable = false },
         error.InvalidSqlSyntax => .{ .code = "42601", .message = "The SQL statement has invalid syntax.", .hint = "Check the reported position and submit one supported statement." },
+        error.SqlInvalidFunctionDefinition => .{ .code = "42P13", .message = "No function body was specified.", .hint = "Supply a routine body in the definition." },
         error.UndefinedTable, error.TableNotFound, error.NotFound, error.CatalogNotFound => .{ .code = "42P01", .message = "The requested catalog object does not exist.", .hint = "Check the database, namespace, and object name.", .retryable = false },
         error.CatalogAlreadyExists, error.TableAlreadyExists => .{ .code = "42P07", .message = "The requested catalog object already exists.", .retryable = false },
         error.SqlDuplicateDatabase => .{ .code = "42P04", .message = "The requested database already exists.", .retryable = false },
@@ -193,7 +216,10 @@ pub fn describe(err: anyerror) Diagnostic {
         error.DatabaseNotEmpty, error.NamespaceNotEmpty, error.TablespaceInUse, error.ProtectedCatalogResource => .{ .code = "2BP01", .message = "The catalog object cannot be removed while protected or in use.", .retryable = false },
         error.RelationalIndexColumnNotFound, error.UndefinedColumn, error.UnknownColumn => .{ .code = "42703", .message = "A referenced column does not exist.", .hint = "Check column names against the current table schema." },
         error.DuplicateColumn, error.DuplicateSqlColumn => .{ .code = "42701", .message = "A column was specified more than once.", .hint = "Remove the duplicate column reference." },
+        error.DuplicateSqlAssignment => .{ .code = "42601", .message = "A column was assigned more than once.", .hint = "Assign each target column only once per statement.", .retryable = false },
         error.AmbiguousSqlColumn => .{ .code = "42702", .message = "A column reference is ambiguous.", .hint = "Use an unambiguous column name or alias." },
+        error.DuplicateSqlAlias => .{ .code = "42712", .message = "A relation alias was specified more than once.", .hint = "Use a distinct alias for the merged USING columns." },
+        error.SqlAmbiguousFunction => .{ .code = "42725", .message = "The function argument type is ambiguous.", .hint = "Cast the argument to an explicit SQL type." },
         error.InvalidSqlParameter => .{ .code = "42P02", .message = "A SQL parameter reference is invalid.", .hint = "Use positional parameters starting at $1 and supply every referenced position." },
         error.ConflictingSqlParameterTypes => .{ .code = "42P08", .message = "A parameter is used with incompatible types.", .hint = "Use separate parameters for incompatible column types." },
         error.SqlGeneratedColumnWrite => .{ .code = "428C9", .message = "A generated column cannot be assigned directly.", .hint = "Omit the generated column and let the server compute its value." },
@@ -203,7 +229,9 @@ pub fn describe(err: anyerror) Diagnostic {
         error.DuplicateSqlRow, error.UniqueConstraintViolation => .{ .code = "23505", .message = "The mutation violates a unique constraint.", .hint = "Use distinct row identities and unique column values.", .retryable = false },
         error.ForeignKeyViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.ForeignKeyMatchFullViolation => .{ .code = "23503", .message = "The mutation violates a foreign key constraint.", .hint = "Ensure referenced rows exist and dependent rows satisfy the configured foreign key action.", .retryable = false },
         error.SqlNotNullViolation => .{ .code = "23502", .message = "A required column cannot be null.", .hint = "Provide a non-null value for every required column.", .retryable = false },
+        error.SqlPrimaryKeyNotNull => .{ .code = "42P16", .message = "A primary-key column cannot drop its NOT NULL constraint.", .hint = "Drop the primary-key constraint before relaxing nullability.", .retryable = false },
         error.SqlCardinalityViolation => .{ .code = "21000", .message = "A scalar subquery returned more than one row.", .hint = "Use a unique predicate or an aggregate to produce at most one value.", .retryable = false },
+        error.SqlConflictCardinalityViolation => .{ .code = "21000", .message = "ON CONFLICT DO UPDATE cannot affect the same row more than once.", .hint = "Use distinct arbiter keys within the proposed rows.", .retryable = false },
         error.SqlMutationCardinalityViolation => .{ .code = "21000", .message = "A target row matched more than one mutation source row.", .hint = "Make the source unique per target row; no changes were committed.", .retryable = false },
         error.SqlTruncateReferenced => .{ .code = "2BP01", .message = "TRUNCATE has referencing tables outside the requested set.", .hint = "List every referencing table or explicitly request CASCADE.", .retryable = false },
         error.UnsupportedEmptyGenerationAuthority => .{ .code = "0A000", .message = "TRUNCATE requires owners with durable generation-handoff receipt authority.", .hint = "Native-only owners do not yet support this barrier. No TRUNCATE job was admitted; use DELETE instead.", .retryable = false },
@@ -211,6 +239,9 @@ pub fn describe(err: anyerror) Diagnostic {
         error.RelationalCheckViolation => .{ .code = "23514", .message = "The mutation violates a check constraint.", .hint = "Change the row values to satisfy the table's check constraints.", .retryable = false },
         error.StoredDestinationAuthorizationRevoked => .{ .code = "42501", .message = "The durable credential no longer authorizes this SQL operation.", .hint = "Use a current Basic or API-key credential with whole-table admin permission before retrying DDL.", .retryable = false },
         error.Forbidden, error.Unauthorized, error.AccessDenied => .{ .code = "42501", .message = "Permission denied for this SQL operation.", .hint = "Check the current credential and permissions for every affected table.", .retryable = false },
+        error.SqlProtocolViolation => .{ .code = "08P01", .message = "A binary SQL value is missing required protocol bytes." },
+        error.SqlJsonbUnsupportedVersion => .{ .code = "XX000", .message = "The JSONB binary format version is not supported." },
+        error.SqlJsonUnicodeEscape => .{ .code = "22P05", .message = "The JSONB value contains an unsupported Unicode escape.", .hint = "JSONB cannot contain a Unicode zero character." },
         error.InvalidSqlBinaryRepresentation => .{ .code = "22P03", .message = "A binary SQL value has invalid framing or payload.", .hint = "Use the declared PostgreSQL type and a complete binary value." },
         error.SqlBinaryTypeMismatch => .{ .code = "42804", .message = "The binary value's element type differs from the declared SQL type.", .hint = "Encode the parameter using its declared element type." },
         error.SqlUntranslatableCharacter => .{ .code = "22P05", .message = "SQL TEXT and JSONB strings and object keys cannot contain NUL (U+0000).", .hint = "Remove NUL characters or replace them with U+FFFD before binding.", .retryable = false },
@@ -220,7 +251,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.InvalidCatalogName => .{ .code = "22023", .message = "The database, namespace, or table name is invalid.", .hint = "Use a valid catalog name without empty components." },
         error.SqlWorkingMemoryLimitExceeded => .{ .code = "54000", .message = "The statement exceeds its working-memory limit (default: 256 MiB, 268435456 bytes).", .hint = "Reduce the number and size of simultaneously retained rows or increase the runtime retained-byte limit.", .retryable = false },
         error.SqlRequestTooLarge => .{ .code = "54000", .message = "The SQL JSON request exceeds the 64 MiB (67108864 byte) limit.", .hint = "Reduce the statement and parameter payload size.", .retryable = false },
-        error.SqlProgramLimitExceeded, error.SqlLimitExceeded, error.SqlResultTooLarge, error.RelationalRowResultTooLarge, error.RelationalExpressionBudgetExceeded, error.TransactionTooLarge, error.RelationalIndexKeyTooLarge, error.SettingLimitExceeded => .{ .code = "54000", .message = "The statement exceeds the supported work, result, or mutation limit.", .hint = "Narrow the predicate or reduce the number and size of rows." },
+        error.SqlProgramLimitExceeded, error.ProgramLimitExceeded, error.SqlLimitExceeded, error.SqlResultTooLarge, error.RelationalRowResultTooLarge, error.RelationalExpressionBudgetExceeded, error.TransactionTooLarge, error.RelationalIndexKeyTooLarge, error.SettingLimitExceeded => .{ .code = "54000", .message = "The statement exceeds the supported work, result, or mutation limit.", .hint = "Narrow the predicate or reduce the number and size of rows." },
         error.SqlNegativeLimit => .{ .code = "2201W", .message = "LIMIT must not be negative." },
         error.SqlNegativeOffset => .{ .code = "2201X", .message = "OFFSET must not be negative." },
         error.InvalidSqlLimit => .{ .code = "54000", .message = "The SQL execution limit is invalid.", .hint = "Choose execution limits within the configured capacity." },
@@ -246,6 +277,16 @@ pub fn message(err: anyerror, buffer: []u8) []const u8 {
     return std.fmt.bufPrint(buffer, "{s} {s}", .{ value.message, hint }) catch value.message;
 }
 
+test "SQL view catalog diagnostics distinguish invalid replacement dependencies and corrupt metadata" {
+    for ([_]anyerror{ error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped }) |err| {
+        const diagnostic = describe(err);
+        try std.testing.expectEqualStrings("42P16", diagnostic.code);
+        try std.testing.expectEqual(false, diagnostic.retryable.?);
+    }
+    try std.testing.expectEqualStrings("2BP01", describe(error.SqlDependentObjectsExist).code);
+    try std.testing.expectEqualStrings("XX001", describe(error.InvalidSqlViewRecord).code);
+}
+
 test "SQL diagnostics retain definite constraints conflicts and unknown outcomes" {
     try std.testing.expectEqual(@as(u16, 503), describe(error.SqlStatementReadUnavailable).httpStatus());
     try std.testing.expectEqual(@as(u16, 503), describe(error.FileBusy).httpStatus());
@@ -254,16 +295,22 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         .{ .err = error.ForeignKeyParentMissing, .code = "23503", .retryable = false },
         .{ .err = error.RelationalCheckViolation, .code = "23514", .retryable = false },
         .{ .err = error.SqlNotNullViolation, .code = "23502", .retryable = false },
+        .{ .err = error.SqlPrimaryKeyNotNull, .code = "42P16", .retryable = false },
         .{ .err = error.PreparedReadSetChanged, .code = "40001", .retryable = true },
         .{ .err = error.FileBusy, .code = "55P03", .retryable = true },
         .{ .err = error.WouldBlock, .code = "55P03", .retryable = true },
         .{ .err = error.SqlStatementReadUnavailable, .code = "53300", .retryable = true },
         .{ .err = error.TableTopologyProtocolUpgradeRequired, .code = "53300", .retryable = true },
+        .{ .err = error.CatalogOccupancyNotReady, .code = "53300", .retryable = true },
+        .{ .err = error.ProgramLimitExceeded, .code = "54000", .retryable = null },
+        .{ .err = error.SqlIndexAlreadyExists, .code = "42P07", .retryable = false },
+        .{ .err = error.SqlConstraintAlreadyExists, .code = "42710", .retryable = false },
         .{ .err = error.SettingAuthorityUnavailable, .code = "53300", .retryable = false },
         .{ .err = error.SqlMutationOutcomeUnknown, .code = "40003", .retryable = false },
         .{ .err = error.SqlConstraintOwnedIndex, .code = "2BP01", .retryable = false },
         .{ .err = error.QueryCanceled, .code = "57014", .retryable = null },
         .{ .err = error.RowPolicyUnsupported, .code = "0A000", .retryable = false },
+        .{ .err = error.UnsupportedNativeIndexOwner, .code = "0A000", .retryable = false },
         .{ .err = error.SqlFeatureNotSupported, .code = "0A000", .retryable = false },
         .{ .err = error.SqlWrongAggregateKind, .code = "42809", .retryable = false },
         .{ .err = error.UndefinedSqlFunction, .code = "42883", .retryable = false },
@@ -310,4 +357,19 @@ test "durable SQL destination credential rejection is forbidden, not internal" {
 test "SQL row evaluation classification preserves resource and control failures" {
     for ([_]anyerror{ error.SqlInvalidTextRepresentation, error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlCardinalityViolation, error.SqlArraySubscriptError, error.SqlInvalidPowerArgument }) |err| try std.testing.expect(isRowEvaluationError(err));
     for ([_]anyerror{ error.OutOfMemory, error.QueryCanceled, error.DeadlineExceeded, error.SqlProgramLimitExceeded, error.ArtifactIntegrityMismatch, error.InvalidSqlBackendResponse }) |err| try std.testing.expect(!isRowEvaluationError(err));
+}
+
+test "SQL context-specific assignment window and conflict diagnostics preserve PostgreSQL identities" {
+    try std.testing.expectEqualStrings("42601", describe(error.DuplicateSqlAssignment).code);
+    try std.testing.expectEqualStrings("42701", describe(error.DuplicateSqlColumn).code);
+    try std.testing.expectEqualStrings("42P20", describe(error.SqlWindowingError).code);
+    try std.testing.expectEqualStrings("42804", describe(error.SqlSetTypeMismatch).code);
+    try std.testing.expectEqualStrings("42846", describe(error.SqlCannotCoerce).code);
+    try std.testing.expectEqualStrings("42601", describe(error.SqlSetColumnCountMismatch).code);
+    const conflict = describe(error.SqlConflictCardinalityViolation);
+    try std.testing.expectEqualStrings("21000", conflict.code);
+    try std.testing.expect(std.mem.indexOf(u8, conflict.message, "ON CONFLICT") != null);
+    try std.testing.expectEqual(@as(?bool, false), conflict.retryable);
+    try std.testing.expect(!isRowEvaluationError(error.SqlWindowingError));
+    try std.testing.expect(isRowEvaluationError(error.SqlConflictCardinalityViolation));
 }

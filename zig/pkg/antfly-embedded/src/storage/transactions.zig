@@ -104,6 +104,7 @@ pub const TxnStatus = enum(u8) {
 };
 
 pub const WriteIntent = struct {
+    row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     key: []const u8,
     value: ?[]const u8, // null for deletes
     /// Borrowed logical typing metadata; must be consumed by canonical AROW
@@ -119,6 +120,7 @@ pub const WriteIntent = struct {
 };
 
 pub const IntentValue = struct {
+    row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     value: ?[]const u8,
     prepared_row: ?[]const u8 = null,
 
@@ -132,6 +134,14 @@ pub const IntentValue = struct {
                 const length = std.mem.readInt(u32, bytes[1..5], .little);
                 if (length > bytes.len - 5 or length == bytes.len - 5) return error.InvalidTxnRecord;
                 break :blk .{ .value = bytes[5..][0..length], .prepared_row = bytes[5 + length ..] };
+            },
+            3 => blk: {
+                if (bytes.len < 3 or bytes[2] > 2) return error.InvalidTxnRecord;
+                const requirement = std.enums.fromInt(@import("../usermgr/row_policy_authority.zig").MutationRequirement, bytes[1]) orelse return error.InvalidTxnRecord;
+                if (requirement == .native) return error.InvalidTxnRecord;
+                var value = try decode(bytes[2..]);
+                value.row_policy_requirement = requirement;
+                break :blk value;
             },
             else => error.InvalidTxnRecord,
         };
@@ -778,7 +788,7 @@ pub const TxnManager = struct {
             for (previous.owned_entries.?) |entry| {
                 const key = entry.key[intents_prefix.len + 17 ..];
                 const decoded = try IntentValue.decode(entry.value);
-                const previous_intent: WriteIntent = .{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row };
+                const previous_intent: WriteIntent = .{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row, .row_policy_requirement = decoded.row_policy_requirement };
                 const cost = try intentAdmissionBytes(previous_intent);
                 const retained = try retainedIntentBytes(self.alloc, previous_intent);
                 admission.count += 1;
@@ -876,24 +886,32 @@ pub const TxnManager = struct {
             const intent_key = try self.makeIntentKey(txn_id, intent.key);
             try appendOwnedBytes(self.alloc, &write_keys, intent_key);
 
-            // Intent value: [is_delete:u8][value_bytes]
+            // SQL provenance prefixes the existing immutable value envelope.
+            // It is committed atomically with the prepare vote and survives
+            // journal replay, restart and replacement of the same intent key.
             var val: []u8 = undefined;
+            const prefix: usize = if (intent.row_policy_requirement == .native) 0 else 2;
             if (intent.value) |v| {
                 if (intent.prepared_row) |row| {
                     const json_len = std.math.cast(u32, v.len) orelse return error.TransactionTooLarge;
-                    val = try self.alloc.alloc(u8, 5 + v.len + row.len);
-                    val[0] = 2;
-                    std.mem.writeInt(u32, val[1..5], json_len, .little);
-                    @memcpy(val[5..][0..v.len], v);
-                    @memcpy(val[5 + v.len ..], row);
+                    val = try self.alloc.alloc(u8, prefix + 5 + v.len + row.len);
+                    const payload = val[prefix..];
+                    payload[0] = 2;
+                    std.mem.writeInt(u32, payload[1..5], json_len, .little);
+                    @memcpy(payload[5..][0..v.len], v);
+                    @memcpy(payload[5 + v.len ..], row);
                 } else {
-                    val = try self.alloc.alloc(u8, 1 + v.len);
-                    val[0] = 0;
-                    @memcpy(val[1..], v);
+                    val = try self.alloc.alloc(u8, prefix + 1 + v.len);
+                    val[prefix] = 0;
+                    @memcpy(val[prefix + 1 ..], v);
                 }
             } else {
-                val = try self.alloc.alloc(u8, 1);
-                val[0] = 1; // is a delete
+                val = try self.alloc.alloc(u8, prefix + 1);
+                val[prefix] = 1; // is a delete
+            }
+            if (prefix != 0) {
+                val[0] = 3;
+                val[1] = @backingInt(intent.row_policy_requirement);
             }
             try appendOwnedBytes(self.alloc, &write_vals, val);
 

@@ -26,6 +26,18 @@ const root_identity = @import("root_identity.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 const Allocator = std.mem.Allocator;
 
+/// Storage selection zero denotes the current physical root. Attestations
+/// reserve zero for an unbound epoch. Keep the domains disjoint and injective:
+/// never clamp zero to one, which would alias the first two selections.
+pub fn attestedRootGeneration(selection: u64) !u64 {
+    return std.math.add(u64, selection, 1) catch error.InvalidRootGeneration;
+}
+
+pub fn rootSelectionForAttestedGeneration(epoch: u64) !u64 {
+    if (epoch == 0) return error.InvalidRootGeneration;
+    return epoch - 1;
+}
+
 const file_name = "root_signing_identity.checkpoint";
 const lock_name = "root_signing_identity.checkpoint.lock";
 const magic = "AFROOTS1";

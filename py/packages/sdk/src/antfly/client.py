@@ -44,6 +44,9 @@ from antfly.client_generated.models import (
     GraphTraverseQuery,
     IndexMaintenanceRequest,
     IndexMaintenanceResponse,
+    IndexPublicationState,
+    IndexPublicationStatus,
+    IndexPublicationStatusIndexType,
     InferenceDecideRequest,
     InferenceDecideResponse,
     InferenceGenerateChunk,
@@ -627,6 +630,48 @@ class IndexOperations:
 
     def __init__(self, client: "AntflyClient") -> None:
         self._client = client
+
+    def publication(
+        self,
+        table: str,
+        name: str,
+        token: str,
+        *,
+        database: str | None = None,
+        namespace: str | None = None,
+    ) -> IndexPublicationStatus:
+        """Observe the exact retained job without replaying DDL.
+
+        Published is historical completion, not current query readiness.
+        Supply both database and namespace for an explicit catalog scope.
+        """
+        if len(token) != 171 or any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in token):
+            raise ValueError("invalid index publication token")
+        if (database is None) != (namespace is None):
+            raise ValueError("database and namespace must be supplied together")
+        prefix = "/db/v1"
+        if database is not None and namespace is not None:
+            prefix += f"/databases/{quote(database, safe='')}/namespaces/{quote(namespace, safe='')}"
+        result = self._client._request(
+            "GET",
+            f"{prefix}/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}/publication",
+            headers={"X-Antfly-Index-Publication-Token": token},
+            _max_response_bytes=16 << 10,
+            _expected_status=200,
+        )
+        try:
+            status = IndexPublicationStatus.from_dict(result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AntflyException("invalid index publication response") from exc
+        if (
+            status.publication_token != token
+            or status.index_name != name
+            or status.index_type is not IndexPublicationStatusIndexType.RELATIONAL
+            or not isinstance(status.replication_pending, bool)
+            or (status.replication_pending and status.state is not IndexPublicationState.ADMISSION_UNKNOWN)
+        ):
+            raise AntflyException("index publication response identity or confirmation mismatch")
+        return status
 
     def retry(self, table: str, name: str, request: IndexMaintenanceRequest) -> IndexMaintenanceResponse:
         """Resume failed maintenance using exact status proofs, without automatic retries.

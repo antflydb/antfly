@@ -43,6 +43,7 @@ pub const Epoch = struct {
     alloc: Allocator,
     ref_count: std.atomic.Value(usize) = .init(1),
     schema: schema_mod.TableSchema,
+    reader_requirements: schema_mod.ReaderRequirements,
     physical_layout: row_codec.PhysicalLayout,
     validator: ?schema_api.CompiledTableValidator = null,
     /// Protected by Registry.mutex. Active epochs do not participate in the
@@ -53,7 +54,7 @@ pub const Epoch = struct {
         var physical_layout = try row_codec.PhysicalLayout.init(alloc, owned_schema);
         errdefer physical_layout.deinit();
         const epoch = try alloc.create(Epoch);
-        epoch.* = .{ .alloc = alloc, .schema = owned_schema, .physical_layout = physical_layout };
+        epoch.* = .{ .alloc = alloc, .schema = owned_schema, .reader_requirements = schema_mod.readerRequirementsForSchema(owned_schema), .physical_layout = physical_layout };
         return epoch;
     }
 
@@ -89,6 +90,7 @@ pub const Epoch = struct {
         epoch.* = .{
             .alloc = alloc,
             .schema = owned_schema,
+            .reader_requirements = schema_mod.readerRequirementsForSchema(owned_schema),
             .physical_layout = physical_layout,
             .validator = owned_validator,
         };
@@ -125,6 +127,12 @@ pub const SchemaView = struct {
 
     pub fn version(self: SchemaView) u32 {
         return self.epoch.schema.version;
+    }
+
+    /// Constant-time requirements from this pinned epoch. Publication cannot
+    /// substitute another generation's capabilities, including at retirement.
+    pub fn readerRequirements(self: SchemaView) schema_mod.ReaderRequirements {
+        return self.epoch.reader_requirements;
     }
 
     pub fn storageMode(self: SchemaView) schema_mod.StorageMode {
@@ -615,6 +623,33 @@ test "schema views keep retired epochs alive" {
     defer current.release();
     try std.testing.expectEqual(@as(u32, 2), current.version());
     try std.testing.expectEqual(schema_mod.StorageMode.relational, current.storageMode());
+}
+
+test "relational index system pinned schema reader requirements survive publication without per-read allocation" {
+    var measured = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const a = measured.allocator();
+    var registry = try Registry.initCloned(a, std.testing.io, .{ .version = 1, .storage_mode = .relational });
+    defer registry.deinit();
+    var old = registry.acquire().?;
+    defer old.release();
+    const before = old.readerRequirements();
+    try std.testing.expectEqual(@as(u32, 13), before.semantic_version);
+    try std.testing.expectEqual(schema_mod.storage_format_version, before.encoding_version);
+    const replacement = try Epoch.createCloned(a, .{ .version = 2, .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true });
+    try registry.publishPrepared(replacement);
+    var active = registry.acquire().?;
+    defer active.release();
+    try std.testing.expectEqual(@as(u32, 30), active.readerRequirements().semantic_version);
+    try std.testing.expect(!active.readerRequirements().canInterpret(29));
+    const references = old.epoch.ref_count.load(.acquire);
+    const allocations = measured.alloc_index;
+    for (0..10_000) |_| {
+        try std.testing.expectEqual(before, old.readerRequirements());
+        try std.testing.expect(old.readerRequirements().canInterpret(13));
+        try std.testing.expect(!old.readerRequirements().canDecodeFrame(13, 13));
+    }
+    try std.testing.expectEqual(references, old.epoch.ref_count.load(.acquire));
+    try std.testing.expectEqual(allocations, measured.alloc_index);
 }
 
 test "same-version publication preserves immutable epoch identity" {

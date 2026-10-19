@@ -6,6 +6,7 @@ class RelationalExpressionType(StrEnum):
     BOOLEAN = "boolean"
     DATETIME = "datetime"
     INTEGER = "integer"
+    JSON = "json"
     NUMBER = "number"
     NUMERIC = "numeric"
     SQL_ARRAY = "sql_array"

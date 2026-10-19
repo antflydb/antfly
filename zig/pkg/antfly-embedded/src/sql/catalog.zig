@@ -30,7 +30,79 @@ pub const Column = struct {
     generated: bool = false,
     /// Native row preparation fills absent DEFAULT cells after SQL evaluation.
     defaulted: bool = false,
+
+    /// Borrow one immutable native layout's complete SQL domain. Shared by
+    /// query binding and installed RLS: unrelated array/numeric columns must
+    /// neither block activation nor lose their widths/modifiers in policies.
+    pub fn fromRelational(column: anytype) !Column {
+        return .{
+            .name = column.name,
+            .path = column.path,
+            .nullable = !column.required or column.allows_null,
+            .element_type = column.sql_element_type,
+            .numeric_modifier = column.numeric_modifier,
+            .type = switch (column.column_type) {
+                .string => if (column.sql_element_type == .uuid) .uuid else .string,
+                .integer => .integer,
+                .number, .numeric => .number,
+                .boolean => .boolean,
+                .datetime => .datetime,
+                .json => .json,
+                .sql_array => .array,
+                else => return error.UnsupportedSqlExecution,
+            },
+        };
+    }
+
+    /// A view dependency binds a logical SQL domain, not the spelling of its
+    /// name/path, nullability, generation expression, or DEFAULT clause.
+    pub fn identitySignature(self: Column, a: std.mem.Allocator) ![32]u8 {
+        const Kind = @import("../common/sql_builtin_type.zig").Type;
+        const identity: ?Kind = self.element_type orelse switch (self.type) {
+            .integer => Kind.int64,
+            .number => Kind.float64,
+            .string => Kind.text,
+            .uuid => Kind.uuid,
+            .boolean => Kind.boolean,
+            .json => Kind.jsonb,
+            .datetime => null,
+            .array => return error.InvalidSqlBackendResponse,
+        };
+        if (self.numeric_modifier) |modifier| {
+            if (identity != .numeric or (self.type != .number and self.type != .array)) return error.InvalidSqlBackendResponse;
+            try modifier.validate();
+        }
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .kind = self.type, .identity = identity, .numeric_modifier = self.numeric_modifier }, .{});
+        defer a.free(bytes);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly:sql-column-domain:v1\x00");
+        hash.update(bytes);
+        return hash.finalResult();
+    }
 };
+
+test "SQL column identity signatures normalize defaults and retain exact builtin array and numeric domains" {
+    const a = std.testing.allocator;
+    const base: Column = .{ .name = "a", .path = "a", .type = .integer };
+    var renamed = base;
+    renamed.name = "renamed";
+    renamed.path = "physical";
+    renamed.nullable = false;
+    renamed.defaulted = true;
+    renamed.element_type = .int64;
+    const signature = try base.identitySignature(a);
+    try std.testing.expectEqual(signature, try renamed.identitySignature(a));
+    renamed.element_type = .int32;
+    try std.testing.expect(!std.mem.eql(u8, &signature, &try renamed.identitySignature(a)));
+    const text_array: Column = .{ .name = "a", .path = "a", .type = .array, .element_type = .text };
+    var json_array = text_array;
+    json_array.element_type = .jsonb;
+    try std.testing.expect(!std.mem.eql(u8, &try text_array.identitySignature(a), &try json_array.identitySignature(a)));
+    const numeric: Column = .{ .name = "a", .path = "a", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 20, .scale = 4 } };
+    var wide = numeric;
+    wide.numeric_modifier = .{ .precision = 22, .scale = 4 };
+    try std.testing.expect(!std.mem.eql(u8, &try numeric.identitySignature(a), &try wide.identitySignature(a)));
+}
 
 pub fn hasColumnDefault(schema: anytype, name: []const u8) bool {
     const entries = schema.column_defaults orelse return false;
@@ -49,6 +121,177 @@ pub const Index = struct {
     /// Expression and partial indexes require a separate implication proof.
     columns: []const []const u8,
 };
+
+/// Immutable declared access shapes, not proof of readiness or membership.
+/// Keep these separate from `Index`: existing direct-total probe consumers
+/// must not accidentally treat a partial or expression index as total.
+pub const IndexDefinition = struct {
+    const native = @import("../storage/relational_index.zig");
+    pub const KeyIdentity = native.ExpressionKeyIdentity;
+    pub const Key = struct {
+        column: []const u8,
+        expression: ?std.json.Value,
+        result_type: ?@import("../storage/schema.zig").RelationalColumnType,
+        collation: ?[]const u8,
+        direction: native.RelationalIndexKeyDirection,
+        nulls: native.RelationalIndexKeyNulls,
+        identity: ?KeyIdentity = null,
+
+        pub fn bindIdentity(self: Key, temporary: std.mem.Allocator, table: @import("../storage/schema.zig").TableSchema) !KeyIdentity {
+            var column: std.json.ObjectMap = .empty;
+            defer column.deinit(temporary);
+            const expression = self.expression orelse blk: {
+                try column.put(temporary, "op", .{ .string = "column" });
+                try column.put(temporary, "column", .{ .string = self.column });
+                break :blk std.json.Value{ .object = column };
+            };
+            const expected = self.result_type orelse for (table.relational_columns) |item| {
+                if (std.mem.eql(u8, item.name, self.column)) break item.column_type;
+            } else return error.RelationalIndexColumnNotFound;
+            var plan = try @import("../schema/relational_expression.zig").Plan.init(temporary, table, expression, expected);
+            defer plan.deinit();
+            return .{ .fingerprint = plan.fingerprint, .kind = plan.result_kind, .builtin = plan.result_sql_type };
+        }
+
+        /// Equality shape only, not readiness, membership or a range proof.
+        /// Collation is part of the comparison domain; direction/NULL ordering
+        /// remain tuple-encoding properties owned by the selected index.
+        pub fn matchesEquality(self: Key, query: KeyIdentity, collation: ?[]const u8) !bool {
+            const stored = self.identity orelse return false;
+            if (stored.kind != query.kind or stored.builtin != query.builtin or !std.mem.eql(u8, &stored.fingerprint, &query.fingerprint)) return false;
+            const expressions = @import("../schema/relational_expression.zig");
+            const stored_fold = if (self.collation) |name| try expressions.foldAsciiCollation(stored.kind, name) else false;
+            const query_fold = if (collation) |name| try expressions.foldAsciiCollation(query.kind, name) else false;
+            return stored_fold == query_fold;
+        }
+    };
+    pub const Predicate = struct {
+        constant: ?bool,
+        column: []const u8,
+        op: native.UniquePredicateOp,
+        value: ?std.json.Value,
+        collation: ?[]const u8,
+    };
+    name: []const u8,
+    keys: []const Key,
+    include_columns: []const []const u8,
+    where: []const Predicate,
+
+    fn copyOptional(a: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+        return if (value) |bytes| try a.dupe(u8, bytes) else null;
+    }
+
+    /// Both embedded and server resolvers consume the same validated schema
+    /// vocabulary. Temporary wire conversion never escapes into a binding.
+    pub fn deriveLeaky(a: std.mem.Allocator, temporary: std.mem.Allocator, parsed: anytype, table: @import("../storage/schema.zig").TableSchema) ![]const IndexDefinition {
+        const declared = (try parsed.relationalIndexDefinitions(temporary)) orelse return &.{};
+        const output = try a.alloc(IndexDefinition, declared.len);
+        for (declared, output) |definition, *out| {
+            out.* = try fromNativeLeaky(a, definition);
+            for (@constCast(out.keys)) |*key| key.identity = try key.bindIdentity(temporary, table);
+        }
+        return output;
+    }
+
+    /// All allocations, including partial failure, belong to the caller's
+    /// preparation region. Decode only on schema derivation, never cache hits.
+    pub fn fromNativeLeaky(a: std.mem.Allocator, definition: native.RelationalIndexDefinition) !IndexDefinition {
+        // This view describes the schema's ordered tuple declarations only.
+        // Other access methods and legacy expression channels need their own
+        // binding contracts rather than an incomplete tuple approximation.
+        if (definition.access_method != .ordered_tuple or definition.expressions.len != 0 or definition.where_expressions.len != 0 or
+            definition.keys.len == 0 or definition.keys.len > 32 or definition.where.len > 256 or definition.include_columns.len > 256)
+            return error.InvalidSqlBackendResponse;
+        const keys = try a.alloc(Key, definition.keys.len);
+        for (definition.keys, keys) |source, *key| {
+            if ((source.expression_json != null) != (source.result_type != null) or
+                (source.expression_json != null) == (source.column.len != 0)) return error.InvalidSqlBackendResponse;
+            key.* = .{
+                .column = try a.dupe(u8, source.column),
+                .expression = if (source.expression_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false, .allocate = .alloc_always }) else null,
+                .result_type = source.result_type,
+                .collation = try copyOptional(a, source.collation),
+                .direction = source.direction,
+                .nulls = source.nulls,
+            };
+        }
+        const predicates = try a.alloc(Predicate, definition.where.len);
+        for (definition.where, predicates) |source, *predicate| {
+            if (source.constant != null) {
+                if (source.field.len != 0 or source.op != .eq or source.value_json != null or source.collation != null)
+                    return error.InvalidSqlBackendResponse;
+            } else if (source.field.len == 0) return error.InvalidSqlBackendResponse;
+            predicate.* = .{
+                .constant = source.constant,
+                .column = try a.dupe(u8, source.field),
+                .op = source.op,
+                .value = if (source.value_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false, .allocate = .alloc_always }) else null,
+                .collation = try copyOptional(a, source.collation),
+            };
+        }
+        return .{ .name = try a.dupe(u8, definition.name), .keys = keys, .include_columns = try copyNames(a, definition.include_columns), .where = predicates };
+    }
+
+    fn copyNames(a: std.mem.Allocator, input: []const []const u8) ![]const []const u8 {
+        const output = try a.alloc([]const u8, input.len);
+        for (input, output) |name, *copy| copy.* = try a.dupe(u8, name);
+        return output;
+    }
+
+    /// Request ownership survives cache eviction. Clone the compact trees
+    /// directly, preserving exact literal tokens without stringify/reparse.
+    pub fn cloneLeaky(self: IndexDefinition, a: std.mem.Allocator) !IndexDefinition {
+        const keys = try a.alloc(Key, self.keys.len);
+        for (self.keys, keys) |source, *key| {
+            key.* = source;
+            key.column = try a.dupe(u8, source.column);
+            key.collation = try copyOptional(a, source.collation);
+            key.expression = if (source.expression) |value| try @import("../storage/typed_json.zig").clone(a, value) else null;
+        }
+        const predicates = try a.alloc(Predicate, self.where.len);
+        for (self.where, predicates) |source, *predicate| {
+            predicate.* = source;
+            predicate.column = try a.dupe(u8, source.column);
+            predicate.collation = try copyOptional(a, source.collation);
+            predicate.value = if (source.value) |value| try @import("../storage/typed_json.zig").clone(a, value) else null;
+        }
+        return .{ .name = try a.dupe(u8, self.name), .keys = keys, .include_columns = try copyNames(a, self.include_columns), .where = predicates };
+    }
+};
+
+test "SQL index descriptors reject incomplete native access shapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const native = @import("../storage/relational_index.zig");
+    const valid: native.RelationalIndexDefinition = .{ .name = "key", .owner_kind = .table, .owner_name = native.relational_table_index_owner_name, .access_method = .ordered_tuple, .keys = &.{.{ .column = "id" }} };
+    _ = try IndexDefinition.fromNativeLeaky(a, valid);
+    for ([_][]const native.RelationalIndexKey{
+        &.{},
+        &.{.{}},
+        &.{.{ .column = "id", .expression_json = "{}", .result_type = .integer }},
+        &.{.{ .expression_json = "{}" }},
+        &.{.{ .column = "id", .result_type = .integer }},
+    }) |keys| {
+        var malformed = valid;
+        malformed.keys = keys;
+        try std.testing.expectError(error.InvalidSqlBackendResponse, IndexDefinition.fromNativeLeaky(a, malformed));
+    }
+    for ([_]native.UniquePredicate{
+        .{},
+        .{ .constant = true, .field = "id" },
+        .{ .constant = false, .op = .ne },
+        .{ .constant = true, .value_json = "null" },
+        .{ .constant = true, .collation = "binary" },
+    }) |predicate| {
+        var malformed = valid;
+        malformed.where = &.{predicate};
+        try std.testing.expectError(error.InvalidSqlBackendResponse, IndexDefinition.fromNativeLeaky(a, malformed));
+    }
+    var other_method = valid;
+    other_method.access_method = .scalar_column;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, IndexDefinition.fromNativeLeaky(a, other_method));
+}
 
 /// Pinned declarative constraints, not similarly named access indexes. Native
 /// execution independently rebinds the name to its guarded durable generation.
@@ -120,13 +363,76 @@ pub const Table = struct {
     external_indexes: ?ExternalIndexes = null,
     columns: []const Column,
     indexes: []const Index = &.{},
+    index_definitions: []const IndexDefinition = &.{},
     constraints: []const Constraint = &.{},
     /// Request-owned logical authority. Never use a mutable adapter's last
     /// resolved name to validate an earlier table in a join or subquery.
     scope: ?Scope = null,
+    row_policy_purpose: @import("../usermgr/row_policy_authority.zig").Purpose = .ordinary,
+    sql_select_required: bool = false,
+    /// Stored SQL keeps creation-time lexical names independently of the
+    /// current logical scope used for catalog and authorization checks.
+    binding_scope: ?Scope = null,
+    /// Request-owned read authority. Never serialized, cached in a plan, or
+    /// inferred from a SQL identifier; native owners receive signed proofs.
+    read_authority: ?*const anyopaque = null,
+    /// Definition-only logical shapes can suppress physical row-envelope
+    /// columns. Executable stored views use ReadRelation, never table routing.
+    virtual_columns_override: ?[]const Column = null,
+
+    /// Hidden SQL columns owned by the row envelope, not the user schema.
+    /// Binders enumerate these explicitly so SELECT * keeps its stored shape.
+    const identity_virtual_columns = [_]Column{.{ .name = "_id", .path = "_id", .type = .string, .nullable = false }};
+    const document_virtual_columns = identity_virtual_columns ++ [_]Column{
+        .{ .name = "_doc", .path = "_doc", .type = .json, .element_type = .jsonb, .nullable = false },
+        .{ .name = "_version", .path = "_version", .type = .integer, .element_type = .int64, .nullable = false, .generated = true },
+    };
+
+    pub fn virtualColumns(self: Table) []const Column {
+        if (self.virtual_columns_override) |columns| return columns;
+        return if (self.storage_mode == .document) &document_virtual_columns else &identity_virtual_columns;
+    }
+
+    /// A virtual JSONB value, never a stored property or a SELECT * column.
+    pub fn isDocumentRoot(self: Table, name: []const u8) bool {
+        if (self.storage_mode != .document) return false;
+        if (std.mem.eql(u8, name, "_doc")) return true;
+        if (!std.mem.endsWith(u8, name, "\x00_doc")) return false;
+        const resolved = self.column(name) catch return false;
+        return std.mem.eql(u8, resolved.name, "_doc");
+    }
+
+    pub fn isDocumentVersion(self: Table, name: []const u8) bool {
+        if (self.storage_mode != .document) return false;
+        const resolved = self.column(name) catch return false;
+        return std.mem.eql(u8, resolved.name, "_version");
+    }
+
+    pub fn validateDocumentWriteColumns(self: Table, names: []const []const u8) !void {
+        var root = false;
+        var fields = false;
+        for (names) |name| {
+            root = root or self.isDocumentRoot(name);
+            fields = fields or (!self.isDocumentRoot(name) and !std.mem.eql(u8, name, "_id"));
+        }
+        if (root and fields) return error.UnsupportedSqlShape;
+    }
+
+    /// Explicit JSON null members in a whole-document value are JSON datums,
+    /// not SQL NULL property assignments. Names borrow the pinned schema;
+    /// only the compact provenance slice belongs to the preparation arena.
+    pub fn documentRootNulls(self: Table, alloc: std.mem.Allocator, root: std.json.Value) ![]const []const u8 {
+        if (self.storage_mode != .document or root != .object) return error.InvalidSqlBackendResponse;
+        var names: std.ArrayList([]const u8) = .empty;
+        errdefer names.deinit(alloc);
+        for (self.columns) |field| if (field.type == .json) {
+            if (root.object.get(field.path)) |value| if (value == .null) try names.append(alloc, field.path);
+        };
+        return names.toOwnedSlice(alloc);
+    }
 
     pub fn column(self: Table, name: []const u8) !Column {
-        if (std.mem.eql(u8, name, "_id")) return .{ .name = "_id", .path = "_id", .type = .string, .nullable = false };
+        for (self.virtualColumns()) |value| if (std.mem.eql(u8, value.name, name)) return value;
         for (self.columns) |value| if (std.mem.eql(u8, value.name, name)) return value;
         // Point predicate planning must use the same pinned logical authority
         // as relation binding; never strip a namespace before validating it.
@@ -134,9 +440,37 @@ pub const Table = struct {
         const scope = self.scope orelse return error.UndefinedColumn;
         if (!scope.matchesQualifier(name[0..separator])) return error.UndefinedColumn;
         const column_name = name[separator + 1 ..];
-        if (std.mem.eql(u8, column_name, "_id")) return .{ .name = "_id", .path = "_id", .type = .string, .nullable = false };
+        for (self.virtualColumns()) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
         for (self.columns) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
         return error.UndefinedColumn;
+    }
+
+    /// Compiler-only typed input view. It grants no native capability or
+    /// storage authority and must never be published as a storage schema.
+    /// Identity is compared only within this already-authorized pinned table.
+    /// The region owns the column vector; names/paths borrow that pinned table.
+    pub fn expressionSchemaLeaky(self: Table, a: std.mem.Allocator) !@import("../storage/schema.zig").TableSchema {
+        if (self.storage_mode != .relational) return error.UnsupportedSqlShape;
+        const native_schema = @import("../storage/schema.zig");
+        const columns = try a.alloc(native_schema.RelationalColumn, self.columns.len);
+        for (self.columns, columns) |column_, *out| out.* = .{
+            .name = column_.name,
+            .path = column_.path,
+            .column_type = switch (column_.type) {
+                .string, .uuid => .string,
+                .integer => .integer,
+                .number => if (column_.element_type == .numeric) .numeric else .number,
+                .array => .sql_array,
+                .boolean => .boolean,
+                .datetime => .datetime,
+                .json => .json,
+            },
+            .required = !column_.nullable,
+            .allows_null = column_.nullable,
+            .sql_element_type = column_.element_type,
+            .numeric_modifier = column_.numeric_modifier,
+        };
+        return .{ .storage_mode = .relational, .version = self.schema_version, .relational_columns = columns, .requires_json_expressions = true };
     }
 
     pub fn columnAliases(self: Table, alloc: std.mem.Allocator, name: []const u8) ![]const []const u8 {
@@ -164,7 +498,80 @@ pub const Condition = struct {
         return self.operand orelse @import("scalar.zig").Datum.fromJson(self.value);
     }
 };
+test "SQL document root virtual columns preserve narrow storage projections and authority" {
+    const table: Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{.{ .name = "title", .path = "title", .type = .string }}, .scope = .{ .database = "default", .namespace = "public", .name = "docs", .revision = 1 } };
+    const root = try table.column("_doc");
+    try std.testing.expectEqual(ast.ColumnType.json, root.type);
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.jsonb, root.element_type.?);
+    try std.testing.expect(table.isDocumentRoot("public\x00docs\x00_doc"));
+    try std.testing.expect(!table.isDocumentRoot("other\x00docs\x00_doc"));
+    try std.testing.expectError(error.UndefinedColumn, table.column("other\x00docs\x00_doc"));
+    try std.testing.expectEqual(@as(usize, 1), table.columns.len);
+    var empty: std.heap.FixedBufferAllocator = .init(&.{});
+    const narrow: Scan = .{ .fields = &.{"title"}, .limit = 1 };
+    try std.testing.expect((try narrow.physicalFields(empty.allocator(), table)).ptr == narrow.fields.ptr);
+    try std.testing.expect(!narrow.needsDocument(table));
+    const whole: Scan = .{ .fields = &.{ "_doc", "title" }, .limit = 1 };
+    const fields = try whole.physicalFields(std.testing.allocator, table);
+    defer std.testing.allocator.free(fields);
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("title", fields[0]);
+    try std.testing.expect(whole.needsDocument(table));
+    var relational = table;
+    relational.storage_mode = .relational;
+    relational.columns = &.{.{ .name = "_doc", .path = "_doc", .type = .string }};
+    try std.testing.expectEqual(ast.ColumnType.string, (try relational.column("_doc")).type);
+    try std.testing.expect(!whole.needsDocument(relational));
+    try std.testing.expect((try whole.physicalFields(empty.allocator(), relational)).ptr == whole.fields.ptr);
+    const invalid: Row = .{ .id = "bad", .version = 1, .value = .null, .document = .null };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, invalid.cell("_doc"));
+    try std.testing.expectError(error.InvalidSqlBackendResponse, invalid.hasField("_doc"));
+}
+
+test "SQL document root null provenance marks only explicit declared JSON members" {
+    const alloc = std.testing.allocator;
+    var root = try std.json.parseFromSlice(std.json.Value, alloc, "{\"metadata\":null,\"title\":null,\"unknown\":null}", .{});
+    defer root.deinit();
+    const table: Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{
+        .{ .name = "metadata", .path = "metadata", .type = .json },
+        .{ .name = "missing", .path = "missing", .type = .json },
+        .{ .name = "title", .path = "title", .type = .string },
+    } };
+    const fields = try table.documentRootNulls(alloc, root.value);
+    defer alloc.free(fields);
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("metadata", fields[0]);
+    const Faults = struct {
+        fn run(a: std.mem.Allocator, definition: Table, value: std.json.Value) !void {
+            const nulls = try definition.documentRootNulls(a, value);
+            defer a.free(nulls);
+            try std.testing.expectEqual(@as(usize, 1), nulls.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Faults.run, .{ table, root.value });
+}
+
 pub const Scan = struct {
+    pub fn needsDocument(self: Scan, table: Table) bool {
+        if (self.include_document) return true;
+        for (self.fields) |name| if (table.isDocumentRoot(name)) return true;
+        return false;
+    }
+
+    /// Virtual document values travel as page-owned preimages, never as a
+    /// fictitious storage field. Ordinary narrow projections borrow unchanged.
+    pub fn physicalFields(self: Scan, alloc: std.mem.Allocator, table: Table) ![]const []const u8 {
+        var count: usize = 0;
+        for (self.fields) |name| count += @intFromBool(!table.isDocumentRoot(name) and !table.isDocumentVersion(name));
+        if (count == self.fields.len) return self.fields;
+        const fields = try alloc.alloc([]const u8, count);
+        var index: usize = 0;
+        for (self.fields) |name| if (!table.isDocumentRoot(name) and !table.isDocumentVersion(name)) {
+            fields[index] = name;
+            index += 1;
+        };
+        return fields;
+    }
     pub const Order = struct { column: []const u8, descending: bool = false, nulls_first: bool = false };
     pub const IndexEquality = struct {
         name: []const u8,
@@ -186,7 +593,7 @@ pub const Scan = struct {
     row_goal: ?u64 = null,
     index_range: ?IndexRange = null,
     fields: []const []const u8,
-    /// Mutation-only full document preimage; ordinary reads remain projected.
+    /// Full document preimage for replacement preparation or explicit _doc.
     include_document: bool = false,
     include_primary_digest: bool = false,
     /// Ordered SQL must not be satisfied by an unrelated secondary-key order.
@@ -203,6 +610,7 @@ pub const Scan = struct {
     /// closed; the coordinated owner read returns one exact-span proof.
     index_equality: ?IndexEquality = null,
     conditions: []const Condition = &.{},
+    expression_equalities: []const @import("../storage/relational_index.zig").ExpressionEqualityHint = &.{},
     after: ?[]const u8 = null,
     /// External scan upper bound, validated against the opened snapshot.
     before: ?[]const u8 = null,
@@ -217,6 +625,9 @@ pub const Row = struct {
     /// are not a version fence when a custom TTL field is unchanged.
     expected_content_digest: ?[32]u8 = null,
     document: ?std.json.Value = null,
+    /// Native document metadata is not a relational user column of the same
+    /// spelling. Only schema-bound document projections grant this identity.
+    document_envelope: bool = false,
     /// Authoritative native null flags aligned with value.object insertion
     /// order. Null means a legacy JSON-only backend without that distinction.
     sql_nulls: ?[]const bool = null,
@@ -330,13 +741,18 @@ pub const Row = struct {
     }
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
+        if (self.document_envelope and std.mem.eql(u8, name, "_version")) return Cell.json(.{ .integer = std.math.cast(i64, self.version) orelse return error.SqlNumericOutOfRange });
+        if (std.mem.eql(u8, name, "_doc")) if (self.document) |document| {
+            if (document != .object) return error.InvalidSqlBackendResponse;
+            return Cell.json(document);
+        };
         if (self.typed_cells) |cells| {
             try self.validateTyped();
             const index = cells.layout.ordinals.get(name) orelse return .{};
             if (index >= cells.count()) return error.InvalidSqlBackendResponse;
             const result = try cells.at(index);
             if (cells.presence) |present| if (!present[index] and !result.sql_null) return error.InvalidSqlBackendResponse;
-            if (result.array != null and (result.sql_null or result.value != .null or result.patterns != null)) return error.InvalidSqlBackendResponse;
+            if (result.array != null and (result.sql_null or result.value != .null or result.patterns() != null)) return error.InvalidSqlBackendResponse;
             if (result.sql_null and result.value != .null) return error.InvalidSqlBackendResponse;
             return result;
         }
@@ -346,7 +762,7 @@ pub const Row = struct {
         const value = self.value.object.values()[index];
         const sql_null = if (self.sql_nulls) |flags| flags[index] else value == .null;
         if (sql_null and value != .null) return error.InvalidSqlBackendResponse;
-        return .{ .value = value, .sql_null = sql_null, .patterns = if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null };
+        return @import("scalar.zig").Datum.fromParts(value, sql_null, if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null);
     }
 
     fn validateTyped(self: Row) !void {
@@ -367,6 +783,11 @@ pub const Row = struct {
     }
 
     pub fn hasField(self: Row, name: []const u8) !bool {
+        if (self.document_envelope and std.mem.eql(u8, name, "_version")) return true;
+        if (std.mem.eql(u8, name, "_doc")) if (self.document) |document| {
+            if (document != .object) return error.InvalidSqlBackendResponse;
+            return true;
+        };
         if (self.typed_cells) |cells| {
             try self.validateTyped();
             const index = cells.layout.ordinals.get(name) orelse return false;
@@ -682,6 +1103,7 @@ pub const StatementRead = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Mutation = struct {
+    row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     /// Owned native authority envelope. The SQL engine carries but never
     /// interprets native claim keys, generation fences or commands.
     conflict_guard: ?*const anyopaque = null,
@@ -728,8 +1150,8 @@ pub const Ddl = union(enum) {
         schema_json: []const u8,
         if_not_exists: bool,
         tablespace: ?[]const u8 = null,
-        /// Only compiler-generated backing index names may be disambiguated.
-        /// Explicit SQL names remain exact catalog declarations.
+        /// Compiler-owned provenance for admission-time name selection.
+        /// Explicit user names must never be included or silently renamed.
         generated_constraint_names: []const []const u8 = &.{},
     },
     drop_table: ast.DropTable,
@@ -749,11 +1171,19 @@ pub const DdlReceipt = struct {
     restore_job_id: ?[]const u8 = null,
     idempotency_key: ?[]const u8 = null,
     fk_generation_publication_id: ?[]const u8 = null,
+    index_publication_token: ?[]const u8 = null,
 };
 /// Scratch must reclaim individual allocations; result may be an arena. DDL
 /// implementations reserve durable receipts in result before admission and
 /// release parsing/validation/plan memory through scratch before returning.
-pub const DdlAllocators = struct { result: std.mem.Allocator, scratch: std.mem.Allocator };
+pub const DdlAllocators = struct {
+    /// HTTP can return a pre-owned recovery receipt after bounded observation;
+    /// PostgreSQL wire waits for terminal completion within its request budget.
+    pub const Completion = enum { bounded, until_deadline };
+    result: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    completion: Completion = .bounded,
+};
 
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
@@ -772,7 +1202,44 @@ pub const AggregatePartialCursor = struct {
     close: *const fn (*anyopaque) void,
 };
 
+pub const Clock = @import("statement_clock.zig");
+pub const ViewExposure = struct { ordinal: usize, name: []const u8 };
+/// Statement-owned authorization predicate over complete typed view outputs.
+/// Providers reuse their existing filter compiler; SQL never invents a second
+/// public policy grammar or serializes a row to invoke it.
+pub const ViewRowFilter = struct {
+    ptr: *const anyopaque,
+    matches: *const fn (*const anyopaque, std.mem.Allocator, []const @import("scalar.zig").Datum) anyerror!bool,
+};
+pub const ReadRelation = union(enum) {
+    table: Table,
+    view: struct {
+        id: u64,
+        generation: u32,
+        query: *const ast.Select,
+        columns: []const Column,
+        exposure: ?[]const ViewExposure = null,
+        backend: Backend,
+        security_barrier: bool,
+        row_filter: ?ViewRowFilter = null,
+    },
+};
+
 pub const Backend = struct {
+    pub const PreparedRead = struct { name: ast.Name, relation: ReadRelation };
+    /// Private resolver namespace. Distinct delegated view contexts must not
+    /// share name bindings even when their SQL references have the same text.
+    binding_scope: usize = 0,
+    prepared_read: ?*const PreparedRead = null,
+    /// Trusted execution source and authorized durable transaction start.
+    /// Neither is populated from SQL parameters, request JSON or cached plans.
+    clock_source: ?Clock.Source = null,
+    transaction_start: ?Clock.Instant = null,
+    /// Value-owned by this statement/cursor. Child adapters copy it unchanged.
+    statement_clock: ?Clock.View = null,
+    /// Immutable typed precision slots borrowed from the result/cursor owner.
+    /// A child adapter preserves this address; it must never cache it in plans.
+    clock_values: ?*const Clock.Frame = null,
     error_context: ?*@import("errors.zig").Context = null,
     /// Execution-local only: never store this owner in an immutable plan.
     regex_execution: ?*@import("regex_execution.zig") = null,
@@ -780,6 +1247,9 @@ pub const Backend = struct {
     /// Carry an explicit context so lowering can change Backend.ptr safely.
     scalar_control: ?struct { ptr: ?*anyopaque, checkpoint: *const fn (?*anyopaque) anyerror!void } = null,
     supports_search_relations: bool = false,
+    /// Advisory expression probes with mandatory SQL residual evaluation.
+    /// This is an execution optimization, never a readiness/capability proof.
+    supports_expression_access_hints: bool = false,
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
@@ -790,6 +1260,7 @@ pub const Backend = struct {
     setting_capture: ?struct {
         owner: @import("setting_catalog.zig").Owner,
         scope: @import("setting_catalog.zig").Scope,
+        sql_user: ?[]const u8 = null,
         overlay: []const @import("setting_catalog.zig").OverlayEntry = &.{},
     } = null,
     /// Authorized, immutable settings captured for this exact statement.
@@ -829,7 +1300,29 @@ pub const Backend = struct {
     /// route/range proof in the mutation's atomic commit read set.
     dynamic_statement_read_set: bool = false,
 
+    /// Capture once at execution admission. Describe never calls this method.
+    /// Ingress pins before selecting a cursor or materializing fallback.
+    pub fn pinStatementClock(self: Backend) !Backend {
+        var pinned = self;
+        if (self.statement_clock) |view| {
+            try view.validate();
+            if (self.clock_values) |frame| if (!frame.matches(view)) return error.InvalidTransactionClock;
+            if (self.transaction_start) |start| {
+                if (start.micros != view.transaction.micros) return error.InvalidTransactionClock;
+            }
+            return pinned;
+        }
+        if (self.clock_values != null) return error.InvalidTransactionClock;
+        const source = self.clock_source orelse if (self.execution_io) |io| Clock.Source{ .io = io } else {
+            if (self.transaction_start != null) return error.SqlClockUnavailable;
+            return pinned;
+        };
+        pinned.statement_clock = try Clock.View.capture(source, self.transaction_start);
+        return pinned;
+    }
+
     pub const VTable = struct {
+        resolve_read: ?*const fn (*anyopaque, std.mem.Allocator, ast.Name) anyerror!ReadRelation = null,
         /// Native opaque identity, generated once before mutation admission.
         /// Providers without this capability require an explicit _id.
         generate_row_id: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]const u8 = null,
@@ -871,6 +1364,17 @@ pub const Backend = struct {
         /// publication. SQL must never emulate DDL with read-then-write.
         ddl: ?*const fn (*anyopaque, DdlAllocators, Ddl) anyerror!DdlOutcome = null,
     };
+
+    pub fn resolveRead(self: Backend, a: std.mem.Allocator, name: ast.Name) !ReadRelation {
+        if (self.prepared_read) |prepared| {
+            if (std.mem.eql(u8, prepared.name.table, name.table) and
+                std.mem.eql(u8, prepared.name.namespace orelse "", name.namespace orelse "") and
+                std.mem.eql(u8, prepared.name.database orelse "", name.database orelse ""))
+                return prepared.relation;
+        }
+        if (self.vtable.resolve_read) |resolve| return resolve(self.ptr, a, name);
+        return .{ .table = try self.vtable.resolve(self.ptr, a, name, .read) };
+    }
 };
 
 test "SQL row cells distinguish absent SQL NULL and JSON null and reject invalid flags" {

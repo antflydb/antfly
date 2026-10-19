@@ -1723,9 +1723,11 @@ pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: [
 fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64) !metadata_table_manager.TableRecord {
     try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
-    const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
+    const comparison = try compareSchemaDefinitions(alloc, table.schema_json, schema_json);
+    const schema_changed = !comparison.equal;
     if (schema_changed and !rewrite) {
         try @import("antfly_local_sources").schema_relational_expression.validateSchemaUpdate(alloc, table.schema_json, schema_json);
+        try @import("antfly_local_sources").schema_relational_checks.validateSchemaUpdate(alloc, table.schema_json, schema_json);
         if (!fk_publication and !try foreignKeyDefinitionsUnchanged(alloc, table.schema_json, schema_json))
             return error.ForeignKeyGenerationPublicationRequired;
     }
@@ -1756,7 +1758,10 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
     alloc.free(updated.indexes_json);
     updated.indexes_json = refreshed_indexes_json;
 
-    if (!schema_changed) return updated;
+    if (!schema_changed) {
+        try refreshSchemaReaderRequirements(alloc, &updated, comparison.next_requirements, null);
+        return updated;
+    }
 
     if (table.read_schema_json.len == 0) {
         const normalized_read_schema_json = if (table.schema_json.len > 0)
@@ -1770,7 +1775,79 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
     const next_indexes_json = try upsertVersionedFullTextIndex(alloc, updated.indexes_json, current_version, next_version, pinned_incarnation);
     alloc.free(updated.indexes_json);
     updated.indexes_json = next_indexes_json;
+    try refreshSchemaReaderRequirements(alloc, &updated, comparison.next_requirements, if (table.read_schema_json.len == 0) comparison.previous_requirements else null);
     return updated;
+}
+
+/// Marked definitions must not carry a predecessor's reader requirements
+/// through ALTER or migration preparation. Do not activate legacy/unmarked
+/// producers here: publication still needs its atomic decoder/owner barriers.
+fn refreshSchemaReaderRequirements(alloc: std.mem.Allocator, table: *metadata_table_manager.TableRecord, active: runtime_schema_mod.ReaderRequirements, prepared_read: ?runtime_schema_mod.ReaderRequirements) !void {
+    if (table.schema_reader_requirements == null) return;
+    var floor = try (runtime_schema_mod.ReaderFloor{}).include(active);
+    if (table.read_schema_json.len != 0) {
+        const read = prepared_read orelse try schema_mod.readerRequirementsForDefinitions(alloc, table.read_schema_json, "");
+        floor = try floor.include(read);
+    }
+    table.schema_reader_requirements = .{ .semantic_version = floor.semantic_version, .encoding_version = floor.encoding_version };
+}
+
+test "system catalog schema reader table updates derive active and retained requirements" {
+    const a = std.testing.allocator;
+    const baseline =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const arrays =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"values":{"type":"sql_array","x-antfly-sql-type":"jsonb","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "rows",
+        .schema_json = baseline,
+        .schema_reader_requirements = .{ .semantic_version = 14, .encoding_version = 31 },
+    };
+    const next = try applySchemaUpdateRecord(a, &table, arrays);
+    defer metadata_table_manager.freeTable(a, next);
+    try std.testing.expectEqual(@as(u32, 31), next.schema_reader_requirements.?.semantic_version);
+    try std.testing.expectEqual(@as(u32, 31), next.schema_reader_requirements.?.encoding_version);
+    try std.testing.expectEqual(@as(u32, 2), try schemaVersion(next.schema_json));
+    try std.testing.expectEqual(@as(u32, 1), try schemaVersion(next.read_schema_json));
+    // Even a semantically unchanged active definition must retain the older
+    // read layout's requirements; its active columns alone are insufficient.
+    var retained = table;
+    retained.read_schema_json = arrays;
+    const unchanged = try applySchemaUpdateRecord(a, &retained, baseline);
+    defer metadata_table_manager.freeTable(a, unchanged);
+    try std.testing.expectEqual(@as(u32, 31), unchanged.schema_reader_requirements.?.semantic_version);
+    var unmarked = table;
+    unmarked.schema_reader_requirements = null;
+    const legacy = try applySchemaUpdateRecord(a, &unmarked, arrays);
+    defer metadata_table_manager.freeTable(a, legacy);
+    try std.testing.expect(legacy.schema_reader_requirements == null);
+}
+
+test "system catalog schema reader table finalization derives only the acknowledged active layout" {
+    const a = std.testing.allocator;
+    const source: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "rows",
+        .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}",
+        .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"values\":{\"type\":\"sql_array\",\"x-antfly-sql-type\":\"jsonb\",\"nullable\":true}},\"additionalProperties\":false}}}}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .schema_reader_requirements = .{ .semantic_version = 31, .encoding_version = 31 },
+    };
+    var table = try metadata_table_manager.cloneTable(a, source);
+    defer metadata_table_manager.freeTable(a, table);
+    try @import("../metadata/schema_migration_finalization.zig").apply(a, &table);
+    try std.testing.expectEqualStrings("", table.read_schema_json);
+    // The active full-text layout retains declared paths (reader v14), even
+    // though the relational columns alone would only require reader v13.
+    try std.testing.expectEqual(@as(u32, 14), table.schema_reader_requirements.?.semantic_version);
+    try std.testing.expectEqual(@as(u32, 31), table.schema_reader_requirements.?.encoding_version);
+    var indexes = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
+    defer indexes.deinit();
+    try std.testing.expect(indexes.value.object.get("full_text_index_v1") == null);
+    try std.testing.expect(indexes.value.object.get("full_text_index_v2") != null);
 }
 
 /// A regular schema update cannot publish a new child FK identity before its
@@ -1813,6 +1890,34 @@ pub fn foreignKeyDefinitionsUnchanged(alloc: std.mem.Allocator, previous_json: [
         next_count += 1;
     };
     return prior_count == next_count;
+}
+
+test "relational declarations metadata CHECK validity admission precedes catalog publication" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gte","value":0,"not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = json, .indexes_json = "{}" };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const a = parsed.arena.allocator();
+    const check = &parsed.value.object.getPtr("checks").?.array.items[0];
+    try check.object.put(a, "not_valid", .{ .bool = false });
+    const validated = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    try std.testing.expectError(error.CheckConstraintValidationRequired, applySchemaUpdateRecord(alloc, &table, validated));
+    const candidate = try prepareSchemaRewriteRecord(alloc, &table, validated);
+    defer metadata_table_manager.freeTable(alloc, candidate);
+    try std.testing.expectEqual(@as(u32, 2), try schemaVersion(candidate.schema_json));
+    // Names and omitted default spelling are not historical authority either.
+    try check.object.put(a, "name", .{ .string = "renamed" });
+    _ = check.object.orderedRemove("not_valid");
+    const renamed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    try std.testing.expectError(error.CheckConstraintValidationRequired, applySchemaUpdateRecord(alloc, &table, renamed));
+    try check.object.put(a, "not_valid", .{ .bool = true });
+    const still_deferred = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    const updated = try applySchemaUpdateRecord(alloc, &table, still_deferred);
+    defer metadata_table_manager.freeTable(alloc, updated);
+    try std.testing.expectEqual(@as(u32, 2), try schemaVersion(updated.schema_json));
 }
 
 test "ordinary schema update rejects unacknowledged FK generation but permits unrelated columns" {
@@ -3203,12 +3308,18 @@ fn compileRuntimeSchemaJsonForVersion(
 }
 
 fn compileRuntimeSchemaJson(alloc: std.mem.Allocator, schema_json: []const u8) ![]u8 {
-    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer runtime_schema_mod.freeSchema(alloc, runtime_schema);
+    return (try compileRuntimeSchemaJsonWithRequirements(alloc, schema_json)).json;
+}
 
-    return try runtimeSchemaJsonAlloc(alloc, runtime_schema);
+const CompiledRuntimeDefinition = struct {
+    json: []u8,
+    requirements: runtime_schema_mod.ReaderRequirements,
+};
+
+fn compileRuntimeSchemaJsonWithRequirements(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledRuntimeDefinition {
+    var prepared = try schema_mod.PreparedSchemaDefinition.init(alloc, schema_json);
+    defer prepared.deinit(alloc);
+    return .{ .json = try runtimeSchemaJsonAlloc(alloc, prepared.runtime_schema), .requirements = prepared.readerRequirements() };
 }
 
 fn runtimeSchemaJsonAlloc(
@@ -3596,6 +3707,16 @@ pub fn schemaVersion(schema_json: []const u8) !u32 {
 }
 
 pub fn schemasSemanticallyEqual(alloc: std.mem.Allocator, current_schema_json: []const u8, next_schema_json: []const u8) !bool {
+    return (try compareSchemaDefinitions(alloc, current_schema_json, next_schema_json)).equal;
+}
+
+const SchemaComparison = struct {
+    equal: bool,
+    next_requirements: runtime_schema_mod.ReaderRequirements,
+    previous_requirements: ?runtime_schema_mod.ReaderRequirements = null,
+};
+
+fn compareSchemaDefinitions(alloc: std.mem.Allocator, current_schema_json: []const u8, next_schema_json: []const u8) !SchemaComparison {
     // Version is backend-owned, so derive both schemas at the same synthetic
     // generation and compare their canonical runtime behavior. This treats
     // omitted fields and their explicit defaults as equal, ignores object key
@@ -3605,29 +3726,32 @@ pub fn schemasSemanticallyEqual(alloc: std.mem.Allocator, current_schema_json: [
     const next_normalized = try normalizeSchemaVersion(alloc, next_schema_json, 0);
     defer alloc.free(next_normalized);
 
-    const next_runtime_json = try compileRuntimeSchemaJson(alloc, next_normalized);
-    defer alloc.free(next_runtime_json);
-    const current_runtime_json = compileRuntimeSchemaJson(alloc, current_normalized) catch |err| switch (err) {
+    const next_definition = try compileRuntimeSchemaJsonWithRequirements(alloc, next_normalized);
+    defer alloc.free(next_definition.json);
+    var result: SchemaComparison = .{ .equal = false, .next_requirements = next_definition.requirements };
+    const current_definition = compileRuntimeSchemaJsonWithRequirements(alloc, current_normalized) catch |err| switch (err) {
         // Let a valid update repair catalog state written by an older schema
         // implementation. Allocation failure remains operational and must not
         // be mistaken for a semantic difference.
         error.OutOfMemory => return err,
-        else => return false,
+        else => return result,
     };
-    defer alloc.free(current_runtime_json);
+    defer alloc.free(current_definition.json);
+    result.previous_requirements = current_definition.requirements;
 
-    if (!try sourceSchemasSemanticallyEqual(alloc, current_normalized, next_normalized)) return false;
+    if (!try sourceSchemasSemanticallyEqual(alloc, current_normalized, next_normalized)) return result;
 
-    var current = try json_helpers.parseJsonValueAlloc(alloc, current_runtime_json);
+    var current = try json_helpers.parseJsonValueAlloc(alloc, current_definition.json);
     defer current.deinit();
-    var next = try json_helpers.parseJsonValueAlloc(alloc, next_runtime_json);
+    var next = try json_helpers.parseJsonValueAlloc(alloc, next_definition.json);
     defer next.deinit();
 
     const current_canonical = try canonicalSchemaJsonAlloc(alloc, current.value, null, .runtime);
     defer alloc.free(current_canonical);
     const next_canonical = try canonicalSchemaJsonAlloc(alloc, next.value, null, .runtime);
     defer alloc.free(next_canonical);
-    return std.mem.eql(u8, current_canonical, next_canonical);
+    result.equal = std.mem.eql(u8, current_canonical, next_canonical);
+    return result;
 }
 
 const CanonicalSchemaKind = enum {

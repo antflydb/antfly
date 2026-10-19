@@ -25,6 +25,8 @@ const RelationalRows = @import("relational_rows.zig");
 const platform_time = @import("antfly_platform").time;
 
 pub const Session = struct {
+    normalization_only: bool = false,
+    require_normalized_visibility: bool = false,
     row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
     range_proofs: ?[]@import("../range_protection.zig").Proof = null,
     page_bytes: usize = 16 * 1024 * 1024,
@@ -60,6 +62,7 @@ pub const Session = struct {
     pub fn nextTypedPage(session: *Session, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget) !RelationalRows.Page {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionNextTypedPage", .{ session, alloc, io, budget });
         try session.checkpoint();
+        if (session.normalization_only) return error.RowPolicyAuthenticationRequired;
         var bounded = budget;
         bounded.target_bytes = @min(bounded.output_bytes, if (bounded.target_bytes == 0) session.page_bytes else @min(bounded.target_bytes, session.page_bytes));
         var page = try session.reader.nextTypedPage(alloc, io, bounded);
@@ -100,15 +103,22 @@ pub const Session = struct {
             if (output_bytes > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
             const key = try alloc.dupe(u8, write.key);
             errdefer alloc.free(key);
-            // Generated values can replace a submitted literal JSON null
-            // with SQL NULL. Return provenance from the prepared authority.
+            // Defaults/generated values can both create and retire JSON null
+            // datums. Derive provenance from actual prepared cells, not the
+            // submitted marker list. Iterate present cells once (including
+            // sparse rows); never parse JSON or scan absent schema columns.
             const typed = try prepared.typedView(view.tableSchema().*, view.physicalLayout());
+            if (session.require_normalized_visibility) if (session.reader.row_filter) |filter| {
+                if (!try filter.matchesRow(alloc, write.key, typed)) return error.RowPolicyDenied;
+            };
             var null_names = std.ArrayListUnmanaged([]const u8).empty;
             defer null_names.deinit(alloc);
-            for (write.json_null_fields) |name| {
-                const ordinal = typed.ordinalForName(name) orelse return error.InvalidBatchRequest;
-                const cell = (try typed.findCell(ordinal)) orelse continue;
-                if (!cell.is_null) try null_names.append(alloc, name);
+            var cells = try typed.cellIterator();
+            while (try cells.next()) |cell| {
+                const column = typed.table_schema.relational_columns[cell.ordinal];
+                if (column.is_json and column.json_kind == .any and !cell.is_null and
+                    std.mem.eql(u8, cell.value.bytes_val, "null"))
+                    try null_names.append(alloc, column.name);
             }
             const nulls = try types.cloneJsonNullFields(alloc, null_names.items);
             out.* = .{ .key = key, .value = value, .json_null_fields = nulls };

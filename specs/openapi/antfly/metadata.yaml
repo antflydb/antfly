@@ -1789,12 +1789,15 @@ components:
       additionalProperties: false
       required: [database, namespace, table, table_id, schema_version, state]
       description: |
-        Durable DDL declaration receipt. admission_unknown means admission has
-        not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
-        Pending or invalid means the declaration
-        committed but validation has not established an active constraint. Do not
-        replay it. Inspect table constraint status using this immutable table
-        identity and schema generation; a later generation supersedes this receipt.
+        Durable DDL operation receipt. admission_unknown means admission has
+        not been confirmed; retain the matching restore job, FK publication ID, or
+        index publication token and reconcile its status without replaying DDL.
+        Pending means a durable operation was admitted, not necessarily that its
+        successor schema is published. Invalid means declaration validation failed.
+        Do not replay either. For an index build, observe the exact publication
+        token; otherwise inspect its restore job or table constraint status using
+        this immutable table identity and schema generation. A later generation
+        may supersede the completed operation.
       properties:
         database:
           type: string
@@ -1818,6 +1821,12 @@ components:
         idempotency_key:
           type: string
           description: Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL.
+        fk_generation_publication_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+          description: Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL.
+        index_publication_token:
+          $ref: "indexes.yaml#/components/schemas/IndexPublicationToken"
     SQLDiagnostic:
       type: object
       additionalProperties: false
@@ -5132,6 +5141,8 @@ components:
         - status
         - shard_status
       properties:
+        publication:
+          $ref: "indexes.yaml#/components/schemas/IndexPublicationStatus"
         shard_status:
           type: object
           additionalProperties:
@@ -13808,13 +13819,18 @@ paths:
       tags:
         - data_operations
       description: |
-        Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
-        subset through the current catalog and native row execution contracts.
-        Parameters are bound separately from statement text. Document, graph,
-        and lake SQL sources, DDL, and SQL sessions are not yet supported.
-        Reads inherit native owner-local consistency, not a global SQL
-        transaction snapshot. Statements requiring a retained multi-page
-        statement snapshot fail when that capability is unavailable.
+        Executes supported SQL statements through the current catalog and native
+        execution contracts. Stored views use CREATE [OR REPLACE] VIEW,
+        ALTER VIEW RENAME TO, and DROP VIEW [CASCADE | RESTRICT] on this same
+        endpoint. Views retain durable source identities; owner/invoker access
+        reuses native row policies and caller/owner filters without changing
+        the caller's SQL identity. Document fields can be projected with
+        jsonb_to_record and declared SQL types, including typed arrays.
+        Parameters are bound separately from statement text. Source, DDL,
+        session, and transaction capabilities are checked explicitly; not every
+        PostgreSQL statement or cross-source transaction is supported.
+        Reads require the native retained statement-snapshot capabilities of
+        their sources, not an implied global SQL transaction snapshot.
         Unsupported statement shapes fail explicitly; the server never
         silently substitutes a different query or truncates the result.
       operationId: executeSQL
@@ -16605,6 +16621,51 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
 
+  /tables/{tableName}/indexes/{indexName}/publication:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: indexName
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      summary: Observe an exact index publication
+      description: >-
+        Requires administration of the current logical table and the retained
+        recovery token. This read never replays DDL. Unknown admission remains
+        unknown, including after an absent or unmirrored observation. Published
+        is historical job completion, not current index query readiness.
+      tags: [index_management]
+      operationId: getIndexPublication
+      parameters:
+        - name: X-Antfly-Index-Publication-Token
+          in: header
+          required: true
+          schema:
+            $ref: "indexes.yaml#/components/schemas/IndexPublicationToken"
+      responses:
+        "200":
+          description: Exact read-only publication observation
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexPublicationStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Current logical table administration is required
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Table identity, publication identity or metadata incarnation changed
+        "426":
+          description: Authoritative relation ownership is not supported by the metadata owner
+        "503":
+          description: Metadata observation is unavailable; retain the token and retry this read
+
   /sources:
     get:
       summary: List saved query sources
@@ -17804,6 +17865,58 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "501":
           description: Catalog target cannot be delegated to legacy table storage unambiguously.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: indexName
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      summary: Observe an exact index publication in an explicit namespace
+      description: >-
+        Requires administration of the current logical table and its retained
+        recovery token. Unknown admission is not permission to replay DDL;
+        published is historical job completion, not current index query readiness.
+      tags: [index_management]
+      operationId: getNamespaceTableIndexPublication
+      parameters:
+        - name: X-Antfly-Index-Publication-Token
+          in: header
+          required: true
+          schema:
+            $ref: "indexes.yaml#/components/schemas/IndexPublicationToken"
+      responses:
+        "200":
+          description: Exact read-only publication observation
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexPublicationStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Current logical table administration is required
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Table identity, publication identity or metadata incarnation changed
+        "426":
+          description: Authoritative relation ownership is not supported by the metadata owner
+        "503":
+          description: Metadata observation is unavailable; retain the token and retry this read
 
   /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status:
     parameters:

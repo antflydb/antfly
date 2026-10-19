@@ -20,6 +20,7 @@ const compiler = @import("antfly_local_sources").sql_compiler;
 const runtime = @import("antfly_local_sources").sql_runtime;
 
 const Fixture = struct {
+    expected_n: i64 = 9007199254740993,
     calls: usize = 0,
     rows: usize = 0,
     json_null_fields_expected: usize = 1,
@@ -42,7 +43,7 @@ const Fixture = struct {
         self.rows = mutations.len;
         for (mutations) |mutation| {
             try std.testing.expectEqual(@as(u64, 0), mutation.expected_version);
-            try std.testing.expectEqual(@as(i64, 9007199254740993), mutation.row.?.object.get("n").?.integer);
+            try std.testing.expectEqual(self.expected_n, mutation.row.?.object.get("n").?.integer);
             if (mutation.row.?.object.get("j")) |json| {
                 try std.testing.expect(json == .null);
                 try std.testing.expectEqual(self.json_null_fields_expected, mutation.json_null_fields.len);
@@ -122,6 +123,58 @@ test "SQL INSERT SELECT retains typed exact integers and JSON null across set so
     }
 }
 
+test "SQL numeric source assignment preserves real precision at the storage boundary" {
+    const Numeric = struct {
+        calls: usize = 0,
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }} };
+        }
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("1.23457", mutations[0].row.?.object.get("n").?.string);
+            return .committed;
+        }
+    };
+    for ([_][]const u8{ "INSERT INTO items (_id,n) SELECT 'a','1.23456789'::real", "INSERT INTO items (_id,n) VALUES ('a','1.23456789'::real)" }) |sql| {
+        var fixture: Numeric = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &.{ .resolve = Numeric.resolve, .scan = Fixture.scan, .mutate = Numeric.mutate, .checkpoint = Fixture.checkpoint } }, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
+}
+
+test "SQL numeric source assignment rounds exactly and range checks before atomic mutation" {
+    for ([_]struct { sql: []const u8, expected: i64 }{
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',9007199254740992.5::numeric", .expected = 9007199254740993 },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',9007199254740992.5::numeric)", .expected = 9007199254740993 },
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',1.5", .expected = 2 },
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',-1.5", .expected = -2 },
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',2.5::double precision", .expected = 2 },
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',2.5::real", .expected = 2 },
+    }) |sql| {
+        var fixture: Fixture = .{ .expected_n = sql.expected };
+        var rounded = try compiler.compile(std.testing.allocator, sql.sql, .{});
+        defer rounded.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), &rounded, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
+    for ([_]struct { sql: []const u8, err: anyerror }{
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',9007199254740993::numeric UNION ALL SELECT 'b',18446744073709551614::numeric", .err = error.InvalidSqlNumber },
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',SUM(n) FROM (VALUES (9223372036854775807::bigint),(9223372036854775807::bigint)) v(n)", .err = error.InvalidSqlNumber },
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a','NaN'::numeric", .err = error.SqlFeatureNotSupported },
+    }) |sql| {
+        var failing: Fixture = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(sql.err, runtime.execute(std.testing.allocator, failing.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), failing.calls);
+    }
+}
+
 test "SQL INSERT source type boundaries reject unknown text before any mutation" {
     for ([_][]const u8{
         "INSERT INTO items (_id,n,j) SELECT 'a',COALESCE($1,NULL),CAST('null' AS json)",
@@ -145,7 +198,6 @@ test "SQL INSERT SELECT validates complete source and never commits partial data
         .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',NULL", .err = error.SqlNotNullViolation },
         .{ .sql = "INSERT INTO items (_id,n) SELECT 'a','123'", .err = error.SqlTypeMismatch },
         .{ .sql = "INSERT INTO items (_id,n) SELECT 'a','123' WHERE FALSE", .err = error.SqlTypeMismatch },
-        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',1.5", .err = error.SqlTypeMismatch },
         .{ .sql = "INSERT INTO items (_id,n) SELECT 'a'", .err = error.InvalidSqlParameters },
         .{ .sql = "INSERT INTO items (_id,n,j) SELECT 'a',1,CAST(NULL AS TEXT) WHERE FALSE", .err = error.SqlTypeMismatch },
     };

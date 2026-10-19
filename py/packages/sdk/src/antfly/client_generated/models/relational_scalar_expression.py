@@ -27,8 +27,25 @@ class RelationalScalarExpression:
     division truncates toward zero. Overflow and division by zero reject
     the write. Arithmetic and string operations propagate null. ASCII case
     operations leave non-ASCII bytes unchanged. No volatile functions are
-    accepted. Allocated results are bounded to 1 MiB each. Allocations
-    and byte-comparison operand work share a 4 MiB evaluation budget per
+    accepted. Allocated results are bounded to 1 MiB each.
+    The replace operation takes three text arguments and performs literal,
+    non-overlapping replacement; an empty search string leaves the input
+    unchanged. md5 takes one text argument and returns 32 lowercase hex
+    characters (a SQL compatibility fingerprint, not a security primitive).
+    Both are strict in SQL NULL and require reader capability version 27,
+    including when nested inside scalar/boolean expressions. Literal search
+    patterns are prepared with immutable plans; matching, copies and dynamic
+    pattern preparation share invocation work/cancellation admission.
+    Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require
+    reader capability version 28, even when nested in boolean programs.
+    They take one NUMERIC or float64 argument; abs also preserves integer
+    widths and float32. round and trunc optionally accept an int32 scale
+    as a second argument only for NUMERIC. Operands must already have their
+    resolved SQL types; SQL lowering inserts required promotions. NUMERIC
+    round uses ties away from zero; float64 round uses ties to even. All
+    selected arguments evaluate before strict NULL propagation. NUMERIC
+    execution never converts through float and shares invocation admission.
+    Allocations and byte-comparison operand work share a 4 MiB evaluation budget per
     row and expression set. An integer literal may use a decimal string
     for exact int64 transport; blob uses base64 and datetime uses the
     normal relational datetime representation.
@@ -94,6 +111,15 @@ class RelationalScalarExpression:
     A matching candidate wins over NULL candidates; otherwise a NULL
     candidate makes the result UNKNOWN. These operations require schema
     capability version 19.
+    JSON expressions require reader capability version 30. The json type
+    carries JSONB semantics, including exact numeric values and display
+    scale. jsonb_typeof and jsonb_array_length take one JSON argument;
+    array length rejects a non-array value. jsonb_extract_path and
+    jsonb_extract_path_text take a JSON argument followed by 1 to 31 text
+    path components. Negative array ordinals count from the end; a missing
+    path returns SQL NULL. JSON extraction retains JSON null; text extraction
+    converts JSON null to SQL NULL. Arguments are evaluated strictly, while
+    enclosing CASE/coalesce retain their short-circuit semantics.
 
         Attributes:
             op (RelationalExpressionOp):
@@ -119,6 +145,9 @@ class RelationalScalarExpression:
             numeric_modifier (SQLNumericModifier | Unset): PostgreSQL NUMERIC precision and signed scale. For arrays this
                 describes every element, not dimensions. Absent means unconstrained NUMERIC.
             value (Any | Unset): Typed literal value, including null.
+            json_null (bool | Unset): For a literal of type json only. True denotes present JSON null and requires value to
+                be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives
+                SDKs that omit optional null values. Requires reader capability version 30.
             column (str | Unset):
             collation (str | Unset): Optional binary or ASCII case-insensitive collation for string comparisons and in_list;
                 aliases match ordered indexes.
@@ -130,6 +159,7 @@ class RelationalScalarExpression:
     sql_type: SQLBuiltinType | Unset = UNSET
     numeric_modifier: SQLNumericModifier | Unset = UNSET
     value: Any | Unset = UNSET
+    json_null: bool | Unset = UNSET
     column: str | Unset = UNSET
     collation: str | Unset = UNSET
     args: list[RelationalScalarExpression] | Unset = UNSET
@@ -150,6 +180,8 @@ class RelationalScalarExpression:
             numeric_modifier = self.numeric_modifier.to_dict()
 
         value = self.value
+
+        json_null = self.json_null
 
         column = self.column
 
@@ -177,6 +209,8 @@ class RelationalScalarExpression:
             field_dict["numeric_modifier"] = numeric_modifier
         if value is not UNSET:
             field_dict["value"] = value
+        if json_null is not UNSET:
+            field_dict["json_null"] = json_null
         if column is not UNSET:
             field_dict["column"] = column
         if collation is not UNSET:
@@ -216,6 +250,8 @@ class RelationalScalarExpression:
 
         value = d.pop("value", UNSET)
 
+        json_null = d.pop("json_null", UNSET)
+
         column = d.pop("column", UNSET)
 
         collation = d.pop("collation", UNSET)
@@ -235,6 +271,7 @@ class RelationalScalarExpression:
             sql_type=sql_type,
             numeric_modifier=numeric_modifier,
             value=value,
+            json_null=json_null,
             column=column,
             collation=collation,
             args=args,

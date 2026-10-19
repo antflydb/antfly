@@ -33,10 +33,16 @@ const range_state = @import("range_state.zig");
 const ttl = @import("../ttl.zig");
 const predicates = @import("relational_predicate.zig");
 const row_cursor_codec = @import("relational_row_cursor.zig");
+const nullability = @import("relational_nullability.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Value = tuples.Value;
 pub const Condition = predicates.Condition;
+pub const ExpressionEquality = struct {
+    identity: @import("../relational_index.zig").ExpressionKeyIdentity,
+    fold_ascii: bool = false,
+    value: Value,
+};
 /// Bounds use index order, including descending components. A partial tuple
 /// denotes the whole matching left prefix, not an implicit NULL suffix.
 pub const Bound = struct { values: []const Value, inclusive: bool = true };
@@ -75,6 +81,9 @@ pub const Request = struct {
     fields: []const []const u8 = &.{},
     /// Conjunction of typed comparisons; SQL UNKNOWN does not match WHERE.
     conditions: []const Condition = &.{},
+    /// Access hints only. Caller-owned residual predicates remain required on
+    /// both index and primary fallback paths; these never certify membership.
+    expression_equalities: []const ExpressionEquality = &.{},
 };
 
 pub const Budget = struct {
@@ -126,6 +135,40 @@ pub const Page = struct {
     }
 };
 
+/// Read-side work only, never authenticated schema-publication authority.
+/// At most one row is returned: the first violation, with an empty projection
+/// and its owned key. An empty page with more=true is unfinished coverage.
+pub const NullabilityPage = struct {
+    page: Page,
+    rows_examined: usize,
+    violation_column: ?usize,
+    /// Owned physical continuation, valid through deinit. It is not an
+    /// authenticated source cut or permission to skip a durable prefix.
+    after: []const u8,
+
+    pub fn deinit(self: *NullabilityPage) void {
+        self.page.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const NullabilityResume = struct { projection_identity: [32]u8, after: []const u8 };
+
+/// A bounded replay assertion, never proof of coverage by itself. The reader
+/// independently visits the prefix and compares every field before advancing.
+pub const NullabilityReplayBoundary = @import("relational_schema_owner_contract.zig").NullabilityReplayBoundary;
+
+test "relational rows snapshot exact point successor comparison handles descending suffixes without allocation" {
+    try std.testing.expect(Reader.exclusiveSuccessor("abc", "abd"));
+    try std.testing.expect(Reader.exclusiveSuccessor("abc\xff\xff", "abd"));
+    try std.testing.expect(Reader.exclusiveSuccessor("\x00\xff", "\x01"));
+    try std.testing.expect(!Reader.exclusiveSuccessor("", ""));
+    try std.testing.expect(!Reader.exclusiveSuccessor("\xff\xff", ""));
+    try std.testing.expect(!Reader.exclusiveSuccessor("abc", "abc"));
+    try std.testing.expect(!Reader.exclusiveSuccessor("abc", "abe"));
+    try std.testing.expect(!Reader.exclusiveSuccessor("abc", "abd\x00"));
+}
+
 pub const Reader = struct {
     row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     alloc: Allocator,
@@ -137,6 +180,9 @@ pub const Reader = struct {
     planner_candidates: usize = 0,
     planner_records: usize = 0,
     index: ?plans.BoundIndex,
+    /// Full-tuple equality selected on this retained snapshot, never a prefix
+    /// or a caller assertion. Borrows the reader-owned physical lower bound.
+    exact_index_tuple: ?[]const u8 = null,
     lower: []const u8,
     upper: []const u8,
     owned_lower: []const u8,
@@ -168,6 +214,27 @@ pub const Reader = struct {
     failed_row: ?Row = null,
     after: std.ArrayList(u8) = .empty,
     done: bool = false,
+    /// A retained cursor cannot mix query visibility or another projection
+    /// into a partially completed physical validation scan.
+    nullability_projection: ?[32]u8 = null,
+    nullability_failed: bool = false,
+
+    const NullabilityVisit = struct {
+        plan: *const nullability.Plan,
+        control: nullability.Control,
+        rows_examined: usize = 0,
+        violation_column: ?usize = null,
+        after: []const u8 = "",
+        replay: ?NullabilityReplayBoundary = null,
+
+        fn verify(self: *const @This(), record_count: usize, more: bool) !void {
+            if (self.replay) |expected| {
+                if (record_count != expected.records_examined or self.rows_examined != expected.rows_examined or
+                    self.violation_column != expected.violation_column or more != expected.more or
+                    !std.mem.eql(u8, self.after, expected.after)) return error.InvalidNullabilityReplay;
+            }
+        }
+    };
 
     const SourceBinding = struct {
         arena: std.heap.ArenaAllocator,
@@ -205,7 +272,7 @@ pub const Reader = struct {
         errdefer read.abort();
         if (active_view.storageMode() != .relational) return error.RelationalTableRequired;
         if (request.expected_schema_version) |version| if (version != active_view.version()) return error.PreparedGenerationChanged;
-        if (request.fields.len > 256 or request.conditions.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))
+        if (request.fields.len > 256 or request.conditions.len > 256 or request.expression_equalities.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))
             return error.InvalidRelationalRowsRequest;
         if (request.index != null and (request.primary_lower != null or request.primary_upper != null)) return error.InvalidRelationalRowsRequest;
         if (request.after != null and request.index == null) return error.InvalidRelationalRowsRequest;
@@ -229,6 +296,7 @@ pub const Reader = struct {
         var lower: []const u8 = owned_lower;
         var upper: []const u8 = owned_upper;
         var selected_index: ?plans.BoundIndex = null;
+        var full_tuple_equality = false;
         var cursor_identity: ?[row_cursor_codec.identity_len]u8 = null;
         if (request.primary_lower) |bound| {
             const prefix = try internal.documentExactPrefixAlloc(owned, bound.key);
@@ -264,6 +332,10 @@ pub const Reader = struct {
                 const requested = (try internal.nextPrefixAlloc(owned, key)) orelse return error.InvalidRelationalRowsRequest;
                 if (std.mem.order(u8, requested, lower) == .gt) lower = requested;
             }
+            full_tuple_equality = request.after == null and request.lower != null and request.upper != null and
+                request.lower.?.inclusive and request.upper.?.inclusive and
+                request.lower.?.values.len == selected_index.?.tuple.keys.len and
+                request.upper.?.values.len == selected_index.?.tuple.keys.len;
         }
         const conditions = try alloc.alloc(predicates.Plan, request.conditions.len);
         var initialized: usize = 0;
@@ -293,6 +365,13 @@ pub const Reader = struct {
                 const implication = try owned.alloc(bool, conditions.len);
                 const KeyConditions = struct { equality: ?Value = null, has_range: bool = false };
                 var keyed: std.AutoHashMapUnmanaged(u64, KeyConditions) = .empty;
+                const ExpressionKey = struct { identity: @import("../relational_index.zig").ExpressionKeyIdentity, fold_ascii: bool };
+                var expression_keyed: std.AutoHashMapUnmanaged(ExpressionKey, Value) = .empty;
+                try expression_keyed.ensureTotalCapacity(owned, @intCast(request.expression_equalities.len));
+                for (request.expression_equalities) |hint| {
+                    const entry = expression_keyed.getOrPutAssumeCapacity(.{ .identity = hint.identity, .fold_ascii = hint.fold_ascii });
+                    if (!entry.found_existing) entry.value_ptr.* = hint.value;
+                }
                 try keyed.ensureTotalCapacity(owned, @intCast(conditions.len));
                 for (request.conditions, conditions) |condition, compiled| {
                     const identity = @as(u64, compiled.tuple.keys[0].ordinal) * 2 + @intFromBool(compiled.tuple.keys[0].fold_ascii);
@@ -313,9 +392,13 @@ pub const Reader = struct {
                     var equality_count: usize = 0;
                     var candidate_values: [32]Value = @splat(.null);
                     for (candidate.tuple.keys) |key| {
-                        if (equality_count == candidate_values.len or key.expression != null) break;
-                        const operand = keyed.get(@as(u64, key.ordinal) * 2 + @intFromBool(key.fold_ascii)) orelse break;
-                        candidate_values[equality_count] = operand.equality orelse break;
+                        if (equality_count == candidate_values.len) break;
+                        candidate_values[equality_count] = if (key.expression) |expression|
+                            expression_keyed.get(.{ .identity = .{ .fingerprint = expression.plan.fingerprint, .kind = key.column_type, .builtin = expression.plan.result_sql_type }, .fold_ascii = key.fold_ascii }) orelse break
+                        else blk: {
+                            const operand = keyed.get(@as(u64, key.ordinal) * 2 + @intFromBool(key.fold_ascii)) orelse break;
+                            break :blk operand.equality orelse break;
+                        };
                         equality_count += 1;
                     }
                     var has_range = false;
@@ -402,6 +485,7 @@ pub const Reader = struct {
                         const bounds = try candidate.bounds(owned, request.conditions, conditions);
                         lower = bounds.lower;
                         upper = bounds.upper;
+                        full_tuple_equality = candidate.equality_count == candidate.index.tuple.keys.len and !candidate.has_range;
                     }
                 }
             }
@@ -422,6 +506,7 @@ pub const Reader = struct {
                 };
             } else index_only = false;
         }
+        const exact_index_tuple = if (full_tuple_equality) try exactTuple(selected_index.?, lower, upper) else null;
         return .{
             .alloc = alloc,
             .arena = arena,
@@ -431,6 +516,7 @@ pub const Reader = struct {
             .planner_candidates = planner_candidates,
             .planner_records = planner_records,
             .index = selected_index,
+            .exact_index_tuple = exact_index_tuple,
             .lower = lower,
             .upper = upper,
             .owned_lower = owned_lower,
@@ -493,6 +579,24 @@ pub const Reader = struct {
             return .{ .lower = lower, .upper = upper };
         }
     };
+
+    fn exactTuple(index: plans.BoundIndex, lower: []const u8, upper: []const u8) !?[]const u8 {
+        const prefix = try records.forwardPrefix(index.id());
+        if (lower.len <= prefix.len or !std.mem.startsWith(u8, lower, &prefix) or !exclusiveSuccessor(lower, upper)) return null;
+        return lower[prefix.len..];
+    }
+
+    fn exclusiveSuccessor(lower: []const u8, upper: []const u8) bool {
+        // Compare nextPrefix(lower) without allocating another potentially
+        // wide tuple. Full-key arity is proven separately by the bound plan.
+        var length = lower.len;
+        while (length != 0) : (length -= 1) {
+            const ordinal = length - 1;
+            if (lower[ordinal] == 255) continue;
+            return upper.len == length and std.mem.eql(u8, lower[0..ordinal], upper[0..ordinal]) and upper[ordinal] == lower[ordinal] + 1;
+        }
+        return false;
+    }
 
     fn boundKey(alloc: Allocator, index: plans.BoundIndex, bound: Bound, upper: bool) ![]const u8 {
         var key = std.ArrayList(u8).empty;
@@ -648,8 +752,9 @@ pub const Reader = struct {
     /// cancellation, or corrupt row cannot silently consume part of the result.
     pub fn nextPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderNextPage", .{ self, alloc, io, budget });
+        if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
-        var page = try self.nextPageFormat(alloc, io, budget, false);
+        var page = try self.nextPageFormat(alloc, io, budget, false, null);
         errdefer page.deinit();
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         return page;
@@ -659,6 +764,7 @@ pub const Reader = struct {
     /// and cached source-layout projection. Ranked queries must retain native
     /// SQL-null provenance rather than round-tripping through public JSON.
     pub fn lookupTypedRow(self: *Reader, alloc: Allocator, document: []const u8) !?Row {
+        if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, false, null });
         return self.lookupRowFormat(alloc, document, false, null);
     }
@@ -779,6 +885,7 @@ pub const Reader = struct {
     }
 
     fn lookupRowFormat(self: *Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
+        if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
         if (self.index != null) return error.InvalidRelationalRowsRequest;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -831,19 +938,100 @@ pub const Reader = struct {
 
     pub fn nextTypedPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderNextTypedPage", .{ self, alloc, io, budget });
+        if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
-        var page = try self.nextPageFormat(alloc, io, budget, true);
+        var page = try self.nextPageFormat(alloc, io, budget, true, null);
         errdefer page.deinit();
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         return page;
     }
 
-    fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool) !Page {
+    /// Scan every physical primary in the owned range, including TTL-hidden
+    /// rows, through the same snapshot/cursor machinery as ordinary reads.
+    /// RLS leases, predicates, custom filters, bounds and payload projections
+    /// cannot masquerade as owner coverage. Caller independently proves the
+    /// durable fence/drain and source cut before persisting any progress.
+    /// Time limits slice read preparation only; replicated progress must bind
+    /// its exact cursor/count, not recompute a wall-time stopping decision.
+    pub fn nextNullabilityPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *const nullability.Plan, control: nullability.Control) !NullabilityPage {
+        return self.nextNullabilityPageMode(alloc, io, budget, plan, control, null);
+    }
+
+    /// Re-execute a recorded prefix without a wall-time stopping decision.
+    /// Record limits and cancellation stay active. EOF claims permit one extra
+    /// bounded probe; stopping at N records alone cannot certify EOF after N.
+    pub fn nextNullabilityReplayPage(self: *Reader, alloc: Allocator, io: ?std.Io, expected: NullabilityReplayBoundary, plan: *const nullability.Plan, control: nullability.Control) !NullabilityPage {
+        try expected.validate();
+        if (expected.violation_column) |column| if (column >= plan.names.len) return error.InvalidNullabilityReplay;
+        if (expected.after.len != 0 and (!internal.isRelationalRowKey(expected.after) or
+            std.mem.order(u8, expected.after, self.owned_lower) == .lt or std.mem.order(u8, expected.after, self.owned_upper) != .lt))
+            return error.InvalidNullabilityReplay;
+        const record_limit = expected.records_examined + @intFromBool(!expected.more);
+        // The normal budget remains structurally valid, but its time field is
+        // deliberately ignored only by this independently checked replay.
+        return self.nextNullabilityPageMode(alloc, io, .{ .records = record_limit, .output_bytes = 2 * row_cursor_codec.max_key_bytes, .time_ns = 1 }, plan, control, expected);
+    }
+
+    fn nextNullabilityPageMode(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *const nullability.Plan, control: nullability.Control, replay: ?NullabilityReplayBoundary) !NullabilityPage {
+        try control.ensureActive();
+        try budget.validate();
+        try self.requireNullabilityProjection(plan, control);
+        if (self.nullability_failed) return error.NullabilityValidationFailed;
+        if (self.nullability_projection) |identity| {
+            if (!std.mem.eql(u8, &identity, &plan.identity)) return error.InvalidNullabilityProjection;
+        } else if (self.after.items.len != 0 or self.done) return error.InvalidNullabilityProjection;
+        var visit: NullabilityVisit = .{ .plan = plan, .control = control, .replay = replay };
+        var bounded = budget;
+        bounded.rows = 1;
+        const page = try self.nextPageFormat(alloc, io, bounded, true, &visit);
+        self.nullability_projection = plan.identity;
+        self.nullability_failed = visit.violation_column != null;
+        return .{ .page = page, .rows_examined = visit.rows_examined, .violation_column = visit.violation_column, .after = visit.after };
+    }
+
+    fn requireNullabilityProjection(self: *const Reader, plan: *const nullability.Plan, control: nullability.Control) !void {
+        if (self.index != null or self.row_policy_lease != null or self.row_filter != null or
+            self.conditions.len != 0 or self.fields.len != 0 or self.include_cursor or self.include_primary_digest or
+            !std.mem.eql(u8, self.lower, self.owned_lower) or !std.mem.eql(u8, self.upper, self.owned_upper))
+            return error.InvalidNullabilityProjection;
+        for (plan.names) |name| {
+            try control.ensureActive();
+            if (self.active.physicalLayout().ordinalForName(self.active.tableSchema().relational_columns, name) == null)
+                return error.RelationalIndexColumnNotFound;
+        }
+    }
+
+    /// Restore an explicitly admitted read-side cursor on a fresh reader.
+    /// The owner must first validate its durable predecessor record and exact
+    /// fenced source cut; this structural check does not authenticate either.
+    pub fn resumeNullabilityScan(self: *Reader, plan: *const nullability.Plan, continuation: NullabilityResume, control: nullability.Control) !void {
+        try control.ensureActive();
+        try self.requireNullabilityProjection(plan, control);
+        if (self.nullability_projection != null or self.after.items.len != 0 or self.done or
+            !std.mem.eql(u8, &continuation.projection_identity, &plan.identity) or continuation.after.len > row_cursor_codec.max_key_bytes)
+            return error.InvalidNullabilityProjection;
+        if (continuation.after.len != 0) {
+            if (!internal.isRelationalRowKey(continuation.after) or std.mem.order(u8, continuation.after, self.owned_lower) == .lt or
+                std.mem.order(u8, continuation.after, self.owned_upper) != .lt) return error.InvalidNullabilityProjection;
+        }
+        try self.after.ensureTotalCapacity(self.alloc, continuation.after.len);
+        try control.ensureActive();
+        @memcpy(self.after.items.ptr[0..continuation.after.len], continuation.after);
+        self.after.items.len = continuation.after.len;
+        self.nullability_projection = plan.identity;
+    }
+
+    fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool, validation: ?*NullabilityVisit) !Page {
         try budget.validate();
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         var result = Page{ .arena = undefined, .rows = &.{}, .more = false, .records_examined = 0, .output_bytes = 0 };
         if (self.done) {
+            if (validation) |visit| {
+                visit.after = try arena.allocator().dupe(u8, self.after.items);
+                try visit.verify(0, false);
+                try visit.control.ensureActive();
+            }
             result.arena = arena;
             return result;
         }
@@ -863,9 +1051,11 @@ pub const Reader = struct {
         const start = if (self.after.items.len == 0) self.lower else if (self.index != null) self.after.items else try internal.documentPrefixSuccessor(alloc, &successor, self.after.items);
         var entry = try cursor.seekAtOrAfter(start);
         var exhausted = true;
-        const started = time.monotonicNs();
+        const time_sliced = if (validation) |visit| visit.replay == null else true;
+        const started = if (time_sliced) time.monotonicNs() else 0;
         while (entry) |kv| : (entry = if (self.index != null) try cursor.next() else try cursor.seekAtOrAfter(try internal.documentPrefixSuccessor(alloc, &successor, continuation.items))) {
             if (io) |runtime_io| try runtime_io.checkCancel();
+            if (validation) |visit| try visit.control.ensureActive();
             if (self.after.items.len != 0 and std.mem.order(u8, kv.key, self.after.items) != .gt) continue;
             if (std.mem.order(u8, kv.key, self.upper) != .lt) break;
             result.records_examined += 1;
@@ -917,7 +1107,7 @@ pub const Reader = struct {
                     // work, but cannot force a scan through every artifact.
                     continuation.clearRetainingCapacity();
                     try continuation.appendSlice(alloc, continuation_key);
-                    if (result.records_examined >= budget.records or time.monotonicNs() - started >= budget.time_ns) {
+                    if (result.records_examined >= budget.records or (time_sliced and time.monotonicNs() - started >= budget.time_ns)) {
                         exhausted = false;
                         break;
                     }
@@ -927,10 +1117,15 @@ pub const Reader = struct {
                     if (err == error.RelationalIndexColumnTypeMismatch) try self.observeFailedRow(key, raw);
                     return err;
                 };
-                const expired = self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
+                const expired = validation == null and self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
                     ttl.isExpired(row.writeTimestampNs(), self.active.visibilityTtlDurationNs(), self.now_ns);
                 var decoded_key: ?[]const u8 = null;
                 const matches = check: {
+                    if (validation) |visit| {
+                        visit.violation_column = try visit.plan.firstNullInRow(row, visit.control);
+                        visit.rows_examined += 1;
+                        break :check visit.violation_column != null;
+                    }
                     if (expired) break :check false;
                     for (if (self.index_only) self.covering_conditions else self.source_conditions) |condition| {
                         if (io) |runtime_io| try runtime_io.checkCancel();
@@ -945,10 +1140,21 @@ pub const Reader = struct {
                 if (matches) {
                     const projection = if (self.index_only) self.covering_projection.? else self.selected.?;
                     const native = typed_output and budget.native_cells;
-                    const cells = if (native) try row.projectSqlDatumsAlloc(page, projection) else null;
                     if (native and native_layout == null) {
-                        native_layout = try sqlLayout(page, row, projection);
+                        // One logical output shape per page, independent of
+                        // which historical physical layout sorts first. Names
+                        // must outlive the reader and source-binding cache.
+                        const names = try page.alloc([]const u8, self.fields.len);
+                        for (self.fields, names) |name, *out| out.* = try page.dupe(u8, name);
+                        native_layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(page, names);
                     }
+                    // Complete projections already follow requested-field
+                    // order. Preserve their direct ordinal fast path; only
+                    // historical schemas missing fields need slot remapping.
+                    const cells = if (!native) null else if (projection.ordinals.len == self.fields.len)
+                        try row.projectSqlDatumsAlloc(page, projection)
+                    else
+                        try row.projectSqlDatumsMappedAlloc(page, projection, native_layout);
                     const typed_projection = if (typed_output and !native) try row.projectSqlTypedAlloc(page, projection) else null;
                     const typed = if (typed_projection) |projected| projected.value else null;
                     const json = if (typed_output) "" else try row.projectAlloc(temporary, projection);
@@ -998,10 +1204,19 @@ pub const Reader = struct {
             }
             continuation.clearRetainingCapacity();
             try continuation.appendSlice(alloc, continuation_key);
-            if (output.items.len >= budget.rows or (budget.target_bytes != 0 and result.output_bytes >= budget.target_bytes) or result.records_examined >= budget.records or time.monotonicNs() - started >= budget.time_ns) {
+            if (output.items.len >= budget.rows or (budget.target_bytes != 0 and result.output_bytes >= budget.target_bytes) or result.records_examined >= budget.records or (time_sliced and time.monotonicNs() - started >= budget.time_ns)) {
                 exhausted = false;
                 break;
             }
+        }
+        // A canceled page must not consume even its successfully inspected
+        // prefix. Historical binding-cache changes are safe to retain.
+        if (validation) |visit| {
+            if (continuation.items.len > row_cursor_codec.max_key_bytes) return error.InvalidNullabilityProjection;
+            visit.after = try page.dupe(u8, continuation.items);
+            try visit.verify(result.records_examined, !exhausted);
+            try visit.control.ensureActive();
+            if (io) |runtime_io| try runtime_io.checkCancel();
         }
         try self.after.ensureTotalCapacity(self.alloc, continuation.items.len);
         @memcpy(self.after.items.ptr[0..continuation.items.len], continuation.items);

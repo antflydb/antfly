@@ -107,6 +107,7 @@ const publisher_vtable: replication_contract.Publisher.VTable = .{
     .recover = recover,
     .preflight = preflight,
     .complete = evaluateReplicationMirrorCommitGate,
+    .admit_record = admitRecord,
     .note_published = notePublished,
     .note_failure = noteFailure,
     .equal_capture = equalCapture,
@@ -122,23 +123,47 @@ fn identity(ptr: *anyopaque) replication_contract.Publisher.Identity {
     return .{ .table_id = primary.identity.table_id, .shard_id = primary.identity.shard_id, .timeline_id = primary.identity.timeline_id, .epoch = primary.identity.epoch };
 }
 
+fn admitRecord(mirror: ReplicationAsyncEffectMirror, request: replication_contract.Publisher.RecordAdmission) !void {
+    if (request.kind != .metadata_control or request.codec != .binary or
+        request.payload_bytes > replication_effects_mod.schema_owner_control.max_wire_bytes)
+        return error.UnsupportedReplicationRecordAdmission;
+    const primary = try runtimePrimary(mirror);
+    if (primary.identity.table_id != request.namespace.table_id or primary.identity.shard_id != request.namespace.shard_id)
+        return error.IdentityNamespaceMismatch;
+    const bytes = try @import("antfly_local_sources").storage_db_replication_record.encodedLen(request.payload_bytes);
+    try primary.log.wal.admitAppendBytes(bytes);
+}
+
 fn publish(mirror: ReplicationAsyncEffectMirror, kind: outbox.Kind, payload: []const u8, namespace: Namespace) !u64 {
+    if (kind == .metadata_control) {
+        try validateMetadataControl(payload, namespace);
+        try admitRecord(mirror, .{ .kind = kind, .codec = .binary, .payload_bytes = payload.len, .namespace = namespace });
+    }
     const primary = try runtimePrimary(mirror);
     return switch (kind) {
         .batch, .restore_batch => replication_effects_mod.appendEncodedBatchMutationRequest(primary, payload, .{ .shard_id = namespace.shard_id, .table_id = namespace.table_id }),
         .replay, .primary_effect => replication_effects_mod.appendEncodedDerivedChangeRecord(primary, payload, .{ .shard_id = namespace.shard_id, .table_id = namespace.table_id }),
-        .schema, .row_policy => replication_effects_mod.appendEncodedSchemaMetadataMutation(primary, payload, .{ .shard_id = namespace.shard_id, .table_id = namespace.table_id }),
+        .schema, .row_policy, .metadata_control => replication_effects_mod.appendEncodedSchemaMetadataMutation(primary, payload, .{ .shard_id = namespace.shard_id, .table_id = namespace.table_id }),
     };
 }
 
 fn recover(mirror: ReplicationAsyncEffectMirror, kind: outbox.Kind, pending: outbox.DurableReplicationOutbox, namespace: Namespace) !u64 {
+    if (kind == .metadata_control) try validateMetadataControl(pending.payload, namespace);
     const primary = try runtimePrimary(mirror);
-    if (try primary.findMatchingRecordFrom(pending.from_lsn, switch (kind) {
+    if (try primary.findMatchingRecordFromWithCodec(pending.from_lsn, switch (kind) {
         .batch, .restore_batch => .batch_mutation,
         .replay, .primary_effect => .derived_effect,
-        .schema, .row_policy => .metadata_mutation,
+        .schema, .row_policy, .metadata_control => .metadata_mutation,
+    }, switch (kind) {
+        .batch, .restore_batch, .schema, .row_policy => .json,
+        .replay, .primary_effect, .metadata_control => .binary,
     }, pending.payload, namespace.shard_id, namespace.table_id)) |existing| return existing;
     return try publish(mirror, kind, pending.payload, namespace);
+}
+
+fn validateMetadataControl(payload: []const u8, namespace: Namespace) !void {
+    const frame = try replication_effects_mod.schema_owner_control.Frame.decode(payload);
+    if (!frame.position.namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
 }
 
 fn preflight(mirror: ReplicationAsyncEffectMirror, record_decision: bool) !void {

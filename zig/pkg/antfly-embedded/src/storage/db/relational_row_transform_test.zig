@@ -19,6 +19,44 @@ const mapper = @import("document_mapper.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const alloc = std.testing.allocator;
 
+test "relational index system typed rewrite preserves JSON SQL null and blob operand identity" {
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"b":{"type":"blob","nullable":true},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"coalesce","args":[{"op":"column","column":"b"},{"op":"literal","type":"blob","value":"eA=="}]}},{"column":"same","expression":{"op":"eq","args":[{"op":"column","column":"b"},{"op":"literal","type":"blob","value":"AAE="}]}},{"column":"j","expression":{"op":"literal","type":"json","value":null}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"b":{"type":"blob","nullable":true},"g":{"type":"blob"},"same":{"type":"boolean","nullable":true},"j":{"type":"json","nullable":true},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    ;
+    var program = try transform.Program.init(alloc, before, after, .{});
+    defer program.deinit();
+    const Run = struct {
+        fn run(a: std.mem.Allocator, owner: *const transform.Program, packed_row: []const u8, expected_blob: []const u8, expected_same: ?bool) !void {
+            var result = try owner.transform(a, packed_row);
+            defer result.deinit(a);
+            const view = try codec.ordinalRowView(result.packed_row, owner.target.tableSchema().*, owner.target.physicalLayout());
+            const columns = owner.target.tableSchema().relational_columns;
+            const g = (try view.findCell(owner.target.physicalLayout().ordinalForName(columns, "g").?)).?;
+            const same = (try view.findCell(owner.target.physicalLayout().ordinalForName(columns, "same").?)).?;
+            const j = (try view.findCell(owner.target.physicalLayout().ordinalForName(columns, "j").?)).?;
+            const payload = (try view.findCell(owner.target.physicalLayout().ordinalForName(columns, "payload").?)).?;
+            try std.testing.expectEqualStrings(expected_blob, g.value.bytes_val);
+            if (expected_same) |boolean| {
+                try std.testing.expect(!same.is_null);
+                try std.testing.expectEqual(boolean, same.value.bool_val);
+            } else try std.testing.expect(same.is_null);
+            try std.testing.expect(j.is_json and j.is_null);
+            try std.testing.expectEqualStrings("{\"scale\":1.20}", payload.value.bytes_val);
+            try std.testing.expectEqual(@as(usize, 1), result.expression_input_cells);
+        }
+    };
+    for ([_][]const u8{ "{\"b\":\"AAE=\",\"payload\":{\"scale\":1.20}}", "{\"b\":null,\"payload\":{\"scale\":1.20}}" }, [_][]const u8{ "AAE=", "eA==" }, [_]?bool{ true, null }) |json, expected, same| {
+        var source = try sourceRow(&program, alloc, json);
+        defer source.deinit(alloc);
+        try Run.run(alloc, &program, source.packed_row, expected, same);
+        var stable = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ &program, source.packed_row, expected, same });
+    }
+}
+
 test "SQL expression DDL rewrite computes stored generated columns and admitted defaults from base cells" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -197,6 +235,45 @@ test "relational index system rewrite projection avoids wide unrelated payload e
     try std.testing.expectEqual(@as(usize, 1), result.expression_input_cells);
     const row = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
     try std.testing.expectEqualSlices(u8, wide, (try row.findCell(row.ordinalForName("wide").?)).?.value.bytes_val);
+}
+
+test "relational index system rewrite preserves NOT VALID history while checking required predicates" {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deferred =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"deferred","column":"n","op":"gte","value":0,"not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"k":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var raw = try std.json.parseFromSliceLeaky(std.json.Value, a, deferred, .{});
+    _ = raw.object.orderedRemove("checks");
+    const unchecked_json = try std.json.Stringify.valueAlloc(a, raw, .{});
+    var unchecked = try transform.Program.init(alloc, unchecked_json, unchecked_json, .{});
+    defer unchecked.deinit();
+    // This row predates the NOT VALID declaration; public writes cannot create it.
+    var old = try sourceRow(&unchecked, alloc, "{\"n\":-1,\"k\":2}");
+    defer old.deinit(alloc);
+    var mixed = try std.json.parseFromSliceLeaky(std.json.Value, a, deferred, .{});
+    mixed.object.getPtr("version").?.* = .{ .integer = 2 };
+    try mixed.object.getPtr("checks").?.array.append(try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"name\":\"required\",\"column\":\"k\",\"op\":\"gte\",\"value\":0}", .{}));
+    const mixed_json = try std.json.Stringify.valueAlloc(a, mixed, .{});
+    var program = try transform.Program.init(alloc, deferred, mixed_json, .{});
+    defer program.deinit();
+    var result = try program.transform(alloc, old.packed_row);
+    defer result.deinit(alloc);
+    const view = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+    try std.testing.expectEqual(@as(i64, -1), (try view.findCell(view.ordinalForName("n").?)).?.value.i64_val);
+    var logical = try codec.validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(alloc, result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+    defer logical.deinit(alloc);
+    try program.target.validator().?.validateTypedStoredRoot(alloc, &logical.root, view);
+    try std.testing.expectError(error.RelationalCheckViolation, program.target.validator().?.validateValue(alloc, &logical.root));
+    var damaged = try sourceRow(&unchecked, alloc, "{\"n\":-1,\"k\":-2}");
+    defer damaged.deinit(alloc);
+    try std.testing.expectError(error.RelationalCheckViolation, program.transform(alloc, damaged.packed_row));
+    // Explicitly validating the deferred rule must reject its old violation.
+    mixed.object.getPtr("checks").?.array.items[0].object.getPtr("not_valid").?.* = .{ .bool = false };
+    var validated = try transform.Program.init(alloc, deferred, try std.json.Stringify.valueAlloc(a, mixed, .{}), .{});
+    defer validated.deinit();
+    try std.testing.expectError(error.RelationalCheckViolation, validated.transform(alloc, old.packed_row));
 }
 
 test "relational index system rewrite target overflow CHECK and required failures publish no result" {

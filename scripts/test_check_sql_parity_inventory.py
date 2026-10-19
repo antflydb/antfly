@@ -237,7 +237,7 @@ class ParityInventoryTest(unittest.TestCase):
             "pgwire original prepared CTE INSERT defers mutation until execute"
         )
         partial["evidence"][2]["test"] = (
-            "SQL document reads reject the relational stateless fallback before transport"
+            "SQL stateless fallback rejects JSON scans before transport"
         )
         with self.assertRaisesRegex(ValueError, "at least one cited evidence test"):
             validate(self.inventory, ledger)

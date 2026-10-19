@@ -118,12 +118,22 @@ fn systemCatalogIdentityCall(comptime Service: type) *const fn (*anyopaque) anye
 }
 
 fn storeRootReadinessCall(comptime Service: type) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreRootReadiness {
-    return storeRootCapabilityReadinessCall(Service, @import("topology_protocol.zig").store_root_uuid_decoder_version);
+    return storeDecoderReadinessCall(Service, @import("topology_protocol.zig").store_root_uuid_decoder_version);
 }
 
-fn storeRootCapabilityReadinessCall(comptime Service: type, comptime required_version: u16) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreRootReadiness {
+fn schemaReaderReadinessCall(comptime Service: type) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreDecoderReadiness {
     return struct {
-        fn call(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.StoreRootReadiness {
+        fn call(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.StoreDecoderReadiness {
+            const svc: *Service = @ptrCast(@alignCast(ptr));
+            try svc.ensureSchemaReaderDecoderReadyWithContext(request);
+            return storeDecoderReadinessCall(Service, @import("topology_protocol.zig").schema_reader_capability_version)(ptr, request);
+        }
+    }.call;
+}
+
+fn storeDecoderReadinessCall(comptime Service: type, comptime required_version: u16) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreDecoderReadiness {
+    return struct {
+        fn call(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.StoreDecoderReadiness {
             const svc: *Service = @ptrCast(@alignCast(ptr));
             const proof = try svc.ensureTableTopologyProtocolReadyWithContext(request, required_version);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
@@ -192,7 +202,7 @@ test "store-root readiness returns only an exact durable v17 activation" {
     var signing_proof = proof;
     signing_proof.required_version = protocol.store_root_signing_decoder_version;
     var signing_fake: Fake = .{ .store = .{ .activation = activation }, .proof = signing_proof };
-    const signing_call = comptime storeRootCapabilityReadinessCall(Fake, protocol.store_root_signing_decoder_version);
+    const signing_call = comptime storeDecoderReadinessCall(Fake, protocol.store_root_signing_decoder_version);
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, signing_call(&signing_fake, .{}));
     signing_fake.store.activation.?.version = protocol.store_root_signing_decoder_version;
     try std.testing.expectEqual(protocol.store_root_signing_decoder_version, (try signing_call(&signing_fake, .{})).activated_version);
@@ -200,6 +210,60 @@ test "store-root readiness returns only an exact durable v17 activation" {
     signing_fake.store.activation.?.member_count += 1;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, signing_call(&signing_fake, .{}));
     try std.testing.expect(!signing_fake.validated);
+}
+
+test "system catalog schema reader readiness binds exact durable membership after activation" {
+    const protocol = @import("topology_protocol.zig");
+    const Fake = struct {
+        metadata_group_id: u64 = 21,
+        prepared: bool = false,
+        validated: bool = false,
+        fail_validation: bool = false,
+        activation: ?protocol.Activation = null,
+        proof: service.TableTopologyProtocolReadiness,
+        pub fn ensureSchemaReaderDecoderReadyWithContext(self: *@This(), _: operation.RequestContext) !void {
+            self.prepared = true;
+        }
+        pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: operation.RequestContext, required: u16) !service.TableTopologyProtocolReadiness {
+            try std.testing.expect(self.prepared);
+            try std.testing.expectEqual(protocol.schema_reader_capability_version, required);
+            return self.proof;
+        }
+        pub fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        pub fn topologyActivation(self: *@This(), _: u64) !?protocol.Activation {
+            return self.activation;
+        }
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, _: service.TableTopologyProtocolReadiness) !void {
+            if (self.fail_validation) return error.TableTopologyProtocolUpgradeRequired;
+            self.validated = true;
+        }
+    };
+    const proof: service.TableTopologyProtocolReadiness = .{
+        .term = 7,
+        .required_version = protocol.schema_reader_capability_version,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .protected_member_count = 2,
+        .protected_membership_fingerprint = @splat(3),
+    };
+    var fake: Fake = .{ .proof = proof };
+    const call = comptime schemaReaderReadinessCall(Fake);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    try std.testing.expect(!fake.validated);
+    fake.activation = .{ .version = protocol.schema_reader_capability_version, .incarnation = proof.metadata_incarnation.?, .member_count = 2, .membership_fingerprint = @splat(3) };
+    try std.testing.expectEqual(protocol.schema_reader_capability_version, (try call(&fake, .{})).activated_version);
+    fake.validated = false;
+    fake.activation.?.membership_fingerprint[0] ^= 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    try std.testing.expect(!fake.validated);
+    fake.activation.?.membership_fingerprint = @splat(3);
+    fake.activation.?.version -= 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    fake.activation.?.version = protocol.schema_reader_capability_version;
+    fake.fail_validation = true;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    try std.testing.expect(!fake.validated);
 }
 
 pub const AdminSource = struct {
@@ -214,6 +278,7 @@ pub const AdminSource = struct {
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
         ensure_store_root_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreRootReadiness = null,
         ensure_store_root_signing_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreRootReadiness = null,
+        ensure_schema_reader_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreDecoderReadiness = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
         provisioning_snapshot: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, node_id: u64) anyerror!@import("restore_staging.zig").ProvisioningSnapshot = null,
         restore_staging_authority: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) anyerror!@import("restore_staging.zig").AuthorityResponse = null,
@@ -320,6 +385,11 @@ pub const AdminSource = struct {
 
     pub fn ensureStoreRootSigningReadiness(self: AdminSource, request: operation.RequestContext) !metadata_api.StoreRootReadiness {
         const fn_ptr = self.vtable.ensure_store_root_signing_readiness orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn ensureSchemaReaderReadiness(self: AdminSource, request: operation.RequestContext) !metadata_api.StoreDecoderReadiness {
+        const fn_ptr = self.vtable.ensure_schema_reader_readiness orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, request);
     }
 
@@ -645,7 +715,8 @@ pub const AdminSource = struct {
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
                 .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataService),
-                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_store_root_signing_readiness = comptime storeDecoderReadinessCall(service.MetadataService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_schema_reader_readiness = comptime schemaReaderReadinessCall(service.MetadataService),
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
                 .runtime_topology = metadataServiceRuntimeTopology,
                 .status = metadataServiceStatus,
@@ -714,7 +785,8 @@ pub const AdminSource = struct {
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataHttpService),
-                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataHttpService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_store_root_signing_readiness = comptime storeDecoderReadinessCall(service.MetadataHttpService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_schema_reader_readiness = comptime schemaReaderReadinessCall(service.MetadataHttpService),
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
@@ -1970,6 +2042,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_store_root_readiness, httpx.Handler.bind(self, metadataStoreRootReadiness));
         try server.post(routes.Routes.internal_store_root_signing_readiness, httpx.Handler.bind(self, metadataStoreRootSigningReadiness));
+        try server.post(routes.Routes.internal_schema_reader_readiness, httpx.Handler.bind(self, metadataSchemaReaderReadiness));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
         try server.post(routes.Routes.internal_provisioning_snapshot, httpx.Handler.bind(self, metadataProvisioningSnapshot));
         try server.post(routes.Routes.internal_restore_staging_authority, httpx.Handler.bind(self, metadataRestoreStagingAuthority));
@@ -2117,6 +2190,7 @@ pub const MetadataHttpServer = struct {
         context.setting_admin = admin_grant;
         context.row_policy_install_authority = parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin;
         context.fk_generation_publication_authority = fk_publication_read or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
+        context.index_publication_authority = parsed.value.isRelationalIndexOwnerCall();
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
         const identity_reader = if (!parsed.value.isMutation())
             self.source.vtable.catalog_identity orelse return ctx.status(426).text("catalog identity upgrade required")
@@ -2439,6 +2513,15 @@ pub const MetadataHttpServer = struct {
             return ctx.status(403).text("authenticated service required");
         const request = requestContext(ctx);
         const result = self.source.ensureStoreRootSigningReadiness(request) catch |err| return metadataMutationError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataSchemaReaderReadiness(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
+            return ctx.status(403).text("authenticated service required");
+        const request = requestContext(ctx);
+        const result = self.source.ensureSchemaReaderReadiness(request) catch |err| return metadataMutationError(ctx, err);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
     }
@@ -3229,7 +3312,8 @@ pub const MetadataHttpServer = struct {
             error.ResourceTemporarilyUnavailable => ctx.status(503).text("report admission capacity exhausted"),
             error.RuntimeStatusProtocolUnavailable => ctx.status(503).text("runtime status protocol is not ready"),
             error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
-            error.RelationalTopologyProtocolUpgradeRequired => ctx.status(409).text("upgrade every table-serving data runtime to relational topology protocol v1 before registration or constrained split/merge"),
+            error.RelationalTopologyProtocolUpgradeRequired => ctx.status(409).text("upgrade every table-serving data runtime to the current relational topology protocol before registration or constrained split/merge"),
+            error.SchemaReaderUpgradeRequired => ctx.status(409).text("upgrade the table-serving schema reader to the activated semantic and ASCH decoder floor before registration"),
             error.TableTopologyProtocolUpgradeRequired => ctx.status(426).text("upgrade every metadata voter and learner to the decoder version required by this store registration"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             else => metadataReadError(ctx, err),
@@ -4235,6 +4319,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         native_generation_restore_version: ?u16 = null,
         dense_native_storage_protocol_version: ?u16 = null,
         relational_topology_protocol_version: ?u16 = null,
+        schema_reader: metadata_table_manager.SchemaReaderCapabilities = .{},
         api_url: ?[]const u8 = null,
         raft_url: ?[]const u8 = null,
         role: ?[]const u8 = null,
@@ -4256,6 +4341,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
     const parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (parsed.value.store_id == 0 or parsed.value.node_id == 0) return error.InvalidNodeID;
+    if (!parsed.value.schema_reader.validForReporter(parsed.value.reporter_incarnation orelse 0)) return error.InvalidStoreReporterFence;
     if (!metadata_table_manager.reporterFenceValid(
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
@@ -4295,6 +4381,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         .native_generation_restore_version = parsed.value.native_generation_restore_version orelse 0,
         .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .relational_topology_protocol_version = parsed.value.relational_topology_protocol_version orelse 0,
+        .schema_reader = parsed.value.schema_reader,
         .api_url = try alloc.dupe(u8, parsed.value.api_url orelse ""),
         .raft_url = try alloc.dupe(u8, parsed.value.raft_url orelse ""),
         .role = try alloc.dupe(u8, parsed.value.role orelse "data"),
@@ -4391,6 +4478,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         artifact_sources_protocol_version: ?u16 = null,
         dense_native_storage_protocol_version: ?u16 = null,
         relational_topology_protocol_version: ?u16 = null,
+        schema_reader: metadata_table_manager.SchemaReaderCapabilities = .{},
         live: ?bool = null,
         health_class: ?[]const u8 = null,
         capacity_bytes: ?u64 = null,
@@ -4406,6 +4494,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
 
     const parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
+    if (!parsed.value.schema_reader.validForReporter(parsed.value.reporter_incarnation orelse 0)) return error.InvalidStoreReporterFence;
     if (!metadata_table_manager.reporterFenceValid(
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
@@ -4444,6 +4533,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
         .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .relational_topology_protocol_version = parsed.value.relational_topology_protocol_version orelse 0,
+        .schema_reader = parsed.value.schema_reader,
         .live = parsed.value.live orelse true,
         .health_class = try alloc.dupe(u8, parsed.value.health_class orelse "healthy"),
         .capacity_bytes = parsed.value.capacity_bytes orelse 0,
@@ -4693,6 +4783,40 @@ test "metadata status JSON preserves compact managed index admission state" {
     // an incomplete identity so it cannot authorize repair-state deletion.
     try std.testing.expectEqualStrings("", indexes[2].kind);
     try std.testing.expect(!indexes[2].coverage_identity_ready);
+}
+
+test "system catalog schema reader admission rejects incomplete unknown and unfenced capabilities" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":30,"encoding_ceiling":31}}
+    ;
+    const registration = try parseStoreRecord(alloc, json);
+    defer metadata_table_manager.freeStore(alloc, registration);
+    const heartbeat = try parseStoreStatusReport(alloc, json);
+    defer freeStoreStatusReport(alloc, heartbeat);
+    try std.testing.expectEqual(@as(u32, 30), registration.schema_reader.semantic_ceiling);
+    try std.testing.expectEqual(@as(u32, 31), registration.schema_reader.encoding_ceiling);
+    try std.testing.expectEqualDeep(registration.schema_reader, heartbeat.schema_reader);
+    try std.testing.expectEqual(@as(u16, 0), registration.relational_topology_protocol_version);
+    const invalid = [_][]const u8{
+        \\{"store_id":20,"node_id":20,"schema_reader":{"semantic_ceiling":30,"encoding_ceiling":31}}
+        ,
+        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":30}}
+        ,
+        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":32,"encoding_ceiling":31}}
+        ,
+        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":30,"encoding_ceiling":32}}
+        ,
+    };
+    for (invalid) |body| {
+        try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, body));
+        try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreStatusReport(alloc, body));
+    }
+    const legacy = try parseStoreRecord(alloc,
+        \\{"store_id":20,"node_id":20}
+    );
+    defer metadata_table_manager.freeStore(alloc, legacy);
+    try std.testing.expect(!legacy.schema_reader.known());
 }
 
 test "relational topology admission JSON preserves capability in registrations and heartbeats" {
@@ -5388,6 +5512,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         reads: usize = 0,
         replace_identity: bool = false,
         status_reads: usize = 0,
+        index_reads: usize = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return error.TestUnexpectedResult;
         }
@@ -5412,6 +5537,13 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 self.status_reads += 1;
                 try std.testing.expect(context.row_policy_install_authority);
+                try std.testing.expect(!context.setting_admin);
+            }
+            if (call.isRelationalIndexOwnerCall()) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.index_reads += 1;
+                try std.testing.expect(context.index_publication_authority);
+                try std.testing.expect(!context.fk_generation_publication_authority);
                 try std.testing.expect(!context.setting_admin);
             }
             return alloc.dupe(u8, "{}");
@@ -5524,6 +5656,90 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     var changed = try server.metadataSystemCatalog(&changed_ctx);
     defer changed.deinit();
     try std.testing.expectEqual(@as(u16, 403), changed.status.code);
+    const index_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .relational_index_owner_decision = .{
+        .table_id = 1,
+        .group_id = 2,
+        .id = @splat(3),
+        .operation = .fence,
+    } }, .{});
+    defer alloc.free(index_body);
+    const index_grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, index_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(index_grant);
+    var index_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+    defer index_request.deinit();
+    try index_request.setBody(index_body);
+    try index_request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+    try index_request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+    try index_request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+    {
+        var denied_ctx = httpx.Context.init(alloc, std.testing.io, &index_request);
+        defer denied_ctx.deinit();
+        var denied = try server.metadataSystemCatalog(&denied_ctx);
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    }
+    try index_request.headers.append(service_auth.header_name, service_token);
+    {
+        var denied_ctx = httpx.Context.init(alloc, std.testing.io, &index_request);
+        defer denied_ctx.deinit();
+        var denied = try server.metadataSystemCatalog(&denied_ctx);
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    }
+    try index_request.headers.append(authority.header_name, index_grant);
+    {
+        var granted_ctx = httpx.Context.init(alloc, std.testing.io, &index_request);
+        defer granted_ctx.deinit();
+        var granted = try server.metadataSystemCatalog(&granted_ctx);
+        defer granted.deinit();
+        try std.testing.expectEqual(@as(u16, 200), granted.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.index_reads);
+    const index_ack = try @import("relational_index_publication.zig").testing.fencedAck();
+    const Call = @import("../system_catalog/server_call.zig").Call;
+    for ([_]Call{ .{ .relational_index_owner_ack = index_ack }, .{ .relational_index_owner_ack_status = index_ack } }) |call| {
+        const ack_body = try std.json.Stringify.valueAlloc(alloc, call, .{});
+        defer alloc.free(ack_body);
+        var ack_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+        defer ack_request.deinit();
+        try ack_request.setBody(ack_body);
+        try ack_request.headers.append(service_auth.header_name, service_token);
+        try ack_request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+        try ack_request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+        try ack_request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+        {
+            var denied_ctx = httpx.Context.init(alloc, std.testing.io, &ack_request);
+            defer denied_ctx.deinit();
+            var denied = try server.metadataSystemCatalog(&denied_ctx);
+            defer denied.deinit();
+            try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+        }
+        const grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, ack_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer alloc.free(grant);
+        try ack_request.headers.append(authority.header_name, grant);
+        var granted_ctx = httpx.Context.init(alloc, std.testing.io, &ack_request);
+        defer granted_ctx.deinit();
+        var granted = try server.metadataSystemCatalog(&granted_ctx);
+        defer granted.deinit();
+        try std.testing.expectEqual(@as(u16, 200), granted.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixture.index_reads);
+    const other_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .relational_index_owner_decision = .{
+        .table_id = 1,
+        .group_id = 2,
+        .id = @splat(3),
+        .operation = .cancel,
+    } }, .{});
+    defer alloc.free(other_body);
+    try index_request.setBody(other_body);
+    {
+        var denied_ctx = httpx.Context.init(alloc, std.testing.io, &index_request);
+        defer denied_ctx.deinit();
+        var denied = try server.metadataSystemCatalog(&denied_ctx);
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixture.index_reads);
 }
 
 test "system catalog forwarding retains its executor clock and tighter ingress deadline" {

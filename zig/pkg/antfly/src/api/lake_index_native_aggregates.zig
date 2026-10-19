@@ -732,6 +732,16 @@ fn consumeCohort(a: A, provider: *@import("lake_index_row_source.zig").Provider,
     }
 }
 
+fn expectAggregateInteger(spec: operators.AggregateSpec, actual: local.sql_scalar.Datum, expected: i64) !void {
+    if (operators.Aggregate.bigintSum(spec.kind, spec.input_type, spec.input_element)) {
+        try std.testing.expect(actual.numeric != null);
+        var digits: [5]u16 = undefined;
+        const number = local.sql_numeric_value.integerView(expected, &digits);
+        const wanted = local.sql_scalar.Datum.typedNumeric(&number);
+        try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(actual, wanted));
+    } else try std.testing.expectEqual(expected, actual.value.integer);
+}
+
 test "external lake native algebraic recipes preserve aliases and SQL NULL identities" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -847,7 +857,7 @@ test "external lake native algebraic publication reads real Parquet into exact S
     defer group.deinit();
     try group.importPartial(partials[0].keys, partials[0].aggregates, partials[0].ordinal);
     const result = (try group.nextResult(page.allocator())).?;
-    try std.testing.expectEqual(@as(i64, 18014398509481985), result.aggregates[0].value.integer);
+    try expectAggregateInteger(spec, result.aggregates[0], 18014398509481985);
     try std.testing.expect((try cursor.next(cursor.ptr, page.allocator(), 32)) == null);
     const count_recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = .{ .kind = .count }, .column = null }} };
     const count_identity = try recipeIdentity(a, count_recipe);
@@ -987,12 +997,12 @@ test "external lake aggregate radix reductions reuse unchanged subtrees across a
             try group.importPartial(rows[0].keys, rows[0].aggregates, rows[0].ordinal);
             const result = (try group.nextResult(output.allocator())).?;
             const files: i64 = if (phase == 1) 17 else 16;
-            try std.testing.expectEqual(@as(i64, switch (slot) {
+            try expectAggregateInteger(recipe.inputs[0].spec, result.aggregates[0], @as(i64, switch (slot) {
                 0 => files * 10,
                 1 => files * 3,
                 2 => 1,
                 else => 7,
-            }), result.aggregates[0].value.integer);
+            }));
         }
         previous = built;
     }
@@ -1127,11 +1137,11 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
             while (try group.nextResult(output.allocator())) |result| {
                 const key = result.keys[0].value.integer;
                 const files: i64 = if (phase == 0) 16 else if (phase == 1) (if (key == 1) @as(i64, 17) else 16) else (if (key == 1) @as(i64, 16) else 15);
-                try std.testing.expectEqual(@as(i64, switch (slot) {
+                try expectAggregateInteger(recipe.inputs[0].spec, result.aggregates[0], @as(i64, switch (slot) {
                     0 => files * key,
                     1 => files,
                     else => key,
-                }), result.aggregates[0].value.integer);
+                }));
                 count += 1;
             }
             try std.testing.expectEqual(@as(usize, 3), count);

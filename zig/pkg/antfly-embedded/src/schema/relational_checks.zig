@@ -22,6 +22,33 @@ const impl = @import("table_schema_impl.zig");
 const expressions = @import("relational_expression.zig");
 const Allocator = std.mem.Allocator;
 
+pub const validation_required_message = "validating a NOT VALID CHECK requires an asynchronous cohort rewrite; retry the schema update with ?rewrite=true and an Idempotency-Key, then poll the returned restore job";
+
+/// A declaration update is not a proof about historical rows. Compare typed
+/// predicates, not declaration names: renaming or replacing an equivalent
+/// NOT VALID rule must not bypass the shared staged-publication boundary.
+pub fn validateSchemaUpdate(alloc: Allocator, previous_json: []const u8, next_json: []const u8) !void {
+    const schema_api = @import("mod.zig");
+    var previous_schema = try schema_api.parseValidatedTableSchema(alloc, if (previous_json.len == 0) "{}" else previous_json);
+    defer previous_schema.deinit(alloc);
+    const definitions = if (previous_schema.checks) |list| list.value else return;
+    for (definitions) |definition| {
+        if (definition.not_valid orelse false) break;
+    } else return;
+    var previous = try schema_api.CompiledTableValidator.initParsed(alloc, previous_schema);
+    defer previous.deinit(alloc);
+    const prior = previous.execution.checks orelse return;
+    var next = try schema_api.CompiledTableValidator.init(alloc, next_json);
+    defer next.deinit(alloc);
+    const candidate = next.execution.checks orelse return;
+    for (candidate.definitions, candidate.plans) |definition, plan| {
+        if (definition.not_valid orelse false) continue;
+        for (prior.definitions, prior.plans) |old_definition, old_plan| {
+            if (!(old_definition.not_valid orelse false) and std.mem.eql(u8, &old_plan.fingerprint, &plan.fingerprint)) break;
+        } else return error.CheckConstraintValidationRequired;
+    }
+}
+
 pub fn valueFromJson(alloc: Allocator, kind: schema.RelationalColumnType, value: std.json.Value, literal: bool) !tuples.Value {
     if (value == .null) return .null;
     return switch (kind) {
@@ -115,7 +142,11 @@ pub const Set = struct {
     plans: []expressions.Plan,
     /// Borrowed immutable schema names, deduplicated across every CHECK form.
     dependency_fields: []const []const u8 = &.{},
+    /// Cold validation must not hydrate columns used only by NOT VALID rules.
+    /// Aliases dependency_fields when every declaration requires validation.
+    validation_dependency_fields: []const []const u8 = &.{},
     identity: [32]u8 = undefined,
+    validation_identity: [32]u8 = undefined,
 
     /// Logical CHECK identity excludes schema epochs, column ordinals and
     /// declaration order. Operands already have canonical typed encodings.
@@ -123,10 +154,19 @@ pub const Set = struct {
         return self.identity;
     }
 
-    fn computeFingerprint(self: *const Set, alloc: Allocator) ![32]u8 {
+    /// Historical coverage excludes NOT VALID declarations, never write-time
+    /// enforcement. An empty historical set has no activation phase at all.
+    pub fn validationFingerprint(self: *const Set) [32]u8 {
+        return self.validation_identity;
+    }
+
+    fn computeFingerprint(self: *const Set, alloc: Allocator, historical: bool) ![32]u8 {
         const entries = try alloc.alloc([32]u8, self.plans.len);
         defer alloc.free(entries);
-        for (self.definitions, self.plans, entries) |definition, plan, *entry| {
+        var count: usize = 0;
+        for (self.definitions, self.plans) |definition, plan| {
+            const not_valid = definition.not_valid orelse false;
+            if (historical and not_valid) continue;
             var state = std.crypto.hash.Blake3.init(.{});
             state.update("antfly check definition v1");
             var size: [8]u8 = undefined;
@@ -135,16 +175,19 @@ pub const Set = struct {
             state.update(definition.name);
             state.update("immutable boolean expression v1");
             state.update(&plan.fingerprint);
-            state.final(entry);
+            if (not_valid) state.update("not valid declaration v1");
+            state.final(&entries[count]);
+            count += 1;
         }
-        std.mem.sort([32]u8, entries, {}, struct {
+        if (historical and count == 0) return @splat(0);
+        std.mem.sort([32]u8, entries[0..count], {}, struct {
             fn less(_: void, a: [32]u8, b: [32]u8) bool {
                 return std.mem.order(u8, &a, &b) == .lt;
             }
         }.less);
         var state = std.crypto.hash.Blake3.init(.{});
         state.update("antfly check coverage v1");
-        for (entries) |entry| state.update(&entry);
+        for (entries[0..count]) |entry| state.update(&entry);
         var result: [32]u8 = undefined;
         state.final(&result);
         return result;
@@ -188,13 +231,37 @@ pub const Set = struct {
             field_index += 1;
         };
         set.dependency_fields = fields;
-        set.identity = try set.computeFingerprint(alloc);
+        set.validation_dependency_fields = fields;
+        set.identity = try set.computeFingerprint(alloc, false);
+        set.validation_identity = set.identity;
+        for (definitions) |definition| if (definition.not_valid orelse false) {
+            set.validation_identity = try set.computeFingerprint(alloc, true);
+            @memset(needed, false);
+            for (definitions, set.plans) |rule, plan| {
+                if (rule.not_valid orelse false) continue;
+                for (plan.dependencies) |ordinal| needed[ordinal] = true;
+            }
+            field_count = 0;
+            for (needed) |selected| if (selected) {
+                field_count += 1;
+            };
+            const historical_fields = try alloc.alloc([]const u8, field_count);
+            field_index = 0;
+            for (needed, table.relational_columns) |selected, column| if (selected) {
+                historical_fields[field_index] = column.name;
+                field_index += 1;
+            };
+            set.validation_dependency_fields = historical_fields;
+            break;
+        };
         return set;
     }
 
     pub fn deinit(self: *Set) void {
         for (self.plans) |*plan| plan.deinit();
         self.alloc.free(self.plans);
+        if (self.validation_dependency_fields.ptr != self.dependency_fields.ptr)
+            self.alloc.free(self.validation_dependency_fields);
         self.alloc.free(self.dependency_fields);
         self.layout.deinit();
         schema.freeSchema(self.alloc, self.table);
@@ -207,7 +274,15 @@ pub const Set = struct {
     }
 
     pub fn firstViolationJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value) !?usize {
-        if (try self.firstJsonWithExecution(execution, value, false)) |failure| return failure.index;
+        if (try self.firstJsonWithExecution(execution, value, null, false)) |failure| return failure.index;
+        return null;
+    }
+
+    /// The typed preparation boundary authenticates names against the pinned
+    /// schema and retains this owner through validation. A JSON document alone
+    /// has no authority to distinguish a present JSON null from SQL NULL.
+    pub fn firstViolationTypedJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, nulls: *@import("../sql/row_value.zig").JsonNulls) !?usize {
+        if (try self.firstJsonWithExecution(execution, value, nulls, false)) |failure| return failure.index;
         return null;
     }
 
@@ -220,28 +295,36 @@ pub const Set = struct {
     }
 
     pub fn firstFailureJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value) !?Failure {
-        return self.firstJsonWithExecution(execution, value, true);
+        return self.firstJsonWithExecution(execution, value, null, true);
+    }
+
+    pub fn firstFailureTypedJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, nulls: *@import("../sql/row_value.zig").JsonNulls) !?Failure {
+        return self.firstJsonWithExecution(execution, value, nulls, true);
     }
 
     fn firstJson(self: *const Set, alloc: Allocator, value: std.json.Value, activation: bool) !?Failure {
         var budget: usize = expressions.max_allocated_bytes;
         var execution = expressions.Execution.init(alloc, &budget);
-        return self.firstJsonWithExecution(&execution, value, activation);
+        return self.firstJsonWithExecution(&execution, value, null, activation);
     }
 
-    fn firstJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, activation: bool) !?Failure {
+    fn firstJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, nulls: ?*@import("../sql/row_value.zig").JsonNulls, activation: bool) !?Failure {
         try execution.charge(0);
         var owner: expressions.ExecutionScratch = undefined;
         owner.init(execution);
         defer owner.deinit();
-        return self.firstJsonInner(execution, value, activation) catch |err| return owner.failure(err);
+        return self.firstJsonInner(execution, value, nulls, activation) catch |err| return owner.failure(err);
     }
 
-    fn firstJsonInner(self: *const Set, execution: *expressions.Execution, value: std.json.Value, activation: bool) !?Failure {
+    fn firstJsonInner(self: *const Set, execution: *expressions.Execution, value: std.json.Value, nulls: ?*@import("../sql/row_value.zig").JsonNulls, activation: bool) !?Failure {
         if (value != .object) return error.InvalidBatchRequest;
+        var input: expressions.PreparedInput = undefined;
+        try input.initJson(execution, value, nulls);
+        defer input.deinit();
         for (self.plans, 0..) |*plan, i| {
+            if (activation and (self.definitions[i].not_valid orelse false)) continue;
             try execution.charge(1);
-            const result = plan.evaluateJsonWithExecution(execution, value) catch |err| {
+            const result = plan.evaluatePreparedWithExecution(execution, &input) catch |err| {
                 if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                 return err;
             };
@@ -285,9 +368,13 @@ pub const Set = struct {
     }
 
     fn firstRowInner(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView, activation: bool) !?Failure {
+        var input: expressions.PreparedInput = undefined;
+        try input.initRow(execution, row);
+        defer input.deinit();
         for (self.plans, 0..) |*plan, i| {
+            if (activation and (self.definitions[i].not_valid orelse false)) continue;
             try execution.charge(1);
-            const result = plan.evaluateRowWithExecution(execution, row) catch |err| {
+            const result = plan.evaluatePreparedWithExecution(execution, &input) catch |err| {
                 if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                 return err;
             };

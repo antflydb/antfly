@@ -18,6 +18,19 @@ test {
     _ = @import("sql/subquery_shape_test.zig");
     _ = @import("sql/joined_mutation_test.zig");
     _ = @import("antfly_local_sources").system_catalog_policies;
+    _ = @import("antfly_local_sources").storage_db_row_policy_bundle;
+    _ = @import("antfly_local_sources").storage_db_table_catalog;
+    _ = @import("antfly_local_sources").system_catalog_domain;
+    // Keep SQL schema lowering and native uniqueness/conflict admission in
+    // one qualification gate; the build selects the cross-layer contract.
+    _ = @import("antfly_local_sources").api_relational_integrity;
+    // Preparation owns the schema compiler as well as SQL declaration
+    // lowering. Discover its explicit cross-layer ownership contracts here.
+    _ = @import("antfly_local_sources").schema_mod;
+    _ = @import("antfly_local_sources").storage_db_relational_nullability;
+    _ = @import("antfly_local_sources").storage_db_relational_predicate;
+    _ = @import("antfly_local_sources").storage_db_relational_predicate_implication;
+    _ = @import("antfly_local_sources").storage_db_relational_index_predicate;
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

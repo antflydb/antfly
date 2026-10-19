@@ -118,6 +118,7 @@ pub const TableApi = struct {
         RelationalCheckViolation,
         ForeignKeyParentMissing,
         ForeignKeyReferenced,
+        ForeignKeyMatchFullViolation,
         MethodNotAllowed,
         Backpressured,
         DenseRepairBackpressure,
@@ -1735,7 +1736,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
             .json = true,
             .retry_after_seconds = 1,
         },
-        error.UniqueConstraintViolation, error.RelationalCheckViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
+        error.UniqueConstraintViolation, error.RelationalCheckViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.ForeignKeyMatchFullViolation => return .{
             .status = 409,
             .json = true,
             .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}),

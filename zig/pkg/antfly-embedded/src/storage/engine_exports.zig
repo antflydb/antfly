@@ -1174,6 +1174,10 @@ fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: std.mem.Allocator) 
     return .{ .value = self.runtimeStatusStatsConsistentIfAvailable(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn runtimeStatusObservationConsistentIfAvailable(self: *DB, alloc: std.mem.Allocator) engine.Outcome(?DB.RuntimeStatusObservation) {
+    return .{ .value = self.runtimeStatusObservationConsistentIfAvailable(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: @import("db/doc_identity.zig").Namespace) engine.Outcome(void) {
     return .{ .value = self.reassignIdentityNamespaceForInternalTransition(namespace) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

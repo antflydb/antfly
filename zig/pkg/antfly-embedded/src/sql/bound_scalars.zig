@@ -170,7 +170,7 @@ pub fn needsResidual(table: ?catalog.Table, predicate: ?*const ast.Predicate) bo
 fn typedComparisonColumn(table: ?catalog.Table, name: []const u8) bool {
     const definition = table orelse return false;
     const column = definition.column(name) catch return false;
-    return column.type == .json or column.type == .array or column.element_type == .numeric;
+    return definition.isDocumentVersion(name) or column.type == .json or column.type == .array or column.element_type == .numeric;
 }
 
 // Floating native columns may receive an explicitly typed NUMERIC parameter.
@@ -320,8 +320,25 @@ test "SQL inferred bare target parameters retain PostgreSQL ambiguity diagnostic
 }
 
 pub fn predicateScalar(alloc: Allocator, table: ?catalog.Table, predicate: *const ast.Predicate) !*const ast.Scalar {
-    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = &.{}, .parameters = &.{} };
+    return predicateScalarTyped(alloc, table, predicate, &.{});
+}
+
+pub fn predicateScalarTyped(alloc: Allocator, table: ?catalog.Table, predicate: *const ast.Predicate, parameters: []scalar.Type) !*const ast.Scalar {
+    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = &.{}, .parameters = parameters };
     return builder.predicateExpression(predicate);
+}
+
+/// Shape inference and executable binding must constrain comparison inputs
+/// identically. Typmods constrain stored columns, not comparison operands.
+pub fn comparisonOperand(alloc: Allocator, column: scalar.Type, value: ast.Value, parameters: []const scalar.Type) !*const ast.Scalar {
+    const literal = try alloc.create(ast.Scalar);
+    literal.* = .{ .literal = value };
+    if (value == .null or column.kind == null) return literal;
+    const floating_parameter = value == .parameter and value.parameter > 0 and value.parameter <= parameters.len and
+        (parameters[value.parameter - 1].element_type == .float32 or parameters[value.parameter - 1].element_type == .float64);
+    const cast = try alloc.create(ast.Scalar);
+    cast.* = .{ .cast = .{ .operand = literal, .type = column.kind.?, .element_type = if (column.kind == .array or (column.element_type == .numeric and !floating_parameter)) column.element_type else null } };
+    return cast;
 }
 
 /// allocator is the bounded binding arena. Nested Program arenas allocate from
@@ -365,6 +382,12 @@ fn bindDescriptors(alloc: Allocator, table: ?catalog.Table, statement: ast.State
     return bindDescriptorsWithInvocation(alloc, table, statement, parameters, settings, fallbacks, typed_parameters, null);
 }
 
+fn needsAssignmentProgram(column: catalog.Column, literal: ast.Value, expression: ?*const ast.Scalar, typed_parameters: bool) bool {
+    return expression != null or (typed_parameters and literal == .parameter) or
+        (column.type == .array and literal == .string) or
+        (column.type == .number and column.element_type == .numeric);
+}
+
 fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []scalar.Type, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const scalar.Type, typed_parameters: bool, invocation: ?*@import("parameter_binding.zig").Invocation) !Bound {
     if (statement == .insert) return bindInsert(alloc, table orelse return error.UndefinedTable, statement.insert, parameters, settings, fallbacks, typed_parameters, invocation);
     const needed = switch (statement) {
@@ -378,7 +401,10 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             if (needsResidual(table, update.predicate)) break :blk true;
             for (update.assignments) |assignment| {
                 if (assignment.expression != null) break :blk true;
-                if (table) |definition| if ((try definition.column(assignment.field)).type == .array and (assignment.value == .string or assignment.value == .parameter)) break :blk true;
+                if (table) |definition| {
+                    const column = try definition.column(assignment.field);
+                    if (needsAssignmentProgram(column, assignment.value, assignment.expression, false) or (column.type == .array and assignment.value == .parameter)) break :blk true;
+                }
             }
             break :blk false;
         },
@@ -401,9 +427,10 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
         .select => |selection| relations.accepts(selection),
         else => false,
     };
-    const columns = try alloc.alloc(scalar.Column, table_columns.len + @intFromBool(table != null));
+    const virtual_columns: []const catalog.Column = if (table) |bound| bound.virtualColumns() else &.{};
+    const columns = try alloc.alloc(scalar.Column, table_columns.len + virtual_columns.len);
     for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
-    if (table != null) columns[table_columns.len] = .{ .name = "_id", .type = .string, .nullable = false, .aliases = if (qualified_names) try table.?.columnAliases(alloc, "_id") else &.{} };
+    for (virtual_columns, columns[table_columns.len..]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
     var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters, .invocation = invocation };
     var out: Bound = .{ .columns = columns, .typed_parameters = typed_parameters, .invocation = invocation };
     const predicate = switch (statement) {
@@ -457,7 +484,7 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             },
             .update => |update| for (update.assignments) |assignment| {
                 const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
-                if (assignment.expression == null and assignment.value != .parameter and !(column.type == .array and assignment.value == .string)) continue;
+                if (!needsAssignmentProgram(column, assignment.value, assignment.expression, true)) continue;
                 const expression = try builder.assignmentNode(assignment.expression, assignment.value, column);
                 changed = try builder.inferAssignment(expression, column) or changed;
             },
@@ -494,11 +521,11 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             @memset(programs, null);
             for (update.assignments, programs) |assignment, *program| {
                 const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
-                if (assignment.expression == null and !(typed_parameters and assignment.value == .parameter) and !(column.type == .array and assignment.value == .string)) continue;
+                if (!needsAssignmentProgram(column, assignment.value, assignment.expression, typed_parameters)) continue;
                 const expression = try builder.assignmentNode(assignment.expression, assignment.value, column);
                 program.* = try builder.assignmentProgram(expression, column);
                 const kind = program.*.?.output_type.kind;
-                if (kind != null and kind != column.type and !(kind == .integer and column.type == .number)) return error.SqlTypeMismatch;
+                if (kind != null and kind != column.type and !@import("builtin_cast.zig").numericAssignmentAllowed(kind, column.type)) return error.SqlTypeMismatch;
             }
             out.assignments = programs;
         },
@@ -539,11 +566,11 @@ fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, par
         @memset(programs, null);
         for (expressions, literals, statement.columns, programs) |expression, literal, name, *program| {
             const column = try table.column(name);
-            if (expression == null and !(typed_parameters and literal == .parameter) and !(column.type == .array and literal == .string)) continue;
+            if (!needsAssignmentProgram(column, literal, expression, typed_parameters)) continue;
             const node = try builder.assignmentNode(expression, literal, column);
             program.* = try builder.assignmentProgram(node, column);
             const kind = program.*.?.output_type.kind;
-            if (kind != null and kind != column.type and !(kind == .integer and column.type == .number)) return error.SqlTypeMismatch;
+            if (kind != null and kind != column.type and !@import("builtin_cast.zig").numericAssignmentAllowed(kind, column.type)) return error.SqlTypeMismatch;
         }
         row.* = programs;
     }
@@ -572,6 +599,69 @@ fn arrayAssignmentBindingScenario(backing: Allocator) !void {
         try std.testing.expect(literal.array.?.flatCell(1).sql_null);
         const parameter = try prepared.insert_rows[0][2].?.evaluate(none.allocator(), &.{}, .{});
         try std.testing.expect(parameter.array == prepared.frame.values[0].array);
+    }
+}
+
+test "SQL exact NUMERIC assignments prepare plain literals once without floating conversion" {
+    const Scenario = struct {
+        fn run(backing: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{
+                .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 20, .scale = 4 } },
+            } };
+            for ([_]struct { sql: []const u8, expected: ?[]const u8 }{
+                .{ .sql = "INSERT INTO items (_id,n) VALUES ('x',9007199254740993.1250)", .expected = "9007199254740993.1250" },
+                .{ .sql = "INSERT INTO items (_id,n) VALUES ('x','1.2300')", .expected = "1.2300" },
+                .{ .sql = "INSERT INTO items (_id,n) VALUES ('x',9007199254740993)", .expected = "9007199254740993" },
+                .{ .sql = "UPDATE items SET n=9007199254740993.1250", .expected = "9007199254740993.1250" },
+                .{ .sql = "UPDATE items SET n='1.2300'", .expected = "1.2300" },
+                .{ .sql = "UPDATE items SET n=NULL", .expected = null },
+            }) |case| {
+                var compiled = try @import("compiler.zig").compile(backing, case.sql, .{});
+                defer compiled.deinit();
+                const bound = try bind(a, table, compiled.statement, &.{});
+                const program = if (compiled.statement == .insert) &bound.insert_rows[0][1].? else &bound.assignments[0].?;
+                var none = std.heap.FixedBufferAllocator.init(&.{});
+                const value = try program.evaluate(none.allocator(), &.{}, &.{}, .{});
+                if (case.expected) |expected| {
+                    try std.testing.expect(value.numeric != null);
+                    var work: @import("numeric_value.zig").Context = .{ .alloc = a };
+                    try std.testing.expectEqualStrings(expected, try @import("numeric_value.zig").format(&work, value.numeric.?.*));
+                    for (0..1000) |_| try std.testing.expect((try program.evaluate(none.allocator(), &.{}, &.{}, .{})).numeric == value.numeric);
+                } else try std.testing.expect(value.sql_null);
+            }
+            var typed_text = try @import("compiler.zig").compile(backing, "UPDATE items SET n='1.2300'::text", .{});
+            defer typed_text.deinit();
+            if (bind(a, table, typed_text.statement, &.{})) |_| {
+                return error.TestUnexpectedResult;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expect(err == error.SqlAssignmentTypeMismatch);
+            }
+        }
+    };
+    try Scenario.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "SQL NUMERIC target context preserves integral expression errors before assignment" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{
+        .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric },
+    } };
+    for ([_][]const u8{
+        "INSERT INTO items (_id,n) VALUES ('x',abs('-9223372036854775808'::bigint))",
+        "UPDATE items SET n=abs('-9223372036854775808'::bigint)",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        const bound = try bind(arena.allocator(), table, compiled.statement, &.{});
+        const program = if (compiled.statement == .insert) &bound.insert_rows[0][1].? else &bound.assignments[0].?;
+        try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
     }
 }
 
@@ -618,7 +708,7 @@ const Builder = struct {
         // Actual input kinds resolve polymorphic holes, not known SQL types.
         var coarse: [1024]?ast.ColumnType = undefined;
         for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
-        const result = if (self.typed_parameters or (self.parameters.len == 0 and expected != null and expected.?.kind == .array)) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, expected, .{ .invocation = self.invocation, .assignment = assignment }, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment }, self.settings);
+        const result = if (self.typedExpected(expected)) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, expected, .{ .invocation = self.invocation, .assignment = assignment }, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment }, self.settings);
         if (result.parameter_types.len > self.parameters.len) return error.InvalidSqlParameters;
         for (result.parameter_descriptors, self.parameters[0..result.parameter_types.len]) |inferred, *existing| {
             if (inferred.kind) |kind| {
@@ -645,8 +735,13 @@ const Builder = struct {
         return self.inferType(expression, if (expected) |kind| .{ .kind = kind } else null, false);
     }
 
+    fn typedExpected(self: *const Builder, expected: ?scalar.Type) bool {
+        return self.typed_parameters or (self.parameters.len == 0 and expected != null and
+            (expected.?.kind == .array or (expected.?.kind == .number and expected.?.element_type == .numeric)));
+    }
+
     fn inferType(self: *Builder, expression: *const ast.Scalar, expected: ?scalar.Type, assignment: bool) !bool {
-        if (self.typed_parameters or (self.parameters.len == 0 and expected != null and expected.?.kind == .array)) return scalar.inferTypedParametersExpected(self.alloc, expression, self.columns, self.parameters, expected, .{ .assignment = assignment });
+        if (self.typedExpected(expected)) return scalar.inferTypedParametersExpected(self.alloc, expression, self.columns, self.parameters, expected, .{ .assignment = assignment });
         var coarse: [1024]?ast.ColumnType = undefined;
         for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
         const changed = try scalar.inferParameters(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment });
@@ -674,7 +769,7 @@ const Builder = struct {
 
     fn assignmentProgram(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !scalar.Program {
         const program_ = try self.programType(expression, .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier }, true);
-        if (program_.output_type.kind != null and program_.output_type.kind != column.type and !(program_.output_type.kind == .integer and column.type == .number)) return error.SqlAssignmentTypeMismatch;
+        if (program_.output_type.kind != null and program_.output_type.kind != column.type and !@import("builtin_cast.zig").numericAssignmentAllowed(program_.output_type.kind, column.type)) return error.SqlAssignmentTypeMismatch;
         return program_;
     }
 
@@ -689,13 +784,7 @@ const Builder = struct {
             .scalar => |expression| expression,
             .comparison => |comparison| blk: {
                 const column = try (self.table orelse return error.UndefinedColumn).column(comparison.field);
-                const literal = try self.node(.{ .literal = comparison.value });
-                // Declared floating parameters keep PostgreSQL's mixed
-                // NUMERIC/float comparison domain. Unknown inputs instead
-                // inherit the column's exact NUMERIC identity.
-                const floating_parameter = comparison.value == .parameter and comparison.value.parameter > 0 and comparison.value.parameter <= self.parameters.len and
-                    (self.parameters[comparison.value.parameter - 1].element_type == .float32 or self.parameters[comparison.value.parameter - 1].element_type == .float64);
-                const right = if (comparison.value == .null) literal else try self.node(.{ .cast = .{ .operand = literal, .type = column.type, .element_type = if (column.type == .array or (column.element_type == .numeric and !floating_parameter)) column.element_type else null } });
+                const right = try comparisonOperand(self.alloc, scalar.columnType(column), comparison.value, self.parameters);
                 break :blk try self.node(.{ .binary = .{
                     .op = switch (comparison.op) {
                         inline else => |tag| @field(ast.Scalar.Binary, @tagName(tag)),

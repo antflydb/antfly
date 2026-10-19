@@ -257,11 +257,12 @@ pub const ReplicationSourceActionHint = struct {
     reseed_exact_cutover_path: []u8,
 };
 
-/// Internal admission result. A successful response means the current
-/// metadata membership has durably activated the store-root UUID decoder.
-pub const StoreRootReadiness = struct {
+/// Internal admission result for an exact durable metadata decoder activation.
+/// The requesting route defines the required decoder profile.
+pub const StoreDecoderReadiness = struct {
     activated_version: u16,
 };
+pub const StoreRootReadiness = StoreDecoderReadiness;
 
 pub const AdminSnapshot = struct {
     /// Compact observational peer view. Never substitutes for a catalog view.

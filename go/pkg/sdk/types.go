@@ -52,6 +52,7 @@ type (
 	SQLPreparedResponse         = oapi.SQLPreparedResponse
 	SQLParameterDescriptor      = oapi.SQLParameterDescriptor
 	SQLResponse                 = oapi.SQLResponse
+	SQLDDLReceipt               = oapi.SQLDDLReceipt
 	SQLColumn                   = oapi.SQLColumn
 	SQLNumericModifier          = oapi.SQLNumericModifier
 	SQLColumnType               = oapi.SQLColumnType
@@ -120,6 +121,12 @@ type (
 	CreatedGraphIndexType                 = oapi.CreatedGraphIndexType
 	CreatedAlgebraicIndexType             = oapi.CreatedAlgebraicIndexType
 	IndexStatus                           = oapi.IndexStatus
+	IndexPublicationToken                 = oapi.IndexPublicationToken
+	IndexPublicationStatus                = oapi.IndexPublicationStatus
+	IndexPublicationStatusIndexType       = oapi.IndexPublicationStatusIndexType
+	IndexPublicationState                 = oapi.IndexPublicationState
+	IndexPublicationPhase                 = oapi.IndexPublicationPhase
+	IndexPublicationFailure               = oapi.IndexPublicationFailure
 	IndexMaintenanceRequest               = oapi.IndexMaintenanceRequest
 	IndexMaintenanceResponse              = oapi.IndexMaintenanceResponse
 	IndexMaintenanceOwnerProof            = oapi.IndexMaintenanceOwnerProof
@@ -523,6 +530,26 @@ type (
 	PathFindResult     = oapi.PathFindResult
 	PathFindWeightMode = oapi.PathFindWeightMode
 	PathWeightMode     = oapi.PathWeightMode
+)
+
+const (
+	IndexPublicationStateAdmissionUnknown   = oapi.IndexPublicationStateAdmissionUnknown
+	IndexPublicationStatePending            = oapi.IndexPublicationStatePending
+	IndexPublicationStatePublished          = oapi.IndexPublicationStatePublished
+	IndexPublicationStateFailed             = oapi.IndexPublicationStateFailed
+	IndexPublicationStateCanceled           = oapi.IndexPublicationStateCanceled
+	IndexPublicationPhaseFencing            = oapi.IndexPublicationPhaseFencing
+	IndexPublicationPhaseReserving          = oapi.IndexPublicationPhaseReserving
+	IndexPublicationPhaseBuilding           = oapi.IndexPublicationPhaseBuilding
+	IndexPublicationPhaseInstalling         = oapi.IndexPublicationPhaseInstalling
+	IndexPublicationPhaseReleasing          = oapi.IndexPublicationPhaseReleasing
+	IndexPublicationPhasePublished          = oapi.IndexPublicationPhasePublished
+	IndexPublicationPhaseCanceling          = oapi.IndexPublicationPhaseCanceling
+	IndexPublicationPhaseCancelReleasing    = oapi.IndexPublicationPhaseCancelReleasing
+	IndexPublicationPhaseCanceled           = oapi.IndexPublicationPhaseCanceled
+	IndexPublicationFailureDuplicateKey     = oapi.IndexPublicationFailureDuplicateKey
+	IndexPublicationFailureInvalidCandidate = oapi.IndexPublicationFailureInvalidCandidate
+	IndexPublicationFailureRequested        = oapi.IndexPublicationFailureRequested
 )
 
 type CreatedGraphArtifactProducerConfig = oapi.CreatedGraphArtifactProducerConfig

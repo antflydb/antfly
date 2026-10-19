@@ -1073,12 +1073,55 @@ pub const UserManager = struct {
         scope: @import("row_policy_authority.zig").Scope,
         now_seconds: i64,
     ) ![]u8 {
+        return self.signRowPolicyRolesImpl(alloc, authenticated_username, credential_principal, logical_table, permission_type, secret, issuer, scope, now_seconds, null);
+    }
+
+    /// Supplied only after the SQL owner has admitted an immutable view
+    /// binding. Both user incarnations and live grants are rechecked while
+    /// capturing roles; a deleted/recreated owner cannot inherit a view.
+    pub const ViewDelegation = struct {
+        pub const Intermediate = struct { principal: []const u8, instance: [16]u8, logical_view: []const u8 };
+        logical_view: []const u8,
+        owner: []const u8,
+        owner_instance: [16]u8,
+        caller_instance: [16]u8,
+        intermediate: []const Intermediate = &.{},
+        /// Invoker views must retain the caller's credential restrictions on
+        /// the base relation, even when its user has broader grants.
+        invoker: bool = false,
+    };
+
+    pub fn signRowPolicyViewRolesAuthorized(self: *UserManager, alloc: Allocator, caller: []const u8, credential: []const u8, logical_table: []const u8, delegation: ViewDelegation, secret: []const u8, issuer: []const u8, scope: @import("row_policy_authority.zig").Scope, now_seconds: i64) ![]u8 {
+        if (scope.access != .read) return error.Forbidden;
+        return self.signRowPolicyRolesImpl(alloc, caller, credential, logical_table, .read, secret, issuer, scope, now_seconds, delegation);
+    }
+
+    fn signRowPolicyRolesImpl(
+        self: *UserManager,
+        alloc: Allocator,
+        authenticated_username: []const u8,
+        credential_principal: []const u8,
+        logical_table: []const u8,
+        permission_type: PermissionType,
+        secret: []const u8,
+        issuer: []const u8,
+        scope: @import("row_policy_authority.zig").Scope,
+        now_seconds: i64,
+        delegation: ?ViewDelegation,
+    ) ![]u8 {
         const authority = @import("row_policy_authority.zig");
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
         defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(authenticated_username)) return error.Forbidden;
+        if (delegation) |value| {
+            if (value.intermediate.len > 63 or scope.access != .read or permission_type != .read or
+                !std.mem.eql(u8, &(self.user_instances.get(authenticated_username) orelse return error.Forbidden), &value.caller_instance) or
+                !std.mem.eql(u8, &(self.user_instances.get(value.owner) orelse return error.Forbidden), &value.owner_instance))
+                return error.Forbidden;
+            if (value.invoker and !std.mem.eql(u8, value.owner, authenticated_username)) return error.Forbidden;
+        }
         const current_permissions = if (std.mem.startsWith(u8, credential_principal, "basic:")) blk: {
             if (!std.mem.eql(u8, credential_principal["basic:".len..], authenticated_username)) return error.Forbidden;
             break :blk try self.getPermissionsForUser(authenticated_username);
@@ -1095,7 +1138,7 @@ pub const UserManager = struct {
         var allowed = false;
         for (current_permissions) |permission| {
             if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
-                catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                catalog_names.tableResourceMatches(permission.resource, if (delegation) |value| value.logical_view else logical_table) and
                 (permission.type == .admin or permission.type == permission_type))
             {
                 allowed = true;
@@ -1103,7 +1146,71 @@ pub const UserManager = struct {
             }
         }
         if (!allowed) return error.Forbidden;
-        const roles = try self.getRolesForUser(authenticated_username);
+        if (scope.purpose.requiresWritePermission() and permission_type != .write) return error.Forbidden;
+        if (scope.purpose.requiresSelectPermission()) {
+            var read_allowed = false;
+            for (current_permissions) |permission| {
+                if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                    catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                    (permission.type == .read or permission.type == .admin))
+                {
+                    read_allowed = true;
+                    break;
+                }
+            }
+            if (!read_allowed) return error.Forbidden;
+        }
+        if (delegation) |value| {
+            if (value.invoker) {
+                var base_allowed = false;
+                for (current_permissions) |permission| {
+                    if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                        catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                        (permission.type == .read or permission.type == .admin))
+                    {
+                        base_allowed = true;
+                        break;
+                    }
+                }
+                if (!base_allowed) return error.Forbidden;
+            }
+            for (value.intermediate) |grant| {
+                if (!std.mem.eql(u8, &(self.user_instances.get(grant.principal) orelse return error.Forbidden), &grant.instance)) return error.Forbidden;
+                const permissions = try self.getPermissionsForUser(grant.principal);
+                defer {
+                    for (permissions) |*permission| permission.deinit(self.alloc);
+                    self.alloc.free(permissions);
+                }
+                var granted = false;
+                for (permissions) |permission| {
+                    if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                        catalog_names.tableResourceMatches(permission.resource, grant.logical_view) and
+                        (permission.type == .read or permission.type == .admin))
+                    {
+                        granted = true;
+                        break;
+                    }
+                }
+                if (!granted) return error.Forbidden;
+            }
+            const owner_permissions = try self.getPermissionsForUser(value.owner);
+            defer {
+                for (owner_permissions) |*permission| permission.deinit(self.alloc);
+                self.alloc.free(owner_permissions);
+            }
+            allowed = false;
+            for (owner_permissions) |permission| {
+                if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                    catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                    (permission.type == .admin or permission.type == .read))
+                {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) return error.Forbidden;
+        }
+        const roles = try self.getRolesForUser(if (delegation) |value| value.owner else authenticated_username);
         defer freeOwnedStrings(self.alloc, roles);
         const role_views = try alloc.alloc([]const u8, roles.len);
         defer alloc.free(role_views);
@@ -1115,6 +1222,8 @@ pub const UserManager = struct {
         }.less);
         return authority.sign(alloc, secret, issuer, .{
             .principal = authenticated_username,
+            .policy_principal = if (delegation) |value| (if (value.invoker) null else value.owner) else null,
+            .setting_principal = if (delegation != null and std.mem.startsWith(u8, credential_principal, "api-key:")) credential_principal else null,
             .roles = role_views,
             .auth_revision = self.role_revision,
         }, scope, now_seconds);
@@ -2100,6 +2209,84 @@ test "usermgr bootstrap retires legacy default credentials without silently reop
     var authed = try manager.authenticateUser("admin", "replacement-admin-password");
     defer authed.deinit(alloc);
     try std.testing.expect(try manager.enforce("admin", .@"*", "*", .admin));
+}
+
+test "usermgr view delegation checks both live grants and user incarnations under one role capture" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(a);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policy_store.iface()));
+    defer manager.deinit();
+    var view_permission = [_]Permission{try Permission.initOwned(a, .table, "published", .read)};
+    defer view_permission[0].deinit(a);
+    var source_permission = [_]Permission{try Permission.initOwned(a, .table, "rows", .read)};
+    defer source_permission[0].deinit(a);
+    var caller = try manager.createUser("caller", "secret", &view_permission);
+    defer caller.deinit(a);
+    var owner = try manager.createUser("owner", "secret", &source_permission);
+    defer owner.deinit(a);
+    try manager.addRoleToSubject("owner", "role:reader");
+    const authority = @import("row_policy_authority.zig");
+    const scope: authority.Scope = .{ .table_id = 7, .table = "rows", .database = "main", .policy_generation = 2, .catalog_epoch = 3 };
+    const key = "1234567890abcdef1234567890abcdef";
+    const delegation: UserManager.ViewDelegation = .{
+        .logical_view = "published",
+        .owner = "owner",
+        .owner_instance = owner.instance_id,
+        .caller_instance = caller.instance_id,
+    };
+    const token = try manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", delegation, key, "cluster", scope, 100);
+    defer a.free(token);
+    var verified = try authority.verify(a, key, "cluster", scope, 100, token);
+    defer verified.deinit();
+    try std.testing.expectEqualStrings("caller", verified.value.principal);
+    try std.testing.expectEqualStrings("owner", verified.value.policy_principal.?);
+    try std.testing.expectEqualStrings("role:reader", verified.value.roles[0]);
+    // An owner view may delegate a view-only credential, including when the
+    // view owner and caller happen to be the same user. Invoker views may not.
+    try manager.addPermissionToUser("caller", source_permission[0]);
+    var limited = try manager.createApiKey("caller", "views-only", &view_permission, &.{}, null);
+    defer limited.deinit(a);
+    const credential = try std.fmt.allocPrint(a, "api-key:{s}", .{limited.key.key_id});
+    defer a.free(credential);
+    const delegated = try manager.signRowPolicyViewRolesAuthorized(a, "caller", credential, "rows", delegation, key, "cluster", scope, 100);
+    defer a.free(delegated);
+    var decoded = try authority.verify(a, key, "cluster", scope, 100, delegated);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings(credential, decoded.value.setting_principal.?);
+    var invoker = delegation;
+    invoker.owner = "caller";
+    invoker.owner_instance = caller.instance_id;
+    invoker.invoker = true;
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", credential, "rows", invoker, key, "cluster", scope, 100));
+    const invoked = try manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", invoker, key, "cluster", scope, 100);
+    defer a.free(invoked);
+    var invocation = try authority.verify(a, key, "cluster", scope, 100, invoked);
+    defer invocation.deinit();
+    try std.testing.expect(invocation.value.policy_principal == null);
+    var nested = delegation;
+    nested.intermediate = &.{.{ .principal = "owner", .instance = owner.instance_id, .logical_view = "inner_view" }};
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", nested, key, "cluster", scope, 100));
+    var nested_permission = try Permission.initOwned(a, .table, "inner_view", .read);
+    defer nested_permission.deinit(a);
+    try manager.addPermissionToUser("owner", nested_permission);
+    const nested_token = try manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", nested, key, "cluster", scope, 100);
+    defer a.free(nested_token);
+    try manager.removePermissionFromUser("owner", "inner_view", .table);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", nested, key, "cluster", scope, 100));
+    var recreated = delegation;
+    recreated.owner_instance = @splat(0x7f);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", recreated, key, "cluster", scope, 100));
+    recreated = delegation;
+    recreated.caller_instance = @splat(0x7f);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", recreated, key, "cluster", scope, 100));
+    try manager.removePermissionFromUser("owner", "rows", .table);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", delegation, key, "cluster", scope, 100));
+    try manager.addPermissionToUser("owner", source_permission[0]);
+    try manager.removePermissionFromUser("caller", "published", .table);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", delegation, key, "cluster", scope, 100));
 }
 
 test "usermgr permissions and row filters mirror go semantics" {

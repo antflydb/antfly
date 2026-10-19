@@ -245,6 +245,9 @@ pub const TableReadSource = struct {
     route_fence: ?metadata_api.CatalogRouteFence = null,
 
     pub const VTable = struct {
+        /// Read-index/topology admission only: no primary lookup, RLS
+        /// evaluation, row materialization, or retained mutation fence.
+        admit_statement_read_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8) anyerror!void = null,
         /// Optional owner-local dynamic read set. A distributed router must
         /// not implement this with independently captured shard snapshots.
         open_relational_statement_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
@@ -859,6 +862,12 @@ pub const TableReadSource = struct {
         }
         const fn_ptr = self.vtable.lookup_group_local orelse return null;
         return try BoundaryAbi.call("lookup_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, key, opts, consistency });
+    }
+
+    pub fn admitStatementReadGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
+        const fence = self.route_fence orelse return error.CatalogRouteFenceRequired;
+        const admit = self.vtable.admit_statement_read_group_local_routed orelse return error.SqlStatementSnapshotRequired;
+        return BoundaryAbi.call("admit_statement_read_group_local_routed", self.boundary_dispatch, admit, .{ self.ptr, alloc, fence, group_id, table_name });
     }
 
     pub fn scanGroupLocal(

@@ -540,9 +540,15 @@ const Encoder = struct {
         for (values) |value| try self.cell(value);
     }
     fn cell(self: *Encoder, value: Datum) anyerror!void {
+        try value.validateTemporal();
         try self.append(&.{@intFromBool(value.sql_null)});
-        if (value.numeric) |number| {
-            if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+        if (value.temporal()) |temporal| {
+            var frame: [16]u8 = undefined;
+            const bytes = try @import("temporal_value.zig").encode(temporal.*, &frame);
+            try self.append(&.{ 12, @backingInt(temporal.kind()) });
+            try self.text(bytes);
+        } else if (value.numeric) |number| {
+            if (value.sql_null or value.array != null or value.patterns() != null or value.value != .null) return error.SqlTypeMismatch;
             const numeric = @import("numeric_value.zig");
             const binary = @import("numeric_binary.zig");
             var context: numeric.Context = .{ .alloc = self.scratch orelse self.a, .max_output_bytes = self.limit };
@@ -552,7 +558,7 @@ const Encoder = struct {
             var writer: std.Io.Writer = .fixed(try self.reserve(length));
             try binary.encode(&context, number.*, &writer);
         } else if (value.array) |array| {
-            if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+            if (value.sql_null or value.patterns() != null or value.value != .null) return error.SqlTypeMismatch;
             const validated = try array.validate(if (self.manager) |manager| manager.array_limits else .{});
             if (validated.dimensions.len != array.dimensions.len) return error.InvalidSqlArrayShape;
             if (self.compact_arrays and @import("array_compact.zig").supported(array.element_type)) {
@@ -575,7 +581,7 @@ const Encoder = struct {
             }
             try self.word(array.cardinality());
             for (0..array.cardinality()) |index| try self.cell(array.flatCell(index));
-        } else if (value.patterns) |pattern| {
+        } else if (value.patterns()) |pattern| {
             const id = try (self.manager orelse return error.InvalidSqlSpill).patternId(pattern);
             try self.append(&.{8});
             try self.word(id);
@@ -859,6 +865,15 @@ const Decoder = struct {
                     else => error.InvalidSqlSpill,
                 };
                 value.* = Datum.typedArray(array);
+            } else if (self.position < self.bytes.len and self.bytes[self.position] == 12) {
+                self.position += 1;
+                if (flag != 0) return error.InvalidSqlSpill;
+                const temporal = @import("temporal_value.zig");
+                const kind = std.enums.fromInt(temporal.Kind, try self.byte()) orelse return error.InvalidSqlSpill;
+                const decoded = temporal.decode(kind, try self.take(try self.count())) catch return error.InvalidSqlSpill;
+                const owned = try self.a.create(temporal.Value);
+                owned.* = decoded;
+                value.* = Datum.typedTemporal(owned);
             } else if (self.position < self.bytes.len and self.bytes[self.position] == 10) {
                 value.* = try self.numeric(flag);
             } else if (self.position < self.bytes.len and self.bytes[self.position] == 9) {
@@ -896,7 +911,7 @@ const Decoder = struct {
                 self.position += 1;
                 const id = try self.word();
                 if (flag != 0) return error.InvalidSqlSpill;
-                value.* = .{ .sql_null = false, .patterns = try (self.manager orelse return error.InvalidSqlSpill).patternAt(id) };
+                value.* = Datum.fromParts(.null, false, try (self.manager orelse return error.InvalidSqlSpill).patternAt(id));
             } else value.* = .{ .sql_null = flag == 1, .value = try self.json(0) };
         }
         return values;
@@ -1078,6 +1093,32 @@ pub const ColumnarBlock = struct {
     }
 };
 const columnar_v1_magic = "NCB\x01";
+
+test "SQL temporal spill decoder rejects malformed flags kinds frames and truncations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bytes: [27]u8 = @splat(0);
+    std.mem.writeInt(u64, bytes[0..8], 1, .little);
+    bytes[9] = 12;
+    bytes[10] = @backingInt(@import("temporal_value.zig").Kind.timestamp);
+    std.mem.writeInt(u64, bytes[11..19], 8, .little);
+    var valid: Decoder = .{ .a = arena.allocator(), .bytes = &bytes };
+    const decoded = try valid.cells();
+    try std.testing.expectEqual(@as(i64, 0), decoded[0].temporal().?.timestamp.micros);
+    for (0..bytes.len) |len| {
+        var truncated: Decoder = .{ .a = arena.allocator(), .bytes = bytes[0..len] };
+        try std.testing.expectError(error.InvalidSqlSpill, truncated.cells());
+    }
+    for ([_]usize{ 8, 10, 11 }) |index| {
+        var bad = bytes;
+        bad[index] = 255;
+        var decoder: Decoder = .{ .a = arena.allocator(), .bytes = &bad };
+        try std.testing.expectError(error.InvalidSqlSpill, decoder.cells());
+    }
+    std.mem.writeInt(i64, bytes[19..27], @import("temporal_value.zig").end_timestamp, .big);
+    var out_of_range: Decoder = .{ .a = arena.allocator(), .bytes = &bytes };
+    try std.testing.expectError(error.InvalidSqlSpill, out_of_range.cells());
+}
 pub const ColumnarVersion = enum { v1, v2 };
 const columnar_v2_magic = "NCB\x02";
 pub fn encodeColumnarBlockAlloc(a: Allocator, rows: []const Row, max_bytes: usize) ![]u8 {
@@ -1087,8 +1128,8 @@ pub fn encodeColumnarBlockVersionAlloc(a: Allocator, rows: []const Row, max_byte
     if (rows.len == 0 or rows.len > 256 or rows[0].values.len > 1024 or rows[0].keys.len > 256) return error.InvalidSqlSpill;
     for (rows) |row| {
         if (row.values.len != rows[0].values.len or row.keys.len != rows[0].keys.len) return error.InvalidSqlSpill;
-        for (row.values) |value| if (value.patterns != null) return error.InvalidSqlSpill;
-        for (row.keys) |value| if (value.patterns != null) return error.InvalidSqlSpill;
+        for (row.values) |value| if (value.patterns() != null) return error.InvalidSqlSpill;
+        for (row.keys) |value| if (value.patterns() != null) return error.InvalidSqlSpill;
     }
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(a);
@@ -2008,6 +2049,7 @@ pub const Sequential = struct {
     file: File,
     size: u64 = 0,
     readers: usize = 0,
+    prefix_readers: usize = 0,
     block_bytes: usize,
     buffer_bytes: ?usize = null,
     write_arena: std.heap.ArenaAllocator,
@@ -2031,6 +2073,16 @@ pub const Sequential = struct {
     }
     pub fn append(self: *Sequential, row: Row, link: u64) !u64 {
         if (self.readers != 0) return error.InvalidSqlSpill;
+        return self.appendInternal(row, link);
+    }
+    /// Serialized append-only replay may extend the unpublished tail while
+    /// independent prefix readers retain their own decoded blocks. Ordinary
+    /// sealed-run readers still prohibit writes. This is not concurrent I/O.
+    pub fn appendPrefix(self: *Sequential, row: Row, link: u64) !u64 {
+        if (self.readers != self.prefix_readers) return error.InvalidSqlSpill;
+        return self.appendInternal(row, link);
+    }
+    fn appendInternal(self: *Sequential, row: Row, link: u64) !u64 {
         if (link != none) return error.InvalidSqlSpill;
         try self.file.manager.check();
         var bytes: usize = @sizeOf(Row);
@@ -2266,7 +2318,7 @@ pub const Sequential = struct {
             if (id >= input.values.len) return error.InvalidSqlSpill;
             if (remap[id] == std.math.maxInt(u16)) {
                 const value = input.values[id];
-                flags[id] = if (value.sql_null) 1 else if (value.value == .null and value.array == null and value.numeric == null and value.patterns == null) 2 else 0;
+                flags[id] = if (value.sql_null) 1 else if (value.value == .null and value.array == null and value.numeric == null and value.extension == null) 2 else 0;
                 if (flags[id] != 0) {
                     remap[id] = 256;
                 } else {
@@ -2318,7 +2370,7 @@ pub const Sequential = struct {
         return true;
     }
     fn tag(value: Datum) u8 {
-        if (value.patterns != null or value.array != null or value.numeric != null) return 255;
+        if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null) return 255;
         return switch (value.value) {
             .null => 0,
             .bool => 1,
@@ -2373,7 +2425,8 @@ pub const Sequential = struct {
             var kind: ?u8 = null;
             for (rows) |row| {
                 const value = (if (keys) row.keys else row.values)[column];
-                if (value.sql_null or (value.value == .null and value.patterns == null and value.array == null and value.numeric == null)) continue;
+                try value.validateTemporal();
+                if (value.sql_null or (value.value == .null and value.patterns() == null and value.array == null and value.numeric == null and value.temporal() == null)) continue;
                 const actual = tag(value);
                 kind = if (kind == null or kind.? == actual) actual else 255;
             }
@@ -2555,6 +2608,8 @@ pub const Sequential = struct {
     /// reader must not move after its first read (JSON arrays retain its arena).
     pub const ReplayReader = struct {
         source: *Sequential,
+        prefix: bool = false,
+        prefix_offset: u64 = 0,
         file: File,
         read_arena: std.heap.ArenaAllocator,
         read_rows: []const Row = &.{},
@@ -2622,7 +2677,33 @@ pub const Sequential = struct {
         }
 
         pub fn readBorrowed(self: *ReplayReader, offset: u64) !Decoded {
+            if (self.prefix) return error.InvalidSqlSpill;
             return readState(self, &self.file, self.source.size, offset);
+        }
+
+        /// The pending tail borrows the writer and expires on any append.
+        /// Callers retaining a row across producer advancement must clone it.
+        /// Flushed blocks retain the ordinary independent-reader lifetime.
+        pub fn readPrefixBorrowed(self: *ReplayReader, offset: u64) !Decoded {
+            if (!self.prefix or offset >= self.source.size) return error.InvalidSqlSpill;
+            try self.source.file.manager.check();
+            const flushed = self.source.size - self.source.pending.items.len;
+            if (offset >= flushed) return .{ .row = self.source.pending.items[@intCast(offset - flushed)], .next = none, .matched = false, .following = offset + 1 };
+            if (offset < self.prefix_offset) {
+                self.prefix_offset = 0;
+                self.read_first = 0;
+                self.read_offset = 0;
+                self.read_rows = &.{};
+                self.read_single_offset = null;
+            }
+            // A row previously served from the pending tail may now be in a
+            // flushed block. Catch up sequentially, without a per-row index.
+            while (self.prefix_offset <= offset) {
+                const value = try readState(self, &self.source.file, flushed, self.prefix_offset);
+                self.prefix_offset += 1;
+                if (self.prefix_offset == offset + 1) return value;
+            }
+            unreachable;
         }
 
         pub fn deinit(self: *ReplayReader) void {
@@ -2630,6 +2711,7 @@ pub const Sequential = struct {
             self.read_arena.deinit();
             self.file.manager.allocator().free(self.file.read_buffer);
             self.source.readers -= 1;
+            if (self.prefix) self.source.prefix_readers -= 1;
             self.* = undefined;
         }
     };
@@ -2642,6 +2724,16 @@ pub const Sequential = struct {
         file.read_start = none;
         file.read_len = 0;
         return .{ .source = self, .file = file, .read_arena = .init(self.file.manager.allocator()) };
+    }
+
+    pub fn openPrefixReader(self: *Sequential) !ReplayReader {
+        self.readers += 1;
+        self.prefix_readers += 1;
+        var file = self.file;
+        file.read_buffer = &.{};
+        file.read_start = none;
+        file.read_len = 0;
+        return .{ .source = self, .file = file, .prefix = true, .read_arena = .init(self.file.manager.allocator()) };
     }
 
     fn readState(self: anytype, file: *File, size: u64, offset: u64) !Decoded {
@@ -3094,9 +3186,21 @@ pub const Sequential = struct {
             const types = @import("../storage/rowsource/types.zig");
             if (column >= self.width()) return error.InvalidSqlSpill;
             const count_rows = self.count();
+            const expected: u8 = switch (kind) {
+                .bool => 1,
+                .i64 => 2,
+                .f64 => 3,
+                .bytes, .json => 5,
+                else => return error.InvalidSqlSpill,
+            };
+            const encoded = if (self.encoded) |block| block.values[column] else null;
+            if (encoded) |stored| switch (stored.values) {
+                .fixed => |fixed| if (fixed.kind != expected) return error.InvalidSqlSpill,
+                .dictionary => |dictionary| if (dictionary.kind != expected) return error.InvalidSqlSpill,
+                else => {},
+            };
             const nulls = try a.alloc(u8, count_rows);
             errdefer a.free(nulls);
-            const encoded = if (self.encoded) |block| block.values[column] else null;
             for (nulls, 0..) |*flag, row_index| {
                 if (encoded) |stored| {
                     if (stored.values != .dynamic and stored.values != .shared) {
@@ -3110,13 +3214,6 @@ pub const Sequential = struct {
                 }
                 flag.* = @intFromBool((try self.cell(row_index, column)).sql_null);
             }
-            const expected: u8 = switch (kind) {
-                .bool => 1,
-                .i64 => 2,
-                .f64 => 3,
-                .bytes, .json => 5,
-                else => return error.InvalidSqlSpill,
-            };
             if (encoded) |stored| {
                 if (stored.values == .dictionary and kind != .json and kind != .bool) {
                     const dictionary = stored.values.dictionary;
@@ -3486,7 +3583,7 @@ const NativeFingerprint = struct {
         for (0..batch.width()) |column| {
             const part: u64 = if (try batch.frozenJson(row, column)) |frozen| self.bodyHash(frozen.bytes, 2 + @as(u8, @intFromBool(frozen.lossless_text))) else if (try batch.encodedJson(row, column)) |text| self.bodyHash(text, 1) else blk: {
                 const value = try batch.cell(a, row, column);
-                if (value.patterns != null or value.array != null or value.numeric != null or Sequential.tag(value) == 255) return null;
+                if (value.extension != null or value.array != null or value.numeric != null or Sequential.tag(value) == 255) return null;
                 const tag: u8 = if (value.sql_null) 128 else Sequential.tag(value);
                 hash.update(&.{tag});
                 break :blk if (value.sql_null or tag == 0) @as(u64, 0) else Sequential.physicalHash(value);
@@ -6075,7 +6172,7 @@ test "SQL native immutable column blocks reject truncation versions and callback
     try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bad, 4096));
     try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bytes, bytes.len - 1));
     var callback: scalar.PatternSet = undefined;
-    const callback_rows = [_]Row{.{ .values = &.{.{ .patterns = &callback, .sql_null = false }}, .keys = &.{}, .ordinal = 0 }};
+    const callback_rows = [_]Row{.{ .values = &.{Datum.fromParts(.null, false, &callback)}, .keys = &.{}, .ordinal = 0 }};
     try std.testing.expectError(error.InvalidSqlSpill, encodeColumnarBlockAlloc(a, &callback_rows, 4096));
 }
 

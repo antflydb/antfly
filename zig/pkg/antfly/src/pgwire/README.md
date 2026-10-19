@@ -112,6 +112,29 @@ be accepted on loopback by default; remote binding requires explicit deployment
 acknowledgement of an externally protected transport. This override supplies no
 TLS itself.
 
+## COPY output
+
+`COPY table [(columns)] TO STDOUT` and `COPY (SELECT ...) TO STDOUT`
+use retained native read cursors in both simple and extended wire protocols.
+Text, CSV and PostgreSQL binary output share typed pgwire encoders. CSV supports
+HEADER, DELIMITER, NULL, QUOTE, ESCAPE and FORCE_QUOTE; text supports HEADER,
+DELIMITER and NULL. Only UTF-8 encoding is currently accepted. Implicit table
+columns exclude generated columns; explicit projections retain their columns.
+
+The server sends CopyOutResponse, bounded CopyData frames, CopyDone and
+`COPY count`. Frames can split fields and rows. COPY does not suspend at the
+Execute row count or silently truncate at the ordinary result limit. Scan,
+memory, spill and deadline limits still apply. A page is flushed before pulling
+another; cancellation, authorization revocation and errors abort without a
+successful COPY completion. One reusable field buffer is connection-budgeted;
+neither a complete row nor the complete result is buffered by the transport.
+
+COPY FROM, server files, PROGRAM, write-returning queries and zero-column
+implicit projections remain unsupported. COPY is a wire streaming operation,
+not an alias for a JSON SQL response; ordinary nonstreaming execution rejects it.
+As in PostgreSQL, `TO STDIN` is accepted as an alternative spelling for client
+output; the TO/FROM direction determines the operation, not the stream token.
+
 ## DDL admission and readiness
 
 Standalone completes initial durable relation catalog publication before opening

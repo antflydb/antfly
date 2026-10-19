@@ -26,6 +26,7 @@ pub const Identity = struct {
     catalog_digest: [32]u8,
     next_epoch: u64,
     backup_seal_supported: bool = false,
+    catalog_checks_identity_supported: bool = false,
     // Explicit durable authority domain; native receipts never contain a
     // fabricated Raft position. Missing capability fails closed at admission.
     generation_handoff_receipt_authority: GenerationHandoffReceiptAuthority = .unsupported,
@@ -43,7 +44,7 @@ pub const receipt_key = "\x00\x00__metadata__:relational_integrity_topology_rece
 
 pub const abort_prefix = "\x00\x00__metadata__:relational_integrity_topology_aborted:";
 
-pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7, child_generation_parent = 8, child_generation_source = 9, child_generation_dual = 10, rewrite_destination = 11 };
+pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7, child_generation_parent = 8, child_generation_source = 9, child_generation_dual = 10, rewrite_destination = 11, index_build = 12, schema_validation = 13 };
 
 pub const ParentRetirementEntry = struct {
     child_table_id: u64,

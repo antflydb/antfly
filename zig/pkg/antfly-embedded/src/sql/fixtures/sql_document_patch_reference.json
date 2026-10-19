@@ -1,0 +1,523 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL JSONB with explicit Antfly patch extension",
+  "seed_version": 42,
+  "seeds": [
+    {
+      "key": "doc:a",
+      "value": {
+        "title": "Before",
+        "obsolete": true,
+        "cold": [
+          1,
+          2,
+          3
+        ],
+        "metadata": {
+          "source": "api"
+        }
+      }
+    },
+    {
+      "key": "doc:b",
+      "value": {
+        "title": "Other",
+        "note": "preserved"
+      }
+    },
+    {
+      "key": "doc:c",
+      "value": {
+        "title": "Untouched",
+        "note": "retained"
+      }
+    }
+  ],
+  "entries": [
+    {
+      "id": "sql-0895",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 1,
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Launch",
+            "metadata": {
+              "source": "api"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0896",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 1,
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Launch",
+            "metadata": {
+              "source": "api"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0897",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 1,
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Launch",
+            "metadata": {
+              "source": "api"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0898",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 2,
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Launch",
+            "metadata": {
+              "source": "api"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Launch"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0899",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 1,
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Launch",
+            "metadata": {
+              "source": "api"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0900",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "obsolete": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 1,
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Before",
+            "metadata": {
+              "source": "api"
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0901",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 1,
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Before",
+            "metadata": {
+              "source": "api",
+              "status": "ready"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0902",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 1,
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Before",
+            "metadata": {
+              "source": "api",
+              "archived_at": null
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0903",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "keyword"
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 1,
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "tags": [
+              "new",
+              "hot"
+            ],
+            "title": "Before",
+            "metadata": {
+              "source": "api"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    }
+  ]
+}

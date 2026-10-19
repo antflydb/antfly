@@ -693,6 +693,8 @@ pub const LakeCatalogConfig = struct {
 
 /// A typed CHECK. Supply either expression or column and op (with optional value and collation), never both forms. Expressions must return boolean and use the shared bounded immutable scalar expression vocabulary. New writes are checked from schema publication; existing rows are validated separately. SQL UNKNOWN satisfies CHECK. Comparison values must match the column type. Integer values may also use exact decimal strings to avoid client-side floating-point rounding.
 pub const RelationalCheckConstraint = struct {
+    /// Enforce this CHECK on every new or changed row without asserting that historical rows satisfy it. Explicit validation clears this declaration only after an unpublished generation has validated all rows and atomically replaced the active generation. Disposable background scan coverage does not change this declaration.
+    not_valid: ?bool = null,
     name: []const u8,
     column: ?[]const u8 = null,
     op: ?RelationalComparisonOp = null,
@@ -704,6 +706,7 @@ pub const RelationalCheckConstraint = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "not_valid", "not_valid", true },
         .{ "name", "name", false },
         .{ "column", "column", true },
         .{ "op", "op", true },
@@ -722,6 +725,10 @@ pub const RelationalCheckConstraint = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.not_valid) |value| {
+            try jw.objectField("not_valid");
+            try jw.write(value);
+        }
         try jw.objectField("name");
         try jw.write(self.name);
         if (self.column) |value| {
@@ -865,6 +872,19 @@ pub const RelationalExpressionOp = enum {
     in_list,
     not_in_list,
     array,
+    replace,
+    md5,
+    abs,
+    ceil,
+    floor,
+    round,
+    trunc,
+    sign,
+    sqrt,
+    jsonb_typeof,
+    jsonb_array_length,
+    jsonb_extract_path,
+    jsonb_extract_path_text,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -898,6 +918,19 @@ pub const RelationalExpressionOp = enum {
             .in_list => "in_list",
             .not_in_list => "not_in_list",
             .array => "array",
+            .replace => "replace",
+            .md5 => "md5",
+            .abs => "abs",
+            .ceil => "ceil",
+            .floor => "floor",
+            .round => "round",
+            .trunc => "trunc",
+            .sign => "sign",
+            .sqrt => "sqrt",
+            .jsonb_typeof => "jsonb_typeof",
+            .jsonb_array_length => "jsonb_array_length",
+            .jsonb_extract_path => "jsonb_extract_path",
+            .jsonb_extract_path_text => "jsonb_extract_path_text",
         };
         try jw.write(s);
     }
@@ -938,6 +971,19 @@ pub const RelationalExpressionOp = enum {
             .{ "in_list", .in_list },
             .{ "not_in_list", .not_in_list },
             .{ "array", .array },
+            .{ "replace", .replace },
+            .{ "md5", .md5 },
+            .{ "abs", .abs },
+            .{ "ceil", .ceil },
+            .{ "floor", .floor },
+            .{ "round", .round },
+            .{ "trunc", .trunc },
+            .{ "sign", .sign },
+            .{ "sqrt", .sqrt },
+            .{ "jsonb_typeof", .jsonb_typeof },
+            .{ "jsonb_array_length", .jsonb_array_length },
+            .{ "jsonb_extract_path", .jsonb_extract_path },
+            .{ "jsonb_extract_path_text", .jsonb_extract_path_text },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -952,6 +998,7 @@ pub const RelationalExpressionType = enum {
     number,
     numeric,
     sql_array,
+    json,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -963,6 +1010,7 @@ pub const RelationalExpressionType = enum {
             .number => "number",
             .numeric => "numeric",
             .sql_array => "sql_array",
+            .json => "json",
         };
         try jw.write(s);
     }
@@ -981,6 +1029,7 @@ pub const RelationalExpressionType = enum {
             .{ "number", .number },
             .{ "numeric", .numeric },
             .{ "sql_array", .sql_array },
+            .{ "json", .json },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -1323,21 +1372,24 @@ pub const RelationalIndexOwnerKind = enum {
     }
 };
 
-/// A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+/// A typed partial-index conjunct. Specify either a constant truth value, or a column and comparison operation, never both. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. A constant false conjunct represents an empty index without inventing a column dependency.
 pub const RelationalIndexPredicate = struct {
-    column: []const u8,
-    op: RelationalComparisonOp,
+    column: ?[]const u8 = null,
+    op: ?RelationalComparisonOp = null,
     /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
     value: ?std.json.Value = null,
     /// String comparison collation with the same semantics as ordered keys.
     collation: ?[]const u8 = null,
+    /// Constant membership truth. SQL UNKNOWN is normalized to false for index membership. Requires reader capability version 26.
+    constant: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "column", "column", false },
-        .{ "op", "op", false },
+        .{ "column", "column", true },
+        .{ "op", "op", true },
         .{ "value", "value", true },
         .{ "collation", "collation", true },
+        .{ "constant", "constant", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1350,10 +1402,14 @@ pub const RelationalIndexPredicate = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("column");
-        try jw.write(self.column);
-        try jw.objectField("op");
-        try jw.write(self.op);
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.op) |value| {
+            try jw.objectField("op");
+            try jw.write(value);
+        }
         if (self.value) |value| {
             try jw.objectField("value");
             try jw.write(value);
@@ -1362,11 +1418,15 @@ pub const RelationalIndexPredicate = struct {
             try jw.objectField("collation");
             try jw.write(value);
         }
+        if (self.constant) |value| {
+            try jw.objectField("constant");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
 
-/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19.
+/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. The replace operation takes three text arguments and performs literal, non-overlapping replacement; an empty search string leaves the input unchanged. md5 takes one text argument and returns 32 lowercase hex characters (a SQL compatibility fingerprint, not a security primitive). Both are strict in SQL NULL and require reader capability version 27, including when nested inside scalar/boolean expressions. Literal search patterns are prepared with immutable plans; matching, copies and dynamic pattern preparation share invocation work/cancellation admission. Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require reader capability version 28, even when nested in boolean programs. They take one NUMERIC or float64 argument; abs also preserves integer widths and float32. round and trunc optionally accept an int32 scale as a second argument only for NUMERIC. Operands must already have their resolved SQL types; SQL lowering inserts required promotions. NUMERIC round uses ties away from zero; float64 round uses ties to even. All selected arguments evaluate before strict NULL propagation. NUMERIC execution never converts through float and shares invocation admission. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19. JSON expressions require reader capability version 30. The json type carries JSONB semantics, including exact numeric values and display scale. jsonb_typeof and jsonb_array_length take one JSON argument; array length rejects a non-array value. jsonb_extract_path and jsonb_extract_path_text take a JSON argument followed by 1 to 31 text path components. Negative array ordinals count from the end; a missing path returns SQL NULL. JSON extraction retains JSON null; text extraction converts JSON null to SQL NULL. Arguments are evaluated strictly, while enclosing CASE/coalesce retain their short-circuit semantics.
 pub const RelationalScalarExpression = struct {
     op: RelationalExpressionOp,
     type: ?RelationalExpressionType = null,
@@ -1376,6 +1436,8 @@ pub const RelationalScalarExpression = struct {
     numeric_modifier: ?SQLNumericModifier = null,
     /// Typed literal value, including null.
     value: OpenApiOptionalNullable(std.json.Value) = .absent,
+    /// For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30.
+    json_null: ?bool = null,
     column: ?[]const u8 = null,
     /// Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes.
     collation: ?[]const u8 = null,
@@ -1388,6 +1450,7 @@ pub const RelationalScalarExpression = struct {
         .{ "sql_type", "sql_type", true },
         .{ "numeric_modifier", "numeric_modifier", true },
         .{ "value", "value", false },
+        .{ "json_null", "json_null", true },
         .{ "column", "column", true },
         .{ "collation", "collation", true },
         .{ "args", "args", true },
@@ -1427,6 +1490,10 @@ pub const RelationalScalarExpression = struct {
                 try jw.objectField("value");
                 try jw.write(value);
             },
+        }
+        if (self.json_null) |value| {
+            try jw.objectField("json_null");
+            try jw.write(value);
         }
         if (self.column) |value| {
             try jw.objectField("column");

@@ -24,6 +24,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal = @import("derived/change_journal.zig");
 pub const primary_effect = @import("primary_effect.zig");
+pub const schema_owner_control = @import("relational_schema_owner_control.zig");
 const db_types = @import("types.zig");
 
 const replication_record = @import("replication_record.zig");
@@ -48,6 +49,7 @@ pub const AppendMetadataMutationOptions = struct {
 };
 
 pub const BatchMutationPayload = struct {
+    index_owner_control: ?@import("relational_index_owner_control.zig").Frame = null,
     /// Original authority for ordinary rows and coordinated resolutions. Input
     /// provenance cannot substitute a standby-local replay sequence.
     ordinary_raft_entry: ?db_types.OrderedApplyReceipt = null,
@@ -819,6 +821,24 @@ pub fn decodeBatchMutationRequest(
         .allocate = .alloc_always,
     });
     errdefer parsed.deinit();
+    if (parsed.value.index_owner_control != null or parsed.value.schema_version == @import("relational_index_owner_control.zig").envelope_version) {
+        if (record.payload.len > @import("relational_index_owner_control.zig").max_wire_bytes) return error.InvalidBatchRequest;
+        // Private control envelopes have exactly these fields. An ignored
+        // unknown field or ordinary batch effect must never enter this path.
+        const Strict = struct {
+            schema_version: u32,
+            request: struct {},
+            index_owner_control: @import("relational_index_owner_control.zig").Frame,
+        };
+        var strict = std.json.parseFromSlice(Strict, alloc, record.payload, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        };
+        defer strict.deinit();
+        try validateIndexOwnerPayload(parsed.value);
+        if (record.payload.len > parsed.value.index_owner_control.?.effect.wireLimit()) return error.InvalidBatchRequest;
+        return parsed;
+    }
     try unwrapGraphApplyEnvelope(&parsed.value);
     if (parsed.value.schema_version == 15 or parsed.value.schema_version == 19) {
         try validateOrdinaryRaftPayload(parsed.value);
@@ -863,6 +883,26 @@ pub fn decodeBatchMutationRequest(
     return parsed;
 }
 
+fn canonicalRequestHash(request: db_types.BatchRequest) ![32]u8 {
+    var writer = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
+    try std.json.Stringify.value(request, .{}, &writer.writer);
+    var result: [32]u8 = undefined;
+    writer.hasher.final(&result);
+    return result;
+}
+
+pub fn validateIndexOwnerPayload(payload: BatchMutationPayload) !void {
+    const control = @import("relational_index_owner_control.zig");
+    if (payload.schema_version != control.envelope_version) return error.InvalidBatchRequest;
+    const frame = payload.index_owner_control orelse return error.InvalidBatchRequest;
+    try frame.validate();
+    inline for (comptime std.meta.fieldNames(BatchMutationPayload)) |name| {
+        if (comptime std.mem.eql(u8, name, "schema_version") or std.mem.eql(u8, name, "request") or std.mem.eql(u8, name, "index_owner_control")) continue;
+        if (@field(payload, name) != null) return error.InvalidBatchRequest;
+    }
+    if (!std.mem.eql(u8, &try canonicalRequestHash(payload.request), &try canonicalRequestHash(.{}))) return error.InvalidBatchRequest;
+}
+
 fn validateNativeTopologyPayload(alloc: Allocator, payload: BatchMutationPayload) !void {
     const stamp = payload.native_topology_position orelse return error.InvalidControlReceiptPosition;
     try stamp.validate();
@@ -892,6 +932,7 @@ pub fn decodeRestoreFinishForReplay(
     if (record.payload_codec != .json) return error.UnsupportedBatchMutationCodec;
     const Finish = @FieldType(@import("restore_staging_contract.zig").Control, "finish");
     const Projection = struct {
+        index_owner_control: ?struct {} = null,
         schema_version: u32 = 1,
         apply_schema_version: ?u32 = null,
         ordinary_raft_entry: ?db_types.OrderedApplyReceipt = null,
@@ -911,6 +952,11 @@ pub fn decodeRestoreFinishForReplay(
     };
     var parsed = try std.json.parseFromSlice(Projection, alloc, record.payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
+    if (parsed.value.index_owner_control != null or parsed.value.schema_version == @import("relational_index_owner_control.zig").envelope_version) {
+        var control = try decodeBatchMutationRequest(alloc, record);
+        defer control.deinit();
+        return null;
+    }
     // A duplicate ordinary batch needs only this small projection. Preserve
     // the no-row-copy replay path even for the graph capability envelope.
     try unwrapSchemaVersion(&parsed.value.schema_version, &parsed.value.apply_schema_version);

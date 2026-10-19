@@ -1022,13 +1022,18 @@ export interface paths {
         put?: never;
         /**
          * Execute a SQL statement
-         * @description Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
-         *     subset through the current catalog and native row execution contracts.
-         *     Parameters are bound separately from statement text. Document, graph,
-         *     and lake SQL sources, DDL, and SQL sessions are not yet supported.
-         *     Reads inherit native owner-local consistency, not a global SQL
-         *     transaction snapshot. Statements requiring a retained multi-page
-         *     statement snapshot fail when that capability is unavailable.
+         * @description Executes supported SQL statements through the current catalog and native
+         *     execution contracts. Stored views use CREATE [OR REPLACE] VIEW,
+         *     ALTER VIEW RENAME TO, and DROP VIEW [CASCADE | RESTRICT] on this same
+         *     endpoint. Views retain durable source identities; owner/invoker access
+         *     reuses native row policies and caller/owner filters without changing
+         *     the caller's SQL identity. Document fields can be projected with
+         *     jsonb_to_record and declared SQL types, including typed arrays.
+         *     Parameters are bound separately from statement text. Source, DDL,
+         *     session, and transaction capabilities are checked explicitly; not every
+         *     PostgreSQL statement or cross-source transaction is supported.
+         *     Reads require the native retained statement-snapshot capabilities of
+         *     their sources, not an implied global SQL transaction snapshot.
          *     Unsupported statement shapes fail explicitly; the server never
          *     silently substitutes a different query or truncates the result.
          */
@@ -2502,6 +2507,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact index publication
+         * @description Requires administration of the current logical table and the retained recovery token. This read never replays DDL. Unknown admission remains unknown, including after an absent or unmirrored observation. Published is historical job completion, not current index query readiness.
+         */
+        get: operations["getIndexPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/sources": {
         parameters: {
             query?: never;
@@ -3022,6 +3050,31 @@ export interface paths {
         post: operations["createNamespaceTableIndex"];
         /** Drop an index from an explicit namespace table */
         delete: operations["dropNamespaceTableIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact index publication in an explicit namespace
+         * @description Requires administration of the current logical table and its retained recovery token. Unknown admission is not permission to replay DDL; published is historical job completion, not current index query readiness.
+         */
+        get: operations["getNamespaceTableIndexPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -4927,12 +4980,15 @@ export interface components {
         /** @enum {string} */
         SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
         /**
-         * @description Durable DDL declaration receipt. admission_unknown means admission has
-         *     not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
-         *     Pending or invalid means the declaration
-         *     committed but validation has not established an active constraint. Do not
-         *     replay it. Inspect table constraint status using this immutable table
-         *     identity and schema generation; a later generation supersedes this receipt.
+         * @description Durable DDL operation receipt. admission_unknown means admission has
+         *     not been confirmed; retain the matching restore job, FK publication ID, or
+         *     index publication token and reconcile its status without replaying DDL.
+         *     Pending means a durable operation was admitted, not necessarily that its
+         *     successor schema is published. Invalid means declaration validation failed.
+         *     Do not replay either. For an index build, observe the exact publication
+         *     token; otherwise inspect its restore job or table constraint status using
+         *     this immutable table identity and schema generation. A later generation
+         *     may supersede the completed operation.
          */
         SQLDDLReceipt: {
             database: string;
@@ -4947,6 +5003,9 @@ export interface components {
             restore_job_id?: string;
             /** @description Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL. */
             idempotency_key?: string;
+            /** @description Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL. */
+            fk_generation_publication_id?: string;
+            index_publication_token?: components["schemas"]["IndexPublicationToken"];
         };
         SQLDiagnostic: {
             /** @description Five-character SQLSTATE error code. */
@@ -7427,6 +7486,7 @@ export interface components {
             buckets?: components["schemas"]["AggregationBucket"][];
         };
         IndexStatus: {
+            publication?: components["schemas"]["IndexPublicationStatus"];
             shard_status: {
                 [key: string]: components["schemas"]["IndexStats"];
             };
@@ -12655,6 +12715,8 @@ export interface components {
             precision: number;
             scale: number;
         };
+        /** @description Opaque versioned recovery handle binding a metadata incarnation, immutable table identity, publication ID and plan commitment. This is not authentication or permission to execute, cancel, adopt a root or replay DDL. Retain it before admission and use current table authorization when observing the publication. */
+        IndexPublicationToken: string;
         /**
          * @description The reranking provider to use.
          * @enum {string}
@@ -14139,9 +14201,9 @@ export interface components {
             aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array" | "replace" | "md5" | "abs" | "ceil" | "floor" | "round" | "trunc" | "sign" | "sqrt" | "jsonb_typeof" | "jsonb_array_length" | "jsonb_extract_path" | "jsonb_extract_path_text";
         /** @enum {string} */
-        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array";
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array" | "json";
         /**
          * @description Exact PostgreSQL builtin identity for a relational root scalar column.
          *     SQL array columns use SQLArrayElementType for their element identity.
@@ -14173,8 +14235,25 @@ export interface components {
          *     division truncates toward zero. Overflow and division by zero reject
          *     the write. Arithmetic and string operations propagate null. ASCII case
          *     operations leave non-ASCII bytes unchanged. No volatile functions are
-         *     accepted. Allocated results are bounded to 1 MiB each. Allocations
-         *     and byte-comparison operand work share a 4 MiB evaluation budget per
+         *     accepted. Allocated results are bounded to 1 MiB each.
+         *     The replace operation takes three text arguments and performs literal,
+         *     non-overlapping replacement; an empty search string leaves the input
+         *     unchanged. md5 takes one text argument and returns 32 lowercase hex
+         *     characters (a SQL compatibility fingerprint, not a security primitive).
+         *     Both are strict in SQL NULL and require reader capability version 27,
+         *     including when nested inside scalar/boolean expressions. Literal search
+         *     patterns are prepared with immutable plans; matching, copies and dynamic
+         *     pattern preparation share invocation work/cancellation admission.
+         *     Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require
+         *     reader capability version 28, even when nested in boolean programs.
+         *     They take one NUMERIC or float64 argument; abs also preserves integer
+         *     widths and float32. round and trunc optionally accept an int32 scale
+         *     as a second argument only for NUMERIC. Operands must already have their
+         *     resolved SQL types; SQL lowering inserts required promotions. NUMERIC
+         *     round uses ties away from zero; float64 round uses ties to even. All
+         *     selected arguments evaluate before strict NULL propagation. NUMERIC
+         *     execution never converts through float and shares invocation admission.
+         *     Allocations and byte-comparison operand work share a 4 MiB evaluation budget per
          *     row and expression set. An integer literal may use a decimal string
          *     for exact int64 transport; blob uses base64 and datetime uses the
          *     normal relational datetime representation.
@@ -14240,6 +14319,15 @@ export interface components {
          *     A matching candidate wins over NULL candidates; otherwise a NULL
          *     candidate makes the result UNKNOWN. These operations require schema
          *     capability version 19.
+         *     JSON expressions require reader capability version 30. The json type
+         *     carries JSONB semantics, including exact numeric values and display
+         *     scale. jsonb_typeof and jsonb_array_length take one JSON argument;
+         *     array length rejects a non-array value. jsonb_extract_path and
+         *     jsonb_extract_path_text take a JSON argument followed by 1 to 31 text
+         *     path components. Negative array ordinals count from the end; a missing
+         *     path returns SQL NULL. JSON extraction retains JSON null; text extraction
+         *     converts JSON null to SQL NULL. Arguments are evaluated strictly, while
+         *     enclosing CASE/coalesce retain their short-circuit semantics.
          */
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];
@@ -14250,6 +14338,8 @@ export interface components {
             numeric_modifier?: components["schemas"]["SQLNumericModifier"];
             /** @description Typed literal value, including null. */
             value?: unknown;
+            /** @description For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30. */
+            json_null?: boolean;
             column?: string;
             /** @description Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes. */
             collation?: string;
@@ -14289,14 +14379,21 @@ export interface components {
         };
         /** @enum {string} */
         RelationalComparisonOp: "is_null" | "is_not_null" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_distinct" | "is_not_distinct";
-        /** @description A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. */
+        /**
+         * @description A typed partial-index conjunct. Specify either a constant truth value,
+         *     or a column and comparison operation, never both. Only TRUE is indexed;
+         *     FALSE and SQL UNKNOWN are excluded. A constant false conjunct represents
+         *     an empty index without inventing a column dependency.
+         */
         RelationalIndexPredicate: {
-            column: string;
-            op: components["schemas"]["RelationalComparisonOp"];
+            column?: string;
+            op?: components["schemas"]["RelationalComparisonOp"];
             /** @description Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL. */
             value?: unknown;
             /** @description String comparison collation with the same semantics as ordered keys. */
             collation?: string;
+            /** @description Constant membership truth. SQL UNKNOWN is normalized to false for index membership. Requires reader capability version 26. */
+            constant?: boolean;
         };
         /** @description Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions. */
         RelationalIndexConfig: {
@@ -14505,6 +14602,11 @@ export interface components {
          *     use exact decimal strings to avoid client-side floating-point rounding.
          */
         RelationalCheckConstraint: {
+            /**
+             * @description Enforce this CHECK on every new or changed row without asserting that historical rows satisfy it. Explicit validation clears this declaration only after an unpublished generation has validated all rows and atomically replaced the active generation. Disposable background scan coverage does not change this declaration.
+             * @default false
+             */
+            not_valid?: boolean;
             name: string;
             column?: string;
             op?: components["schemas"]["RelationalComparisonOp"];
@@ -15103,6 +15205,29 @@ export interface components {
         };
         /** @description Discriminated normalized configuration returned after an index is created. */
         CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"] | components["schemas"]["CreatedRelationalIndex"];
+        /** @enum {string} */
+        IndexPublicationState: "admission_unknown" | "pending" | "published" | "failed" | "canceled";
+        /** @enum {string} */
+        IndexPublicationPhase: "fencing" | "reserving" | "building" | "installing" | "releasing" | "published" | "canceling" | "cancel_releasing" | "canceled";
+        /** @enum {string} */
+        IndexPublicationFailure: "duplicate_key" | "invalid_candidate" | "requested";
+        /** @description Exact observation of an online relational-index publication job, not a query-readiness certificate. Published means this retained job completed; later schema/index changes may supersede its artifacts. An absent or unmirrored job is admission_unknown, never permission to replay DDL. */
+        IndexPublicationStatus: {
+            /** @enum {string} */
+            index_type: "relational";
+            index_name: string;
+            publication_token: components["schemas"]["IndexPublicationToken"];
+            table_id: string;
+            publication_id: string;
+            plan_digest: string;
+            metadata_incarnation: string;
+            state: components["schemas"]["IndexPublicationState"];
+            phase?: components["schemas"]["IndexPublicationPhase"];
+            failure?: components["schemas"]["IndexPublicationFailure"];
+            replication_pending: boolean;
+            /** Format: uint16 */
+            owner_count?: number;
+        };
         /**
          * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
@@ -26421,6 +26546,61 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    getIndexPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Index-Publication-Token": components["schemas"]["IndexPublicationToken"];
+            };
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact read-only publication observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexPublicationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table identity, publication identity or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authoritative relation ownership is not supported by the metadata owner */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation is unavailable; retain the token and retry this read */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     listQuerySources: {
         parameters: {
             query?: never;
@@ -27611,6 +27791,63 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceTableIndexPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Index-Publication-Token": components["schemas"]["IndexPublicationToken"];
+            };
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact read-only publication observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexPublicationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table identity, publication identity or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authoritative relation ownership is not supported by the metadata owner */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation is unavailable; retain the token and retry this read */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

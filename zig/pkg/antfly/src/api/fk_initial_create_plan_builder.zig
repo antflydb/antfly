@@ -52,10 +52,10 @@ fn parentsSettled(tables_snapshot: []const records.TableRecord, child_name: []co
     return !pending;
 }
 
-/// The support-index DDL is committed before initial CREATE planning. Its
-/// schema migration can still replace the parent's exact TableRecord while
-/// owner read-index fences are being collected. Pin only a finalized parent
-/// definition; the owner stage separately waits for physical index readiness.
+/// An existing parent migration can still replace its exact TableRecord while
+/// owner read-index fences are being collected. Pin a finalized predecessor;
+/// any new support definitions are staged in the initial publication plan,
+/// not committed here. The owner stage waits for physical index readiness.
 fn settledParentSnapshot(
     server: *server_mod.ApiHttpServer,
     context: operation.RequestContext,
@@ -125,8 +125,6 @@ pub fn build(
     return buildWithScratch(server, alloc, alloc, context, identity, target, request);
 }
 
-/// The plan belongs to alloc; validation and witness projections are scoped
-/// to reclaiming scratch, rather than nested under the plan's owning arena.
 pub fn buildWithScratch(
     server: *server_mod.ApiHttpServer,
     alloc: std.mem.Allocator,
@@ -135,6 +133,32 @@ pub fn buildWithScratch(
     identity: ?server_mod.AuthenticatedIdentity,
     target: domain.Target,
     request: tables.CreateTableRequest,
+) !publication.InitialCreatePlan {
+    return buildWithGeneratedNamesAndScratch(server, alloc, scratch, context, identity, target, request, &.{});
+}
+
+pub fn buildWithGeneratedNames(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    context: operation.RequestContext,
+    identity: ?server_mod.AuthenticatedIdentity,
+    target: domain.Target,
+    request: tables.CreateTableRequest,
+    generated_constraint_names: []const []const u8,
+) !publication.InitialCreatePlan {
+    return buildWithGeneratedNamesAndScratch(server, alloc, alloc, context, identity, target, request, generated_constraint_names);
+}
+
+/// Durable plan values use alloc; validation and projections use reclaiming scratch.
+pub fn buildWithGeneratedNamesAndScratch(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    context: operation.RequestContext,
+    identity: ?server_mod.AuthenticatedIdentity,
+    target: domain.Target,
+    request: tables.CreateTableRequest,
+    generated_constraint_names: []const []const u8,
 ) !publication.InitialCreatePlan {
     try context.ensureActive();
     const logical_child = try target.resourceNameAlloc(alloc);
@@ -157,6 +181,7 @@ pub fn buildWithScratch(
         .tablespace_name = request.tablespace_name,
         .min_ranges_explicit = request.num_shards != null,
         .candidate = candidate,
+        .generated_constraint_names = generated_constraint_names,
     } });
     const prepared = try std.json.parseFromSliceLeaky(publication.InitialCreatePrepare, alloc, prepare_bytes, .{ .allocate = .alloc_always });
     var child = prepared.child;
@@ -248,6 +273,7 @@ pub fn buildWithScratch(
     }.less);
     const plan: publication.InitialCreatePlan = .{
         .id = id,
+        .catalog_coverage = .checks_v1,
         .retirement_scope = retirementScopeForDeployment(server.cfg.deployment_mode),
         .catalog_id = prepared.catalog_id,
         .expected_catalog_revision = prepared.expected_catalog_revision,
@@ -261,8 +287,10 @@ pub fn buildWithScratch(
         .logical_name = try alloc.dupe(u8, target.table),
         .namespace_id = namespace_id,
     };
-    try plan.validate(scratch);
-    return plan;
+    var named_plan = plan;
+    named_plan.constraint_name_admission = prepared.constraint_name_admission;
+    try named_plan.validate(scratch);
+    return named_plan;
 }
 
 /// Seal a durable support reservation only after every touched parent has

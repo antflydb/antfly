@@ -30,6 +30,52 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .relational_check_violation, .err = error.RelationalCheckViolation },
+    .{ .status = .foreign_key_match_full_violation, .err = error.ForeignKeyMatchFullViolation },
+    .{ .status = .invalid_sql_view_record, .err = error.InvalidSqlViewRecord },
+    .{ .status = .sql_view_cycle, .err = error.SqlViewCycle },
+    .{ .status = .sql_view_column_rename, .err = error.SqlViewColumnRename },
+    .{ .status = .sql_view_column_type_changed, .err = error.SqlViewColumnTypeChanged },
+    .{ .status = .sql_view_column_dropped, .err = error.SqlViewColumnDropped },
+    .{ .status = .sql_dependent_objects_exist, .err = error.SqlDependentObjectsExist },
+    .{ .status = .sql_program_limit_exceeded, .err = error.SqlProgramLimitExceeded },
+    .{ .status = .invalid_schema_reader_requirements, .err = error.InvalidSchemaReaderRequirements },
+    .{ .status = .sql_invalid_power_argument, .err = error.SqlInvalidPowerArgument },
+    .{ .status = .immutable_relational_index_definition_conflict, .err = error.ImmutableRelationalIndexDefinitionConflict },
+    .{ .status = .invalid_index_publication_candidate, .err = error.InvalidIndexPublicationCandidate },
+    .{ .status = .invalid_private_index_cancellation, .err = error.InvalidPrivateIndexCancellation },
+    .{ .status = .invalid_private_index_claim_inventory, .err = error.InvalidPrivateIndexClaimInventory },
+    .{ .status = .invalid_private_index_claim_receipt, .err = error.InvalidPrivateIndexClaimReceipt },
+    .{ .status = .index_owner_receipt_changed, .err = error.IndexOwnerReceiptChanged },
+    .{ .status = .invalid_private_index_inputs, .err = error.InvalidPrivateIndexInputs },
+    .{ .status = .invalid_private_index_native_receipt, .err = error.InvalidPrivateIndexNativeReceipt },
+    .{ .status = .invalid_private_index_owner_job, .err = error.InvalidPrivateIndexOwnerJob },
+    .{ .status = .invalid_relational_index_progress, .err = error.InvalidRelationalIndexProgress },
+    .{ .status = .missing_relational_index_definitions, .err = error.MissingRelationalIndexDefinitions },
+    .{ .status = .private_index_cancellation_pending, .err = error.PrivateIndexCancellationPending },
+    .{ .status = .private_index_cancellation_required, .err = error.PrivateIndexCancellationRequired },
+    .{ .status = .private_index_job_required, .err = error.PrivateIndexJobRequired },
+    .{ .status = .private_index_owner_job_changed, .err = error.PrivateIndexOwnerJobChanged },
+    .{ .status = .private_index_root_recovery_required, .err = error.PrivateIndexRootRecoveryRequired },
+    .{ .status = .invalid_schema_validation_job, .err = error.InvalidSchemaValidationJob },
+    .{ .status = .schema_validation_job_changed, .err = error.SchemaValidationJobChanged },
+    .{ .status = .schema_validation_job_required, .err = error.SchemaValidationJobRequired },
+    .{ .status = .schema_validation_runtime_recovery_required, .err = error.SchemaValidationRuntimeRecoveryRequired },
+    .{ .status = .invalid_schema_owner_control, .err = error.InvalidSchemaOwnerControl },
+    .{ .status = .invalid_schema_validation_page_command, .err = error.InvalidSchemaValidationPageCommand },
+    .{ .status = .invalid_nullability_replay, .err = error.InvalidNullabilityReplay },
+    .{ .status = .schema_validation_canceled, .err = error.SchemaValidationCanceled },
+    .{ .status = .schema_validation_not_ready, .err = error.SchemaValidationNotReady },
+    .{ .status = .schema_validation_publication_required, .err = error.SchemaValidationPublicationRequired },
+    .{ .status = .schema_validation_cancellation_required, .err = error.SchemaValidationCancellationRequired },
+    .{ .status = .invalid_ordered_apply_receipt, .err = error.InvalidOrderedApplyReceipt },
+    .{ .status = .conflicting_ordered_apply_receipt, .err = error.ConflictingOrderedApplyReceipt },
+    .{ .status = .invalid_relational_index_budget, .err = error.InvalidRelationalIndexBudget },
+    .{ .status = .private_index_claim_backlog_full, .err = error.PrivateIndexClaimBacklogFull },
+    .{ .status = .private_index_publication_canceled, .err = error.PrivateIndexPublicationCanceled },
+    .{ .status = .private_index_publication_required, .err = error.PrivateIndexPublicationRequired },
+    .{ .status = .relational_index_catalog_schema_mismatch, .err = error.RelationalIndexCatalogSchemaMismatch },
+    .{ .status = .catalog_occupancy_not_ready, .err = error.CatalogOccupancyNotReady },
     .{ .status = .setting_authority_unavailable, .err = error.SettingAuthorityUnavailable },
     .{ .status = .online_merge_artifact_tails_unsupported, .err = error.OnlineMergeArtifactTailsUnsupported },
     .{ .status = .artifact_catalog_corrupt, .err = error.ArtifactCatalogCorrupt },
@@ -602,6 +648,7 @@ const mappings = [_]Mapping{
     .{ .status = .storage_unavailable, .err = error.StorageUnavailable },
     .{ .status = .transaction_too_large, .err = error.TransactionTooLarge },
     .{ .status = .unsupported_operation, .err = error.UnsupportedOperation },
+    .{ .status = .unsupported_native_index_owner, .err = error.UnsupportedNativeIndexOwner },
     .{ .status = .incomplete_seed_artifact, .err = error.IncompleteSeedArtifact },
     .{ .status = .invalid_artifact_boundary, .err = error.InvalidArtifactBoundary },
     .{ .status = .invalid_artifact_chunk_size, .err = error.InvalidArtifactChunkSize },
@@ -983,12 +1030,63 @@ pub fn validateForTest() !void {
     try std.testing.expectError(error.CallbackReadOnly, relay.finish(.ha_read_only_standby));
 }
 
+test "native private index control errors retain distinct compiled identities" {
+    const errors = [_]anyerror{
+        error.ImmutableRelationalIndexDefinitionConflict,
+        error.InvalidIndexPublicationCandidate,
+        error.InvalidPrivateIndexCancellation,
+        error.InvalidPrivateIndexClaimInventory,
+        error.InvalidPrivateIndexClaimReceipt,
+        error.IndexOwnerReceiptChanged,
+        error.InvalidPrivateIndexInputs,
+        error.InvalidPrivateIndexNativeReceipt,
+        error.InvalidPrivateIndexOwnerJob,
+        error.InvalidRelationalIndexProgress,
+        error.MissingRelationalIndexDefinitions,
+        error.PrivateIndexCancellationPending,
+        error.PrivateIndexCancellationRequired,
+        error.PrivateIndexJobRequired,
+        error.PrivateIndexOwnerJobChanged,
+        error.PrivateIndexRootRecoveryRequired,
+        error.InvalidRelationalIndexBudget,
+        error.PrivateIndexClaimBacklogFull,
+        error.PrivateIndexPublicationCanceled,
+        error.PrivateIndexPublicationRequired,
+        error.RelationalIndexCatalogSchemaMismatch,
+    };
+    for (errors) |expected| {
+        const status = statusFromError(expected);
+        try std.testing.expect(status != .internal);
+        try std.testing.expectError(expected, statusToError(status));
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 14);
+        try validateFailureEnvelope(status, &failure, abi.abi_version);
+        try std.testing.expectEqualStrings(@errorName(expected), failure.errorName());
+    }
+}
+
+test "index publication unsupported owner stays definite across compiled runtime boundaries" {
+    const status = statusFromError(error.UnsupportedNativeIndexOwner);
+    try std.testing.expectEqual(abi.Status.unsupported_native_index_owner, status);
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, statusToError(status));
+    const failure = failureFromError(error.UnsupportedNativeIndexOwner, .storage_owner, abi.abi_version, 23);
+    try validateFailureEnvelope(status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("UnsupportedNativeIndexOwner", failure.errorName());
+}
+
 test "seed replica policy mismatch survives compiled runtime boundaries" {
     try std.testing.expectEqual(abi.Status.seed_replica_policy_mismatch, statusFromError(error.SeedReplicaPolicyMismatch));
     try std.testing.expectError(error.SeedReplicaPolicyMismatch, statusToError(.seed_replica_policy_mismatch));
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    try std.testing.expectEqual(abi.Status.sql_invalid_power_argument, statusFromError(error.SqlInvalidPowerArgument));
+    try std.testing.expectError(error.SqlInvalidPowerArgument, statusToError(.sql_invalid_power_argument));
+    // Typed occupancy is a publication precondition, not an undeclared
+    // provider defect or proof of an uncertain admitted mutation.
+    const occupancy = failureFromError(error.CatalogOccupancyNotReady, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.catalog_occupancy_not_ready, occupancy.status);
+    try validateFailureEnvelope(occupancy.status, &occupancy, abi.abi_version);
+    try std.testing.expectError(error.CatalogOccupancyNotReady, statusToError(occupancy.status));
     // A stale FK attachment must remain a semantic rejection across the
     // storage-owner ABI. Collapsing it to StorageKernelFailure can poison a
     // replicated apply entry and stall every later proposal on that owner.
@@ -1007,6 +1105,8 @@ test "registered storage-kernel errors are unique and round trip without losing 
     // restore validation as its exact error, not generic kernel pressure.
     try std.testing.expectEqual(abi.Status.invalid_relational_row, statusFromError(error.InvalidRelationalRow));
     try std.testing.expectError(error.InvalidRelationalRow, statusToError(.invalid_relational_row));
+    try std.testing.expectEqual(abi.Status.relational_check_violation, statusFromError(error.RelationalCheckViolation));
+    try std.testing.expectError(error.RelationalCheckViolation, statusToError(.relational_check_violation));
     try validateForTest();
 }
 
@@ -1032,6 +1132,30 @@ test "committed visibility outcomes survive the storage owner boundary" {
         error.EnrichmentWorkerFailed,
         error.CommitVisibilityNotSatisfied,
         error.CommitPropagationIncomplete,
+    }) |err| {
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(err, statusToError(failure.status));
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+}
+
+test "schema owner observation preserves exact conflict and runtime recovery failures" {
+    for ([_]anyerror{
+        error.InvalidSchemaOwnerControl,
+        error.InvalidSchemaValidationPageCommand,
+        error.InvalidNullabilityReplay,
+        error.SchemaValidationCanceled,
+        error.SchemaValidationNotReady,
+        error.SchemaValidationPublicationRequired,
+        error.SchemaValidationCancellationRequired,
+        error.InvalidOrderedApplyReceipt,
+        error.ConflictingOrderedApplyReceipt,
+        error.InvalidSchemaValidationJob,
+        error.SchemaValidationJobChanged,
+        error.SchemaValidationJobRequired,
+        error.SchemaValidationRuntimeRecoveryRequired,
     }) |err| {
         const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
         try std.testing.expect(failure.status != .internal);

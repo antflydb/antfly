@@ -293,6 +293,33 @@ pub fn aggregate(request: AggregationRequest) !Response {
     return response;
 }
 
+/// Owned by a control worker and destroyed there before the borrowed Owner is
+/// closed. The provider pins the exact physical owner; apply never destroys
+/// retained buffers, reparses the command or rebinds its committed entry.
+pub const RaftSchemaPreparation = struct {
+    handle: ?*anyopaque,
+    owner: ?*anyopaque,
+    term: u64,
+    index: u64,
+
+    pub fn apply(self: *RaftSchemaPreparation, options: Owner.QueryOptions) !void {
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_apply_prepared_raft_schema_control(self.owner, &.{
+            .prepared = self.handle,
+            .term = self.term,
+            .index = self.index,
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftSchemaOwnerPreparedApplyRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "prepared Raft schema owner control");
+    }
+
+    pub fn deinit(self: *RaftSchemaPreparation) void {
+        abi.antfly_storage_owner_destroy_raft_schema_preparation(self.handle);
+        self.handle = null;
+    }
+};
+
 pub const Owner = struct {
     handle: ?*anyopaque,
 
@@ -520,6 +547,422 @@ pub const Owner = struct {
             },
             &response.buffer,
         ));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerAdmissionJson(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8) !Response {
+        return self.nativeIndexOwnerAdmissionImpl(table_name, header_json, manifest, .admit);
+    }
+
+    pub fn nativeIndexOwnerCancellationAdmissionJson(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8) !Response {
+        return self.nativeIndexOwnerAdmissionImpl(table_name, header_json, manifest, .cancel_admit);
+    }
+
+    fn nativeIndexOwnerAdmissionImpl(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8, operation: abi.NativeIndexOwnerOperation) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = operation,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(header_json),
+            .manifest = .fromSlice(manifest),
+        }, &response.buffer));
+        return response;
+    }
+
+    /// Private kernel delivery only; metadata permission and the actual leased
+    /// hash-owner placement must be established by the server receiver.
+    pub fn nativeIndexOwnerClaimsJson(self: *Owner, table_name: []const u8, command_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .claims,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(command_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerBuildJson(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !Response {
+        return self.nativeIndexOwnerBuildScopedJson(table_name, request_json, "", options);
+    }
+    pub fn nativeIndexOwnerBuildScopedJson(self: *Owner, table_name: []const u8, request_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .build,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+            .manifest = .fromSlice(root_scope_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
+    /// Trusted server installation after independent metadata authorization.
+    /// The host selects the signing scope; remote callers never supply it.
+    pub fn nativeIndexOwnerInstallationScopedJson(self: *Owner, table_name: []const u8, request_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .install,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+            .manifest = .fromSlice(root_scope_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
+    /// Private terminal effect after metadata accepts the installed cohort.
+    pub fn nativeIndexOwnerReleaseScopedJson(self: *Owner, table_name: []const u8, intent_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        return self.nativeIndexOwnerTerminalScopedJson(table_name, .release, intent_json, root_scope_json, options);
+    }
+
+    pub fn nativeIndexOwnerCancellationReleaseScopedJson(self: *Owner, table_name: []const u8, intent_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        return self.nativeIndexOwnerTerminalScopedJson(table_name, .cancel_release, intent_json, root_scope_json, options);
+    }
+
+    fn nativeIndexOwnerTerminalScopedJson(self: *Owner, table_name: []const u8, operation: abi.NativeIndexOwnerOperation, intent_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = operation,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(intent_json),
+            .manifest = .fromSlice(root_scope_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
+    /// Host-scoped cleanup completion. The body contains immutable identity,
+    /// not the physical binding or a caller-claimed cleanup cut.
+    pub fn nativeIndexOwnerCancellationCompletionScopedJson(self: *Owner, table_name: []const u8, identity_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .cancel_complete,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+            .manifest = .fromSlice(root_scope_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
+    /// Trusted server command after independent durable metadata acceptance.
+    pub fn nativeIndexSourceConsumptionJson(self: *Owner, table_name: []const u8, command_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .consume,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(command_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn raftIndexOwnerObservation(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Identity, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_index_raft_contract.Observation {
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        try identity.validate();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_observation_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .identity_json = .fromSlice(encoded),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerObservationRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index owner observation");
+        if (response.bytes().len == 0 or response.bytes().len > contract.Observation.max_json_bytes) return error.InvalidPrivateIndexOwnerJob;
+        var parsed = try std.json.parseFromSlice(contract.Observation, alloc, response.bytes(), .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        try parsed.value.validate(identity);
+        return parsed.value;
+    }
+
+    /// Advisory physical binding, not a reservation, receipt or permission.
+    pub fn raftIndexClaims(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, command: @import("antfly_local_sources").storage_db_relational_index_owner_control.ClaimCommand, options: QueryOptions) !std.json.Parsed(?@import("antfly_local_sources").storage_db_relational_index_owner_control.DeliveredClaims) {
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        try command.validate();
+        if (command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        const encoded = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > native.max_claim_wire_bytes) return error.TransactionTooLarge;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_claims_json(self.handle, &.{ .table_name = .fromSlice(table_name), .command_json = .fromSlice(encoded), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerClaimsRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index claims observation");
+        if (response.bytes().len == 0 or response.bytes().len > native.max_response_bytes) return error.InvalidPrivateIndexClaimReceipt;
+        var parsed = try std.json.parseFromSlice(?native.DeliveredClaims, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        if (parsed.value) |outcome| try outcome.validateFor(command);
+        return parsed;
+    }
+
+    pub fn raftIndexClaimSource(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").storage_db_relational_index_owner_control.Identity, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire) {
+        return self.raftIndexSourceProjected(alloc, table_name, identity, false, options);
+    }
+
+    pub fn raftIndexSourceProjected(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").storage_db_relational_index_owner_control.Identity, consumed_only: bool, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire) {
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        try identity.validate();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > native.Identity.max_json_bytes) return error.InvalidPrivateIndexOwnerJob;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_source_json(self.handle, &.{ .consumed_only = @intFromBool(consumed_only), .table_name = .fromSlice(table_name), .identity_json = .fromSlice(encoded), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerSourceRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index claim source");
+        if (response.bytes().len == 0 or response.bytes().len > (if (consumed_only) @as(usize, 32 * 1024) else native.SourceWire.max_wire_bytes)) return error.InvalidPrivateIndexClaimInventory;
+        var parsed = try std.json.parseFromSlice(native.SourceWire, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.requireRaftIdentity(identity);
+        if (consumed_only and (parsed.value.header != null or parsed.value.payload_b64 != null)) return error.InvalidPrivateIndexClaimInventory;
+        return parsed;
+    }
+
+    pub fn raftIndexOwnerLifecycle(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_db_relational_index_raft_contract.LifecycleRequest, prepare: bool, audit_root: ?@import("antfly_local_sources").storage_db_relational_index_owner_control.AuditRoot, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_raft_contract.LifecyclePreparation) {
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        try request.validate();
+        if ((prepare and request == .install) != (audit_root != null)) return error.InvalidArgument;
+        const root_json = if (audit_root) |root| try std.json.Stringify.valueAlloc(alloc, root, .{}) else null;
+        defer if (root_json) |bytes| alloc.free(bytes);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > contract.LifecyclePreparation.max_request_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_lifecycle_json(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(encoded), .prepare = @intFromBool(prepare), .audit_root_json = .fromSlice(root_json orelse ""), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerLifecycleRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index owner lifecycle preparation");
+        if (response.bytes().len == 0 or response.bytes().len > contract.LifecyclePreparation.max_response_bytes) return error.InvalidRelationalIndexProgress;
+        var parsed = try std.json.parseFromSlice(contract.LifecyclePreparation, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.validateFor(request);
+        if (!prepare and (parsed.value.gc != null or (parsed.value.progress == .install and (parsed.value.progress.install.command != null or parsed.value.progress.install.physical != null)))) return error.InvalidRelationalIndexProgress;
+        return parsed;
+    }
+
+    pub fn raftIndexOwnerCancellation(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_db_relational_index_raft_contract.CancellationRequest, prepare: bool, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_raft_contract.CancellationPreparation) {
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        try request.validate();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > contract.CancellationPreparation.max_request_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_cancellation_json(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(encoded), .prepare = @intFromBool(prepare), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerCancellationRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index owner cancellation preparation");
+        if (response.bytes().len == 0 or response.bytes().len > contract.CancellationPreparation.max_response_bytes) return error.InvalidPrivateIndexCancellation;
+        var parsed = try std.json.parseFromSlice(contract.CancellationPreparation, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.validateFor(request);
+        if (!prepare and parsed.value.command != null) return error.InvalidPrivateIndexCancellation;
+        return parsed;
+    }
+
+    pub fn raftIndexOwnerBuild(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildRequest, prepare: bool, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildPreparation) {
+        return self.raftIndexOwnerStep(alloc, table_name, request, @intFromBool(prepare), null, options);
+    }
+
+    pub fn raftIndexOwnerStep(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildRequest, mode: u32, audit_root: ?@import("antfly_local_sources").storage_db_relational_index_owner_control.AuditRoot, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildPreparation) {
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        if (mode > 2 or (mode == 2) != (audit_root != null)) return error.InvalidArgument;
+        const root_json = if (audit_root) |root| try std.json.Stringify.valueAlloc(alloc, root, .{}) else null;
+        defer if (root_json) |bytes| alloc.free(bytes);
+        try request.validate();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > contract.BuildPreparation.max_request_bytes) return error.InvalidPrivateIndexOwnerJob;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_build_json(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(encoded), .prepare = mode, .audit_root_json = .fromSlice(root_json orelse ""), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerBuildRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index owner build preparation");
+        if (response.bytes().len == 0 or response.bytes().len > contract.BuildPreparation.max_response_bytes) return error.InvalidRelationalIndexProgress;
+        var parsed = try std.json.parseFromSlice(contract.BuildPreparation, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.validateFor(request);
+        const observed_tag: std.meta.Tag(contract.BuildPreparation) = if (request.target_expectation == null) .progress else .validation;
+        if (mode == 0 and std.meta.activeTag(parsed.value) != observed_tag) return error.InvalidRelationalIndexProgress;
+        if (mode == 2 and parsed.value != .audit) return error.InvalidRelationalIndexProgress;
+        return parsed;
+    }
+
+    pub fn raftIndexOwnerAdmissionPreparation(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, admission: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Admission, manifest: []const u8, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_index_raft_contract.AdmissionPreparation {
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        const limits = contract.AdmissionPreparation;
+        try admission.validate();
+        if (manifest.len == 0 or manifest.len > limits.max_manifest_bytes) return error.InvalidPrivateIndexInputs;
+        const encoded = try std.json.Stringify.valueAlloc(alloc, admission, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > limits.max_header_json_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_preparation_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .admission_json = .fromSlice(encoded),
+            .manifest = .fromSlice(manifest),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerPreparationRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index owner preparation");
+        if (response.bytes().len == 0 or response.bytes().len > limits.max_json_bytes) return error.InvalidPrivateIndexOwnerJob;
+        var parsed = try std.json.parseFromSlice(contract.AdmissionPreparation, alloc, response.bytes(), .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        try parsed.value.validate(admission, @import("antfly_local_sources").storage_db_relational_index_inputs.digest(manifest));
+        return parsed.value;
+    }
+
+    pub fn nativeSchemaOwnerObservation(self: *Owner, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_schema_owner_contract.NativeObservation {
+        try binding.validate();
+        var buffer: [8192]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(binding, .{}, &writer);
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_native_schema_observation_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .binding_json = .fromSlice(writer.buffered()),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        const Observation = @import("antfly_local_sources").storage_db_relational_schema_owner_contract.NativeObservation;
+        if (response.bytes().len == 0 or response.bytes().len > Observation.max_wire_bytes) return error.SchemaValidationJobChanged;
+        var scratch: [128 * 1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        const result = try std.json.parseFromSliceLeaky(Observation, fixed.allocator(), response.bytes(), .{ .ignore_unknown_fields = false });
+        try result.validateFor(binding);
+        return result;
+    }
+
+    /// Trusted committed-entry ingress. The command is already encoded ASVR;
+    /// it cannot carry or override the actual state machine's term/index.
+    pub fn applyRaftSchemaOwnerControl(self: *Owner, table_name: []const u8, command: []const u8, term: u64, index: u64, options: QueryOptions) !void {
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_apply_raft_schema_control(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .command = .fromSlice(command),
+            .term = term,
+            .index = index,
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftSchemaOwnerApplyRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft schema owner control");
+    }
+
+    /// Control lane only. Command bytes and callbacks need survive only this
+    /// call. Drain/destroy the returned ticket before closing this owner.
+    pub fn prepareRaftSchemaOwnerControl(self: *Owner, table_name: []const u8, command: []const u8, term: u64, index: u64, options: QueryOptions) !RaftSchemaPreparation {
+        var prepared: ?*anyopaque = null;
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_prepare_raft_schema_control(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .command = .fromSlice(command),
+            .term = term,
+            .index = index,
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &prepared, &failure);
+        errdefer abi.antfly_storage_owner_destroy_raft_schema_preparation(prepared);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftSchemaOwnerApplyRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft schema owner preparation");
+        return .{ .handle = prepared orelse return error.StorageKernelFailure, .owner = self.handle, .term = term, .index = index };
+    }
+
+    pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .inspect,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexClaimSourceJson(self: *Owner, table_name: []const u8, identity_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .source,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerCancellationStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .cancel_inspect,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerReceiptJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .receipt,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerCleanupJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .cancel_cleanup,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        return self.nativeIndexOwnerDerivedGcJson(table_name, identity_json, .cancel_gc_page);
+    }
+
+    pub fn nativeIndexOwnerClaimGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        return self.nativeIndexOwnerDerivedGcJson(table_name, identity_json, .cancel_claim_gc_page);
+    }
+
+    fn nativeIndexOwnerDerivedGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8, comptime operation: abi.NativeIndexOwnerOperation) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = operation,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerCancellationJson(self: *Owner, table_name: []const u8, intent_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .cancel_intent,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(intent_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerControlJson(self: *Owner, table_name: []const u8, operation: abi.NativeIndexOwnerOperation, command_json: []const u8) !Response {
+        if (operation != .fence and operation != .reserve and operation != .cancel_fence and operation != .cancel_reserve) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = operation,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(command_json),
+        }, &response.buffer));
         return response;
     }
 

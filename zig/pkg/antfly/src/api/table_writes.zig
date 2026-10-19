@@ -22553,6 +22553,8 @@ pub const ProvisionedTableWriteSource = struct {
         raft_entry: ?db_mod.OrderedApplyReceipt,
     ) !?void {
         const apply_req = req;
+        try @import("antfly_local_sources").storage_db_relational_index_raft_contract.validateBatchRequest(apply_req);
+        if (apply_req.relational_index_owner_control) |command| if (command.fence().owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
         const split_identity_namespace = try validateSplitReplicationForApply(apply_req, group_id);
         const merge_identity_namespace = try validateMergeReplicationForApply(apply_req, group_id);
         try validateMergeCheckpointForApply(apply_req, group_id);
@@ -22654,7 +22656,7 @@ pub const ProvisionedTableWriteSource = struct {
                     else
                         try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
                 } else if (raft_entry) |entry| {
-                    @import("../storage/server_db_adapter.zig").applyOrdered(&cached.db, apply_req, entry) catch |err| {
+                    @import("../storage/server_db_adapter.zig").applyOrderedGroup(&cached.db, group_id, apply_req, entry) catch |err| {
                         preserve_writer_on_error = err == error.RaftApplyWriterUnavailable;
                         return err;
                     };
@@ -22719,7 +22721,7 @@ pub const ProvisionedTableWriteSource = struct {
                     else
                         try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
                 } else if (raft_entry) |entry|
-                    try @import("../storage/server_db_adapter.zig").applyOrdered(&db, apply_req, entry)
+                    try @import("../storage/server_db_adapter.zig").applyOrderedGroup(&db, group_id, apply_req, entry)
                 else
                     try db.batchReplicatedApply(apply_req);
             }

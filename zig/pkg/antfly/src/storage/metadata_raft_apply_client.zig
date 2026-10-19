@@ -314,6 +314,9 @@ pub const RaftApplyStore = struct {
     pub fn getRelationalTopologyProtocolActivationVersion(self: *RaftApplyStore, group_id: u64) !u16 {
         return self.projection(u16, .{ .kind = .relational_topology_protocol_activation_version, .group_id = group_id });
     }
+    pub fn getSchemaReaderFloor(self: *RaftApplyStore, group_id: u64) !metadata_table_manager.SchemaReaderFloor {
+        return self.catalogProjection(metadata_table_manager.SchemaReaderFloor, self.alloc, group_id, .schema_reader_floor);
+    }
     pub fn resolveTableCreateIdentity(self: *RaftApplyStore, group_id: u64, initial: u64) !u64 {
         return self.projection(u64, .{ .kind = .resolve_table_create_identity, .group_id = group_id, .arg0 = initial });
     }
@@ -330,6 +333,10 @@ pub const RaftApplyStore = struct {
     }
     pub fn standaloneRevision(self: *RaftApplyStore) !u64 {
         return self.projection(u64, .{ .kind = .standalone_revision });
+    }
+    pub const StandaloneRevisionState = contract.StandaloneRevisionState;
+    pub fn standaloneRevisionState(self: *RaftApplyStore) !StandaloneRevisionState {
+        return self.catalogProjection(StandaloneRevisionState, self.alloc, 0, .standalone_revision_state);
     }
     pub fn replaceStandaloneCatalog(self: *RaftApplyStore, group_id: u64, expected_revision: u64, tables: []const metadata.TableRecord, ranges: []const metadata.RangeRecord, auxiliary_json: []const u8) !void {
         return self.updateStandaloneCatalog(group_id, expected_revision, .{ .replace = true, .tables = tables, .ranges = ranges, .auxiliary_json = auxiliary_json });
@@ -525,6 +532,13 @@ pub const RaftApplyStore = struct {
     pub fn sqlPolicyBeginCommandJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: sql_policies.BeginRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_begin_command = request });
     }
+    pub fn sqlPolicyDefinitionCommandJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: sql_policies.Command) ![]u8 {
+        var output: std.Io.Writer.Allocating = .init(alloc);
+        defer output.deinit();
+        var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(contract.CatalogProjectionRequest{ .sql_policy_definition_command = command }, &stream);
+        return self.projectionWithAllocator([]u8, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(output.written()) });
+    }
     pub fn requirePolicyIndexMutationAllowed(self: *RaftApplyStore, group_id: u64, table_id: u64) !void {
         const value = try self.catalogProjection(bool, self.alloc, group_id, .{ .require_policy_index_mutation_allowed = table_id });
         if (!value) return error.RowPolicyUnsupported;
@@ -545,8 +559,100 @@ pub const RaftApplyStore = struct {
     pub fn fkGenerationPublicationSourceDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.SourceDecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_source_decision = request });
     }
+    pub fn relationalIndexStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").StatusRequest) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_status = request });
+    }
+    pub fn relationalIndexPrepareCutJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").PrepareRequest) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_prepare = request });
+    }
+    pub fn observeStandaloneNativeReporter(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/standalone_native_owner.zig").Registration) !@import("../metadata/standalone_native_owner.zig").RestartObservation {
+        try request.validate();
+        return self.catalogProjection(@import("../metadata/standalone_native_owner.zig").RestartObservation, self.alloc, group_id, .{ .standalone_native_reporter_observation = request });
+    }
+    pub fn relationalIndexAdmissionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").AdmissionRequest) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_admission_status = request });
+    }
+    pub fn validateRelationalIndexBegin(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index_publication.zig").BeginRequest, prepared: *const @import("../metadata/relational_index_publication.zig").Prepared) !void {
+        _ = try request.observation(prepared);
+        if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_begin_preflight = request })) return error.InvalidGenerationPublication;
+    }
+    pub fn validateRelationalIndexPublicationDecision(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index_publication.zig").DecidePublish) !void {
+        try request.validate();
+        if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_publish_preflight = request })) return error.InvalidGenerationPublication;
+    }
+    pub fn relationalIndexPublicationDecisionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").DecidePublish) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_publish_status = request });
+    }
+    pub fn validateRelationalIndexCancellation(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index_publication.zig").CancelDecision) !void {
+        try request.validate();
+        if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_cancel_preflight = request })) return error.InvalidGenerationPublication;
+    }
+    pub fn relationalIndexCancellationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").CancelDecision) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_cancel_status = request });
+    }
+
+    pub fn relationalIndexOwnerDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_owner_decision = request });
+    }
+    pub fn relationalIndexOwnerAckStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_owner_ack_status = request });
+    }
+    pub fn validateRelationalIndexOwnerAck(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
+        const publication = @import("../metadata/relational_index_publication.zig");
+        if (bytes.len == 0 or bytes.len > publication.max_ack_bytes) return error.InvalidGenerationPublication;
+        const valid = try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_owner_ack_preflight = bytes });
+        if (!valid) return error.InvalidIndexOwnerReceipt;
+    }
+    pub fn relationalIndexWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_work.zig").Query) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_work = request });
+    }
+    pub fn relationalIndexSourceAcceptanceStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_delivery_journal.zig").Query) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_source_accept_status = request });
+    }
+    pub fn validateRelationalIndexSourceAcceptance(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
+        const journal = @import("../metadata/relational_index_delivery_journal.zig");
+        if (bytes.len == 0 or bytes.len > journal.max_command_bytes) return error.InvalidGenerationPublication;
+        if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_source_accept_preflight = bytes })) return error.InvalidPrivateIndexClaimReceipt;
+    }
+    pub fn validateRelationalIndexSourceCompletion(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
+        if (bytes.len == 0 or bytes.len > @import("../metadata/relational_index_delivery_journal.zig").max_completion_bytes) return error.InvalidGenerationPublication;
+        if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_source_complete_preflight = bytes })) return error.InvalidPrivateIndexClaimReceipt;
+    }
     pub fn fkInitialCreatePrepareJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare = request });
+    }
+    pub fn fkInitialCreatePrepareJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const normalized = try context.platformDeadline();
+        const bytes = try self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare_with_deadline = .{ .request = request, .deadline_ns = normalized.deadline_ns } });
+        errdefer alloc.free(bytes);
+        try context.ensureActive();
+        return bytes;
+    }
+    pub fn prepareConstraintNamesJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("antfly_local_sources").system_catalog_domain.ConstraintNamePreparation, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const normalized = try context.platformDeadline();
+        const bytes = try self.catalogProjection([]u8, alloc, group_id, .{ .constraint_name_prepare = .{ .request = request, .deadline_ns = normalized.deadline_ns } });
+        errdefer alloc.free(bytes);
+        try context.ensureActive();
+        return bytes;
+    }
+    pub fn checkConstraintNamesWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("antfly_local_sources").system_catalog_domain.ConstraintNameCheck, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+        const normalized = try context.platformDeadline();
+        const ready = try self.catalogProjection(bool, alloc, group_id, .{ .constraint_name_check = .{ .request = request, .deadline_ns = normalized.deadline_ns } });
+        try context.ensureActive();
+        if (!ready) return error.InvalidCatalogRecord;
+    }
+    pub fn preflightFkGenerationNameAdmission(self: *RaftApplyStore, group_id: u64, plan: fk_generation_publication.Plan) !void {
+        if (plan.constraint_name_guard == null) return;
+        const ready = try self.catalogProjection(bool, self.alloc, group_id, .{ .fk_generation_name_admission = plan });
+        if (!ready) return error.InvalidCatalogRecord;
     }
     pub fn preflightFkInitialCreateCommand(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
         const result = try self.projection(contract.InitialFkPreflight, .{
@@ -578,6 +684,10 @@ pub const RaftApplyStore = struct {
     }
     pub fn storeRootControlJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_initial_retirement_wire.Control) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .store_root_control = request });
+    }
+    pub fn validateStoreRootEnrollmentProtocol(self: *RaftApplyStore, group_id: u64) !void {
+        const valid = try self.catalogProjection(bool, self.alloc, group_id, .validate_store_root_enrollment_protocol);
+        if (!valid) return error.TableTopologyProtocolUpgradeRequired;
     }
     pub fn fkInitialParentDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_parent_decision = request });

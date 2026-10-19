@@ -103,6 +103,7 @@ pub const Diagnostic = struct {
 pub const MutationOutcome = enum { committed, committed_pending, committed_repair_required, committed_graph_metric_materialization_rejected };
 
 pub const Description = struct {
+    copy_out: ?@import("antfly_local_sources").sql_ast.CopyOptions = null,
     columns: []const Column = &.{},
     parameter_types: []const Type = &.{},
     parameter_descriptors: []const Parameter = &.{},
@@ -224,6 +225,7 @@ pub const Backend = struct {
 /// Result pages must be released before close or detach: native page arenas
 /// may borrow the stream's shared memory admission and retained column metadata.
 pub const ReadStream = struct {
+    copy_out: ?@import("antfly_local_sources").sql_ast.CopyOptions = null,
     context: *anyopaque,
     columns: []const Column,
     next: *const fn (*anyopaque, std.mem.Allocator, Request, u32) anyerror!StreamPage,

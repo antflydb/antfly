@@ -805,6 +805,24 @@ impl types::CreateIndexError {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn relational_json_null_expression_round_trip() {
+        for with_value in [false, true] {
+            let mut source = serde_json::json!({
+                "op": "literal", "type": "json", "json_null": true
+            });
+            if with_value {
+                source["value"] = serde_json::Value::Null;
+            }
+            let expression: super::types::RelationalScalarExpression =
+                serde_json::from_value(source).unwrap();
+            let restored = serde_json::to_value(expression).unwrap();
+            assert_eq!(restored["type"], "json");
+            assert_eq!(restored["json_null"], true);
+            assert!(restored.get("value").is_none_or(serde_json::Value::is_null));
+        }
+    }
+
+    #[test]
     fn relational_array_literal_round_trip() {
         for identity in [
             "text", "int16", "int32", "int64", "float32", "float64", "boolean", "uuid", "jsonb",

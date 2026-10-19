@@ -21,7 +21,7 @@ const decisions = @import("../functions/decisions.zig");
 pub fn limitsFor(backend: @import("catalog.zig").Backend) scalar.EvalLimits {
     const checkpoint = if (backend.scalar_control) |control| control.checkpoint else null;
     const context = if (backend.scalar_control) |control| control.ptr else null;
-    return .{ .regex_execution = backend.regex_execution, .regex_checkpoint = checkpoint, .regex_context = context, .checkpoint = checkpoint, .checkpoint_context = context };
+    return .{ .execution_io = backend.execution_io, .clock_values = backend.clock_values, .regex_execution = backend.regex_execution, .regex_checkpoint = checkpoint, .regex_context = context, .checkpoint = checkpoint, .checkpoint_context = context };
 }
 /// Single-source reads route by their bound physical identity. Mutations route
 /// by the target. Multi-source reads use the provider's general routing policy;
@@ -86,6 +86,10 @@ pub fn validateStatement(a: std.mem.Allocator, provider: ?decisions.DecisionProv
 }
 fn validateRelation(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, node: *const @import("relation_binding.zig").Node, parameters: []const std.json.Value) anyerror!void {
     switch (node.operation) {
+        .unnest => |function| {
+            try validateRelation(a, provider, function.source, parameters);
+            for (function.arrays) |*program| try validate(a, provider, program, parameters);
+        },
         .recursive => |part| {
             try validateRelation(a, provider, part.seed, parameters);
             try validateRelation(a, provider, part.step, parameters);

@@ -31,13 +31,18 @@ pub const PatternSet = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Datum = struct {
+    /// Immutable temporal payload owned by the pinned invocation/row region.
+    /// The JSON null placeholder is never a temporal value or SQL NULL.
+    extension_kind: enum(u8) { none, patterns, temporal } = .none,
+    // One tagged, pointer-sized extension; the discriminator fits existing
+    // tail padding. Constructors/accessors are the only interpretation boundary.
+    extension: ?*const anyopaque = null,
     /// Exact immutable NUMERIC payload, owned by the pinned value region.
     /// JSON null is only a placeholder and is never SQL NULL or numeric data.
     numeric: ?*const @import("numeric_value.zig").Value = null,
     /// A pinned, immutable SQL array. JSON arrays remain in value and never
     /// acquire SQL-array semantics from their payload shape.
     array: ?*const @import("array_value.zig").Value = null,
-    patterns: ?*PatternSet = null,
     value: Json = .null,
     sql_null: bool = true,
 
@@ -53,7 +58,82 @@ pub const Datum = struct {
     pub fn typedNumeric(value: *const @import("numeric_value.zig").Value) Datum {
         return .{ .numeric = value, .sql_null = false };
     }
+    pub fn typedTemporal(value: *const @import("temporal_value.zig").Value) Datum {
+        return .{ .extension_kind = .temporal, .extension = value, .sql_null = false };
+    }
+    pub fn temporal(self: Datum) ?*const @import("temporal_value.zig").Value {
+        return if (self.extension_kind == .temporal and self.extension != null) @ptrCast(@alignCast(self.extension.?)) else null;
+    }
+    pub fn patterns(self: Datum) ?*PatternSet {
+        return if (self.extension_kind == .patterns and self.extension != null) @constCast(@as(*const PatternSet, @ptrCast(@alignCast(self.extension.?)))) else null;
+    }
+    pub fn fromParts(value: Json, sql_null: bool, pattern: ?*PatternSet) Datum {
+        var result: Datum = .{ .value = value, .sql_null = sql_null };
+        if (pattern) |p| {
+            result.extension_kind = .patterns;
+            result.extension = p;
+        }
+        return result;
+    }
+    pub fn validateTemporal(self: Datum) !void {
+        if ((self.extension_kind == .none) != (self.extension == null)) return error.SqlTypeMismatch;
+        if (self.temporal()) |value| {
+            if (self.sql_null or self.numeric != null or self.array != null or self.patterns() != null or self.value != .null) return error.SqlTypeMismatch;
+            var frame: [16]u8 = undefined;
+            _ = try @import("temporal_value.zig").encode(value.*, &frame);
+        }
+    }
 };
+
+pub fn temporalBinaryLeaky(a: Allocator, kind: @import("temporal_value.zig").Kind, bytes: []const u8, work: *arrays.Budget) !Datum {
+    try work.consume(1);
+    const value = try @import("temporal_value.zig").decode(kind, bytes);
+    const owned = try a.create(@import("temporal_value.zig").Value);
+    owned.* = value;
+    return Datum.typedTemporal(owned);
+}
+
+test "SQL temporal scalar dispatch preserves typed identity and exact text casts" {
+    // Extension identity occupies existing tail padding, not another pointer
+    // in every primitive cell. Keep this invariant on every selected target.
+    const Legacy = struct {
+        numeric: ?*const @import("numeric_value.zig").Value,
+        array: ?*const @import("array_value.zig").Value,
+        patterns: ?*PatternSet,
+        value: Json,
+        sql_null: bool,
+    };
+    try std.testing.expect(@sizeOf(Datum) <= @sizeOf(Legacy));
+    const a = std.testing.allocator;
+    const value: @import("temporal_value.zig").Value = .{ .timestamp_tz = .{ .micros = -946_684_800_000_001 } };
+    for ([_][]const u8{ "v", "coalesce(v, NULL)", "greatest(v, v)" }) |query| {
+        var compiled = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const result = try program.evaluate(none.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{});
+        try std.testing.expect(!result.sql_null and result.temporal() == &value);
+    }
+    for ([_][]const u8{ "v = v", "v IS NOT NULL", "v IS DISTINCT FROM NULL" }) |query| {
+        var compiled = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const result = try program.evaluate(none.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{});
+        try std.testing.expect(!result.sql_null and result.value.bool);
+    }
+    var compiled = try @import("compiler.zig").compileScalar(a, "v::text", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = try program.evaluate(arena.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{});
+    try std.testing.expectEqualStrings("1969-12-31 23:59:59.999999+00", result.value.string);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{ .output_bytes = 1 }));
+}
 
 /// Leaky constructors retain limbs and their stable view in the caller's
 /// region. Frames/operators own that region; no input bytes remain borrowed.
@@ -173,6 +253,10 @@ pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true, e
 pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
+    /// This spelling belongs to multiple visible relations. Keep it in the
+    /// binding environment so unused ambiguity is harmless; reject only an
+    /// actual reference, before any physical execution is admitted.
+    ambiguous: bool = false,
     nullable: bool = true,
     element_type: ?arrays.ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
@@ -208,6 +292,11 @@ pub const BindLimits = struct {
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
 pub const EvalLimits = struct {
+    /// Invocation-owned I/O for volatile functions. Never cache this in a
+    /// compiled program or synthesize entropy from clocks/process state.
+    execution_io: ?std.Io = null,
+    /// Immutable stable-address typed values owned by the enclosing execution.
+    clock_values: ?*const @import("statement_clock.zig").Frame = null,
     steps: usize = 65_536,
     pattern_steps: usize = 8 * 1024 * 1024,
     input_bytes: usize = @import("resource_limits.zig").default_memory_bytes,
@@ -224,7 +313,291 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path };
+pub const Volatility = enum { immutable, stable, @"volatile" };
+pub const Function = enum {
+    ai_decide,
+    ai_choice,
+    ai_score,
+    ai_probability,
+    abs,
+    lower,
+    upper,
+    length,
+    octet_length,
+    concat,
+    coalesce,
+    nullif,
+    greatest,
+    least,
+    ceil,
+    floor,
+    round,
+    sqrt,
+    power,
+    mod,
+    substring,
+    trim,
+    ltrim,
+    rtrim,
+    replace,
+    starts_with,
+    date_part,
+    extract,
+    date_trunc,
+    to_timestamp,
+    current_setting,
+    @"$single",
+    @"$pattern_quantified",
+    trunc,
+    sign,
+    to_jsonb,
+    jsonb_build_object,
+    jsonb_extract_path_text,
+    concat_ws,
+    bit_length,
+    strpos,
+    jsonb_typeof,
+    lpad,
+    rpad,
+    repeat,
+    reverse,
+    left,
+    right,
+    split_part,
+    translate,
+    overlay,
+    ascii,
+    chr,
+    @"$array",
+    @"$array_quantified",
+    cardinality,
+    array_ndims,
+    array_length,
+    array_lower,
+    array_upper,
+    @"$array_pattern_quantified",
+    @"$contains",
+    @"$overlaps",
+    array_to_string,
+    jsonb_exists,
+    string_to_array,
+    @"$like_escape",
+    jsonb_set,
+    @"$document_patch",
+    array_position,
+    array_positions,
+    array_remove,
+    array_replace,
+    array_append,
+    array_prepend,
+    array_cat,
+    jsonb_exists_any,
+    jsonb_exists_all,
+    regexp_like,
+    regexp_count,
+    regexp_instr,
+    regexp_substr,
+    regexp_replace,
+    jsonb_array_length,
+    initcap,
+    jsonb_extract_path,
+    md5,
+    now,
+    gen_random_uuid,
+    transaction_timestamp,
+    @"$current_timestamp",
+    @"$current_user",
+    @"$record_validate",
+    @"$record_field",
+    @"$json_path",
+    @"$json_path_text",
+    pub fn volatility(self: Function) Volatility {
+        return switch (self) {
+            .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid => .@"volatile",
+            .now, .transaction_timestamp, .@"$current_timestamp", .@"$current_user", .current_setting, .date_part, .extract, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
+            else => .immutable,
+        };
+    }
+};
+
+fn clockFunction(function: Function) ?@import("statement_clock.zig").StableFunction {
+    return switch (function) {
+        .now, .transaction_timestamp, .@"$current_timestamp" => .transaction,
+        else => null,
+    };
+}
+
+/// The existing public datetime descriptor identifies OID 1184 only. Other
+/// native temporal kinds must not be relabeled or lose their typed payload.
+pub fn timestampResult(datum: Datum, kind: ?ast.ColumnType) !@import("temporal_value.zig").Timestamp {
+    try datum.validateTemporal();
+    const value = datum.temporal() orelse return error.SqlTypeMismatch;
+    if (kind != .datetime or value.kind() != .timestamp_tz) return error.UnsupportedSqlShape;
+    return value.timestamp_tz;
+}
+
+pub fn formatTimestampResult(datum: Datum, kind: ?ast.ColumnType, output: *[@import("temporal_text.zig").output_capacity]u8) ![]const u8 {
+    return @import("temporal_text.zig").format(.{ .timestamp_tz = try timestampResult(datum, kind) }, output);
+}
+
+test "SQL native UUID generation is volatile demand driven and requires secure invocation entropy" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "pg_catalog.gen_random_uuid()", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(ast.ColumnType.uuid, program.output_type.kind.?);
+    try std.testing.expectEqual(arrays.ElementType.uuid, program.output_type.element_type.?);
+    try std.testing.expectEqual(Volatility.@"volatile", Function.gen_random_uuid.volatility());
+    try std.testing.expect(program.constant_pool == null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.SqlEntropyUnavailable, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
+    var prior: [16]u8 = @splat(0);
+    for (0..128) |_| {
+        const datum = try program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = std.testing.io });
+        try std.testing.expect(!datum.sql_null);
+        const uuid = try @import("../common/uuid.zig").parse(datum.value.string);
+        try std.testing.expectEqual(@as(u8, 4), uuid[6] >> 4);
+        try std.testing.expectEqual(@as(u8, 2), uuid[8] >> 6);
+        try std.testing.expect(!std.mem.eql(u8, &prior, &uuid));
+        prior = uuid;
+    }
+    var lazy = try @import("compiler.zig").compileScalar(a, "CASE WHEN false THEN gen_random_uuid() ELSE NULL::uuid END", .{});
+    defer lazy.deinit();
+    var lazy_program = try bind(a, lazy.expression, &.{}, &.{}, .{});
+    defer lazy_program.deinit();
+    try std.testing.expect((try lazy_program.evaluate(arena.allocator(), &.{}, &.{}, .{})).sql_null);
+    const Source = struct {
+        calls: usize = 0,
+        failure: ?std.Io.RandomSecureError = null,
+        fn fill(raw: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.failure) |failure| return failure;
+            @memset(bytes, 0);
+            bytes[15] = @intCast(self.calls);
+        }
+    };
+    var source: Source = .{ .failure = error.EntropyUnavailable };
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Source.fill;
+    const io: std.Io = .{ .userdata = &source, .vtable = &vtable };
+    try std.testing.expectError(error.SqlEntropyUnavailable, program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io }));
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    source.failure = error.Canceled;
+    try std.testing.expectError(error.Canceled, program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io }));
+    source.failure = null;
+    var two = try @import("compiler.zig").compileScalar(a, "gen_random_uuid() = gen_random_uuid()", .{});
+    defer two.deinit();
+    var two_program = try bind(a, two.expression, &.{}, &.{}, .{});
+    defer two_program.deinit();
+    try std.testing.expect(!(try two_program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io })).value.bool);
+    try std.testing.expectEqual(@as(usize, 4), source.calls);
+    try std.testing.expect((try lazy_program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io })).sql_null);
+    try std.testing.expectEqual(@as(usize, 4), source.calls);
+}
+
+test "SQL transaction timestamp expressions borrow execution values without allocation or sampling" {
+    const Clock = @import("statement_clock.zig");
+    const Fake = struct {
+        calls: usize = 0,
+        fn sample(raw: ?*anyopaque) !i128 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return error.UnexpectedClockSample;
+        }
+    };
+    var fake: Fake = .{};
+    const view: Clock.View = .{ .source = .{ .callback = .{ .ptr = &fake, .now = Fake.sample } }, .transaction = try Clock.Instant.init(-946_684_800_000_001), .statement = try Clock.Instant.init(0) };
+    const first = try Clock.Frame.init(view);
+    var next_view = view;
+    next_view.statement = try Clock.Instant.init(1_000_000);
+    const second = try Clock.Frame.init(next_view);
+    for ([_][]const u8{ "now()", "transaction_timestamp()", "CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP(6)", "CURRENT_TIMESTAMP(0x6)", "now()::timestamptz", "coalesce(NULL::timestamptz, now())", "CASE WHEN true THEN now() ELSE CURRENT_TIMESTAMP(0) END" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, query, .{});
+        defer parsed.deinit();
+        var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(ast.ColumnType.datetime, program.output_type.kind.?);
+        try std.testing.expect(program.constant_pool == null);
+        try std.testing.expect(!@import("typed_kernel.zig").supported(&program));
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        for ([_]*const Clock.Frame{ &first, &second }) |frame| {
+            for (0..10_000) |_| {
+                const value = try program.evaluate(none.allocator(), &.{}, &.{}, .{ .clock_values = frame });
+                try std.testing.expect(value.temporal().? == try frame.value(.transaction, 6));
+                try std.testing.expect(!value.sql_null);
+            }
+        }
+        try std.testing.expectError(error.SqlClockUnavailable, program.evaluate(none.allocator(), &.{}, &.{}, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(Volatility.stable, Function.now.volatility());
+    try std.testing.expectEqual(Volatility.stable, Function.@"$current_timestamp".volatility());
+}
+
+test "SQL transaction timestamp precisions use the pinned frame and lazy branches need no clock" {
+    const Clock = @import("statement_clock.zig");
+    const frame = try Clock.Frame.init(.{ .source = .{ .io = std.testing.io }, .transaction = try Clock.Instant.init(-123_456_789), .statement = try Clock.Instant.init(42) });
+    for (0..7) |precision| {
+        var query: [64]u8 = undefined;
+        const sql = try std.fmt.bufPrint(&query, "CURRENT_TIMESTAMP({d})", .{precision});
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const datum = try program.evaluate(none.allocator(), &.{}, &.{}, .{ .clock_values = &frame });
+        try std.testing.expect(datum.temporal().? == try frame.value(.transaction, @intCast(precision)));
+    }
+    var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, "CASE WHEN false THEN now() ELSE NULL::timestamptz END", .{});
+    defer parsed.deinit();
+    var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expect((try program.evaluate(none.allocator(), &.{}, &.{}, .{})).sql_null);
+    for ([_][]const u8{ "now(1)", "transaction_timestamp(1)" }) |sql| {
+        var invalid = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.SqlUndefinedFunction, bind(std.testing.allocator, invalid.expression, &.{}, &.{}, .{}));
+    }
+}
+
+test "SQL transaction timestamp precision is demanded lazily and keeps exact public type identity" {
+    const Clock = @import("statement_clock.zig");
+    const frame = try Clock.Frame.init(.{ .source = .{ .io = std.testing.io }, .transaction = try Clock.Instant.init(@import("temporal_value.zig").end_timestamp - 1), .statement = try Clock.Instant.init(0) });
+    for ([_][]const u8{ "CASE WHEN false THEN CURRENT_TIMESTAMP(0) ELSE now() END", "coalesce(now(), CURRENT_TIMESTAMP(0))", "greatest(now(), transaction_timestamp())" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, query, .{});
+        defer parsed.deinit();
+        var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const value = try program.evaluate(none.allocator(), &.{}, &.{}, .{ .clock_values = &frame });
+        var output: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+        try std.testing.expectEqualStrings("294276-12-31 23:59:59.999999+00", try formatTimestampResult(value, .datetime, &output));
+        try std.testing.expectError(error.UnsupportedSqlShape, formatTimestampResult(value, .string, &output));
+        try std.testing.expectError(error.UnsupportedRelationalValueType, @import("runtime.zig").encodeStorageDatum(none.allocator(), value, .{ .name = "v", .path = "v", .type = .datetime, .nullable = false }, 1024));
+    }
+    var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, "CURRENT_TIMESTAMP(0)", .{});
+    defer parsed.deinit();
+    var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.TemporalOutOfRange, program.evaluate(none.allocator(), &.{}, &.{}, .{ .clock_values = &frame }));
+    const other: @import("temporal_value.zig").Value = .{ .timestamp = try Clock.Instant.init(0) };
+    try std.testing.expectError(error.UnsupportedSqlShape, timestampResult(Datum.typedTemporal(&other), .datetime));
+    var invalid = Datum.typedTemporal(try frame.value(.transaction, 6));
+    invalid.sql_null = true;
+    try std.testing.expectError(error.SqlTypeMismatch, timestampResult(invalid, .datetime));
+}
+
+fn numericKernelFunction(function: Function) ?@import("numeric_functions.zig").Function {
+    return switch (function) {
+        inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @field(@import("numeric_functions.zig").Function, @tagName(tag)),
+        else => null,
+    };
+}
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -323,6 +696,7 @@ pub const Program = struct {
             .cast => |cast| earlier[cast.operand],
             .unary => |unary| earlier[unary.operand],
             .call => |call| blk: {
+                if (call.function.volatility() != .immutable) break :blk false;
                 switch (call.function) {
                     .@"$array", .string_to_array, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .sqrt => {},
                     else => break :blk false,
@@ -464,9 +838,29 @@ pub const Program = struct {
     /// NULL placeholders. Borrowed scalar results remain valid while the
     /// program, cells and parameters live; computed strings use alloc.
     pub fn evaluateInstruction(self: *const Program, alloc: Allocator, index: u32, parameters: []const Json) !Datum {
-        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = .{} };
+        return self.evaluateInstructionWithLimits(alloc, index, parameters, .{});
+    }
+
+    pub fn evaluateInstructionWithLimits(self: *const Program, alloc: Allocator, index: u32, parameters: []const Json, limits: EvalLimits) !Datum {
+        if (index >= self.instructions.len) return error.InvalidSqlProgram;
+        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
         return context.runDatum(index, 0);
     }
+
+    /// One preparation owner supplies only proven immutable constants. Its
+    /// shared evaluator retains work and byte admission across all folds.
+    pub const ConstantEvaluation = struct {
+        context: Evaluator,
+        pub fn init(program: *const Program, alloc: Allocator, constants: []const ?Datum, limits: EvalLimits) ConstantEvaluation {
+            return .{ .context = .{ .program = program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits, .folded_values = constants } };
+        }
+        pub fn evaluate(self: *ConstantEvaluation, index: u32) !Datum {
+            return self.context.runDatum(index, 0);
+        }
+        pub fn usedSteps(self: *ConstantEvaluation) usize {
+            return self.context.usedSteps();
+        }
+    };
 
     pub fn evaluate(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Datum {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
@@ -648,20 +1042,104 @@ pub fn parameterElementType(descriptor: Type) !arrays.ElementType {
     return descriptor.element_type orelse try arrayElementType(descriptor.kind orelse return error.UnknownSqlParameterType);
 }
 
-/// Only an unresolved root string literal inherits the target array domain.
+/// Only an unresolved root string literal inherits the target assignment domain.
 /// Explicit text expressions retain their identity and require an SQL cast.
 pub fn assignmentExpression(alloc: Allocator, expression: *const ast.Scalar, expected: Type) !*const ast.Scalar {
-    if (expected.kind != .array or expression.* != .literal or expression.literal != .string) return expression;
+    const kind = expected.kind orelse return expression;
+    if (kind == .string or expression.* != .literal or expression.literal != .string) return expression;
+    if (kind == .array and expected.element_type == null) return error.SqlAssignmentTypeMismatch;
     const cast = try alloc.create(ast.Scalar);
-    cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = expected.element_type orelse return error.SqlAssignmentTypeMismatch } };
+    cast.* = .{ .cast = .{ .operand = expression, .type = kind, .element_type = expected.element_type, .numeric_modifier = expected.numeric_modifier } };
     return cast;
+}
+
+test "SQL assignment root literals inherit target domains without casting typed text" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { input: []const u8, target: Type }{
+        .{ .input = "{\"n\":9007199254740993.1250}", .target = .{ .kind = .json, .element_type = .jsonb } },
+        .{ .input = "A0EEBC999C0B4EF8BB6D6BB9BD380A11", .target = .{ .kind = .uuid, .element_type = .uuid } },
+        .{ .input = "32767", .target = .{ .kind = .integer, .element_type = .int16 } },
+        .{ .input = "9007199254740993.1250", .target = .{ .kind = .number, .element_type = .numeric } },
+        .{ .input = "true", .target = .{ .kind = .boolean, .element_type = .boolean } },
+        .{ .input = "[-1:1]={one,NULL,two}", .target = .{ .kind = .array, .element_type = .text } },
+    }) |case| {
+        const literal: ast.Scalar = .{ .literal = .{ .string = case.input } };
+        const expression = try assignmentExpression(a, &literal, case.target);
+        var program = try bind(std.testing.allocator, expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(case.target.kind, program.output_type.kind);
+        const value = try program.evaluate(a, &.{}, &.{}, .{});
+        try std.testing.expect(!value.sql_null);
+        const typed_text: ast.Scalar = .{ .cast = .{ .operand = &literal, .type = .string, .element_type = .text } };
+        try std.testing.expect(try assignmentExpression(a, &typed_text, case.target) == &typed_text);
+    }
+}
+
+test "SQL assignment text output retains PostgreSQL builtin identity nulls and demand" {
+    const a = std.testing.allocator;
+    const Golden = struct { assignment_contracts: []const struct { expression: []const u8, text: ?[]const u8, sql_null: bool } };
+    var golden = try std.json.parseFromSlice(Golden, a, @import("parity_fixtures.zig").array_mutation_reference, .{ .ignore_unknown_fields = true });
+    defer golden.deinit();
+    for (golden.value.assignment_contracts) |contract| {
+        errdefer std.debug.print("assignment output: {s}\n", .{contract.expression});
+        var compiled = try @import("compiler.zig").compileScalar(a, contract.expression, .{});
+        defer compiled.deinit();
+        var program = try bindTypedExpectedWithSettings(a, compiled.expression, &.{}, &.{}, .{ .kind = .string, .element_type = .text }, .{ .assignment = true }, null);
+        defer program.deinit();
+        try std.testing.expectEqual(ast.ColumnType.string, program.output_type.kind.?);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(contract.sql_null, value.sql_null);
+        if (contract.text) |text| try std.testing.expectEqualStrings(text, value.value.string);
+    }
+    // A result hint is not an implicit cast outside assignment boundaries.
+    var integer = try @import("compiler.zig").compileScalar(a, "42::bigint", .{});
+    defer integer.deinit();
+    var ordinary = try bindTypedExpectedWithSettings(a, integer.expression, &.{}, &.{}, .{ .kind = .string, .element_type = .text }, .{}, null);
+    defer ordinary.deinit();
+    try std.testing.expectEqual(ast.ColumnType.integer, ordinary.output_type.kind.?);
+    var text = try @import("compiler.zig").compileScalar(a, "'42'::text", .{});
+    defer text.deinit();
+    var opposite = try bindTypedExpectedWithSettings(a, text.expression, &.{}, &.{}, .{ .kind = .integer, .element_type = .int64 }, .{ .assignment = true }, null);
+    defer opposite.deinit();
+    try std.testing.expectEqual(ast.ColumnType.string, opposite.output_type.kind.?);
+    const Entropy = struct {
+        calls: usize = 0,
+        fn fill(raw: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            @memset(bytes, 0);
+        }
+    };
+    var entropy: Entropy = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Entropy.fill;
+    const io: std.Io = .{ .userdata = &entropy, .vtable = &vtable };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var uuid = try @import("compiler.zig").compileScalar(a, "gen_random_uuid()", .{});
+    defer uuid.deinit();
+    var generated = try bindTypedExpectedWithSettings(a, uuid.expression, &.{}, &.{}, .{ .kind = .string, .element_type = .text }, .{ .assignment = true }, null);
+    defer generated.deinit();
+    const value = try generated.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io });
+    try std.testing.expectEqualStrings("00000000-0000-4000-8000-000000000000", value.value.string);
+    try std.testing.expectEqual(@as(usize, 1), entropy.calls);
+    var lazy = try @import("compiler.zig").compileScalar(a, "CASE WHEN false THEN gen_random_uuid() ELSE NULL::uuid END", .{});
+    defer lazy.deinit();
+    var lazy_program = try bindTypedExpectedWithSettings(a, lazy.expression, &.{}, &.{}, .{ .kind = .string, .element_type = .text }, .{ .assignment = true }, null);
+    defer lazy_program.deinit();
+    try std.testing.expect((try lazy_program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io })).sql_null);
+    try std.testing.expectEqual(@as(usize, 1), entropy.calls);
 }
 
 /// Shared assignment coercion for typed source cursors and mutation cells.
 /// Identity borrows the source; converted cells belong to alloc, and dimension
 /// metadata borrows the pinned source until the caller's ownership boundary.
 pub fn assignArray(alloc: Allocator, datum: Datum, target: arrays.ElementType, limits: EvalLimits) !Datum {
-    if (datum.value != .null or datum.patterns != null) return error.SqlAssignmentTypeMismatch;
+    if (datum.value != .null or datum.patterns() != null) return error.SqlAssignmentTypeMismatch;
     if (datum.sql_null) {
         if (datum.array != null) return error.SqlAssignmentTypeMismatch;
         return datum;
@@ -676,6 +1154,32 @@ pub fn assignArray(alloc: Allocator, datum: Datum, target: arrays.ElementType, l
     const program: Program = .{ .arena = &arena, .instructions = &.{}, .root = 0, .output_type = .{}, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
     var evaluator: Evaluator = .{ .program = &program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
     return evaluator.castArray(datum, target);
+}
+
+/// Numeric assignment uses PostgreSQL's narrowing/range/rounding rules,
+/// without turning an already typed text/JSON value into numeric input.
+pub fn assignNumeric(alloc: Allocator, datum: Datum, source_identity: ?arrays.ElementType, target: arrays.ElementType, limits: EvalLimits) !Datum {
+    if (!builtin_cast.integral(target) and !builtin_cast.floating(target) and target != .numeric) return error.SqlAssignmentTypeMismatch;
+    if (datum.array != null or datum.patterns() != null or datum.temporal() != null) return error.SqlAssignmentTypeMismatch;
+    if (datum.sql_null) {
+        if (datum.value != .null or datum.numeric != null) return error.SqlTypeMismatch;
+        return datum;
+    }
+    const source: arrays.ElementType = if (datum.numeric != null) source: {
+        if (datum.value != .null) return error.SqlTypeMismatch;
+        break :source .numeric;
+    } else switch (datum.value) {
+        .integer => if (source_identity) |kind| if (builtin_cast.integral(kind)) kind else return error.SqlTypeMismatch else .int64,
+        .float => if (source_identity) |kind| if (builtin_cast.floating(kind)) kind else return error.SqlTypeMismatch else .float64,
+        else => return datum, // Existing unknown-literal admission owns text.
+    };
+    if (!builtin_cast.assignmentAllowed(source, target)) return error.SqlAssignmentTypeMismatch;
+    if (source == target) return datum;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const program: Program = .{ .arena = &arena, .instructions = &.{}, .root = 0, .output_type = .{}, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
+    var evaluator: Evaluator = .{ .program = &program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+    return evaluator.castDatumBuiltin(datum, source, target);
 }
 
 fn normalizeParameterType(descriptor: Type) !Type {
@@ -762,6 +1266,24 @@ test "SQL logical JSON parameters and identity casts never parse string payloads
         try std.testing.expectEqualStrings("null", string.value.string);
         const json_null = try program.evaluate(none.allocator(), &.{Datum.json(.null)}, &.{}, .{});
         try std.testing.expect(!json_null.sql_null and json_null.value == .null);
+    }
+}
+
+test "SQL document patch binds JSONB operands and preserves function namespace identity" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "antfly.json_patch('{\"a\":1}', '{\"ops\":[{\"op\":\"set\",\"path\":\"a\",\"value\":2}]}')", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+    try std.testing.expect(!result.sql_null);
+    try std.testing.expectEqual(std.math.Order.eq, try compare(result.value.object.get("a").?, .{ .integer = 2 }));
+    for ([_][]const u8{ "\"antfly.json_patch\"('{}','{}')", "other.json_patch('{}','{}')", "\"Antfly\".json_patch('{}','{}')" }) |sql| {
+        var invalid = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.UnsupportedSqlShape, bind(a, invalid.expression, &.{}, &.{}, .{}));
     }
 }
 
@@ -1046,7 +1568,7 @@ test "SQL NUMERIC modifiers match PostgreSQL rounding overflow arrays and lazy e
             if (result.array) |array| {
                 var buffer: [16384]u8 = undefined;
                 var writer = std.Io.Writer.fixed(&buffer);
-                try @import("array_text.zig").encode(array.*, &writer, .{});
+                try @import("array_text.zig").encode(a, array.*, &writer, .{});
                 try std.testing.expectEqualStrings(expected, writer.buffered());
             } else {
                 var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
@@ -1068,7 +1590,7 @@ test "SQL NUMERIC modifier dynamic arrays retain bounds and unwind allocation fa
             const result = try program.evaluate(arena.allocator(), &.{}, &.{.{ .string = "[-2:0]={12.345,NULL,-12.345}" }}, .{});
             var buffer: [16384]u8 = undefined;
             var writer = std.Io.Writer.fixed(&buffer);
-            try @import("array_text.zig").encode(result.array.?.*, &writer, .{});
+            try @import("array_text.zig").encode(a, result.array.?.*, &writer, .{});
             try std.testing.expectEqualStrings("[-2:0]={12.35,NULL,-12.35}", writer.buffered());
             if (!errors) return;
             try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{}, &.{.{ .string = "{99.995}" }}, .{}));
@@ -1248,7 +1770,7 @@ test "SQL constant preparation preserves PostgreSQL input validation and lazy ru
                 return alloc.dupe(u8, try @import("numeric_value.zig").format(&context, number.*));
             }
             var writer: std.Io.Writer.Allocating = .init(r);
-            try @import("array_text.zig").encode(value.array.?.*, &writer.writer, .{});
+            try @import("array_text.zig").encode(r, value.array.?.*, &writer.writer, .{});
             return alloc.dupe(u8, writer.written());
         }
     };
@@ -1593,6 +2115,22 @@ fn mixedNumberQuantified(value: arrays.Value, probe: arrays.Element, op: arrays.
 fn uuidTextOperand(expression: *const ast.Scalar) bool {
     return expression.* == .literal and expression.literal == .string;
 }
+fn jsonUnknownOperandDomain(left: Type, right: Type, left_expression: *const ast.Scalar, right_expression: *const ast.Scalar) ?Type {
+    if ((left.kind == .json and uuidTextOperand(right_expression)) or
+        (right.kind == .json and uuidTextOperand(left_expression)))
+        return .{ .kind = .json, .element_type = .jsonb, .nullable = left.nullable or right.nullable };
+    return null;
+}
+/// Hash keys must use the same resolved domain as the equality operator.
+/// In particular exact NUMERIC and integer values have different physical
+/// hashes until both operands have passed through their comparison coercion.
+pub fn comparisonDomain(left: Type, right: Type) !Type {
+    var merged = try common(left, right);
+    if (merged.kind == .number and merged.element_type == .float32 and
+        (left.element_type == .numeric or right.element_type == .numeric)) merged.element_type = .float64;
+    return merged;
+}
+
 fn common(left: Type, right: Type) !Type {
     if (left.kind == .array or right.kind == .array) {
         const chosen = if (left.kind == .array) left else right;
@@ -1640,6 +2178,15 @@ pub fn statementConstant(node: *const ast.Scalar) bool {
 }
 
 fn functionId(name: []const u8) !Function {
+    // PostgreSQL has starts_with(text,text), not a symmetric ends_with
+    // builtin. Do not accidentally promise a nonstandard overload.
+    if (std.mem.eql(u8, name, "ends_with")) return error.SqlUndefinedFunction;
+    if (std.mem.eql(u8, name, "antfly\x00json_patch")) return .@"$document_patch";
+    if (std.mem.startsWith(u8, name, "pg_catalog\x00")) {
+        const builtin = try functionId(name[11..]);
+        if (std.mem.startsWith(u8, @tagName(builtin), "$") or std.mem.startsWith(u8, @tagName(builtin), "ai_")) return error.UnsupportedSqlShape;
+        return builtin;
+    }
     if (std.mem.eql(u8, name, "$regex_operator")) return .regexp_like;
     inline for (@typeInfo(Function).@"enum".field_names, @typeInfo(Function).@"enum".field_values) |reflected_name, field_value| if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     if (std.mem.eql(u8, name, "char_length") or std.mem.eql(u8, name, "character_length")) return .length;
@@ -2030,18 +2577,23 @@ fn arity(function: Function, count: usize) !void {
         return;
     }
     const valid = switch (function) {
+        .now, .transaction_timestamp, .@"$current_user", .gen_random_uuid => count == 0,
+        .@"$record_validate" => count == 1,
+        .@"$record_field" => count == 3,
+        .@"$current_timestamp" => count == 1,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
         .array_replace => count == 3,
         .@"$like_escape" => count == 4,
-        .@"$contains", .@"$overlaps", .jsonb_exists, .jsonb_exists_any, .jsonb_exists_all => count == 2,
+        .@"$contains", .@"$overlaps", .@"$json_path", .@"$json_path_text", .jsonb_exists, .jsonb_exists_any, .jsonb_exists_all => count == 2,
         .array_to_string => count == 2 or count == 3,
         .string_to_array => count == 2 or count == 3,
         .jsonb_set => count == 3 or count == 4,
+        .@"$document_patch" => count == 2,
         .@"$array" => true,
         .@"$array_quantified" => count == 4,
-        .cardinality, .array_ndims, .jsonb_array_length, .initcap => count == 1,
+        .cardinality, .array_ndims, .jsonb_array_length, .initcap, .md5 => count == 1,
         .array_length, .array_lower, .array_upper => count == 2,
         .ai_decide, .ai_probability => count == 3,
         .ai_choice, .ai_score => count == 4,
@@ -2050,7 +2602,7 @@ fn arity(function: Function, count: usize) !void {
         .concat_ws => count >= 2,
         .jsonb_build_object => count % 2 == 0,
         .jsonb_extract_path_text, .jsonb_extract_path => count >= 2,
-        .nullif, .power, .mod, .starts_with, .strpos, .repeat, .left, .right, .date_part, .date_trunc, .@"$single" => count == 2,
+        .nullif, .power, .mod, .starts_with, .strpos, .repeat, .left, .right, .date_part, .extract, .date_trunc, .@"$single" => count == 2,
         .@"$pattern_quantified", .@"$array_pattern_quantified" => count == 5,
         .substring, .lpad, .rpad => count == 2 or count == 3,
         .replace, .translate, .split_part => count == 3,
@@ -2059,7 +2611,7 @@ fn arity(function: Function, count: usize) !void {
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return if (arrayCompatibleFunction(function) or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
+    if (!valid) return if (clockFunction(function) != null or arrayCompatibleFunction(function) or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -2154,6 +2706,7 @@ const Binder = struct {
             } else literalType(value),
             .column => |name| blk: {
                 const column = self.columns[self.names.get(name) orelse return error.UnknownColumn];
+                if (column.ambiguous) return error.AmbiguousSqlColumn;
                 if (column.numeric_modifier) |modifier| {
                     if ((column.type != .number and column.type != .array) or column.element_type != .numeric) return error.InvalidSqlProgram;
                     try modifier.validate();
@@ -2207,15 +2760,23 @@ const Binder = struct {
                 if (try self.arrayConcatenation(binary, depth)) |call| break :blk try self.infer(call, depth + 1);
                 const left = try self.infer(binary.left, depth + 1);
                 const right = try self.infer(binary.right, depth + 1);
+                if ((left.kind == .datetime and numeric(right.kind)) or (right.kind == .datetime and numeric(left.kind))) return error.SqlUndefinedFunction;
                 try arrayOperator(left, right);
                 if ((left.kind == .uuid and right.kind == .string and !uuidTextOperand(binary.right)) or
                     (left.kind == .string and right.kind == .uuid and !uuidTextOperand(binary.left))) return error.SqlTypeMismatch;
                 if (binary.op == .json_get or binary.op == .json_text) {
                     if (left.kind != null and left.kind != .json) return error.SqlTypeMismatch;
                     if (right.kind != null and right.kind != .string and right.kind != .integer) return error.SqlTypeMismatch;
-                    break :blk .{ .kind = if (binary.op == .json_get) .json else .string };
+                    break :blk .{
+                        .kind = if (binary.op == .json_get) .json else .string,
+                        .element_type = if (binary.op == .json_get) .jsonb else .text,
+                        .nullable = true,
+                    };
                 }
-                const merged = try common(left, right);
+                const json_domain = jsonUnknownOperandDomain(left, right, binary.left, binary.right);
+                if (json_domain == null and ((left.kind == .json and right.kind == .string) or
+                    (right.kind == .json and left.kind == .string))) return error.SqlUndefinedFunction;
+                const merged = json_domain orelse try common(left, right);
                 switch (binary.op) {
                     .add, .subtract, .multiply, .divide, .modulo => {
                         if (merged.kind != null and !numeric(merged.kind)) return error.SqlTypeMismatch;
@@ -2242,6 +2803,33 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (function == .gen_random_uuid) break :blk .{ .kind = .uuid, .element_type = .uuid, .nullable = false };
+                if (function == .@"$record_field" or function == .@"$record_validate") {
+                    const input = try self.infer(call.args[0], depth + 1);
+                    if (input.kind != null and input.kind != .json) return error.SqlUndefinedFunction;
+                    if (function == .@"$record_validate") break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = false };
+                    const name = call.args[1];
+                    if (name.* != .literal or name.literal != .string or call.args[2].* != .cast or call.args[2].cast.operand.* != .literal or call.args[2].cast.operand.literal != .null) return error.InvalidSqlProgram;
+                    var result = try self.infer(call.args[2], depth + 1);
+                    if (result.kind == null) return error.InvalidSqlProgram;
+                    result.nullable = true;
+                    break :blk result;
+                }
+                if (clockFunction(function) != null) {
+                    if (function == .@"$current_timestamp") {
+                        const arg = call.args[0];
+                        if (arg.* != .literal or arg.literal != .integer or arg.literal.integer < 0 or arg.literal.integer > 6) return error.InvalidSqlProgram;
+                    }
+                    break :blk .{ .kind = .datetime, .nullable = false };
+                }
+                if (function == .@"$json_path" or function == .@"$json_path_text") {
+                    const input = try self.infer(call.args[0], depth + 1);
+                    const path = try self.infer(call.args[1], depth + 1);
+                    const unknown = call.args[0].* == .literal and call.args[0].literal == .string;
+                    if (input.kind != null and input.kind != .json and !unknown) return error.SqlUndefinedFunction;
+                    if (path.kind != null and (path.kind != .array or (path.element_type != null and path.element_type != .text))) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = if (function == .@"$json_path") .json else .string, .element_type = if (function == .@"$json_path") .jsonb else .text, .nullable = true };
+                }
                 if (function == .jsonb_extract_path or function == .jsonb_extract_path_text) {
                     for (call.args, 0..) |arg, i| {
                         const actual = try self.infer(arg, depth + 1);
@@ -2250,6 +2838,29 @@ const Binder = struct {
                         if (actual.kind != null and actual.kind != desired and !unknown) return error.SqlUndefinedFunction;
                     }
                     break :blk .{ .kind = if (function == .jsonb_extract_path) .json else .string, .element_type = if (function == .jsonb_extract_path) .jsonb else .text, .nullable = true };
+                }
+                if (function == .date_part or function == .extract or function == .date_trunc) {
+                    // Resolve signatures from declared types before capturing
+                    // rows. Only unknown string literals may acquire a temporal
+                    // type; a BIGINT or typed TEXT is not a timestamp overload.
+                    var nullable = false;
+                    for (call.args, 0..) |arg, index| {
+                        const actual = try self.infer(arg, depth + 1);
+                        const expected: ast.ColumnType = if (index == 0) .string else .datetime;
+                        const unknown = arg.* == .literal and arg.literal == .string;
+                        if (actual.kind != null and actual.kind != expected and !unknown) return error.SqlUndefinedFunction;
+                        nullable = nullable or actual.nullable;
+                    }
+                    break :blk .{ .kind = if (function == .date_trunc) .datetime else .number, .element_type = if (function == .date_part) .float64 else if (function == .extract) .numeric else null, .nullable = nullable };
+                }
+                if (function == .starts_with or function == .md5) {
+                    var nullable = false;
+                    for (call.args) |arg| {
+                        const actual = try self.infer(arg, depth + 1);
+                        if (actual.kind != null and actual.kind != .string) return error.SqlUndefinedFunction;
+                        nullable = nullable or actual.nullable;
+                    }
+                    break :blk .{ .kind = if (function == .md5) .string else .boolean, .element_type = if (function == .md5) .text else .boolean, .nullable = nullable };
                 }
                 if (function == .jsonb_array_length or function == .initcap) {
                     const arg = call.args[0];
@@ -2338,7 +2949,10 @@ const Binder = struct {
                         const desired: ast.ColumnType = if (function == .@"$array_quantified") (if (i == 0) arrayScalarType(input.element_type.?) else if (i == 2) .integer else .boolean) else .integer;
                         if (actual.kind != null and actual.kind != desired and !(numeric(actual.kind) and numeric(desired))) return error.SqlTypeMismatch;
                     }
-                    break :blk .{ .kind = if (function == .@"$array_quantified") .boolean else .integer, .nullable = true };
+                    // PostgreSQL array dimensions, bounds and cardinality are
+                    // int4. Retain that width so SUM(array_length(...)) widens
+                    // to int8, rather than accidentally choosing NUMERIC.
+                    break :blk .{ .kind = if (function == .@"$array_quantified") .boolean else .integer, .element_type = if (function == .@"$array_quantified") .boolean else .int32, .nullable = true };
                 }
                 if (function == .jsonb_exists_any or function == .jsonb_exists_all) {
                     var nullable = false;
@@ -2350,6 +2964,13 @@ const Binder = struct {
                         nullable = nullable or actual.nullable;
                     }
                     break :blk .{ .kind = .boolean, .nullable = nullable };
+                }
+                if (function == .@"$document_patch") {
+                    for (call.args) |arg| {
+                        const actual = try self.infer(arg, depth + 1);
+                        if (actual.kind != null and actual.kind != .json and !(arg.* == .literal and arg.literal == .string)) return error.SqlUndefinedFunction;
+                    }
+                    break :blk .{ .kind = .json, .element_type = .jsonb, .nullable = true };
                 }
                 if (function == .jsonb_set) {
                     for (call.args, 0..) |arg, i| {
@@ -2385,6 +3006,7 @@ const Binder = struct {
                     }, .nullable = true };
                 }
 
+                if (function == .@"$current_user") break :blk .{ .kind = .string, .nullable = false };
                 if (function == .current_setting) {
                     const name = call.args[0];
                     if (name.* != .literal or name.literal != .string) return error.UnsupportedSqlShape;
@@ -2437,6 +3059,12 @@ const Binder = struct {
                         else => .text,
                     }, .nullable = nullable };
                 }
+                if (function == .mod) for (call.args) |arg| {
+                    const actual = try self.infer(arg, depth + 1);
+                    // mod has integer/NUMERIC overloads, never float4/float8.
+                    // Do not silently substitute fmod for PostgreSQL binding.
+                    if (actual.kind == .number and actual.element_type != .numeric) return error.SqlUndefinedFunction;
+                };
                 if (function == .nullif) try arrayOperator(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1));
                 switch (function) {
                     .@"$single" => merged = try self.infer(call.args[0], depth + 1),
@@ -2572,6 +3200,18 @@ const Binder = struct {
         return false;
     }
 
+    fn compileOperatorOperand(self: *Binder, expression: *const ast.Scalar, domain: Type, depth: usize) anyerror!u32 {
+        if (domain.kind == .json and expression.* == .literal and expression.literal == .string) {
+            // PostgreSQL unknown literals use the selected operator's input
+            // function. Keep the cast explicit so bounded constant preparation
+            // parses it once, rather than retaining a text-valued JSON impostor.
+            const cast = try self.alloc.create(ast.Scalar);
+            cast.* = .{ .cast = .{ .operand = expression, .type = .json, .element_type = .jsonb } };
+            return self.compileArrayContext(cast, .json, .jsonb, depth + 1);
+        }
+        return self.compileArrayContext(expression, domain.kind, domain.element_type, depth);
+    }
+
     fn compileArrayContext(self: *Binder, expression: *const ast.Scalar, expected: ?ast.ColumnType, array_element: ?arrays.ElementType, depth: usize) anyerror!u32 {
         if (depth >= self.limits.depth or self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
         if (expression.* == .cast and expression.cast.type == .number and expression.cast.element_type != null and builtin_cast.floating(expression.cast.element_type.?)) {
@@ -2582,7 +3222,24 @@ const Binder = struct {
         const empty_constructor = expression.* == .call and std.mem.eql(u8, expression.call.name, "$array") and expression.call.args.len == 0;
         if (depth == 0 and empty_constructor and self.limits.assignment) return error.UnknownSqlArrayType;
         var kind = if (empty_constructor and array_element != null) Type{ .kind = .array, .element_type = array_element, .nullable = false } else try self.infer(expression, depth);
-        if (expected == .number and array_element == .numeric and (kind.kind == .integer or (expression.* == .literal and expression.literal == .string))) kind = .{ .kind = .number, .element_type = .numeric, .nullable = kind.nullable };
+        if (expected == .number and array_element == .numeric and kind.kind == .integer and expression.* != .literal) {
+            // Context conversion is a boundary instruction, not an overload
+            // substitution. Quantified/set producers still deliver NUMERIC,
+            // while their integral computation retains its own overflow rules.
+            const operand = try self.compileArrayContext(expression, null, null, depth + 1);
+            if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+            const index: u32 = @intCast(self.instructions.items.len);
+            try self.instructions.append(self.alloc, .{
+                .type = .{ .kind = .number, .element_type = .numeric, .nullable = kind.nullable },
+                .operation = .{ .cast = .{ .operand = operand, .type = .number, .element_type = .numeric } },
+            });
+            return index;
+        }
+        // Assignment context may resolve a literal's input domain, but must
+        // not select a different overload for an already-typed expression.
+        // For example ABS(bigint_min) overflows before assignment to NUMERIC.
+        if (expected == .number and array_element == .numeric and expression.* == .literal and
+            (kind.kind == .integer or expression.literal == .string)) kind = .{ .kind = .number, .element_type = .numeric, .nullable = kind.nullable };
         if (expression.* == .literal and expression.literal == .parameter) kind = self.parameters[expression.literal.parameter - 1];
         if (kind.kind == null) kind.kind = expected;
         if (self.typed_parameters and expression.* == .literal and expression.literal == .parameter and self.parameters[expression.literal.parameter - 1].kind == null) kind.element_type = array_element;
@@ -2658,11 +3315,9 @@ const Binder = struct {
                 if (binary.op == .json_get or binary.op == .json_text) break :blk .{ .binary = .{ .op = binary.op, .left = try self.compile(binary.left, .json, depth + 1), .right = try self.compile(binary.right, .string, depth + 1) } };
                 const left_type = try self.infer(binary.left, depth + 1);
                 const right_type = try self.infer(binary.right, depth + 1);
-                var merged = try common(left_type, right_type);
+                const merged = jsonUnknownOperandDomain(left_type, right_type, binary.left, binary.right) orelse try comparisonDomain(left_type, right_type);
                 // PostgreSQL's mixed NUMERIC/real operators use float8;
                 // CASE/COALESCE and array common types still select real.
-                if (merged.kind == .number and merged.element_type == .float32 and
-                    (left_type.element_type == .numeric or right_type.element_type == .numeric)) merged.element_type = .float64;
                 const operand_kind: ?ast.ColumnType = switch (binary.op) {
                     .@"and", .@"or" => .boolean,
                     .concat => merged.kind orelse .string,
@@ -2670,7 +3325,8 @@ const Binder = struct {
                     .add, .subtract, .multiply, .divide, .modulo => merged.kind orelse expected,
                     else => merged.kind,
                 };
-                break :blk .{ .binary = .{ .op = binary.op, .left = try self.compileArrayContext(binary.left, operand_kind, merged.element_type, depth + 1), .right = try self.compileArrayContext(binary.right, operand_kind, merged.element_type, depth + 1) } };
+                const operand_domain: Type = .{ .kind = operand_kind, .element_type = merged.element_type, .nullable = merged.nullable };
+                break :blk .{ .binary = .{ .op = binary.op, .left = try self.compileOperatorOperand(binary.left, operand_domain, depth + 1), .right = try self.compileOperatorOperand(binary.right, operand_domain, depth + 1) } };
             },
             .call => |call| blk: {
                 if (std.mem.eql(u8, call.name, "$validate")) {
@@ -2695,6 +3351,11 @@ const Binder = struct {
                     break :blk .{ .literal = .{ .integer = 1 } };
                 }
                 const function = try functionId(call.name);
+                if (function == .@"$current_user") {
+                    if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
+                    _ = self.settings orelse return error.SettingCatalogUnavailable;
+                    break :blk .{ .call = .{ .function = function, .args = &.{} } };
+                }
                 if (function == .current_setting) {
                     if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
                     const view = self.settings orelse return error.SettingCatalogUnavailable;
@@ -2763,11 +3424,14 @@ const Binder = struct {
                 const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
+                        .@"$record_validate" => .json,
+                        .@"$record_field" => if (i == 0) .json else if (i == 1) .string else kind.kind,
                         .@"$like_escape" => if (i == 3) .boolean else .string,
                         .string_to_array => .string,
                         .jsonb_exists => if (i == 0) .json else .string,
                         .jsonb_exists_any, .jsonb_exists_all => if (i == 0) .json else .array,
                         .jsonb_set => if (i == 1) .array else if (i == 3) .boolean else .json,
+                        .@"$document_patch" => .json,
                         .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).kind,
                         .array_to_string => if (i == 0) .array else .string,
                         .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
@@ -2780,30 +3444,37 @@ const Binder = struct {
                         .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse, .translate, .ascii => .string,
                         .concat_ws => if (i == 0) .string else null,
                         .jsonb_typeof, .jsonb_array_length => .json,
-                        .initcap => .string,
+                        .initcap, .md5 => .string,
                         .substring, .repeat, .left, .right => if (i == 0) .string else .integer,
                         .split_part => if (i == 2) .integer else .string,
                         .overlay => if (i < 2) .string else .integer,
                         .chr => .integer,
                         .lpad, .rpad => if (i == 1) .integer else .string,
-                        .date_part, .date_trunc => if (i == 0) .string else .datetime,
+                        .date_part, .extract, .date_trunc => if (i == 0) .string else .datetime,
                         .to_timestamp => .number,
+                        .@"$current_timestamp" => .integer,
                         .concat => null,
                         .to_jsonb, .jsonb_build_object => null,
                         .jsonb_extract_path_text, .jsonb_extract_path => if (i == 0) .json else .string,
+                        .@"$json_path", .@"$json_path_text" => if (i == 0) .json else .array,
                         else => kind.kind,
                     };
                     const actual = try self.infer(arg, depth + 1);
-                    if ((function == .jsonb_array_length or ((function == .jsonb_extract_path or function == .jsonb_extract_path_text) and i == 0)) and arg.* == .literal and arg.literal == .string) {
+                    if ((function == .jsonb_array_length or ((function == .jsonb_extract_path or function == .jsonb_extract_path_text or function == .@"$json_path" or function == .@"$json_path_text") and i == 0)) and arg.* == .literal and arg.literal == .string) {
                         const coercion = try self.alloc.create(ast.Scalar);
                         coercion.* = .{ .cast = .{ .operand = arg, .type = .json, .element_type = .jsonb } };
                         out.* = try self.compileArrayContext(coercion, .json, .jsonb, depth + 1);
                         continue;
                     }
-                    if (((function == .jsonb_set and i < 3) or function == .jsonb_exists_any or function == .jsonb_exists_all) and arg.* == .literal and arg.literal == .string) {
+                    if ((function == .@"$json_path" or function == .@"$json_path_text") and i == 1) {
+                        out.* = try self.compileArrayContext(arg, .array, .text, depth + 1);
+                        continue;
+                    }
+                    if (((function == .jsonb_set and i < 3) or function == .@"$document_patch" or function == .jsonb_exists_any or function == .jsonb_exists_all) and arg.* == .literal and arg.literal == .string) {
                         const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = if (i == 1) .text else null } };
-                        out.* = try self.compileArrayContext(coercion, desired, if (i == 1) .text else null, depth + 1);
+                        const identity: ?arrays.ElementType = if (function == .@"$document_patch") .jsonb else if (i == 1) .text else null;
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = identity } };
+                        out.* = try self.compileArrayContext(coercion, desired, identity, depth + 1);
                         continue;
                     }
                     if (function == .@"$array" and self.explicit_arrays.contains(expression) and actual.kind != null) {
@@ -2825,7 +3496,9 @@ const Binder = struct {
                         continue;
                     }
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
-                    const element_context: ?arrays.ElementType = if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
+                    const element_context: ?arrays.ElementType = if (function == .@"$record_field" or function == .@"$record_validate")
+                        (if (i == 0) .jsonb else if (i == 1) .text else kind.element_type)
+                    else if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
                         .jsonb_exists_any, .jsonb_exists_all => if (i == 1) .text else null,
                         .jsonb_set => if (i == 1) .text else null,
                         .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).element_type,
@@ -2899,6 +3572,16 @@ const Binder = struct {
                 .type = .{ .kind = .number, .element_type = array_element, .nullable = kind.nullable },
                 .operation = .{ .cast = .{ .operand = index, .type = .number, .element_type = array_element } },
             });
+            return promoted;
+        }
+        // PostgreSQL assignment to a string-category target uses the source's
+        // output function. This is an assignment boundary only: retain the
+        // original overload, volatility and lazy child evaluation, and never
+        // introduce the same coercion for comparisons/common-type inference.
+        if (depth == 0 and self.limits.assignment and expected == .string and kind.kind != .string and kind.kind != null) {
+            if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+            const promoted: u32 = @intCast(self.instructions.items.len);
+            try self.instructions.append(self.alloc, .{ .type = .{ .kind = .string, .element_type = .text, .nullable = kind.nullable }, .operation = .{ .cast = .{ .operand = index, .type = .string } } });
             return promoted;
         }
         if (expected == .array and array_element != null and kind.kind == .array and kind.element_type != array_element) {
@@ -3088,6 +3771,7 @@ const Evaluator = struct {
     cells: []const Datum,
     parameters: []const Json,
     typed_parameters: ?[]const Datum = null,
+    folded_values: ?[]const ?Datum = null,
     parameter_lookup: @import("parameter_frame.zig").Frame.Lookup = .{},
     limits: EvalLimits,
     work_owner: ?@import("numeric_value.zig").Context = null,
@@ -3171,13 +3855,14 @@ const Evaluator = struct {
 
     fn run(self: *Evaluator, index: u32, depth: usize) anyerror!Json {
         const result = try self.runDatum(index, depth);
-        if (result.array != null or result.numeric != null) return error.SqlTypeMismatch;
+        if (result.array != null or result.numeric != null or result.temporal() != null) return error.SqlTypeMismatch;
         return result.value;
     }
 
     fn runDatum(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
         if (depth >= self.limits.depth) return self.workOwner().limit();
         try self.workOwner().charge(1);
+        if (self.folded_values) |values| if (index < values.len) if (values[index]) |value| return value;
         const instruction = self.program.instructions[index];
         if (self.program.constant_numerics.get(index)) |number| return Datum.typedNumeric(number);
         var result: Datum = switch (instruction.operation) {
@@ -3215,6 +3900,12 @@ const Evaluator = struct {
                 }
                 const datum = try self.runDatum(cast.operand, depth + 1);
                 if (datum.sql_null) break :blk .{};
+                if (datum.temporal() != null) {
+                    try datum.validateTemporal();
+                    if (cast.type == .datetime and datum.temporal().?.kind() == .timestamp_tz and cast.element_type == null) break :blk datum;
+                    if (cast.type != .string) return error.UnsupportedSqlShape;
+                    break :blk Datum.json(.{ .string = try self.temporalText(datum) });
+                }
                 if (cast.type == .array) {
                     if (datum.array == null and datum.value == .string) {
                         const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, cast.element_type orelse return error.InvalidSqlProgram, datum.value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.bytes, .work = self.remainingSteps() }, .context = self.workOwner() });
@@ -3227,7 +3918,16 @@ const Evaluator = struct {
                     const converted = try self.castArray(datum, cast.element_type orelse return error.InvalidSqlProgram);
                     break :blk if (!self.input_validation and cast.numeric_modifier != null) try self.constrainNumeric(converted, cast.numeric_modifier.?) else converted;
                 }
-                if (datum.array != null) return error.SqlTypeMismatch;
+                if (datum.array) |array| {
+                    if (cast.type != .string) return error.SqlTypeMismatch;
+                    var text: std.Io.Writer.Allocating = .init(self.alloc);
+                    defer text.deinit();
+                    try @import("array_text.zig").encode(self.alloc, array.*, &text.writer, .{ .wire_bytes = self.limits.output_bytes -| self.bytes, .context = self.workOwner() });
+                    const owned = try text.toOwnedSlice();
+                    errdefer self.alloc.free(owned);
+                    try self.charge(owned.len);
+                    break :blk Datum.json(.{ .string = owned });
+                }
                 if (cast.element_type) |target| {
                     const source = self.program.instructions[cast.operand].type;
                     const source_element = source.element_type orelse (if (source.kind == null or source.kind == .datetime or source.kind == .number) null else try arrayElementType(source.kind.?));
@@ -3342,6 +4042,56 @@ const Evaluator = struct {
                 break :blk if (unknown) .{} else Datum.json(.{ .bool = list.negated });
             },
             .call => |call| blk: {
+                if (call.function == .extract or call.function == .date_part) {
+                    const unit = try self.runDatum(call.args[0], depth + 1);
+                    const source = try self.runDatum(call.args[1], depth + 1);
+                    if (unit.sql_null or source.sql_null) break :blk .{};
+                    if (unit.value != .string) return error.SqlUndefinedFunction;
+                    const temporal = @import("temporal_value.zig");
+                    const timestamp = if (source.temporal()) |value| t: {
+                        if (value.kind() != .timestamp_tz) return error.SqlUndefinedFunction;
+                        break :t value.timestamp_tz;
+                    } else t: {
+                        if (source.value != .string) return error.SqlUndefinedFunction;
+                        const ns = datetime.parseDateTimeToSignedNs(source.value.string) orelse return error.InvalidSqlDateTime;
+                        break :t try temporal.Timestamp.fromUnixNanoseconds(ns);
+                    };
+                    const part = try @import("temporal_extract.zig").timestamp(timestamp, unit.value.string);
+                    if (call.function == .date_part) {
+                        const numerator: f64 = @floatFromInt(part.coefficient);
+                        break :blk Datum.json(.{ .float = numerator / std.math.pow(f64, 10, @floatFromInt(part.scale)) });
+                    }
+                    const exact = @import("numeric_value.zig");
+                    var context = self.numericContext();
+                    var value = try exact.fromScaledInteger(&context, part.coefficient, part.scale);
+                    errdefer value.deinit();
+                    try self.charge(@sizeOf(exact.Value) + value.allocation.len * @sizeOf(u16));
+                    const owned = try self.alloc.create(exact.Value);
+                    owned.* = value.value;
+                    break :blk Datum.typedNumeric(owned);
+                }
+                if (call.function == .gen_random_uuid) {
+                    const io = self.limits.execution_io orelse return error.SqlEntropyUnavailable;
+                    var bytes: [16]u8 = undefined;
+                    std.Io.randomSecure(io, &bytes) catch |err| return switch (err) {
+                        error.EntropyUnavailable => error.SqlEntropyUnavailable,
+                        else => err,
+                    };
+                    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+                    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                    try self.charge(36);
+                    const text = @import("../common/uuid.zig").format(bytes);
+                    break :blk Datum.json(.{ .string = try self.alloc.dupe(u8, &text) });
+                }
+                if (clockFunction(call.function)) |function| {
+                    const frame = self.limits.clock_values orelse return error.SqlClockUnavailable;
+                    const precision: u8 = if (call.function == .@"$current_timestamp") p: {
+                        const value = try self.runDatum(call.args[0], depth + 1);
+                        if (value.sql_null or value.value != .integer or value.value.integer < 0 or value.value.integer > 6) return error.InvalidSqlProgram;
+                        break :p @intCast(value.value.integer);
+                    } else 6;
+                    break :blk Datum.typedTemporal(try frame.value(function, precision));
+                }
                 if (decisions.descriptor(@tagName(call.function))) |desc| {
                     if (self.limits.decision_values) |values| if (index < values.len) if (values[index]) |value| break :blk value;
                     const args = try self.alloc.alloc(Json, call.args.len);
@@ -3352,6 +4102,10 @@ const Evaluator = struct {
                     }
                     if (self.limits.decision_demand) |demand| demand.* = .{ .instruction = index, .function = desc.function, .args = args };
                     return error.DecisionNotEvaluated;
+                }
+                if (call.function == .@"$current_user") {
+                    const view = self.program.settings orelse return error.SettingCatalogUnavailable;
+                    break :blk Datum.json(.{ .string = view.sql_user orelse view.scope.principal });
                 }
                 if (call.function == .current_setting) {
                     const view = self.program.settings orelse return error.SettingCatalogUnavailable;
@@ -3543,6 +4297,16 @@ const Evaluator = struct {
                         };
                         break :blk if (answer) |value| Datum.json(.{ .integer = value }) else .{};
                     },
+                    .@"$document_patch" => {
+                        const target = try self.runDatum(call.args[0], depth + 1);
+                        const patch = try self.runDatum(call.args[1], depth + 1);
+                        if (target.sql_null or patch.sql_null) break :blk .{};
+                        if (target.array != null or patch.array != null) return error.SqlTypeMismatch;
+                        var work = self.workBudget();
+                        const changed = try @import("json_document_patch.zig").apply(self.alloc, target.value, patch.value, self.limits.output_bytes -| self.bytes, &work);
+                        try self.charge(changed.allocated_bytes);
+                        break :blk Datum.json(changed.value);
+                    },
                     .jsonb_set => {
                         // Strict SQL functions evaluate all arguments before
                         // NULL propagation, unlike CASE and COALESCE.
@@ -3624,9 +4388,40 @@ const Evaluator = struct {
                         }
                         break :blk Datum.json(.{ .object = object });
                     },
-                    .jsonb_extract_path_text, .jsonb_extract_path => {
+                    .@"$record_validate", .@"$record_field" => {
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        if (!input.sql_null and (input.array != null or input.numeric != null or input.value != .object)) return error.InvalidSqlParameters;
+                        if (call.function == .@"$record_validate") break :blk Datum.json(.{ .bool = true });
+                        if (input.sql_null) break :blk .{};
+                        const name = try self.runDatum(call.args[1], depth + 1);
+                        if (name.sql_null or name.value != .string) return error.InvalidSqlProgram;
+                        const value = input.value.object.get(name.value.string) orelse break :blk .{};
+                        const target = self.program.instructions[call.args[2]].type;
+                        break :blk try self.recordField(value, target);
+                    },
+                    .jsonb_extract_path_text, .jsonb_extract_path, .@"$json_path", .@"$json_path_text" => {
                         var value = try self.runDatum(call.args[0], depth + 1);
-                        for (call.args[1..]) |arg| {
+                        var path_work = self.workBudget();
+                        if (call.function == .@"$json_path" or call.function == .@"$json_path_text") {
+                            const input = try self.runDatum(call.args[1], depth + 1);
+                            if (input.sql_null) break :blk .{};
+                            const path = input.array orelse return error.InvalidSqlProgram;
+                            if (path.element_type != .text) return error.InvalidSqlProgram;
+                            for (0..path.cardinality()) |ordinal| {
+                                try path_work.consume(1);
+                                const key = path.flatCell(ordinal);
+                                if (key.sql_null) {
+                                    value = .{};
+                                    continue;
+                                }
+                                if (key.value != .string) return error.InvalidSqlProgram;
+                                if (value.sql_null) continue;
+                                value.value = try @import("json_path.zig").extract(value.value, key.value.string, &path_work) orelse {
+                                    value = .{};
+                                    continue;
+                                };
+                            }
+                        } else for (call.args[1..]) |arg| {
                             // Strict calls evaluate every argument, even after
                             // SQL NULL or a missing intermediate component.
                             const key = try self.runDatum(arg, depth + 1);
@@ -3636,35 +4431,15 @@ const Evaluator = struct {
                             }
                             if (key.array != null or key.value != .string) return error.SqlTypeMismatch;
                             if (value.sql_null) continue;
-                            try self.workOwner().charge(key.value.string.len);
-                            value.value = switch (value.value) {
-                                .object => |object| object.get(key.value.string) orelse {
-                                    value = .{};
-                                    continue;
-                                },
-                                .array => |array| element: {
-                                    const ordinal = @import("json_path.zig").ordinal(key.value.string) catch {
-                                        value = .{};
-                                        continue;
-                                    };
-                                    const count: i64 = @intCast(array.items.len);
-                                    const position = if (ordinal < 0) count + ordinal else ordinal;
-                                    if (position < 0 or position >= count) {
-                                        value = .{};
-                                        continue;
-                                    }
-                                    break :element array.items[@intCast(position)];
-                                },
-                                else => {
-                                    value = .{};
-                                    continue;
-                                },
+                            value.value = try @import("json_path.zig").extract(value.value, key.value.string, &path_work) orelse {
+                                value = .{};
+                                continue;
                             };
                         }
                         if (value.sql_null) break :blk .{};
                         // JSON null is retained by JSONB extraction but maps
                         // to SQL NULL for its text-returning counterpart.
-                        if (call.function == .jsonb_extract_path) break :blk value;
+                        if (call.function == .jsonb_extract_path or call.function == .@"$json_path") break :blk value;
                         if (value.value == .null) break :blk .{};
                         if (value.value == .string) break :blk value;
                         var work = self.workBudget();
@@ -3751,6 +4526,7 @@ const Evaluator = struct {
             _ = try builtin_cast.checkedInteger(result.value.integer, kind);
         };
         if (!result.sql_null and result.value == .float and instruction.type.element_type == .float32) result.value = .{ .float = try builtin_cast.floatValue(f32, result.value) };
+        try result.validateTemporal();
         return result;
     }
 
@@ -3820,16 +4596,14 @@ const Evaluator = struct {
 
     fn jsonText(self: *Evaluator, value: Json) ![]const u8 {
         _ = try self.validateJson(value, 0);
-        var writer: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer writer.deinit();
-        // The execution allocator also carries the statement-wide hard cap.
-        // Count before producing output so a large JSON subtree cannot evade
-        // this scalar's independent output bound.
-        var counter: std.Io.Writer.Discarding = .init(&.{});
-        try std.json.Stringify.value(value, .{}, &counter.writer);
-        try self.charge(std.math.cast(usize, counter.count) orelse return error.SqlProgramLimitExceeded);
-        std.json.Stringify.value(value, .{}, &writer.writer) catch return error.OutOfMemory;
-        return writer.toOwnedSlice();
+        // SQL casts/path text use PostgreSQL JSONB display, not compact API
+        // JSON serialization. Reuse the exact-output, cooperatively budgeted
+        // formatter rather than serializing/reparsing the typed DOM.
+        var work = self.workBudget();
+        const text = try @import("jsonb_text.zig").format(self.alloc, value, self.limits.output_bytes -| self.bytes, &work);
+        errdefer self.alloc.free(text);
+        try self.charge(text.len);
+        return text;
     }
 
     fn validateJson(self: *Evaluator, value: Json, depth: usize) anyerror!usize {
@@ -3967,6 +4741,45 @@ const Evaluator = struct {
         const value = try self.alloc.create(arrays.Value);
         value.* = try output.finish(self.alloc, limits, &work);
         return Datum.typedArray(value);
+    }
+
+    fn recordLeaf(raw: *anyopaque, value: Json, target: arrays.ElementType) anyerror!Datum {
+        const self: *Evaluator = @ptrCast(@alignCast(raw));
+        try self.workOwner().charge(1);
+        if (value == .null) return .{};
+        if (target == .jsonb) return Datum.json(value);
+        const text = if (value == .string) value.string else try self.jsonText(value);
+        // Record conversion uses the destination type's text input function,
+        // not SQL JSONB cast rules (which intentionally differ).
+        return self.castDatumBuiltin(Datum.json(.{ .string = text }), .text, target);
+    }
+    fn recordCharge(raw: *anyopaque, bytes: usize) anyerror!void {
+        const self: *Evaluator = @ptrCast(@alignCast(raw));
+        try self.workOwner().charge(1);
+        try self.charge(bytes);
+    }
+    fn recordField(self: *Evaluator, value: Json, target: Type) anyerror!Datum {
+        if (value == .null) return .{};
+        var converted: Datum = undefined;
+        if (target.kind == .array) {
+            const element = target.element_type orelse return error.InvalidSqlProgram;
+            if (value == .string) {
+                const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, element, value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.bytes, .work = self.remainingSteps() }, .context = self.workOwner() });
+                try self.charge(decoded.allocated_bytes + @sizeOf(arrays.Value));
+                const array = try self.alloc.create(arrays.Value);
+                array.* = decoded.value;
+                converted = Datum.typedArray(array);
+            } else {
+                var work = self.workBudget();
+                converted = try @import("json_record_array.zig").decode(self.alloc, value, element, .{ .ptr = self, .convert = recordLeaf, .charge = recordCharge, .work = &work });
+            }
+        } else if (target.kind == .datetime) {
+            const text = if (value == .string) value.string else try self.jsonText(value);
+            converted = Datum.json(try self.convert(.{ .string = text }, .datetime));
+        } else {
+            converted = try recordLeaf(self, value, target.element_type orelse try arrayElementType(target.kind orelse return error.InvalidSqlProgram));
+        }
+        return if (target.numeric_modifier) |modifier| try self.constrainNumeric(converted, modifier) else converted;
     }
 
     const ConcatLeaf = union(enum) {
@@ -4267,6 +5080,7 @@ const Evaluator = struct {
     /// then exact decimal parsing. JSON numbers have neither a float width
     /// nor NaN/infinity payloads; PostgreSQL represents specials as strings.
     fn sqlJson(self: *Evaluator, datum: Datum, descriptor: Type) !Json {
+        if (datum.temporal() != null) return error.UnsupportedSqlShape; // JSON temporal spelling needs exact type activation
         if (datum.sql_null) return .null;
         if (datum.numeric != null) return self.numericJson(datum);
         if (descriptor.kind == .number and datum.value == .float) {
@@ -4302,45 +5116,28 @@ const Evaluator = struct {
 
     fn numericFunction(self: *Evaluator, function: Function, args: []const u32, depth: usize) !Datum {
         const exact = @import("numeric_value.zig");
-        const first = try self.runDatum(args[0], depth);
-        if (first.sql_null) return .{};
-        const input = try self.castDatumBuiltin(first, self.program.instructions[args[0]].type.element_type, .numeric);
-        if (function == .mod) {
-            const second = try self.runDatum(args[1], depth);
-            if (second.sql_null) return .{};
-            return self.numericArithmetic(.modulo, input, try self.castDatumBuiltin(second, self.program.instructions[args[1]].type.element_type, .numeric));
+        var selected: [2]Datum = undefined;
+        var has_null = false;
+        for (args, 0..) |arg, i| {
+            selected[i] = try self.runDatum(arg, depth);
+            has_null = has_null or selected[i].sql_null;
         }
-        const value = input.numeric.?.*;
-        if (function == .abs or function == .sign) {
-            try self.charge(@sizeOf(exact.Value));
-            const result = try self.alloc.create(exact.Value);
-            if (function == .abs) {
-                result.* = value;
-                result.negative = false;
-                if (result.kind == .negative_infinity) result.kind = .positive_infinity;
-            } else result.* = if (value.kind == .nan) .{ .kind = .nan } else if (value.isZero()) .{} else .{ .digits = &.{1}, .negative = value.negative or value.kind == .negative_infinity };
-            return Datum.typedNumeric(result);
-        }
-        const scale: i32 = if (args.len == 2) selected: {
-            const requested = try self.runDatum(args[1], depth);
-            if (requested.sql_null) return .{};
-            if (requested.value != .integer) return error.SqlTypeMismatch;
-            break :selected std.math.cast(i32, requested.value.integer) orelse return error.SqlNumericOutOfRange;
+        // Strict calls evaluate selected arguments before NULL propagation.
+        // A NULL value must not hide an error in its scale/divisor expression.
+        if (has_null) return .{};
+        const input = try self.castDatumBuiltin(selected[0], self.program.instructions[args[0]].type.element_type, .numeric);
+        if (function == .mod) return self.numericArithmetic(.modulo, input, try self.castDatumBuiltin(selected[1], self.program.instructions[args[1]].type.element_type, .numeric));
+        const scale: i32 = if (args.len == 2) requested_scale: {
+            if (selected[1].value != .integer) return error.SqlTypeMismatch;
+            break :requested_scale std.math.cast(i32, selected[1].value.integer) orelse return error.SqlNumericOutOfRange;
         } else 0;
-        // Evaluate both arguments before borrowing the remaining work budget.
-        // Nested scale expressions must not receive a second copy of it.
+        // Borrow remaining work only after argument evaluation. Nested scale
+        // expressions never receive a second copy of the invocation budget.
         var ctx = self.numericContext();
-        var result = if (function == .sqrt) try exact.squareRoot(&ctx, value) else try exact.quantize(&ctx, value, scale, if (function == .round) .half_away else .truncate);
+        const functions = @import("numeric_functions.zig");
+        const operation = numericKernelFunction(function) orelse return error.InvalidSqlProgram;
+        var result = try functions.numeric(&ctx, operation, input.numeric.?.*, scale);
         errdefer result.deinit();
-        if (function == .ceil or function == .floor) {
-            const order = try exact.order(&ctx, value, result.value);
-            if ((function == .ceil and order == .gt) or (function == .floor and order == .lt)) {
-                const one: exact.Value = .{ .digits = &.{1} };
-                const adjusted = if (function == .ceil) try exact.add(&ctx, result.value, one) else try exact.subtract(&ctx, result.value, one);
-                result.deinit();
-                result = adjusted;
-            }
-        }
         try self.charge(@sizeOf(exact.Value) + result.allocation.len * 2);
         const owned = try self.alloc.create(exact.Value);
         owned.* = result.value;
@@ -4496,11 +5293,21 @@ const Evaluator = struct {
     /// floating object keys are text, so JSON numeric canonicalization would
     /// incorrectly expand exponents and discard the sign of negative zero.
     fn sqlText(self: *Evaluator, datum: Datum, descriptor: Type) ![]const u8 {
+        if (datum.temporal() != null) return self.temporalText(datum);
         if (datum.numeric != null) return self.formatText(try self.numericJson(datum));
         if (descriptor.kind == .json) return self.jsonText(datum.value);
         if (descriptor.kind == .number and datum.value == .float)
             return (try self.castBuiltin(datum.value, descriptor.element_type orelse .float64, .text)).string;
         return self.formatText(datum.value);
+    }
+
+    fn temporalText(self: *Evaluator, datum: Datum) ![]const u8 {
+        try datum.validateTemporal();
+        const codec = @import("temporal_text.zig");
+        var output: [codec.output_capacity]u8 = undefined;
+        const text = try codec.format(datum.temporal().?.*, &output);
+        try self.charge(text.len);
+        return self.alloc.dupe(u8, text);
     }
 
     fn formatText(self: *Evaluator, value: Json) ![]const u8 {
@@ -4561,7 +5368,7 @@ const Evaluator = struct {
             }
             if (set != .null and set != .array) return error.SqlTypeMismatch;
             const patterns: []const Json = if (set == .null) &.{} else set.array.items;
-            if (set_datum.patterns) |source| {
+            if (set_datum.patterns()) |source| {
                 if (source.count == 0) return .{ .bool = all.bool };
                 if (operand == .null) return .null;
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -4679,25 +5486,18 @@ const Evaluator = struct {
             },
             .abs => return switch (first) {
                 .integer => |v| .{ .integer = if (v < 0) std.math.negate(v) catch return error.SqlNumericOutOfRange else v },
-                .float => |v| .{ .float = @abs(v) },
+                .float => |v| .{ .float = try @import("numeric_functions.zig").floating(self.workOwner(), .abs, v) },
                 else => error.SqlTypeMismatch,
             },
-            .ceil, .floor, .round, .trunc => return if (first == .integer) first else if (first == .float) .{ .float = switch (function) {
-                .ceil => @ceil(first.float),
-                .floor => @floor(first.float),
-                .trunc => @trunc(first.float),
-                else => roundTiesEven(first.float),
-            } } else error.SqlTypeMismatch,
+            .ceil, .floor, .round, .trunc => return if (first == .integer) first else if (first == .float) .{ .float = try @import("numeric_functions.zig").floating(self.workOwner(), numericKernelFunction(function).?, first.float) } else error.SqlTypeMismatch,
             .sign => return switch (first) {
                 .integer => |value| .{ .integer = if (value < 0) -1 else if (value > 0) 1 else 0 },
-                .float => |value| .{ .float = if (value < 0) -1 else if (value > 0) 1 else 0 },
+                .float => |value| .{ .float = try @import("numeric_functions.zig").floating(self.workOwner(), .sign, value) },
                 else => error.SqlTypeMismatch,
             },
             .sqrt => {
                 const v = if (first == .float) first.float else try asFloat(first);
-                if (v < 0) return error.SqlInvalidPowerArgument;
-                if (std.math.isNan(v) or std.math.isPositiveInf(v)) return .{ .float = v };
-                return finite(@sqrt(v));
+                return .{ .float = try @import("numeric_functions.zig").floating(self.workOwner(), .sqrt, v) };
             },
             .power => {
                 const base = try arithmeticNumber(first);
@@ -4831,7 +5631,28 @@ const Evaluator = struct {
                 if (function == .lower) _ = std.ascii.lowerString(output, output) else _ = std.ascii.upperString(output, output);
                 break :blk .{ .string = output };
             },
-            .starts_with => if (values[1] == .string) .{ .bool = std.mem.startsWith(u8, text_value, values[1].string) } else error.SqlTypeMismatch,
+            .starts_with => blk: {
+                if (values[1] != .string) return error.SqlTypeMismatch;
+                const affix = values[1].string;
+                if (affix.len > text_value.len) break :blk .{ .bool = false };
+                var offset: usize = 0;
+                while (offset < affix.len) {
+                    const end = offset + @min(256, affix.len - offset);
+                    try self.workOwner().charge(end - offset);
+                    if (!std.mem.eql(u8, text_value[offset..end], affix[offset..end])) break :blk .{ .bool = false };
+                    offset = end;
+                }
+                break :blk .{ .bool = true };
+            },
+            .md5 => blk: {
+                // SQL's compatibility fingerprint, not a security primitive.
+                // Hash borrowed UTF-8 bytes; retain only the fixed-size result.
+                try self.charge(32);
+                const bytes = try @import("text_value.zig").md5(text_value, self.workOwner());
+                const output = try self.alloc.alloc(u8, 32);
+                @memcpy(output, &bytes);
+                break :blk .{ .string = output };
+            },
             .trim, .ltrim, .rtrim => blk: {
                 const trim_chars = if (args.len == 1) " " else if (values[1] == .string) values[1].string else return error.SqlTypeMismatch;
                 var characters: std.AutoHashMapUnmanaged(u21, void) = .empty;
@@ -4878,21 +5699,10 @@ const Evaluator = struct {
             },
             .replace => blk: {
                 if (values[1] != .string or values[2] != .string) return error.SqlTypeMismatch;
-                if (values[1].string.len == 0) break :blk first;
-                var output: std.ArrayList(u8) = .empty;
-                errdefer output.deinit(self.alloc);
-                var chunks = std.mem.splitSequence(u8, text_value, values[1].string);
-                var initial = true;
-                while (chunks.next()) |chunk| {
-                    if (!initial) {
-                        try self.charge(values[2].string.len);
-                        try output.appendSlice(self.alloc, values[2].string);
-                    }
-                    initial = false;
-                    try self.charge(chunk.len);
-                    try output.appendSlice(self.alloc, chunk);
-                }
-                break :blk .{ .string = try output.toOwnedSlice(self.alloc) };
+                const result = try @import("text_value.zig").replace(self.alloc, text_value, values[1].string, values[2].string, self.limits.output_bytes -| self.bytes, self.workOwner());
+                errdefer if (result.owned) self.alloc.free(result.bytes);
+                try self.charge(result.allocated_bytes);
+                break :blk .{ .string = result.bytes };
             },
             else => unreachable,
         };
@@ -5057,14 +5867,6 @@ const Evaluator = struct {
     }
 };
 
-fn roundTiesEven(value: f64) f64 {
-    const magnitude = @abs(value);
-    const integral = @floor(magnitude);
-    const fraction = magnitude - integral;
-    const rounded = if (fraction > 0.5 or (fraction == 0.5 and @mod(integral, 2) != 0)) integral + 1 else integral;
-    return std.math.copysign(rounded, value);
-}
-
 fn finite(value: f64) !Json {
     if (!std.math.isFinite(value)) return error.SqlNumericOutOfRange;
     return .{ .float = value };
@@ -5165,7 +5967,11 @@ pub fn compareDatums(left: Datum, right: Datum) anyerror!std.math.Order {
 
 pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budget) anyerror!std.math.Order {
     try work.consume(1);
+    try left.validateTemporal();
+    try right.validateTemporal();
     if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
+    if (left.temporal()) |value| return @import("temporal_ops.zig").compare(value.*, (right.temporal() orelse return error.SqlTypeMismatch).*);
+    if (right.temporal() != null) return error.SqlTypeMismatch;
     if (left.numeric) |number| {
         var none = std.heap.FixedBufferAllocator.init(&.{});
         var ctx = work.numericContext(none.allocator());
@@ -5189,7 +5995,9 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
 }
 
 pub fn semanticHashDatum(value: Datum) anyerror!u64 {
+    try value.validateTemporal();
     if (value.sql_null) return 0;
+    if (value.temporal()) |temporal| return @import("temporal_ops.zig").hash(temporal.*);
     if (value.numeric) |number| {
         var none = std.heap.FixedBufferAllocator.init(&.{});
         var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
@@ -5261,6 +6069,10 @@ test "SQL PostgreSQL JSON path extraction preserves JSON null strict arguments a
     try checkScalarKernelReference(@embedFile("fixtures/sql_json_path_reference.json"));
 }
 
+test "SQL PostgreSQL JSON path operators preserve typed paths comparison inputs and precedence" {
+    try checkScalarKernelReference(@embedFile("fixtures/sql_json_path_operator_reference.json"));
+}
+
 fn checkScalarKernelReference(bytes: []const u8) !void {
     const a = std.testing.allocator;
     const Golden = struct { entries: []const struct { sql: []const u8, value: Json = .null, sql_null: ?bool = null, oid: ?u32 = null, @"error": ?[]const u8 = null } };
@@ -5285,12 +6097,20 @@ fn checkScalarKernelReference(bytes: []const u8) !void {
             continue;
         };
         try std.testing.expect(case.@"error" == null);
+        const actual_kind = program.output_type.kind orelse {
+            std.debug.print("scalar kernel missing result identity: {s}\n", .{case.sql});
+            return error.MissingScalarResultIdentity;
+        };
+        // Scalar kinds have canonical defaults; explicit widths/identities
+        // override them. Exercise the same distinction as public descriptors.
+        const actual_type = program.output_type.element_type orelse try arrayElementType(actual_kind);
         try std.testing.expectEqual(switch (case.oid.?) {
+            16 => arrays.ElementType.boolean,
             23 => arrays.ElementType.int32,
             25 => .text,
             3802 => .jsonb,
             else => return error.UnexpectedScalarKernelResultType,
-        }, program.output_type.element_type.?);
+        }, actual_type);
         try std.testing.expectEqual(case.sql_null orelse (case.value == .null), actual.sql_null);
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(arena.allocator(), case.value, .{}), try std.json.Stringify.valueAlloc(arena.allocator(), actual.value, .{}));
     }
@@ -5298,22 +6118,77 @@ fn checkScalarKernelReference(bytes: []const u8) !void {
 
 test "SQL JSON path extraction borrows immutable values without allocations and shares work limits" {
     const a = std.testing.allocator;
-    var compiled = try @import("compiler.zig").compileScalar(a, "jsonb_extract_path(doc, 'a', ' 1')", .{});
+    for ([_][]const u8{ "jsonb_extract_path(doc, 'a', ' 1')", "doc #> '{a,1}'" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "doc", .type = .json, .element_type = .jsonb }}, &.{}, .{});
+        defer program.deinit();
+        const document = try std.json.parseFromSlice(Json, a, "{\"a\":[0,\"borrowed\"]}", .{});
+        defer document.deinit();
+        const source = document.value.object.get("a").?.array.items[1].string;
+        var no_memory = std.heap.FixedBufferAllocator.init(&.{});
+        for (0..1000) |_| {
+            const result = try program.evaluate(no_memory.allocator(), &.{Datum.json(document.value)}, &.{}, .{ .steps = 32 });
+            try std.testing.expect(!result.sql_null);
+            try std.testing.expectEqualStrings("borrowed", result.value.string);
+            try std.testing.expect(result.value.string.ptr == source.ptr);
+        }
+        try std.testing.expectEqual(@as(usize, 0), no_memory.end_index);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(no_memory.allocator(), &.{Datum.json(document.value)}, &.{}, .{ .steps = 3 }));
+    }
+}
+
+test "SQL JSON path parameters infer text arrays and reuse owned frames without row allocations" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "$1 #>> $2", .{});
     defer compiled.deinit();
-    var program = try bind(a, compiled.expression, &.{.{ .name = "doc", .type = .json, .element_type = .jsonb }}, &.{}, .{});
+    var program = try bindTyped(a, compiled.expression, &.{}, &.{}, .{});
     defer program.deinit();
-    const document = try std.json.parseFromSlice(Json, a, "{\"a\":[0,\"borrowed\"]}", .{});
-    defer document.deinit();
-    const source = document.value.object.get("a").?.array.items[1].string;
-    var no_memory = std.heap.FixedBufferAllocator.init(&.{});
-    for (0..1000) |_| {
-        const result = try program.evaluate(no_memory.allocator(), &.{Datum.json(document.value)}, &.{}, .{ .steps = 32 });
+    try std.testing.expectEqual(ast.ColumnType.json, program.parameter_descriptors[0].kind.?);
+    try std.testing.expectEqual(ast.ColumnType.array, program.parameter_descriptors[1].kind.?);
+    try std.testing.expectEqual(arrays.ElementType.text, program.parameter_descriptors[1].element_type.?);
+    const json = try std.json.parseFromSlice(Json, a, "{\"a\":[1,\"borrowed\"]}", .{});
+    defer json.deinit();
+    const Frame = @import("parameter_frame.zig").Frame;
+    const input = try a.dupe(u8, "[-1:0][2:2]={{a},{-1}}");
+    defer a.free(input);
+    var frame = try Frame.prepare(a, program.parameter_descriptors, &.{ .{ .datum = Datum.json(json.value) }, .{ .text = input } }, .{});
+    defer frame.deinit();
+    @memset(input, 0);
+    const prepared = try program.bindParameters(&frame);
+    const source = frame.values[0].value.object.get("a").?.array.items[1].string;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const result = try prepared.evaluate(none.allocator(), &.{}, .{});
         try std.testing.expect(!result.sql_null);
         try std.testing.expectEqualStrings("borrowed", result.value.string);
         try std.testing.expect(result.value.string.ptr == source.ptr);
     }
-    try std.testing.expectEqual(@as(usize, 0), no_memory.end_index);
-    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(no_memory.allocator(), &.{Datum.json(document.value)}, &.{}, .{ .steps = 3 }));
+    try std.testing.expectEqual(@as(usize, 0), none.end_index);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, prepared.evaluate(none.allocator(), &.{}, .{ .steps = 3 }));
+    var null_frame = try Frame.prepare(a, program.parameter_descriptors, &.{ .{ .datum = Datum.json(json.value) }, .sql_null }, .{});
+    defer null_frame.deinit();
+    const null_prepared = try program.bindParameters(&null_frame);
+    try std.testing.expect((try null_prepared.evaluate(none.allocator(), &.{}, .{})).sql_null);
+    std.debug.print("SQL JSON path parameters: rows=10000 decode_count=1 scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
+}
+
+test "SQL JSON comparison prepares unknown input literals once without row allocations" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "jsonb_extract_path(doc,'a') = '[\"rated\"]'", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "doc", .type = .json, .element_type = .jsonb }}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(@as(usize, 1), program.constant_inputs.count());
+    const document = try std.json.parseFromSlice(Json, a, "{\"a\":[\"rated\"]}", .{});
+    defer document.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    for (0..10000) |_| {
+        const result = try program.evaluate(none.allocator(), &.{Datum.json(document.value)}, &.{}, .{});
+        try std.testing.expect(!result.sql_null and result.value.bool);
+    }
+    try std.testing.expectEqual(@as(usize, 0), none.end_index);
 }
 
 test "SQL JSON cardinality reads parsed arrays without allocation or element work" {
@@ -5373,6 +6248,95 @@ test "SQL initcap uses one bounded output allocation with cancellation and OOM c
             const value = try bound.evaluate(alloc, &.{}, &.{.{ .string = "héLLO😀wORLD" }}, .{});
             defer alloc.free(value.value.string);
             try std.testing.expectEqualStrings("HéLlo😀World", value.value.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+}
+
+test "SQL literal replacement shares invocation admission and borrows unchanged rows" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "replace(s,$1,$2)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+    defer program.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const text = "aaaaaaaaaaaaaaaa";
+    // Output size remains admitted even when its bytes borrow the input.
+    const unchanged = try program.evaluate(none.allocator(), &.{Datum.json(.{ .string = text })}, &.{ .{ .string = "aaab" }, .{ .string = "wider" } }, .{ .output_bytes = text.len });
+    try std.testing.expectEqual(@intFromPtr(text.ptr), @intFromPtr(unchanged.value.string.ptr));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(a, &.{Datum.json(.{ .string = text })}, &.{ .{ .string = "aaab" }, .{ .string = "wider" } }, .{ .steps = 10 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(a, &.{Datum.json(.{ .string = "aaaa" })}, &.{ .{ .string = "a" }, .{ .string = "wide" } }, .{ .output_bytes = 15 }));
+    var exact: [16]u8 = undefined;
+    var memory = std.heap.FixedBufferAllocator.init(&exact);
+    const changed = try program.evaluate(memory.allocator(), &.{Datum.json(.{ .string = "aaaa" })}, &.{ .{ .string = "a" }, .{ .string = "wide" } }, .{ .output_bytes = 16 });
+    try std.testing.expectEqualStrings("widewidewidewide", changed.value.string);
+}
+
+test "SQL affix and digest kernels bound work allocations and cancellation" {
+    const a = std.testing.allocator;
+    const input: [4096]u8 = @splat('a');
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    for ([_][]const u8{"starts_with(s,$1)"}) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+        defer program.deinit();
+        // No scratch/output allocation, even for a long equal affix.
+        const result = try program.evaluate(none.allocator(), &.{Datum.json(.{ .string = &input })}, &.{.{ .string = &input }}, .{ .steps = 8192 });
+        try std.testing.expect(result.value.bool);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = &input })}, &.{.{ .string = &input }}, .{ .steps = 128 }));
+        // A tiny prefix must not scan or charge the unrelated large tail.
+        const short = try program.evaluate(none.allocator(), &.{Datum.json(.{ .string = &input })}, &.{.{ .string = "a" }}, .{ .steps = 16 });
+        try std.testing.expect(short.value.bool);
+    }
+    var compiled = try @import("compiler.zig").compileScalar(a, "md5(s)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+    defer program.deinit();
+    var memory: [32]u8 = undefined;
+    var exact = std.heap.FixedBufferAllocator.init(&memory);
+    const result = try program.evaluate(exact.allocator(), &.{Datum.json(.{ .string = "abc" })}, &.{}, .{});
+    try std.testing.expectEqualStrings("900150983cd24fb0d6963f7d28e17f72", result.value.string);
+    try std.testing.expectError(error.OutOfMemory, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = "abc" })}, &.{}, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = &input })}, &.{}, .{ .steps = 128 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = "abc" })}, &.{}, .{ .output_bytes = 31 }));
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.QueryCanceled;
+        }
+    };
+    var control: Control = .{};
+    try std.testing.expectError(error.QueryCanceled, program.evaluate(a, &.{Datum.json(.{ .string = &input })}, &.{}, .{ .checkpoint = Control.check, .checkpoint_context = &control }));
+    try std.testing.expectEqual(@as(usize, 2), control.calls);
+}
+
+test "SQL digest scaling retains constant output space and cleans allocation failures" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "md5(s)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+    defer program.deinit();
+    const input: [16384]u8 = @splat('a');
+    for ([_]usize{ 4096, 16384 }) |length| {
+        var memory: [32]u8 = undefined;
+        var exact = std.heap.FixedBufferAllocator.init(&memory);
+        // Fourfold subject growth admits exactly linear hashing work and no
+        // larger scratch/output allocation. This is not a latency benchmark.
+        const result = try program.evaluate(exact.allocator(), &.{Datum.json(.{ .string = input[0..length] })}, &.{}, .{ .steps = length + 128 });
+        try std.testing.expectEqual(@as(usize, 32), result.value.string.len);
+    }
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            var expression = try @import("compiler.zig").compileScalar(alloc, "md5($1)", .{});
+            defer expression.deinit();
+            var bound = try bind(alloc, expression.expression, &.{}, &.{}, .{});
+            defer bound.deinit();
+            const result = try bound.evaluate(alloc, &.{}, &.{.{ .string = "héllo😀" }}, .{});
+            defer alloc.free(result.value.string);
+            try std.testing.expectEqualStrings("9c837c88949d76509749939beea9e092", result.value.string);
         }
     };
     try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
@@ -5588,6 +6552,81 @@ test "SQL NUMERIC square root retains domain diagnostics strict nulls and reques
     const text = try exact.format(&context, result.numeric.?.*);
     defer a.free(text);
     try std.testing.expectEqualStrings("1.414213562373095", text);
+}
+
+test "SQL shared numeric functions preserve PostgreSQL overloads values NULLs and selected errors" {
+    const a = std.testing.allocator;
+    const Entry = struct { domain: enum { numeric, float64 }, input: ?[]const u8, sql: []const u8, expected: ?[]const u8, sqlstate: ?[]const u8 };
+    const Strict = struct { sql: []const u8, sqlstate: []const u8 };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Entry, strict_errors: []const Strict }, a, @embedFile("fixtures/sql_numeric_functions_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 210), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        errdefer std.debug.print("numeric function SQL oracle: {s}\n", .{entry.sql});
+        var compiled = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{}, &.{.string}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = program.evaluate(arena.allocator(), &.{}, &.{if (entry.input) |input| .{ .string = input } else .null}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        try std.testing.expectEqual(entry.expected == null, result.sql_null);
+        if (result.sql_null) continue;
+        if (entry.domain == .numeric) {
+            try std.testing.expectEqual(arrays.ElementType.numeric, program.output_type.element_type.?);
+            var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+            try std.testing.expectEqualStrings(entry.expected.?, try @import("numeric_value.zig").format(&context, result.numeric.?.*));
+        } else {
+            try std.testing.expectEqual(arrays.ElementType.float64, program.output_type.element_type.?);
+            var hex: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(entry.expected.?, try std.fmt.bufPrint(&hex, "{x:0>16}", .{@as(u64, @bitCast(result.value.float))}));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), fixture.value.strict_errors.len);
+    for (fixture.value.strict_errors) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{}, &.{.integer}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        _ = program.evaluate(arena.allocator(), &.{}, &.{.{ .integer = 0 }}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "SQL shared numeric functions preserve PostgreSQL unary cast precedence" {
+    const a = std.testing.allocator;
+    const Entry = struct { sql: []const u8, expected: ?[]const u8, sqlstate: ?[]const u8 };
+    const fixture = try std.json.parseFromSlice(struct { cast_precedence: []const Entry }, a, @embedFile("fixtures/sql_numeric_functions_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 11), fixture.value.cast_precedence.len);
+    for (fixture.value.cast_precedence) |entry| {
+        const sql = try std.fmt.allocPrint(a, "({s})::text", .{entry.sql});
+        defer a.free(sql);
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = bind(a, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = program.evaluate(arena.allocator(), &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        try std.testing.expectEqualStrings(entry.expected.?, result.value.string);
+    }
 }
 
 test "SQL NUMERIC prepared literals rounding and integer array probes require no hot allocation" {
@@ -5932,6 +6971,27 @@ test "SQL Unicode text hot loop reuses bounded output scratch" {
     std.debug.print("SQL Unicode text: rows=50000 scratch_bytes={d} elapsed_ns={d}\n", .{ arena.queryCapacity(), std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
 }
 
+test "SQL JSONB casts and path text share canonical display and NULL provenance" {
+    const cases = [_]struct { sql: []const u8, text: ?[]const u8 }{
+        .{ .sql = "CAST('{\"zz\":1.2300e2,\"a\":[true,null]}'::jsonb AS text)", .text = "{\"a\": [true, null], \"zz\": 123.00}" },
+        .{ .sql = "'{\"a\":{\"zz\":1.2300e2,\"b\":2}}'::jsonb ->> 'a'", .text = "{\"b\": 2, \"zz\": 123.00}" },
+        .{ .sql = "CAST('\"text\"'::jsonb AS text)", .text = "\"text\"" },
+        .{ .sql = "CAST('null'::jsonb AS text)", .text = "null" },
+        .{ .sql = "CAST(NULL::jsonb AS text)", .text = null },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(case.text == null, value.sql_null);
+        if (case.text) |text| try std.testing.expectEqualStrings(text, value.value.string);
+    }
+}
+
 test "SQL typed JSON construction and path extraction preserve scalar and NULL provenance" {
     const cases = [_]struct { sql: []const u8, json: []const u8, sql_null: bool = false }{
         .{ .sql = "to_jsonb('wrapped')", .json = "\"wrapped\"" },
@@ -5945,6 +7005,15 @@ test "SQL typed JSON construction and path extraction preserve scalar and NULL p
         .{ .sql = "jsonb_extract_path_text(CAST('{}' AS json),'missing')", .json = "null", .sql_null = true },
         .{ .sql = "jsonb_extract_path_text(CAST('[1]' AS json),'9223372036854775807')", .json = "null", .sql_null = true },
         .{ .sql = "jsonb_extract_path_text(CAST('{\"a\":true}' AS json),'a')", .json = "\"true\"" },
+        .{ .sql = "'{\"a\":[1,\"last\"]}'::jsonb #>> '{a,-1}'", .json = "\"last\"" },
+        .{ .sql = "'{\"a\":null}'::jsonb #> ARRAY['a']", .json = "null" },
+        .{ .sql = "'{\"a\":null}'::jsonb #>> ARRAY['a']", .json = "null", .sql_null = true },
+        .{ .sql = "'true'::jsonb #> '{}'::text[]", .json = "true" },
+        .{ .sql = "'true'::jsonb #>> '{}'::text[]", .json = "\"true\"" },
+        .{ .sql = "'{}'::jsonb #> '{absent}'", .json = "null", .sql_null = true },
+        .{ .sql = "'{\"a\":1}'::jsonb #>> ARRAY['a',NULL]", .json = "null", .sql_null = true },
+        .{ .sql = "'{\"a\":1}'::jsonb #> NULL::text[]", .json = "null", .sql_null = true },
+        .{ .sql = "'{\"a\":[1,2]}'::jsonb #>> '[-2:-1]={a,-1}'::text[]", .json = "\"2\"" },
     };
     for (cases) |case| {
         var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, case.sql, .{});
@@ -6965,4 +8034,39 @@ test "SQL quantified JSONB compatibility inputs are logical while text casts sti
     defer arena.deinit();
     try std.testing.expect((try program.evaluate(arena.allocator(), &.{ .json(.{ .string = "\"alpha\"" }), .typedArray(&source) }, &.{}, .{})).value.bool);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, program.evaluate(arena.allocator(), &.{ .json(.{ .string = "alpha" }), .typedArray(&source) }, &.{}, .{}));
+}
+
+test "SQL builtin signatures reject temporal and floating MOD mismatches before evaluation" {
+    const a = std.testing.allocator;
+    const columns = [_]Column{
+        .{ .name = "i", .type = .integer, .element_type = .int64 },
+        .{ .name = "f", .type = .number, .element_type = .float64 },
+        .{ .name = "r", .type = .number, .element_type = .float32 },
+        .{ .name = "t", .type = .string, .element_type = .text },
+    };
+    for ([_][]const u8{
+        "date_trunc('hour',i)", "date_part('epoch',i)",
+        "date_trunc('day',t)",  "date_part(42,'2026-01-01'::datetime)",
+        "mod(f,f)",             "mod(r,r)",
+        "mod(i,f)",
+    }) |sql| {
+        var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlUndefinedFunction, inferOutput(a, parsed.expression, &columns, &.{}));
+    }
+    for ([_][]const u8{ "mod(i,i)", "mod(1.25,0.5)", "date_part('year','2026-01-01'::datetime)", "date_trunc('day','2026-01-01'::datetime)" }) |sql| {
+        var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        _ = try inferOutput(a, parsed.expression, &columns, &.{});
+    }
+}
+
+test "SQL array navigation retains PostgreSQL int4 result identity" {
+    for ([_][]const u8{ "cardinality(ARRAY[1,2])", "array_ndims(ARRAY[1,2])", "array_length(ARRAY[1,2],1)", "array_lower(ARRAY[1,2],1)", "array_upper(ARRAY[1,2],1)" }) |sql| {
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        const actual = try inferOutput(std.testing.allocator, parsed.expression, &.{}, &.{});
+        try std.testing.expectEqual(@as(?ast.ColumnType, .integer), actual.kind);
+        try std.testing.expectEqual(@as(?arrays.ElementType, .int32), actual.element_type);
+    }
 }

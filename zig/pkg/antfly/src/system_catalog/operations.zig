@@ -28,6 +28,38 @@ const settings = @import("antfly_local_sources").system_catalog_settings;
 
 pub const Request = domain.Request;
 
+pub fn mutateSqlView(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("views.zig").Request) ![]u8 {
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.mutation.validate();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_view_catalog_version);
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.ensureLinearizableReadWithContext(context);
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const command = @import("views.zig").command(request);
+    const result = try store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command);
+    errdefer alloc.free(result);
+    var parsed = try std.json.parseFromSlice(@import("views.zig").MutationResult, alloc, result, .{});
+    defer parsed.deinit();
+    if (parsed.value.revision == request.expected_revision) return result;
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const meta = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+    if (meta.revision != parsed.value.revision or !std.mem.eql(u8, &hash, &meta.last_command)) return error.MetadataMutationOutcomeUnknown;
+    return result;
+}
+
 pub fn storeRootMutation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
     const enroll = input == .store_root_enroll;
     if (enroll and !context.setting_admin) return error.Forbidden;
@@ -73,33 +105,72 @@ pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context
     return store.storeRootControlJson(alloc, svc.metadata_group_id, .{ .enrollment_status = identity });
 }
 
+// Own the validated ingress representation across the catalog barrier. JSON
+// request parsing and storage validation stay outside the serialized lane;
+// name allocation, schema-derived index expansion and placement still use its
+// admitted cut. Reparsing also needlessly mints new private index identities.
+fn prepareCreateRequest(alloc: std.mem.Allocator, request: Request) !?tables_api.CreateTableRequest {
+    const creating_table = request.mutation.kind == .table and request.mutation.action == .create;
+    if (creating_table != (request.create_table_json != null)) return error.InvalidCatalogMutation;
+    const json = request.create_table_json orelse return null;
+    var req = try tables_api.parseStoredCreateTableRequest(alloc, json);
+    errdefer req.deinit(alloc);
+    const settings_value = req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{};
+    try settings_value.validateCreate(req.num_shards, if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+    try tables_api.validateObjectCreateDefinition(alloc, req);
+    return req;
+}
+
+test "system catalog table create preparation owns one validated request across publication" {
+    const alloc = std.testing.allocator;
+    var req = blk: {
+        const input = try alloc.dupe(u8, "{\"num_shards\":2,\"description\":\"owned create\",\"schema\":{\"version\":0}}");
+        defer alloc.free(input);
+        const prepared = (try prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .table, .action = .create, .name = "items" }, .create_table_json = input })).?;
+        @memset(input, ' ');
+        break :blk prepared;
+    };
+    defer req.deinit(alloc);
+    try std.testing.expectEqualStrings("owned create", req.description.?);
+    try std.testing.expectEqual(@as(u32, 2), req.num_shards.?);
+    try std.testing.expect(req.indexes_json.?.len != 0);
+    var schema = try std.json.parseFromSlice(std.json.Value, alloc, req.schema_json.?, .{});
+    defer schema.deinit();
+    try std.testing.expectEqual(@as(i64, 0), schema.value.object.get("version").?.integer);
+    try std.testing.expect((try prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .database, .action = .create, .name = "db" } })) == null);
+    try std.testing.expectError(error.InvalidCatalogMutation, prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .table, .action = .create, .name = "items" } }));
+    try std.testing.expectError(error.InvalidCatalogMutation, prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .table, .action = .drop, .name = "items" }, .create_table_json = "{}" }));
+    try std.testing.expectError(error.InvalidCreateTableRequest, prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .table, .action = .create, .name = "items" }, .create_table_json = "{\"num_shards\":0}" }));
+}
+
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
-    var object_create = false;
-    if (request.create_table_json) |json| {
-        var create_req = try tables_api.parseStoredCreateTableRequest(alloc, json);
-        defer create_req.deinit(alloc);
-        const storage_settings = create_req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{};
-        try storage_settings.validateCreate(create_req.num_shards, if (create_req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
-        try tables_api.validateObjectCreateDefinition(alloc, create_req);
-        object_create = storage_settings.engine == .object;
-    }
-    const required_version = if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    if (request.generated_constraint_names.len != 0 and (request.mutation.kind != .table or request.mutation.action != .create)) return error.InvalidCatalogMutation;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const create_req = try prepareCreateRequest(a, request);
+    const object_create = if (create_req) |req| (req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{}).engine == .object else false;
+    const ordinary_version = if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    const required_version = if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
     const admission = try store.systemCatalogAdmission(a, svc.metadata_group_id, request.mutation);
     var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation };
     if (request.mutation.action == .create and request.mutation.kind == .table) {
-        const json = request.create_table_json orelse return error.InvalidCatalogMutation;
-        var req = try tables_api.parseStoredCreateTableRequest(a, json);
+        var req = create_req orelse return error.InvalidCatalogMutation;
+        if (request.generated_constraint_names.len != 0) {
+            const bytes = try store.prepareConstraintNamesJsonWithContext(a, svc.metadata_group_id, .{ .create = .{ .expected_revision = admission.meta.revision, .namespace_id = admission.namespace_id, .logical_name = request.mutation.name, .schema_json = req.schema_json orelse return error.InvalidCatalogMutation, .generated_names = request.generated_constraint_names } }, context);
+            const names = try std.json.parseFromSliceLeaky(domain.ConstraintNamePrepared, a, bytes, .{});
+            req.schema_json = try a.dupe(u8, names.schema_json orelse return error.InvalidCatalogRecord);
+            command.constraint_name_admission = names.admission;
+            command.version = 2;
+        }
         const storage_name = request.physical_name orelse try std.fmt.allocPrint(a, "table:{d}", .{admission.meta.next_id});
         if (!std.mem.startsWith(u8, storage_name, "table:") or storage_name.len > 1024) return error.InvalidCatalogMutation;
         req.indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(a, storage_name, req.indexes_json orelse tables_api.default_indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
@@ -244,7 +315,7 @@ pub fn beginPolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: o
 pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("antfly_local_sources").system_catalog_policies.PublicationCommand) ![]u8 {
     if (!context.setting_admin or !context.row_policy_install_authority) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_publication_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_intent_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -334,17 +405,647 @@ pub fn fkGenerationPublicationSourceDecisionJson(svc: anytype, alloc: std.mem.Al
     return store.fkGenerationPublicationSourceDecisionJson(alloc, svc.metadata_group_id, request);
 }
 
-pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: fk_publication.Command) ![]u8 {
-    if (!context.fk_generation_publication_authority) return error.Forbidden;
-    try command.validateShape();
+pub fn relationalIndexStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").StatusRequest) ![]u8 {
+    if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_generation_publication_version);
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexStatusJson(alloc, svc.metadata_group_id, request);
+}
+
+pub fn prepareRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").PrepareRequest) ![]u8 {
+    if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexPrepareCutJson(alloc, svc.metadata_group_id, request);
+}
+
+pub fn beginRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").BeginRequest) ![]u8 {
+    const publication = @import("../metadata/relational_index_publication.zig");
+    if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    var prepared = try request.begin.plan.prepare(alloc);
+    defer prepared.deinit();
+    const observation = try request.observation(&prepared);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, request.begin, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > publication.max_command_bytes) return error.CatalogCommandTooLarge;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.index_publication_head_version);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
     defer if (gate_held) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    try store.validateRelationalIndexBegin(svc.metadata_group_id, request, &prepared);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .begin_relational_index_publication = bytes });
+    svc.unlockCatalogMutation();
+    gate_held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.relationalIndexAdmissionStatusJson(alloc, svc.metadata_group_id, observation) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(observed);
+    var parsed = std.json.parseFromSlice(publication.AdmissionStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer parsed.deinit();
+    if (!(parsed.value.isAdmitted(observation) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+    return observed;
+}
+
+test "relational index publication admission releases its gate and recovers lost replies without replay" {
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        locked: bool = false,
+        proposals: usize = 0,
+        lose_reply: bool = false,
+        store: Store,
+        const Store = struct {
+            head: @import("antfly_local_sources").storage_db_relational_index_publication_progress.Head,
+            admitted: bool = false,
+            pending: bool = false,
+            conflict: bool = false,
+            pub fn validateRelationalIndexBegin(self: *@This(), _: u64, request: publication.BeginRequest, prepared: *const publication.Prepared) !void {
+                _ = try request.observation(prepared);
+                if (self.conflict) return error.CatalogAlreadyExists;
+                if (self.admitted) return error.GenerationPublicationChanged;
+            }
+            pub fn relationalIndexAdmissionStatusJson(self: *@This(), a: std.mem.Allocator, _: u64, request: publication.AdmissionRequest) ![]u8 {
+                return std.json.Stringify.valueAlloc(a, publication.AdmissionStatus{ .metadata_incarnation = request.metadata_incarnation, .head = if (self.admitted) self.head else null, .replication_pending = self.pending }, .{});
+            }
+        };
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, version: u16) !u16 {
+            return version;
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: operation.RequestContext) !void {}
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, _: u16) !void {
+            try std.testing.expect(self.locked);
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+            try std.testing.expect(self.locked);
+            try std.testing.expect(command == .begin_relational_index_publication);
+            self.proposals += 1;
+            self.store.admitted = true;
+            return 1;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: operation.RequestContext) !void {
+            try std.testing.expect(!self.locked);
+            if (self.lose_reply) return error.Timeout;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const plan = try publication.testing.plan(arena.allocator());
+    var prepared = try plan.prepare(alloc);
+    defer prepared.deinit();
+    const request: publication.BeginRequest = .{ .metadata_incarnation = @splat('1'), .begin = .{ .plan = plan } };
+    const observation = try request.observation(&prepared);
+    const context: operation.RequestContext = .{ .setting_admin = true, .index_publication_authority = true };
+    var svc: Mock = .{ .store = .{ .head = prepared.head } };
+    try std.testing.expectError(error.Forbidden, beginRelationalIndexPublication(&svc, alloc, .{ .setting_admin = true }, request));
+    try std.testing.expectError(error.Forbidden, beginRelationalIndexPublication(&svc, alloc, .{ .index_publication_authority = true }, request));
+    try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    const bytes = try beginRelationalIndexPublication(&svc, alloc, context, request);
+    defer alloc.free(bytes);
+    var status = try std.json.parseFromSlice(publication.AdmissionStatus, alloc, bytes, .{});
+    defer status.deinit();
+    try std.testing.expect(try status.value.isAdmitted(observation));
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    try std.testing.expect(!svc.locked);
+    svc = .{ .store = .{ .head = prepared.head, .conflict = true } };
+    try std.testing.expectError(error.CatalogAlreadyExists, beginRelationalIndexPublication(&svc, alloc, context, request));
+    try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    try std.testing.expect(!svc.locked);
+    svc = .{ .store = .{ .head = prepared.head }, .lose_reply = true };
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, beginRelationalIndexPublication(&svc, alloc, context, request));
+    const recovered = try relationalIndexAdmissionStatusJson(&svc, alloc, context, observation);
+    defer alloc.free(recovered);
+    var recovered_status = try std.json.parseFromSlice(publication.AdmissionStatus, alloc, recovered, .{});
+    defer recovered_status.deinit();
+    try std.testing.expect(try recovered_status.value.isAdmitted(observation));
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    svc = .{ .store = .{ .head = prepared.head, .pending = true } };
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, beginRelationalIndexPublication(&svc, alloc, context, request));
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    try std.testing.expect(!svc.locked);
+}
+
+pub fn relationalIndexAdmissionStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").AdmissionRequest) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexAdmissionStatusJson(alloc, svc.metadata_group_id, request);
+}
+
+test "relational index publication admission status requires authority and a linearizable cut" {
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        reads: usize = 0,
+        store: Store = .{},
+        const Store = struct {
+            calls: usize = 0,
+            pub fn relationalIndexAdmissionStatusJson(self: *@This(), alloc: std.mem.Allocator, group: u64, request: publication.AdmissionRequest) ![]u8 {
+                try std.testing.expectEqual(@as(u64, 13), group);
+                try request.validate();
+                self.calls += 1;
+                return alloc.dupe(u8, "{}");
+            }
+        };
+        pub fn ensureLinearizableReadWithContext(self: *@This(), context: operation.RequestContext) !void {
+            try context.ensureActive();
+            self.reads += 1;
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+    };
+    var svc: Mock = .{};
+    const request: publication.AdmissionRequest = .{ .table_id = 17, .id = @splat(1), .plan_digest = @splat(2), .metadata_incarnation = @splat(3) };
+    try std.testing.expectError(error.Forbidden, relationalIndexAdmissionStatusJson(&svc, std.testing.allocator, .{}, request));
+    var invalid = request;
+    invalid.table_id = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, relationalIndexAdmissionStatusJson(&svc, std.testing.allocator, .{ .index_publication_authority = true }, invalid));
+    try std.testing.expectEqual(@as(usize, 0), svc.reads);
+    try std.testing.expectEqual(@as(usize, 0), svc.store.calls);
+    const bytes = try relationalIndexAdmissionStatusJson(&svc, std.testing.allocator, .{ .index_publication_authority = true }, request);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), svc.reads);
+    try std.testing.expectEqual(@as(usize, 1), svc.store.calls);
+}
+
+pub fn relationalIndexOwnerAckStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexOwnerAckStatusJson(alloc, svc.metadata_group_id, request);
+}
+
+pub fn relationalIndexPublicationDecisionStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").DecidePublish) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexPublicationDecisionStatusJson(alloc, svc.metadata_group_id, request);
+}
+
+pub fn decideRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").DecidePublish) ![]u8 {
+    return decideRelationalIndex(svc, alloc, context, request, false);
+}
+
+pub fn cancelRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").CancelDecision) ![]u8 {
+    return decideRelationalIndex(svc, alloc, context, request, true);
+}
+
+pub fn relationalIndexCancellationStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").CancelDecision) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexCancellationStatusJson(alloc, svc.metadata_group_id, request);
+}
+
+/// Both irreversible publication and pre-publication cancellation share the
+/// same proposal/uncertainty boundary. Neither holds the gate while waiting.
+fn decideRelationalIndex(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: anytype, comptime cancel: bool) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.index_publication_decision_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (comptime cancel) try store.validateRelationalIndexCancellation(svc.metadata_group_id, request) else try store.validateRelationalIndexPublicationDecision(svc.metadata_group_id, request);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(if (comptime cancel) .{ .cancel_relational_index_publication = request } else .{ .decide_relational_index_publication = request });
+    svc.unlockCatalogMutation();
+    gate_held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const observed = (if (comptime cancel) store.relationalIndexCancellationStatusJson(alloc, svc.metadata_group_id, request) else store.relationalIndexPublicationDecisionStatusJson(alloc, svc.metadata_group_id, request)) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(observed);
+    var parsed = std.json.parseFromSlice(if (cancel) publication.CancellationStatus else publication.DecisionStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer parsed.deinit();
+    const confirmed = (if (comptime cancel) parsed.value.isCanceled(request) else parsed.value.isDecided(request)) catch return error.MetadataMutationOutcomeUnknown;
+    if (!confirmed) return error.MetadataMutationOutcomeUnknown;
+    return observed;
+}
+
+pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.index_publication_head_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(bytes);
+    const publication = @import("../metadata/relational_index_publication.zig");
+    if (bytes.len > publication.max_ack_bytes) return error.CatalogCommandTooLarge;
+    try store.validateRelationalIndexOwnerAck(svc.metadata_group_id, bytes);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .ack_relational_index_publication = bytes });
+    svc.unlockCatalogMutation();
+    gate_held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.relationalIndexOwnerAckStatusJson(alloc, svc.metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(observed);
+    var parsed = std.json.parseFromSlice(publication.AckStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer parsed.deinit();
+    if (!(parsed.value.isAcknowledged(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+    return observed;
+}
+
+pub fn relationalIndexOwnerDecisionJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try request.validate();
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexOwnerDecisionJson(alloc, svc.metadata_group_id, request);
+}
+
+pub fn relationalIndexSourceAcceptanceStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, query: @import("../metadata/relational_index_delivery_journal.zig").Query) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try query.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexSourceAcceptanceStatusJson(alloc, svc.metadata_group_id, query);
+}
+pub fn acceptRelationalIndexSource(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_delivery_journal.zig").Request) ![]u8 {
+    const journal = @import("../metadata/relational_index_delivery_journal.zig");
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.signed.verify();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.index_delivery_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > journal.max_command_bytes) return error.CatalogCommandTooLarge;
+    try store.validateRelationalIndexSourceAcceptance(svc.metadata_group_id, bytes);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .accept_relational_index_delivery = bytes });
+    svc.unlockCatalogMutation();
+    gate_held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.relationalIndexSourceAcceptanceStatusJson(alloc, svc.metadata_group_id, journal.Query.from(request)) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(observed);
+    var parsed = std.json.parseFromSlice(journal.Status, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer parsed.deinit();
+    if (!(parsed.value.isAccepted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+    return observed;
+}
+
+pub fn completeRelationalIndexSource(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_delivery_journal.zig").CompletionRequest) ![]u8 {
+    const journal = @import("../metadata/relational_index_delivery_journal.zig");
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.index_delivery_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > journal.max_completion_bytes) return error.CatalogCommandTooLarge;
+    try store.validateRelationalIndexSourceCompletion(svc.metadata_group_id, bytes);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .complete_relational_index_source = bytes });
+    svc.unlockCatalogMutation();
+    gate_held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.relationalIndexSourceAcceptanceStatusJson(alloc, svc.metadata_group_id, request.query) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(observed);
+    var parsed = std.json.parseFromSlice(journal.Status, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer parsed.deinit();
+    if (!(parsed.value.isCompleted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+    return observed;
+}
+
+test "relational index publication decision dispatch preserves authority gates and uncertain outcomes" {
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        locked: bool = false,
+        proposals: usize = 0,
+        wait_failure: bool = false,
+        store: Store,
+        const Store = struct {
+            observed: publication.DecisionStatus,
+            reject: bool = false,
+            pub fn validateRelationalIndexPublicationDecision(self: *@This(), _: u64, _: publication.DecidePublish) !void {
+                if (self.reject) return error.GenerationPublicationChanged;
+            }
+            pub fn relationalIndexPublicationDecisionStatusJson(self: *@This(), alloc: std.mem.Allocator, _: u64, _: publication.DecidePublish) ![]u8 {
+                return std.json.Stringify.valueAlloc(alloc, self.observed, .{});
+            }
+        };
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, version: u16) !u16 {
+            try std.testing.expectEqual(protocol.index_publication_decision_version, version);
+            return version;
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: operation.RequestContext) !void {}
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, _: u16) !void {
+            try std.testing.expect(self.locked);
+        }
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+            try std.testing.expect(self.locked);
+            try std.testing.expect(command == .decide_relational_index_publication);
+            self.proposals += 1;
+            if (self.store.observed.head.phase == .building) self.store.observed.head = try self.store.observed.head.decidePublish(command.decide_relational_index_publication.expected_revision);
+            return 1;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: operation.RequestContext) !void {
+            try std.testing.expect(!self.locked);
+            if (self.wait_failure) return error.Timeout;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const plan = try publication.testing.plan(arena.allocator());
+    var prepared = try plan.prepare(std.testing.allocator);
+    defer prepared.deinit();
+    var head = prepared.head;
+    head.phase = .building;
+    head.revision = 4;
+    head.completed_sources = head.owner_count;
+    head.completion_revision = 3;
+    for (head.counts[0..3]) |*count| count.* = head.owner_count;
+    const request: publication.DecidePublish = .{ .table_id = head.table_id, .id = head.plan_id, .expected_revision = head.revision };
+    var svc: Mock = .{ .store = .{ .observed = .{ .head = head } } };
+    const context: operation.RequestContext = .{ .index_publication_authority = true };
+    try std.testing.expectError(error.Forbidden, decideRelationalIndexPublication(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.Forbidden, relationalIndexPublicationDecisionStatusJson(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.DeadlineExceeded, decideRelationalIndexPublication(&svc, std.testing.allocator, .{ .index_publication_authority = true, .deadline_ns = 0 }, undefined));
+    try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    const bytes = try decideRelationalIndexPublication(&svc, std.testing.allocator, context, request);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(!svc.locked);
+    var observed = try std.json.parseFromSlice(publication.DecisionStatus, std.testing.allocator, bytes, .{});
+    defer observed.deinit();
+    try std.testing.expect(try observed.value.isDecided(request));
+    svc.store.reject = true;
+    try std.testing.expectError(error.GenerationPublicationChanged, decideRelationalIndexPublication(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    svc.store.reject = false;
+    svc.wait_failure = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, decideRelationalIndexPublication(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    svc.wait_failure = false;
+    svc.store.observed.replication_pending = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, decideRelationalIndexPublication(&svc, std.testing.allocator, context, request));
+    const pending_json = try relationalIndexPublicationDecisionStatusJson(&svc, std.testing.allocator, context, request);
+    defer std.testing.allocator.free(pending_json);
+    var pending = try std.json.parseFromSlice(publication.DecisionStatus, std.testing.allocator, pending_json, .{});
+    defer pending.deinit();
+    try std.testing.expect(!try pending.value.isDecided(request));
+}
+
+test "relational index publication cancellation dispatch fences authority and preserves uncertain outcomes" {
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        locked: bool = false,
+        proposals: usize = 0,
+        wait_failure: bool = false,
+        store: Store,
+        const Store = struct {
+            observed: publication.CancellationStatus,
+            reject: bool = false,
+            pub fn validateRelationalIndexCancellation(self: *@This(), _: u64, _: publication.CancelDecision) !void {
+                if (self.reject) return error.GenerationPublicationChanged;
+            }
+            pub fn relationalIndexCancellationStatusJson(self: *@This(), alloc: std.mem.Allocator, _: u64, _: publication.CancelDecision) ![]u8 {
+                return std.json.Stringify.valueAlloc(alloc, self.observed, .{});
+            }
+        };
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, version: u16) !u16 {
+            try std.testing.expectEqual(protocol.index_publication_head_version, version);
+            return version;
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: operation.RequestContext) !void {}
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, _: u16) !void {
+            try std.testing.expect(self.locked);
+        }
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+            try std.testing.expect(self.locked);
+            try std.testing.expect(command == .cancel_relational_index_publication);
+            self.proposals += 1;
+            const request = command.cancel_relational_index_publication;
+            if (self.store.observed.head.phase == .fencing) self.store.observed.head = try self.store.observed.head.cancel(request.expected_revision, request.failure);
+            return 1;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: operation.RequestContext) !void {
+            try std.testing.expect(!self.locked);
+            if (self.wait_failure) return error.Timeout;
+        }
+    };
+    const request: publication.CancelDecision = .{ .table_id = 9, .id = @splat(1), .expected_revision = 1, .failure = .duplicate_key };
+    var svc: Mock = .{ .store = .{ .observed = .{ .head = .{ .table_id = 9, .plan_id = request.id, .plan_digest = @splat(2), .candidate_digest = @splat(3), .reservation_digest = @splat(4), .owner_count = 1 } } } };
+    const context: operation.RequestContext = .{ .index_publication_authority = true };
+    try std.testing.expectError(error.Forbidden, cancelRelationalIndexPublication(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.Forbidden, relationalIndexCancellationStatusJson(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.DeadlineExceeded, cancelRelationalIndexPublication(&svc, std.testing.allocator, .{ .index_publication_authority = true, .deadline_ns = 0 }, undefined));
+    try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    const bytes = try cancelRelationalIndexPublication(&svc, std.testing.allocator, context, request);
+    defer std.testing.allocator.free(bytes);
+    var status = try std.json.parseFromSlice(publication.CancellationStatus, std.testing.allocator, bytes, .{});
+    defer status.deinit();
+    try std.testing.expect(try status.value.isCanceled(request));
+    try std.testing.expect(!svc.locked);
+    svc.store.reject = true;
+    try std.testing.expectError(error.GenerationPublicationChanged, cancelRelationalIndexPublication(&svc, std.testing.allocator, context, request));
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    svc.store.reject = false;
+    svc.wait_failure = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, cancelRelationalIndexPublication(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    svc.wait_failure = false;
+    svc.store.observed.replication_pending = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, cancelRelationalIndexPublication(&svc, std.testing.allocator, context, request));
+    const pending_bytes = try relationalIndexCancellationStatusJson(&svc, std.testing.allocator, context, request);
+    defer std.testing.allocator.free(pending_bytes);
+    var pending = try std.json.parseFromSlice(publication.CancellationStatus, std.testing.allocator, pending_bytes, .{});
+    defer pending.deinit();
+    try std.testing.expect(!try pending.value.isCanceled(request));
+}
+
+test "relational index publication ACK submission fences capabilities releases mutation gates and preserves ambiguous outcomes" {
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        locked: bool = false,
+        proposals: usize = 0,
+        waits: usize = 0,
+        wait_failure: bool = false,
+        store: Store,
+        const Store = struct {
+            observed: publication.AckStatus,
+            reject: bool = false,
+            pub fn validateRelationalIndexOwnerAck(self: *@This(), _: u64, _: []const u8) !void {
+                if (self.reject) return error.IndexOwnerReceiptChanged;
+            }
+            pub fn relationalIndexOwnerAckStatusJson(self: *@This(), alloc: std.mem.Allocator, _: u64, _: publication.Ack) ![]u8 {
+                return std.json.Stringify.valueAlloc(alloc, self.observed, .{});
+            }
+        };
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, version: u16) !u16 {
+            try std.testing.expectEqual(protocol.index_publication_head_version, version);
+            return version;
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: operation.RequestContext) !void {}
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, _: u16) !void {
+            try std.testing.expect(self.locked);
+        }
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+            try std.testing.expect(self.locked);
+            try std.testing.expect(command == .ack_relational_index_publication);
+            self.proposals += 1;
+            return 1;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: operation.RequestContext) !void {
+            try std.testing.expect(!self.locked);
+            self.waits += 1;
+            if (self.wait_failure) return error.Timeout;
+        }
+    };
+    const request = try publication.testing.fencedAck();
+    var svc: Mock = .{ .store = .{ .observed = try publication.testing.completeAckStatus(request) } };
+    const context: operation.RequestContext = .{ .index_publication_authority = true };
+    try std.testing.expectError(error.Forbidden, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.Forbidden, relationalIndexOwnerAckStatusJson(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.DeadlineExceeded, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, .{ .index_publication_authority = true, .deadline_ns = 0 }, undefined));
+    try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    const bytes = try acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request);
+    std.testing.allocator.free(bytes);
+    try std.testing.expect(!svc.locked);
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    svc.store.reject = true;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    svc.store.reject = false;
+    svc.wait_failure = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    svc.wait_failure = false;
+    svc.store.observed = publication.testing.pendingAckStatus(request);
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    try std.testing.expectEqual(@as(usize, 3), svc.proposals);
+    try std.testing.expectEqual(@as(usize, 3), svc.waits);
+}
+
+test "system catalog relational index publication read requires authority before a linearizable barrier" {
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        reads: usize = 0,
+        const Store = struct {
+            pub fn relationalIndexOwnerDecisionJson(_: *@This(), _: std.mem.Allocator, _: u64, _: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
+                return error.UnexpectedRead;
+            }
+        };
+        pub fn ensureLinearizableReadWithContext(self: *@This(), _: operation.RequestContext) !void {
+            self.reads += 1;
+        }
+        pub fn projectedStore(_: *@This()) ?*Store {
+            return null;
+        }
+    };
+    var svc: Mock = .{};
+    const request: @import("../metadata/relational_index_publication.zig").OwnerRequest = .{ .table_id = 1, .group_id = 2, .id = @splat(3), .operation = .fence };
+    try std.testing.expectError(error.Forbidden, relationalIndexOwnerDecisionJson(&svc, std.testing.allocator, .{}, request));
+    try std.testing.expectEqual(@as(usize, 0), svc.reads);
+    try std.testing.expectError(error.MissingMetadataStore, relationalIndexOwnerDecisionJson(&svc, std.testing.allocator, .{ .index_publication_authority = true }, request));
+    try std.testing.expectEqual(@as(usize, 1), svc.reads);
+}
+
+pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: fk_publication.Command) ![]u8 {
+    if (!context.fk_generation_publication_authority) return error.Forbidden;
+    try command.validateShape();
+    try context.ensureActive();
+    if (command.plan) |plan| try plan.requireAdmissionCoverage();
+    const naming = if (command.plan) |plan| plan.constraint_name_guard != null else false;
+    const required = if (command.catalog_coverage == .checks_v1) protocol.checks_catalog_identity_version else if (naming) protocol.constraint_occupancy_version else protocol.fk_generation_publication_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (command.plan) |plan| if (plan.constraint_name_guard != null)
+        try store.preflightFkGenerationNameAdmission(svc.metadata_group_id, plan);
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
     if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
@@ -366,7 +1067,9 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     if (!context.fk_generation_publication_authority) return error.Forbidden;
     try command.validateShape();
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_initial_create_version);
+    const naming = if (command.plan) |plan| plan.constraint_name_admission != null else false;
+    const minimum = if (command.catalog_coverage == .checks_v1) protocol.initial_fk_checks_catalog_version else if (naming) @max(protocol.fk_initial_create_version, protocol.constraint_occupancy_version) else protocol.fk_initial_create_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, minimum);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
@@ -402,7 +1105,7 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
 pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("antfly_local_sources").system_catalog_policies.Command) ![]u8 {
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_publication_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_intent_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -410,7 +1113,7 @@ pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: o
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const current = try store.systemCatalogMeta(alloc, svc.metadata_group_id);
     if (current.revision != command.expected_revision) return error.RowPolicyCatalogChanged;
-    const bytes = try serializePolicyDefinitionCommand(alloc, command);
+    const bytes = try store.sqlPolicyDefinitionCommandJson(alloc, svc.metadata_group_id, command);
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_policies = bytes });
@@ -503,17 +1206,48 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .policy_publication_begin => |request| beginPolicyPublication(svc, alloc, context, request),
         .policy_definition_mutate => |command| mutatePolicyDefinition(svc, alloc, context, command),
         .policy_publication_mutate => |command| mutatePolicyPublication(svc, alloc, context, command),
-        .fk_generation_publication_begin => |plan| mutateFkGenerationPublication(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child_before.table_id, .expected_revision = 0, .action = .begin, .plan = plan }),
+        .fk_generation_publication_begin => |plan| mutateFkGenerationPublication(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child_before.table_id, .expected_revision = 0, .action = .begin, .plan = plan, .catalog_coverage = plan.catalog_coverage }),
         .fk_generation_publication_mutate => |command| mutateFkGenerationPublication(svc, alloc, context, command),
         .fk_generation_publication_status => |child_table_id| fkGenerationPublicationStatusJson(svc, alloc, context, child_table_id),
         .fk_generation_publication_work => |after_child_table_id| fkGenerationPublicationWorkJson(svc, alloc, context, after_child_table_id),
         .fk_generation_publication_decision => |request| fkGenerationPublicationDecisionJson(svc, alloc, context, request),
         .fk_generation_publication_source_decision => |request| fkGenerationPublicationSourceDecisionJson(svc, alloc, context, request),
+        .relational_index_status => |request| relationalIndexStatusJson(svc, alloc, context, request),
+        .relational_index_prepare => |request| prepareRelationalIndexPublication(svc, alloc, context, request),
+        .relational_index_begin => |request| beginRelationalIndexPublication(svc, alloc, context, request),
+        .relational_index_admission_status => |request| relationalIndexAdmissionStatusJson(svc, alloc, context, request),
+        .relational_index_owner_decision => |request| relationalIndexOwnerDecisionJson(svc, alloc, context, request),
+        .relational_index_owner_ack => |request| acknowledgeRelationalIndexOwner(svc, alloc, context, request),
+        .relational_index_owner_ack_status => |request| relationalIndexOwnerAckStatusJson(svc, alloc, context, request),
+        .relational_index_publish_decide => |request| decideRelationalIndexPublication(svc, alloc, context, request),
+        .relational_index_publish_status => |request| relationalIndexPublicationDecisionStatusJson(svc, alloc, context, request),
+        .relational_index_cancel => |request| cancelRelationalIndexPublication(svc, alloc, context, request),
+        .relational_index_cancel_status => |request| relationalIndexCancellationStatusJson(svc, alloc, context, request),
+        .relational_index_source_accept => |request| acceptRelationalIndexSource(svc, alloc, context, request),
+        .relational_index_source_complete => |request| completeRelationalIndexSource(svc, alloc, context, request),
+        .relational_index_source_accept_status => |request| relationalIndexSourceAcceptanceStatusJson(svc, alloc, context, request),
         .fk_initial_create_prepare => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
+            if (request.generated_constraint_names.len != 0)
+                _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.constraint_occupancy_version);
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-            break :blk store.fkInitialCreatePrepareJson(alloc, svc.metadata_group_id, request);
+            break :blk store.fkInitialCreatePrepareJsonWithContext(alloc, svc.metadata_group_id, request, context);
+        },
+        .constraint_name_prepare => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.constraint_occupancy_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.prepareConstraintNamesJsonWithContext(alloc, svc.metadata_group_id, .{ .addition = request }, context);
+        },
+        .constraint_name_check => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.constraint_occupancy_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            try store.checkConstraintNamesWithContext(alloc, svc.metadata_group_id, request, context);
+            break :blk std.json.Stringify.valueAlloc(alloc, true, .{});
         },
         .fk_initial_child_decision => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
@@ -521,7 +1255,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.fkInitialChildDecisionJson(alloc, svc.metadata_group_id, request);
         },
-        .fk_initial_create_begin => |plan| mutateFkInitialCreate(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }),
+        .fk_initial_create_begin => |plan| mutateFkInitialCreate(svc, alloc, context, .{ .catalog_coverage = plan.catalog_coverage, .plan_id = plan.id, .child_table_id = plan.child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }),
         .fk_initial_create_mutate => |command| mutateFkInitialCreate(svc, alloc, context, command),
         .fk_initial_create_status => |child_table_id| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
@@ -632,6 +1366,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             // become a replayable pre-admission error on the forwarding hop.
             break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
         },
+        .sql_view_mutate => |request| mutateSqlView(svc, alloc, context, request),
         .mutate => |request| mutate(svc, alloc, context, request),
     };
 }

@@ -222,6 +222,7 @@ const Builder = struct {
                 .avg => self.node(.{ .cast = .{ .operand = call.args[0], .type = .number } }),
                 .bool_and, .bool_or => self.node(.{ .cast = .{ .operand = call.args[0], .type = .boolean } }),
                 .pattern_set => self.node(.{ .cast = .{ .operand = try self.node(.{ .cast = .{ .operand = call.args[0], .type = .string } }), .type = .json } }),
+                .array_agg => self.node(.{ .call = .{ .name = "$array", .args = call.args } }),
                 else => call.args[0],
             };
             for (self.aggregates.items, 0..) |aggregate, index| if (same(input, aggregate)) return self.slot(self.groups.len + index);
@@ -378,19 +379,34 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         };
         try operators.Aggregate.validate(kind, input_type);
         const input_element = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
-        spec.* = .{ .kind = kind, .input_type = input_type, .input_element = input_element, .distinct = node.call.distinct };
+        spec.* = .{ .kind = kind, .input_type = input_type, .input_element = if ((kind == .sum or kind == .avg) and input_type == .integer) input_element orelse .int64 else input_element, .distinct = node.call.distinct };
         column.type = switch (kind) {
             .count => .integer,
             .avg => .number,
             .bool_and, .bool_or => .boolean,
             .pattern_set => .json,
+            .array_agg => .array,
             else => input_type orelse .string,
         };
         // Extrema retain the complete input domain, not just its coarse
         // number/array tag. Exact decimals must not become float results.
         if (column.type == .array or kind == .min or kind == .max) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
+        if (kind == .array_agg and column.element_type == null) column.element_type = switch (input_type orelse .string) {
+            .string => .text,
+            .uuid => .uuid,
+            .integer => .int64,
+            .number => .float64,
+            .boolean => .boolean,
+            .json => .jsonb,
+            else => return error.UnsupportedSqlShape,
+        };
         if ((kind == .sum or kind == .avg) and input_element == .numeric) column.element_type = .numeric;
-        if (kind == .sum and input_element == .float32) column.element_type = .float32;
+        if (kind == .sum or kind == .avg) {
+            const domain: scalar.Type = .{ .kind = input_type, .element_type = input_element };
+            const output = if (kind == .sum) operators.Aggregate.sumType(domain) else operators.Aggregate.averageType(domain);
+            column.type = output.kind orelse .string;
+            column.element_type = output.element_type;
+        }
         if (node.call.within_group != null) {
             column.type = if (orderedKind(node.call.name).? == .continuous) .number else input_type orelse .string;
             column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;

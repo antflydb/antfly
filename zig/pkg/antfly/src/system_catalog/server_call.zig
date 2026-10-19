@@ -78,7 +78,23 @@ pub const Call = union(enum) {
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../metadata/fk_generation_publication.zig").SourceDecisionRequest,
+    relational_index_status: @import("../metadata/relational_index_publication.zig").StatusRequest,
+    relational_index_prepare: @import("../metadata/relational_index_publication.zig").PrepareRequest,
+    relational_index_begin: @import("../metadata/relational_index_publication.zig").BeginRequest,
+    relational_index_admission_status: @import("../metadata/relational_index_publication.zig").AdmissionRequest,
+    relational_index_owner_decision: @import("../metadata/relational_index_publication.zig").OwnerRequest,
+    relational_index_owner_ack: @import("../metadata/relational_index_publication.zig").Ack,
+    relational_index_owner_ack_status: @import("../metadata/relational_index_publication.zig").Ack,
+    relational_index_publish_decide: @import("../metadata/relational_index_publication.zig").DecidePublish,
+    relational_index_publish_status: @import("../metadata/relational_index_publication.zig").DecidePublish,
+    relational_index_cancel: @import("../metadata/relational_index_publication.zig").CancelDecision,
+    relational_index_cancel_status: @import("../metadata/relational_index_publication.zig").CancelDecision,
+    relational_index_source_accept: @import("../metadata/relational_index_delivery_journal.zig").Request,
+    relational_index_source_accept_status: @import("../metadata/relational_index_delivery_journal.zig").Query,
+    relational_index_source_complete: @import("../metadata/relational_index_delivery_journal.zig").CompletionRequest,
     fk_initial_create_prepare: @import("../metadata/fk_generation_publication.zig").InitialCreatePrepareRequest,
+    constraint_name_prepare: domain.ConstraintNamePrepareRequest,
+    constraint_name_check: domain.ConstraintNameCheck,
     fk_initial_child_decision: @import("../metadata/fk_generation_publication.zig").InitialChildDecisionRequest,
     fk_initial_create_begin: @import("../metadata/fk_generation_publication.zig").InitialCreatePlan,
     fk_initial_create_mutate: @import("../metadata/fk_generation_publication.zig").InitialCommand,
@@ -100,6 +116,7 @@ pub const Call = union(enum) {
     snapshot: void,
     resolve: Target,
     resolve_many: ResolveMany,
+    sql_view_mutate: @import("views.zig").Request,
     relation_replace: RelationReplacement,
     relation_schema_mutate: RelationSchemaMutation,
     query_definition: []const u8,
@@ -111,7 +128,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate => true,
+            .sql_view_mutate, .relation_replace, .relation_schema_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -133,6 +150,17 @@ pub const Call = union(enum) {
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
+            .relational_index_admission_status,
+            .relational_index_owner_decision,
+            .relational_index_owner_ack,
+            .relational_index_owner_ack_status,
+            .relational_index_publish_decide,
+            .relational_index_publish_status,
+            .relational_index_cancel,
+            .relational_index_cancel_status,
+            .relational_index_source_accept,
+            .relational_index_source_complete,
+            .relational_index_source_accept_status,
             .fk_initial_create_prepare,
             .fk_initial_child_decision,
             .fk_initial_create_status,
@@ -145,10 +173,70 @@ pub const Call = union(enum) {
     }
 
     pub fn isMutation(self: @This()) bool {
-        return self == .mutate or self == .fk_initial_retirement_ack or
-            (self != .store_root_enrollment_status and self.requiresAdministrativeGrant());
+        return self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or self == .relational_index_publish_decide or self == .relational_index_cancel or self == .relational_index_source_accept or self == .relational_index_source_complete or
+            (self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
+    }
+
+    pub fn isRelationalIndexOwnerCall(self: @This()) bool {
+        return self == .relational_index_status or self == .relational_index_prepare or self == .relational_index_begin or self == .relational_index_admission_status or self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status or self == .relational_index_publish_decide or self == .relational_index_publish_status or self == .relational_index_cancel or self == .relational_index_cancel_status or self == .relational_index_source_accept or self == .relational_index_source_accept_status or self == .relational_index_source_complete;
     }
 };
+
+test "relational index publication ACK calls require body bound authority and distinguish mutations from status" {
+    const abi = @import("antfly_runtime_abi");
+    const VTable = struct { submit: *const fn (*const anyerror) anyerror!u64 };
+    const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+    const Callbacks = struct {
+        fn submit(err: *const anyerror) anyerror!u64 {
+            return err.*;
+        }
+        fn foreign(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return Boundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    for ([_]anyerror{ error.IndexOwnerReceiptChanged, error.InvalidIndexOwnerReceipt, error.MetadataMutationOutcomeUnknown }) |err| {
+        try std.testing.expectError(err, Boundary.call("submit", &Callbacks.foreign, &Callbacks.submit, .{&err}));
+    }
+    const admission: Call = .{ .relational_index_admission_status = undefined };
+    const beginning: Call = .{ .relational_index_begin = undefined };
+    const preparation: Call = .{ .relational_index_prepare = undefined };
+    const scoped_status: Call = .{ .relational_index_status = undefined };
+    try std.testing.expect(!scoped_status.isMutation());
+    try std.testing.expect(scoped_status.requiresAdministrativeGrant());
+    try std.testing.expect(scoped_status.isRelationalIndexOwnerCall());
+    try std.testing.expect(!preparation.isMutation());
+    try std.testing.expect(preparation.requiresAdministrativeGrant());
+    try std.testing.expect(preparation.isRelationalIndexOwnerCall());
+    try std.testing.expect(beginning.isMutation());
+    try std.testing.expect(beginning.requiresAdministrativeGrant());
+    try std.testing.expect(beginning.isRelationalIndexOwnerCall());
+    try std.testing.expect(!admission.isMutation());
+    try std.testing.expect(admission.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(admission.isRelationalIndexOwnerCall());
+    const ack: Call = .{ .relational_index_owner_ack = undefined };
+    const status: Call = .{ .relational_index_owner_ack_status = undefined };
+    const accept: Call = .{ .relational_index_source_accept = undefined };
+    const accepted: Call = .{ .relational_index_source_accept_status = undefined };
+    const completed: Call = .{ .relational_index_source_complete = undefined };
+    const decide: Call = .{ .relational_index_publish_decide = undefined };
+    const decided: Call = .{ .relational_index_publish_status = undefined };
+    const cancel: Call = .{ .relational_index_cancel = undefined };
+    const canceled: Call = .{ .relational_index_cancel_status = undefined };
+    try std.testing.expect(cancel.isMutation());
+    try std.testing.expect(!canceled.isMutation());
+    for ([_]Call{ ack, status, accept, accepted, completed, decide, decided, cancel, canceled }) |call| {
+        try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+        try std.testing.expect(!call.requiresAdministrativeGrant());
+        try std.testing.expect(call.isRelationalIndexOwnerCall());
+    }
+    try std.testing.expect(ack.isMutation());
+    try std.testing.expect(!status.isMutation());
+    try std.testing.expect(accept.isMutation());
+    try std.testing.expect(completed.isMutation());
+    try std.testing.expect(!accepted.isMutation());
+    try std.testing.expect(decide.isMutation());
+    try std.testing.expect(!decided.isMutation());
+}
 
 test "system catalog policy publication status is a service-only read, not a setting grant" {
     const status: Call = .{ .policy_publication_status = 7 };
@@ -160,6 +248,16 @@ test "system catalog policy publication status is a service-only read, not a set
     try std.testing.expect((Call{ .setting_snapshot = undefined }).requiresSettingAuthorityReadGrant());
     try std.testing.expect((Call{ .fk_generation_publication_status = undefined }).requiresSettingAuthorityReadGrant());
     try std.testing.expect((Call{ .policy_publication_begin = undefined }).requiresAdministrativeGrant());
+}
+
+test "system catalog relational index owner decision requires a body bound read grant and cannot mutate" {
+    const call: Call = .{ .relational_index_owner_decision = .{ .table_id = 1, .group_id = 2, .id = @splat(3), .operation = .fence } };
+    try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!call.requiresAdministrativeGrant());
+    try std.testing.expect(!call.isMutation());
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Call, std.testing.allocator,
+        \\{"relational_index_owner_decision":{"table_id":1,"group_id":2,"id":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"operation":"fence","index_publication_authority":true}}
+    , .{}));
 }
 
 test "store-root enrollment status is an admin-bound read, not a mutation" {
@@ -186,6 +284,11 @@ test "native lake lifecycle calls bind private read and mutation grants" {
 }
 
 test "system catalog relation replacement requires a body-bound administrative mutation grant" {
+    for ([_]Call{ .{ .constraint_name_prepare = undefined }, .{ .constraint_name_check = undefined } }) |prepare| {
+        try std.testing.expect(prepare.requiresAdministrativeGrant());
+        try std.testing.expect(!prepare.requiresSettingAuthorityReadGrant());
+        try std.testing.expect(!prepare.isMutation());
+    }
     const call: Call = .{ .relation_replace = undefined };
     try std.testing.expect(call.requiresAdministrativeGrant());
     try std.testing.expect(call.isMutation());

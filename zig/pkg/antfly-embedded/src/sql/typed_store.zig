@@ -24,7 +24,7 @@ const A = std.mem.Allocator;
 /// Allocation admission still accounts for actual vector/hash capacity growth.
 pub fn retainedCellBytes(value: Datum) !usize {
     if (fixedCoefficient(value) != null) return 19;
-    return 1 +| (if (value.patterns != null) @sizeOf(?*scalar.PatternSet) else @as(usize, 0)) +| switch (value.value) {
+    return 1 +| (if (value.patterns() != null) @sizeOf(?*scalar.PatternSet) else @as(usize, 0)) +| switch (value.value) {
         .integer, .float => @as(usize, 8),
         .bool => @as(usize, 1),
         .string, .number_string => |text| @sizeOf([]const u8) +| text.len +| 32,
@@ -316,6 +316,7 @@ const Column = struct {
     patterns: std.ArrayList(?*scalar.PatternSet) = .empty,
     arrays: std.ArrayList(?*const @import("array_value.zig").Value) = .empty,
     numerics: std.ArrayList(?*const @import("numeric_value.zig").Value) = .empty,
+    temporals: std.ArrayList(?*const @import("temporal_value.zig").Value) = .empty,
     fn deinit(self: *Column, a: A) void {
         if (self.fixed) |*fixed| fixed.deinit(a);
         if (self.json_bytes) |bytes| {
@@ -331,6 +332,7 @@ const Column = struct {
         self.patterns.deinit(a);
         self.arrays.deinit(a);
         self.numerics.deinit(a);
+        self.temporals.deinit(a);
     }
     fn isNull(self: Column, row: usize) bool {
         return self.nulls.items[row / 64] & (@as(u64, 1) << @as(u6, @intCast(row % 64))) != 0;
@@ -350,10 +352,17 @@ const Column = struct {
             .decimals => |v| .{ .number_string = v.getText(row) },
             .encoded => |v| v.items[row],
         };
-        return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row], .array = if (self.arrays.items.len == 0) null else self.arrays.items[row], .numeric = if (self.numerics.items.len == 0) null else self.numerics.items[row] };
+        var result = Datum.fromParts(value, false, if (self.patterns.items.len == 0) null else self.patterns.items[row]);
+        result.array = if (self.arrays.items.len == 0) null else self.arrays.items[row];
+        result.numeric = if (self.numerics.items.len == 0) null else self.numerics.items[row];
+        if (self.temporals.items.len != 0) if (self.temporals.items[row]) |temporal| {
+            if (result.patterns() != null or result.numeric != null or result.array != null or result.value != .null) return error.SqlTypeMismatch;
+            return Datum.typedTemporal(temporal);
+        };
+        return result;
     }
     fn appendDictionary(self: *Column, a: A, owned: A, begin: usize, batch: @import("execution_batch.zig").Batch) !bool {
-        if (self.fixed != null or self.json_bytes != null or batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
+        if (self.temporals.items.len != 0 or self.fixed != null or self.json_bytes != null or batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
         const source = batch.dictionary;
         for (source.indices) |id| if (id >= source.values.len) return error.InvalidSqlBackendResponse;
         const remap = try a.alloc(u32, source.values.len);
@@ -366,7 +375,7 @@ const Column = struct {
         var referenced: usize = 0;
         for (source.values, remap) |value, id| {
             if (id == std.math.maxInt(u32)) continue;
-            if (value.patterns != null or value.array != null or value.numeric != null) return false;
+            if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null) return false;
             if (value.sql_null) continue;
             const actual = std.meta.activeTag(value.value);
             if (actual != .integer and actual != .float and actual != .string and actual != .number_string) return false;
@@ -490,6 +499,14 @@ const Column = struct {
         self.json_bytes.?.items[row] = payload;
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
+        try value.validateTemporal();
+        if (self.temporals.items.len != 0 or value.temporal() != null) {
+            if (self.temporals.items.len == 0) {
+                try self.temporals.resize(a, row);
+                @memset(self.temporals.items, null);
+            }
+            try self.temporals.append(a, if (value.temporal() != null) (try @import("operators.zig").cloneDatum(owned, value)).temporal() else null);
+        }
         if (self.json_bytes) |bytes| try bytes.append(a, null);
         const coefficient = fixedCoefficient(value);
         if (self.fixed == null and self.json_bytes == null and self.values == .unknown and self.numerics.items.len == 0 and self.arrays.items.len == 0 and self.patterns.items.len == 0 and coefficient != null) {
@@ -502,7 +519,7 @@ const Column = struct {
             @memset(self.fixed.?.scales.items, 0);
         }
         if (self.fixed) |*fixed| {
-            if (value.sql_null or (coefficient != null and value.array == null and value.patterns == null)) {
+            if (value.sql_null or (coefficient != null and value.array == null and value.patterns() == null)) {
                 if (row % 64 == 0) try self.nulls.append(a, 0);
                 if (value.sql_null) self.nulls.items[row / 64] |= @as(u64, 1) << @as(u6, @intCast(row % 64));
                 if (!value.sql_null) if (coefficient) |c| {
@@ -541,12 +558,12 @@ const Column = struct {
         }
         if (row % 64 == 0) try self.nulls.append(a, 0);
         if (value.sql_null) self.nulls.items[row / 64] |= @as(u64, 1) << @as(u6, @intCast(row % 64));
-        if (self.patterns.items.len != 0 or value.patterns != null) {
+        if (self.patterns.items.len != 0 or value.patterns() != null) {
             if (self.patterns.items.len == 0) {
                 try self.patterns.resize(a, row);
                 @memset(self.patterns.items, null);
             }
-            try self.patterns.append(a, value.patterns);
+            try self.patterns.append(a, value.patterns());
         }
         if (self.values == .unknown and !value.sql_null) {
             self.values = switch (value.value) {
@@ -839,7 +856,7 @@ pub const Store = struct {
     pub fn dictionaryId(self: *const Store, row_index: usize, column: usize) !?u64 {
         if (row_index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];
-        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0) return null;
+        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0 or stored.temporals.items.len != 0) return null;
         const id: u32 = switch (stored.values) {
             inline .integers, .numbers => |v| if (v.encoded) v.indices.items[row_index] else return null,
             .strings, .decimals => |v| if (v.flat == null) v.indices.items[row_index] else return null,
@@ -850,7 +867,7 @@ pub const Store = struct {
     pub fn dictionaryBatch(self: *const Store, a: A, column: usize, begin: usize, count: usize) !?@import("execution_batch.zig").Batch {
         if (self.failed or column >= self.columns.len or begin > self.len or count > self.len - begin) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];
-        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0) return null;
+        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0 or stored.temporals.items.len != 0) return null;
         switch (stored.values) {
             inline .integers, .numbers => |v| if (!v.encoded) return null,
             .strings, .decimals => |v| if (v.flat != null) return null,
@@ -902,7 +919,7 @@ pub const Store = struct {
             }
         }
         bytes +|= if (repeated) @sizeOf(u32) + 1 else try retainedCellBytes(value);
-        if (repeated and value.patterns != null) bytes +|= @sizeOf(?*scalar.PatternSet);
+        if (repeated and value.patterns() != null) bytes +|= @sizeOf(?*scalar.PatternSet);
         return bytes;
     }
     /// Estimate only new native JSON bodies, including duplicates within this
@@ -1153,6 +1170,7 @@ pub const Store = struct {
     pub fn equal(self: *const Store, a: A, row_index: usize, values: []const Datum, null_equal: bool) !bool {
         if (self.failed or values.len != self.columns.len or row_index >= self.len) return error.InvalidSqlBackendResponse;
         for (values, 0..) |value, column| {
+            try value.validateTemporal();
             const stored = self.columns[column];
             const is_null = stored.isNull(row_index);
             if (is_null or value.sql_null) {
@@ -1165,7 +1183,7 @@ pub const Store = struct {
                 if ((try scalar.compareDatums(Datum.typedNumeric(&number), value)) != .eq) return false;
                 continue;
             }
-            if (value.array != null or value.numeric != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null)) {
+            if (value.array != null or value.numeric != null or value.temporal() != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null) or (stored.temporals.items.len != 0 and stored.temporals.items[row_index] != null)) {
                 if ((try scalar.compareDatums(try stored.cell(a, row_index), value)) != .eq) return false;
                 continue;
             }

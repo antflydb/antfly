@@ -397,6 +397,8 @@ pub const BatchRequest = struct {
     relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
     relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
+    /// Private ordered owner control. Never admitted from public batch JSON.
+    relational_index_owner_control: ?@import("relational_index_raft_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
@@ -1497,6 +1499,7 @@ pub const ColumnarScanStats = struct {
 /// Borrowed typed request for native callers. Encoded only at an archive or
 /// network boundary; fields and JSON operands must outlive the synchronous scan.
 pub const RelationalRowQuery = struct {
+    pub const ExpressionEquality = @import("../relational_index.zig").ExpressionEqualityHint;
     pub const Bound = struct { values: []const std.json.Value, inclusive: bool = true };
     pub const Condition = struct {
         column: []const u8,
@@ -1504,6 +1507,10 @@ pub const RelationalRowQuery = struct {
         value: ?std.json.Value = null,
         collation: ?[]const u8 = null,
     };
+    /// Private mutation preparation: exposed RETURNING postimages must pass
+    /// the same owner-side SELECT policy and mandatory filter as a read.
+    /// Ordinary write normalization deliberately does not require visibility.
+    require_normalized_visibility: bool = false,
     /// Retained typed readers bound bytes as well as rows. Transported with
     /// the query so every owner uses the same requested page envelope.
     page_bytes: usize = 16 * 1024 * 1024,
@@ -1517,6 +1524,10 @@ pub const RelationalRowQuery = struct {
     lower: ?Bound = null,
     upper: ?Bound = null,
     conditions: []const Condition = &.{},
+    /// Internal access hints, not filters. The caller must retain the logical
+    /// predicate, including when no READY matching index exists. Ignoring a
+    /// hint always leaves a correct primary scan with that residual predicate.
+    expression_equalities: []const ExpressionEquality = &.{},
     schema_version: ?u32 = null,
 };
 
@@ -1712,6 +1723,8 @@ pub const TransactionWrite = struct {
 };
 
 pub const TransactionVersionPredicate = struct {
+    /// Private SQL command provenance; public batch parsers never populate it.
+    row_policy_requirement: @import("../../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     key: []const u8,
     expected_version: u64,
     /// Internal observation guard. TTL timestamps need not change on updates.

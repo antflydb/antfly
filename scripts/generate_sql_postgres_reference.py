@@ -30,6 +30,7 @@ from copy import deepcopy
 from datetime import date, datetime, time
 from decimal import Decimal
 import getpass
+import hashlib
 import json
 import math
 import os
@@ -157,6 +158,10 @@ def properties(schema):
 
 def pg_type(prop):
     kind = prop.get("type")
+    if kind == "integer" and "x-antfly-sql-type" in prop:
+        return {"int16": "smallint", "int32": "integer", "int64": "bigint"}[
+            prop["x-antfly-sql-type"]
+        ]
     if kind == "sql_array":
         element = prop.get("x-antfly-sql-type")
         if element not in ARRAY_ELEMENT_TYPES:
@@ -178,6 +183,8 @@ def pg_type(prop):
 
 
 def encoded(value):
+    if isinstance(value, UUID):
+        return str(value)
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("non-finite numeric needs a dedicated wire contract")
@@ -426,16 +433,68 @@ def array_reference(data, oid):
     return {"dimensions": dimensions, "values": values, "sql_nulls": nulls}
 
 
-def parameters(case):
+def parameters(case, inferred_oids=None):
     from psycopg.types.json import Jsonb
 
+    if inferred_oids is not None and len(inferred_oids) != len(case["params"]):
+        raise ValueError("PostgreSQL parameter description cardinality mismatch")
     result = []
-    for cell in case["params"]:
+    for index, cell in enumerate(case["params"]):
         value = parameter(cell)
         if isinstance(cell, dict) and "json" in cell:
-            value = Jsonb(json.loads(value) if isinstance(value, str) else value)
+            value = json.loads(value) if isinstance(value, str) else value
+            oid = inferred_oids[index] if inferred_oids is not None else None
+            if oid == 1009:
+                # The source tag is its API JSON transport, not a jsonb SQL
+                # declaration. Only the independent server's parameter type
+                # may identify this as text[], never SQL text heuristics or
+                # the fact that its payload happens to be a JSON array.
+                if value is not None and (
+                    not isinstance(value, list)
+                    or any(
+                        item is not None and not isinstance(item, str) for item in value
+                    )
+                ):
+                    raise ValueError(
+                        "text[] parameter requires string or SQL NULL elements"
+                    )
+            elif oid in ARRAY_TYPES:
+                raise ValueError(
+                    "array parameter requires an explicit element-domain adapter"
+                )
+            else:
+                value = Jsonb(value)
         result.append(value)
     return result
+
+
+def describe_parameter_oids(connection, case):
+    """Ask PostgreSQL to bind the unchanged statement before adapting API JSON.
+
+    Parse/Describe of the unnamed statement executes no SQL and retains no
+    named prepared resource. The subsequent raw cursor still executes the
+    original statement and positional values, without inserted casts.
+    """
+    import psycopg
+
+    prepared = connection.pgconn.prepare(
+        b"", case["sql"].encode(connection.info.encoding)
+    )
+    if prepared.status != psycopg.pq.ExecStatus.COMMAND_OK:
+        raise psycopg.errors.error_from_result(prepared, connection.info.encoding)
+    described = connection.pgconn.describe_prepared(b"")
+    if described.status != psycopg.pq.ExecStatus.COMMAND_OK:
+        raise psycopg.errors.error_from_result(described, connection.info.encoding)
+    return [described.param_type(index) for index in range(described.nparams)]
+
+
+def execution_parameters(connection, case):
+    inferred_oids = (
+        describe_parameter_oids(connection, case)
+        if any(isinstance(cell, dict) and "json" in cell for cell in case["params"])
+        else None
+    )
+    return parameters(case, inferred_oids)
 
 
 def create_table(db, name, props, rows, identity=False):
@@ -530,7 +589,7 @@ def empty_set_contract(db, case):
     return None
 
 
-def execute(db, case, read=False):
+def execute(db, case, read=False, exact_numeric=False):
     import psycopg
 
     if re.search(
@@ -554,7 +613,11 @@ def execute(db, case, read=False):
         )
         with cursor:
             result = cursor_result(
-                cursor, case, read, allow_empty=negative_contract is not None
+                cursor,
+                case,
+                read,
+                allow_empty=negative_contract is not None,
+                exact_numeric=exact_numeric,
             )
             if negative_contract is not None:
                 if result["rows"]:
@@ -563,8 +626,10 @@ def execute(db, case, read=False):
             return result
 
 
-def cursor_result(cursor, case, read, allow_empty=False):
-    cursor.execute(case["sql"], parameters(case), binary=True)
+def cursor_result(cursor, case, read, allow_empty=False, exact_numeric=False):
+    cursor.execute(
+        case["sql"], execution_parameters(cursor.connection, case), binary=True
+    )
     # DECLARE ... FOR accepts SELECT, not arbitrary mutation statements.
     tag = "SELECT" if read else cursor.statusmessage.split()[0]
     if (read and tag != "SELECT") or (
@@ -600,6 +665,10 @@ def cursor_result(cursor, case, read, allow_empty=False):
                 )
                 if cursor.description[j].type_code in ARRAY_TYPES
                 and cursor.pgresult.get_value(i, j) is not None
+                else str(cell)
+                if exact_numeric
+                and cursor.description[j].type_code == 1700
+                and cell is not None
                 else encoded(cell)
                 for j, cell in enumerate(row)
             ]
@@ -687,8 +756,50 @@ def mutation_profile(constraint_profile="base"):
     return profile
 
 
+# Explicit zero-effect contracts, not a blanket exemption for empty fixtures.
+# Hashes bind the unchanged source statement; independent observers prove the
+# conflicting source population before the original mutation executes.
+MUTATION_NOOP_OBSERVERS = {
+    "sql-1432": (
+        "534b804c6a4a346076d39299fa092a7ea3df42318782e07c140cf163dab5fa15",
+        "SELECT count(*) FROM public.usage_records WHERE status = 'ready'",
+    ),
+    "sql-1462": (
+        "c482ec8edadb210d392d7db106be8ef2761fe87888781c6a586d8d33828d9854",
+        "SELECT count(*) FROM public.usage_records WHERE id = 'u1'",
+    ),
+}
+
+
+def mutation_noop_contract(db, case, profile, row_limit):
+    observer = MUTATION_NOOP_OBSERVERS.get(case["id"])
+    if observer is None:
+        return None
+    digest, query = observer
+    if (
+        hashlib.sha256(case["sql"].encode("utf-8")).hexdigest() != digest
+        or case["params"]
+        or profile.get("primary_key") != ["id"]
+    ):
+        raise ValueError(
+            "zero-effect mutation requires its exact source and primary owner"
+        )
+    eligible = db.execute(query).fetchone()[0]
+    if not 0 < eligible <= row_limit:
+        raise ValueError(
+            "zero-effect mutation has no bounded conflicting source population"
+        )
+    return {"kind": "primary_conflict_do_nothing", "eligible_rows": eligible}
+
+
 def mutation_reference(
-    db, cases, profile, row_limit=ROW_LIMIT, byte_limit=16 * 1024 * 1024
+    db,
+    cases,
+    profile,
+    row_limit=ROW_LIMIT,
+    byte_limit=16 * 1024 * 1024,
+    *,
+    negative_sqlstates=None,
 ):
     """Exact mutations, isolated by savepoints, with complete multi-table state.
 
@@ -702,6 +813,13 @@ def mutation_reference(
     from psycopg import sql
     from psycopg.generators import fetch
     from psycopg.pq import ExecStatus
+
+    negative_sqlstates = negative_sqlstates or {}
+    if set(negative_sqlstates) - {case["id"] for case in cases} or any(
+        not isinstance(code, str) or not re.fullmatch(r"[0-9A-Z]{5}", code)
+        for code in negative_sqlstates.values()
+    ):
+        raise ValueError("invalid explicit mutation rejection contracts")
 
     if psycopg.__version__ != "3.3.6":
         raise RuntimeError("mutation streaming oracle requires pinned psycopg 3.3.6")
@@ -772,6 +890,23 @@ def mutation_reference(
             "rows": rows,
             "sql_nulls": nulls,
         }
+
+    def capture_tables(tables, budget, label="mutation final state"):
+        states = {}
+        for table in tables:
+            columns = list(properties(table["schema"]))
+            query = sql.SQL("SELECT {} FROM public.{} ORDER BY {}").format(
+                sql.SQL(",").join(map(sql.Identifier, columns)),
+                sql.Identifier(table["name"]),
+                sql.SQL(",").join(map(sql.Identifier, columns)),
+            )
+            with StreamingMutationCursor(db) as cursor:
+                state = collect(cursor, query, None, budget, label)
+            if state.pop("command_tag") != "SELECT":
+                raise ValueError("invalid table state command")
+            state.pop("affected")
+            states[table["name"]] = state
+        return states
 
     tables = [
         {
@@ -861,7 +996,7 @@ def mutation_reference(
                 raise ValueError("mutation admission probe unexpectedly succeeded")
         for case in cases:
             try:
-                if re.search(
+                if case["id"] not in negative_sqlstates and re.search(
                     r"\b(CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|random|randomblob|gen_random_uuid)\b",
                     case["sql"],
                     re.I,
@@ -871,11 +1006,17 @@ def mutation_reference(
                     )
                 with db.transaction(force_rollback=True):
                     remaining = [byte_limit]
+                    noop = mutation_noop_contract(db, case, profile, row_limit)
+                    before = (
+                        capture_tables(tables, remaining, "mutation initial state")
+                        if noop is not None
+                        else None
+                    )
                     with StreamingMutationCursor(db) as cursor:
                         entry = collect(
                             cursor,
                             case["sql"],
-                            parameters(case),
+                            execution_parameters(db, case),
                             remaining,
                             "mutation RETURNING",
                         )
@@ -883,28 +1024,55 @@ def mutation_reference(
                     affected = entry["affected"]
                     if tag not in {"INSERT", "UPDATE", "DELETE", "MERGE"}:
                         raise ValueError("statement is not a mutation")
-                    if affected is None or not 0 < affected <= row_limit:
+                    if affected is None or not 0 <= affected <= row_limit:
                         raise ValueError(
                             "mutation is non-exercising or exceeds row budget"
                         )
-                    entry.update(id=case["id"], final_tables={})
-                    for table in tables:
-                        columns = list(properties(table["schema"]))
-                        query = sql.SQL("SELECT {} FROM public.{} ORDER BY {}").format(
-                            sql.SQL(",").join(map(sql.Identifier, columns)),
-                            sql.Identifier(table["name"]),
-                            sql.SQL(",").join(map(sql.Identifier, columns)),
+                    if noop is None and affected == 0:
+                        raise ValueError(
+                            "mutation is non-exercising without a zero-effect contract"
                         )
-                        with StreamingMutationCursor(db) as cursor:
-                            state = collect(
-                                cursor, query, None, remaining, "mutation final state"
+                    entry.update(
+                        id=case["id"], final_tables=capture_tables(tables, remaining)
+                    )
+                    if noop is not None:
+                        if (
+                            tag != "INSERT"
+                            or affected != 0
+                            or entry["rows"]
+                            or entry["final_tables"] != before
+                        ):
+                            raise ValueError(
+                                "zero-effect mutation changed its result or table state"
                             )
-                        if state.pop("command_tag") != "SELECT":
-                            raise ValueError("invalid final state command")
-                        state.pop("affected")
-                        entry["final_tables"][table["name"]] = state
+                        entry["noop_contract"] = noop
+                    if case["id"] in negative_sqlstates:
+                        raise ValueError(
+                            "declared mutation rejection unexpectedly succeeded"
+                        )
                     entries.append(entry)
             except (psycopg.Error, ValueError, KeyError, TypeError) as error:
+                if (
+                    case["id"] in negative_sqlstates
+                    and isinstance(error, psycopg.Error)
+                    and error.sqlstate == negative_sqlstates[case["id"]]
+                ):
+                    entries.append(
+                        {
+                            "id": case["id"],
+                            "sqlstate": error.sqlstate,
+                            "command_tag": "",
+                            "affected": 0,
+                            "columns": [],
+                            "column_oids": [],
+                            "rows": [],
+                            "sql_nulls": [],
+                            "final_tables": capture_tables(
+                                tables, [byte_limit], "rejected mutation final state"
+                            ),
+                        }
+                    )
+                    continue
                 excluded.append(
                     {
                         "id": case["id"],
@@ -946,7 +1114,32 @@ def aggregate_order_observer(case):
     )
 
 
-def read_reference(db, cases, profile):
+def join_order_observer(case, retain_offset=True):
+    """Expose original join peers without inventing a deterministic tie order.
+
+    The original executes unchanged. Only the independent witness drops LIMIT
+    and exposes its existing key. OFFSET is retained after separately proving
+    that its cut does not split a peer group.
+    """
+    if case.get("family") != "join":
+        raise ValueError("join witness requires an original join")
+    match = re.fullmatch(
+        r"(.+) ORDER BY (order_id|1|3) (ASC|DESC|USING >)( NULLS FIRST)? LIMIT ([0-9]+)(?: OFFSET ([0-9]+))?",
+        case["sql"],
+    )
+    if not match:
+        raise ValueError("original join witness shape changed")
+    body, key, direction, nulls, _, offset = match.groups()
+    if not body.startswith(("SELECT ", "WITH ")):
+        raise ValueError("original join witness source changed")
+    expression = "join_witness.amount" if key == "3" else "join_witness.order_id"
+    suffix = f" OFFSET {offset}" if retain_offset and offset else ""
+    # A wrapper preserves the body, including CTEs and IS DISTINCT FROM. Never
+    # splice at a textual FROM that could belong to a predicate or subquery.
+    return f"SELECT join_witness.*, {expression} AS order_key FROM ({body}) AS join_witness ORDER BY {expression} {direction}{nulls or ''}{suffix}"
+
+
+def read_reference(db, cases, profile, *, order_observers=None):
     import psycopg
 
     entries, excluded = [], []
@@ -960,10 +1153,36 @@ def read_reference(db, cases, profile):
             try:
                 with db.transaction(force_rollback=True):
                     db.execute("SET TRANSACTION READ ONLY")
-                    entry = execute(db, case, read=True)
-                    observer_sql = ORDER_OBSERVERS.get(
-                        case["id"]
-                    ) or aggregate_order_observer(case)
+                    entry = execute(
+                        db,
+                        case,
+                        read=True,
+                        exact_numeric=profile.get("exact_numeric", False),
+                    )
+                    observer_sql = (
+                        (order_observers or {}).get(case["id"])
+                        or ORDER_OBSERVERS.get(case["id"])
+                        or aggregate_order_observer(case)
+                    )
+                    if profile.get("original_join_witnesses"):
+                        observer_sql = join_order_observer(case)
+                        offset = re.search(r" OFFSET ([0-9]+)$", case["sql"])
+                        if offset:
+                            full = execute(
+                                db,
+                                {**case, "sql": join_order_observer(case, False)},
+                                read=True,
+                                exact_numeric=profile.get("exact_numeric", False),
+                            )
+                            cut = int(offset.group(1))
+                            if (
+                                cut <= 0
+                                or cut >= len(full["rows"])
+                                or full["rows"][cut - 1][-1] == full["rows"][cut][-1]
+                            ):
+                                raise ValueError(
+                                    "join OFFSET witness splits a peer group or has no following row"
+                                )
                     if "sql-1345" <= case["id"] <= "sql-1365":
                         # These originals sort by their projected amount. The
                         # observer exposes the full peer frontier, not a second
@@ -979,7 +1198,12 @@ def read_reference(db, cases, profile):
                                 1,
                             )
                     if observer_sql:
-                        observer = execute(db, {**case, "sql": observer_sql}, read=True)
+                        observer = execute(
+                            db,
+                            {**case, "sql": observer_sql},
+                            read=True,
+                            exact_numeric=profile.get("exact_numeric", False),
+                        )
                         groups = []
                         key = object()
                         for row, nulls in zip(
@@ -1001,7 +1225,155 @@ def read_reference(db, cases, profile):
         "profile": profile,
         "entries": entries,
         "excluded": excluded,
+        **(
+            {"exact_builtin_types": True} if profile.get("exact_numeric", False) else {}
+        ),
     }
+
+
+def numeric_window_profile():
+    """Unique ordered frontiers and exact NUMERIC outputs, not float oracles."""
+    profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
+    profile["exact_numeric"] = True
+    properties(profile["schema"])["amount"] = {
+        "type": "integer",
+        "x-antfly-sql-type": "int32",
+    }
+    template = deepcopy(profile["rows"][0]["value"])
+    profile["rows"] = []
+    for i in range(24):
+        value = deepcopy(template)
+        value.update(
+            id=f"window-{i:02}",
+            status="open",
+            tenant_id="window-tenant",
+            organization_id="window-org",
+            amount=3 * i + (1 if i % 2 else 2),
+            quantity=3,
+        )
+        profile["rows"].append({"key": value["id"], "value": value})
+    return profile
+
+
+def text_read_profile():
+    """Nonempty text witnesses; preserve the original SQL and parameters."""
+    profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
+    props = properties(profile["schema"])
+    props["status"]["nullable"] = True
+    props["email"]["nullable"] = True
+    # PostgreSQL chr accepts int4, not the storage-default int8.
+    props["amount"] = {"type": "integer", "x-antfly-sql-type": "int32"}
+    template = deepcopy(profile["rows"][0]["value"])
+    profile["rows"] = []
+    for i, status in enumerate(
+        [
+            "op_A",
+            "op%active",
+            "ACTIVE12",
+            "ACTIVE2",
+            "atest",
+            "étest",
+            "open",
+            "open",
+            "",
+            None,
+            "active",
+            "ready",
+        ]
+    ):
+        value = deepcopy(template)
+        value.update(
+            id=f"text-{i:02}",
+            status=status,
+            amount=[65, 66, 233, 128512, 67, 68, 69, 70, 0, 0, 71, 72][i],
+            quantity=i + 1,
+            organization_id=f"org-{i % 3}",
+            tenant_id="text-tenant",
+            created_at=f"2025-01-{i + 1:02}T00:00:00Z",
+            email=[
+                "ADA@EXAMPLE.TEST",
+                "grace@example.test",
+                "other@example.test",
+                None,
+            ][i % 4],
+        )
+        value["metadata"]["source"] = "manual" if i % 2 else "autoscale_delta"
+        profile["rows"].append({"key": value["id"], "value": value})
+    return profile
+
+
+def join_read_profile():
+    """Typed join witnesses with real duplicate rows, NULLs and missing peers."""
+    profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
+    props = properties(profile["schema"])
+    props["scope"] = {"type": "keyword", "nullable": True}
+    props["amount"]["nullable"] = True
+    props["enabled"]["nullable"] = True
+    profile["original_join_witnesses"] = True
+    for row in profile["rows"]:
+        value = row["value"]
+        value["scope"] = "read write"
+        if value["kind"] == "order":
+            value["metadata"]["source"] = "orders"
+        elif value["id"] == "c1":
+            value["name"] = "Ada"
+            value.pop("enabled")
+            value["metadata"]["source"] = "external"
+        else:
+            value["name"] = "ad_user"
+            value["scope"] = "write"
+
+    def row(key, identity, customer, name, *, kind="order", tenant="t3", amount=-2):
+        value = deepcopy(profile["rows"][0]["value"])
+        value.update(
+            id=identity,
+            customer_id=customer,
+            name=name,
+            kind=kind,
+            tenant_id=tenant,
+            amount=amount,
+            enabled=True,
+        )
+        value["metadata"] = {
+            "source": "orders" if kind == "order" else "external",
+            "flags": [],
+        }
+        return {"key": key, "value": value}
+
+    duplicate = row("duplicate-order-a", "00-dup", "dup", "Duplicate order")
+    duplicate_copy = deepcopy(duplicate)
+    duplicate_copy["key"] = "duplicate-order-b"
+    null_key = row("null-key", "00-null-key", "unused", "Null key", tenant="t1")
+    null_key["value"].pop("customer_id")
+    null_amount = row("null-amount", "99-null-amount", "c1", "Null amount", tenant="t1")
+    null_amount["value"].pop("amount")
+    profile["rows"].extend(
+        [
+            row("bot", "bot", "bot", "bot_automaton", kind="customer"),
+            row("duplicate-customer-a", "dup", "dup", "Dupe A", kind="customer"),
+            row("duplicate-customer-b", "dup", "dup", "Dupe B", kind="customer"),
+            row("shadow", "c1", "c1", "Shadow", kind="customer", tenant="other"),
+            duplicate,
+            duplicate_copy,
+            row("missing", "00-missing", "missing", "Missing customer", tenant="t1"),
+            null_key,
+            null_amount,
+        ]
+    )
+    customers = [
+        deepcopy(row) for row in profile["rows"] if row["value"]["kind"] == "customer"
+    ]
+    customers.append(
+        row("orphan", "orphan", "orphan", "Orphan", kind="customer", tenant="t1")
+    )
+    profile["additional_tables"] = [
+        {
+            "name": "customer_records",
+            "schema": deepcopy(profile["schema"]),
+            "rows": customers,
+        }
+    ]
+    return profile
 
 
 def set_read_profile():
@@ -1187,15 +1559,78 @@ def normalize_ordered_contract(entry):
     entry.pop("sql_nulls")
 
 
-def document_reference(db, cases, schemas):
+DOCUMENT_SLUG_IDS = {f"sql-{n:04}" for n in range(960, 967)}
+DOCUMENT_ARRAY_IDS = {
+    "sql-1007",
+    *[f"sql-{n:04}" for n in range(1018, 1023)],
+    "sql-1025",
+}
+DOCUMENT_POSITION_IDS = {f"sql-{n:04}" for n in range(1047, 1054)}
+
+
+def document_witness_rows(identity):
+    """Explicit matching rows; never rewrite original SQL or grant index proof."""
+    rows = deepcopy(SEEDS)
+    first = rows[0]["value"]
+    if identity in DOCUMENT_SLUG_IDS:
+        first["status"] = "Draft Launch"
+    elif identity in DOCUMENT_ARRAY_IDS:
+        first["metadata"]["flags"] = ["rated", "hot"]
+    elif identity in DOCUMENT_POSITION_IDS:
+        first["status"] = "warm"
+    elif identity == "sql-1091":
+        # Absent optional property is SQL NULL; explicit JSON null is a
+        # different document validation and projection contract.
+        del first["status"]
+    return rows
+
+
+DOCUMENT_NEGATIVE_IDS = {
+    "sql-0970",
+    "sql-0971",
+    "sql-0972",
+    "sql-0973",
+    "sql-0891",
+    "sql-0911",
+    "sql-0913",
+    "sql-0918",
+    "sql-0922",
+    "sql-0928",
+    "sql-0929",
+    "sql-0930",
+    "sql-0932",
+    "sql-0933",
+    "sql-0934",
+    "sql-0938",
+    "sql-0946",
+    "sql-1069",
+    "sql-1075",
+}
+
+
+def document_reference(db, cases, schemas, *, annotation_only=False):
     import psycopg
     from psycopg import sql
 
     entries, excluded = [], []
     for case in cases:
         schema = schemas[case["id"]]
+        seeds = document_witness_rows(case["id"]) if annotation_only else SEEDS
         raw = json.dumps(schema)
-        if '"generated"' in raw or "x-antfly-column-name" in raw:
+        generated_names = {
+            name for name, prop in properties(schema).items() if "generated" in prop
+        }
+        # Historical planner annotations are not active generated-column or
+        # index declarations in the public document schema. Qualify direct
+        # expressions independently of those annotations, but never claim
+        # generated-column reads/writes or path aliases from an inert profile.
+        uses_generated = any(
+            re.search(r"\b" + re.escape(name) + r"\b", case["sql"], re.I)
+            for name in generated_names
+        )
+        if "x-antfly-column-name" in raw or (
+            generated_names and (not annotation_only or uses_generated)
+        ):
             excluded.append(
                 {
                     "id": case["id"],
@@ -1206,7 +1641,7 @@ def document_reference(db, cases, schemas):
         try:
             with db.transaction(force_rollback=True):
                 props = properties(schema)
-                create_table(db, "docs", props, SEEDS, identity=True)
+                create_table(db, "docs", props, seeds, identity=True)
                 # SQL NULL and a missing document property are different
                 # physical states. PostgreSQL UPDATE OF triggers expose the
                 # actual assignment columns without parsing/rewriting the
@@ -1238,12 +1673,12 @@ def document_reference(db, cases, schemas):
                     ROW_LIMIT + 1
                 )
                 if len(final) > ROW_LIMIT or set(row[0] for row in final) - {
-                    seed["key"] for seed in SEEDS
+                    seed["key"] for seed in seeds
                 }:
                     raise ValueError("insert identity/default profile required")
                 stored = {row[0]: row[1:] for row in final}
                 expected = []
-                for seed in SEEDS:
+                for seed in seeds:
                     if seed["key"] not in stored:
                         continue
                     value = deepcopy(seed["value"])
@@ -1265,8 +1700,9 @@ def document_reference(db, cases, schemas):
                             value[name] = cell
                     expected.append({"key": seed["key"], "value": value})
                 native_schema = deepcopy(schema)
-                metadata = properties(native_schema).get("metadata")
-                if metadata is not None and metadata.get("type") == "json":
+                for metadata in properties(native_schema).values():
+                    if metadata.get("type") != "json":
+                        continue
                     # The source uses a historical relational-only shorthand
                     # for an object-valued document property. Publish the
                     # current document JSON Schema shape explicitly, retain
@@ -1274,9 +1710,31 @@ def document_reference(db, cases, schemas):
                     metadata["type"] = "object"
                     metadata["additionalProperties"] = True
                 entry.update(schema=schema, native_schema=native_schema, final=expected)
+                if seeds != SEEDS:
+                    entry["seeds"] = seeds
                 entries.append(entry)
         except (psycopg.Error, ValueError, KeyError, TypeError) as error:
-            excluded.append({"id": case["id"], "reason": str(error)})
+            if (
+                annotation_only
+                and case["id"] in DOCUMENT_NEGATIVE_IDS
+                and isinstance(error, psycopg.Error)
+                and error.sqlstate
+            ):
+                native_schema = deepcopy(schema)
+                for metadata in properties(native_schema).values():
+                    if metadata.get("type") == "json":
+                        metadata.update(type="object", additionalProperties=True)
+                entries.append(
+                    {
+                        "id": case["id"],
+                        "schema": schema,
+                        "native_schema": native_schema,
+                        "sqlstate": error.sqlstate,
+                        "final": deepcopy(SEEDS),
+                    }
+                )
+            else:
+                excluded.append({"id": case["id"], "reason": str(error)})
     return {
         "format": 2,
         "reference": "PostgreSQL exact SQL",
@@ -1293,10 +1751,15 @@ def main():
         "campaign",
         choices=[
             "read",
+            "digest_read",
+            "text_read",
+            "numeric_window",
             "typed_array_read",
             "aggregate_read",
             "set_read",
+            "join_read",
             "document",
+            "document_projection",
             "lateral",
             "mutation",
             "correlated_mutation",
@@ -1325,14 +1788,32 @@ def main():
         default=[],
         help="generate an explicit unchanged source cohort; cannot narrow a checked golden",
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="write generated reference JSON instead of stdout; incompatible with --check",
+    )
     args = parser.parse_args()
+    if args.output and args.check:
+        parser.error("--output cannot overwrite a checked golden")
     if args.only_id and (args.check or args.include):
         parser.error("--only-id cannot narrow a checked golden")
     if args.constraint_profile != "base" and args.campaign != "mutation":
         parser.error("constraint profiles require the mutation campaign")
     if args.include and not args.check:
         parser.error("--include requires a checked baseline golden")
-    manifest = json.loads((FIXTURES / f"sql_{args.campaign}_campaign.json").read_text())
+    manifest_name = (
+        "document" if args.campaign == "document_projection" else args.campaign
+    )
+    manifest = json.loads((FIXTURES / f"sql_{manifest_name}_campaign.json").read_text())
+    if args.campaign == "document_projection":
+        supplement = json.loads(
+            (FIXTURES / "sql_document_projection_campaign.json").read_text()
+        )
+        manifest["entries"].extend(supplement["entries"])
+        ids = [entry["id"] for entry in manifest["entries"]]
+        if len(ids) != len(set(ids)):
+            parser.error("document projection schemas contain duplicate IDs")
     requested = [entry["id"] for entry in manifest["entries"]]
     if args.only_id:
         requested = args.only_id
@@ -1356,15 +1837,25 @@ def main():
     with postgres() as db:
         if args.campaign in {
             "read",
+            "digest_read",
+            "text_read",
+            "numeric_window",
             "typed_array_read",
             "aggregate_read",
             "set_read",
             "lateral",
+            "join_read",
             "mutation",
             "correlated_mutation",
         }:
             profile = (
-                set_read_profile()
+                join_read_profile()
+                if args.campaign == "join_read"
+                else text_read_profile()
+                if args.campaign == "text_read"
+                else numeric_window_profile()
+                if args.campaign == "numeric_window"
+                else set_read_profile()
                 if args.campaign == "set_read"
                 else typed_array_read_profile()
                 if args.campaign == "typed_array_read"
@@ -1388,6 +1879,7 @@ def main():
                 db,
                 cases,
                 {entry["id"]: entry["schema"] for entry in manifest["entries"]},
+                annotation_only=args.campaign == "document_projection",
             )
         result["server_version"] = db.info.server_version
     if expected:
@@ -1413,7 +1905,18 @@ def main():
             f"Verified {len(result['entries'])} exact PostgreSQL {args.campaign} contracts"
         )
     else:
-        print(json.dumps(result, indent=2, allow_nan=False))
+        rendered = json.dumps(result, indent=2, allow_nan=False) + "\n"
+        if args.output:
+            if result["excluded"] or len(result["entries"]) != len(requested):
+                parser.error(
+                    f"reference not written: requested source contracts failed: {result['excluded']}"
+                )
+            args.output.write_text(rendered)
+            print(
+                f"Wrote {len(result['entries'])} exact PostgreSQL contracts to {args.output}"
+            )
+        else:
+            print(rendered, end="")
 
 
 if __name__ == "__main__":

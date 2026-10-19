@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 61;
+pub const abi_version: u32 = 67;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -738,6 +738,53 @@ pub const Status = enum(u32) {
     seed_replica_policy_mismatch = 778,
     document_artifact_publication_failed = 779,
     decision_limit_exceeded = 780,
+    catalog_occupancy_not_ready = 781,
+    immutable_relational_index_definition_conflict = 782,
+    invalid_index_publication_candidate = 783,
+    invalid_private_index_cancellation = 784,
+    invalid_private_index_claim_inventory = 785,
+    invalid_private_index_claim_receipt = 786,
+    invalid_private_index_inputs = 787,
+    invalid_private_index_native_receipt = 788,
+    invalid_private_index_owner_job = 789,
+    invalid_relational_index_progress = 790,
+    missing_relational_index_definitions = 791,
+    private_index_cancellation_pending = 792,
+    private_index_cancellation_required = 793,
+    private_index_job_required = 794,
+    private_index_owner_job_changed = 795,
+    private_index_publication_canceled = 796,
+    private_index_publication_required = 797,
+    relational_index_catalog_schema_mismatch = 798,
+    sql_invalid_power_argument = 799,
+    invalid_schema_reader_requirements = 800,
+    private_index_root_recovery_required = 801,
+    invalid_relational_index_budget = 802,
+    private_index_claim_backlog_full = 803,
+    unsupported_native_index_owner = 804,
+    invalid_schema_validation_job = 805,
+    schema_validation_job_changed = 806,
+    schema_validation_job_required = 807,
+    schema_validation_runtime_recovery_required = 808,
+    invalid_schema_owner_control = 809,
+    invalid_schema_validation_page_command = 810,
+    invalid_nullability_replay = 811,
+    schema_validation_canceled = 812,
+    schema_validation_not_ready = 813,
+    schema_validation_publication_required = 814,
+    schema_validation_cancellation_required = 815,
+    invalid_ordered_apply_receipt = 816,
+    conflicting_ordered_apply_receipt = 817,
+    index_owner_receipt_changed = 818,
+    invalid_sql_view_record = 819,
+    sql_view_cycle = 820,
+    sql_view_column_rename = 821,
+    sql_view_column_type_changed = 822,
+    sql_view_column_dropped = 823,
+    sql_dependent_objects_exist = 824,
+    sql_program_limit_exceeded = 825,
+    relational_check_violation = 826,
+    foreign_key_match_full_violation = 827,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -776,6 +823,12 @@ pub const FailureIdentity = extern struct {
         return self.error_name[0..@min(self.error_name_len, failure_error_name_capacity)];
     }
 };
+
+test "concurrent main and SQL statuses retain distinct wire identities" {
+    const std_test = @import("std");
+    try std_test.testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
+    try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.catalog_occupancy_not_ready));
+}
 
 test "released main Status identifiers retain their exact names and numeric values" {
     @setEvalBranchQuota(10_000);

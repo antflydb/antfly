@@ -1,0 +1,96 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "format": 1,
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword",
+                "nullable": true
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "r1",
+        "value": {
+          "id": "u1",
+          "status": "ACTIVE"
+        }
+      },
+      {
+        "key": "r2",
+        "value": {
+          "id": "u2",
+          "status": "ACTIVE"
+        }
+      },
+      {
+        "key": "r3",
+        "value": {
+          "id": "u3",
+          "status": "active"
+        }
+      },
+      {
+        "key": "r4",
+        "value": {
+          "id": "u4",
+          "status": null
+        }
+      },
+      {
+        "key": "r5",
+        "value": {
+          "id": "u5",
+          "status": "h\u00e9llo\ud83d\ude00"
+        }
+      }
+    ]
+  },
+  "entries": [
+    {
+      "id": "sql-0257",
+      "columns": [
+        "status_md5"
+      ],
+      "rows": [
+        [
+          "18ff74f43da410c5529f7d6fca84f115"
+        ],
+        [
+          "18ff74f43da410c5529f7d6fca84f115"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    }
+  ],
+  "excluded": [],
+  "server_version": 180006
+}

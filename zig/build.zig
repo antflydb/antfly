@@ -297,6 +297,18 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_numeric_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, numeric_tests);
     b.step("sql-numeric-test", "Run isolated exact NUMERIC arithmetic row and key contracts").dependOn(&run_numeric_tests.step);
 
+    const temporal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/temporal_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_temporal_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, temporal_tests);
+    b.step("sql-temporal-test", "Verify native typed temporal domains and PostgreSQL binary precision").dependOn(&run_temporal_tests.step);
+
     const exact_float_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("pkg/antfly-embedded/src/common/json_float_decimal.zig"),
@@ -788,6 +800,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const unit_test_step = owner_tests.unit_test_step;
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
+    unit_test_step.dependOn(&run_temporal_tests.step);
     unit_test_step.dependOn(&run_exact_float_tests.step);
     unit_test_step.dependOn(&run_capture_regex_tests.step);
     unit_test_step.dependOn(&run_sql_regex_tests.step);
@@ -1024,6 +1037,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     }
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, lmdb_engine_mod, runtime_library_artifacts);
+    const storage_failure_identity_tests = b.addTest(.{ .root_module = production_antfly_imports.storage_boundary.identity });
+    storage_owner_runs.runs[0].step.dependOn(&b.addRunArtifact(storage_failure_identity_tests).step);
     b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);
     b.step("antfly-storage-owner-source-test", "Run compiled owner source and callback regressions").dependOn(&storage_owner_runs.runs[1].step);
     for (storage_owner_runs.runs) |run| {

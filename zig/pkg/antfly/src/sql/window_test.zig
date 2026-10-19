@@ -359,7 +359,7 @@ test "SQL unused named windows validate without evaluating discarded expressions
     try std.testing.expectEqualStrings("1", quoted_result.output.rows[0][0].string);
     var missing_order = try compiler.compile(std.testing.allocator, "SELECT 1 WINDOW unused AS (RANGE 1 PRECEDING)", .{});
     defer missing_order.deinit();
-    try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, backend.backend(), &missing_order, &.{}, .{}));
+    try std.testing.expectError(error.SqlWindowingError, runtime.execute(std.testing.allocator, backend.backend(), &missing_order, &.{}, .{}));
     var wrong_type = try compiler.compile(std.testing.allocator, "SELECT 1 WINDOW unused AS (ORDER BY 'a' RANGE 1 PRECEDING)", .{});
     defer wrong_type.deinit();
     try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, backend.backend(), &wrong_type, &.{}, .{}));
@@ -489,6 +489,7 @@ test "SQL window shape infers frame value and offset parameters before execution
     var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{});
     defer description.deinit();
     for (description.binding.parameter_types) |kind| try std.testing.expectEqual(ast.ColumnType.integer, kind.?);
+    try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int32), description.binding.parameter_descriptors[4].element_type);
     var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{ .{ .integer = 7 }, .{ .integer = 2 }, .{ .integer = 1 }, .{ .integer = 9 }, .{ .integer = 2 } }, .{});
     defer result.deinit();
     for (result.output.rows[0], [_]i64{ 8, 9, 1 }) |value, want| try std.testing.expectEqual(want, try std.fmt.parseInt(i64, value.string, 10));

@@ -6909,6 +6909,7 @@ pub const MetadataAdminVoprSource = struct {
             // publication/coordination protocols. Keep these explicit so a
             // newly added Call remains visible to exhaustive compilation.
             .lake_index_lifecycle_read,
+            .sql_view_mutate,
             .lake_index_lifecycle_work,
             .lake_index_lifecycle_mutate,
             .relation_replace,
@@ -6925,7 +6926,15 @@ pub const MetadataAdminVoprSource = struct {
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
+            .relational_index_owner_decision,
+            .relational_index_owner_ack,
+            .relational_index_owner_ack_status,
+            .relational_index_source_accept,
+            .relational_index_source_complete,
+            .relational_index_source_accept_status,
             .fk_initial_create_prepare,
+            .constraint_name_prepare,
+            .constraint_name_check,
             .fk_initial_child_decision,
             .fk_initial_create_begin,
             .fk_initial_create_mutate,

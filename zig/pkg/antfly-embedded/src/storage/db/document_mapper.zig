@@ -496,11 +496,6 @@ pub const PreparedRelationalWrite = struct {
                 if (!column.is_json or column.json_kind != .any) return error.InvalidBatchRequest;
                 const datum = parsed.value.object.get(name) orelse return error.InvalidBatchRequest;
                 if (datum != .null or (try seen.getOrPut(scratch, name)).found_existing) return error.InvalidBatchRequest;
-                // Generated fields are output-only. Their expression result
-                // owns its null semantics, regardless of submitted metadata.
-                if (!preserve_logical_values) if (validator) |compiled| if (compiled.execution.expressions) |expressions| {
-                    if (expressions.generated_columns[ordinal]) continue;
-                };
                 try effective_json_null_fields.append(scratch, name);
             }
         }
@@ -509,12 +504,11 @@ pub const PreparedRelationalWrite = struct {
             // schema boundary as CHECKs, extraction, indexes and logical hash.
             // Durable intents have already crossed it and must never evaluate
             // the current expression plan again during replay.
-            if (effective_json_null_fields.items.len != 0)
-                try compiled.prepareTypedValue(parsed.arena.allocator(), scratch, &parsed.value, effective_json_null_fields.items, preserve_logical_values)
-            else if (preserve_logical_values)
-                try compiled.validateValue(scratch, &parsed.value)
-            else
-                try compiled.prepareValue(parsed.arena.allocator(), scratch, &parsed.value);
+            const prepared = try compiled.prepareTypedValueWithNulls(parsed.arena.allocator(), scratch, &parsed.value, effective_json_null_fields.items, preserve_logical_values);
+            // The result belongs to the parsed row region and remains alive
+            // through extraction, physical encoding and semantic hashing.
+            effective_json_null_fields.clearRetainingCapacity();
+            try effective_json_null_fields.appendSlice(scratch, prepared.fields);
         };
 
         var extracted = extractWriteFromParsedPrepared(
@@ -4339,6 +4333,7 @@ fn buildRelationalRowValueFromParsedInternal(
             column: runtime_schema.RelationalColumn,
             found: std.json.Value,
             json_literal_null: bool,
+            preserve_json_display: bool,
             owned_buffers: *std.ArrayListUnmanaged([]u8),
         ) !relational_row_codec.Cell {
             const value_type = relationalValueType(column.column_type);
@@ -4380,7 +4375,10 @@ fn buildRelationalRowValueFromParsedInternal(
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
             } else if (column.is_json) blk: {
-                const encoded = try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
+                const encoded = if (preserve_json_display)
+                    try document_content_hash.canonicalJsonStorageValueAlloc(output_alloc, found)
+                else
+                    try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
@@ -4421,6 +4419,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 for (json_null_fields) |name| {
                     if (std.mem.eql(u8, name, entry.key_ptr.*)) break true;
                 } else false,
+                table_schema.requires_jsonb_display,
                 &owned,
             ));
         }
@@ -4447,7 +4446,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 return std.mem.lessThan(u8, schema_columns[lhs.ordinal].name, schema_columns[rhs.ordinal].name);
             }
         }.lessThan);
-        const digest = try document_content_hash.hashRelationalSparseCellsCanonical(cells.items, table_schema);
+        const digest = try document_content_hash.hashRelationalSparseCellsCanonical(scratch, cells.items, table_schema);
         std.mem.sort(relational_row_codec.Cell, cells.items, {}, ordinalSort);
         break :blk digest;
     } else blk: {
@@ -4477,6 +4476,7 @@ fn buildRelationalRowValueFromParsedInternal(
             target += 1;
         }
         const digest = try document_content_hash.hashRelationalIndexedCellsCanonical(
+            scratch,
             cells.items,
             table_schema,
             physical_layout.hash_ordinals,

@@ -24,6 +24,28 @@ pub const StorageMode = @import("antfly_schema_openapi").TableStorageMode;
 const relational_wire = @import("antfly_schema_openapi");
 const relational_native = @import("../storage/relational_index.zig");
 
+fn validateIndexPredicate(condition: relational_wire.RelationalIndexPredicate) !void {
+    if (condition.constant != null) {
+        if (condition.column != null or condition.op != null or condition.value != null or condition.collation != null)
+            return error.InvalidSchemaUpdateRequest;
+    } else {
+        const column = condition.column orelse return error.InvalidSchemaUpdateRequest;
+        if (column.len == 0 or condition.op == null) return error.InvalidSchemaUpdateRequest;
+        if (condition.collation) |collation| if (collation.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn indexPredicate(alloc: std.mem.Allocator, condition: relational_wire.RelationalIndexPredicate) !relational_native.UniquePredicate {
+    try validateIndexPredicate(condition);
+    return .{
+        .constant = condition.constant,
+        .field = condition.column orelse "",
+        .op = TableSchema.nativeEnum(relational_native.RelationalCheckOp, condition.op orelse .eq),
+        .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
+        .collation = condition.collation,
+    };
+}
+
 pub const TableSchema = struct {
     version: u32 = 0,
     storage_mode: StorageMode = .document,
@@ -78,12 +100,7 @@ pub const TableSchema = struct {
             };
             const conditions: []const relational_wire.RelationalIndexPredicate = declaration.where orelse &.{};
             const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
-            for (conditions, where) |condition, *target| target.* = .{
-                .field = condition.column,
-                .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
-                .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
-                .collation = condition.collation,
-            };
+            for (conditions, where) |condition, *target| target.* = try indexPredicate(alloc, condition);
             definition.* = .{
                 .name = declaration.name,
                 .columns = declaration.columns orelse &.{},
@@ -143,12 +160,7 @@ pub const TableSchema = struct {
             };
             const conditions: []const relational_wire.RelationalIndexPredicate = declaration.where orelse &.{};
             const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
-            for (conditions, where) |condition, *target| target.* = .{
-                .field = condition.column,
-                .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
-                .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
-                .collation = condition.collation,
-            };
+            for (conditions, where) |condition, *target| target.* = try indexPredicate(alloc, condition);
             definition.* = .{ .name = declaration.name, .keys = keys, .include_columns = declaration.include_columns orelse &.{}, .where = where, .owner_kind = .table, .owner_name = relational_native.relational_table_index_owner_name, .access_method = .ordered_tuple };
         }
         return definitions;
@@ -1108,9 +1120,9 @@ pub fn validateDocumentValueWithPlan(
     if (compiled == null and schema.storage_mode == .relational) {
         var plan = try CompiledValidationPlan.init(alloc, schema);
         defer plan.deinit(alloc);
-        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false, null);
+        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false, null, null);
     }
-    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null);
+    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null, null);
 }
 
 /// The only boundary that skips verification owns both expression evaluation
@@ -1132,32 +1144,115 @@ pub fn prepareDocumentValueWithPlan(
         try expressions.applyJsonWithExecution(&execution, value);
         try compiled.normalizeSql(&execution, value, false, .derived);
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution, null);
 }
 
-/// Typed null metadata is schema-checked by the row preparer before entering
-/// this boundary. Pointer identity scopes the exception to the exact root
-/// datums; nested nulls and unrelated SQL NULLs retain ordinary validation.
+/// Compatibility boundary for callers that cannot consume changed metadata.
+/// New row preparers retain the owned result from the typed boundary below.
 pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !void {
+    const prepared = try prepareTypedDocumentWithNulls(owned_alloc, scratch, schema, value, physical_fields, compiled, json_null_fields, preserve);
+    defer prepared.deinit(owned_alloc);
+    // Legacy representation-only callers cannot silently drop changed datum
+    // semantics. Row preparation consumes the returned authority instead.
+    if (prepared.fields.len != json_null_fields.len) return error.InvalidBatchRequest;
+    for (prepared.fields) |name| {
+        const found = for (json_null_fields) |input| {
+            if (std.mem.eql(u8, name, input)) break true;
+        } else false;
+        if (!found) return error.InvalidBatchRequest;
+    }
+}
+
+/// Owned semantic metadata, never a borrowed snapshot of a retired row owner.
+pub const PreparedJsonNulls = struct {
+    fields: []const []const u8,
+
+    pub fn deinit(self: PreparedJsonNulls, alloc: std.mem.Allocator) void {
+        for (self.fields) |name| alloc.free(name);
+        alloc.free(self.fields);
+    }
+};
+
+pub fn prepareTypedDocumentWithNulls(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !PreparedJsonNulls {
     try compiled.requireSchema(schema);
     if (value.* != .object) return error.InvalidBatchRequest;
     const expressions_module = @import("relational_expression.zig");
+    const operands = @import("../sql/row_value.zig");
     var budget: usize = expressions_module.max_allocated_bytes;
     var execution = expressions_module.Execution.init(owned_alloc, &budget);
+    var roots: operands.JsonRow = undefined;
+    roots.init(owned_alloc, budget, &execution.numeric);
+    defer roots.deinit();
+    try roots.bindAdmission(&budget);
+    var nulls: operands.JsonNulls = undefined;
+    nulls.init(owned_alloc, budget, &execution.numeric);
+    defer nulls.deinit();
+    try nulls.bindAdmission(&budget);
+    const document_schema = try resolveDocumentSchema(schema, value.object);
+    // Authenticate at this shared boundary, including document-table callers.
+    // Property dispatch reuses the immutable compiled map for wide schemas.
+    for (json_null_fields) |name| {
+        try execution.charge(1 +| name.len);
+        const resolved = document_schema orelse return error.InvalidBatchRequest;
+        const property = compiled.findProperty(resolved.properties, name) orelse return error.InvalidBatchRequest;
+        const json_column = if (schema.storage_mode == .document)
+            @import("../sql/document_row.zig").propertyType(property) == .json
+        else if (property.field_type) |kind|
+            std.mem.eql(u8, kind, "json")
+        else
+            false;
+        if (!json_column) return error.InvalidBatchRequest;
+        const datum = value.object.get(name) orelse return error.InvalidBatchRequest;
+        if (datum != .null) return error.InvalidBatchRequest;
+    }
+    nulls.import(json_null_fields) catch |err| return switch (err) {
+        error.InvalidSqlProgram => error.InvalidBatchRequest,
+        error.SqlProgramLimitExceeded => error.RelationalExpressionBudgetExceeded,
+        else => err,
+    };
     if (!preserve) {
         try compiled.normalizeSql(&execution, value, false, .base);
         if (compiled.expressions) |expressions| {
-            try expressions.applyJsonWithExecution(&execution, value);
+            try expressions.applyTypedJsonWithExecution(&execution, value, &roots, &nulls);
             try compiled.normalizeSql(&execution, value, false, .derived);
         }
     }
-    const pointers = try scratch.alloc(*const std.json.Value, json_null_fields.len);
+    const names = nulls.snapshot() catch |err| return switch (err) {
+        error.SqlProgramLimitExceeded => error.RelationalExpressionBudgetExceeded,
+        else => err,
+    };
+    const pointer_bytes = std.math.mul(usize, names.len, @sizeOf(*const std.json.Value)) catch return execution.limit();
+    if (pointer_bytes > budget) return execution.limit();
+    budget -= pointer_bytes;
+    const pointers = try scratch.alloc(*const std.json.Value, names.len);
     defer scratch.free(pointers);
-    for (json_null_fields, pointers) |name, *pointer| {
+    for (names, pointers) |name, *pointer| {
         pointer.* = value.object.getPtr(name) orelse return error.InvalidBatchRequest;
         if (pointer.*.* != .null) return error.InvalidBatchRequest;
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers, !preserve, &execution);
+    // Typed restore checks the actual null provenance, never repairs it.
+    if (preserve) {
+        // Domain/canonical admission precedes evaluation, just as on ordinary
+        // restore. Verification must not run on unadmitted typed input.
+        try compiled.normalizeSql(&execution, value, true, .all);
+        if (compiled.expressions) |expressions|
+            try expressions.verifyTypedJsonWithExecution(&execution, value.*, names);
+    }
+    try validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, pointers, true, &execution, &nulls);
+    var output_bytes = std.math.mul(usize, names.len, @sizeOf([]const u8)) catch return execution.limit();
+    for (names) |name| output_bytes = std.math.add(usize, output_bytes, name.len) catch return execution.limit();
+    if (output_bytes > budget) return execution.limit();
+    budget -= output_bytes;
+    const fields = try owned_alloc.alloc([]const u8, names.len);
+    errdefer owned_alloc.free(fields);
+    var copied: usize = 0;
+    errdefer for (fields[0..copied]) |name| owned_alloc.free(name);
+    for (names, fields) |name, *field| {
+        try execution.charge(1 +| name.len);
+        field.* = try owned_alloc.dupe(u8, name);
+        copied += 1;
+    }
+    return .{ .fields = fields };
 }
 
 fn validateDocumentValueInternal(
@@ -1172,6 +1267,10 @@ fn validateDocumentValueInternal(
     // assertion on restore or public validation. Expressions have already run.
     sql_admitted: bool,
     shared_execution: ?*@import("relational_expression.zig").Execution,
+    // Only typed preparation supplies this schema-authenticated owner. Keep
+    // its identity and allowance through CHECKs; pointers alone only authorize
+    // recursive property validation and cannot recreate SQL null provenance.
+    json_null_owner: ?*@import("../sql/row_value.zig").JsonNulls,
 ) !void {
     if (compiled) |plan| try plan.requireSchema(schema);
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
@@ -1278,11 +1377,19 @@ fn validateDocumentValueInternal(
     }
     if (schema.checks) |checks| if (checks.value.len != 0) {
         if (compiled) |plan| {
-            if (try plan.checks.?.firstViolationJsonWithExecution(execution, value.*) != null) return error.RelationalCheckViolation;
+            const violation = if (json_null_owner) |owner|
+                try plan.checks.?.firstViolationTypedJsonWithExecution(execution, value.*, owner)
+            else
+                try plan.checks.?.firstViolationJsonWithExecution(execution, value.*);
+            if (violation != null) return error.RelationalCheckViolation;
         } else {
             var plan = try CompiledValidationPlan.init(alloc, schema);
             defer plan.deinit(alloc);
-            if (try plan.checks.?.firstViolationJsonWithExecution(execution, value.*) != null) return error.RelationalCheckViolation;
+            const violation = if (json_null_owner) |owner|
+                try plan.checks.?.firstViolationTypedJsonWithExecution(execution, value.*, owner)
+            else
+                try plan.checks.?.firstViolationJsonWithExecution(execution, value.*);
+            if (violation != null) return error.RelationalCheckViolation;
         }
     };
 }
@@ -2680,6 +2787,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             for (includes) |column| if (column.len == 0 or (try columns.getOrPut(alloc, column)).found_existing) return error.InvalidSchemaUpdateRequest;
             const conditions: []const relational_wire.RelationalIndexPredicate = index.where orelse &.{};
             if (conditions.len > 256) return error.InvalidSchemaUpdateRequest;
+            for (conditions) |condition| try validateIndexPredicate(condition);
         }
     }
     if (root.get("checks")) |checks| {
@@ -2753,6 +2861,9 @@ fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value
         for (parsed.value[0..i]) |prior| if (std.mem.eql(u8, prior.name, item.name)) return error.InvalidSchemaUpdateRequest;
         const columns = if (T == relational_wire.RelationalUniqueConstraint) item.columns orelse &.{} else item.child_columns;
         if (T == relational_wire.RelationalUniqueConstraint) {
+            const conditions = item.where orelse &.{};
+            if (conditions.len > 256) return error.InvalidSchemaUpdateRequest;
+            for (conditions) |condition| try validateIndexPredicate(condition);
             if (item.timing == .deferred and !(item.deferrable orelse false)) return error.InvalidSchemaUpdateRequest;
             if ((item.columns != null) == (item.keys != null)) return error.InvalidSchemaUpdateRequest;
             if (item.keys) |keys| {
@@ -2958,7 +3069,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         for (indexes.value) |index| {
             for (index.keys) |key| if (key.column) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
             for (index.include_columns orelse &.{}) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
-            for (index.where orelse &.{}) |condition| if (findDocumentProperty(document_schema.properties, condition.column) == null) return error.InvalidSchemaUpdateRequest;
+            for (index.where orelse &.{}) |condition| if (condition.column) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
         }
     }
     if (schema.default_type.len != 0 and !std.mem.eql(u8, schema.default_type, document_schema.name)) {
@@ -3184,7 +3295,7 @@ test "relational declarations validation shares one allowance across NUMERIC con
     defer document.deinit();
     var budget: usize = expressions.max_allocated_bytes;
     var row = expressions.Execution.init(a, &budget);
-    try validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row);
+    try validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null);
     const used = 8 * 1024 * 1024 - row.numeric.remaining;
     try std.testing.expect(used > 1);
     try std.testing.expect(budget < expressions.max_allocated_bytes - @sizeOf(@import("numeric_constraints.zig").Execution));
@@ -3193,9 +3304,9 @@ test "relational declarations validation shares one allowance across NUMERIC con
     budget = expressions.max_allocated_bytes;
     row = expressions.Execution.init(a, &budget);
     row.numeric.remaining = used - 1;
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null));
     row.numeric.remaining = 8 * 1024 * 1024;
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null));
 }
 
 test "relational declarations exact NUMERIC preparation lends sticky quotas to recursive constraints" {

@@ -271,9 +271,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) return error.ReadOnly;
             if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
+            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
             var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
-            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
             if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
             const total_start_ns = monotonicTimeNs();
@@ -3138,6 +3138,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.RowPolicyMutationUnsupported;
             const bundle = if (S.ownerField(self, "local_execution").*.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
             const schema = schema_view.tableSchema().*;
+            var requirements = try @import("row_policy_bundle.zig").MutationRequirements.init(S.ownerField(self, "alloc").*, req.predicates, principal);
+            defer requirements.deinit(S.ownerField(self, "alloc").*);
+            const select_check = if (requirements.needsSelect()) try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .select) else null;
+            defer if (select_check) |evaluation| evaluation.deinit();
             var insert_check = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .insert);
             defer insert_check.deinit();
             var update_old = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .update_old);
@@ -3150,6 +3154,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer probe.abort();
             for (req.writes, 0..) |write, i| {
                 if (isMetadataKey(write.key)) return error.RowPolicyMutationUnsupported;
+                const requirement = try requirements.forKey(write.key);
+                if (requirement.isDelete()) return error.RowPolicyAuthenticationRequired;
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
                 defer S.ownerField(self, "alloc").*.free(store_key);
                 const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
@@ -3157,20 +3163,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else => return err,
                 };
                 if (old_bytes) |bytes| {
+                    if (requirement.isInsert()) return error.RowPolicyDenied;
                     if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
                     const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
                         try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
                     else
                         try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
                     if (!try update_old.permits(old)) return error.RowPolicyDenied;
+                    if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
                 }
+                if (old_bytes == null and requirement.isUpdate()) return error.RowPolicyDenied;
                 const prepared = prepared_rows.?[i] orelse return error.RowPolicyMutationUnsupported;
                 const new = try relational_row_codec.ordinalRowViewTrusted(prepared.packed_row, schema, schema_view.physicalLayout());
                 if (!try (if (old_bytes != null) update_new else insert_check).permits(new))
                     return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(new)) return error.RowPolicyDenied;
             }
             for (req.deletes) |key| {
                 if (isMetadataKey(key)) return error.RowPolicyMutationUnsupported;
+                const requirement = try requirements.forKey(key);
+                if (requirement.isInsert() or requirement.isUpdate()) return error.RowPolicyAuthenticationRequired;
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, key);
                 defer S.ownerField(self, "alloc").*.free(store_key);
                 const bytes = probe.getLeased(store_key) catch |err| switch (err) {
@@ -3183,13 +3195,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else
                     try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
                 if (!try delete_old.permits(old)) return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
             }
         }
 
         pub fn ensureDurableReplicationStartupBarrier(self: anytype) !void {
             // A failed primary append must complete before a later mutation can
             // overtake its afterimage in the hot-standby tail.
-            while (S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
+            while (S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) {
+                // The admission flag closes an ordering gap, not a hint-only
+                // spin loop. Force a bounded truth scan even if another hint
+                // is stale or staging aborted before its transaction commit.
+                S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
+                try self.flushDurableReplicationOutboxes();
+            }
             if (!S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.load(.acquire) and
                 !S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.load(.acquire)) return;
             const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
@@ -3363,9 +3382,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mirror = switch (kind) {
                     .batch, .restore_batch => S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
                     .replay, .primary_effect => S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
-                    .schema, .row_policy => S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
+                    .schema, .row_policy, .metadata_control => S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
                 } orelse return error.ReplicationPublisherUnavailable;
-                if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
+                if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and kind != .metadata_control and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
                 var ctx = self.batchContext();
                 try recoverDurableReplicationOutboxContext(&ctx, mirror, outbox, kind);
                 // The key names this exact mutation, so concurrent publishers cannot

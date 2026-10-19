@@ -37,6 +37,21 @@ it("exports generated NUMERIC scalar and array result modifiers", () => {
   }
 });
 
+it.each([false, true])("retains JSON null identity with optional value present=%s", (withValue) => {
+  const expression: RelationalScalarExpression = {
+    op: "literal",
+    type: "json",
+    json_null: true,
+    ...(withValue ? { value: null } : {}),
+  };
+  expect(JSON.parse(JSON.stringify(expression))).toEqual(expression);
+  const consumer: RelationalScalarExpression = {
+    op: "jsonb_typeof",
+    args: [expression],
+  };
+  expect(JSON.parse(JSON.stringify(consumer)).args[0].json_null).toBe(true);
+});
+
 it("exports exact NUMERIC schema and expression identities without rounding literal text", () => {
   const kind: SQLBuiltinType = "numeric";
   const expression: RelationalScalarExpression = {

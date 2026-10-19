@@ -33,7 +33,7 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
     defer entries.deinit(alloc);
     for (schema.document_schemas) |document| {
         for (document.properties) |property| {
-            if (std.mem.eql(u8, property.name, "_id")) continue;
+            if (std.mem.eql(u8, property.name, "_id") or std.mem.eql(u8, property.name, "_doc") or std.mem.eql(u8, property.name, "_version")) continue;
             const kind = propertyType(property);
             const element_type = if (comptime @hasField(@TypeOf(property), "sql_type"))
                 if (property.sql_type) |identity| @import("../common/sql_builtin_type.zig").Type.fromWire(identity) else null
@@ -73,6 +73,33 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
     return columns;
 }
 
+/// One declared-column derivation for query caches and durable dependency
+/// admission. Output and partial allocations belong to the caller's arena.
+pub fn deriveRelationalColumnsLeaky(owned: std.mem.Allocator, temporary: std.mem.Allocator, parsed: anytype, native: anytype) ![]const catalog.Column {
+    if (native.storage_mode != .relational) return error.UnsupportedSqlExecution;
+    var generated: std.StringHashMapUnmanaged(void) = .empty;
+    defer generated.deinit(temporary);
+    if (parsed.generated_columns) |items| {
+        if (items.value != .array) return error.InvalidSqlBackendResponse;
+        for (items.value.array.items) |item| {
+            if (item != .object) return error.InvalidSqlBackendResponse;
+            const name = item.object.get("column") orelse return error.InvalidSqlBackendResponse;
+            if (name != .string) return error.InvalidSqlBackendResponse;
+            try generated.put(temporary, name.string, {});
+        }
+    }
+    const columns = try owned.alloc(catalog.Column, native.relational_columns.len);
+    for (native.relational_columns, columns) |column, *out| {
+        out.* = try catalog.Column.fromRelational(column);
+        out.name = try owned.dupe(u8, column.name);
+        out.path = try owned.dupe(u8, column.path);
+        out.generated = generated.contains(column.name);
+        out.defaulted = catalog.hasColumnDefault(parsed, column.name);
+        out.type = relationalType(parsed, column.name, out.type);
+    }
+    return columns;
+}
+
 /// Recover logical UUID semantics without changing the physical keyword layout.
 pub fn relationalType(schema: anytype, name: []const u8, physical: ast.ColumnType) ast.ColumnType {
     if (physical != .string) return physical;
@@ -82,7 +109,9 @@ pub fn relationalType(schema: anytype, name: []const u8, physical: ast.ColumnTyp
     return physical;
 }
 
-fn propertyType(property: anytype) ast.ColumnType {
+/// Shared declared-domain classification for document SQL reads and typed
+/// preparation. JSON arrays are distinct from SQL arrays, including jsonb[].
+pub fn propertyType(property: anytype) ast.ColumnType {
     if (property.field_type) |name| if (std.mem.eql(u8, name, "sql_array")) return .array;
     if (comptime @hasField(@TypeOf(property), "sql_type")) {
         if (property.sql_type == .uuid) return .uuid;
@@ -97,6 +126,23 @@ fn propertyType(property: anytype) ast.ColumnType {
     if (std.mem.eql(u8, name, "string") or std.mem.eql(u8, name, "text") or
         std.mem.eql(u8, name, "keyword") or std.mem.eql(u8, name, "html") or std.mem.eql(u8, name, "link")) return .string;
     return .json;
+}
+
+test "SQL document version is native envelope metadata not a schema property" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{.{ .name = "title", .path = "title", .type = .string }} };
+    const raw = try std.json.parseFromSliceLeaky(Json, a, "{\"_version\":999,\"title\":\"visible\"}", .{});
+    const row = try projectValue(a, table, "a", 42, raw, &.{ "_version", "title" });
+    try std.testing.expectEqual(@as(i64, 42), (try row.cell("_version")).value.integer);
+    try std.testing.expect(try row.hasField("_version"));
+    const scan: catalog.Scan = .{ .fields = &.{ "_version", "title" }, .limit = 1 };
+    const physical = try scan.physicalFields(a, table);
+    try std.testing.expectEqual(@as(usize, 1), physical.len);
+    try std.testing.expectEqualStrings("title", physical[0]);
+    const relational: catalog.Row = .{ .id = "a", .version = 42, .value = raw };
+    try std.testing.expectEqual(@as(i64, 999), (try relational.cell("_version")).value.integer);
 }
 
 test "SQL UUID schema projection retains typed column and canonical cell" {
@@ -146,6 +192,7 @@ pub fn declaredCell(alloc: std.mem.Allocator, column: catalog.Column, raw: catal
 pub const Projection = struct {
     columns: []const catalog.Column,
     has_typed_cells: bool = false,
+    document_root: bool = false,
     source_slots: std.StringHashMapUnmanaged(usize) = .empty,
     next_source: []usize = &.{},
 
@@ -158,7 +205,7 @@ pub const Projection = struct {
         defer selected.deinit(alloc);
         for (fields) |name| {
             if (std.mem.eql(u8, name, "_id")) continue;
-            const column = declared.get(name) orelse return error.UndefinedColumn;
+            const column = if (table.isDocumentRoot(name) or table.isDocumentVersion(name)) try table.column(name) else declared.get(name) orelse return error.UndefinedColumn;
             try selected.put(alloc, name, column);
         }
         const columns = try alloc.alloc(catalog.Column, selected.count());
@@ -179,7 +226,7 @@ pub const Projection = struct {
             initialized += 1;
             has_typed_cells = has_typed_cells or column.type == .array or column.element_type == .numeric;
         }
-        return .{ .columns = columns, .has_typed_cells = has_typed_cells };
+        return .{ .columns = columns, .has_typed_cells = has_typed_cells, .document_root = table.storage_mode == .document };
     }
 
     /// Ranked hits need a root-member routing plan; ordinary scan projections
@@ -219,7 +266,9 @@ pub const Projection = struct {
     /// Adapt an already parsed native projection. Metadata is page-owned and
     /// payloads borrow that same page's pinned JSON tree. No JSON reparsing or
     /// nested JSONB/string cloning occurs. Legacy scalar-only pages stay cheap.
-    pub fn adaptBorrowed(self: Projection, alloc: std.mem.Allocator, layout: ?*const catalog.Row.TypedLayout, row: catalog.Row) !catalog.Row {
+    pub fn adaptBorrowed(self: Projection, alloc: std.mem.Allocator, layout: ?*const catalog.Row.TypedLayout, input: catalog.Row) !catalog.Row {
+        var row = input;
+        row.document_envelope = self.document_root;
         if (!self.has_typed_cells) return row;
         if (row.typed_cells) |native| {
             var direct = native.layout.names.len == self.columns.len;
@@ -273,6 +322,9 @@ pub const Projection = struct {
     /// Optional canonical JSON columns. Placeholder cells are private to the
     /// native reader; ordinary cell access must parse that column on demand.
     pub fn projectSearchEncoded(self: Projection, alloc: std.mem.Allocator, scratch: std.mem.Allocator, layout: *const catalog.Row.TypedLayout, id: []const u8, source: SearchSource, metadata: SearchMetadata, encoded: ?[]?[]const u8) !catalog.Row {
+        // Ranked hits lack a snapshot-bound primary version. A stored member
+        // must not impersonate native concurrency metadata.
+        if (self.document_root) for (self.columns) |column| if (std.mem.eql(u8, column.name, "_version")) return error.UnsupportedSqlShape;
         if (encoded) |slots| {
             if (slots.len != self.columns.len) return error.InvalidSqlBackendResponse;
             @memset(slots, null);
@@ -418,7 +470,7 @@ pub const Projection = struct {
             const cells = try alloc.alloc(catalog.Row.Cell, self.columns.len);
             const presence = try alloc.alloc(bool, self.columns.len);
             for (self.columns, cells, presence) |column, *cell, *present| {
-                const raw = root.object.get(column.path);
+                const raw: ?Json = if (self.document_root and std.mem.eql(u8, column.name, "_doc")) root else if (self.document_root and std.mem.eql(u8, column.name, "_version")) .{ .integer = std.math.cast(i64, version) orelse return error.SqlNumericOutOfRange } else root.object.get(column.path);
                 present.* = raw != null;
                 const sql_null = raw == null or (raw.? == .null and column.type != .json);
                 if (sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
@@ -433,18 +485,18 @@ pub const Projection = struct {
                     try coerce(alloc, raw.?, column.type);
                 cell.* = try declaredCell(alloc, column, .{ .value = value, .sql_null = sql_null });
             }
-            return .{ .id = try alloc.dupe(u8, id), .version = version, .value = .null, .typed_cells = .{ .layout = layout, .values = cells, .presence = presence } };
+            return .{ .id = try alloc.dupe(u8, id), .version = version, .document_envelope = self.document_root, .value = .null, .typed_cells = .{ .layout = layout, .values = cells, .presence = presence } };
         }
         var object: std.json.ObjectMap = .empty;
         try object.ensureTotalCapacity(alloc, @intCast(self.columns.len));
         const nulls = try alloc.alloc(bool, self.columns.len);
         for (self.columns, nulls) |column, *sql_null| {
-            const raw = root.object.get(column.path);
+            const raw: ?Json = if (self.document_root and std.mem.eql(u8, column.name, "_doc")) root else if (self.document_root and std.mem.eql(u8, column.name, "_version")) .{ .integer = std.math.cast(i64, version) orelse return error.SqlNumericOutOfRange } else root.object.get(column.path);
             sql_null.* = raw == null or (raw.? == .null and column.type != .json);
             const value: Json = if (sql_null.*) .null else try coerce(alloc, raw.?, column.type);
             try object.put(alloc, try alloc.dupe(u8, column.name), value);
         }
-        return .{ .id = try alloc.dupe(u8, id), .version = version, .value = .{ .object = object }, .sql_nulls = nulls };
+        return .{ .id = try alloc.dupe(u8, id), .version = version, .document_envelope = self.document_root, .value = .{ .object = object }, .sql_nulls = nulls };
     }
 };
 

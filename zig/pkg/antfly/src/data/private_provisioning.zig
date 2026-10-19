@@ -61,7 +61,7 @@ pub fn validateInitial(alloc: std.mem.Allocator, public_tables: []const tables.T
         var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
         defer parsed.deinit(alloc);
         if (parsed.version != descriptor.schema_version or parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
-        var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, table.table_id, null);
+        var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalogWithCoverage(alloc, parsed, table.table_id, null, descriptor.catalog_coverage);
         defer compiled.deinit();
         std.crypto.hash.Blake3.hash(compiled.value, &digest, .{});
         if (!std.mem.eql(u8, &digest, &descriptor.catalog_digest) or
@@ -226,7 +226,7 @@ test "initial FK private owner is exact, unpublished, and supports schema epoch 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const schema_json = "{\"version\":0,\"storage_mode\":\"relational\"}";
+    const schema_json = "{\"version\":0,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
     var schema_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
     var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, schema_json);
@@ -258,6 +258,30 @@ test "initial FK private owner is exact, unpublished, and supports schema epoch 
     try std.testing.expectEqual(@as(usize, 0), (try validate(alloc, &.{}, &.{}, projection)).len);
     descriptors[0].namespace.range_id = 10;
     try std.testing.expectError(error.InvalidGenerationPublication, validateInitial(alloc, &.{}, &.{}, projection));
+}
+
+test "initial FK private owner coverage is explicit and rejects a forged legacy marker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gte","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, json);
+    defer parsed.deinit(a);
+    var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalogWithCoverage(a, parsed, 7, null, .checks_v1);
+    defer compiled.deinit();
+    var public_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(json, &public_digest, .{});
+    var catalog_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(compiled.value, &catalog_digest, .{});
+    var table_values = [_]tables.TableRecord{.{ .table_id = 7, .name = "hidden_fk", .schema_json = json }};
+    var range_values = [_]tables.RangeRecord{.{ .table_id = 7, .group_id = 9, .range_id = 9, .doc_identity_shard_id = 9, .doc_identity_range_id = 9, .start_key = "" }};
+    var descriptors = [_]staging.ProvisioningProjection.InitialFkOwner{.{ .catalog_coverage = .checks_v1, .plan_id = @splat(1), .plan_digest = @splat(2), .child_table_id = 7, .child_group_id = 9, .namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 }, .schema_version = 1, .schema_digest = compiled.catalog.schema_digest, .public_schema_json_digest = public_digest, .catalog_digest = catalog_digest }};
+    const projection: staging.ProvisioningProjection = .{ .tables = &table_values, .ranges = &range_values, .initial_fk_owners = &descriptors };
+    try std.testing.expectEqual(@as(usize, 1), (try validateInitial(a, &.{}, &.{}, projection)).len);
+    descriptors[0].catalog_coverage = .legacy;
+    try std.testing.expectError(error.InvalidGenerationPublication, validateInitial(a, &.{}, &.{}, projection));
 }
 
 test "private provisioning validates immutable hidden owners and rejects forged descriptors" {

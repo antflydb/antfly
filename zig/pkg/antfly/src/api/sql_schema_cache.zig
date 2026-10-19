@@ -28,10 +28,11 @@ const Layout = struct {
     external_base_source: ?@import("antfly_local_sources").serverless_external_source_schema_binding.OwnedExternalTableBinding = null,
     columns: []const catalog.Column = &.{},
     indexes: []const catalog.Index = &.{},
+    index_definitions: []const catalog.IndexDefinition = &.{},
     constraints: []const catalog.Constraint = &.{},
 
     fn table(self: Layout, id: u64, physical_name: []const u8) catalog.Table {
-        return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .constraints = self.constraints };
+        return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .index_definitions = self.index_definitions, .constraints = self.constraints };
     }
 };
 const Entry = struct {
@@ -108,11 +109,13 @@ pub const Cache = struct {
             out.* = .{ .name = try alloc.dupe(u8, index.name), .columns = names };
         }
         const constraints = try alloc.alloc(catalog.Constraint, entry.layout.constraints.len);
+        const definitions = try alloc.alloc(catalog.IndexDefinition, entry.layout.index_definitions.len);
+        for (entry.layout.index_definitions, definitions) |definition, *out| out.* = try definition.cloneLeaky(alloc);
         for (entry.layout.constraints, constraints) |constraint, *out| {
             out.* = constraint;
             out.name = try alloc.dupe(u8, constraint.name);
         }
-        return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .columns = columns, .indexes = indexes, .constraints = constraints };
+        return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .columns = columns, .indexes = indexes, .index_definitions = definitions, .constraints = constraints };
     }
     fn acquire(self: *Cache, io: std.Io, scratch: std.mem.Allocator, json: []const u8, limit: usize) !*Entry {
         var digest: [32]u8 = undefined;
@@ -199,47 +202,18 @@ fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned
     }
     const native = try schema.deriveRuntimeTableSchema(alloc, parsed);
     defer native_schema.freeSchema(alloc, native);
-    if (native.storage_mode != .relational) return error.UnsupportedSqlExecution;
-    var generated = std.StringHashMap(void).init(alloc);
-    if (parsed.generated_columns) |items| {
-        if (items.value != .array) return error.InvalidSqlBackendResponse;
-        for (items.value.array.items) |item| {
-            if (item != .object) return error.InvalidSqlBackendResponse;
-            const name = item.object.get("column") orelse return error.InvalidSqlBackendResponse;
-            if (name != .string) return error.InvalidSqlBackendResponse;
-            try generated.put(name.string, {});
-        }
-    }
-    const columns = try owned.alloc(catalog.Column, native.relational_columns.len);
-    for (native.relational_columns, columns) |column, *out| out.* = .{
-        .name = try owned.dupe(u8, column.name),
-        .path = try owned.dupe(u8, column.path),
-        .nullable = !column.required or column.allows_null,
-        .generated = generated.contains(column.name),
-        .defaulted = catalog.hasColumnDefault(parsed, column.name),
-        .element_type = column.sql_element_type,
-        .numeric_modifier = column.numeric_modifier,
-        .type = @import("antfly_local_sources").sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
-            .string => .string,
-            .integer => .integer,
-            .number => .number,
-            .numeric => .number,
-            .boolean => .boolean,
-            .datetime => .datetime,
-            .json => .json,
-            .sql_array => .array,
-            else => return error.UnsupportedSqlExecution,
-        }),
-    };
-    layout.columns = columns;
+    layout.columns = try @import("antfly_local_sources").sql_document_row.deriveRelationalColumnsLeaky(owned, alloc, parsed, native);
     if (native.external_base_source) |source| {
         layout.external_base_source = try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(owned, source);
         layout.version = native.version;
         return;
     }
     var indexes: std.ArrayList(catalog.Index) = .empty;
+    layout.index_definitions = try catalog.IndexDefinition.deriveLeaky(owned, alloc, parsed, native);
     if (parsed.relational_indexes) |declarations| for (declarations.value) |index| {
-        if (index.where != null or index.keys.len == 0 or index.keys.len > 32) continue;
+        // SQL DDL emits an empty predicate list for total indexes. Presence
+        // alone is not partiality; only a nonempty predicate needs implication.
+        if ((if (index.where) |where| where.len != 0 else false) or index.keys.len == 0 or index.keys.len > 32) continue;
         const names = try owned.alloc([]const u8, index.keys.len);
         var direct = true;
         for (index.keys, names) |key, *name| {
@@ -311,6 +285,111 @@ test "SQL schema cache pins direct total index candidates with the layout" {
     try std.testing.expectEqualStrings("label_tenant_idx", table.indexes[1].name);
     try std.testing.expectEqualStrings("label", table.indexes[1].columns[0]);
     try std.testing.expectEqualStrings("tenant", table.indexes[1].columns[1]);
+}
+
+test "SQL schema cache retains SQL-lowered total indexes without admitting partial or expression access" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var candidate_schema = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"}},"additionalProperties":false}}}}
+    , .{});
+    for ([_][]const u8{
+        "CREATE INDEX direct_label ON items(label)",
+        "CREATE INDEX partial_label ON items(label) WHERE label='ready'",
+        "CREATE INDEX expression_label ON items(lower(label))",
+    }, 0..) |statement, ordinal| {
+        var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, statement, .{});
+        defer compiled.deinit();
+        try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &candidate_schema, compiled.statement.catalog_ddl));
+        const bytes = try std.json.Stringify.valueAlloc(a, candidate_schema, .{});
+        for ([_]bool{ false, true }) |uncached| {
+            const table = if (uncached)
+                try cache.resolveWithEntryLimit(std.testing.io, a, bytes, 1, "physical", 1)
+            else
+                try cache.resolve(std.testing.io, a, bytes, 1, "physical");
+            try std.testing.expectEqual(@as(usize, 1), table.indexes.len);
+            try std.testing.expectEqualStrings("direct_label", table.indexes[0].name);
+            try std.testing.expectEqualStrings("label", table.indexes[0].columns[0]);
+            try std.testing.expectEqual(ordinal + 1, table.index_definitions.len);
+            if (ordinal >= 1) {
+                const partial = table.index_definitions[1];
+                try std.testing.expectEqualStrings("partial_label", partial.name);
+                try std.testing.expectEqualStrings("label", partial.keys[0].column);
+                try std.testing.expectEqualStrings("label", partial.where[0].column);
+                try std.testing.expectEqual(.eq, partial.where[0].op);
+                try std.testing.expectEqualStrings("ready", partial.where[0].value.?.string);
+            }
+            if (ordinal >= 2) {
+                const expression = table.index_definitions[2];
+                try std.testing.expectEqualStrings("expression_label", expression.name);
+                try std.testing.expectEqualStrings("lower_ascii", expression.keys[0].expression.?.object.get("op").?.string);
+                try std.testing.expectEqualStrings("label", expression.keys[0].expression.?.object.get("args").?.array.items[0].object.get("column").?.string);
+            }
+        }
+    }
+}
+
+test "SQL schema cache owns complete index shapes across eviction fallback and allocation faults" {
+    const json =
+        \\{"version":7,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"mixed","keys":[{"column":"tenant","direction":"desc","nulls":"first"},{"expression":{"op":"lower_ascii","args":[{"op":"column","column":"label"}]},"result_type":"string","collation":"binary","direction":"asc","nulls":"last"}],"include_columns":["label"],"where":[{"column":"tenant","op":"gte","value":9007199254740993},{"column":"label","op":"is_not_null"}]},{"name":"empty","keys":[{"column":"label"}],"where":[{"constant":false}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"},"tenant":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const Faults = struct {
+        fn check(a: std.mem.Allocator, table: catalog.Table) !void {
+            try std.testing.expectEqual(@as(u32, 7), table.schema_version);
+            // Neither declaration is a direct-total probe, even when all
+            // physical keys happen to be direct columns (constant FALSE).
+            try std.testing.expectEqual(@as(usize, 0), table.indexes.len);
+            try std.testing.expectEqual(@as(usize, 2), table.index_definitions.len);
+            const mixed = table.index_definitions[0];
+            try std.testing.expectEqualStrings("mixed", mixed.name);
+            try std.testing.expectEqualStrings("tenant", mixed.keys[0].column);
+            try std.testing.expectEqual(.desc, mixed.keys[0].direction);
+            try std.testing.expectEqual(.first, mixed.keys[0].nulls);
+            try std.testing.expect(mixed.keys[0].expression == null);
+            const expression = mixed.keys[1];
+            try std.testing.expectEqualStrings("", expression.column);
+            try std.testing.expectEqual(.string, expression.result_type.?);
+            try std.testing.expectEqualStrings("binary", expression.collation.?);
+            try std.testing.expectEqual(.asc, expression.direction);
+            try std.testing.expectEqual(.last, expression.nulls);
+            const tree = expression.expression.?;
+            try std.testing.expectEqualStrings("lower_ascii", tree.object.get("op").?.string);
+            try std.testing.expectEqualStrings("label", tree.object.get("args").?.array.items[0].object.get("column").?.string);
+            try std.testing.expectEqualDeep(expression.identity.?, try expression.bindIdentity(a, try table.expressionSchemaLeaky(a)));
+            try std.testing.expectEqualStrings("label", mixed.include_columns[0]);
+            try std.testing.expectEqualStrings("tenant", mixed.where[0].column);
+            try std.testing.expectEqual(.gte, mixed.where[0].op);
+            try std.testing.expectEqualStrings("9007199254740993", mixed.where[0].value.?.number_string);
+            try std.testing.expect(mixed.where[1].value == null);
+            try std.testing.expectEqual(false, table.index_definitions[1].where[0].constant.?);
+        }
+        fn run(a: std.mem.Allocator, bytes: []const u8) !void {
+            var cache = Cache.init(a);
+            defer cache.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const first = try cache.resolve(std.testing.io, alloc, bytes, 1, "rows");
+            const hit = try cache.resolve(std.testing.io, alloc, bytes, 2, "other_rows");
+            const fallback = try cache.resolveWithEntryLimit(std.testing.io, alloc, bytes, 3, "fallback", 1);
+            // Destroy source buffers too: both descriptor paths must own
+            // strings, exact operands, nested expression objects and arrays.
+            for (&cache.slots) |*slot| if (slot.entry) |entry| {
+                cache.destroy(entry);
+                slot.* = .{};
+            };
+            try check(alloc, first);
+            try check(alloc, hit);
+            try check(alloc, fallback);
+            try std.testing.expectEqual(@as(u64, 2), hit.id);
+            try std.testing.expectEqualStrings("other_rows", hit.physical_name);
+        }
+    };
+    try Faults.run(std.testing.allocator, json);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{json});
 }
 
 test "SQL schema cache owns named constraint kinds across eviction and allocation faults" {
