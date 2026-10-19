@@ -35,6 +35,8 @@ pub const Progress = struct {
     anchors_bound: bool = false,
     scan: u8 = 0,
     causal_version: u8 = 0,
+    /// An admitted correction keeps its policy bounds across catalog changes.
+    horizons: ?[]const u16 = null,
 };
 pub const Status = struct { source_revision: u64, propagated: bool, frontier: u64, settled: bool, retire_ready: bool = false };
 fn selectedKey(a: A, group: state.Group, owner: state.Owner, event: index.Invalidation) ![]u8 {
@@ -66,10 +68,8 @@ pub fn advance(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation
 }
 pub fn advanceHorizons(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation, horizons: []const u16) !void {
     if (horizons.len > 128) return error.InvalidGroupedPriorContext;
-    var horizon: u16 = 0;
     for (horizons) |value| {
         if (value == 0 or value > 128) return error.InvalidGroupedPriorContext;
-        horizon = @max(horizon, value);
     }
     const group = state.Group{ .definition = event.definition, .key = event.partition.group };
     const selected = try selectedKey(a, group, owner, event);
@@ -85,7 +85,7 @@ pub fn advanceHorizons(a: A, txn: anytype, owner: state.Owner, event: index.Inva
         // block the fan-in needed to materialize the original event itself.
         var original = event;
         original.repair = false;
-        try advanceProgress(a, txn, owner, original, horizons, horizon, group, selected, &progress);
+        try advanceProgress(a, txn, owner, original, horizons, group, selected, &progress);
         return;
     }
     const revision = try state.invalidate(a, txn, owner, event);
@@ -97,9 +97,13 @@ pub fn advanceHorizons(a: A, txn: anytype, owner: state.Owner, event: index.Inva
         // moves. Propagation needs the actual last published position instead.
         progress.ordinal = if (before) |snapshot| (if (snapshot.units.len > 0) snapshot.ordinal else event.ordinal) else event.ordinal;
     }
-    try advanceProgress(a, txn, owner, event, horizons, horizon, group, selected, &progress);
+    try advanceProgress(a, txn, owner, event, horizons, group, selected, &progress);
 }
-fn advanceProgress(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation, horizons: []const u16, horizon: u16, group: state.Group, selected: []const u8, progress: *Progress) !void {
+fn advanceProgress(a: A, txn: anytype, owner: state.Owner, event: index.Invalidation, horizons: []const u16, group: state.Group, selected: []const u8, progress: *Progress) !void {
+    const policies = progress.horizons orelse horizons;
+    progress.horizons = policies;
+    var horizon: u16 = 0;
+    for (policies) |value| horizon = @max(horizon, value);
     const revision = progress.enrollment;
     const cause = try causeId(a, owner, event);
     if (progress.done) return causes.retirePage(a, txn, group, cause);
@@ -150,7 +154,7 @@ fn advanceProgress(a: A, txn: anytype, owner: state.Owner, event: index.Invalida
                     break;
                 };
                 if (!known) {
-                    if (seen.items.len == horizon) {
+                    if (seen.items.len >= horizon) {
                         progress.done = true;
                         break;
                     }
@@ -158,7 +162,7 @@ fn advanceProgress(a: A, txn: anytype, owner: state.Owner, event: index.Invalida
                 }
                 var affected: [128]u16 = undefined;
                 var count: usize = 0;
-                for (horizons) |value| if (value >= distance) {
+                for (policies) |value| if (value >= distance) {
                     affected[count] = value;
                     count += 1;
                 };

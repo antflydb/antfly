@@ -503,3 +503,32 @@ test "unmaterialized corrections coalesce without waiting for an obsolete source
     try std.testing.expect((try propagation.status(a, &txn, owner, event)).?.propagated);
     for (partitions[1..]) |partition| try std.testing.expect(try state.pendingFor(a, &txn, group, partition) != null);
 }
+
+test "admitted correction keeps its horizon when a consumer is removed mid scan" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var txn = Txn{ .a = a };
+    const definition = index.Definition{ .table_incarnation = 5, .configuration = groups.digest("turns") };
+    const group = state.Group{ .definition = definition, .key = "thread" };
+    const owner = state.Owner{ .namespace = @splat(1), .incarnation = 8 };
+    const original = index.Partition{ .group = group.key, .segment = "original", .cell = 0 };
+    try CorrectionFixture.seed(a, &txn, group, &.{original}, &.{0});
+    for (1..301) |i| {
+        const partition = index.Partition{ .group = group.key, .segment = try std.fmt.allocPrint(a, "segment-{d}", .{i}), .cell = @intCast(i) };
+        const snapshot = try CorrectionFixture.snapshot(a, group, partition, @intCast(i * 128), 1);
+        try state.writeRecord(a, &txn, try state.snapshotKey(a, group, partition), snapshot);
+        try state.writeRecord(a, &txn, try state.directoryKey(a, group, partition, snapshot.ordinal), state.DirectoryEntry{ .partition = partition, .snapshot = snapshot });
+    }
+    const event = index.Invalidation{ .definition = definition, .partition = original, .document = "row", .source_revision = 7, .ordinal = 0 };
+    try propagation.advanceHorizons(a, &txn, owner, event, &.{ 1, 128 });
+    _ = try CorrectionFixture.publish(a, &txn, group, original, 0);
+    try propagation.advanceHorizons(a, &txn, owner, event, &.{ 1, 128 });
+    const before = (try propagation.currentProgress(a, &txn, owner, event)).?;
+    try std.testing.expect(!before.done and before.segments.len > 1);
+    try propagation.advanceHorizons(a, &txn, owner, event, &.{1});
+    const after = (try propagation.currentProgress(a, &txn, owner, event)).?;
+    try std.testing.expect(after.done);
+    try std.testing.expectEqual(@as(usize, 128), after.segments.len);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 128 }, after.horizons.?);
+}
