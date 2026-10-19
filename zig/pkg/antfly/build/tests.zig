@@ -6652,6 +6652,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.column_scan_plan.",
             "storage.db.column_source.",
             "storage.db.db.",
+            "storage.db.db_apply.",
+            "storage.db.db_repair.",
+            "storage.db.db_enrichment.",
+            "storage.db.db_artifact.",
             "storage.db.db_document.",
             "storage.db.db_search.",
             "storage.db.db_transaction.",
@@ -6913,7 +6917,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     }
     // db.zig's DB operations are split across db_<area>.zig; the runtime
     // lanes partition their tests together.
-    for ([_][]const u8{ "db", "db_dense", "db_document", "db_graph", "db_relational", "db_restore", "db_search", "db_split", "db_transaction" }) |source| {
+    for ([_][]const u8{ "db", "db_apply", "db_artifact", "db_dense", "db_document", "db_enrichment", "db_graph", "db_relational", "db_repair", "db_restore", "db_search", "db_split", "db_transaction" }) |source| {
         unit_storage_shard_audit.addArg("--runtime-partition-source");
         unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly-embedded/src/storage/db/{s}.zig", .{source})));
     }

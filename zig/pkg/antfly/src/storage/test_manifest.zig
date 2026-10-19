@@ -173,6 +173,10 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_column_scan_plan;
     _ = @import("antfly_local_sources").storage_db_config;
     _ = @import("antfly_local_sources").storage_db_db;
+    _ = @import("antfly_local_sources").storage_db_db_apply;
+    _ = @import("antfly_local_sources").storage_db_db_repair;
+    _ = @import("antfly_local_sources").storage_db_db_enrichment;
+    _ = @import("antfly_local_sources").storage_db_db_artifact;
     _ = @import("antfly_local_sources").storage_db_db_document;
     _ = @import("antfly_local_sources").storage_db_db_search;
     _ = @import("antfly_local_sources").storage_db_db_transaction;
