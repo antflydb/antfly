@@ -1748,7 +1748,7 @@ const Capture = struct {
             prepared.deinit();
             live = false;
             const started = batch_clock.monotonicNs();
-            const encoded = try projector.encodeEmbeddingGemma2VideoTensorResident(self.cb, self.a, input, options.width, options.height);
+            const encoded = try self.encodeGpu(input, options, 1);
             if (self.resident) |tensors| {
                 const tensor = if (self.cb.embedding_stage != null) MetalCompute.escapeEmbeddingStage(self.cb, encoded.tensor) catch |err| {
                     self.cb.free(encoded.tensor);
@@ -3204,7 +3204,10 @@ test "embeddinggemma2 video phase denial precedes projector access" {
     const stage = @import("../ops/ops.zig").EmbeddingStageControl{ .ptr = &hook, .pause_fn = Hook.unused, .resume_fn = Hook.unused, .cleanup_fn = Hook.cleanup, .workspace_fn = Hook.reserve };
     const cb = ComputeBackend{ .ptr = undefined, .vtable = undefined, .embedding_stage = &stage };
     var capture = Capture{ .a = std.testing.allocator, .cb = &cb, .track = undefined, .control = .{}, .output = &.{}, .frame_tokens = &.{}, .selected = &.{} };
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, capture.encodeGpu(undefined, .{ .width = 480, .height = 480, .matrix = .bt709 }, 8));
-    const expected = if (capture.preparedVision()) try projector.embeddingGemma2VideoPreparedScratch(480, 480, 8) else 8 * try projector.embeddingGemma2VideoScratch(480, 480);
-    try std.testing.expectEqual(expected, hook.observed);
+    for ([_]usize{ 1, 8 }) |count| {
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, capture.encodeGpu(undefined, .{ .width = 480, .height = 480, .matrix = .bt709 }, count));
+        const expected = if (capture.preparedVision()) try projector.embeddingGemma2VideoPreparedScratch(480, 480, count) else count * try projector.embeddingGemma2VideoScratch(480, 480);
+        try std.testing.expectEqual(expected, hook.observed);
+        try std.testing.expectEqual(capture.preparedVision(), capture.last_prepared);
+    }
 }

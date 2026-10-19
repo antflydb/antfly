@@ -996,3 +996,9 @@ uses completed cost per frame and respects smaller resource ceilings. Prepared
 and legacy observations are isolated; retry cost cannot poison prepared-plan
 calibration. Metal queue, composition and backbone memory estimates describe
 their own physical stages and preserve global/process admission checks.
+
+Singleton device projections share the admitted execution path with larger
+cohorts, including required prepared plans, conservative fallback admission
+and completed-cost observation. This is necessary for cold calibration to
+advance from width one. Pretrained qualification checks serving-path samples;
+direct batch-tower probes alone do not qualify adaptive selection.

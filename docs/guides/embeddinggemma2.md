@@ -1788,13 +1788,32 @@ policy. The video qualifier includes alternating completed four/six-frame tower
 measurements and vector checks. The stage qualifier forces a warmed-cache
 admission denial and verifies retained input after provider retirement/recovery.
 
-The completed ReleaseFast 576x528 tower comparison measured 330.481 ms for
-four frames and 491.649 ms for six (82.620 and 81.942 ms/frame), using seven
+The completed ReleaseFast 576x528 tower comparison measured 389.054 ms for
+four frames and 572.990 ms for six (97.264 and 95.498 ms/frame), using seven
 samples after two warmups in alternating order with projection parity. This
 falls inside the policy's 5% preference margin and does not establish a larger
-batch throughput win. Debug measured 90.773 versus 98.396 ms/frame, favouring
-four; this variability reinforces completed-cost selection. The same
-ReleaseFast shared-host run measured 194.692 versus
-194.838 ms for the full short-clip legacy/prepared comparison: effectively flat.
+batch throughput win. Debug measured 97.807 versus 95.666 ms/frame, also inside
+the same margin; selection remains based on completed cost. The same ReleaseFast
+shared-host run measured 244.481 versus 246.943 ms for the full short-clip legacy/prepared comparison: effectively flat.
 These admission and candidate-selection changes do not establish PyTorch parity
 or a production latency SLO.
+
+Singleton video projections use the same admitted prepared/legacy execution
+path as larger cohorts. Their completed samples train the prepared namespace,
+so cold calibration can advance beyond width one. The pretrained video
+qualifier checks samples from the serving path as well as direct tower parity.
+
+Compact image/audio phase reductions preserve their explicit-workspace policy;
+a generic model-size floor cannot reappear during a qualified reduction. Mixed
+Metal groups inspect image geometry and audio duration before reserving retained
+rows. Their host plan covers metadata, resize/frontend storage and the bounded
+encoded-audio decoder. Declared FLAC sample counts must agree with decoded
+audio before frontend preparation; unknown durations retain maximum sequence bounds;
+unqualified preparation and CPU/CUDA retain conservative envelopes.
+
+Ready encoder cohorts test live admission at each phase and shrink in place
+when a smaller cohort fits. Prepared tensors and independent admission owners
+remain live across those attempts. Completed vectors survive later pressure
+failures; only unfinished items receive indexed errors. After prepared owners
+drain, the broker may retry those failed items independently without replaying
+completed peers. Cancellation and non-pressure errors do not trigger resizing.

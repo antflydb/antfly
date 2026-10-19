@@ -96,6 +96,20 @@ pub fn completedForPlan(metal: bool, width: u32, height: u32, count: usize, elap
     defer mutex.unlock();
     entry(metal, width, height, 0, prepared).observe(count, elapsed);
 }
+/// Test diagnostics exercise actual serving routes, not just policy simulation.
+pub fn frameSamplesForTesting(prepared: bool) [8]u64 {
+    std.debug.assert(@import("builtin").is_test);
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    defer mutex.unlock();
+    var samples: [8]u64 = @splat(0);
+    for (entries) |item| {
+        const category: u32 = @truncate(item.key);
+        if (category != (1 | (@as(u32, @intFromBool(prepared)) << 1))) continue;
+        for (item.costs, &samples) |cost, *sum| sum.* += cost.samples;
+    }
+    return samples;
+}
+
 test "embeddinggemma2 video batch policy learns completed throughput within admission" {
     var cpu = Entry{};
     for (widths) |width| for (0..2) |_| {

@@ -1671,7 +1671,7 @@ fn prepareAudioCpuBounded(allocator: std.mem.Allocator, audio_bytes: []const u8,
         else => return if (reference_resample) error.InvalidAudioInput else err,
     };
     defer decoded.deinit();
-    if (reference_resample and audio.detectFormat(audio_bytes) == .flac) {
+    if (audio.detectFormat(audio_bytes) == .flac) {
         // STREAMINFO is useful for admission only when decode agrees. Reject
         // a false duration before allocating resampling/packed feature buffers.
         const info = try @import("inference_audio").flac.parseStreamInfo(audio_bytes);
@@ -9207,4 +9207,32 @@ fn checkLazyVisionNormWeights(cb: ComputeBackend, _: ComputeBackend) !void {
 }
 test "embeddinggemma2 prepared vision norms bypass all fallback coefficient loads and load only on decline" {
     try @import("../ops/media_residency_test.zig").onNative(@import("../ops/media_residency_test.zig").noWeights, checkLazyVisionNormWeights);
+}
+
+test "embeddinggemma2 FLAC duration admission rejects forged counts on every preparation path" {
+    const a = std.testing.allocator;
+    // One valid mono 16-bit constant subframe with 1024 samples, including
+    // header/frame CRCs. Keep this synthetic fixture local and dependency-free.
+    var storage: [55]u8 = @splat(0);
+    const bytes = &storage;
+    @memcpy(bytes[0..8], "fLaC\x80\x00\x00\x22");
+    std.mem.writeInt(u16, bytes[8..10], 1024, .big);
+    std.mem.writeInt(u16, bytes[10..12], 1024, .big);
+    @memcpy(bytes[42..55], &[_]u8{ 0xff, 0xf8, 0x70, 0x08, 0, 0x03, 0xff, 0xd6, 0, 0, 0, 0x6a, 0x77 });
+    const without_count = (@as(u64, 16000) << 44) | (@as(u64, 15) << 36);
+    std.mem.writeInt(u64, bytes[18..26], without_count | 1024, .big);
+    var valid = try prepareEmbeddingGemma2AudioWithPacking(a, bytes, .{}, true);
+    defer valid.deinit();
+    try std.testing.expect(valid.tokenCount() > 1);
+    std.mem.writeInt(u64, bytes[18..26], without_count | 640, .big);
+    try std.testing.expectEqual(@as(usize, 5), try embeddingGemma2EncodedAudioSequenceBound(bytes));
+    for ([_]bool{ false, true }) |device| {
+        try std.testing.expectError(error.InvalidAudioInput, prepareEmbeddingGemma2AudioWithPacking(a, bytes, .{}, device));
+    }
+    // Unknown sample counts remain valid and keep the full sequence envelope.
+    std.mem.writeInt(u64, bytes[18..26], without_count, .big);
+    try std.testing.expectEqual(@as(usize, 8192), try embeddingGemma2EncodedAudioSequenceBound(bytes));
+    var unknown = try prepareEmbeddingGemma2AudioWithPacking(a, bytes, .{}, true);
+    defer unknown.deinit();
+    try std.testing.expect(unknown.tokenCount() > 1);
 }

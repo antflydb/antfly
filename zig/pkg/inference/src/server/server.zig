@@ -37816,6 +37816,10 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
         try std.testing.expectApproxEqAbs(@as(f64, 1), @sqrt(norm), 1e-5);
 
         if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VIDEO_PLAN") and std.mem.eql(u8, name, "h264_video")) {
+            const policy = @import("../pipelines/media_batch_policy.zig");
+            const serving_samples = policy.frameSamplesForTesting(true);
+            try std.testing.expect(serving_samples[0] >= 2);
+            std.debug.print("embeddinggemma2 video_serving_calibration singleton_samples={d} pair_samples={d} prepared=true\n", .{ serving_samples[0], serving_samples[1] });
             const Env = struct {
                 extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
                 extern "c" fn unsetenv([*:0]const u8) c_int;

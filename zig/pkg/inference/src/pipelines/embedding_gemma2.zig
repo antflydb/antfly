@@ -609,6 +609,16 @@ fn executionBounds(known: bool, tokens: usize, preparation: usize, vision: usize
     return .{ .sequence = sequence, .host = host, .workspace = @min(legacy, work) };
 }
 
+/// Header/duration bounds describe composition metadata and inline preparation.
+/// GPU activations are admitted at the fenced tower/backbone boundaries. The
+/// fixed host margin covers frontend recipes, resize storage and wrappers.
+fn metalGroupBounds(tokens: usize, preparation: usize, tower: usize) !ExecutionBounds {
+    const rows = @min(@as(usize, 8192), @max(@as(usize, 1), tokens));
+    const host = try std.math.add(usize, 128 * 1024 * 1024, try std.math.add(usize, preparation, try std.math.mul(usize, rows, 16 * 1024)));
+    const backbone = try videoBackboneBounds(true, rows, 0);
+    return .{ .sequence = rows, .host = @min(@as(usize, 512 * 1024 * 1024), host), .workspace = @max(backbone.workspace, tower) };
+}
+
 const GroupInspection = struct { bounds: ExecutionBounds, input_bytes: usize, has_video: bool, device_bytes: usize, commands: u64 };
 fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllocator, session: Session, cfg: encoder.Config, group: Group, options: Options, effective: Control) !GroupInspection {
     const a = bounded.allocator();
@@ -644,7 +654,34 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
     for (group.content) |part| switch (part) {
         .text => |bytes| sequence_bound = std.math.add(usize, sequence_bound, bytes.len) catch return error.ResourceLimitExceeded,
         .video, .sampled_video => {},
-        else => shape_known = false,
+        .image, .raster => {
+            if (!boundedGroupPlanning(session.backend(), options)) {
+                shape_known = false;
+                continue;
+            }
+            const header = if (part == .raster) blk: {
+                try part.raster.validate();
+                break :blk @import("image.zig").EncodedImageInfo{ .width = part.raster.width, .height = part.raster.height };
+            } else try @import("image.zig").inspectEncodedForInference(part.image, null);
+            try @import("image.zig").DecodeLimits.inference_default.validate(header.width, header.height);
+            const geometry = try projector.embeddingGemma2ImageGeometry(header.width, header.height);
+            sequence_bound = try std.math.add(usize, sequence_bound, geometry.tokenCount() + 4);
+            const decoded = if (part == .raster) 0 else try std.math.mul(usize, try std.math.mul(usize, header.width, header.height), 3);
+            preparation_bound = @max(preparation_bound, decoded);
+            vision_bound = @max(vision_bound, try projector.embeddingGemma2GeometryPlanScratch(geometry.grid_x * geometry.grid_y, geometry.tokenCount(), 1));
+        },
+        .audio, .pcm => {
+            if (!boundedGroupPlanning(session.backend(), options)) {
+                shape_known = false;
+                continue;
+            }
+            const audio_tokens = if (part == .pcm) try projector.embeddingGemma2PcmSequenceLength(part.pcm.samples.len, part.pcm.sample_rate) else try projector.embeddingGemma2EncodedAudioSequenceBound(part.audio);
+            sequence_bound = try std.math.add(usize, sequence_bound, audio_tokens);
+            // Encoded codecs retain their full bounded decoder allowance even
+            // when a trustworthy header supplies a shorter sequence bound.
+            if (part == .audio) preparation_bound = @max(preparation_bound, @import("audio.zig").default_decode_working_bytes);
+            vision_bound = @max(vision_bound, audioRunRequest(session.backend(), 0, 0, 1).workspace_bytes);
+        },
     };
     if (options.video_ahead) |ahead| {
         device_bytes = if (session.backend() == .metal) try ahead.plan.deviceBytes() else 0;
@@ -680,7 +717,10 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
         try std.math.add(usize, (if (has_video) @as(usize, 1536) else 768) * 1024 * 1024, device_bytes)
     else
         512 * 1024 * 1024;
-    const bounds = try executionBounds(shape_known, sequence_bound, preparation_bound, vision_bound, device_bytes, legacy_workspace);
+    const bounds = if (shape_known and boundedVision(session.backend()) and !has_video)
+        try metalGroupBounds(sequence_bound, preparation_bound, vision_bound)
+    else
+        try executionBounds(shape_known, sequence_bound, preparation_bound, vision_bound, device_bytes, legacy_workspace);
     return .{ .bounds = bounds, .input_bytes = input_bytes, .has_video = has_video, .device_bytes = device_bytes, .commands = command_slots };
 }
 
@@ -998,6 +1038,7 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     var inputs: usize = 0;
     var sequence: usize = 1;
     var has_video = false;
+    var retained_rows: usize = 0;
     for (groups, 0..) |group, index| {
         try control.check();
         validateGroup(group, options) catch |err| {
@@ -1018,6 +1059,7 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
         inputs = try std.math.add(usize, inputs, view.input_bytes);
         sequence = @max(sequence, view.bounds.sequence);
         has_video = has_video or view.has_video;
+        retained_rows = try std.math.add(usize, retained_rows, @min(options.max_tokens, view.bounds.sequence));
     }
     if (inspected == 0) return .{ .vectors = vectors, .input_tokens = counts, .execution = .serial };
     var execution_waiter = Scheduler.Waiter{};
@@ -1027,12 +1069,13 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     // next tower executes. At most four 8192x512 F32 inputs can be retained.
     // Composition may retain projected rows beside composed backbone rows;
     // the fixed margin also covers one independent handoff copy.
-    const retained = inspected * 8192 * 512 * @sizeOf(f32);
+    const bounded_groups = boundedGroupPlanning(session.backend(), options);
+    const retained = (if (bounded_groups) retained_rows else inspected * 8192) * 512 * @sizeOf(f32);
     workspace = try std.math.add(usize, workspace, retained);
     bounded.limit = host;
     const video_phases = has_video and videoPhaseAdmission(session.backend(), lock);
     const idle_backend = device + 2 * retained + 64 * 1024 * 1024;
-    const execution_request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = if (boundedVision(session.backend())) 1 else sequence, .input_bytes = inputs, .backend_input_bytes = if (boundedVision(session.backend())) 0 else null, .host_preprocess_bytes = host, .workspace_bytes = if (boundedVision(session.backend()) and !has_video) 2 * retained + 64 * 1024 * 1024 else workspace, .output_bytes = inspected * options.dimensions * 4 };
+    const execution_request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = if (boundedVision(session.backend())) 1 else sequence, .input_bytes = inputs, .backend_input_bytes = if (boundedVision(session.backend())) 0 else null, .host_preprocess_bytes = host, .workspace_planned = bounded_groups and !has_video, .workspace_bytes = if (bounded_groups and !has_video) 2 * retained + 64 * 1024 * 1024 else workspace, .output_bytes = inspected * options.dimensions * 4 };
     var permit = try admitWithVisionCacheReclaim(session, if (video_phases) queuedVideoRequest(execution_request, idle_backend) else execution_request, control);
     defer permit.deinit();
     var pool = media_admission.Pool{ .limits = .{ .host_bytes = host, .device_bytes = if (session.backend() == .metal) device else 0, .commands = if (session.backend() == .metal) commands else 0 } };
@@ -1041,14 +1084,18 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     defer guard.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = if (video_phases) idle_backend else device + retained, .cb = &managed.backend, .control = control, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, inspected * @min(options.max_tokens, 8192)) else null };
+    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = if (video_phases) idle_backend else device + retained, .cb = &managed.backend, .control = control, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, retained_rows) else null };
     lane.attach();
     defer lane.deinit();
     const cb = &managed.backend;
     var cache = FrameCache{ .allocator = workspaceBackingAllocator(session.backend()), .session = session, .control = control };
     defer cache.deinit();
     var scheduler = CohortReady{ .a = a, .out = out, .session = session, .cb = cb, .lane = &lane, .tokenizer = tokenizer, .groups = groups, .indexes = indexes[0..inspected], .options = options, .control = control, .errors = errors, .permit = &permit, .pool = &pool, .cache = &cache, .vectors = vectors, .counts = counts, .inputs = inputs, .host = host, .retained = retained };
-    var media_parts = try projectCohortParts(a, session, cb, groups, indexes[0..inspected], options, control, &permit, errors, &scheduler);
+    var media_parts = projectCohortParts(a, session, cb, groups, indexes[0..inspected], options, control, &permit, errors, &scheduler) catch |err| {
+        if (!isPreparationPressure(err)) return err;
+        preserveCompletedGroups(vectors, errors, indexes[0..inspected], err);
+        return .{ .vectors = vectors, .input_tokens = counts, .execution = scheduler.observation.execution(scheduler.observation.native_items + scheduler.observation.serial_items) };
+    };
     defer media_parts.deinit(a, cb);
     return .{ .vectors = vectors, .input_tokens = counts, .execution = scheduler.observation.execution(scheduler.observation.native_items + scheduler.observation.serial_items) };
 }
@@ -1198,21 +1245,12 @@ const CohortReady = struct {
             var lengths: [4]usize = undefined;
             for (rows[offset..prepared], lengths[0 .. prepared - offset]) |row, *length| length.* = row.ids.len;
             var take = preparedCohortCountForBackend(lengths[0 .. prepared - offset], 4, encoder.compactRowsEnabled(cb.kind() == .metal));
-            var longest: usize = 0;
             if (take == 0) return error.EmbeddingInputTooLong;
-            // Model intermediates are bounded by the same per-row envelope as
-            // segmented Metal frames; there is no cross-picture dense score matrix.
-            var request: @import("../backends/session.zig").RunRequest = undefined;
-            while (true) {
-                longest = rows[offset + take - 1].ids.len;
-                var active: usize = 0;
-                for (rows[offset..][0..take]) |row| for (row.mask) |value| {
-                    active += @intFromBool(value != 0);
-                };
-                const packed_geometry = encoder.compactRowsEnabled(cb.kind() == .metal);
-                request = .{ .batch = if (packed_geometry) 1 else take, .sequence = if (packed_geometry) active else longest, .input_bytes = inputs, .workspace_planned = cb.kind() == .metal, .backend_input_bytes = (if (packed_geometry) active else take * longest) * 512 * 4, .host_preprocess_bytes = if (cb.kind() == .cuda and force) 1024 * 1024 + prepared * options.max_tokens * 16 else host, .workspace_bytes = (if (cb.kind() == .cuda) try cudaEncoderWorkspace(longest, take) else 256 * 1024 * 1024 + (if (packed_geometry) active else take * longest) * 192 * 1024) + retained, .preprocessing_complete = cb.kind() == .cuda, .output_bytes = take * options.dimensions * @sizeOf(f32) };
-                if (take == 1 or try session.fitsRun(request)) break;
+            const plan = ReadyRequest{ .backend = cb.kind(), .rows = rows[offset..prepared], .inputs = inputs, .host = host, .retained = retained, .prepared = prepared, .max_tokens = options.max_tokens, .dimensions = options.dimensions, .force = force };
+            var request = try plan.request(take);
+            while (take > 1 and !try session.fitsRun(request)) {
                 take -= 1;
+                request = try plan.request(take);
             }
             if (session.run_admission) |admission| {
                 const needed = try admission.estimateRequest(request, session.outputInfo());
@@ -1234,28 +1272,90 @@ const CohortReady = struct {
             }
         }
         if (self.lane.video_phases) try self.lane.reserve(0);
-        var supplement = try self.lane.admitPhase(peak, self.lane.credit());
-        defer supplement.deinit();
         for (phases[0..phase_count]) |phase| {
             offset = phase.offset;
-            const take = phase.count;
-            const packed_rows = try packVideoRows(a, cb, rows[offset..][0..take]);
-            defer packed_rows.deinit(a, cb);
-            const compact = if (cb.kind() == .cuda) try runCudaPackedGroups(a, cb, cfg, packed_rows, take, options.dimensions, control) else read: {
-                const output = try encoder.forwardPackedPooledEmbeddingsCT(cb, a, cfg, packed_rows.embeddings, packed_rows.mask, take, packed_rows.sequence, options.dimensions, packed_rows.compact_input);
-                defer cb.free(output);
-                break :read try readPooledBatch(a, cb, output, take, options.dimensions);
-            };
-            defer {
-                for (compact) |vector| a.free(vector);
-                a.free(compact);
+            const end = offset + phase.count;
+            while (offset < end) {
+                const plan = ReadyRequest{ .backend = cb.kind(), .rows = rows[offset..end], .inputs = inputs, .host = host, .retained = retained, .prepared = prepared, .max_tokens = options.max_tokens, .dimensions = options.dimensions, .force = force };
+                var admitted = admitReadyCohort(self.lane, end - offset, plan, ReadyRequest.request) catch |err| {
+                    if (!isPreparationPressure(err)) return err;
+                    // No remaining singleton fits. Publish its indexed error;
+                    // completed peers and all other prepared rows remain owned.
+                    errors[owners[offset]] = err;
+                    offset += 1;
+                    continue;
+                };
+                defer admitted.permit.deinit();
+                const take = admitted.count;
+                const packed_rows = try packVideoRows(a, cb, rows[offset..][0..take]);
+                defer packed_rows.deinit(a, cb);
+                const compact = if (cb.kind() == .cuda) try runCudaPackedGroups(a, cb, cfg, packed_rows, take, options.dimensions, control) else read: {
+                    const output = try encoder.forwardPackedPooledEmbeddingsCT(cb, a, cfg, packed_rows.embeddings, packed_rows.mask, take, packed_rows.sequence, options.dimensions, packed_rows.compact_input);
+                    defer cb.free(output);
+                    break :read try readPooledBatch(a, cb, output, take, options.dimensions);
+                };
+                defer {
+                    for (compact) |vector| a.free(vector);
+                    a.free(compact);
+                }
+                for (compact, owners[offset..][0..take]) |vector, index| vectors[index] = try out.dupe(f32, vector);
+                observation.record(take);
+                offset += take;
             }
-            for (compact, owners[offset..][0..take]) |vector, index| vectors[index] = try out.dupe(f32, vector);
-            observation.record(take);
         }
         for (ready[0..ready_count]) |index| parts.releaseGroup(a, cb, index);
     }
 };
+
+/// The same physical request is used for policy planning and live admission.
+const ReadyRequest = struct {
+    backend: @import("../ops/ops.zig").BackendKind,
+    rows: []const PreparedGroup,
+    inputs: usize,
+    host: usize,
+    retained: usize,
+    prepared: usize,
+    max_tokens: usize,
+    dimensions: usize,
+    force: bool,
+    fn request(self: @This(), take: usize) !@import("../backends/session.zig").RunRequest {
+        var longest: usize = 0;
+        var active: usize = 0;
+        for (self.rows[0..take]) |row| {
+            longest = @max(longest, row.ids.len);
+            for (row.mask) |value| active += @intFromBool(value != 0);
+        }
+        const compact = encoder.compactRowsEnabled(self.backend == .metal);
+        const physical = if (compact) active else take * longest;
+        return .{ .batch = if (compact) 1 else take, .sequence = if (compact) active else longest, .input_bytes = self.inputs, .workspace_planned = self.backend == .metal, .backend_input_bytes = physical * 512 * 4, .host_preprocess_bytes = if (self.backend == .cuda and self.force) 1024 * 1024 + self.prepared * self.max_tokens * 16 else self.host, .workspace_bytes = (if (self.backend == .cuda) try cudaEncoderWorkspace(longest, take) else 256 * 1024 * 1024 + physical * 192 * 1024) + self.retained, .preprocessing_complete = self.backend == .cuda, .output_bytes = take * self.dimensions * @sizeOf(f32) };
+    }
+};
+const ReadyAdmission = struct { count: usize, permit: RunPermit };
+fn admitReadyCohort(lane: *StageLane, maximum: usize, context: anytype, comptime request_fn: anytype) !ReadyAdmission {
+    std.debug.assert(maximum > 0 and maximum <= 4);
+    var count = maximum;
+    while (true) {
+        try lane.control.check();
+        const request = try request_fn(context, count);
+        if (count > 1 and !try lane.session.fitsRun(request)) {
+            count -= 1;
+            continue;
+        }
+        const admission = lane.session.run_admission orelse return .{ .count = count, .permit = .{ .session = lane.session, .lease = null } };
+        const target = try admission.estimateRequest(request, lane.session.outputInfo());
+        const permit = lane.admitPhase(target, lane.credit()) catch |err| {
+            if (count == 1 or !isPreparationPressure(err)) return err;
+            count -= 1;
+            continue;
+        };
+        return .{ .count = count, .permit = permit };
+    }
+}
+fn preserveCompletedGroups(vectors: [][]f32, errors: []?anyerror, indexes: []const usize, failure: anyerror) void {
+    for (indexes) |index| if (vectors[index].len == 0 and errors[index] == null) {
+        errors[index] = failure;
+    };
+}
 
 const CohortParts = struct {
     parts: [4][]?SoftTokens = @splat(&.{}),
@@ -2660,7 +2760,7 @@ fn retainPackedPhase(permit: *RunPermit, batch: usize, packed_rows: ResidentPack
     const old = permit.request orelse return;
     var active: usize = 0;
     for (packed_rows.mask) |value| active += @intFromBool(value != 0);
-    try permit.retainForRun(.{ .batch = 1, .sequence = active, .input_bytes = old.input_bytes, .backend_input_bytes = active * 512 * 4, .pre_admitted_host_bytes = old.pre_admitted_host_bytes, .host_preprocess_bytes = @min(old.host_preprocess_bytes, 128 * 1024 * 1024 + active * 192 * 1024), .preprocessing_complete = true, .workspace_bytes = @min(old.workspace_bytes, 256 * 1024 * 1024 + active * 192 * 1024), .output_bytes = batch * 768 * 4 });
+    try permit.retainForRun(.{ .batch = 1, .sequence = active, .input_bytes = old.input_bytes, .backend_input_bytes = active * 512 * 4, .pre_admitted_host_bytes = old.pre_admitted_host_bytes, .host_preprocess_bytes = @min(old.host_preprocess_bytes, 128 * 1024 * 1024 + active * 192 * 1024), .preprocessing_complete = true, .workspace_planned = old.workspace_planned, .workspace_bytes = @min(old.workspace_bytes, 256 * 1024 * 1024 + active * 192 * 1024), .output_bytes = batch * 768 * 4 });
 }
 fn retainPreparedPhase(permit: *RunPermit, batch: usize, sequence: usize) !void {
     const old = permit.request orelse return;
@@ -2776,6 +2876,9 @@ fn projectPreparedImages(comptime resident: bool, cb: *const ComputeBackend, a: 
     };
 }
 
+fn boundedGroupPlanning(backend: @import("../backends/backends.zig").BackendType, options: Options) bool {
+    return boundedVision(backend) and options.prepare_ahead and options.resident_images and options.resident_audio;
+}
 pub fn boundedVision(backend: @import("../backends/backends.zig").BackendType) bool {
     return backend == .metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN");
 }
@@ -4792,4 +4895,112 @@ pub fn qualifyVideoPhaseReclaim(a: std.mem.Allocator, source_session: Session, l
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
     try std.testing.expect(admission.controller.snapshotBackend(.gpu).backendTotalBytes() <= admission.limits.backend_limit_bytes);
     std.debug.print("embeddinggemma2 video_phase_reclaim warmed_cache=true retained_input_parity=true attempts={d}\n", .{timing.phase_reclaim_attempts});
+}
+
+const PhaseTestSession = struct {
+    fn run(_: *anyopaque, _: []const @import("../backends/tensor.zig").Tensor, _: std.mem.Allocator) anyerror![]@import("../backends/tensor.zig").Tensor {
+        return error.UnexpectedModelRun;
+    }
+    fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+        return &.{};
+    }
+    fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+        return .metal;
+    }
+    fn close(_: *anyopaque) void {}
+    const vtable = Session.VTable{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+};
+
+test "embeddinggemma2 compact phase preserves explicit and conservative workspace policies" {
+    const memory = @import("../runtime/tier/memory.zig");
+    for ([_]bool{ false, true }) |planned| {
+        var controller = memory.AdmissionController{};
+        defer controller.deinit();
+        var dummy: u8 = 0;
+        const session = Session{ .ptr = &dummy, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 600 * 1024 * 1024 }, .static_workspace_bytes = 512 * 1024 * 1024, .check_live_memory = false } };
+        var permit = try session.admit(.{ .batch = 1, .sequence = 4, .backend_input_bytes = 4 * 512 * 4, .host_preprocess_bytes = 128 * 1024 * 1024, .workspace_bytes = 320 * 1024 * 1024, .workspace_planned = planned, .output_bytes = 768 * 4 });
+        defer permit.deinit();
+        try retainPackedPhase(&permit, 1, .{ .embeddings = undefined, .mask = @constCast(&[_]i64{ 1, 1, 1, 1 }), .sequence = 4, .compact_input = true });
+        try std.testing.expectEqual(planned, permit.request.?.workspace_planned);
+        const scratch = permit.lease.?.amounts.backend_scratch_bytes;
+        if (planned) try std.testing.expect(scratch < 320 * 1024 * 1024) else try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), scratch);
+    }
+}
+
+test "embeddinggemma2 live cohort admission shrinks prepared rows and preserves independent owners" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Probe = struct {
+        attempts: [4]usize = @splat(0),
+        fn request(self: *@This(), count: usize) !@import("../backends/session.zig").RunRequest {
+            self.attempts[count - 1] += 1;
+            return .{ .workspace_bytes = (256 + count * 64) * 1024 * 1024, .workspace_planned = true, .backend_input_bytes = 0, .output_bytes = 0 };
+        }
+        fn cancel(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var dummy: u8 = 0;
+    const limits = memory.Limits{ .backend_limit_bytes = 700 * 1024 * 1024 };
+    const session = Session{ .ptr = &dummy, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var base = try session.admit(.{ .workspace_bytes = 32 * 1024 * 1024, .workspace_planned = true, .backend_input_bytes = 0, .output_bytes = 0 });
+    defer base.deinit();
+    var peer = try controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = 256 * 1024 * 1024 }, false);
+    defer peer.release();
+    const original = base.lease.?.amounts;
+    var lane = StageLane{ .session = session, .gate = null, .waiter = undefined, .cb = undefined, .control = .{}, .permit = &base, .idle_backend = 0 };
+    var probe = Probe{};
+    var first = try admitReadyCohort(&lane, 4, &probe, Probe.request);
+    try std.testing.expectEqual(@as(usize, 2), first.count);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 1, 1 }, &probe.attempts);
+    try std.testing.expectEqual(@as(usize, 640 * 1024 * 1024), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(original, base.lease.?.amounts);
+    first.permit.deinit();
+    peer.release();
+    var second = try admitReadyCohort(&lane, 2, &probe, Probe.request);
+    defer second.permit.deinit();
+    try std.testing.expectEqual(@as(usize, 2), second.count);
+    try std.testing.expectEqual(original, base.lease.?.amounts);
+    lane.control = .{ .check_fn = Probe.cancel };
+    try std.testing.expectError(error.Cancelled, admitReadyCohort(&lane, 4, &probe, Probe.request));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 1, 1 }, &probe.attempts);
+}
+
+test "embeddinggemma2 late pressure preserves completed group values and prior indexed errors" {
+    var first: [1]f32 = .{0.25};
+    var second: [1]f32 = .{0.5};
+    var vectors = [_][]f32{ &first, &.{}, &second, &.{} };
+    var errors = [_]?anyerror{ null, null, null, error.InvalidInputShape };
+    preserveCompletedGroups(&vectors, &errors, &.{ 0, 1, 2, 3 }, error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqualSlices(?anyerror, &.{ null, error.ResourceTemporarilyUnavailable, null, error.InvalidInputShape }, &errors);
+    try std.testing.expectEqual(@intFromPtr(&first), @intFromPtr(vectors[0].ptr));
+    try std.testing.expectEqual(@intFromPtr(&second), @intFromPtr(vectors[2].ptr));
+}
+
+test "embeddinggemma2 mixed header bounds scale images and audio without maximum context reservations" {
+    var dummy: u8 = 0;
+    const session = Session{ .ptr = &dummy, .vtable = &PhaseTestSession.vtable };
+    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = std.testing.failing_allocator, .limit = 512 * 1024 * 1024 };
+    const cfg = encoder.Config{ .vision = true, .audio = true };
+    const bytes: [48 * 48 * 4]u8 = @splat(127);
+    const raster = Raster{ .bytes = &bytes, .width = 48, .height = 48, .stride_bytes = 48 * 4 };
+    const samples: [16000]f32 = @splat(0);
+    const group = Group{ .content = &.{ .{ .text = "describe" }, .{ .raster = raster }, .{ .pcm = .{ .samples = &samples, .sample_rate = 16000 } } } };
+    const inspected = try inspectGroup(&bounded, session, cfg, group, .{}, .{});
+    try std.testing.expect(inspected.bounds.sequence < 512);
+    try std.testing.expect(inspected.bounds.host < 192 * 1024 * 1024);
+    try std.testing.expectEqual(bytes.len + samples.len * 4 + 8, inspected.input_bytes);
+    for ([_]Options{ .{ .resident_images = false }, .{ .resident_audio = false }, .{ .prepare_ahead = false } }) |legacy_options| {
+        const legacy = try inspectGroup(&bounded, session, cfg, group, legacy_options, .{});
+        try std.testing.expectEqual(@as(usize, 8192), legacy.bounds.sequence);
+        try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), legacy.bounds.host);
+    }
+    const a = std.testing.allocator;
+    const wav = try @import("audio.zig").wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer a.free(wav);
+    const encoded = try inspectGroup(&bounded, session, cfg, .{ .content = &.{.{ .audio = wav }} }, .{}, .{});
+    try std.testing.expect(encoded.bounds.sequence < 512);
+    try std.testing.expect(encoded.bounds.host < 320 * 1024 * 1024);
+    try std.testing.expect(encoded.bounds.host >= @import("audio.zig").default_decode_working_bytes);
 }

@@ -293,10 +293,31 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
             }
             break :blk .{ .vectors = vectors, .execution = .fallback };
         };
-        if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-cohort items={d} execution={s}\n", .{ items.len, @tagName(result.execution) });
         defer shared.free(result.input_tokens);
+        var execution = result.execution;
+        // The scheduler preserves finished peers and shrinks prepared encoder
+        // cohorts before returning pressure errors. Once its prepared owners
+        // drain, retry only the failed items; completed towers never replay.
+        for (items, groups[0..items.len], 0..) |item, group, index| {
+            const failure = errors[index] orelse continue;
+            if (failure != error.MemoryBudgetExceeded and failure != error.ResourceLimitExceeded and failure != error.ResourceTemporarilyUnavailable) continue;
+            item.control.check() catch |err| {
+                errors[index] = err;
+                continue;
+            };
+            const singleton = grouped.embed(shared, first.session, first.tokenizer, group, first.options, first.gate, control) catch |err| {
+                errors[index] = err;
+                continue;
+            };
+            shared.free(result.vectors[index]);
+            result.vectors[index] = singleton.vector;
+            result.input_tokens[index] = singleton.input_tokens;
+            errors[index] = null;
+            execution = .fallback;
+        }
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-cohort items={d} execution={s}\n", .{ items.len, @tagName(execution) });
         @memcpy(counts[0..items.len], result.input_tokens);
-        break :blk .{ .vectors = result.vectors, .execution = result.execution };
+        break :blk .{ .vectors = result.vectors, .execution = execution };
     } else if (first.part == .audio) blk: {
         var clips: [4]@import("audio_preparation.zig").Clip = undefined;
         for (items, 0..) |item, index| clips[index] = .{ .bytes = item.payloadAs(Ticket).part.audio };

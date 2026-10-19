@@ -840,3 +840,11 @@ denial, the pipeline retains tensor leases and its model turn, retires provider
 bindings, retries admission and selectively reclaims idle caches. Ownership is
 restored before return, including cancellation/error cleanup. Other quota or
 forced denials do not trigger cache eviction.
+
+Mixed Metal group reservations use inspected image geometry and trustworthy
+audio duration bounds for retained rows. Encoded audio retains its bounded
+decoder allowance even with a short header duration; unknown durations keep
+maximum token bounds. Compact phase reductions preserve explicit workspace
+policy. Live encoder admission can shrink a ready cohort without discarding
+its prepared inputs. Later pressure preserves completed vectors and indexes;
+the broker retries only failed items after prepared owners drain.
