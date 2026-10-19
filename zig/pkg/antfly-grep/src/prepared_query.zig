@@ -38,6 +38,7 @@ pub fn Registry(comptime Search: type) type {
             // One scalar certificate per immutable registration. No result
             // payload, generation, matcher scratch or source bytes are pinned.
             completion: ?struct { token: [64]u8, revision: [64]u8, summary: Search.SummaryType } = null,
+            lexical: Search.LexicalIndex = undefined,
             index: Search.IncrementalIndex = undefined,
             delivery_arena: ?std.heap.ArenaAllocator = null,
             delivery: ?Search.Delivery = null,
@@ -47,6 +48,7 @@ pub fn Registry(comptime Search: type) type {
                 errdefer a.destroy(plan);
                 plan.* = .{ .a = a, .budget = .{ .backing = a, .limit = plan_limit }, .arena = undefined };
                 plan.index = Search.IncrementalIndex.init(a, io);
+                plan.lexical = Search.LexicalIndex.init(a, io);
                 plan.arena = .init(plan.budget.allocator());
                 errdefer plan.arena.deinit();
                 const scratch = plan.arena.allocator();
@@ -85,6 +87,7 @@ pub fn Registry(comptime Search: type) type {
             }
             pub fn deinit(plan: *Plan) void {
                 const a = plan.a;
+                plan.lexical.deinit();
                 plan.index.deinit();
                 if (plan.delivery_arena) |*arena| arena.deinit();
                 plan.matcher.deinit();
@@ -99,7 +102,7 @@ pub fn Registry(comptime Search: type) type {
         pub fn retainedBytes(self: *const Self) usize {
             var bytes: usize = 0;
             for (self.slots) |slot| if (slot) |plan| {
-                bytes += @sizeOf(Plan) + plan.budget.live + plan.index.budget.live;
+                bytes += @sizeOf(Plan) + plan.budget.live + plan.index.budget.live + plan.lexical.budget.live;
             };
             return bytes;
         }

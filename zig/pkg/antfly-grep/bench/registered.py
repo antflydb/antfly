@@ -44,9 +44,16 @@ class Client(Service):
         )
         self.process.stdin.flush()
         rows = []
+        first_event = None
         while True:
             row = self.read()
             rows.append(row)
+            if first_event is None and row["type"] in (
+                "match",
+                "workspace_unchanged",
+                "workspace_lexical_delta",
+            ):
+                first_event = time.monotonic() - started
             if row["type"] == "workspace_error":
                 raise RuntimeError(rows)
             if row["type"] in (
@@ -59,6 +66,7 @@ class Client(Service):
         result = {
             "seconds": time.monotonic() - started,
             "response_bytes": self.wire_bytes - before,
+            "first_event_seconds": first_event,
         }
         if op == "refresh":
             self.ready = rows[-1]

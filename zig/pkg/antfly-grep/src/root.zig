@@ -26,6 +26,7 @@ pub const filetypes = @import("filetypes.zig");
 pub const decision = @import("decision.zig");
 const Allocator = std.mem.Allocator;
 pub const Summary = struct {
+    lexical_entries_visited: usize = 0,
     lexical_cache_hits: usize = 0,
     lexical_files_evaluated: usize = 0,
     index_requests: usize = 0,
@@ -219,7 +220,36 @@ fn evaluationRuns(a: Allocator, selected: []const bool, probabilities: []const f
     return try runs.toOwnedSlice(a);
 }
 const Incremental = @import("incremental.zig").Index(Summary, SavedEvaluation);
-const SavedLexical = struct { summary: Summary, rows: []const u8, binary_offset: ?usize };
+const LexicalRow = struct {
+    raw: []const u8,
+    text_length: usize,
+    separate_text: ?[]const u8,
+    line: usize,
+    offset: usize,
+    matched: bool,
+    spans: []const @import("matcher.zig").Span,
+};
+const SavedLexical = struct { summary: Summary, rows: []const LexicalRow, binary_offset: ?usize };
+const LexicalCapture = struct {
+    budget: @import("antfly_regex").Budget,
+    arena: std.heap.ArenaAllocator,
+    rows: std.ArrayList(LexicalRow) = .empty,
+    fn create(a: Allocator) !*LexicalCapture {
+        const value = try a.create(LexicalCapture);
+        value.* = .{ .budget = .{ .backing = a, .limit = 256 * 1024 }, .arena = undefined };
+        value.arena = .init(value.budget.allocator());
+        return value;
+    }
+    fn reset(self: *LexicalCapture) void {
+        self.arena.deinit();
+        self.arena = .init(self.budget.allocator());
+        self.rows = .empty;
+    }
+    fn deinit(self: *LexicalCapture, a: Allocator) void {
+        self.arena.deinit();
+        a.destroy(self);
+    }
+};
 const WorkspaceReuse = struct {
     lexical: @import("reuse_cache.zig").Cache(SavedLexical, 4096, 8 * 1024 * 1024),
     queries: @import("reuse_cache.zig").Cache(SavedQuery, 32, 4 * 1024 * 1024),
@@ -278,6 +308,7 @@ const Region = @import("regions.zig").Region;
 const ExternalDictionary = @import("external_dictionary.zig").Shared;
 pub const Search = struct {
     const lexical_limit = 256 * 1024;
+    pub const LexicalIndex = @import("lexical_index.zig").Index(Summary);
     pub const Reuse = WorkspaceReuse;
     pub const IncrementalIndex = Incremental;
     pub const Delivery = @import("incremental.zig").Delivery;
@@ -296,6 +327,7 @@ pub const Search = struct {
     executor: ?*@import("worker_pool.zig").Pool = null,
     workspace_generation: ?*const @import("workspace_store.zig").Generation = null,
     workspace_entry: ?*const @import("workspace_store.zig").Entry = null,
+    file_revision: [64]u8 = undefined,
     fresh_workspace_preparation: bool = false,
     coalescer: decision.Coalescer = .{},
     spill: ?*Spill = null,
@@ -351,9 +383,15 @@ pub const Search = struct {
     replacement_file_context: bool = false,
     sink: ?*std.Io.Writer = null,
     retaining_output: bool = false,
+    first_file_flushed: bool = false,
+    buffered_files: u8 = 0,
     output_bytes: usize = 0,
     output_buffer: std.ArrayList(u8) = .empty,
-    lexical_rows: std.ArrayList(u8) = .empty,
+    lexical_index: ?*LexicalIndex = null,
+    lexical_paths: ?[]const []const u8 = null,
+    lexical_patch: ?struct { base_token: [64]u8, base_revision: [64]u8, removed: []const JsonText } = null,
+    lexical_staging: ?*LexicalCapture = null,
+    lexical_replay_row: ?*const LexicalRow = null,
     lexical_capture: bool = false,
     lexical_overflow: bool = false,
     collecting: bool = true,
@@ -391,27 +429,43 @@ pub const Search = struct {
     pub fn lexicalCertificateEligible(o: *const Options) bool {
         return o.ask == null and !o.no_cache and !o.debug and !o.trace and !o.quiet;
     }
-    pub fn completedConditional(a: Allocator, io: std.Io, o: *const Options, generation: *const @import("workspace_store.zig").Generation, summary: Summary, token: [64]u8) !u8 {
+    pub fn completedConditional(a: Allocator, io: std.Io, o: *const Options, generation: *const @import("workspace_store.zig").Generation, summary: Summary, token: [64]u8) !?u8 {
         var search: Search = .{ .a = a, .io = io, .options = o, .matcher = undefined, .decider = decision.Client.init(a, io, o) };
         defer search.output_buffer.deinit(a);
         defer search.decider.deinit();
         const guard = @import("interrupt.zig").Guard.init(&search.limits.cancel);
         defer guard.deinit();
+        // Stage the entire acknowledgement, including its fresh summary. A
+        // bounded full miss can fit when acknowledgement + summary cannot.
+        var staged: std.Io.Writer.Allocating = .init(a);
+        defer staged.deinit();
+        search.sink = &staged.writer;
         const started = std.Io.Clock.awake.now(io);
         search.summary = summary;
         search.summary.query_cache_hits = 1;
+        search.summary.lexical_entries_visited = 0;
         search.summary.lexical_cache_hits = 0;
         search.summary.lexical_files_evaluated = 0;
         search.summary.incremental_cache_hits = 0;
         search.summary.incremental_files_evaluated = 0;
         search.summary.incremental_results_materialized = 0;
-        if (!search.limits.cancel.load(.acquire)) try search.protocolJson(.{ .type = "workspace_unchanged", .result_token = token, .revision = generation.revision, .observed_at = generation.captured_at }, false);
-        return search.finish(started);
+        if (!search.limits.cancel.load(.acquire)) search.protocolJson(.{ .type = "workspace_unchanged", .result_token = token, .revision = generation.revision, .observed_at = generation.captured_at }, false) catch |err| {
+            if (err == error.OutputBudgetExceeded) return null;
+            return err;
+        };
+        const code = search.finish(started) catch |err| {
+            if (err == error.OutputBudgetExceeded) return null;
+            return err;
+        };
+        try std.Io.File.stdout().writeStreamingAll(io, staged.written());
+        return code;
     }
-    pub fn publishCompletion(self: *Search) ![64]u8 {
+    pub fn publishCompletion(self: *Search, previous: ?[64]u8) ![64]u8 {
         var nonce: [32]u8 = undefined;
-        self.io.random(&nonce);
-        const token = std.fmt.bytesToHex(nonce, .lower);
+        const token = previous orelse token: {
+            self.io.random(&nonce);
+            break :token std.fmt.bytesToHex(nonce, .lower);
+        };
         try self.protocolJson(.{ .type = "result_token", .result_token = token }, true);
         try self.flushOutput();
         return token;
@@ -455,6 +509,7 @@ pub const Search = struct {
         result.reuse_identity = root.reuse_identity;
         result.evaluation_identity = root.evaluation_identity;
         result.incremental = root.incremental;
+        result.lexical_index = root.lexical_index;
         result.decider.shareCache(&root.decider);
         result.decider.coalescer = root.decider.coalescer;
         result.ranking = root.ranking;
@@ -488,7 +543,7 @@ pub const Search = struct {
             views.deinit(self.io);
             self.a.destroy(views);
         }
-        self.lexical_rows.deinit(self.a);
+        if (self.lexical_staging) |capture| capture.deinit(self.a);
         self.output_buffer.deinit(self.a);
         self.matcher.deinit();
         self.decider.deinit();
@@ -526,6 +581,7 @@ pub const Search = struct {
         }
         self.shared_limits = &self.limits;
         self.decider.limits = &self.limits;
+        if (self.lexical_patch) |patch| try self.protocolJson(.{ .type = "workspace_lexical_delta", .base_token = patch.base_token, .base_revision = patch.base_revision, .revision = self.workspace_generation.?.revision, .observed_at = self.workspace_generation.?.captured_at, .removed = patch.removed, .ordering = "path" }, false);
         const implicit_directory = self.options.ask != null and self.options.paths.items.len == 0 and self.options.table_config == null and (try std.Io.File.stdin().isTty(self.io));
         self.query_reuse_eligible = (self.options.ask != null and self.options.ranked and self.options.sort == null and
             self.options.max_result_files != std.math.maxInt(usize) and !self.hasStdinPath() and
@@ -580,7 +636,7 @@ pub const Search = struct {
             self.ranking = ranking;
             self.owns_ranking = true;
         }
-        const single_regular_file = if (self.workspace_generation) |generation| generation.entries.items.len == 1 else self.options.paths.items.len == 1 and !self.hasStdinPath() and
+        const single_regular_file = if (self.lexical_paths) |paths| paths.len <= 1 else if (self.workspace_generation) |generation| generation.entries.items.len == 1 else self.options.paths.items.len == 1 and !self.hasStdinPath() and
             (if (std.Io.Dir.cwd().statFile(self.io, self.options.paths.items[0], .{})) |info| info.kind == .file else |_| false);
         self.single_source = single_regular_file and self.options.table_config == null;
         if (self.ranking == null and self.options.ask != null and self.options.ranked and self.options.sort == null and
@@ -618,13 +674,26 @@ pub const Search = struct {
         };
 
         if (self.workspace_generation) |generation| {
-            var entries = generation.iterator();
-            while (entries.next()) |entry| {
-                if (self.stopped()) break;
-                self.workspace_entry = entry;
-                self.explicit_file = entry.explicit_file;
-                self.render_filename = true;
-                self.file(entry.path, entry.path) catch |err| try self.reportError(entry.path, err);
+            if (self.lexical_paths) |paths| {
+                for (paths) |path| {
+                    if (self.stopped()) break;
+                    if (self.options.ask == null) self.summary.lexical_entries_visited += 1;
+                    const entry = generation.find(path) orelse continue;
+                    self.workspace_entry = entry;
+                    self.explicit_file = entry.explicit_file;
+                    self.render_filename = true;
+                    self.file(entry.path, entry.path) catch |err| try self.reportError(entry.path, err);
+                }
+            } else {
+                var entries = generation.iterator();
+                while (entries.next()) |entry| {
+                    if (self.stopped()) break;
+                    if (self.options.ask == null) self.summary.lexical_entries_visited += 1;
+                    self.workspace_entry = entry;
+                    self.explicit_file = entry.explicit_file;
+                    self.render_filename = true;
+                    self.file(entry.path, entry.path) catch |err| try self.reportError(entry.path, err);
+                }
             }
             self.workspace_entry = null;
         } else {
@@ -1095,7 +1164,23 @@ pub const Search = struct {
             fn finish(self: *StreamingSink) !void {
                 defer self.release();
                 try self.writer.flush();
-                if (self.locked and !self.ctx.search.options.block_buffered) try self.ctx.search.flushOutput();
+                if (self.locked and !self.ctx.search.options.block_buffered) {
+                    const root = self.ctx.search;
+                    // Deliver the first lexical result immediately. Pipe output
+                    // then batches a bounded number of files/bytes. Keeping
+                    // startup batches below the general 64 KiB threshold lets
+                    // the reader decode concurrently with later encoding. Once
+                    // 128 KiB is in flight, amortize writes with larger batches.
+                    // TTY/provider and explicit line buffering keep their
+                    // existing publication behavior; no clock/polling is added.
+                    const bulk = root.output_bytes >= 128 * 1024;
+                    root.buffered_files += 1;
+                    if (root.options.ask != null or root.stdout_tty or !root.first_file_flushed or root.buffered_files >= @as(u8, if (bulk) 64 else 8) or root.output_buffer.items.len >= @as(usize, if (bulk) 65536 else 16384)) {
+                        try root.flushOutput();
+                        root.first_file_flushed = true;
+                        root.buffered_files = 0;
+                    }
+                }
             }
         };
         fn worker(ctx: *Parallel) void {
@@ -1349,12 +1434,15 @@ pub const Search = struct {
         defer self.provenance = previous_source;
         self.provenance = .{ .uri = local_uri, .observed_at = if (self.options.json) std.Io.Clock.real.now(self.io).toSeconds() else null };
         if (self.workspace_entry) |entry| {
-            self.provenance.revision = &entry.revision;
+            self.file_revision = entry.revision();
+            self.provenance.revision = &self.file_revision;
             self.provenance.snapshot = &self.workspace_generation.?.revision;
             self.provenance.observed_at = self.workspace_generation.?.captured_at;
             self.provenance.freshness = .snapshot;
         }
         const before = self.summary;
+        const output_before = self.output_bytes;
+        defer if (self.lexical_index) |index| index.record(display, summaryDelta(self.summary, before), self.output_bytes > output_before);
         self.file_elapsed_ns = null;
         self.file_before = before;
         self.file_output_start = self.output_bytes;
@@ -1385,12 +1473,13 @@ pub const Search = struct {
                 try self.jsonEnd(display, before);
                 return;
             }
-            self.lexical_rows.clearRetainingCapacity();
-            self.lexical_overflow = false;
-            self.lexical_capture = true;
-            self.summary.lexical_files_evaluated += 1;
+            if (self.lexical_staging == null) self.lexical_staging = LexicalCapture.create(self.a) catch null;
+            if (self.lexical_staging) |capture| capture.reset();
+            self.lexical_overflow = self.lexical_staging == null;
+            self.lexical_capture = !self.lexical_overflow;
         }
         defer self.lexical_capture = false;
+        if (self.options.ask == null) self.summary.lexical_files_evaluated += 1;
         self.readFile(path_name, display) catch |err| {
             try self.jsonEnd(display, before);
             return err;
@@ -1404,21 +1493,21 @@ pub const Search = struct {
             var outcome = summaryDelta(self.summary, before);
             outcome.lexical_cache_hits = 0;
             outcome.lexical_files_evaluated = 0;
-            self.reuse.?.lexical.put(key, times, .{ .summary = outcome, .rows = self.lexical_rows.items, .binary_offset = self.binary_offset });
+            self.reuse.?.lexical.put(key, times, .{ .summary = outcome, .rows = self.lexical_staging.?.rows.items, .binary_offset = self.binary_offset });
         };
         if (self.deferred_candidate) |c| c.elapsed_ns = if (self.file_started) |start| @intCast(@max(0, start.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds)) else 0;
     }
     fn lexicalKey(self: *Search, path: []const u8) ?[32]u8 {
         const o = self.options;
-        if (self.reuse == null or self.reuse_identity == null or o.ask != null or o.no_cache or o.cache_ttl_seconds == 0 or o.debug or o.trace or !o.json or self.retaining_output or o.quiet or o.count or o.count_matches or o.files_with_matches or o.files_without_match or o.max_output_bytes != std.math.maxInt(usize)) return null;
+        if (self.reuse == null or self.reuse_identity == null or o.ask != null or o.no_cache or o.cache_ttl_seconds == 0 or o.debug or o.trace or !o.json or self.retaining_output or o.quiet or o.count or o.count_matches or o.files_with_matches or o.files_without_match or o.max_output_bytes != std.math.maxInt(usize) or o.max_source_bytes != std.math.maxInt(usize)) return null;
         const entry = self.workspace_entry orelse return null;
         // Small sources are cheaper to match directly than to hash, lease and
-        // decode JSON. Completion certificates still cover their whole query.
-        if (entry.bytes.len < 4096) return null;
+        // replay typed rows. Completion certificates still cover their whole query.
+        if (entry.bytes().len < 4096) return null;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly-workspace-lexical-v1");
         hash.update(&self.reuse_identity.?);
-        hash.update(&entry.revision);
+        hash.update(&entry.digest);
         hash.update(&.{ @intFromBool(self.explicit_file), @intFromBool(self.render_filename) });
         hash.update(path);
         var key: [32]u8 = undefined;
@@ -1435,25 +1524,20 @@ pub const Search = struct {
         }
         self.summary.lexical_cache_hits += 1;
         self.binary_offset = saved.binary_offset;
-        var rows = std.mem.splitScalar(u8, saved.rows, '\n');
-        while (rows.next()) |row| {
-            if (row.len == 0) continue;
+        for (saved.rows) |*row| {
             if ((self.shared_limits orelse &self.limits).cancel.load(.acquire)) return error.Canceled;
-            var parsed = try std.json.parseFromSlice(std.json.Value, self.a, row, .{ .allocate = .alloc_always });
-            defer parsed.deinit();
-            var value = parsed.value;
-            const kind = value.object.get("type").?.string;
-            if (std.mem.eql(u8, kind, "begin")) {
-                try self.jsonBegin(path);
-                continue;
+            self.lexical_replay_row = row;
+            self.raw_line = row.raw;
+            self.current_hits = null;
+            self.replay_spans = false;
+            defer {
+                self.lexical_replay_row = null;
+                self.raw_line = null;
             }
-            if (std.mem.eql(u8, kind, "end")) continue;
-            _ = value.object.swapRemove("source");
-            _ = value.object.swapRemove("result_schema_version");
-            _ = value.object.swapRemove("file_id");
-            try self.json(value);
+            try self.emit(path, row.separate_text orelse row.raw[0..row.text_length], row.line, row.offset, row.matched, std.math.nan(f64));
         }
     }
+
     fn reportStagedError(self: *Search, path: []const u8, err: anyerror) !void {
         self.reportError(path, err) catch |failure| {
             if ((err == error.OutputBudgetExceeded or err == error.PendingOutputBudgetExceeded) and
@@ -1600,7 +1684,7 @@ pub const Search = struct {
     }
     fn readFile(self: *Search, path_name: []const u8, display: []const u8) !void {
         if (self.workspace_entry) |entry| {
-            if (entry.bytes.len > self.options.max_file_bytes) {
+            if (entry.bytes().len > self.options.max_file_bytes) {
                 if (self.options.skip_oversize) return;
                 return error.StreamTooLong;
             }
@@ -1611,7 +1695,7 @@ pub const Search = struct {
                 if (self.fresh_workspace_preparation) self.summary.source_parses += 1;
             }
             self.replacement_file_context = @import("builtin").os.tag == .linux and (self.options.mmap or (self.options.mmap_auto and self.options.ask == null));
-            return self.processBytes(display, entry.bytes);
+            return self.processBytes(display, entry.bytes());
         }
         if (self.options.skip_oversize) {
             const info = try std.Io.Dir.cwd().statFile(self.io, path_name, .{});
@@ -2274,7 +2358,7 @@ pub const Search = struct {
         if (self.shared_limits) |limits| if (!Limits.reserve(&limits.source_bytes, bytes.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
         self.summary.files += 1;
         self.summary.bytes += bytes.len;
-        const validated_snapshot = if (self.workspace_entry) |entry| entry.preparation != null and entry.bytes.ptr == bytes.ptr and entry.bytes.len == bytes.len else false;
+        const validated_snapshot = if (self.workspace_entry) |entry| entry.preparation != null and entry.bytes().ptr == bytes.ptr and entry.bytes().len == bytes.len else false;
         if (self.options.ask != null and !validated_snapshot and !std.unicode.utf8ValidateSlice(bytes)) {
             self.summary.invalid_utf8_files += 1;
             return;
@@ -2287,7 +2371,7 @@ pub const Search = struct {
         const lines = if (self.options.ask != null) blk: {
             var hit = false;
             prepared = if (self.workspace_entry) |entry| blk2: {
-                if (!self.options.crlf and !self.options.null_data and bytes.ptr == entry.bytes.ptr and bytes.len == entry.bytes.len and entry.preparation != null) {
+                if (!self.options.crlf and !self.options.null_data and bytes.ptr == entry.bytes().ptr and bytes.len == entry.bytes().len and entry.preparation != null) {
                     hit = true;
                     break :blk2 entry.prepared().?;
                 }
@@ -2791,7 +2875,7 @@ pub const Search = struct {
         if (entry.preparation == null or self.options.crlf or self.options.null_data) return null;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(&self.evaluation_identity.?);
-        hash.update(&entry.revision);
+        hash.update(&entry.digest);
         hash.update(path);
         var key: [32]u8 = undefined;
         hash.final(&key);
@@ -2919,7 +3003,8 @@ pub const Search = struct {
         while (current) |record| : (current = Incremental.next(record)) {
             if (count >= self.options.max_result_files or self.limits.cancel.load(.acquire)) break;
             const entry = generation.find(record.path) orelse continue;
-            if (!std.mem.eql(u8, &entry.revision, &record.revision) or entry.preparation == null) return error.InconsistentIncrementalIndex;
+            const revision = entry.revision();
+            if (!std.mem.eql(u8, &revision, &record.revision) or entry.preparation == null) return error.InconsistentIncrementalIndex;
             var borrowed: ?*const SavedCandidate = null;
             if (self.prior_delivery) |base| if (base.by_path.get(record.path)) |tag| {
                 if (std.mem.eql(u8, &tag, &record.tag)) if (previous) |lease| {
@@ -2966,10 +3051,11 @@ pub const Search = struct {
             self.best_probability = record.score;
             const previous_source = self.provenance;
             defer self.provenance = previous_source;
-            self.provenance = .{ .uri = try @import("document.zig").localUriAt(a, self.local_cwd.?, record.path), .revision = &entry.revision, .snapshot = &generation.revision, .observed_at = generation.captured_at, .freshness = .snapshot };
+            self.file_revision = entry.revision();
+            self.provenance = .{ .uri = try @import("document.zig").localUriAt(a, self.local_cwd.?, record.path), .revision = &self.file_revision, .snapshot = &generation.revision, .observed_at = generation.captured_at, .freshness = .snapshot };
             self.render_filename = true;
             self.file_before = .{};
-            try self.retainCandidate(a, record.path, entry.bytes, prepared.lines, selected, probabilities, self.options.jev_mode);
+            try self.retainCandidate(a, record.path, entry.bytes(), prepared.lines, selected, probabilities, self.options.jev_mode);
             if (self.deferred_candidate) |candidate| {
                 self.deferred_candidate = null;
                 candidate.summary = record.summary;
@@ -3013,14 +3099,14 @@ pub const Search = struct {
     fn evaluateFile(self: *Search, a: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !bool {
         defer if (self.incremental) |index| {
             if (self.workspace_entry) |entry| {
-                if (entry.preparation == null or bytes.ptr != entry.bytes.ptr or bytes.len != entry.bytes.len) {
+                if (entry.preparation == null or bytes.ptr != entry.bytes().ptr or bytes.len != entry.bytes().len) {
                     index.fail();
                 } else {
                     var scratch: @import("antfly_regex").Budget = .{ .backing = self.a, .limit = 2 * 1024 * 1024 };
                     const runs = evaluationRuns(scratch.allocator(), selected, probabilities, self.evidence.?.line_scores) catch null;
                     if (runs) |spans| {
                         defer scratch.allocator().free(spans);
-                        self.pending_record = index.capture(path, entry.revision, .{
+                        self.pending_record = index.capture(path, entry.revision(), .{
                             .line_count = selected.len,
                             .runs = spans,
                             .dense = if (selected.len != 0 and spans.len == 0) .{ .selected = selected, .probabilities = probabilities, .line_scores = self.evidence.?.line_scores } else null,
@@ -3126,8 +3212,8 @@ pub const Search = struct {
         var regions: std.ArrayList(Region) = .empty;
         if (self.options.semantic_files_only) return;
         const plan = if (self.region_plans) |cache| if (self.workspace_entry) |entry| blk: {
-            if (self.options.crlf or self.options.null_data or bytes.ptr != entry.bytes.ptr or bytes.len != entry.bytes.len or entry.preparation == null) break :blk null;
-            break :blk cache.get(path_name, entry.revision, bytes, lines, self.evidence.?.index, self.options.chunk_lines, self.options.context_lines);
+            if (self.options.crlf or self.options.null_data or bytes.ptr != entry.bytes().ptr or bytes.len != entry.bytes().len or entry.preparation == null) break :blk null;
+            break :blk cache.get(path_name, entry.revision(), bytes, lines, self.evidence.?.index, self.options.chunk_lines, self.options.context_lines);
         } else null else null;
         defer if (plan) |value| value.release();
         self.decider.stage = if (self.options.chunk_lines == 1) .line else .region;
@@ -3297,17 +3383,17 @@ pub const Search = struct {
             return count;
         }
     };
-    noinline fn captureLexical(self: *Search, bytes: []const u8) void {
-        if (self.lexical_overflow) return;
-        if (bytes.len > lexical_limit - self.lexical_rows.items.len) {
+    fn captureLexicalRow(self: *Search, text: []const u8, raw: []const u8, line: usize, offset: usize, matched: bool, spans: []const @import("matcher.zig").Span) void {
+        if (!self.lexical_capture or self.lexical_overflow) return;
+        self.captureLexicalRowFallible(text, raw, line, offset, matched, spans) catch {
             self.lexical_overflow = true;
-            return;
-        }
-        self.lexical_rows.ensureTotalCapacityPrecise(self.a, @min(lexical_limit, @max(self.lexical_rows.items.len + bytes.len, self.lexical_rows.capacity + self.lexical_rows.capacity / 2 + 64))) catch {
-            self.lexical_overflow = true;
-            return;
         };
-        self.lexical_rows.appendSliceAssumeCapacity(bytes);
+    }
+    noinline fn captureLexicalRowFallible(self: *Search, text: []const u8, raw: []const u8, line: usize, offset: usize, matched: bool, spans: []const @import("matcher.zig").Span) !void {
+        const capture = self.lexical_staging.?;
+        const a = capture.arena.allocator();
+        const shared_prefix = text.len <= raw.len and std.mem.eql(u8, text, raw[0..text.len]);
+        try capture.rows.append(a, .{ .raw = try a.dupe(u8, raw), .text_length = text.len, .separate_text = if (shared_prefix) null else try a.dupe(u8, text), .line = line, .offset = offset, .matched = matched, .spans = spans });
     }
     pub fn write(self: *Search, bytes: []const u8) !void {
         if (self.retaining_output) if (self.shared_limits) |limits| {
@@ -3416,7 +3502,7 @@ pub const Search = struct {
             // Borrow the scanner's stable spans; rendering changes only the
             // view length, never the backing entries or capture storage.
             hits.items = @constCast(self.current_hits.?);
-        } else if (!self.replay_spans and matched and p == null and !self.options.invert and (self.options.json or self.options.only_matching or self.options.replacement != null or self.color_enabled or self.options.column or self.options.vimgrep)) while (self.matcher.find(text, cursor)) |hit| {
+        } else if (self.lexical_replay_row == null and !self.replay_spans and matched and p == null and !self.options.invert and (self.options.json or self.options.only_matching or self.options.replacement != null or self.color_enabled or self.options.column or self.options.vimgrep)) while (self.matcher.find(text, cursor)) |hit| {
             if (hit.span.start == hit.span.end and previous_end != null and previous_end.? == hit.span.end) {
                 cursor = self.matcher.advance(text, hit.span.end);
                 if (cursor > text.len or (!terminated and cursor == text.len)) break;
@@ -3440,13 +3526,15 @@ pub const Search = struct {
             const raw = self.raw_line orelse text;
             const utf8 = self.options.json_compact or std.unicode.utf8ValidateSlice(text);
             const encoded = if (utf8) null else try base64(a, text);
-            const subs = JsonSubmatches{ .matcher = &self.matcher, .text = text, .terminated = terminated, .runs = if (self.replay_spans and matched) self.cachedRuns() else null, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
+            var captured_spans: std.ArrayList(@import("matcher.zig").Span) = .empty;
+            const subs = JsonSubmatches{ .capture = if (self.lexical_capture and !self.lexical_overflow) .{ .a = self.lexical_staging.?.arena.allocator(), .spans = &captured_spans, .failed = &self.lexical_overflow } else null, .spans = if (self.lexical_replay_row) |row| row.spans else null, .matcher = &self.matcher, .text = text, .terminated = terminated, .runs = if (self.replay_spans and matched) self.cachedRuns() else null, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
             const raw_valid = std.unicode.utf8ValidateSlice(raw);
             if (self.options.json_compact) {
                 try self.json(.{ .type = if (matched) "match" else "context", .data = .{ .lines = JsonText{ .text = if (raw_valid) raw else null, .bytes = if (raw_valid) null else try base64(a, raw) }, .line_number = line, .absolute_offset = byte_offset, .submatches = subs }, .probability = p, .scope = if (p != null and !independent) "region" else "line" });
             } else {
                 try self.json(.{ .type = if (matched) "match" else "context", .data = .{ .path = encoded_path, .lines = JsonText{ .text = if (raw_valid) raw else null, .bytes = if (raw_valid) null else try base64(a, raw) }, .line_number = line, .absolute_offset = byte_offset, .submatches = subs }, .path = if (encoded_path.text != null) path_name else null, .path_bytes_base64 = encoded_path.bytes, .line_number = line, .byte_offset = byte_offset, .text = if (utf8) text else null, .bytes_base64 = encoded, .probability = p, .scope = if (p != null and !independent) "region" else "line" });
             }
+            self.captureLexicalRow(text, raw, line, byte_offset, matched, captured_spans.items);
             return;
         }
         if ((self.options.heading orelse false) and self.render_filename) {
@@ -3599,6 +3687,9 @@ pub const Search = struct {
         }
     };
     const JsonSubmatches = struct {
+        const Collector = struct { a: Allocator, spans: *std.ArrayList(@import("matcher.zig").Span), failed: *bool };
+        capture: ?Collector = null,
+        spans: ?[]const @import("matcher.zig").Span = null,
         matcher: *Matcher,
         text: []const u8,
         terminated: bool,
@@ -3606,7 +3697,9 @@ pub const Search = struct {
         runs: ?[]const SpanRun = null,
         pub fn jsonStringify(self: @This(), json_writer: *std.json.Stringify) !void {
             try json_writer.beginArray();
-            if (self.hits) |hits| {
+            if (self.spans) |spans| {
+                for (spans) |span| try self.item(json_writer, span);
+            } else if (self.hits) |hits| {
                 for (hits) |hit| try self.item(json_writer, hit.span);
             } else {
                 var spans = SpanIterator{ .matcher = self.matcher, .text = self.text, .terminated = self.terminated, .runs = self.runs };
@@ -3616,6 +3709,9 @@ pub const Search = struct {
             try json_writer.endArray();
         }
         fn item(self: @This(), json_writer: *std.json.Stringify, span: @import("matcher.zig").Span) !void {
+            if (self.capture) |collector| if (!collector.failed.*) collector.spans.append(collector.a, span) catch {
+                collector.failed.* = true;
+            };
             const bytes = self.text[span.start..span.end];
             if (std.unicode.utf8ValidateSlice(bytes)) {
                 try json_writer.write(.{ .match = .{ .text = bytes }, .start = span.start, .end = span.end });
@@ -3651,25 +3747,15 @@ pub const Search = struct {
         writer: std.Io.Writer,
         failure: ?anyerror = null,
         fn drain(writer: *std.Io.Writer, slices: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-            return drainImpl(writer, slices, splat, false);
-        }
-        fn captureDrain(writer: *std.Io.Writer, slices: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-            return drainImpl(writer, slices, splat, true);
-        }
-        fn send(self: *@This(), bytes: []const u8, comptime capture: bool) !void {
-            try self.search.write(bytes);
-            if (capture) self.search.captureLexical(bytes);
-        }
-        fn drainImpl(writer: *std.Io.Writer, slices: []const []const u8, splat: usize, comptime capture: bool) std.Io.Writer.Error!usize {
             const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
-            self.send(writer.buffer[0..writer.end], capture) catch |err| {
+            self.search.write(writer.buffer[0..writer.end]) catch |err| {
                 self.failure = err;
                 return error.WriteFailed;
             };
             writer.end = 0;
             var count: usize = 0;
             for (slices[0 .. slices.len - 1]) |bytes| {
-                self.send(bytes, capture) catch |err| {
+                self.search.write(bytes) catch |err| {
                     self.failure = err;
                     return error.WriteFailed;
                 };
@@ -3677,7 +3763,7 @@ pub const Search = struct {
             }
             for (0..splat) |_| {
                 const bytes = slices[slices.len - 1];
-                self.send(bytes, capture) catch |err| {
+                self.search.write(bytes) catch |err| {
                     self.failure = err;
                     return error.WriteFailed;
                 };
@@ -3693,7 +3779,7 @@ pub const Search = struct {
     }
     fn emitReplay(self: *Search, path: []const u8, text: []const u8, line: usize, offset: usize, terminated: bool) !void {
         var buffer: [65536]u8 = undefined;
-        var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = if (self.lexical_capture) OutputWriter.captureDrain else OutputWriter.drain }, .buffer = &buffer } };
+        var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = OutputWriter.drain }, .buffer = &buffer } };
         self.renderReplay(&output.writer, path, text, line, offset, terminated) catch |err| return self.outputError(&output, err);
         output.writer.flush() catch |err| return output.failure orelse err;
     }
@@ -3800,14 +3886,14 @@ pub const Search = struct {
         }
         if (self.matcher.failure) |err| return err;
     }
-    const JsonText = struct {
+    pub const JsonText = struct {
         text: ?[]const u8,
         bytes: ?[]const u8,
         pub fn jsonStringify(self: @This(), writer: anytype) !void {
             if (self.text) |value| try writer.write(.{ .text = value }) else try writer.write(.{ .bytes = self.bytes.? });
         }
     };
-    fn jsonText(a: Allocator, text: []const u8) !JsonText {
+    pub fn jsonText(a: Allocator, text: []const u8) !JsonText {
         const valid = std.unicode.utf8ValidateSlice(text);
         return .{ .text = if (valid) text else null, .bytes = if (valid) null else try base64(a, text) };
     }
@@ -3937,7 +4023,7 @@ pub const Search = struct {
     fn json(self: *Search, value: anytype) !void {
         if (self.options.max_output_bytes == std.math.maxInt(usize) and !self.retaining_output) {
             var buffer: [65536]u8 = undefined;
-            var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = if (self.lexical_capture) OutputWriter.captureDrain else OutputWriter.drain }, .buffer = &buffer } };
+            var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = OutputWriter.drain }, .buffer = &buffer } };
             self.encodeJson(value, &output.writer) catch |err| return self.outputError(&output, err);
             output.writer.flush() catch |err| return output.failure orelse err;
         } else {
@@ -4142,7 +4228,7 @@ test "delta descriptors survive excerpt eviction and full replay reconstructs mi
     for (generation.entries.items, &members) |*entry, *member| {
         try std.testing.expect(generation.prepareEntry(io, entry));
         var runs = [_]EvaluationRun{.{ .end = entry.prepared().?.lines.len, .probability = 1, .line_score = 1, .selected = true }};
-        index.commit(index.capture(entry.path, entry.revision, .{ .line_count = entry.prepared().?.lines.len, .runs = &runs, .dense = null, .regions = &.{}, .file_score = 1, .best = 1, .considered = 1, .evaluated = 1, .preview_rejected = false }, times), .{ .files = 1, .files_with_matches = 1, .matches = 1 }, 1);
+        index.commit(index.capture(entry.path, entry.revision(), .{ .line_count = entry.prepared().?.lines.len, .runs = &runs, .dense = null, .regions = &.{}, .file_score = 1, .best = 1, .considered = 1, .evaluated = 1, .preview_rejected = false }, times), .{ .files = 1, .files_with_matches = 1, .matches = 1 }, 1);
         member.* = .{ .path = entry.path, .tag = index.files.get(entry.path).?.tag };
         try by_path.put(a, member.path, member.tag);
     }

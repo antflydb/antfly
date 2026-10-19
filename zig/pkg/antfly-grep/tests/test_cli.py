@@ -6368,12 +6368,20 @@ class CliTests(unittest.TestCase):
             self.assertEqual(empty["files"], 0, empty)
             forced = request("refresh", force_rescan=True)[0]
             self.assertEqual(empty["revision"], forced["revision"])
-            self.write("src/b.txt", "hit\n")
-            changed = request("refresh")[0]
-            self.assertEqual(changed["files"], 1, changed)
+            # A delayed event from the forced empty capture can conservatively
+            # reject the first namespace certificate. Verify every result, then
+            # require a healthy changed-membership fast path within a bounded
+            # number of fresh additions, rather than requiring kernel timing.
+            for attempt in range(5):
+                self.write(f"src/b{attempt}.txt", "hit\n")
+                changed = request("refresh")[0]
+                self.assertEqual(changed["files"], attempt + 1, changed)
+                forced = request("refresh", force_rescan=True)[0]
+                self.assertEqual(changed["revision"], forced["revision"])
+                if changed["discovery_reused"]:
+                    break
+                time.sleep(0.01)
             self.assertTrue(changed["discovery_reused"], changed)
-            forced = request("refresh", force_rescan=True)[0]
-            self.assertEqual(changed["revision"], forced["revision"])
 
     def test_workspace_new_excluded_file_is_watched_for_size_eligibility(self):
         self.write("src/a.txt", "hit\n")
@@ -6506,6 +6514,367 @@ class CliTests(unittest.TestCase):
                 "WorkspaceInvalidated",
             )
 
+    def test_workspace_bounded_lexical_conditional_preserves_complete_misses(self):
+        self.write("src/a.txt", "STOP\n")
+        with self.workspace("src") as (ready, request):
+            tested = 0
+            for budget in range(1000, 1501, 50):
+                handle = request(
+                    "register", args=["absent", f"--max-output-bytes={budget}"]
+                )[0]["query_handle"]
+                first = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                tokens = [
+                    r["result_token"] for r in first if r["type"] == "result_token"
+                ]
+                if not tokens:
+                    continue
+                tested += 1
+                second = request(
+                    "search",
+                    revision=ready["revision"],
+                    query_handle=handle,
+                    if_result_token=tokens[0],
+                )
+                self.assertEqual(first[-1]["exit_code"], 1, first)
+                self.assertEqual(second[-1]["exit_code"], 1, second)
+                self.assertFalse(
+                    any(r["type"] == "workspace_error" for r in second), second
+                )
+            self.assertGreater(tested, 0)
+
+        # A cached completed file must not evade a global input allowance on a
+        # later request after the original query exhausted that allowance.
+        content = "x" * 4096 + "\nSTOP\n"
+        self.write("src/a.txt", content)
+        self.write("src/b.txt", content)
+        with self.workspace("src") as (ready, request):
+            handle = request(
+                "register", args=["STOP", "--threads=1", "--max-source-bytes=5000"]
+            )[0]["query_handle"]
+            for _ in range(2):
+                rows = request(
+                    "search", revision=ready["revision"], query_handle=handle
+                )
+                self.assertEqual(rows[-1]["exit_code"], 2, rows)
+                self.assertFalse(any(r["type"] == "result_token" for r in rows))
+                self.assertEqual(
+                    next(
+                        r["stats"]["lexical_cache_hits"]
+                        for r in rows
+                        if r["type"] == "summary"
+                    ),
+                    0,
+                )
+        # Growing one file beyond the complete query's global allowance must
+        # also retain ordinary budget behavior when delta delivery is requested.
+        with self.workspace("src") as (ready, request):
+            handle = request(
+                "register", args=["STOP", "--threads=1", "--max-source-bytes=9000"]
+            )[0]["query_handle"]
+            rows = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token="0" * 64,
+                delta=True,
+            )
+            self.assertEqual(rows[-1]["exit_code"], 0, rows)
+            token = next(r["result_token"] for r in rows if r["type"] == "result_token")
+            acknowledged = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+            )
+            self.assertEqual(acknowledged[-1]["exit_code"], 0, acknowledged)
+            self.assertTrue(
+                any(r["type"] == "workspace_unchanged" for r in acknowledged)
+            )
+            self.write("src/b.txt", "y" * 6000 + "\nSTOP\n")
+            ready = request("refresh")[0]
+            rows = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+                delta=True,
+            )
+            self.assertEqual(rows[-1]["exit_code"], 2, rows)
+            self.assertFalse(
+                any(
+                    r["type"] in ("workspace_lexical_delta", "result_token")
+                    for r in rows
+                )
+            )
+
+    def test_workspace_lexical_tokens_survive_full_delivery_and_count_tiny_scans(self):
+        self.write("src/a.txt", "STOP\n")
+        self.write("src/b.txt", "STOP\n")
+        with self.workspace("src") as (ready, request):
+            handle = request("register", args=["STOP"])[0]["query_handle"]
+            fields = dict(revision=ready["revision"], query_handle=handle)
+            first = request("search", **fields)
+            token = next(
+                r["result_token"] for r in first if r["type"] == "result_token"
+            )
+            second = request("search", **fields)
+            self.assertEqual(
+                token,
+                next(r["result_token"] for r in second if r["type"] == "result_token"),
+            )
+            stats = next(r["stats"] for r in second if r["type"] == "summary")
+            self.assertEqual(stats["lexical_files_evaluated"], 2)
+            self.assertEqual(stats["lexical_entries_visited"], 2)
+            third = request("search", **fields, if_result_token=token)
+            self.assertTrue(any(r["type"] == "workspace_unchanged" for r in third))
+            stats = next(r["stats"] for r in third if r["type"] == "summary")
+            self.assertEqual(stats["lexical_files_evaluated"], 0)
+            self.assertEqual(stats["lexical_entries_visited"], 0)
+
+    def test_workspace_lexical_deltas_reconcile_changes_without_visiting_other_files(
+        self,
+    ):
+        a = self.write("src/a.txt", "STOP old\n")
+        b = self.write("src/b.txt", "negative\n")
+        self.write("src/c.txt", "STOP unchanged\n")
+        d = self.write("src/d.txt", "STOP deleted\n")
+        with self.workspace("src") as (ready, request):
+            handle = request("register", args=["STOP"])[0]["query_handle"]
+            first = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token="0" * 64,
+                delta=True,
+            )
+            token = next(
+                r["result_token"] for r in first if r["type"] == "result_token"
+            )
+            self.assertFalse(any(r["type"] == "workspace_lexical_delta" for r in first))
+            a.write_text("now negative\n")
+            b.write_text("STOP newly positive\n")
+            d.unlink()
+            self.write("src/e.txt", "STOP added\n")
+            ready = request("refresh")[0]
+            changed = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+                delta=True,
+            )
+            patch = next(r for r in changed if r["type"] == "workspace_lexical_delta")
+            self.assertEqual(
+                {p["text"] for p in patch["removed"]}, {"src/a.txt", "src/d.txt"}
+            )
+            self.assertEqual(
+                {r["data"]["path"]["text"] for r in changed if r["type"] == "begin"},
+                {"src/b.txt", "src/e.txt"},
+            )
+            stats = next(r["stats"] for r in changed if r["type"] == "summary")
+            self.assertEqual(stats["lexical_entries_visited"], 4)
+            self.assertEqual(stats["lexical_files_evaluated"], 3)
+            self.assertEqual(stats["matches"], 3)
+            self.assertEqual(stats["files"], 4)
+            token = next(
+                r["result_token"] for r in changed if r["type"] == "result_token"
+            )
+            full = request("search", revision=ready["revision"], query_handle=handle)
+            self.assertEqual(
+                token,
+                next(r["result_token"] for r in full if r["type"] == "result_token"),
+            )
+            a.write_text("still negative but changed length\n")
+            ready = request("refresh")[0]
+            negative = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+                delta=True,
+            )
+            self.assertTrue(
+                any(r["type"] == "workspace_lexical_delta" for r in negative)
+            )
+            self.assertFalse(any(r["type"] == "begin" for r in negative))
+            stats = next(r["stats"] for r in negative if r["type"] == "summary")
+            self.assertEqual(stats["lexical_entries_visited"], 1)
+            self.assertEqual(stats["matches"], 3)
+            token = next(
+                r["result_token"] for r in negative if r["type"] == "result_token"
+            )
+            a.write_text("STOP intermediate\n")
+            request("refresh")
+            a.write_text("STOP later\n")
+            ready = request("refresh")[0]
+            fallback = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+                delta=True,
+            )
+            self.assertFalse(
+                any(r["type"] == "workspace_lexical_delta" for r in fallback)
+            )
+            self.assertEqual(
+                next(r["stats"] for r in fallback if r["type"] == "summary")[
+                    "lexical_entries_visited"
+                ],
+                4,
+            )
+
+            # APFS rejects non-UTF8 names; Linux preserves them byte-for-byte.
+            raw_path = os.fsencode(self.root / "src") + b"/invalid-\xff.txt"
+            try:
+                fd = os.open(raw_path, os.O_CREAT | os.O_WRONLY, 0o600)
+            except (OSError, UnicodeError):
+                if sys.platform != "darwin":
+                    raise
+                return
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(b"STOP bytes path\n")
+            ready = request("refresh")[0]
+            full = request("search", revision=ready["revision"], query_handle=handle)
+            token = next(r["result_token"] for r in full if r["type"] == "result_token")
+            os.unlink(raw_path)
+            ready = request("refresh")[0]
+            removed = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+                delta=True,
+            )
+            patch = next(r for r in removed if r["type"] == "workspace_lexical_delta")
+            self.assertEqual(
+                patch["removed"],
+                [{"bytes": base64.b64encode(b"src/invalid-\xff.txt").decode()}],
+            )
+
+    def test_workspace_lexical_deltas_remove_passthru_context_without_matches(self):
+        a = self.write("src/a.txt", "x" * 4096 + "\n")
+        b = self.write("src/b.txt", "STOP\n")
+        with self.workspace("src") as (ready, request):
+            handle = request("register", args=["STOP", "--passthru", "--threads=1"])[0][
+                "query_handle"
+            ]
+            request("search", revision=ready["revision"], query_handle=handle)
+            first = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                delta=True,
+                if_result_token="0" * 64,
+            )
+            self.assertEqual(
+                next(
+                    r["stats"]["lexical_cache_hits"]
+                    for r in first
+                    if r["type"] == "summary"
+                ),
+                1,
+            )
+            token = next(
+                r["result_token"] for r in first if r["type"] == "result_token"
+            )
+            a.unlink()
+            ready = request("refresh")[0]
+            changed = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                delta=True,
+                if_result_token=token,
+            )
+            self.assertEqual(
+                next(
+                    r["removed"]
+                    for r in changed
+                    if r["type"] == "workspace_lexical_delta"
+                ),
+                [{"text": "src/a.txt"}],
+            )
+            token = next(
+                r["result_token"] for r in changed if r["type"] == "result_token"
+            )
+            b.write_text("negative again\n")
+            self.write("src/c.txt", "also negative\n")
+            ready = request("refresh")[0]
+            changed = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                delta=True,
+                if_result_token=token,
+            )
+            self.assertEqual(changed[-1]["exit_code"], 1, changed)
+            self.assertEqual(
+                {r["data"]["path"]["text"] for r in changed if r["type"] == "begin"},
+                {"src/b.txt", "src/c.txt"},
+            )
+            self.assertEqual(len([r for r in changed if r["type"] == "context"]), 2)
+            token = next(
+                r["result_token"] for r in changed if r["type"] == "result_token"
+            )
+            b.unlink()
+            ready = request("refresh")[0]
+            changed = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                delta=True,
+                if_result_token=token,
+            )
+            self.assertEqual(changed[-1]["exit_code"], 1, changed)
+            self.assertEqual(
+                next(
+                    r["removed"]
+                    for r in changed
+                    if r["type"] == "workspace_lexical_delta"
+                ),
+                [{"text": "src/b.txt"}],
+            )
+            stats = next(r["stats"] for r in changed if r["type"] == "summary")
+            self.assertEqual(stats["files"], 1)
+            self.assertEqual(stats["matches"], 0)
+            self.assertEqual(stats["lexical_entries_visited"], 1)
+            self.assertEqual(stats["lexical_files_evaluated"], 0)
+
+    def test_lexical_benchmark_signature_detects_wrong_file_bindings(self):
+        import importlib.util
+
+        bench = Path(__file__).resolve().parents[1] / "bench"
+        sys.path.insert(0, str(bench))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "lexical_benchmark_oracle", bench / "lexical_reuse.py"
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            rows = [
+                {
+                    "type": "begin",
+                    "file_id": "a",
+                    "data": {"path": {"text": "a"}},
+                    "source": {"uri": "file:///a", "revision": "1"},
+                },
+                {
+                    "type": "begin",
+                    "file_id": "b",
+                    "data": {"path": {"text": "b"}},
+                    "source": {"uri": "file:///b", "revision": "2"},
+                },
+                {"type": "match", "file_id": "a", "data": {"lines": {"text": "STOP"}}},
+            ]
+            wrong = json.loads(json.dumps(rows))
+            wrong[-1]["file_id"] = "b"
+            self.assertNotEqual(module.signature(rows), module.signature(wrong))
+        finally:
+            sys.path.pop(0)
+
     def test_workspace_lexical_certificates_include_misses_and_bind_handles(self):
         self.write("src/a.txt", "STOP here\n")
         with self.workspace("src") as (ready, request):
@@ -6605,7 +6974,7 @@ class CliTests(unittest.TestCase):
                 b.write_text("negative\n" + "padding\n" * 600)
 
     def test_workspace_lexical_reuse_has_bounded_dense_fallback_and_trim(self):
-        self.write("src/dense.txt", "STOP\n" * 2000)
+        self.write("src/dense.txt", "STOP\n" * 12000)
         self.write("src/tiny.txt", "STOP\n" + "padding\n" * 600)
         with self.workspace("src") as (ready, request):
             handle = request("register", args=["STOP"])[0]["query_handle"]

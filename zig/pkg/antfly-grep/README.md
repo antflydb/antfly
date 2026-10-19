@@ -2695,7 +2695,7 @@ Evidence: [Linux capture](bench/results/compact-capture-linux.json),
 [macOS capture](bench/results/compact-capture-macos.json), and
 [all source/binary/report/archive identities](bench/results/compact-validation.json).
 
-### Lexical completion certificates and bounded file reuse
+### Lexical completion certificates and bounded file reuse (qualification at b261a10f84)
 
 Registered literal and regex searches can return `result_token` after a complete
 exit-0 or exit-1 result, including a complete miss. Repeating that handle, pinned
@@ -2809,3 +2809,140 @@ source-catalog changes do not enter the grep-only dependency graph. Native macOS
 Linux ARM64 and Windows x86_64 product binaries are checked byte-for-byte against
 the qualified artifacts after that merge; the native conformance target and
 license boundary are rerun on the merged tree.
+
+### Typed lexical replay and changed-path delivery
+
+The follow-up to `b261a10f84` fixes finite-budget acknowledgements: the entire
+conditional response is staged before publication. If it cannot fit, search
+falls back to ordinary delivery, preserving complete misses that fit the budget.
+Repeated full deliveries retain the same registered-query token while the pinned
+revision is unchanged. `lexical_files_evaluated` includes tiny-file scans;
+`lexical_entries_visited` separately counts inventory paths visited during the
+request, including deleted paths in a delta. Logical file/match totals describe
+the complete result, while these counters describe work actually performed.
+
+Per-file payloads now contain typed rows, owned line bytes and match spans,
+rather than serialized JSON. Spans are collected during their original encoding;
+replay needs neither JSON parsing nor another regex pass. Envelopes, source IDs,
+observation times and end statistics are still regenerated. The shared 8 MiB
+cache and per-worker 256 KiB staging bound remain; failed admission only causes
+ordinary scanning. Sources smaller than 4 KiB still bypass payload caching.
+
+Registered lexical clients can opt into changed-path delivery by bootstrapping
+with `delta: true` and an unknown valid `if_result_token` (64 hexadecimal digits,
+for example all zeroes). That first request returns a full result and builds an
+optional, 16 MiB maximum per-registration summary index. Subsequent requests with
+`delta: true` and the last completed token can receive:
+
+```json
+{"type":"workspace_lexical_delta","base_token":"…","base_revision":"…","revision":"…","observed_at":0,"removed":[{"text":"src/old.txt"}],"ordering":"path"}
+```
+
+Removed paths use the same `{ "text": "…" }` or base64 `{ "bytes": "…" }`
+representation as `begin.data.path`, preserving non-UTF8 Linux names.
+Apply this as a transaction: remove the listed prior result paths, replace each
+path introduced by a new `begin` and its following match/context rows, and
+retain other paths. Apply the new revision/observation time to the retained
+view's snapshot provenance; per-file content revisions remain unchanged. Commit
+only after a complete summary, a result token and `workspace_end` with exit code
+0 or 1. An error, cancellation or incomplete response must leave the prior view
+intact. Sort the combined view by original path bytes (UTF-8 encode `text`
+or base64 decode `bytes`); patch event order is not a complete result ordering. `workspace_unchanged` requires no changes. A response without
+either delta/unchanged event replaces the entire view.
+
+The index owns paths and compact logical totals, not source generations or
+cached result payloads. A single edit visits only the generation's changed paths,
+even if payload caching was skipped or evicted. Miss-to-hit, hit-to-miss,
+additions and deletions update aggregate counts. A separate visibility bit tracks
+context-only `--passthru` files, so deletion removes displayed context even when
+the file has zero logical matches. Index admission failure,
+unknown/stale tokens and skipped generations fall back to complete delivery.
+Count and file-list modes and finite output/input budgets retain their normal
+delivery paths. Finite `--max-source-bytes` disables per-file/delta reuse so cached
+files cannot evade the global allowance or change exhaustion into success. Ordinary lexical queries do not populate this optional index. `forget`,
+registration eviction, `trim` and process exit release the corresponding state.
+This metadata remains in RAM; no durable source or lexical index is introduced.
+
+On 64-bit targets, workspace entry metadata is reduced from 168 to 120 bytes by
+storing SHA-256 in binary and reading content through its existing blob owner.
+External hexadecimal revisions and canonical inventory-v3 hashes are unchanged.
+`workspace_ready.entry_bytes` exposes this structure size; retained allocation
+accounting and RSS remain separate measurements.
+
+A symbolized macOS profile of repeated tiny-file JSON delivery showed output
+writes/serialization dominating, rather than regex execution. Parallel lexical
+pipe delivery now flushes the first completed file. Startup batches flush after
+eight files or 16 KiB at a file boundary so decoding can overlap encoding. After
+128 KiB of output, bulk batches flush after 64 files or at the general 64 KiB
+threshold. Large records retain that general flush threshold. Explicit line buffering,
+interactive terminals and decision-provider output retain their flush behavior.
+No additional regex JIT path is justified by that profile. First-event and total
+latency must both be considered when measuring this change.
+
+`bench/lexical_reuse.py` now binds compact match IDs to path/source identities
+and compares provenance, match/context data, binary offsets and logical end
+counts. Swapping a match's file ID is a regression even when its text is equal.
+`bench/lexical_delta.py` applies patches to a materialized client view and compares
+it with full baseline results, while asserting only one path is visited for a
+one-file edit. Both record first-event latency. Refresh is outside search timing;
+these controls use warm synthetic data, not cold-storage or independent native
+Linux hardware. Changes and output still cost resources; avoiding an unnecessary
+request in the consuming client remains the cheapest unchanged-result path.
+
+This branch merges `origin/main` through `3584896882`.
+
+Final controls against `b261a10f84` use alternating serial trials, warm synthetic
+files and the same client for each binary. This task's builds/tests were stopped
+before measurement; other shared-host activity remains uncontrolled. The Linux
+ARM64 Docker VM is capped at two CPUs. Refresh/capture is outside query timing.
+Delta results are compared with full results after reconstructing the entire
+client view, including per-file content identity and current snapshot provenance.
+
+| Workload | Linux VM before → after | macOS before → after |
+|---|---:|---:|
+| One-file delta delivery, 10K files (baseline delivers full view) | 202.024 → 0.158 ms | 98.206 → 0.124 ms |
+| Full delivery, 64 files / roughly 64 MiB | 0.780 → 0.743 ms | 0.616 → 0.580 ms |
+| Full delivery after one edit, same fixture | 1.039 → 0.806 ms | 0.687 → 0.635 ms |
+| Full delivery, 1K tiny files / dense JSON | 9.322 → 9.270 ms | 8.133 → 8.511 ms |
+| Initial capture, 100K tiny files | 761 → 725 ms | 5,078 → 4,973 ms |
+| Ready RSS, 100K tiny files | 63,592 → 58,388 KiB | 62,208 → 58,032 KiB |
+
+The 10K-file delta transfers 2,857 bytes instead of 11,849,220 in Linux, and
+2,909 instead of 12,369,196 in macOS. Each edit visits/evaluates one path; summary
+file/match counts still describe the whole result. Per-request producer time for
+64-file full delivery drops 0.634→0.451 ms in Linux and 0.371→0.175 ms in macOS.
+Producer time includes output backpressure and is not a CPU-time measurement.
+Accounted retained capture allocations at 100K files drop 55,579,336→50,457,496
+bytes on both platforms. RSS reflects touched resident pages, not just ownership
+accounting. Optional delta metadata adds its own separately bounded RAM.
+
+Small controls are mixed: macOS tiny-file full delivery regresses about 4.6%,
+while tiny-file edit delivery improves about 3.4%; Linux conditional tiny-query
+latency also regresses in this run. Their raw trials and first-event latencies
+remain in the reports. The larger delta gain comes from avoiding unchanged work
+and output, not from making a cold scan or identical output arbitrarily cheap.
+No universal throughput, cold-cache, native Linux hardware, or zero-cost claim
+is made.
+
+Final binaries pass **239 CLI cases each on macOS/Linux** (two expected skips
+each), **92/93 package cases each** (one expected skip), macOS ReleaseSafe package
+checks, native regex/grammar/dictionary/hardening targets and benchmark/differential
+tool tests. Another **1,000 generated ripgrep/PCRE2 comparisons** find no mismatch
+or timeout. Regressions cover finite output/input budgets, stable tokens,
+compact-file binding, skipped revision chains, byte-path removals, cached
+context-only passthrough files and all-miss deltas. The empty/trailing-root watch
+fixture verifies every result against forced capture and requires the fast path
+within bounded fresh additions, allowing the documented conservative event-race
+fallback. Windows x86_64 cross-compilation and release contents are qualified;
+Windows runtime, independent Linux hardware and live-provider quality remain
+outside this fixture qualification. Full PR CI remains subject to admission.
+
+Evidence: [Linux deltas](bench/results/typed-delta-linux.json),
+[Linux full delivery](bench/results/typed-lexical-linux.json),
+[dense controls](bench/results/typed-tiny-linux.json),
+[Linux capture](bench/results/typed-capture-linux.json),
+[preparation controls](bench/results/typed-preparation-linux.json),
+[refresh controls](bench/results/typed-refresh-linux.json),
+[macOS deltas](bench/results/typed-delta-macos.json),
+[macOS capture](bench/results/typed-capture-macos.json), and
+[source/binary/report/archive identities](bench/results/typed-validation.json).

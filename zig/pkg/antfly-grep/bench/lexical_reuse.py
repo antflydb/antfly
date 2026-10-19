@@ -34,11 +34,55 @@ from registered import Client
 
 
 def signature(rows):
-    return sorted(
-        json.dumps(row["data"], sort_keys=True)
-        for row in rows
-        if row["type"] in ("match", "context")
-    )
+    files = {}
+    out = []
+    for row in rows:
+        if row["type"] == "begin":
+            files[row.get("file_id")] = (row["data"]["path"], row["source"])
+        elif row["type"] in ("match", "context"):
+            path, source = files.get(
+                row.get("file_id"), (row["data"].get("path"), row.get("source", {}))
+            )
+            if path is None:
+                raise RuntimeError("unbound match file identity")
+            out.append(
+                json.dumps(
+                    {
+                        "type": row["type"],
+                        "path": path,
+                        "source": {
+                            key: value
+                            for key, value in source.items()
+                            if key != "observed_at"
+                        },
+                        "probability": row.get("probability"),
+                        "scope": row.get("scope"),
+                        "data": row["data"],
+                    },
+                    sort_keys=True,
+                )
+            )
+        elif row["type"] == "end":
+            path, source = files.get(
+                row.get("file_id"), (row["data"].get("path"), row.get("source", {}))
+            )
+            stats = {
+                k: v
+                for k, v in row["data"]["stats"].items()
+                if k not in ("elapsed", "bytes_printed")
+            }
+            out.append(
+                json.dumps(
+                    {
+                        "type": "end",
+                        "path": path,
+                        "binary_offset": row["data"].get("binary_offset"),
+                        "stats": stats,
+                    },
+                    sort_keys=True,
+                )
+            )
+    return sorted(out)
 
 
 def main():
@@ -171,7 +215,12 @@ def main():
         mode: {
             name: {
                 field: statistics.median(t[mode][name][field] for t in report["trials"])
-                for field in ("seconds", "producer_seconds", "response_bytes")
+                for field in (
+                    "seconds",
+                    "producer_seconds",
+                    "first_event_seconds",
+                    "response_bytes",
+                )
             }
             for name in binaries
         }

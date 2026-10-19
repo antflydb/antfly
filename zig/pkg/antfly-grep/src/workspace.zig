@@ -168,7 +168,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     return 0;
 }
 fn ready(a: A, io: std.Io, generation: *const Generation, id: ?u64) !void {
-    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .capture_workers = generation.capture_workers, .parallel_sources_read = generation.parallel_sources_read, .sources_opened = generation.sources_opened, .refresh_entries_visited = generation.refresh_entries_visited, .namespace_paths_checked = generation.namespace_paths_checked, .namespace_directories_scanned = generation.namespace_directories_scanned, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
+    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .entry_bytes = @sizeOf(@import("workspace_store.zig").Entry), .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .capture_workers = generation.capture_workers, .parallel_sources_read = generation.parallel_sources_read, .sources_opened = generation.sources_opened, .refresh_entries_visited = generation.refresh_entries_visited, .namespace_paths_checked = generation.namespace_paths_checked, .namespace_directories_scanned = generation.namespace_directories_scanned, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
 }
 fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, args: []const []const u8, if_result_token: ?[]const u8) !u8 {
     var option_arena = std.heap.ArenaAllocator.init(a);
@@ -197,9 +197,12 @@ fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generat
 }
 
 fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, plan: *@import("prepared_query.zig").Registry(Search).Plan, token: ?[]const u8, delta: bool) !u8 {
+    // Any staging/allocation/output failure invalidates partly updated metadata.
+    // The client applies patches only after a complete successful transaction.
+    errdefer plan.lexical.clear();
     if (Search.lexicalCertificateEligible(&plan.options)) if (plan.completion) |certificate| {
         if (token != null and std.mem.eql(u8, token.?, &certificate.token) and std.mem.eql(u8, &generation.revision, &certificate.revision))
-            return Search.completedConditional(a, io, &plan.options, generation, certificate.summary, certificate.token);
+            if (try Search.completedConditional(a, io, &plan.options, generation, certificate.summary, certificate.token)) |code| return code;
     };
     if (token) |value| if (try Search.conditional(a, io, &plan.options, generation, reuse, plan.identity, value)) |code| return code;
     var searcher = try Search.initCompiled(a, io, &plan.options, &plan.matcher, plan.cwd);
@@ -225,11 +228,43 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
         if (plan.delivery != null) searcher.prior_delivery = &plan.delivery.?;
         if (delta and token != null and plan.delivery != null and std.mem.eql(u8, token.?, &plan.delivery.?.token)) searcher.delta_base = &plan.delivery.?;
     }
+    // Delta indexing is opt-in. A bootstrap delta with an unknown valid token
+    // delivers a complete result and builds bounded metadata for future edits.
+    var delta_arena = std.heap.ArenaAllocator.init(a);
+    defer delta_arena.deinit();
+    const lo = &plan.options;
+    const lexical_eligible = Search.lexicalCertificateEligible(lo) and !lo.count and !lo.count_matches and !lo.files_with_matches and !lo.files_without_match and lo.max_output_bytes == std.math.maxInt(usize) and lo.max_source_bytes == std.math.maxInt(usize);
+    if (lexical_eligible and (delta or plan.lexical.revision != null)) {
+        const same = plan.lexical.healthy and plan.lexical.revision != null and std.mem.eql(u8, &plan.lexical.revision.?, &generation.revision);
+        if (!same) {
+            const parent = plan.lexical.healthy and plan.lexical.revision != null and generation.parent_revision != null and std.mem.eql(u8, &plan.lexical.revision.?, &generation.parent_revision.?);
+            const patch = parent and delta and token != null and plan.completion != null and std.mem.eql(u8, token.?, &plan.completion.?.token) and std.mem.eql(u8, &plan.completion.?.revision, &plan.lexical.revision.?);
+            var removed: std.ArrayList(Search.JsonText) = .empty;
+            if (parent) {
+                for (generation.changes.items) |path| {
+                    if (patch and plan.lexical.visible(path)) try removed.append(delta_arena.allocator(), try Search.jsonText(delta_arena.allocator(), path));
+                    plan.lexical.remove(path);
+                }
+            } else plan.lexical.clear();
+            searcher.lexical_index = &plan.lexical;
+            if (patch) {
+                searcher.lexical_paths = generation.changes.items;
+                searcher.summary = plan.lexical.aggregate;
+                searcher.lexical_patch = .{ .base_token = plan.completion.?.token, .base_revision = plan.completion.?.revision, .removed = removed.items };
+            }
+        }
+    }
     const guard = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);
     defer guard.deinit();
     const code = try searcher.run();
+    if (searcher.lexical_index != null) {
+        if (code <= 1 and searcher.summary.complete and plan.lexical.healthy and plan.lexical.files.count() == generation.entries.items.len and !searcher.limits.cancel.load(.acquire)) {
+            plan.lexical.revision = generation.revision;
+        } else plan.lexical.clear();
+    }
     if (Search.lexicalCertificateEligible(&plan.options) and code <= 1 and searcher.summary.complete and !searcher.limits.cancel.load(.acquire)) {
-        const completed_token = try searcher.publishCompletion();
+        const previous = if (plan.completion) |c| (if (std.mem.eql(u8, &c.revision, &generation.revision)) c.token else null) else null;
+        const completed_token = try searcher.publishCompletion(previous);
         plan.completion = .{ .token = completed_token, .revision = generation.revision, .summary = searcher.summary };
     }
     if (plan.options.trace) std.debug.print("antfly-grep: registered index attached={} healthy={} files={d}/{d} bytes={d} revision_present={} query_hit={d} incremental_hit={d}\n", .{ searcher.incremental != null, plan.index.healthy, plan.index.files.count(), generation.entries.items.len, plan.index.budget.live, plan.index.revision != null, searcher.summary.query_cache_hits, searcher.summary.incremental_cache_hits });
