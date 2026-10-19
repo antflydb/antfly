@@ -1816,6 +1816,21 @@ inputs drain. Contiguous compatible spans import as one tensor without stacking;
 other layouts retain bounded copying. Tighter caller pools keep independent
 outputs when the slab would displace their transient command window.
 
+Video admission owns cache tickets before charging unique preparation misses.
+The tickets survive producer shutdown and model-input cleanup, preventing cache
+eviction from invalidating reduced reservations. Fully cached selections retain
+full model token/composition costs, but need no preparation commands, slab,
+coefficient upload or preparer creation. All decoder/reference slots remain
+reserved whenever any selected picture needs decoding; only selected-output
+surface counts shrink.
+
+Metal preparation uses buffer-layout estimates independent of CPU RGB/repacking
+scratch. Uploads, chroma reconstruction and independent outputs are included;
+slab or external destinations exclude duplicate command output credit. Immutable
+shader pipelines share one synchronized device-cache entry; request queues and
+mutable preparation resources remain separate. Version-validated remote ranges
+also avoid a full packet-payload scan when establishing cache identity.
+
 Every Metal group, including preparation/residency opt-outs, admits any actual
 backbone deficit at its fenced transition before reducing its existing leases.
 

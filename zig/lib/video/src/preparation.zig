@@ -98,6 +98,48 @@ pub fn croppedSize(width: u32, height: u32, crop: media.webm.Crop) ![2]u32 {
     if (horizontal >= width or vertical >= height) return error.InvalidVideoGeometry;
     return .{ width - @as(u32, @intCast(horizontal)), height - @as(u32, @intCast(vertical)) };
 }
+/// Device allocations made by apple_prepare.m, independent of CPU RGB/repack
+/// workspace. Imported decoder textures are charged to their decoder owner.
+/// Coefficients/LUTs have their own retained reservation. The fixed allowance
+/// covers command/encoder metadata and page/texture allocation rounding.
+pub const MetalLayout = struct {
+    upload_bytes: usize = 0,
+    chroma_format: u8 = 1,
+    rgb: bool = false,
+    owns_output: bool = true,
+};
+pub fn metalPlaneUploadBytes(width: u32, height: u32, depth: u8, chroma: u8) !usize {
+    if (depth < 8 or depth > 14 or chroma > 3) return error.UnsupportedSurfaceFormat;
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidVideoGeometry;
+    const sample: usize = if (depth == 8) 1 else 2;
+    const y = std.mem.alignForward(usize, try std.math.mul(usize, width, sample), 256) * @as(usize, height);
+    if (chroma == 0) return std.mem.alignForward(usize, y, 16384);
+    const cw = if (chroma == 3) width else (width + 1) / 2;
+    const ch = if (chroma == 1) (height + 1) / 2 else height;
+    const uv = std.mem.alignForward(usize, try std.math.mul(usize, cw, 2 * sample), 256) * @as(usize, ch);
+    return std.math.add(usize, std.mem.alignForward(usize, y, 16384), std.mem.alignForward(usize, uv, 16384));
+}
+pub fn metalWorkingBytes(width: u32, height: u32, options: Options, layout: MetalLayout) !usize {
+    // Geometry's host scratch cap must not reject this device-only estimate,
+    // especially when preflight bounds a possible reconstruction policy.
+    var geometry_options = options;
+    geometry_options.max_scratch_bytes = std.math.maxInt(usize);
+    const g = try geometry(width, height, geometry_options);
+    if (layout.upload_bytes > std.math.maxInt(usize) - 16383) return error.ResourceLimitExceeded;
+    if (layout.chroma_format > 3) return error.UnsupportedSurfaceFormat;
+    const cropped = try croppedSize(width, height, options.crop);
+    const rows = if (options.rotation == .clockwise90 or options.rotation == .clockwise270) cropped[0] else cropped[1];
+    var bytes = try std.math.add(usize, 256 * 1024, std.mem.alignForward(usize, try std.math.mul(usize, @as(usize, g.width) * 3, rows), 16384));
+    bytes = try std.math.add(usize, bytes, std.mem.alignForward(usize, layout.upload_bytes, 16384));
+    if (layout.owns_output) bytes = try std.math.add(usize, bytes, std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384));
+    if (!layout.rgb and layout.chroma_format == 0) bytes = try std.math.add(usize, bytes, 16384); // dummy UV texture
+    if (!layout.rgb and options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none and layout.chroma_format != 0) {
+        const columns = if (width % 2 != 0 or layout.chroma_format == 3) width else (width + 1) / 2;
+        const chroma_rows = if (layout.chroma_format == 1) (height + 1) / 2 else height;
+        bytes = try std.math.add(usize, bytes, std.mem.alignForward(usize, try std.math.mul(usize, @as(usize, columns) * 4, chroma_rows), 16384));
+    }
+    return bytes;
+}
 pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Geometry {
     if (source_width == 0 or source_height_u32 == 0 or options.width == 0 or options.height == 0) return error.InvalidVideoGeometry;
     // Match the qualified texture/display bounds even when caller budgets grow.
@@ -114,8 +156,8 @@ pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Ge
     const horizontal_bytes = try std.math.mul(usize, try std.math.mul(usize, options.width, source_height), 3);
     const output_bytes = try std.math.mul(usize, pixels, 3 * @sizeOf(f32));
     const rgb_bytes = try std.math.mul(usize, source_pixels, 3);
-    // One conservative bound covers both reference and device paths, including
-    // CPU result/patch repacking. Coefficient storage is checked separately.
+    // CPU conversion and result/patch repacking bound. Metal command admission
+    // uses metalWorkingBytes; coefficient storage is checked separately.
     const reconstruction = if (options.matrix != .gbr_identity and options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none)
         try std.math.add(usize, try std.math.mul(usize, source_pixels, 4), try std.math.mul(usize, @as(usize, source_width) + source_height_u32, 128))
     else
@@ -729,7 +771,7 @@ pub const Metal = struct {
         defer scope.deinit();
         try validateColorLayout(1, surface.format.fullRange(), options);
         const g = try geometry(surface.width, surface.height, options);
-        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try metalWorkingBytes(surface.width, surface.height, options, .{ .owns_output = self.output_slab_bytes == 0 }), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control) + try self.ensureChroma(allocator, surface.width, surface.height, 1, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
@@ -758,7 +800,7 @@ pub const Metal = struct {
         if (surface.sample_shift > 16 - surface.bit_depth or (surface.bit_depth == 8 and surface.sample_shift != 0)) return error.UnsupportedSurfaceFormat;
         try validateColorLayout(surface.chroma_format, surface.full_range, options);
         const g = try geometry(surface.width, surface.height, options);
-        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try metalWorkingBytes(surface.width, surface.height, options, .{ .chroma_format = surface.chroma_format, .owns_output = self.output_slab_bytes == 0 }), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control) + try self.ensureChroma(allocator, surface.width, surface.height, surface.chroma_format, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift, @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
@@ -776,7 +818,7 @@ pub const Metal = struct {
         const g = try geometry(surface.width, surface.height, options);
         const size = try std.math.add(usize, surface.planes[0].bytes.len, surface.planes[1].bytes.len);
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
-        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try std.math.add(usize, g.scratch_bytes, size), .commands = 1 }) else media.admission.Token{};
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try metalWorkingBytes(surface.width, surface.height, options, .{ .upload_bytes = try metalPlaneUploadBytes(surface.width, surface.height, surface.bit_depth, surface.chroma_format), .chroma_format = surface.chroma_format, .owns_output = self.output_slab_bytes == 0 }), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control) + try self.ensureChroma(allocator, surface.width, surface.height, surface.chroma_format, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
@@ -813,7 +855,7 @@ pub const Metal = struct {
         const size = try std.math.add(usize, try std.math.mul(usize, stride, view.height - 1), try std.math.mul(usize, view.width, view.channels()));
         const g = try geometry(view.width, view.height, options);
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
-        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try std.math.add(usize, g.scratch_bytes, size), .commands = 1 }) else media.admission.Token{};
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try metalWorkingBytes(view.width, view.height, options, .{ .upload_bytes = size, .rgb = true, .owns_output = destination == null and self.output_slab_bytes == 0 }), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, view.width, view.height, g, options, control);
         // The RGB kernel uses the otherwise inapplicable matrix/range words

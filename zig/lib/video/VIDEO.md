@@ -956,6 +956,28 @@ has separate admission, is never overwritten, and survives until imports and
 queued commands drain. Compatible contiguous spans import directly as one
 batch; unrelated buffers retain bounded stacking. Geometry-derived planning
 includes this storage, and tight caller pools may retain independent outputs.
+Admission pins exact cached projections before calculating the preparation
+window. The pins outlive producers and imported model inputs, including error
+and cancellation cleanup, so eviction cannot turn a planned hit into an
+unadmitted decode. Token counts and presentation order still describe the full
+selection. A fully pinned selection reserves no preparation device bytes or
+commands and creates no preparer. Any miss retains all decoder/reference slots while reducing only selected-output
+surfaces.
+
+Metal command credits describe its own allocations: uploaded image buffers or
+integer textures, the horizontal resize buffer, optional chroma reconstruction,
+and independently owned output. Final slab/external destinations exclude that
+output from command credit. Page/row rounding and a fixed command allowance are
+included; CPU conversion/repacking bounds remain separate. The planner allows
+independent output as a conservative fallback when a slab cannot fit.
+
+The six immutable preparation PSOs share a synchronized, single-device cache.
+Replacing that bounded entry leaves active preparers' strong references valid.
+Queues, CoreVideo imports, slabs, geometry coefficients and tone LUTs remain
+request-owned; fully cached work bypasses creation entirely. Sharing removes
+repeated shader compilation from warm preparation setup, while a process's
+first shader compilation remains a cold-start cost.
+
 Video calibration considers only compatible ready frames and measures imports
 and packing as part of completed cost. Vision admission shrinks cohorts before
 consuming preparations; conservative fallback also adapts its retained-input

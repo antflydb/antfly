@@ -32,6 +32,10 @@ pub const Limits = struct {
     max_reads: usize = 100_000,
 };
 pub const Range = struct {
+    /// Content digest or immutable object/version binding. Providers supplying
+    /// this must validate that every returned range belongs to that snapshot.
+    /// A display URL or unverified ETag is insufficient.
+    immutable_binding: ?[32]u8 = null,
     context: *anyopaque,
     /// May return a short read. Returning zero before the declared end is EOF.
     read_at: *const fn (*anyopaque, u64, []u8, Control) anyerror!usize,

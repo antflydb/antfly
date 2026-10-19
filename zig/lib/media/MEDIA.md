@@ -247,6 +247,20 @@ audio adapters delegate EBML/MP4 container work while retaining PCM APIs.
 
 ## Authenticated ranges and object storage
 
+Range providers may expose an `immutable_binding` only when they validate every
+read against the same content digest or immutable object version. The maintained
+object adapter derives it from length-delimited canonical object/version,
+version kind and source length; read-ahead preserves it. Provider configuration
+and context remain immutable while a range is borrowed. Video selection/cache
+bindings combine this proof with track, packet and sampling metadata without
+fetching every payload. Ordinary borrowed bytes and unverified range providers
+retain full content validation; a display identity alone never enables reuse.
+A request may reuse its validated binding while its borrowed bytes, provider
+configuration and packet metadata remain immutable and owned through worker
+shutdown. This memo is discarded with the admission scope, so a new request
+validates unverified sources again.
+
+
 [objectstore.Adapter](src/objectstore.zig) optionally wraps the maintained
 object-store clients: borrow an application client or create an owned S3/GCS
 client. S3 uses SigV4/dynamic credentials; GCS uses configured bearer credentials

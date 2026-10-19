@@ -55,6 +55,40 @@
 @implementation AVPrepared
 - (void)dealloc { if (_command.status >= MTLCommandBufferStatusCommitted) [_command waitUntilCompleted]; av_metal_import_release(_imported); }
 @end
+// One bounded device entry; request queues, texture imports, slabs and LUTs
+// stay request-owned. Publication and compilation share a lock, preventing
+// concurrent cold requests from compiling identical pipelines twice.
+static BOOL preparationPipelines(AVPreparer *p) {
+    static NSLock *lock;
+    static AVPreparer *cached;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSLock new]; });
+    [lock lock];
+    @try {
+        if (cached.device == p.device) {
+            p.horizontal = cached.horizontal; p.vertical = cached.vertical;
+            p.horizontalRGBA = cached.horizontalRGBA; p.horizontalNative = cached.horizontalNative;
+            p.chromaNative = cached.chromaNative; p.chromaFloat = cached.chromaFloat;
+            return YES;
+        }
+        NSError *error = nil;
+        id<MTLLibrary> library = [p.device newLibraryWithSource:@VIDEO_PREPARE_SHADER options:nil error:&error];
+        if (!library) return NO;
+        p.horizontal = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal"] error:&error];
+        p.vertical = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"vertical_patch"] error:&error];
+        p.horizontalRGBA = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_rgba"] error:&error];
+        p.horizontalNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_native"] error:&error];
+        p.chromaNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_native"] error:&error];
+        p.chromaFloat = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_float"] error:&error];
+        if (!p.horizontal || !p.vertical || !p.horizontalRGBA || !p.horizontalNative || !p.chromaNative || !p.chromaFloat) return NO;
+        AVPreparer *entry = [AVPreparer new]; entry.device = p.device;
+        entry.horizontal = p.horizontal; entry.vertical = p.vertical;
+        entry.horizontalRGBA = p.horizontalRGBA; entry.horizontalNative = p.horizontalNative;
+        entry.chromaNative = p.chromaNative; entry.chromaFloat = p.chromaFloat;
+        cached = entry;
+        return YES;
+    } @finally { [lock unlock]; }
+}
 int32_t av_preparer_create(void *device, void **out) {
     *out = NULL;
     if (!device) return -1;
@@ -64,16 +98,7 @@ int32_t av_preparer_create(void *device, void **out) {
         void *cache = NULL;
         if (!p.queue || av_metal_create(device, &cache)) return -1;
         p.cache = cache;
-        NSError *error = nil;
-        id<MTLLibrary> library = [p.device newLibraryWithSource:@VIDEO_PREPARE_SHADER options:nil error:&error];
-        if (!library) return -1;
-        p.horizontal = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal"] error:&error];
-        p.vertical = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"vertical_patch"] error:&error];
-        p.horizontalRGBA = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_rgba"] error:&error];
-        p.horizontalNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_native"] error:&error];
-        p.chromaNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_native"] error:&error];
-        p.chromaFloat = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_float"] error:&error];
-        if (!p.horizontal || !p.vertical || !p.horizontalRGBA || !p.horizontalNative || !p.chromaNative || !p.chromaFloat) return -1;
+        if (!preparationPipelines(p)) return -1;
         *out = (__bridge_retained void *)p; return 0;
     }
 }
