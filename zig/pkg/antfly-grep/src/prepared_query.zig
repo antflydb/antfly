@@ -39,6 +39,7 @@ pub fn Registry(comptime Search: type) type {
             // payload, generation, matcher scratch or source bytes are pinned.
             completion: ?struct { token: [64]u8, revision: [64]u8, summary: Search.SummaryType } = null,
             lexical: Search.LexicalIndex = undefined,
+            lexical_admission: Search.LexicalIndex.Admission = .{},
             index: Search.IncrementalIndex = undefined,
             delivery_arena: ?std.heap.ArenaAllocator = null,
             delivery: ?Search.Delivery = null,

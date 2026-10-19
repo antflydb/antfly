@@ -66,6 +66,7 @@ pub const Generation = struct {
     revision: [64]u8 = undefined,
     captured_at: i64 = 0,
     source_bytes: usize = 0,
+    path_bytes: usize = 0,
     watch_fallback: bool = false,
     source_bytes_read: usize = 0,
     capture_workers: usize = 0,
@@ -698,6 +699,7 @@ pub const Generation = struct {
             const entry = old.entries.swapRemove(op.slot);
             entry.release();
             old.budget.allocator().free(entry.path);
+            old.path_bytes -= entry.path.len;
             if (op.slot != op.last) {
                 old.linkDirectory(op.slot);
                 if (old.entries.items[op.slot].blob.token) |token| old.linkWatch(op.slot, token.slot);
@@ -708,6 +710,7 @@ pub const Generation = struct {
             var next = entry;
             if (op.added) {
                 next.path = op.path.?;
+                old.path_bytes += next.path.len;
                 op.path = null;
                 old.entries.appendAssumeCapacity(next);
             } else {
@@ -935,19 +938,42 @@ fn clonePrepared(a: A, temporary: A, bytes: []const u8, value: source.Prepared) 
     return out;
 }
 fn readBlob(io: std.Io, file: std.Io.File, before: anytype, blob: *Blob) ![32]u8 {
-    var buffer: [65536]u8 = undefined;
-    var reader = file.reader(io, &buffer);
-    reader.interface.readSliceAll(blob.bytes) catch |err| {
-        return if (err == error.EndOfStream) error.WorkspaceChangedDuringCapture else err;
-    };
-    if (reader.interface.takeByte()) |_| return error.WorkspaceChangedDuringCapture else |err| {
-        if (err != error.EndOfStream) return err;
-    }
+    // The before/after stamp includes size and ctime. Reading directly into the
+    // immutable owner avoids a small-file buffer copy and a separate EOF probe;
+    // a growing file is rejected by the final stamp, a shrinking file by the
+    // short read. No shared file position or proportional scratch is needed.
+    if (try file.readPositionalAll(io, blob.bytes, 0) != blob.bytes.len) return error.WorkspaceChangedDuringCapture;
     const after = try file.stat(io);
     if (!Collector.sameStamp(before, after)) return error.WorkspaceChangedDuringCapture;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(blob.bytes, &digest, .{});
     return digest;
+}
+
+test "direct snapshot reads reject growth and shrinkage and preserve empty file hashes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "input", .data = "old" });
+    const file = try tmp.dir.openFile(io, "input", .{});
+    defer file.close(io);
+    const before = try file.stat(io);
+    const blob = try Blob.create(a, 3);
+    defer blob.release();
+    _ = try readBlob(io, file, before, blob);
+    try std.testing.expectEqualStrings("old", blob.bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "input", .data = "longer" });
+    try std.testing.expectError(error.WorkspaceChangedDuringCapture, readBlob(io, file, before, blob));
+    try tmp.dir.writeFile(io, .{ .sub_path = "input", .data = "x" });
+    try std.testing.expectError(error.WorkspaceChangedDuringCapture, readBlob(io, file, before, blob));
+    try tmp.dir.writeFile(io, .{ .sub_path = "input", .data = "" });
+    const empty = try Blob.create(a, 0);
+    defer empty.release();
+    const hash = try readBlob(io, file, try file.stat(io), empty);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("", &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &hash);
 }
 
 // Cold capture batches own a fixed number of descriptors and at most 8 MiB
@@ -1219,6 +1245,7 @@ const Collector = struct {
         errdefer generation.budget.allocator().free(owned_path);
         try generation.entries.append(generation.budget.allocator(), .{ .blob = blob, .path = owned_path, .digest = revision, .explicit_file = explicit_file, .witness_reused = witness_reused, .preparation = preparation });
         generation.source_bytes += blob.bytes.len;
+        generation.path_bytes += display.len;
         if (preparation) |owner| {
             owner.refs += 1;
             generation.preparations_reused += 1;
@@ -1469,6 +1496,7 @@ test "membership updates retain canonical identities and visit only affected dir
         try std.testing.expect(current.namespace_paths_checked < 24);
         const rebuilt = try Generation.capture(a, io, &o, null);
         defer rebuilt.deinit();
+        try std.testing.expectEqual(rebuilt.path_bytes, current.path_bytes);
         try std.testing.expectEqualSlices(u8, &rebuilt.revision, &current.revision);
         var ordered = current.iterator();
         var expected = rebuilt.iterator();
@@ -1507,6 +1535,7 @@ test "parallel cold capture equals serial capture and bounds failed admission" {
     defer parallel.deinit();
     try std.testing.expectEqualSlices(u8, &serial.revision, &parallel.revision);
     try std.testing.expectEqual(serial.source_bytes, parallel.source_bytes);
+    try std.testing.expectEqual(serial.path_bytes, parallel.path_bytes);
     try std.testing.expectEqual(@as(usize, 0), serial.capture_workers);
     try std.testing.expectEqual(@as(usize, 4), parallel.capture_workers);
     try std.testing.expectEqual(@as(usize, 40), parallel.parallel_sources_read);

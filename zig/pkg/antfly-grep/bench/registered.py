@@ -39,12 +39,14 @@ class Client(Service):
     def exchange(self, op, **fields):
         started = time.monotonic()
         before = self.wire_bytes
+        self.response_start = before
         self.process.stdin.write(
             json.dumps({"version": 1, "id": 1, "op": op, **fields}).encode() + b"\n"
         )
         self.process.stdin.flush()
         rows = []
         first_event = None
+        begun = False
         while True:
             row = self.read()
             rows.append(row)
@@ -52,15 +54,21 @@ class Client(Service):
                 "match",
                 "workspace_unchanged",
                 "workspace_lexical_delta",
+                "workspace_not_modified",
             ):
                 first_event = time.monotonic() - started
-            if row["type"] == "workspace_error":
+            begun = begun or row["type"] == "workspace_begin"
+            if row["type"] == "workspace_error" and not begun:
                 raise RuntimeError(rows)
             if row["type"] in (
                 "query_registered",
                 "workspace_end",
                 "workspace_ready",
                 "workspace_trimmed",
+                "workspace_not_modified",
+                "workspace_invalidated",
+                "query_forgotten",
+                "workspace_closed",
             ):
                 break
         result = {
@@ -72,8 +80,13 @@ class Client(Service):
             self.ready = rows[-1]
             result["ready"] = rows[-1]
         if op == "search":
-            if rows[-1]["exit_code"] != 0:
+            if rows[-1]["exit_code"] not in (0, 1):
                 raise RuntimeError(rows)
+            if rows[-1]["type"] == "workspace_not_modified":
+                if not rows[-1]["complete"]:
+                    raise RuntimeError(rows)
+                result.update(producer_seconds=None, summary=None)
+                return result, rows
             summary = next(r for r in rows if r["type"] == "summary")
             if not summary["stats"]["complete"]:
                 raise RuntimeError(rows)

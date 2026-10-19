@@ -41,6 +41,42 @@ pub fn Index(comptime Summary: type) type {
         healthy: bool = true,
         mutex: std.Io.Mutex = .init,
         pub const limit = 16 * 1024 * 1024;
+        /// Negative admission survives payload eviction. Content edits do not
+        /// make an oversized path index smaller. Retry only after a meaningful
+        /// footprint reduction or a larger allowance, with no inventory walk.
+        pub const Admission = struct {
+            denied_cost: usize = 0,
+            denied_limit: usize = 0,
+            transient_delay: u8 = 0,
+            transient_remaining: u8 = 0,
+            fn cost(files: usize, paths: usize) usize {
+                return paths +| files *| (@sizeOf(Logical) + @sizeOf([]const u8) + 1);
+            }
+            pub fn permit(self: *Admission, files: usize, paths: usize, allowance: usize) bool {
+                if (self.denied_cost != 0) return allowance > self.denied_limit or cost(files, paths) <= self.denied_cost - self.denied_cost / 4;
+                if (self.transient_remaining == 0) return true;
+                self.transient_remaining -= 1;
+                return false;
+            }
+            pub fn reject(self: *Admission, files: usize, paths: usize, allowance: usize) void {
+                self.* = .{ .denied_cost = @max(1, cost(files, paths)), .denied_limit = allowance };
+            }
+            pub fn deferRetry(self: *Admission) void {
+                const delay = @min(64, @max(1, self.transient_delay *| 2));
+                self.* = .{ .transient_delay = delay, .transient_remaining = delay };
+            }
+        };
+        /// Reserve the map once, avoiding transient old+new tables while
+        /// growing and rejecting a provably oversized index before scanning.
+        pub fn reserve(self: *Self, files: usize, paths: usize) bool {
+            const count = std.math.cast(u32, files) orelse {
+                self.budget.denied = true;
+                return false;
+            };
+            self.files.ensureTotalCapacity(self.budget.allocator(), count) catch return false;
+            self.budget.denied = paths > self.budget.limit -| self.budget.live;
+            return !self.budget.denied;
+        }
         pub fn init(a: A, io: std.Io) Self {
             return .{ .a = a, .io = io, .budget = .{ .backing = a, .limit = limit } };
         }
@@ -56,6 +92,7 @@ pub fn Index(comptime Summary: type) type {
             self.inexact = 0;
             self.revision = null;
             self.healthy = true;
+            self.budget.denied = false;
         }
         fn adjust(self: *Self, value: Logical, add: bool) void {
             const values = .{ value.bytes, value.matches, value.occurrences, @intFromBool(value.flags.searched), @intFromBool(value.flags.matched), @intFromBool(value.flags.skipped), @intFromBool(value.flags.invalid) };
@@ -97,6 +134,7 @@ pub fn Index(comptime Summary: type) type {
                 return;
             };
             self.adjust(logical, true);
+            self.budget.denied = false;
         }
     };
 }
@@ -123,4 +161,37 @@ test "lexical summary index repairs aggregates and bounds failed admission" {
     try std.testing.expect(!index.healthy);
     index.clear();
     try std.testing.expectEqual(@as(usize, 0), index.budget.live);
+}
+
+test "lexical admission remembers failure across content revisions and uses hysteresis" {
+    const I = Index(TestSummary);
+    var admission: I.Admission = .{};
+    try std.testing.expect(admission.permit(1000, 10000, 100));
+    admission.reject(1000, 10000, 100);
+    try std.testing.expect(!admission.permit(1000, 10000, 100));
+    try std.testing.expect(!admission.permit(999, 9999, 100));
+    try std.testing.expect(!admission.permit(2000, 20000, 100));
+    try std.testing.expect(admission.permit(500, 5000, 100));
+    try std.testing.expect(admission.permit(1000, 10000, 101));
+    var index = I.init(std.testing.allocator, std.testing.io);
+    defer index.deinit();
+    index.budget.limit = 100;
+    try std.testing.expect(!index.reserve(1000, 10000));
+    index.clear();
+    try std.testing.expectEqual(@as(usize, 0), index.budget.live);
+    index.budget.limit = I.limit;
+    try std.testing.expect(index.reserve(1000, 10000));
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var transient = I.init(failing.allocator(), std.testing.io);
+    defer transient.deinit();
+    try std.testing.expect(!transient.reserve(1000, 10000));
+    try std.testing.expect(!transient.budget.denied);
+    admission = .{};
+    admission.deferRetry();
+    try std.testing.expect(!admission.permit(1000, 10000, I.limit));
+    try std.testing.expect(admission.permit(1000, 10000, I.limit));
+    // A recovered allocator can admit the same footprint without requiring
+    // an inventory shrink or a new registration.
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expect(transient.reserve(1000, 10000));
 }

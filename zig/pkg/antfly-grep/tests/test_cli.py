@@ -5902,6 +5902,7 @@ class CliTests(unittest.TestCase):
                     continue
                 if row["type"] in (
                     "workspace_end",
+                    "workspace_not_modified",
                     "workspace_error",
                     "workspace_ready",
                     "workspace_invalidated",
@@ -6608,6 +6609,217 @@ class CliTests(unittest.TestCase):
                     for r in rows
                 )
             )
+
+    def test_workspace_oversized_lexical_index_backs_off_until_inventory_shrinks(self):
+        if os.name == "nt":
+            self.skipTest("long path fixture requires POSIX paths")
+        source = "src/" + "/".join(ch * 240 for ch in "abc")
+        directory = self.root / source
+        directory.mkdir(parents=True)
+        count = 24000
+        # Shared long directory prefixes exceed the 16 MiB path budget without
+        # needing hundreds of thousands of files or a test-only product flag.
+        paths = [directory / f"f{i:05}.txt" for i in range(count)]
+        for path in paths:
+            path.write_text("negative\n")
+        with self.workspace(source) as (ready, request):
+            handle = request("register", args=["STOP", "--threads=2"])[0][
+                "query_handle"
+            ]
+
+            def run(ready):
+                rows = request(
+                    "search",
+                    revision=ready["revision"],
+                    query_handle=handle,
+                    if_result_token="0" * 64,
+                    delta=True,
+                )
+                self.assertEqual(rows[-1]["exit_code"], 1, rows[-1])
+                stats = next(r["stats"] for r in rows if r["type"] == "summary")
+                self.assertTrue(stats["complete"])
+                return stats, rows
+
+            failed, _ = run(ready)
+            self.assertEqual(failed["lexical_index_admissions"], 1)
+            self.assertEqual(failed["lexical_index_admission_failures"], 1)
+            skipped, _ = run(ready)
+            self.assertEqual(skipped["lexical_index_admissions"], 0)
+            self.assertEqual(skipped["lexical_index_admission_skips"], 1)
+            paths[0].write_text("still negative with a new revision\n")
+            ready = request("refresh")[0]
+            skipped, _ = run(ready)
+            self.assertEqual(skipped["lexical_index_admission_skips"], 1)
+            for path in paths[count // 4 :]:
+                path.unlink()
+            ready = request("refresh")[0]
+            admitted, rows = run(ready)
+            self.assertEqual(admitted["files"], count // 4)
+            self.assertEqual(admitted["lexical_index_admissions"], 1)
+            self.assertEqual(admitted["lexical_index_admission_failures"], 0)
+            token = next(r["result_token"] for r in rows if r["type"] == "result_token")
+            paths[0].write_text("STOP now positive\n")
+            ready = request("refresh")[0]
+            patch = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+                delta=True,
+            )
+            self.assertTrue(any(r["type"] == "workspace_lexical_delta" for r in patch))
+            stats = next(r["stats"] for r in patch if r["type"] == "summary")
+            self.assertEqual(stats["lexical_entries_visited"], 1)
+            self.assertEqual(stats["matches"], 1)
+
+    def test_workspace_minimal_acknowledgement_is_terminal_bound_and_budgeted(self):
+        path = self.write("src/a.txt", "STOP old\n")
+        with self.workspace("src") as (ready, request):
+            for args, expected in ((["STOP"], 0), (["missing"], 1)):
+                handle = request("register", args=args)[0]["query_handle"]
+                fields = dict(revision=ready["revision"], query_handle=handle)
+                full = request("search", **fields)
+                token = next(
+                    r["result_token"] for r in full if r["type"] == "result_token"
+                )
+                compact = request(
+                    "search", **fields, if_result_token=token, acknowledgement="minimal"
+                )
+                self.assertEqual(len(compact), 1, compact)
+                self.assertEqual(compact[0]["type"], "workspace_not_modified")
+                self.assertTrue(compact[0]["complete"])
+                self.assertEqual(compact[0]["exit_code"], expected)
+                self.assertEqual(compact[0]["result_token"], token)
+                self.assertEqual(compact[0]["revision"], ready["revision"])
+                self.assertLess(len(json.dumps(compact[0])), 512)
+                unknown = request(
+                    "search",
+                    **fields,
+                    if_result_token="0" * 64,
+                    acknowledgement="minimal",
+                )
+                self.assertEqual(unknown[0]["type"], "workspace_begin")
+                self.assertEqual(unknown[-1]["exit_code"], expected)
+            # A finite allowance remains valid on the minimal path.
+            handle = request("register", args=["missing", "--max-output-bytes=2000"])[
+                0
+            ]["query_handle"]
+            fields = dict(revision=ready["revision"], query_handle=handle)
+            full = request("search", **fields)
+            token = next(r["result_token"] for r in full if r["type"] == "result_token")
+            fallback = request(
+                "search", **fields, if_result_token=token, acknowledgement="minimal"
+            )
+            self.assertEqual(fallback[0]["type"], "workspace_not_modified")
+            self.assertEqual(fallback[-1]["exit_code"], 1)
+            # Existing handles/tokens cannot acknowledge changed or invalidated sources.
+            handle = request("register", args=["STOP"])[0]["query_handle"]
+            full = request("search", revision=ready["revision"], query_handle=handle)
+            token = next(r["result_token"] for r in full if r["type"] == "result_token")
+            path.write_text("STOP new\n")
+            ready = request("refresh")[0]
+            changed = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+                acknowledgement="minimal",
+            )
+            self.assertEqual(changed[0]["type"], "workspace_begin")
+            request("invalidate")
+            self.assertEqual(
+                request(
+                    "search",
+                    revision=ready["revision"],
+                    query_handle=handle,
+                    if_result_token=token,
+                    acknowledgement="minimal",
+                )[0]["message"],
+                "WorkspaceInvalidated",
+            )
+            self.assertEqual(
+                request("refresh", acknowledgement="minimal")[0]["message"],
+                "InvalidAcknowledgementOperation",
+            )
+
+    def test_retained_workspace_consumer_omits_requests_and_commits_exact_deltas(self):
+        bench = Path(__file__).resolve().parents[1] / "bench"
+        sys.path.insert(0, str(bench))
+        try:
+            from retained import RetainedClient
+            from lexical_reuse import signature
+
+            path = self.write("src/a.txt", "STOP old\n")
+            self.write("src/b.txt", "STOP unchanged\n")
+            client = RetainedClient(Path(BINARY), self.root, "src", [], self.env)
+            try:
+                _, rows = client.exchange("register", args=["STOP"])
+                handle = rows[0]["query_handle"]
+                view, first = client.search_view(handle)
+                self.assertEqual(first["requests"], 1)
+                before = client.wire_bytes
+                again, skipped = client.search_view(handle)
+                self.assertIs(again, view)
+                self.assertEqual(skipped["requests"], 0)
+                self.assertEqual(client.wire_bytes, before)
+                _, ack = client.search_view(handle, revalidate=True)
+                self.assertLess(ack["response_bytes"], 512)
+                original = view.files[b"src/b.txt"]
+                path.write_text("now negative\n")
+                self.write("src/c.txt", "STOP added\n")
+                client.exchange("refresh")
+                updated, delta = client.search_view(handle)
+                self.assertIs(updated, view)
+                self.assertEqual(delta["requests"], 1)
+                self.assertIs(updated.files[b"src/b.txt"], original)
+                self.assertNotIn(b"src/a.txt", updated.files)
+                self.assertIn(b"src/c.txt", updated.files)
+                _, full = client.exchange(
+                    "search", revision=client.ready["revision"], query_handle=handle
+                )
+                self.assertEqual(signature(updated.materialize()), signature(full))
+                client.exchange("invalidate")
+                before = client.wire_bytes
+                with self.assertRaisesRegex(RuntimeError, "refresh required"):
+                    client.search_view(handle)
+                self.assertEqual(client.wire_bytes, before)
+                client.exchange("refresh")
+                client.search_view(handle)
+                # Caller-owned completed views survive failed transactions.
+                old = (view.revision, view.token, dict(view.files))
+                with self.assertRaises(RuntimeError):
+                    view.apply([{"type": "workspace_end", "exit_code": 2}], "bad", 0)
+                self.assertEqual(old, (view.revision, view.token, view.files))
+                client.max_retained_payload = 1
+                client.view = None
+                delivered, _ = client.search_view(handle)
+                self.assertTrue(delivered.files)
+                self.assertIsNone(client.view)
+                _, missing = client.exchange("register", args=["absent"])
+                empty, result = client.search_view(missing[0]["query_handle"])
+                self.assertEqual(empty.exit_code, 1)
+                self.assertFalse(empty.files)
+                _, result = client.search_view(missing[0]["query_handle"])
+                self.assertEqual(result["requests"], 0)
+                client.exchange("trim")
+                with self.assertRaises(ValueError):
+                    client.search_view(handle)
+            finally:
+                client.close()
+            bounded = RetainedClient(
+                Path(BINARY), self.root, "src", [], self.env, max_response_bytes=1024
+            )
+            try:
+                _, registration = bounded.exchange("register", args=["STOP"])
+                with self.assertRaisesRegex(RuntimeError, "response budget exceeded"):
+                    bounded.search_view(registration[0]["query_handle"])
+                self.assertFalse(bounded.valid)
+                self.assertIsNone(bounded.view)
+                self.assertIsNotNone(bounded.process.poll())
+            finally:
+                bounded.close()
+        finally:
+            sys.path.pop(0)
 
     def test_workspace_lexical_tokens_survive_full_delivery_and_count_tiny_scans(self):
         self.write("src/a.txt", "STOP\n")

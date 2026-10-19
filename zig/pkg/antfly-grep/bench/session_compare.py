@@ -56,11 +56,26 @@ class Service:
         if self.ready["type"] != "workspace_ready":
             raise RuntimeError(self.ready)
 
+    def _response_too_large(self):
+        # Stop the owned producer rather than blocking on an unconsumed pipe.
+        self.process.kill()
+        self.process.wait(timeout=5)
+        raise RuntimeError("workspace response budget exceeded")
+
     def read(self):
+        response_limit = getattr(self, "max_response_bytes", None)
+        response_start = getattr(self, "response_start", 0)
+
         deadline = time.monotonic() + 120
         while True:
             end = self.pending.find(b"\n", self.cursor)
             if end >= 0:
+                if (
+                    response_limit is not None
+                    and self.wire_bytes - response_start + end + 1 - self.cursor
+                    > response_limit
+                ):
+                    self._response_too_large()
                 line = bytes(self.pending[self.cursor : end])
                 self.wire_bytes += end + 1 - self.cursor
                 self.cursor = end + 1
@@ -77,6 +92,12 @@ class Service:
             data = os.read(self.process.stdout.fileno(), 65536)
             if not data:
                 raise RuntimeError("workspace closed unexpectedly")
+            if (
+                response_limit is not None
+                and self.wire_bytes - response_start + len(self.pending) + len(data)
+                > response_limit
+            ):
+                self._response_too_large()
             self.pending.extend(data)
 
     def search(self, token=None, query=None, require_warm=True):
@@ -131,7 +152,12 @@ class Service:
 
 
 def cpu_seconds(pid):
-    # Darwin ps reports cumulative process CPU with hundredth-second precision.
+    # Linux reports process user/system ticks, including its worker threads.
+    # Darwin ps has hundredth-second precision; qualify repeated request batches
+    # rather than interpreting one sub-millisecond call as a CPU measurement.
+    if platform.system() == "Linux":
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
     if platform.system() != "Darwin":
         return None
     value = subprocess.check_output(

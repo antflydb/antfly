@@ -27,6 +27,9 @@ pub const decision = @import("decision.zig");
 const Allocator = std.mem.Allocator;
 pub const Summary = struct {
     lexical_entries_visited: usize = 0,
+    lexical_index_admissions: usize = 0,
+    lexical_index_admission_failures: usize = 0,
+    lexical_index_admission_skips: usize = 0,
     lexical_cache_hits: usize = 0,
     lexical_files_evaluated: usize = 0,
     index_requests: usize = 0,
@@ -56,7 +59,24 @@ pub const Line = @import("source_cache.zig").Line;
 const Limits = @import("budget.zig").Limits;
 const Spill = @import("spill.zig").Store;
 const Temp = @import("temporary.zig").File;
-const Task = struct { workspace_entry: ?*const @import("workspace_store.zig").Entry = null, prepared: bool = false, path: []const u8, display: []const u8, filename: bool, explicit_file: bool = false, timestamp: i96 = 0, ordinal: usize = 0, result: ?[]u8 = null, score: f64 = 0 };
+const Task = struct {
+    workspace_entry: ?*const @import("workspace_store.zig").Entry = null,
+    prepared: bool = false,
+    path: []const u8,
+    display: []const u8,
+    owns_paths: bool = true,
+    filename: bool,
+    explicit_file: bool = false,
+    timestamp: i96 = 0,
+    ordinal: usize = 0,
+    result: ?[]u8 = null,
+    score: f64 = 0,
+    fn releasePaths(self: Task, a: Allocator) void {
+        if (!self.owns_paths) return;
+        a.free(self.path);
+        a.free(self.display);
+    }
+};
 const EvidenceRow = struct { line: usize, byte_offset: usize, text: []const u8, p: ?f64, region_p: ?f64, matched: bool };
 const EvidenceView = struct {
     rows: []EvidenceRow,
@@ -361,6 +381,7 @@ pub const Search = struct {
     summary: Summary = .{},
     stop: bool = false,
     render_filename: bool = true,
+    render_arena: ?std.heap.ArenaAllocator = null,
     header_printed: bool = false,
     explicit_file: bool = false,
     binary_offset: ?usize = null,
@@ -429,6 +450,24 @@ pub const Search = struct {
     pub fn lexicalCertificateEligible(o: *const Options) bool {
         return o.ask == null and !o.no_cache and !o.debug and !o.trace and !o.quiet;
     }
+    pub fn lexicalDeltaEligible(o: *const Options) bool {
+        return lexicalCertificateEligible(o) and !o.count and !o.count_matches and !o.files_with_matches and !o.files_without_match and o.max_output_bytes == std.math.maxInt(usize) and o.max_source_bytes == std.math.maxInt(usize);
+    }
+    /// A single terminal control frame for clients which already own the exact
+    /// completed view. No Search/matcher/provider/summary writer is constructed.
+    /// Budget or cancellation failure falls back to the ordinary protocol.
+    pub fn completedMinimal(io: std.Io, o: *const Options, generation: *const @import("workspace_store.zig").Generation, summary: Summary, token: [64]u8, id: u64) !bool {
+        var canceled: std.atomic.Value(bool) = .init(false);
+        const guard = @import("interrupt.zig").Guard.init(&canceled);
+        defer guard.deinit();
+        var buffer: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(.{ .type = "workspace_not_modified", .id = id, .revision = generation.revision, .result_token = token, .observed_at = generation.captured_at, .complete = true, .exit_code = @as(u8, if (summary.matches != 0 or summary.reading_leads != 0) 0 else 1) }, .{}, &writer);
+        try writer.writeByte('\n');
+        if (writer.buffered().len > o.max_output_bytes or canceled.load(.acquire)) return false;
+        try std.Io.File.stdout().writeStreamingAll(io, writer.buffered());
+        return true;
+    }
     pub fn completedConditional(a: Allocator, io: std.Io, o: *const Options, generation: *const @import("workspace_store.zig").Generation, summary: Summary, token: [64]u8) !?u8 {
         var search: Search = .{ .a = a, .io = io, .options = o, .matcher = undefined, .decider = decision.Client.init(a, io, o) };
         defer search.output_buffer.deinit(a);
@@ -444,6 +483,9 @@ pub const Search = struct {
         search.summary = summary;
         search.summary.query_cache_hits = 1;
         search.summary.lexical_entries_visited = 0;
+        search.summary.lexical_index_admissions = 0;
+        search.summary.lexical_index_admission_failures = 0;
+        search.summary.lexical_index_admission_skips = 0;
         search.summary.lexical_cache_hits = 0;
         search.summary.lexical_files_evaluated = 0;
         search.summary.incremental_cache_hits = 0;
@@ -518,6 +560,7 @@ pub const Search = struct {
         return result;
     }
     pub fn deinit(self: *Search) void {
+        if (self.render_arena) |*arena| arena.deinit();
         if (self.discovery_decider) |client| {
             client.deinit();
             self.a.destroy(client);
@@ -548,8 +591,7 @@ pub const Search = struct {
         self.matcher.deinit();
         self.decider.deinit();
         for (self.tasks.items) |task| {
-            self.a.free(task.path);
-            self.a.free(task.display);
+            task.releasePaths(self.a);
             if (task.result) |result| self.a.free(result);
         }
         self.tasks.deinit(self.a);
@@ -774,6 +816,9 @@ pub const Search = struct {
         try self.write("\n");
     }
     fn finish(self: *Search, started: std.Io.Timestamp) !u8 {
+        if (self.lexical_index) |index| if (!index.healthy) {
+            self.summary.lexical_index_admission_failures = 1;
+        };
         if (self.limits.cancel.load(.acquire) and self.summary.complete and !self.options.quiet) {
             self.summary.complete = false;
             try self.reportError("<search>", error.Canceled);
@@ -1100,8 +1145,7 @@ pub const Search = struct {
             for (self.threads[0..self.started]) |thread| thread.join();
             // Canceled workers may leave queued paths; ownership stays here.
             while (self.queue.pop(root.io)) |task| {
-                root.a.free(task.path);
-                root.a.free(task.display);
+                task.releasePaths(root.a);
             }
             const failure = self.context.failure;
             root.a.free(self.threads);
@@ -1209,8 +1253,7 @@ pub const Search = struct {
                 };
                 if (task.prepared) continue;
                 defer if (ctx.queue != null) {
-                    root.a.free(task.path);
-                    root.a.free(task.display);
+                    task.releasePaths(root.a);
                 };
                 var output: std.Io.Writer.Allocating = .init(root.a);
                 defer output.deinit();
@@ -1394,10 +1437,15 @@ pub const Search = struct {
     }
     pub fn file(self: *Search, path_name: []const u8, display: []const u8) !void {
         if (self.collecting) {
-            const path = try self.a.dupe(u8, path_name);
-            errdefer self.a.free(path);
-            const shown = try self.a.dupe(u8, display);
-            errdefer self.a.free(shown);
+            // Workspace generations outlive this search and every worker is
+            // joined before refresh. Borrow their immutable names rather than
+            // allocating two copies per queued file. Live discovery still owns
+            // its transient strings, including on cancellation/error cleanup.
+            const borrowed = if (self.workspace_entry) |entry| std.mem.eql(u8, entry.path, path_name) and std.mem.eql(u8, entry.path, display) else false;
+            const path = if (borrowed) path_name else try self.a.dupe(u8, path_name);
+            errdefer if (!borrowed) self.a.free(path);
+            const shown = if (borrowed) display else try self.a.dupe(u8, display);
+            errdefer if (!borrowed) self.a.free(shown);
             var timestamp: i96 = 0;
             if (self.options.sort) |sort| {
                 if (!std.mem.eql(u8, sort, "path") and !std.mem.eql(u8, sort, "none")) {
@@ -1405,19 +1453,17 @@ pub const Search = struct {
                     timestamp = if (std.mem.eql(u8, sort, "modified")) stat.mtime.nanoseconds else if (std.mem.eql(u8, sort, "accessed")) (stat.atime orelse std.Io.Timestamp.zero).nanoseconds else (try @import("filesystem.zig").info(self.a, self.io, path_name)).created orelse return error.CreationTimeUnavailable;
                 }
             }
-            const task: Task = .{ .workspace_entry = self.workspace_entry, .ordinal = self.next_ordinal, .path = path, .display = shown, .filename = self.render_filename, .timestamp = timestamp, .explicit_file = self.explicit_file };
+            const task: Task = .{ .workspace_entry = self.workspace_entry, .ordinal = self.next_ordinal, .path = path, .display = shown, .owns_paths = !borrowed, .filename = self.render_filename, .timestamp = timestamp, .explicit_file = self.explicit_file };
             self.next_ordinal += 1;
             if (self.pipeline) |pool| {
                 if (!try pool.submit(task)) {
-                    self.a.free(path);
-                    self.a.free(shown);
+                    task.releasePaths(self.a);
                     return;
                 }
             } else if (self.discovery_stream) {
                 try self.inventoryTask(task);
                 if (self.inventory_count > self.options.max_files) try self.startInventory(true);
-                self.a.free(task.path);
-                self.a.free(task.display);
+                task.releasePaths(self.a);
             } else try self.tasks.append(self.a, task);
             return;
         }
@@ -3485,9 +3531,12 @@ pub const Search = struct {
             }
             return;
         }
-        var arena = std.heap.ArenaAllocator.init(self.a);
-        defer arena.deinit();
-        const a = arena.allocator();
+        // A worker owns its renderer. Reuse bounded scratch between rows rather
+        // than allocating/freeing an arena for every match; large exceptional
+        // records are released at the end of this call, never retained.
+        if (self.render_arena == null) self.render_arena = .init(self.a);
+        defer _ = self.render_arena.?.reset(.{ .retain_with_limit = 64 * 1024 });
+        const a = self.render_arena.?.allocator();
         const p: ?f64 = if (std.math.isNan(probability)) null else probability;
         const independent = self.independent_override orelse if (self.evidence) |evidence| line > 0 and line <= evidence.line_scores.len and std.math.isFinite(evidence.line_scores[line - 1]) and evidence.line_scores[line - 1] >= 0 and evidence.line_scores[line - 1] == probability else self.options.ask != null;
         const replacement_context = self.options.replacement != null and !self.options.multiline and !self.options.json and !self.replacement_absolute_start and self.matcher.hasAbsoluteStart();
@@ -3714,14 +3763,14 @@ pub const Search = struct {
             };
             const bytes = self.text[span.start..span.end];
             if (std.unicode.utf8ValidateSlice(bytes)) {
-                try json_writer.write(.{ .match = .{ .text = bytes }, .start = span.start, .end = span.end });
+                try @import("json_fields.zig").write(json_writer, .{ .match = .{ .text = bytes }, .start = span.start, .end = span.end });
             } else {
                 // Invalid byte matches are rare; bounded chunks of base64 avoid
                 // a second array proportional to the number of occurrences.
                 try json_writer.beginObject();
-                try json_writer.objectField("match");
+                try @import("json_fields.zig").field(json_writer, "match");
                 try json_writer.beginObject();
-                try json_writer.objectField("bytes");
+                try @import("json_fields.zig").field(json_writer, "bytes");
                 try json_writer.beginWriteRaw();
                 try json_writer.writer.writeByte('"');
                 var at: usize = 0;
@@ -3734,9 +3783,9 @@ pub const Search = struct {
                 try json_writer.writer.writeByte('"');
                 json_writer.endWriteRaw();
                 try json_writer.endObject();
-                try json_writer.objectField("start");
+                try @import("json_fields.zig").field(json_writer, "start");
                 try json_writer.write(span.start);
-                try json_writer.objectField("end");
+                try @import("json_fields.zig").field(json_writer, "end");
                 try json_writer.write(span.end);
                 try json_writer.endObject();
             }
@@ -3890,7 +3939,7 @@ pub const Search = struct {
         text: ?[]const u8,
         bytes: ?[]const u8,
         pub fn jsonStringify(self: @This(), writer: anytype) !void {
-            if (self.text) |value| try writer.write(.{ .text = value }) else try writer.write(.{ .bytes = self.bytes.? });
+            if (self.text) |value| try @import("json_fields.zig").write(writer, .{ .text = value }) else try @import("json_fields.zig").write(writer, .{ .bytes = self.bytes.? });
         }
     };
     pub fn jsonText(a: Allocator, text: []const u8) !JsonText {
@@ -3920,14 +3969,16 @@ pub const Search = struct {
         var stats = self.jsonStats(before);
         stats.bytes_printed = self.output_bytes - self.file_output_start;
         const elapsed = self.file_elapsed_ns orelse if (self.file_started) |start| @max(0, start.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds) else 0;
-        const human = try std.fmt.allocPrint(self.a, "{d:.6}s", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000_000});
-        defer self.a.free(human);
+        var human_buffer: [64]u8 = undefined;
+        const human = try std.fmt.bufPrint(&human_buffer, "{d:.6}s", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000_000});
         stats.elapsed = .{ .secs = @intCast(@divFloor(elapsed, 1_000_000_000)), .nanos = @intCast(@mod(elapsed, 1_000_000_000)), .human = human };
-        const encoded_path = try jsonText(self.a, path);
-        defer if (encoded_path.bytes) |bytes| self.a.free(bytes);
         if (self.options.json_compact) {
             try self.json(.{ .type = "end", .data = .{ .binary_offset = self.binary_offset, .stats = stats } });
-        } else try self.json(.{ .type = "end", .data = .{ .path = encoded_path, .binary_offset = self.binary_offset, .stats = stats } });
+        } else {
+            const encoded_path = try jsonText(self.a, path);
+            defer if (encoded_path.bytes) |bytes| self.a.free(bytes);
+            try self.json(.{ .type = "end", .data = .{ .path = encoded_path, .binary_offset = self.binary_offset, .stats = stats } });
+        }
         self.json_started = false;
     }
     const AtomicRecord = struct {
@@ -3993,25 +4044,25 @@ pub const Search = struct {
                         try json_writer.write(field.value_ptr.*);
                     }
                 } else inline for (@typeInfo(@FieldType(@This(), "value")).@"struct".field_names) |field_name| {
-                    try json_writer.objectField(field_name);
-                    try json_writer.write(@field(envelope.value, field_name));
+                    try @import("json_fields.zig").field(json_writer, field_name);
+                    try @import("json_fields.zig").write(json_writer, @field(envelope.value, field_name));
                 }
                 if (envelope.compact) {
-                    try json_writer.objectField("result_schema_version");
+                    try @import("json_fields.zig").field(json_writer, "result_schema_version");
                     try json_writer.write(@as(u32, 2));
                     if (envelope.file_id) |id| {
-                        try json_writer.objectField("file_id");
+                        try @import("json_fields.zig").field(json_writer, "file_id");
                         try json_writer.write(@as([]const u8, &id));
                     }
                 }
                 if (!std.mem.eql(u8, eventKind(envelope.value), "summary")) {
                     if (!envelope.compact) {
-                        try json_writer.objectField("result_schema_version");
+                        try @import("json_fields.zig").field(json_writer, "result_schema_version");
                         try json_writer.write(@as(u32, 1));
                     }
                     if (!envelope.compact or envelope.file_id == null or std.mem.eql(u8, eventKind(envelope.value), "begin")) {
-                        try json_writer.objectField("source");
-                        try json_writer.write(envelope.source);
+                        try @import("json_fields.zig").field(json_writer, "source");
+                        try @import("json_fields.zig").write(json_writer, envelope.source);
                     }
                 }
                 try json_writer.endObject();
@@ -4080,6 +4131,7 @@ test "line offsets preserve CRLF and unterminated final lines" {
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 test {
+    _ = @import("json_fields.zig");
     _ = @import("evidence.zig");
     _ = @import("source_views.zig");
     _ = @import("workspace_store.zig");

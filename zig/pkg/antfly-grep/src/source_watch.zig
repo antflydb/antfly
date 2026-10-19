@@ -146,9 +146,15 @@ pub const Watch = struct {
     }
     fn armKind(self: *Watch, file: std.Io.File, directory: bool) ?Token {
         if (comptime !supported) return null;
-        self.poll();
         if (self.fd < 0 or self.failed) return null;
         const id = identity(file.handle) orelse return null;
+        // Full-table misses cannot acquire a witness. Do not drain the kernel
+        // queue for each of the remaining files in a large cold capture. Keep
+        // identity reuse (including hard links) and poll before slot recycling.
+        // Capture/refresh still performs its final publication barrier.
+        if (!self.identities.contains(id) and self.freeSlot() == null) return null;
+        self.poll();
+        if (self.fd < 0 or self.failed) return null;
         const mask = if (comptime builtin.os.tag == .linux) linuxMask(directory) else 0;
         if (self.identities.get(id)) |i| {
             const slot = &self.slots[i];

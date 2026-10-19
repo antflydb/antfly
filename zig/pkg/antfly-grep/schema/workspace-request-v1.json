@@ -66,6 +66,14 @@
     "delta": {
       "type": "boolean",
       "default": false
+    },
+    "acknowledgement": {
+      "enum": [
+        "full",
+        "minimal"
+      ],
+      "default": "full",
+      "description": "Minimal is opt-in for registered conditional lexical searches. A valid hit is one terminal workspace_not_modified frame, with complete/exit_code and no begin/summary/end; otherwise ordinary output follows."
     }
   },
   "allOf": [
@@ -198,7 +206,36 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "required": [
+          "acknowledgement"
+        ],
+        "properties": {
+          "acknowledgement": {
+            "const": "minimal"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "query_handle",
+          "if_result_token"
+        ],
+        "properties": {
+          "op": {
+            "const": "search"
+          },
+          "query_handle": {
+            "type": "string"
+          },
+          "if_result_token": {
+            "type": "string"
+          }
+        }
+      }
     }
   ],
-  "$comment": "Each UTF-8 JSON request occupies at most 65535 bytes before LF. Requests execute serially. Search revision must equal the current non-invalidated workspace_ready revision. Refresh is transactional and a failed refresh leaves the session invalidated. Trim releases optional process-local caches, provider resources, and idle workers; it preserves the source snapshot and invalidated state. Search may supply if_result_token; a valid complete cache hit can emit workspace_unchanged instead of result rows, followed by fresh summary/end. Tokens expire with all evidence and are process-local. Refresh force_rescan discards optional kernel witnesses and reads every eligible file. Default refresh is conservative; --workspace-watch opts into native event visibility assumptions. Register binds immutable effective options/provider credentials and compiled patterns to a bounded process-local query_handle, compact by default. Search may supply args or a handle; overrides with a handle are rejected. Forget and trim retire handles. Delta with a retained matching baseline can emit workspace_delta(order, removed) and only upserted file payloads. Clients atomically commit the new view/token only after complete summary and successful workspace_end; unknown baselines fall back to full output. Incremental state admission/coverage/TTL loss uses ordinary search."
+  "$comment": "Each UTF-8 JSON request occupies at most 65535 bytes before LF. Requests execute serially. Search revision must equal the current non-invalidated workspace_ready revision. Refresh is transactional and a failed refresh leaves the session invalidated. Trim releases optional process-local caches, provider resources, and idle workers; it preserves the source snapshot and invalidated state. Search may supply if_result_token; a valid complete cache hit can emit workspace_unchanged instead of result rows, followed by fresh summary/end. Tokens expire with all evidence and are process-local. Refresh force_rescan discards optional kernel witnesses and reads every eligible file. Default refresh is conservative; --workspace-watch opts into native event visibility assumptions. Register binds immutable effective options/provider credentials and compiled patterns to a bounded process-local query_handle, compact by default. Search may supply args or a handle; overrides with a handle are rejected. Forget and trim retire handles. Delta with a retained matching baseline can emit workspace_delta(order, removed) and only upserted file payloads. Clients atomically commit the new view/token only after complete summary and successful workspace_end; unknown baselines fall back to full output. Incremental state admission/coverage/TTL loss uses ordinary search. acknowledgement=minimal requires a registered conditional search. A complete lexical certificate can return one terminal workspace_not_modified frame carrying id, revision, result_token, observed_at, complete and exit_code (0 or 1), with no begin/summary/end. Any fallback uses the ordinary protocol. workspace_ready includes observed_at and query_registered advertises supports_lexical_delta. Client-side omission is valid only for an already materialized pinned revision; refresh is explicit."
 }

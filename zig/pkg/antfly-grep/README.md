@@ -2949,3 +2949,104 @@ Evidence: [Linux deltas](bench/results/typed-delta-linux.json),
 [macOS deltas](bench/results/typed-delta-macos.json),
 [macOS capture](bench/results/typed-capture-macos.json), and
 [source/binary/report/archive identities](bench/results/typed-validation.json).
+
+### Admission backoff, minimal acknowledgements and retained clients
+
+The next follow-up uses `7a19e40c9a` as its qualification baseline. Failed optional
+lexical-index admission no longer repeats the same allocation work on every
+bootstrap request. Cold admission reserves the hash table once and checks owned
+path bytes against the remaining 16 MiB allowance before scanning. A separate
+negative admission record survives payload clearing and content-only edits.
+Its constant-time cost estimate uses file count and total path bytes, maintained
+transactionally by capture and changed-path membership updates. Admission retries
+after an estimated footprint reduction of at least 25%, a larger allowance, or a
+new registration. Backing-allocator failures instead use exponential retry
+backoff of 1–64 requests, allowing recovery without an inventory shrink. Failure
+remains an exact full-delivery fallback; `forget` and
+`trim` release the record. Summary counters distinguish
+`lexical_index_admissions`, `lexical_index_admission_failures` and
+`lexical_index_admission_skips`. A real 24K-file long-path fixture exceeds the
+budget, verifies backoff across an edit, shrinks the inventory, and verifies
+successful admission and subsequent changed-path delivery.
+
+Registered conditional searches may opt into a smaller response:
+
+```json
+{"version":1,"id":7,"op":"search","revision":"…","query_handle":"…","if_result_token":"…","acknowledgement":"minimal"}
+```
+
+A matching complete lexical certificate can return exactly one terminal frame:
+
+```json
+{"type":"workspace_not_modified","id":7,"revision":"…","result_token":"…","observed_at":0,"complete":true,"exit_code":0}
+```
+
+This response has no `workspace_begin`, summary or `workspace_end`. Exit code 1
+is also a successful completed transaction for a query with no matches. The
+query handle and snapshot bind the result; an unknown token, changed revision,
+unsupported query or insufficient output allowance uses ordinary delivery.
+Invalidated workspaces still require refresh. Cancellation is checked before
+publication. The opt-in lexical fast path constructs no matcher, provider client,
+heap-backed summary or result payload. Default acknowledgements keep the existing
+protocol. Small workspace control frames use stack storage and one write.
+`workspace_ready.observed_at` exposes the current capture observation time, and
+`query_registered.supports_lexical_delta` advertises the supported row contract;
+index admission remains optional and bounded.
+
+[retained.py](bench/retained.py) is a stdlib-only reference **consumer and benchmark
+tool**, not a Python dependency of the Zig binary. It retains one live compact
+lexical view, skips a request when that handle and the last validated pinned
+revision are already materialized, and can explicitly revalidate using the
+minimal acknowledgement. Refresh is explicit: a skipped request makes no new
+claim about live filesystem freshness. Invalidation and failed refresh prohibit
+reuse; registration changes, forget, trim and close discard the retained view.
+
+The client validates complete transactions and file-ID bindings before applying
+changes. Delta publication changes only affected paths without copying the
+unchanged payload map or retaining prior generation chains. It stores serialized
+file payloads, overlays the current snapshot/observation metadata when explicitly
+materializing rows, and supports UTF-8 and base64 byte paths. The default 8 MiB
+allowance bounds retained serialized payload/path bytes, not Python object RSS.
+A separate configurable response-wire allowance (by default twice that allowance
+plus 64 KiB, at least 64 KiB) is checked before JSON decoding and while reading
+partial frames. Exhaustion stops the owned producer and invalidates the client
+without publishing a partial view. A local allocation failure invalidates the view certificate; a full refetch is
+required. Provider/ranked searches and finite-budget/non-row registrations are
+excluded from this reference client's request-omission API.
+
+```python
+# Run with zig/pkg/antfly-grep/bench on PYTHONPATH.
+from pathlib import Path
+from retained import RetainedClient
+
+client = RetainedClient(Path("/path/to/antfly-grep"), Path.cwd(), "src", [], {})
+try:
+    _, rows = client.exchange("register", args=["TODO"])
+    handle = rows[0]["query_handle"]
+    view, work = client.search_view(handle)       # full bootstrap
+    view, work = client.search_view(handle)       # zero requests/bytes
+    view, work = client.search_view(handle, revalidate=True)  # minimal ack
+    client.exchange("refresh")                   # explicit freshness work
+    view, work = client.search_view(handle)        # changed paths or full fallback
+finally:
+    client.close()
+```
+
+Full output still requires encoding and transfer. Worker rendering now reuses at
+most 64 KiB of scratch between rows, releases exceptional larger records, and
+borrows pinned workspace paths for queued tasks; live discovery retains explicit
+string ownership. Per-file elapsed labels use stack storage, and compact end
+records avoid unused path encoding. Typed JSON envelopes pre-quote static ASCII
+schema keys; dynamic keys, value escaping, numeric formatting and custom
+serializers remain with `std.json`, with byte-equivalence tests. Cold captures
+read directly into their
+immutable content owner and use the existing size/ctime/identity barrier to reject
+short reads or growth, avoiding a separate EOF read and buffering copy. Full
+source-watch tables still reuse known inode identities, but reject new identities
+without polling the kernel for each remaining file. Capture/refresh retains the
+final event/publication barriers and conservative fallback on lost coverage.
+
+These changes avoid repeated work; they do not make freshness, cold reads,
+changed results, full output or retained RAM free. No additional regex JIT path is
+justified by the output/capture profiles. Independent native Linux hardware and
+cold-storage qualification remain separate from the warm controls below.

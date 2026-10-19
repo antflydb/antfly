@@ -21,10 +21,19 @@ const A = std.mem.Allocator;
 const Options = @import("options.zig").Options;
 const Generation = @import("workspace_store.zig").Generation;
 fn emit(a: A, io: std.Io, value: anytype) !void {
-    const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
-    defer a.free(bytes);
-    try std.Io.File.stdout().writeStreamingAll(io, bytes);
-    try std.Io.File.stdout().writeStreamingAll(io, "\n");
+    // Small control frames need no heap allocation and only one write. Large
+    // error/control frames retain the allocating fallback.
+    var buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(buffer[0 .. buffer.len - 1]);
+    std.json.Stringify.value(value, .{}, &writer) catch {
+        const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
+        defer a.free(bytes);
+        try std.Io.File.stdout().writeStreamingAll(io, bytes);
+        try std.Io.File.stdout().writeStreamingAll(io, "\n");
+        return;
+    };
+    buffer[writer.end] = '\n';
+    try std.Io.File.stdout().writeStreamingAll(io, buffer[0 .. writer.end + 1]);
 }
 pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 {
     if (base.pre != null or base.search_zip or base.table_config != null or base.pattern_files.items.len != 0 or base.inventory or base.follow) return error.UnsupportedWorkspaceCaptureOptions;
@@ -68,7 +77,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false, query_handle: ?[]const u8 = null, compact: bool = true, delta: bool = false };
+        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false, query_handle: ?[]const u8 = null, compact: bool = true, delta: bool = false, acknowledgement: enum { full, minimal } = .full };
         const parsed = std.json.parseFromSlice(Request, scratch, line, .{}) catch {
             try emit(a, io, .{ .type = "workspace_error", .id = @as(?u64, null), .message = "InvalidWorkspaceRequest" });
             continue;
@@ -91,6 +100,10 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
             try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidForceRescanOperation" });
             continue;
         }
+        if (request.acknowledgement == .minimal and (!std.mem.eql(u8, request.op, "search") or request.query_handle == null or request.if_result_token == null)) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidAcknowledgementOperation" });
+            continue;
+        }
         if (request.delta and (!std.mem.eql(u8, request.op, "search") or request.query_handle == null or request.if_result_token == null)) {
             try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidDeltaOperation" });
             continue;
@@ -104,7 +117,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 continue;
             };
-            try emit(a, io, .{ .type = "query_registered", .id = request.id, .query_handle = plan.handle, .result_schema_version = if (plan.options.json_compact) @as(u32, 2) else 1 });
+            try emit(a, io, .{ .type = "query_registered", .id = request.id, .query_handle = plan.handle, .result_schema_version = if (plan.options.json_compact) @as(u32, 2) else 1, .supports_lexical_delta = Search.lexicalDeltaEligible(&plan.options) });
         } else if (std.mem.eql(u8, request.op, "forget")) {
             if (request.query_handle == null or !registrations.forget(request.query_handle.?)) {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnknownQueryHandle" });
@@ -154,6 +167,13 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnknownQueryHandle" });
                 continue;
             } else null;
+            if (request.acknowledgement == .minimal) if (plan) |prepared| {
+                if (Search.lexicalCertificateEligible(&prepared.options)) if (prepared.completion) |certificate| {
+                    if (std.mem.eql(u8, request.if_result_token.?, &certificate.token) and std.mem.eql(u8, &generation.revision, &certificate.revision)) {
+                        if (try Search.completedMinimal(io, &prepared.options, generation, certificate.summary, certificate.token, request.id)) continue;
+                    }
+                };
+            };
             try emit(a, io, .{ .type = "workspace_begin", .id = request.id, .revision = generation.revision });
             const code = (if (plan) |prepared| registered(Search, a, io, generation, &session, &reuse, prepared, request.if_result_token, request.delta) else search(Search, a, io, base, generation, &session, &reuse, request.args, request.if_result_token)) catch |err| blk: {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
@@ -168,7 +188,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     return 0;
 }
 fn ready(a: A, io: std.Io, generation: *const Generation, id: ?u64) !void {
-    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .entry_bytes = @sizeOf(@import("workspace_store.zig").Entry), .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .capture_workers = generation.capture_workers, .parallel_sources_read = generation.parallel_sources_read, .sources_opened = generation.sources_opened, .refresh_entries_visited = generation.refresh_entries_visited, .namespace_paths_checked = generation.namespace_paths_checked, .namespace_directories_scanned = generation.namespace_directories_scanned, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
+    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .observed_at = generation.captured_at, .files = generation.entries.items.len, .entry_bytes = @sizeOf(@import("workspace_store.zig").Entry), .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .capture_workers = generation.capture_workers, .parallel_sources_read = generation.parallel_sources_read, .sources_opened = generation.sources_opened, .refresh_entries_visited = generation.refresh_entries_visited, .namespace_paths_checked = generation.namespace_paths_checked, .namespace_directories_scanned = generation.namespace_directories_scanned, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
 }
 fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, args: []const []const u8, if_result_token: ?[]const u8) !u8 {
     var option_arena = std.heap.ArenaAllocator.init(a);
@@ -233,8 +253,10 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
     var delta_arena = std.heap.ArenaAllocator.init(a);
     defer delta_arena.deinit();
     const lo = &plan.options;
-    const lexical_eligible = Search.lexicalCertificateEligible(lo) and !lo.count and !lo.count_matches and !lo.files_with_matches and !lo.files_without_match and lo.max_output_bytes == std.math.maxInt(usize) and lo.max_source_bytes == std.math.maxInt(usize);
-    if (lexical_eligible and (delta or plan.lexical.revision != null)) {
+    const lexical_eligible = Search.lexicalDeltaEligible(lo);
+    const admission_allowed = plan.lexical_admission.permit(generation.entries.items.len, generation.path_bytes, plan.lexical.budget.limit);
+    if (lexical_eligible and delta and !admission_allowed) searcher.summary.lexical_index_admission_skips = 1;
+    if (lexical_eligible and admission_allowed and (delta or plan.lexical.revision != null)) {
         const same = plan.lexical.healthy and plan.lexical.revision != null and std.mem.eql(u8, &plan.lexical.revision.?, &generation.revision);
         if (!same) {
             const parent = plan.lexical.healthy and plan.lexical.revision != null and generation.parent_revision != null and std.mem.eql(u8, &plan.lexical.revision.?, &generation.parent_revision.?);
@@ -245,8 +267,16 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
                     if (patch and plan.lexical.visible(path)) try removed.append(delta_arena.allocator(), try Search.jsonText(delta_arena.allocator(), path));
                     plan.lexical.remove(path);
                 }
-            } else plan.lexical.clear();
-            searcher.lexical_index = &plan.lexical;
+            } else {
+                plan.lexical.clear();
+                searcher.summary.lexical_index_admissions = 1;
+                if (!plan.lexical.reserve(generation.entries.items.len, generation.path_bytes)) {
+                    if (plan.lexical.budget.denied) plan.lexical_admission.reject(generation.entries.items.len, generation.path_bytes, plan.lexical.budget.limit) else plan.lexical_admission.deferRetry();
+                    plan.lexical.clear();
+                    searcher.summary.lexical_index_admission_failures = 1;
+                }
+            }
+            if (searcher.summary.lexical_index_admission_failures == 0) searcher.lexical_index = &plan.lexical;
             if (patch) {
                 searcher.lexical_paths = generation.changes.items;
                 searcher.summary = plan.lexical.aggregate;
@@ -260,7 +290,13 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
     if (searcher.lexical_index != null) {
         if (code <= 1 and searcher.summary.complete and plan.lexical.healthy and plan.lexical.files.count() == generation.entries.items.len and !searcher.limits.cancel.load(.acquire)) {
             plan.lexical.revision = generation.revision;
-        } else plan.lexical.clear();
+            plan.lexical_admission = .{};
+        } else {
+            if (!plan.lexical.healthy) {
+                if (plan.lexical.budget.denied) plan.lexical_admission.reject(generation.entries.items.len, generation.path_bytes, plan.lexical.budget.limit) else plan.lexical_admission.deferRetry();
+            }
+            plan.lexical.clear();
+        }
     }
     if (Search.lexicalCertificateEligible(&plan.options) and code <= 1 and searcher.summary.complete and !searcher.limits.cancel.load(.acquire)) {
         const previous = if (plan.completion) |c| (if (std.mem.eql(u8, &c.revision, &generation.revision)) c.token else null) else null;
