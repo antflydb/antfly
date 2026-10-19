@@ -316,6 +316,7 @@ pub const storage_db_config = @import("storage/db/config.zig");
 pub const storage_db_control_root = @import("storage/db/control_root.zig");
 pub const storage_db_core = @import("storage/db/core.zig");
 pub const storage_db_db = @import("storage/db/db.zig");
+pub const storage_db_db_graph = @import("storage/db/db_graph.zig");
 pub const storage_db_db_split_sim_fixture = @import("storage/db/db_split_sim_fixture.zig");
 pub const storage_db_dense_exact = @import("storage/db/dense_exact.zig");
 pub const storage_db_derived_apply_state = @import("storage/db/derived/apply_state.zig");

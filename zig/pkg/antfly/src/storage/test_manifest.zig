@@ -174,6 +174,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_column_scan_plan;
     _ = @import("antfly_local_sources").storage_db_config;
     _ = @import("antfly_local_sources").storage_db_db;
+    _ = @import("antfly_local_sources").storage_db_db_graph;
     _ = @import("antfly_local_sources").storage_db_commit_integration;
     _ = @import("antfly_local_sources").storage_db_dense_exact;
     _ = @import("antfly_local_sources").storage_db_derived_apply_state;
