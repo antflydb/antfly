@@ -1543,6 +1543,18 @@ Cancellation drains or cancels both owned frame slots before freeing views.
 and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN=1` also disables that candidate.
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_CACHE=1` bypasses retained mask metadata.
 
+Live model delivery checks coordinator readiness before admission or snapshot
+allocation. Each prepared window has an independent allocation owner: host
+admission grows in bounded chunks before allocation and uses the same optional
+cache reclamation as model preflight. Preparation scratch and unused admission
+slack are trimmed at phase boundaries; actual retained snapshot, allocation
+bookkeeping and output storage survive delivery or acknowledgement retries.
+The 512 MiB allocation ceiling, cancellation and live-memory checks remain in
+force. Prepared snapshots can use an allocator independent of ingestion state;
+that allocator remains alive through commit or abandoned-output cleanup. Internal
+window/output-retry storage uses reclaiming workspace backing even when the
+caller supplies an arena for independently owned outputs.
+
 Metal vision retains up to two admitted activation layouts per model. Each uses
 bounded 512-row FFN tiles, snapshots immutable norm coefficients and reuses
 separate norm, residual, alternating hidden and prepared-head ranges. Activation
@@ -1556,6 +1568,17 @@ packed projection, GELU and down projection into final hidden rows. Residual
 normalization/addition uses one dispatch. Position gathering/addition and the
 spatial projector each have an owned frame, respecting external frame owners.
 Cancellation drains both layer slots before clearing the request's layout view.
+
+`ANTFLY_GEMMA4_VISION_PROFILE=1` flushes vision phase boundaries and reports
+CPU wall time, completed Metal command-buffer GPU time and host download bytes.
+Use it for attribution; its extra fences change serving latency. The maintained
+video oracle corpus attributed approximately 49% of measured layer GPU time to
+FFNs and 31% to attention, with no layer activation downloads. A larger FFN tile
+candidate did not establish a reliable gain in three alternating process pairs
+and increased median peak process footprint by approximately 53 MiB. Serving
+keeps the bounded 512-row tile policy. Qualify future kernel changes with paired
+completed timings, shape-specific throughput, memory and pretrained parity;
+process-wide medians alone can hide clock drift between paired runs.
 
 Metal image preparation consumes RGB or RGBA bytes with an explicit row stride,
 ignores alpha/padding, and writes exact torchvision bicubic, centered patch rows

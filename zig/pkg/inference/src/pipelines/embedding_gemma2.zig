@@ -283,7 +283,7 @@ fn admitWithVisionCacheReclaim(session: Session, request: @import("../backends/s
 fn admitReclaimingVisionCache(session: Session, request: @import("../backends/session.zig").RunRequest, control: Control, context: anytype, comptime reclaim_vision: anytype, comptime reclaim_language: anytype) !RunPermit {
     return admitReclaimingResources(false, session, request, control, context, reclaim_vision, reclaim_language);
 }
-fn admitHostPreprocess(session: Session, bytes: usize, control: Control) !RunPermit {
+pub fn admitHostPreprocess(session: Session, bytes: usize, control: Control) !RunPermit {
     return admitReclaimingResources(true, session, bytes, control, session, reclaimMediaWeights, factory.reclaimEmbeddingGemma2LanguageWeights);
 }
 fn admitReclaimingResources(comptime host_only: bool, session: Session, request: if (host_only) usize else @import("../backends/session.zig").RunRequest, control: Control, context: anytype, comptime reclaim_vision: anytype, comptime reclaim_language: anytype) !RunPermit {
@@ -519,13 +519,58 @@ pub fn embedLiveWindow(out: std.mem.Allocator, session: Session, tokenizer: Toke
     try sampling.validate();
     const effective = control orelse Control{};
     const adapter = effective.imageWorkControl();
-    var window_permit = try admitHostPreprocess(session, 192 * 1024 * 1024, effective);
-    defer window_permit.deinit();
-    var window = try @import("antfly_video").live_windows.join(out, "live-model-window", segments, .{ .stream = .{ .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } } });
+    const allocation = try LiveAllocation.create(workspaceBackingAllocator(session.backend()), session, effective);
+    defer allocation.deinit();
+    var window = @import("antfly_video").live_windows.join(allocation.allocator(), "live-model-window", segments, .{ .stream = .{ .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } } }) catch |err| return allocation.failure(err);
     defer window.deinit();
+    try allocation.trim();
     const parts = [_]Part{ .{ .sampled_video = .{ .reader = &window.reader, .sampling = .{ .timestamps = sampling } } }, .{ .text = caption orelse "" } };
-    return embed(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control);
+    return embed(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control) catch |err| return allocation.failure(err);
 }
+
+/// Independently retained live-window allocations. Admission grows before
+/// allocation, recovers optional caches under pressure, and trims unused slack
+/// before model execution and callback delivery. The hard ceiling still applies.
+pub const LiveAllocation = struct {
+    backing: std.mem.Allocator,
+    session: Session,
+    control: Control,
+    owner_permit: RunPermit,
+    admitted: @import("../backends/admitted_allocator.zig").AdmittedAllocator,
+    bounded: @import("../runtime/bounded_allocator.zig").BoundedAllocator,
+    /// Backing storage must reclaim frees; public output allocators may be arenas.
+    pub fn create(a: std.mem.Allocator, session: Session, control: Control) !*LiveAllocation {
+        var permit = try admitHostPreprocess(session, @sizeOf(LiveAllocation), control);
+        errdefer permit.deinit();
+        const self = try a.create(LiveAllocation);
+        self.* = .{ .backing = a, .session = session, .control = control, .owner_permit = permit, .admitted = .{ .backing = a, .session = session, .trim_on_free = true }, .bounded = .{ .backing = undefined, .limit = 512 * 1024 * 1024 } };
+        if (session.run_admission != null) {
+            self.admitted.admission_context = self;
+            self.admitted.admit = acquire;
+        }
+        self.bounded.backing = self.admitted.allocator();
+        return self;
+    }
+    fn acquire(raw: *anyopaque, bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+        const self: *LiveAllocation = @ptrCast(@alignCast(raw));
+        return (try admitHostPreprocess(self.session, bytes, self.control)).lease orelse return error.ResourceLimitExceeded;
+    }
+    pub fn allocator(self: *LiveAllocation) std.mem.Allocator {
+        return self.bounded.allocator();
+    }
+    pub fn trim(self: *LiveAllocation) !void {
+        try self.admitted.trim();
+    }
+    pub fn failure(self: *LiveAllocation, err: anyerror) anyerror {
+        return if (err == error.OutOfMemory) (if (self.bounded.denied) error.MemoryBudgetExceeded else self.admitted.admission_error orelse err) else err;
+    }
+    pub fn deinit(self: *LiveAllocation) void {
+        std.debug.assert(self.bounded.live == 0);
+        self.admitted.deinit();
+        self.owner_permit.deinit();
+        self.backing.destroy(self);
+    }
+};
 
 pub const LiveResult = struct {
     result: ?Result,
@@ -549,15 +594,16 @@ pub fn embedNextLiveCached(out: std.mem.Allocator, session: Session, tokenizer: 
     try effective.check();
     if (cache) |owner| if (owner.session.ptr != session.ptr or owner.session.vtable != session.vtable) return error.InvalidVideoCacheSession;
     if (coordinator.options.window.stream.max_bytes > 64 * 1024 * 1024 or coordinator.options.window.max_packets > 8192) return error.ResourceLimitExceeded;
-    var window_permit = try admitHostPreprocess(session, 512 * 1024 * 1024, effective);
-    defer window_permit.deinit();
+    const allocation = try LiveAllocation.create(workspaceBackingAllocator(session.backend()), session, effective);
+    defer allocation.deinit();
     const adapter = effective.imageWorkControl();
     const old_control = coordinator.options.window.stream.control;
     coordinator.options.window.stream.control = .{ .context = adapter.context, .check_fn = adapter.check_fn };
     defer coordinator.options.window.stream.control = old_control;
-    var prepared = (try coordinator.pull(reader)) orelse return null;
+    var prepared = (coordinator.pullAlloc(reader, allocation.allocator()) catch |err| return allocation.failure(err)) orelse return null;
     defer prepared.deinit();
-    const result = try embedPreparedLiveCached(out, session, tokenizer, coordinator, &prepared, caption, options, lock, control, cache);
+    try allocation.trim();
+    const result = embedPreparedLiveCached(out, session, tokenizer, coordinator, &prepared, caption, options, lock, control, cache) catch |err| return allocation.failure(err);
     errdefer if (result.result) |value| out.free(value.vector);
     try coordinator.commit(&prepared);
     return result;
@@ -567,9 +613,12 @@ pub fn embedNextLiveCached(out: std.mem.Allocator, session: Session, tokenizer: 
 pub fn embedPreparedLiveCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, coordinator: *@import("antfly_video").live_coordinator.Coordinator, prepared: *@import("antfly_video").live_coordinator.Prepared, caption: ?[]const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !LiveResult {
     const effective = control orelse Control{};
     try effective.check();
+    const allocation = try LiveAllocation.create(workspaceBackingAllocator(session.backend()), session, effective);
+    defer allocation.deinit();
     const sampling = @import("embedding_gemma2_video.zig").Sampling{ .source_timestamps = prepared.policy };
-    var selection: ?@import("embedding_gemma2_video.zig").ReaderSelection = if (prepared.has_pictures and prepared.logical != null) try @import("embedding_gemma2_video.zig").ReaderSelection.init(out, &prepared.window.reader, sampling, &prepared.logical.?, coordinator.options.window.stream.admission_pool, coordinator.options.window.stream.control) else null;
+    var selection: ?@import("embedding_gemma2_video.zig").ReaderSelection = if (prepared.has_pictures and prepared.logical != null) (@import("embedding_gemma2_video.zig").ReaderSelection.init(allocation.allocator(), &prepared.window.reader, sampling, &prepared.logical.?, coordinator.options.window.stream.admission_pool, coordinator.options.window.stream.control) catch |err| return allocation.failure(err)) else null;
     defer if (selection) |*owner| owner.deinit();
+    try allocation.trim();
     const parts = [_]Part{ .{ .sampled_video = .{ .reader = &prepared.window.reader, .sampling = sampling, .selection = if (selection) |*owner| owner else null } }, .{ .text = caption orelse "" } };
     const result: ?Result = if (prepared.has_pictures) try embedCached(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control, cache) else null;
     errdefer if (result) |value| out.free(value.vector);
@@ -5216,4 +5265,125 @@ test "embeddinggemma2 host preflight reclaims shared caches without reserving mo
         }
         try std.testing.expectEqual(@as(usize, if (mode == .forced or mode == .permanent) 0 else 1), probe.calls);
     }
+}
+
+test "embeddinggemma2 live snapshot admits actual retained bytes and returns slack before model execution" {
+    const a = std.testing.allocator;
+    const media = @import("antfly_media");
+    const coordinator_mod = @import("antfly_video").live_coordinator;
+    const memory = @import("../runtime/tier/memory.zig");
+    const bytes = @embedFile("../testdata/video/live-fragmented.mp4");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var marker: u8 = 0;
+    const limits = memory.Limits{ .host_limit_bytes = 4 * 1024 * 1024, .combined_limit_bytes = 4 * 1024 * 1024 };
+    const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var ingest = try media.live_mp4.Ingest.init(a, "live-sized-snapshot", bytes[0..797], .{});
+    defer ingest.deinit();
+    try ingest.push(bytes[797..20811]);
+    var unit: ?media.live_mp4.Segment = try ingest.finishSegment();
+    defer if (unit) |*owner| owner.deinit();
+    var coordinator = try coordinator_mod.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s });
+    defer coordinator.deinit();
+    try coordinator.append(&unit);
+    try std.testing.expect(try coordinator.ready());
+    const owner = try LiveAllocation.create(a, session, .{});
+    var prepared = (try coordinator.prepareAlloc(owner.allocator())).?;
+    const before = controller.snapshot().host_scratch_bytes;
+    try owner.trim();
+    const retained = controller.snapshot().host_scratch_bytes;
+    try std.testing.expect(retained < before);
+    try std.testing.expect(retained >= owner.bounded.live + @sizeOf(LiveAllocation));
+    try std.testing.expect(retained < 128 * 1024);
+    // A peer uses all returned scratch while the real packet snapshot remains
+    // readable. The reservation remains exact through output retry retention.
+    var peer = try controller.tryAcquire(.gpu, limits, .{ .host_scratch_bytes = limits.host_limit_bytes - retained }, false);
+    var packet = try prepared.window.reader.readPacket(0);
+    try std.testing.expect(packet.bytes.len > 0);
+    packet.deinit();
+    peer.release();
+    const vector = try owner.allocator().alloc(f32, 768);
+    try owner.trim();
+    try std.testing.expect(controller.snapshot().host_scratch_bytes >= retained + vector.len * 4);
+    owner.allocator().free(vector);
+    prepared.deinit();
+    try owner.trim();
+    try std.testing.expectEqual(@as(usize, @sizeOf(LiveAllocation)), controller.snapshot().host_scratch_bytes);
+    owner.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "embeddinggemma2 live adaptive admission preserves cancellation and hard ceilings" {
+    const Gate = struct {
+        canceled: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            if (@as(*@This(), @ptrCast(@alignCast(raw.?))).canceled) return error.Cancelled;
+        }
+    };
+    var gate = Gate{};
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    const owner = try LiveAllocation.create(std.testing.allocator, session, .{ .ptr = &gate, .check_fn = Gate.check });
+    defer owner.deinit();
+    gate.canceled = true;
+    const failure = owner.allocator().alloc(u8, 1024);
+    try std.testing.expectError(error.OutOfMemory, failure);
+    try std.testing.expectEqual(error.Cancelled, owner.failure(error.OutOfMemory));
+    try std.testing.expectEqual(@as(usize, 0), owner.bounded.live);
+    gate.canceled = false;
+    owner.bounded.limit = 1;
+    try std.testing.expectError(error.OutOfMemory, owner.allocator().alloc(u8, 2));
+    // A local ceiling denial must not reuse a previous admission error.
+    try std.testing.expectEqual(error.MemoryBudgetExceeded, owner.failure(error.OutOfMemory));
+}
+
+test "embeddinggemma2 live retry windows never retain storage in a caller output arena" {
+    const a = std.testing.allocator;
+    const media = @import("antfly_media");
+    const coordinator_mod = @import("antfly_video").live_coordinator;
+    const memory = @import("../runtime/tier/memory.zig");
+    const bytes = @embedFile("../testdata/video/live-fragmented.mp4");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var ingest = try media.live_mp4.Ingest.init(a, "arena-independent-window", bytes[0..797], .{});
+    defer ingest.deinit();
+    try ingest.push(bytes[797..20811]);
+    var unit: ?media.live_mp4.Segment = try ingest.finishSegment();
+    defer if (unit) |*owner| owner.deinit();
+    var coordinator = try coordinator_mod.Coordinator.init(a, .{ .duration_ns = 1 });
+    defer coordinator.deinit();
+    try coordinator.append(&unit);
+    // An interval between picture timestamps prepares a real owned snapshot
+    // without invoking the model. Delivery still retains it until acknowledged.
+    coordinator.start_ns = 1;
+    const Consumer = struct {
+        fn accept(_: *anyopaque, delivery: *LiveStreamDelivery) !void {
+            try std.testing.expect(delivery.value.result == null);
+            return error.ConsumerFailure;
+        }
+    };
+    const Reader = struct {
+        const Progress = struct { resource_complete: bool };
+        pub fn streamNext(_: *@This(), _: anytype, _: anytype) !?Progress {
+            return error.UnexpectedHttpRead;
+        }
+        pub fn ended(_: *@This()) bool {
+            return false;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stream = try LiveStream.init(arena.allocator(), session, undefined, &coordinator, null, .{}, null, .{}, null);
+    const capacity = arena.queryCapacity();
+    var reader = Reader{};
+    try std.testing.expectError(error.ConsumerFailure, stream.process(&reader, &marker, Consumer.accept));
+    try std.testing.expectEqual(capacity, arena.queryCapacity());
+    try std.testing.expect(controller.snapshot().host_scratch_bytes < 128 * 1024);
+    stream.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
 }
