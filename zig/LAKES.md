@@ -1224,3 +1224,14 @@ Aggregate metadata v5 binds logical roots to a shared immediate-child cohort
 proof, so fused queries avoid a recursive startup metadata walk. Readers validate
 child identities and recipe slots as consumed; GC retains shared descriptors and
 legacy formats remain readable. No new attachment or query options are required.
+
+Native aggregate publication carries checksum-bound child state proofs directly
+from new publishers and authenticated inherited directories. Build hints are not
+serialized; certified parent directories avoid child-root rereads, and a bounded
+build-local memo avoids repeated validation of legacy and alias references. Aggregate query
+readers share bounded decoded leases for descriptors and column blocks, while
+checking each logical root and current reader authority. Admitted configuration
+cohorts also pin one next-file batch on a private cursor, overlapping reads with
+current indexing/uploads. Extra input/decode memory and shared I/O admission are
+required; denied or unused speculation drains safely and ordinary streaming
+remains available. These refinements retain reader protocol 58 and metadata v5.

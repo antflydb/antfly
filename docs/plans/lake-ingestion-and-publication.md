@@ -2380,3 +2380,57 @@ Parquet V1/V2 mixed/NULL-only files, real Iceberg evolution/deletes, signed deci
 pruning and NUMERIC materializations. The complete stripped Debug server, CLI
 version, formatting, license/Apache boundary, source catalog and pinned Zig 0.17.0
 engine-error catalog checks passed. `origin/main` is merged through `3584896882`.
+
+### Publication metadata handoff and file lookahead refinements
+
+Aggregate publishers now return build-local, checksum-bound state proofs alongside
+new child roots. Recursive publishers pass those identities and physical slots to
+the parent directory directly. Loading an inherited v5 directory derives the same
+proof from its authenticated cohort descriptor. The parent verifies each proof's
+immutable object identity and interpretation, exact recipe, group count and depth
+before using it; these build hints are omitted from serialization. Legacy roots
+and inherited alias references without a parent proof use validated child reads
+with a publication-local memo of at most 4,096 scalar proofs. Hits remain bound to
+object identity, interpretation and exact recipe; eviction affects only performance.
+Fresh and inherited certified partition publication therefore needs no additional child-root reads to construct
+the parent descriptor. Reduction planning also loads directory depth and children
+in one operation instead of reopening each directory for its depth.
+
+Query readers acquire shared decoded leases for cohort descriptors and aggregate
+column blocks through the existing bounded decoded cache. The immutable descriptor
+is shared across logical members, while each reader still checks its own root
+commitment, recipe, child map and current authority. Column-block row counts and
+physical widths are checked against every logical directory. Reader close or
+block advancement releases only that reader's lease; other readers remain valid.
+Cache keys retain store scope and immutable artifact identity, and current
+cancellation/deadline checks remain active even while consuming a warm block.
+
+Admitted publication cohorts can now overlap across file boundaries. One private
+lookahead cursor opens the next canonical candidate and pins its first source
+batch while current consumers decode, upload and checkpoint. The demanded cursor
+and first batch transfer together after joining, without a second scan or a
+whole-file replay spool. The publication allocator reserves an additional complete
+input/decode workspace before enabling this lane, and the shared I/O scheduler can
+decline speculation independently of required builders. Divergent requests discard
+and join unused lookahead; failures become authoritative only when the exact file
+is demanded. Smaller memory budgets and saturated I/O admission keep the ordinary
+single-cursor path. All cursors, borrowed frames and speculative tasks drain before
+their allocator, source views or publication capability are released.
+
+These refinements preserve metadata v5 and reader protocol 58: the durable graph
+and public UX are unchanged. Deterministic regressions deny all child-root reads
+while publishing fresh and inherited directories, check proof tampering and shared
+decoded ownership/scope/deadlines, and exercise successful, denied and failed
+streaming lookahead. Archive-scale latency and resource measurements are still
+needed before quantifying workload speedups.
+
+Refinement qualification passed 324 native and 175 shared external-lake tests
+without failures or leaks, followed by 12 final focused refinement tests and nine
+aggregate compatibility/allocation-failure/delta regressions after the bounded
+memo was added. The real-Parquet configuration regression also passes with
+borrowed backpressure and admitted file lookahead under a 224 MiB working-set
+limit, as well as denied I/O admission. All 12 selected HTTP E2Es passed against
+the final rebuilt server, including real Iceberg evolution/deletes and exact
+COUNT/SUM after restart with source payloads unavailable. The stripped Debug
+server, CLI, formatting, license/Apache boundary and source/engine-error catalog
+checks passed with pinned Zig 0.17.0. Main is merged through `dfc6007c5d`.

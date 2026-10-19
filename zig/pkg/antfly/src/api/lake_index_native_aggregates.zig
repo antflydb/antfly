@@ -237,6 +237,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                 var resolver: LeafResolver = .{ .a = a, .out = out, .provider = &native_provider, .source = source, .binding = binding, .recipe = recipe, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .metadata_count = metadata_count, .store = store, .spill = &spill, .budget = &budget, .cancellation = cancellation, .contributions = &contributions };
                 var reduction: Reduction = .{ .a = a, .out = out, .store = store, .recipe = recipe, .specs = specs, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .contributions = &contributions, .spill = &spill, .cancellation = cancellation, .resolver = &resolver };
                 defer reduction.shape_keys.deinit(a);
+                defer reduction.proof_memo.deinit(a);
                 native_provider.only_file = null;
                 const root = (try reduction.reduceDelta(&native_provider)) orelse full: {
                     if (file_keys == null) {
@@ -539,6 +540,7 @@ const Reduction = struct {
     cancellation: @import("antfly_cancellation").CancellationToken,
     resolver: ?*LeafResolver = null,
     shape_keys: std.AutoHashMapUnmanaged([2][32]u8, [32]u8) = .empty,
+    proof_memo: artifacts.ProofMemo = .{},
     fn shapeKey(self: *@This(), leaves: []const Leaf) anyerror![32]u8 {
         if (leaves.len == 1) return leaves[0].key;
         const range = [2][32]u8{ leaves[0].key, leaves[leaves.len - 1].key };
@@ -627,7 +629,7 @@ const Reduction = struct {
         }
         const was_complete = complete;
         if (!complete and self.recipe.keys.len != 0 and artifacts.isPartitioned(left.refs[0].metadata_version) and artifacts.isPartitioned(right.refs[0].metadata_version)) {
-            const published = try self.mergePartitions(left, right, null, aliases, 0);
+            const published = try self.mergePartitions(left, right, null, aliases, 0, null);
             @memcpy(refs, published);
             self.out.free(published);
             complete = true;
@@ -643,7 +645,7 @@ const Reduction = struct {
             self.out.free(published);
         }
         if (was_complete and self.recipe.keys.len != 0 and artifacts.isPartitioned(left.refs[0].metadata_version) and artifacts.isPartitioned(right.refs[0].metadata_version)) {
-            self.out.free(try self.mergePartitions(left, right, refs, aliases, 0));
+            self.out.free(try self.mergePartitions(left, right, refs, aliases, 0, null));
         }
         for (self.names, refs, 0..) |name, ref, slot| {
             const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
@@ -787,7 +789,7 @@ const Reduction = struct {
         try importContributions(self.a, self.store, refs, self.recipe, group, self.cancellation);
         return artifacts.publishPartitionedAt(self.a, self.out, self.store, self.names, group, self.recipe, self.spill, self.cancellation, depth);
     }
-    fn mergePartitions(self: *@This(), left: Leaf, right: Leaf, known: ?[]const local.serverless_manifest_artifact_ref.ArtifactRef, ownership: []std.ArrayList([32]u8), depth: u8) anyerror![]local.serverless_manifest_artifact_ref.ArtifactRef {
+    fn mergePartitions(self: *@This(), left: Leaf, right: Leaf, known: ?[]const local.serverless_manifest_artifact_ref.ArtifactRef, ownership: []std.ArrayList([32]u8), depth: u8, output_proofs: ?[]artifacts.StateProof) anyerror![]local.serverless_manifest_artifact_ref.ArtifactRef {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
@@ -799,9 +801,11 @@ const Reduction = struct {
         const current = try a.alloc([]const Part, self.names.len);
         for (self.names, 0..) |_, slot| {
             const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
-            if (try artifacts.partitionDepth(a, self.store.*, left.refs[slot], single, self.cancellation) != depth or try artifacts.partitionDepth(a, self.store.*, right.refs[slot], single, self.cancellation) != depth) return error.InvalidNativeAggregateArtifact;
-            lparts[slot] = try artifacts.loadPartitions(a, self.store.*, left.refs[slot], single, self.cancellation);
-            rparts[slot] = try artifacts.loadPartitions(a, self.store.*, right.refs[slot], single, self.cancellation);
+            const ldir = try artifacts.loadPartitionDirectory(a, self.store.*, left.refs[slot], single, self.cancellation);
+            const rdir = try artifacts.loadPartitionDirectory(a, self.store.*, right.refs[slot], single, self.cancellation);
+            if (ldir.depth != depth or rdir.depth != depth) return error.InvalidNativeAggregateArtifact;
+            lparts[slot] = ldir.parts;
+            rparts[slot] = rdir.parts;
             if (known) |roots| current[slot] = try artifacts.loadPartitions(a, self.store.*, roots[slot], single, self.cancellation);
         }
         for (0..artifacts.partitionFanout(depth)) |bucket| {
@@ -819,6 +823,9 @@ const Reduction = struct {
             const rrefs = try pa.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, self.names.len);
             const refs = try pa.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, self.names.len);
             const keys = try pa.alloc([32]u8, self.names.len);
+            const proofs = try pa.alloc(?artifacts.StateProof, self.names.len);
+            @memset(proofs, null);
+            const fresh_proofs = try pa.alloc(artifacts.StateProof, self.names.len);
             var left_present = false;
             var right_present = false;
             var count: u64 = 0;
@@ -863,6 +870,7 @@ const Reduction = struct {
                         if (part.bucket == bucket) break part;
                     } else return error.InvalidNativeAggregateArtifact;
                     refs[slot] = part.artifact;
+                    proofs[slot] = part.proof;
                     count = part.groups;
                 } else if (prior_records[slot]) |record| refs[slot] = record.artifact else complete = false;
             }
@@ -876,8 +884,11 @@ const Reduction = struct {
                     if (depth == artifacts.max_partition_depth) return error.InvalidNativeAggregateArtifact;
                     const lsplit = try self.splitRefs(lrefs, depth + 1);
                     const rsplit = try self.splitRefs(rrefs, depth + 1);
-                    const merged = try self.mergePartitions(.{ .key = @splat(0), .refs = lsplit }, .{ .key = @splat(0), .refs = rsplit }, if (complete) refs else null, child_aliases, depth + 1);
-                    if (!complete) @memcpy(refs, merged);
+                    const merged = try self.mergePartitions(.{ .key = @splat(0), .refs = lsplit }, .{ .key = @splat(0), .refs = rsplit }, if (complete) refs else null, child_aliases, depth + 1, if (complete) null else fresh_proofs);
+                    if (!complete) {
+                        @memcpy(refs, merged);
+                        for (proofs, fresh_proofs) |*proof, fresh| proof.* = fresh;
+                    }
                     self.out.free(merged);
                 } else if (!complete) {
                     const group = try operators.Grouped.create(self.a, self.specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
@@ -885,16 +896,13 @@ const Reduction = struct {
                     try importContributions(self.a, self.store, lrefs, self.recipe, group, self.cancellation);
                     try importContributions(self.a, self.store, rrefs, self.recipe, group, self.cancellation);
                     const published = if (depth < artifacts.max_partition_depth and count > artifacts.partition_leaf_groups)
-                        try artifacts.publishPartitionedAt(self.a, pa, self.store, self.names, group, self.recipe, self.spill, self.cancellation, depth + 1)
+                        try artifacts.publishPartitionedAtProven(self.a, pa, self.store, self.names, group, self.recipe, self.spill, self.cancellation, depth + 1, fresh_proofs)
                     else
-                        try artifacts.publishCohort(self.a, pa, self.store, self.names, group, self.recipe, self.cancellation);
+                        try artifacts.publishCohortProven(self.a, pa, self.store, self.names, group, self.recipe, self.cancellation, fresh_proofs);
                     @memcpy(refs, published);
+                    for (proofs, fresh_proofs) |*proof, fresh| proof.* = fresh;
                     pa.free(published);
                 }
-                const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[0..1] };
-                const reader = try artifacts.Reader.open(self.a, self.store.*, refs[0], single, self.cancellation);
-                count = reader.groupCount();
-                reader.cursor().close(reader);
                 for (refs, keys, self.names, 0..) |ref, key, name, slot| {
                     const one: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
                     // Lookup metadata must outlive the scratch reader arena.
@@ -905,18 +913,33 @@ const Reduction = struct {
                     defer self.out.free(bytes);
                     try self.contributions.append(self.out, try std.json.parseFromSliceLeaky(local.metadata_lake_index_catalog.FileContribution, self.out, bytes, .{ .allocate = .alloc_always }));
                 }
-            } else @memcpy(refs, if (left_present) lrefs else rrefs);
-            for (refs, lists) |ref, *list| {
+            } else {
+                @memcpy(refs, if (left_present) lrefs else rrefs);
+                for (proofs, 0..) |*proof, slot| {
+                    const parts = if (left_present) lparts[slot] else rparts[slot];
+                    for (parts) |part| if (part.bucket == bucket) {
+                        proof.* = part.proof;
+                        break;
+                    };
+                }
+            }
+            for (refs, proofs, 0..) |ref, *proof, slot| {
+                const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
+                if (proof.* == null) proof.* = try self.proof_memo.resolve(self.a, self.store.*, ref, single, self.cancellation);
+                if (slot == 0 and left_present and right_present) count = proof.*.?.groups;
+                if (proof.*.?.groups != count) return error.InvalidNativeAggregateArtifact;
+            }
+            for (refs, lists, proofs) |ref, *list, proof| {
                 // Root publication follows scratch teardown; retain nested IDs.
                 var retained = ref;
                 retained.artifact_id = try a.dupe(u8, ref.artifact_id);
                 retained.checksum = try a.dupe(u8, ref.checksum);
                 retained.name = try a.dupe(u8, ref.name);
-                try list.append(a, .{ .bucket = @intCast(bucket), .artifact = retained, .groups = count });
+                try list.append(a, .{ .bucket = @intCast(bucket), .artifact = retained, .groups = count, .proof = proof });
             }
         }
         if (known != null) return self.out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, 0);
-        return artifacts.publishPartitionRootsAt(self.a, self.out, self.store, self.names, self.recipe, lists, self.cancellation, depth);
+        return artifacts.publishPartitionRootsAtProven(self.a, self.out, self.store, self.names, self.recipe, lists, self.cancellation, depth, output_proofs);
     }
     fn bitAt(key: [32]u8, bit: usize) bool {
         return (key[bit / 8] & (@as(u8, 128) >> @as(u3, @intCast(bit % 8)))) != 0;
@@ -1475,9 +1498,10 @@ test "external lake recursive group partitions retain sibling artifacts on a sin
     defer old.deinit(a);
     var contributions: std.ArrayList(local.metadata_lake_index_catalog.FileContribution) = .empty;
     var reduction: Reduction = .{ .a = a, .out = out, .store = &store, .recipe = recipe, .specs = &specs, .names = names, .old = &old, .previous = &.{}, .contributions = &contributions, .spill = &manager, .cancellation = .none };
+    defer reduction.proof_memo.deinit(a);
     var ownership = [_]std.ArrayList([32]u8){ .empty, .empty };
     defer for (&ownership) |*list| list.deinit(out);
-    const merged = try reduction.mergePartitions(.{ .key = @splat(1), .refs = prior }, .{ .key = @splat(2), .refs = fresh }, null, &ownership, 0);
+    const merged = try reduction.mergePartitions(.{ .key = @splat(1), .refs = prior }, .{ .key = @splat(2), .refs = fresh }, null, &ownership, 0, null);
     const before_root = try artifacts.loadPartitions(out, store, prior[0], single, .none);
     const after_root = try artifacts.loadPartitions(out, store, merged[0], single, .none);
     try std.testing.expectEqual(@as(usize, 1), before_root.len);

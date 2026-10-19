@@ -257,6 +257,10 @@ pub const Replay = struct {
     read_ahead_hits: usize = 0,
     streamed_batches: usize = 0,
     pipeline: ?*@import("lake_index_build_pipeline.zig") = null,
+    /// A speculative lane pins only the first borrowed source batch. Joining
+    /// transfers its cursor and this batch together; no replay spool is built.
+    primed: ?rows.ColumnBatch = null,
+    primed_ready: bool = false,
     captured_file: ?usize = null,
     readers: usize = 0,
     mutex: std.Io.Mutex = .init,
@@ -277,6 +281,8 @@ pub const Replay = struct {
         if (self.readers != 0) return error.LakeReplayBusy;
         if (self.live) |source| source.deinit(self.live_allocator);
         self.live = null;
+        self.primed = null;
+        self.primed_ready = false;
         if (self.run) |*run| {
             run.close();
             self.manager.deinit();
@@ -310,6 +316,19 @@ pub const Replay = struct {
         self.ready = true;
         self.captured_file = file;
         self.captures += 1;
+    }
+    pub fn primeStream(self: *Replay, a: A, binding: Binding, file: usize, token: Cancellation) anyerror!bool {
+        try self.beginStream(a, binding, file, token);
+        self.primed = try self.live.?.next(a);
+        self.primed_ready = true;
+        return true;
+    }
+    pub fn nextLive(self: *Replay) !?rows.ColumnBatch {
+        if (self.primed_ready) {
+            self.primed_ready = false;
+            return self.primed;
+        }
+        return self.live.?.next(self.live_allocator);
     }
     fn capture(self: *Replay, a: A, original: Binding, file_index: usize, cancellation: Cancellation) !void {
         if (self.ready and self.captured_file == file_index) return;

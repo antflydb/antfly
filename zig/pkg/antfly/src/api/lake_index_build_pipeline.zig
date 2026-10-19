@@ -28,6 +28,8 @@ pub const width = 8;
 const State = enum { running, waiting, granted, done };
 const Slot = struct { state: State = .done, file: usize = 0, shared: ?*Replay = null };
 replay: *Replay,
+current: ?*Replay = null,
+stream_read_ahead: bool = false,
 spare: ?*Replay = null,
 scheduler: ?*local.sql_parallel_scheduler.Scheduler = null,
 prefetch: ?local.sql_parallel_scheduler.Task(anyerror!bool) = null,
@@ -66,6 +68,9 @@ const Frame = struct {
     pending: u8 = 0,
     batch: ?local.storage_rowsource_types.ColumnBatch = null,
 };
+fn activeReplay(self: *Self) *Replay {
+    return self.current orelse self.replay;
+}
 pub fn deinit(self: *Self) void {
     for (&self.frames) |*frame| if (frame.arena) |*arena| {
         arena.deinit();
@@ -81,7 +86,7 @@ fn immutableBatch(self: *Self, input: local.storage_rowsource_types.ColumnBatch)
         if (column.values == .encoded) break true;
     } else false;
     if (!encoded) return input;
-    if (self.stream_arena == null) self.stream_arena = .init(self.replay.live_allocator);
+    if (self.stream_arena == null) self.stream_arena = .init(self.activeReplay().live_allocator);
     const a = self.stream_arena.?.allocator();
     const columns = try a.dupe(rows.ColumnVector, input.columns);
     for (columns) |*column| {
@@ -214,8 +219,8 @@ fn driveInner(self: *Self, a: A, token: Token) !void {
             } else self.drainPrefetch();
         }
         const shared = if (self.streaming) live: {
-            target = self.replay;
-            try target.beginStream(a, capture_binding, request_.file, token);
+            if (prepared != true) try target.beginStream(a, capture_binding, request_.file, token);
+            self.current = target;
             self.stream_members = 0;
             self.stream_pending = 0;
             self.stream_generation = 0;
@@ -242,6 +247,12 @@ fn driveInner(self: *Self, a: A, token: Token) !void {
             };
             self.changed.broadcast(self.io);
         }
+        if (self.streaming and self.stream_read_ahead) if (self.spare) |spare| if (try self.nextFile(a, request_.file)) |next| {
+            const inactive = if (target == self.replay) spare else self.replay;
+            self.prefetch_target = inactive;
+            self.prefetch_file = next;
+            self.prefetch = (self.scheduler orelse local.sql_parallel_scheduler.global()).submitIoTransient(self.io, 8 * 1024 * 1024, Replay.primeStream, .{ inactive, a, capture_binding, next, token });
+        };
         if (self.streaming and self.buffered) try self.produceStream(token);
         if (!self.streaming) if (self.spare) |spare| if (try self.nextFile(a, request_.file)) |next| {
             const inactive = if (target == self.replay) spare else self.replay;
@@ -251,9 +262,9 @@ fn driveInner(self: *Self, a: A, token: Token) !void {
         };
     }
 }
-/// The raw cursor owns the current immutable typed batch. Every granted
-/// consumer must acknowledge it before the cursor advances. Backpressure keeps
-/// ownership bounded by one source batch, independent of file size or skew.
+/// Consumers acknowledge a pinned generation before advancing. Owned frames
+/// permit bounded overlap; borrowed fallback pins the source until all readers
+/// release it, independently of file size or consumer skew.
 pub fn readStream(self: *Self, slot: usize, generation: *u64, token: Token) !?local.storage_rowsource_types.ColumnBatch {
     if (!self.buffered) return self.readBorrowedStream(slot, generation, token);
     const bit = @as(u8, 1) << @as(u3, @intCast(slot));
@@ -293,7 +304,7 @@ pub fn produceStream(self: *Self, token: Token) !void {
             if (self.stream_members == 0) return;
         }
         if (frame.arena == null) {
-            frame.budget = .{ .backing = self.replay.live_allocator, .limit = self.frame_limit };
+            frame.budget = .{ .backing = self.activeReplay().live_allocator, .limit = self.frame_limit };
             frame.arena = .init(frame.budget.allocator());
         }
         _ = frame.arena.?.reset(.free_all);
@@ -303,7 +314,7 @@ pub fn produceStream(self: *Self, token: Token) !void {
         const batch = input: {
             try self.source_mutex.lock(self.io);
             defer self.source_mutex.unlock(self.io);
-            const raw = try self.replay.live.?.next(self.replay.live_allocator) orelse break :input null;
+            const raw = try self.activeReplay().nextLive() orelse break :input null;
             break :input @import("lake_index_owned_batch.zig").copy(frame.arena.?.allocator(), raw) catch |err| {
                 if (err != error.OutOfMemory or !frame.budget.isLocallyExhausted()) return err;
                 _ = frame.arena.?.reset(.free_all);
@@ -353,7 +364,7 @@ fn readBorrowedStream(self: *Self, slot: usize, generation: *u64, token: Token) 
         {
             try self.source_mutex.lock(self.io);
             defer self.source_mutex.unlock(self.io);
-            self.stream_batch = if (try self.replay.live.?.next(self.replay.live_allocator)) |batch| try self.immutableBatch(batch) else null;
+            self.stream_batch = if (try self.activeReplay().nextLive()) |batch| try self.immutableBatch(batch) else null;
         }
         if (self.stream_batch == null) {
             self.stream_eof = true;
@@ -730,4 +741,36 @@ test "external lake streaming wakes a full producer on cancellation and consumer
         }
         try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
     }
+}
+
+test "external lake streaming selected lookahead failure aborts required work and releases admission" {
+    const a = std.testing.allocator;
+    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    source.inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &.{} };
+    var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+    var replay = Replay.init(a, &provider, &.{"x"});
+    defer replay.deinit();
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{};
+    var pipeline: Self = .{ .replay = &replay, .io = std.testing.io, .streaming = true, .stream_read_ahead = true };
+    defer pipeline.deinit();
+    const Worker = struct {
+        fn fail() anyerror!bool {
+            return error.TestSpeculativeReadFailed;
+        }
+        fn requestFile(p: *Self) anyerror!void {
+            defer p.complete(0);
+            _ = try p.request(0, 0, .none);
+        }
+    };
+    pipeline.prefetch = scheduler.submitIoTransient(std.testing.io, 8, Worker.fail, .{}) orelse return error.TestUnexpectedResult;
+    pipeline.prefetch_file = 0;
+    pipeline.prefetch_target = &replay;
+    pipeline.activate(0);
+    var task = try std.testing.io.concurrent(Worker.requestFile, .{&pipeline});
+    defer task.cancel(std.testing.io) catch {};
+    try std.testing.expectError(error.TestSpeculativeReadFailed, pipeline.drive(a, .none));
+    try std.testing.expectError(error.TestSpeculativeReadFailed, task.await(std.testing.io));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    try std.testing.expectEqual(@as(usize, 0), replay.captures);
 }

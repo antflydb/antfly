@@ -210,6 +210,12 @@ fn buildCohort(args_: Args, units: []const Unit) !?Result {
     const queue_bytes = std.math.mul(usize, frame_limit, 2) catch return null;
     const buffered = queue_bytes < available - workspace;
     if (buffered) workspace += queue_bytes;
+    // A second private cursor pins one first batch, its compressed input and
+    // decoder state. Admission covers its entire lifetime, including uploads
+    // by consumers of the current file. No speculative archive spool is used.
+    const scan_workspace = std.math.add(usize, args_.provider.limits.max_input_bytes, decoded) catch return null;
+    const stream_read_ahead = scan_workspace < available - workspace;
+    if (stream_read_ahead) workspace += scan_workspace;
     const replay_limit = @min(replay.budget.limit, available - workspace);
     var projection_arena = std.heap.ArenaAllocator.init(args_.a);
     defer projection_arena.deinit();
@@ -275,7 +281,7 @@ fn buildCohort(args_: Args, units: []const Unit) !?Result {
     replay.budget.limit = replay_limit / 2;
     ahead.budget.limit = replay_limit / 2;
     ahead.max_spill_bytes = disk_limit / 2;
-    var pipeline: Pipeline = .{ .replay = replay, .spare = &ahead, .io = io, .scheduler = args.scheduler, .streaming = true, .buffered = buffered, .frame_limit = frame_limit };
+    var pipeline: Pipeline = .{ .replay = replay, .spare = &ahead, .io = io, .scheduler = args.scheduler, .streaming = true, .stream_read_ahead = stream_read_ahead, .buffered = buffered, .frame_limit = frame_limit };
     defer pipeline.deinit();
     defer replay.reset() catch unreachable;
     ahead.pipeline = &pipeline;
@@ -397,8 +403,22 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
     try std.testing.expect(!bounded.limit_exceeded);
     args.a = a;
+    var streaming_scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_bytes = 128 * 1024 * 1024 };
+    args.scheduler = &streaming_scheduler;
     const result = (try build(args)) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 3), replay.captures);
+    try std.testing.expect(streaming_scheduler.peak_io_workers > 0);
+    try std.testing.expect(replay.read_ahead_hits > 0);
+    try std.testing.expectEqual(@as(usize, 0), streaming_scheduler.workers);
+    // Denied speculative I/O admission preserves one scan per required file.
+    var denied_ahead: local.sql_parallel_scheduler.Scheduler = .{ .max_io_workers = 0, .max_bytes = 128 * 1024 * 1024 };
+    args.scheduler = &denied_ahead;
+    const before_denied = replay.captures;
+    const hits_before_denied = replay.read_ahead_hits;
+    _ = (try build(args)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), replay.captures - before_denied);
+    try std.testing.expectEqual(hits_before_denied, replay.read_ahead_hits);
+    args.scheduler = null;
+    try std.testing.expectEqual(@as(usize, 6), replay.captures);
     try std.testing.expect(replay.streamed_batches != 0);
     try std.testing.expectEqual(@as(usize, 0), replay.readers);
     try std.testing.expectEqual(@as(usize, 3), result.native.declarations.len);
@@ -442,6 +462,33 @@ test "external lake file-first publication shares one decode across five native 
         try std.testing.expect(limited_replay.captures < 21);
     }
     try std.testing.expectEqual(@as(usize, 0), modest.live_bytes);
+    // At 224 MiB these three light consumers admit the second source cursor
+    // while retaining borrowed single-batch backpressure (no two-frame queue).
+    var borrowed_budget = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 224 * 1024 * 1024 });
+    {
+        var borrowed_provider = provider;
+        var borrowed_replay = replay_api.Replay.init(borrowed_budget.allocator(), &borrowed_provider, columns);
+        defer borrowed_replay.deinit();
+        borrowed_provider.replay = &borrowed_replay;
+        var borrowed_index: @import("lake_index_contributions.zig").Index = undefined;
+        try borrowed_index.init(borrowed_budget.allocator(), store, null, .none);
+        defer borrowed_index.deinit();
+        var borrowed_args = args;
+        borrowed_args.a = borrowed_budget.allocator();
+        borrowed_args.provider = &borrowed_provider;
+        borrowed_args.index = &borrowed_index;
+        borrowed_args.table.indexes_json = "{\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"total\",\"op\":\"sum\",\"measure\":\"amount\"},{\"name\":\"rows\",\"op\":\"count\"},{\"name\":\"by_body\",\"op\":\"count\",\"group_by\":[\"body\"]}]}}";
+        var borrowed_scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_bytes = 128 * 1024 * 1024 };
+        borrowed_args.scheduler = &borrowed_scheduler;
+        const borrowed = (try build(borrowed_args)) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(borrowed_replay.read_ahead_hits > 0);
+        try std.testing.expectEqual(@as(usize, 3), borrowed_replay.captures);
+        const borrowed_ordered = try @import("lake_index_ordered_rows.zig").loadRootLazy(out, store, borrowed.ordered[0].artifact, .none, null);
+        try std.testing.expectEqual(@as(u64, 12), borrowed_ordered.page.?.records);
+        try std.testing.expectEqual(@as(usize, 0), borrowed_scheduler.workers);
+    }
+    try std.testing.expectEqual(@as(usize, 0), borrowed_budget.live_bytes);
+    try std.testing.expect(!borrowed_budget.limit_exceeded);
     // A file larger than replay admission streams ordinarily. Every consumer
     // still receives all rows and no reader pins the failed temporary replay.
     replay.max_spill_bytes = 1;
