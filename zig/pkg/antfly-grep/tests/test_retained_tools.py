@@ -22,7 +22,7 @@ from unittest.mock import Mock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
-from retained import Payloads, View
+from retained import FRAME_MAGIC, Payloads, View
 from session_compare import Service
 
 
@@ -171,6 +171,38 @@ class StreamingViewTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             v.materialize_file(b"missing")
 
+    def test_file_iteration_does_not_materialize_unread_large_frames(self):
+        import tracemalloc
+
+        p = Payloads()
+        for row in (
+            {
+                "type": "begin",
+                "file_id": "a",
+                "data": {"path": {"text": "a"}},
+                "source": {},
+            },
+            {
+                "type": "match",
+                "file_id": "a",
+                "data": {"text": "x" * (2 * 1024 * 1024)},
+            },
+            {"type": "end", "file_id": "a", "data": {}},
+        ):
+            p.consume(row, json.dumps(row).encode())
+        v = View("h", revision="rev", token="token", files=p.finish())
+        tracemalloc.start()
+        try:
+            rows = v.iter_file(b"a")
+            self.assertEqual(next(rows)["type"], "begin")
+            self.assertLess(tracemalloc.get_traced_memory()[1], 128 * 1024)
+            rows.close()
+        finally:
+            tracemalloc.stop()
+        # Older serialized array views still expand through the same API.
+        v.files[b"legacy"] = b'[{"type":"end","file_id":"old"}]'
+        self.assertEqual(v.materialize_file(b"legacy")[0]["file_id"], "old")
+
     def test_malformed_v4_tuples_fail_before_publication(self):
         from retained import validate_batch
 
@@ -256,7 +288,9 @@ class StreamingViewTests(unittest.TestCase):
         encoded = [json.dumps(row, ensure_ascii=False).encode() for row in frames]
         for row, raw in zip(frames, encoded):
             self.assertTrue(p.consume(row, raw))
-        self.assertEqual(p.finish()[b"a\xff"], b"[" + b",".join(encoded) + b"]")
+        self.assertEqual(
+            p.finish()[b"a\xff"], FRAME_MAGIC + b"\n".join(encoded) + b"\n"
+        )
         v = View("handle")
         v.apply(
             [
@@ -300,7 +334,7 @@ class StreamingViewTests(unittest.TestCase):
         self.assertFalse(payloads.open)
         for name, frames in expected.items():
             self.assertIsInstance(actual[name], bytes)
-            self.assertEqual(actual[name], b"[" + b",".join(frames) + b"]")
+            self.assertEqual(actual[name], FRAME_MAGIC + b"\n".join(frames) + b"\n")
 
     def test_missing_end_and_duplicate_identity_are_rejected(self):
         p = Payloads()

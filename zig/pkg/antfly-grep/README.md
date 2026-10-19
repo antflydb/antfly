@@ -3569,8 +3569,10 @@ bounds. Default v1/v2/v3 formats are unchanged. A retried encoding attempt
 resets row-local span capture, preventing duplicate spans in later cache replay.
 
 The reference consumer retains original frames and offers `View.iter_file(path)`
-and `materialize_file(path)`. Applications can decode only a visible file;
-`materialize()` remains an explicit whole-view operation. Validation and atomic
+and `materialize_file(path)`. Applications can decode only a visible file or stop after its first few frames.
+Versioned private retained framing bounds decoding to the consumed frame,
+including when a later line in that file is enormous; legacy array payloads
+remain readable. `materialize()` remains an explicit whole-view operation. Validation and atomic
 view publication still precede reuse. Unknown files raise `KeyError`. Iteration
 pins a file's serialized payload and observation before yielding its rows.
 

@@ -34,6 +34,25 @@ from dataclasses import dataclass, field
 from registered import Client
 
 
+# Private retained storage, not a producer wire format. Frames are JSONL,
+# already validated before publication, and can be decoded without copying or
+# materializing a complete file. Legacy compact JSON arrays remain readable.
+FRAME_MAGIC = b"AGVIEW1\n"
+
+
+def file_rows(payload):
+    if not payload.startswith(FRAME_MAGIC):
+        yield from json.loads(payload)
+        return
+    cursor = len(FRAME_MAGIC)
+    while cursor < len(payload):
+        end = payload.find(b"\n", cursor)
+        if end < 0:
+            raise RuntimeError("incomplete retained frame")
+        yield json.loads(payload[cursor:end])
+        cursor = end + 1
+
+
 def path_bytes(value):
     if "text" in value:
         return value["text"].encode("utf-8")
@@ -98,6 +117,8 @@ class Payloads:
 
     def consume(self, row, encoded):
         kind = row["type"]
+        if kind in ("begin", "match", "context", "end", "batch") and b"\n" in encoded:
+            raise RuntimeError("multiline retained frame")
         if kind == "begin":
             path = path_bytes(row["data"]["path"])
             identity = row["file_id"]
@@ -105,7 +126,7 @@ class Payloads:
                 raise RuntimeError("duplicate file identity")
             self.identities[identity] = path
             buffer = self.open[path] = io.BytesIO()
-            buffer.write(b"[")
+            buffer.write(FRAME_MAGIC)
             buffer.write(encoded)
         elif kind in ("match", "context", "end", "batch"):
             path = self.identities.get(row["file_id"])
@@ -114,10 +135,10 @@ class Payloads:
             if kind == "batch":
                 validate_batch(row, len(encoded))
             buffer = self.open[path]
-            buffer.write(b",")
+            buffer.write(b"\n")
             buffer.write(encoded)
             if kind == "end":
-                buffer.write(b"]")
+                buffer.write(b"\n")
                 self.files[path] = buffer.getvalue()
                 del self.open[path]
         else:
@@ -141,7 +162,7 @@ class View:
     payload_bytes: int = 0
 
     def iter_file(self, path):
-        """Decode one file on demand; untouched retained files stay serialized.
+        """Decode consumed frames only; untouched files and tails stay serialized.
 
         Iteration pins this file payload and the provenance observation before
         yielding, so a subsequent refresh cannot mix generations within a file.
@@ -150,7 +171,7 @@ class View:
             raise RuntimeError("view requires a complete transaction")
         payload = self.files[path]
         revision, observed_at = self.revision, self.observed_at
-        for row in json.loads(payload):
+        for row in file_rows(payload):
             if row["type"] == "begin":
                 row["source"]["snapshot"] = revision
                 row["source"]["observed_at"] = observed_at
@@ -257,7 +278,11 @@ class View:
             if len(ended) != len(files):
                 raise RuntimeError("incomplete file payload")
             upserts = {
-                path: json.dumps(value, separators=(",", ":")).encode()
+                path: FRAME_MAGIC
+                + b"\n".join(
+                    json.dumps(row, separators=(",", ":")).encode() for row in value
+                )
+                + b"\n"
                 for path, value in staged.items()
             }
         else:
