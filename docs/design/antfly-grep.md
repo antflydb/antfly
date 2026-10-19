@@ -23,59 +23,38 @@ revision, timestamps, metadata, regions and permissions. Providers such as S3,
 GCS, R2, Box, Dropbox and GitHub are ingestion concerns. Query planning uses the
 stored document and its indexed revision, independently of the original provider.
 
-Tables can declare an existing built-in substring companion:
+Configure table names and the document contract root, for example:
 
 ```json
-{
-  "name": "sources",
-  "document_field": "grep",
-  "content_index": {
-    "field": "grep.content._substring"
-  }
-}
+{"name":"sources","document_field":"grep"}
 ```
 
-Map `grep.content` with `"x-antfly-types": ["text", "substring"]` to obtain this
-companion. An optional `content_index.full_text_index` selects an existing named
-full-text index. Omit it for the active schema index. The configured companion
-must cover the complete stored content at the same revision with the built-in
-substring analyzer, without custom normalization, truncation or partial backfills.
-Missing/misconfigured indexes return ordinary query errors; they must not silently
-be treated as empty results. The existing optional raw-trigram `candidate_index`
-remains supported, but the two index declarations are mutually exclusive.
-
-Without an index declaration, the CLI uses the same query API with `match_all`
-and any user filter, then matches each returned document locally. This is a full
-traversal of a query result, not a separate scan API or remote-object reader.
+The shared [logical-field query design](logical-field-queries.md) owns operation
+semantics and server planning. There is no `content_index` routing declaration.
+Mapping `grep.content` with `"x-antfly-types": ["text", "substring"]` allows the
+server to accelerate containment. The server selects a compatible representation
+and verifies original values; index suffixes are not part of the CLI contract.
+The older raw-trigram `candidate_index` remains a compatibility option.
 
 ## Conservative predicate planning
 
-Every pattern alternative must supply a proven necessary case-sensitive byte
-literal from the native matcher. Each literal must contain a contiguous ASCII
-alphanumeric run of at least three bytes. Choose at most 32 bytes of that run and
-lowercase it. The built-in substring analyzer indexes all normalized word
-suffixes up to 32 bytes, so a raw match implies a candidate hit. Punctuation and
-normalization can introduce false positives, which local verification removes.
+Every pattern alternative must supply a proven necessary case-sensitive literal
+from the native matcher. Send ordinary `contains` predicates against the logical
+`grep.content` field, combined with OR. If any branch lacks a proven literal,
+omit candidate pushdown. Never send the user's entire regex under a different
+dialect and assume equivalence.
 
-For fixed strings, use the existing substring `match` predicate. For regex
-patterns, use an existing `regexp` prefix (`fragment.*`) over the same suffix
-field. This prefix contains only ASCII letters/digits; it does not translate or
-approximate the user's entire PCRE/ripgrep expression. Combine alternatives with
-OR. If any branch lacks a safe literal/run, omit the entire candidate predicate.
-Bound alternative count and predicate size through the matcher's existing limits.
+The request uses canonical `query`, preserves the user's `filter_query`, selects
+ascending `_id` order from page one, and replays the predicate for every retained
+snapshot page. `value_search_execution.allow_scan` explicitly permits fallback
+when no safe compatible index constraint exists. The server's verification
+budgets and failures remain explicit. Fetch only required source-contract fields,
+then apply permissions/path checks and the complete CLI matcher, including
+line/word boundaries, captures, context and replacements.
 
-The ordinary request uses `full_text_search` for those candidates,
-`filter_query` for the user's explicit scope, and optional `full_text_index`.
-Keep ascending `_id` ordering from page one, replay the same predicate and scope
-for every retained-snapshot page, and fetch only required source-contract fields.
-Apply document permission/path checks and the complete local matcher afterward,
-including case, line/word boundaries, captures, context and replacements.
-
-Index normalization does not establish equivalence with original file bytes.
-The current automatic path therefore uses conservative candidates even when a
-particular literal could have an exact server-side equivalent. Further exact
-translations require differential tests for their analyzer and regex semantics.
-There is no approximate semantic retrieval in an exact grep plan.
+The earlier `match`/`regexp` companion-field configuration was superseded by the
+shared logical-field contract before merge. Historical benchmark reports describe
+the binaries actually measured; they do not qualify the new server planner.
 
 ## Exhaustive modes and accounting
 

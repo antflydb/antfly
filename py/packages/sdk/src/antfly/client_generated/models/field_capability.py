@@ -10,6 +10,7 @@ from ..models.antfly_type import AntflyType
 from ..models.field_capability_index_sort_order import FieldCapabilityIndexSortOrder
 from ..models.field_capability_query_modes_item import FieldCapabilityQueryModesItem
 from ..models.field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
+from ..models.field_capability_value_operations_item import FieldCapabilityValueOperationsItem
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="FieldCapability")
@@ -35,6 +36,13 @@ class FieldCapability:
             coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
         name (str | Unset): Mapping or dynamic-template name, when applicable.
         field (str | Unset): Concrete query field path when known. Pattern-only dynamic templates may omit this.
+        logical_field (str | Unset): Original source field accepted by logical value operations. Physical emitted names
+            remain diagnostic/advanced query targets.
+        value_operations (list[FieldCapabilityValueOperationsItem] | Unset): Logical operations supported for this
+            string source. Availability does
+            not attest index coverage or authorize scans. Value operations verify
+            original values; case_sensitive defaults to true, false uses Unicode
+            simple folding without normalization. Execution policy and budgets apply.
         path_pattern (str | Unset): Dynamic-template path_match pattern, when applicable.
         field_pattern (str | Unset): Dynamic-template match pattern, when applicable.
         match_mapping_type (str | Unset): Dynamic-template match_mapping_type, when applicable.
@@ -56,6 +64,8 @@ class FieldCapability:
     sort_lifecycle_state: FieldCapabilitySortLifecycleState
     name: str | Unset = UNSET
     field: str | Unset = UNSET
+    logical_field: str | Unset = UNSET
+    value_operations: list[FieldCapabilityValueOperationsItem] | Unset = UNSET
     path_pattern: str | Unset = UNSET
     field_pattern: str | Unset = UNSET
     match_mapping_type: str | Unset = UNSET
@@ -85,6 +95,15 @@ class FieldCapability:
         name = self.name
 
         field = self.field
+
+        logical_field = self.logical_field
+
+        value_operations: list[str] | Unset = UNSET
+        if not isinstance(self.value_operations, Unset):
+            value_operations = []
+            for value_operations_item_data in self.value_operations:
+                value_operations_item = value_operations_item_data.value
+                value_operations.append(value_operations_item)
 
         path_pattern = self.path_pattern
 
@@ -120,6 +139,10 @@ class FieldCapability:
             field_dict["name"] = name
         if field is not UNSET:
             field_dict["field"] = field
+        if logical_field is not UNSET:
+            field_dict["logical_field"] = logical_field
+        if value_operations is not UNSET:
+            field_dict["value_operations"] = value_operations
         if path_pattern is not UNSET:
             field_dict["path_pattern"] = path_pattern
         if field_pattern is not UNSET:
@@ -163,6 +186,17 @@ class FieldCapability:
 
         field = d.pop("field", UNSET)
 
+        logical_field = d.pop("logical_field", UNSET)
+
+        _value_operations = d.pop("value_operations", UNSET)
+        value_operations: list[FieldCapabilityValueOperationsItem] | Unset = UNSET
+        if _value_operations is not UNSET:
+            value_operations = []
+            for value_operations_item_data in _value_operations:
+                value_operations_item = FieldCapabilityValueOperationsItem(value_operations_item_data)
+
+                value_operations.append(value_operations_item)
+
         path_pattern = d.pop("path_pattern", UNSET)
 
         field_pattern = d.pop("field_pattern", UNSET)
@@ -193,6 +227,8 @@ class FieldCapability:
             sort_lifecycle_state=sort_lifecycle_state,
             name=name,
             field=field,
+            logical_field=logical_field,
+            value_operations=value_operations,
             path_pattern=path_pattern,
             field_pattern=field_pattern,
             match_mapping_type=match_mapping_type,

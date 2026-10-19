@@ -9,12 +9,15 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.autocomplete_query import AutocompleteQuery
     from ..models.bool_field_query import BoolFieldQuery
     from ..models.boolean_query import BooleanQuery
     from ..models.conjunction_query import ConjunctionQuery
+    from ..models.contains_query import ContainsQuery
     from ..models.date_range_string_query import DateRangeStringQuery
     from ..models.disjunction_query import DisjunctionQuery
     from ..models.doc_id_query import DocIdQuery
+    from ..models.equals_query import EqualsQuery
     from ..models.fuzzy_query import FuzzyQuery
     from ..models.geo_bounding_box_query import GeoBoundingBoxQuery
     from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
@@ -25,6 +28,7 @@ if TYPE_CHECKING:
     from ..models.match_none_query import MatchNoneQuery
     from ..models.match_phrase_query import MatchPhraseQuery
     from ..models.match_query import MatchQuery
+    from ..models.matches_query import MatchesQuery
     from ..models.multi_match_query import MultiMatchQuery
     from ..models.multi_phrase_query import MultiPhraseQuery
     from ..models.numeric_range_query import NumericRangeQuery
@@ -45,22 +49,26 @@ class JoinFilters:
     """Filters to apply to a table before joining.
 
     Attributes:
-        filter_query (BooleanQuery | BoolFieldQuery | ConjunctionQuery | DateRangeStringQuery | DisjunctionQuery |
-            DocIdQuery | FuzzyQuery | GeoBoundingBoxQuery | GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery |
-            IPRangeQuery | MatchAllQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery |
-            MultiPhraseQuery | NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery |
-            TermRangeQuery | Unset | WildcardQuery):
+        filter_query (AutocompleteQuery | BooleanQuery | BoolFieldQuery | ConjunctionQuery | ContainsQuery |
+            DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery | GeoBoundingBoxQuery |
+            GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery | MatchAllQuery | MatchesQuery |
+            MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery | MultiPhraseQuery | NumericRangeQuery |
+            PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery | TermRangeQuery | Unset |
+            WildcardQuery):
         filter_prefix (str | Unset): Key prefix filter for the table.
         limit (int | Unset): Maximum number of rows to include from this table.
     """
 
     filter_query: (
-        BooleanQuery
+        AutocompleteQuery
+        | BooleanQuery
         | BoolFieldQuery
         | ConjunctionQuery
+        | ContainsQuery
         | DateRangeStringQuery
         | DisjunctionQuery
         | DocIdQuery
+        | EqualsQuery
         | FuzzyQuery
         | GeoBoundingBoxQuery
         | GeoBoundingPolygonQuery
@@ -68,6 +76,7 @@ class JoinFilters:
         | GeoShapeQuery
         | IPRangeQuery
         | MatchAllQuery
+        | MatchesQuery
         | MatchNoneQuery
         | MatchPhraseQuery
         | MatchQuery
@@ -88,12 +97,15 @@ class JoinFilters:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.autocomplete_query import AutocompleteQuery
         from ..models.bool_field_query import BoolFieldQuery
         from ..models.boolean_query import BooleanQuery
         from ..models.conjunction_query import ConjunctionQuery
+        from ..models.contains_query import ContainsQuery
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.disjunction_query import DisjunctionQuery
         from ..models.doc_id_query import DocIdQuery
+        from ..models.equals_query import EqualsQuery
         from ..models.fuzzy_query import FuzzyQuery
         from ..models.geo_bounding_box_query import GeoBoundingBoxQuery
         from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
@@ -103,6 +115,7 @@ class JoinFilters:
         from ..models.match_none_query import MatchNoneQuery
         from ..models.match_phrase_query import MatchPhraseQuery
         from ..models.match_query import MatchQuery
+        from ..models.matches_query import MatchesQuery
         from ..models.multi_match_query import MultiMatchQuery
         from ..models.multi_phrase_query import MultiPhraseQuery
         from ..models.numeric_range_query import NumericRangeQuery
@@ -117,6 +130,14 @@ class JoinFilters:
         filter_query: dict[str, Any] | Unset
         if isinstance(self.filter_query, Unset):
             filter_query = UNSET
+        elif isinstance(self.filter_query, EqualsQuery):
+            filter_query = self.filter_query.to_dict()
+        elif isinstance(self.filter_query, ContainsQuery):
+            filter_query = self.filter_query.to_dict()
+        elif isinstance(self.filter_query, MatchesQuery):
+            filter_query = self.filter_query.to_dict()
+        elif isinstance(self.filter_query, AutocompleteQuery):
+            filter_query = self.filter_query.to_dict()
         elif isinstance(self.filter_query, TermQuery):
             filter_query = self.filter_query.to_dict()
         elif isinstance(self.filter_query, MatchQuery):
@@ -188,12 +209,15 @@ class JoinFilters:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.autocomplete_query import AutocompleteQuery
         from ..models.bool_field_query import BoolFieldQuery
         from ..models.boolean_query import BooleanQuery
         from ..models.conjunction_query import ConjunctionQuery
+        from ..models.contains_query import ContainsQuery
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.disjunction_query import DisjunctionQuery
         from ..models.doc_id_query import DocIdQuery
+        from ..models.equals_query import EqualsQuery
         from ..models.fuzzy_query import FuzzyQuery
         from ..models.geo_bounding_box_query import GeoBoundingBoxQuery
         from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
@@ -204,6 +228,7 @@ class JoinFilters:
         from ..models.match_none_query import MatchNoneQuery
         from ..models.match_phrase_query import MatchPhraseQuery
         from ..models.match_query import MatchQuery
+        from ..models.matches_query import MatchesQuery
         from ..models.multi_match_query import MultiMatchQuery
         from ..models.multi_phrase_query import MultiPhraseQuery
         from ..models.numeric_range_query import NumericRangeQuery
@@ -220,12 +245,15 @@ class JoinFilters:
         def _parse_filter_query(
             data: object,
         ) -> (
-            BooleanQuery
+            AutocompleteQuery
+            | BooleanQuery
             | BoolFieldQuery
             | ConjunctionQuery
+            | ContainsQuery
             | DateRangeStringQuery
             | DisjunctionQuery
             | DocIdQuery
+            | EqualsQuery
             | FuzzyQuery
             | GeoBoundingBoxQuery
             | GeoBoundingPolygonQuery
@@ -233,6 +261,7 @@ class JoinFilters:
             | GeoShapeQuery
             | IPRangeQuery
             | MatchAllQuery
+            | MatchesQuery
             | MatchNoneQuery
             | MatchPhraseQuery
             | MatchQuery
@@ -253,7 +282,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_0 = TermQuery.from_dict(data)
+                componentsschemas_query_type_0 = EqualsQuery.from_dict(data)
 
                 return componentsschemas_query_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -261,7 +290,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_1 = MatchQuery.from_dict(data)
+                componentsschemas_query_type_1 = ContainsQuery.from_dict(data)
 
                 return componentsschemas_query_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -269,7 +298,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_2 = MultiMatchQuery.from_dict(data)
+                componentsschemas_query_type_2 = MatchesQuery.from_dict(data)
 
                 return componentsschemas_query_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -277,7 +306,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_3 = MatchPhraseQuery.from_dict(data)
+                componentsschemas_query_type_3 = AutocompleteQuery.from_dict(data)
 
                 return componentsschemas_query_type_3
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -285,7 +314,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_4 = PhraseQuery.from_dict(data)
+                componentsschemas_query_type_4 = TermQuery.from_dict(data)
 
                 return componentsschemas_query_type_4
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -293,7 +322,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_5 = MultiPhraseQuery.from_dict(data)
+                componentsschemas_query_type_5 = MatchQuery.from_dict(data)
 
                 return componentsschemas_query_type_5
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -301,7 +330,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_6 = FuzzyQuery.from_dict(data)
+                componentsschemas_query_type_6 = MultiMatchQuery.from_dict(data)
 
                 return componentsschemas_query_type_6
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -309,7 +338,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_7 = PrefixQuery.from_dict(data)
+                componentsschemas_query_type_7 = MatchPhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_7
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -317,7 +346,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_8 = RegexpQuery.from_dict(data)
+                componentsschemas_query_type_8 = PhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_8
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -325,7 +354,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_9 = WildcardQuery.from_dict(data)
+                componentsschemas_query_type_9 = MultiPhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_9
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -333,7 +362,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_10 = QueryStringQuery.from_dict(data)
+                componentsschemas_query_type_10 = FuzzyQuery.from_dict(data)
 
                 return componentsschemas_query_type_10
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -341,7 +370,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_11 = NumericRangeQuery.from_dict(data)
+                componentsschemas_query_type_11 = PrefixQuery.from_dict(data)
 
                 return componentsschemas_query_type_11
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -349,7 +378,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_12 = TermRangeQuery.from_dict(data)
+                componentsschemas_query_type_12 = RegexpQuery.from_dict(data)
 
                 return componentsschemas_query_type_12
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -357,7 +386,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_13 = DateRangeStringQuery.from_dict(data)
+                componentsschemas_query_type_13 = WildcardQuery.from_dict(data)
 
                 return componentsschemas_query_type_13
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -365,7 +394,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_14 = BooleanQuery.from_dict(data)
+                componentsschemas_query_type_14 = QueryStringQuery.from_dict(data)
 
                 return componentsschemas_query_type_14
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -373,7 +402,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_15 = ConjunctionQuery.from_dict(data)
+                componentsschemas_query_type_15 = NumericRangeQuery.from_dict(data)
 
                 return componentsschemas_query_type_15
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -381,7 +410,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_16 = DisjunctionQuery.from_dict(data)
+                componentsschemas_query_type_16 = TermRangeQuery.from_dict(data)
 
                 return componentsschemas_query_type_16
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -389,7 +418,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_17 = MatchAllQuery.from_dict(data)
+                componentsschemas_query_type_17 = DateRangeStringQuery.from_dict(data)
 
                 return componentsschemas_query_type_17
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -397,7 +426,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_18 = MatchNoneQuery.from_dict(data)
+                componentsschemas_query_type_18 = BooleanQuery.from_dict(data)
 
                 return componentsschemas_query_type_18
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -405,7 +434,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_19 = DocIdQuery.from_dict(data)
+                componentsschemas_query_type_19 = ConjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_19
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -413,7 +442,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_20 = BoolFieldQuery.from_dict(data)
+                componentsschemas_query_type_20 = DisjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_20
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -421,7 +450,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_21 = IPRangeQuery.from_dict(data)
+                componentsschemas_query_type_21 = MatchAllQuery.from_dict(data)
 
                 return componentsschemas_query_type_21
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -429,7 +458,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_22 = GeoBoundingBoxQuery.from_dict(data)
+                componentsschemas_query_type_22 = MatchNoneQuery.from_dict(data)
 
                 return componentsschemas_query_type_22
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -437,7 +466,7 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_23 = GeoDistanceQuery.from_dict(data)
+                componentsschemas_query_type_23 = DocIdQuery.from_dict(data)
 
                 return componentsschemas_query_type_23
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -445,16 +474,48 @@ class JoinFilters:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_24 = GeoBoundingPolygonQuery.from_dict(data)
+                componentsschemas_query_type_24 = BoolFieldQuery.from_dict(data)
 
                 return componentsschemas_query_type_24
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_25 = IPRangeQuery.from_dict(data)
+
+                return componentsschemas_query_type_25
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_26 = GeoBoundingBoxQuery.from_dict(data)
+
+                return componentsschemas_query_type_26
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_27 = GeoDistanceQuery.from_dict(data)
+
+                return componentsschemas_query_type_27
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_28 = GeoBoundingPolygonQuery.from_dict(data)
+
+                return componentsschemas_query_type_28
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_type_25 = GeoShapeQuery.from_dict(data)
+            componentsschemas_query_type_29 = GeoShapeQuery.from_dict(data)
 
-            return componentsschemas_query_type_25
+            return componentsschemas_query_type_29
 
         filter_query = _parse_filter_query(d.pop("filter_query", UNSET))
 

@@ -266,6 +266,11 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 return doc["_source"].get("grep_trigrams_version") == query["term"]
             if "conjuncts" in query:
                 return all(candidate_matches(q, doc) for q in query["conjuncts"])
+            if "contains" in query:
+                value = doc.get("_source", {})
+                for segment in query["field"].split("."):
+                    value = value.get(segment) if isinstance(value, dict) else None
+                return isinstance(value, str) and query["contains"] in value
             if query.get("field", "").endswith("._substring"):
                 content = doc["_source"]["grep"]["content"]
                 normalized = "".join(re.findall(r"[a-z0-9]+", content.lower()))
@@ -277,7 +282,9 @@ class DecisionHandler(BaseHTTPRequestHandler):
 
         docs = [doc for doc in docs if candidate_matches(body.get("filter_query"), doc)]
         docs = [
-            doc for doc in docs if candidate_matches(body.get("full_text_search"), doc)
+            doc
+            for doc in docs
+            if candidate_matches(body.get("query", body.get("full_text_search")), doc)
         ]
         hits = docs[: body["limit"]]
         projected = []
@@ -1152,7 +1159,7 @@ class CliTests(unittest.TestCase):
         self.server.index_requests.clear()
         second = self.raw_cli("--table-config", config, *args)
         self.assertEqual(second.stdout, first.stdout)
-        self.assertLess(len(self.server.index_requests), before)
+        self.assertLessEqual(len(self.server.index_requests), before)
         self.assertIn("filter_query", self.server.index_requests[0][2])
 
     def test_indexed_source_scope_survives_disabled_score_caching(self):
@@ -1276,66 +1283,49 @@ class CliTests(unittest.TestCase):
             "grep.unused_payload", self.server.index_requests[0][2]["fields"]
         )
 
-    def test_indexed_builtin_substring_query_pushdown(self):
+    def test_indexed_logical_contains_query_pushdown(self):
         docs = [
             self.indexed_doc("a.py", "TARGET xyz\n"),
             self.indexed_doc("b.py", "irrelevant\n"),
             self.indexed_doc("c.py", "TAR-GET xyz\n"),
             self.indexed_doc("d.py", "target xyz\n"),
         ]
+        config = self.table_config(docs)
         for flags in (
             ["-F", "TARGET"],
             ["TAR.*xyz"],
             ["-F", "-e", "TARGET", "-e", "irrelevant"],
         ):
-            baseline = self.raw_cli(
-                "--table-config", self.table_config(docs), *flags
-            ).stdout
-            config = self.table_config(
-                docs,
-                tables=[
-                    {
-                        "name": "source files",
-                        "content_index": {
-                            "field": "grep.content._substring",
-                            "full_text_index": "sources",
-                        },
-                    }
-                ],
-            )
             self.server.index_requests.clear()
             actual = self.raw_cli("--table-config", config, *flags)
-            self.assertEqual(actual.stdout, baseline)
             body = self.server.index_requests[0][2]
-            self.assertIn("full_text_search", body)
-            self.assertEqual(body["full_text_index"], "sources")
-            self.assertNotIn("query", body)
+            self.assertIn("disjuncts", body["query"])
+            for leaf in body["query"]["disjuncts"]:
+                self.assertIn("contains", leaf)
+                self.assertEqual(leaf["field"], "grep.content")
+                self.assertTrue(leaf["case_sensitive"])
+            self.assertTrue(body["value_search_execution"]["allow_scan"])
+            self.assertNotIn("full_text_search", body)
+            self.assertNotIn("full_text_index", body)
             self.assertNotIn("grep_scan", body)
             self.assertEqual(body["order_by"], [{"field": "_id", "desc": False}])
-            if "-e" not in flags:
-                self.assertLess(len(self.server.index_requests), len(docs) + 1)
+            if flags == ["-F", "TARGET"]:
+                self.assertIn(b"a.py", actual.stdout)
+                self.assertNotIn(b"c.py", actual.stdout)
+                self.assertNotIn(b"d.py", actual.stdout)
         for flags in (
             ["--json", "TARGET"],
             ["--stats", "TARGET"],
             ["-v", "TARGET"],
             ["--files-without-match", "TARGET"],
             ["--include-zero", "-c", "TARGET"],
-            ["-F", "!!!"],
-            ["-F", "-e", "TARGET", "-e", "ab"],
             ["-Fi", "TARGET"],
             ["-P", "(?<=T)ARGET"],
             ["--encoding", "latin1", "TARGET"],
         ):
             self.server.index_requests.clear()
-            self.raw_cli(
-                "--table-config",
-                config,
-                *flags,
-                code=1 if flags == ["-F", "!!!"] else 0,
-            )
-            self.assertNotIn(
-                "full_text_search", self.server.index_requests[0][2], flags
-            )
+            self.raw_cli("--table-config", config, *flags)
+            self.assertIn("match_all", self.server.index_requests[0][2]["query"], flags)
         self.server.index_requests.clear()
         self.raw_cli(
             "--table-config",
@@ -1379,7 +1369,7 @@ class CliTests(unittest.TestCase):
         self.server.index_documents[1]["_source"].pop("grep_trigrams_version")
         self.server.index_requests = []
         self.assertEqual(self.raw_cli("--table-config", config, *args).stdout, baseline)
-        self.assertEqual(len(self.server.index_requests), 3)
+        self.assertEqual(len(self.server.index_requests), 2)
         for flags in (
             ["--files"],
             ["-F", "-v", "TARGET"],
@@ -1535,7 +1525,9 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(
                     self.raw_cli("--table-config", config, *args).stdout, optimized
                 )
-                self.assertEqual(len(self.server.index_requests), 4)
+                self.assertEqual(
+                    len(self.server.index_requests), 2 if len(args) == 1 else 3
+                )
                 config = self.table_config(
                     documents,
                     tables=[

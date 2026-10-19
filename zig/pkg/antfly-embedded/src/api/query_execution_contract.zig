@@ -3301,6 +3301,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
     {
         try appendQueryHierarchyField(alloc, &out, &first, req);
     }
+    if (!std.meta.eql(req.value_search_execution, @import("../search/value_query.zig").Policy{})) {
+        try appendJsonFieldName(alloc, &out, &first, "value_search_execution");
+        const policy_json = try std.json.Stringify.valueAlloc(alloc, req.value_search_execution, .{});
+        defer alloc.free(policy_json);
+        try out.appendSlice(alloc, policy_json);
+    }
     if (req.limit != 10) {
         try appendJsonFieldU32(alloc, &out, &first, "limit", req.limit);
     }
@@ -4344,6 +4350,25 @@ pub fn appendTextQueryValue(
 ) !void {
     switch (query) {
         .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
+        .value => |v| {
+            try out.appendSlice(alloc, "{");
+            try appendJsonString(alloc, out, @tagName(v.kind));
+            try out.appendSlice(alloc, ":");
+            try appendJsonString(alloc, out, v.text);
+            try out.appendSlice(alloc, ",\"field\":");
+            try appendJsonString(alloc, out, v.field);
+            try out.appendSlice(alloc, if (v.case_sensitive) ",\"case_sensitive\":true" else ",\"case_sensitive\":false");
+            try appendTextQueryBoost(alloc, out, v.boost);
+            try out.appendSlice(alloc, "}");
+        },
+        .autocomplete => |v| {
+            try out.appendSlice(alloc, "{\"autocomplete\":");
+            try appendJsonString(alloc, out, v.text);
+            try out.appendSlice(alloc, ",\"field\":");
+            try appendJsonString(alloc, out, v.field);
+            try appendTextQueryBoost(alloc, out, v.boost);
+            try out.appendSlice(alloc, "}");
+        },
         .match_none => try out.appendSlice(alloc, "{\"match_none\":{}}"),
         .phrase => |phrase| try appendPhraseTextQueryValue(alloc, out, phrase),
         .multi_phrase => |phrase| try appendMultiPhraseTextQueryValue(alloc, out, phrase),
@@ -5048,11 +5073,15 @@ fn finishRemoteSearchResult(alloc: std.mem.Allocator, response: metadata_openapi
         .graph_metric_results = graph_metric_results,
         .graph_metric_rerank_status = graph_metric_rerank_status,
     };
+    errdefer if (result.value_search_profile_json) |json| alloc.free(json);
     if (response.profile) |profile| {
         if (profile != .object) return error.InvalidRemoteResponse;
         if (profile.object.get("document_authority_version")) |version| {
             if (version != .integer or version.integer != 1) return error.InvalidRemoteResponse;
             result.document_authority_version = 1;
+        }
+        if (profile.object.get("value_search")) |value| {
+            result.value_search_profile_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
         }
         if (profile.object.get("sort")) |value| {
             if (value != .null) {

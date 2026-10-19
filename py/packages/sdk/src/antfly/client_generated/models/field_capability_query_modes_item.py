@@ -7,6 +7,7 @@ class FieldCapabilityQueryModesItem(StrEnum):
     FULL_TEXT = "full_text"
     GEO = "geo"
     RANGE = "range"
+    SUBSTRING = "substring"
 
     def __str__(self) -> str:
         return str(self.value)

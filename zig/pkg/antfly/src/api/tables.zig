@@ -1995,6 +1995,8 @@ fn generatedFieldCapabilitiesFromSchema(alloc: std.mem.Allocator, schema_capabil
 }
 
 const GeneratedFieldCapability = struct {
+    logical_field: ?[]const u8 = null,
+    value_operations: ?[]const []const u8 = null,
     name: ?[]const u8 = null,
     field: ?[]const u8 = null,
     path_pattern: ?[]const u8 = null,
@@ -2192,6 +2194,16 @@ fn mergeGeneratedFieldCapability(
     existing: *GeneratedFieldCapability,
     incoming: GeneratedFieldCapability,
 ) !void {
+    if (!optionalStringEql(existing.logical_field, incoming.logical_field)) {
+        if (existing.logical_field) |value| alloc.free(@constCast(value));
+        existing.logical_field = null;
+        if (existing.value_operations) |ops| freeOwnedStringSlice(alloc, ops);
+        existing.value_operations = null;
+    } else if (existing.value_operations) |ops| {
+        var intersection = ops;
+        try intersectOwnedQueryModes(alloc, &intersection, incoming.value_operations orelse &.{});
+        existing.value_operations = intersection;
+    }
     try intersectOwnedQueryModes(alloc, &existing.query_modes, incoming.query_modes);
     existing.sortable = existing.sortable and incoming.sortable;
     try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, runtime_schema_mod.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
@@ -2247,6 +2259,8 @@ fn generatedFieldCapabilitiesPublicSliceAlloc(
     errdefer alloc.free(public);
     for (capabilities.items, 0..) |capability, i| {
         public[i] = .{
+            .logical_field = capability.logical_field,
+            .value_operations = capability.value_operations,
             .name = capability.name,
             .field = capability.field,
             .path_pattern = capability.path_pattern,
@@ -2290,6 +2304,15 @@ fn generatedFieldCapabilityAlloc(alloc: std.mem.Allocator, capability: runtime_s
     };
     errdefer freeGeneratedFieldCapability(alloc, owned);
 
+    // Synthetic identity/score metadata is not a JSON source string. Its
+    // existing query modes remain explicit instead of advertising value ops.
+    const logical_field = if (std.mem.eql(u8, capability.provenance, "reserved")) null else capability.logical_field orelse capability.field;
+    owned.logical_field = try dupeOptionalString(alloc, logical_field);
+    owned.value_operations = if (logical_field != null) switch (capability.field_type) {
+        .text, .html, .keyword, .link, .substring => try dupeStringSlice(alloc, &.{ "equals", "contains", "matches" }),
+        .search_as_you_type => try dupeStringSlice(alloc, &.{ "equals", "contains", "matches", "autocomplete" }),
+        else => null,
+    } else null;
     owned.name = try dupeOptionalString(alloc, capability.name);
     owned.field = try dupeOptionalString(alloc, capability.field);
     owned.path_pattern = try dupeOptionalString(alloc, capability.path_pattern);
@@ -2355,6 +2378,8 @@ fn freeGeneratedFieldCapabilities(
 }
 
 fn freePublicGeneratedFieldCapability(alloc: std.mem.Allocator, capability: metadata_openapi.FieldCapability) void {
+    if (capability.logical_field) |value| alloc.free(@constCast(value));
+    if (capability.value_operations) |ops| freeOwnedStringSlice(alloc, ops);
     if (capability.name) |value| alloc.free(@constCast(value));
     if (capability.field) |value| alloc.free(@constCast(value));
     if (capability.path_pattern) |value| alloc.free(@constCast(value));
@@ -2371,6 +2396,8 @@ fn freePublicGeneratedFieldCapability(alloc: std.mem.Allocator, capability: meta
 }
 
 fn freeGeneratedFieldCapability(alloc: std.mem.Allocator, capability: GeneratedFieldCapability) void {
+    if (capability.logical_field) |value| alloc.free(@constCast(value));
+    if (capability.value_operations) |ops| freeOwnedStringSlice(alloc, ops);
     if (capability.name) |value| alloc.free(@constCast(value));
     if (capability.field) |value| alloc.free(@constCast(value));
     if (capability.path_pattern) |value| alloc.free(@constCast(value));
@@ -6587,4 +6614,20 @@ test "external lake public aggregate recipes expand through schema derivation" {
         "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"count\"},{\"name\":\"n\",\"op\":\"count\"}]}",
     };
     for (invalid) |body| try std.testing.expectError(error.InvalidCreateTableRequest, validatePublicAlgebraicIndexJson(a, body));
+}
+
+test "logical field public capability ownership survives DTO conversion" {
+    const a = std.testing.allocator;
+    const identity = try generatedFieldCapabilityAlloc(a, runtime_schema_mod.reservedIdFieldCapability(.{}));
+    defer freeGeneratedFieldCapability(a, identity);
+    try std.testing.expect(identity.logical_field == null);
+    try std.testing.expect(identity.value_operations == null);
+    var capabilities = std.ArrayListUnmanaged(GeneratedFieldCapability).empty;
+    var capability = runtime_schema_mod.observedDynamicFieldCapability(null, "title._2gram", .{ .field_type = .search_as_you_type, .analyzer = "search_as_you_type" });
+    capability.logical_field = "title";
+    try capabilities.append(a, try generatedFieldCapabilityAlloc(a, capability));
+    const public = try generatedFieldCapabilitiesPublicSliceAlloc(a, &capabilities);
+    defer freeGeneratedFieldCapabilities(a, public);
+    try std.testing.expectEqualStrings("title", public[0].logical_field.?);
+    try std.testing.expect(stringSliceContains(public[0].value_operations.?, "autocomplete"));
 }

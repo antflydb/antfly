@@ -738,6 +738,8 @@ pub const Status = enum(u32) {
     seed_replica_policy_mismatch = 778,
     document_artifact_publication_failed = 779,
     decision_limit_exceeded = 780,
+    value_search_requires_scan = 781,
+    value_search_limit_exceeded = 782,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

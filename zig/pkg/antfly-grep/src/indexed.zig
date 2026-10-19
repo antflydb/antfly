@@ -20,9 +20,15 @@ const document = @import("document.zig");
 const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
-pub const ContentIndex = struct { field: []const u8, full_text_index: ?[]const u8 = null };
-pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", content_index: ?ContentIndex = null, candidate_index: ?CandidateIndex = null };
+pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
+pub const ValueSearchExecution = struct {
+    allow_scan: bool = true,
+    max_documents: u64 = 100_000,
+    max_bytes: u64 = 64 * 1024 * 1024,
+    max_regex_work: u64 = 100_000_000,
+};
 pub const Config = struct {
+    value_search_execution: ValueSearchExecution = .{},
     version: u32,
     endpoint: []const u8,
     tables: []const Table,
@@ -38,15 +44,13 @@ pub fn run(search: anytype) !void {
     const parsed = try std.json.parseFromSlice(Config, search.a, bytes, .{});
     defer parsed.deinit();
     const config = parsed.value;
+    const execution = config.value_search_execution;
+    if (execution.max_documents == 0 or execution.max_bytes == 0 or execution.max_regex_work == 0 or execution.max_documents > std.math.maxInt(i64) or execution.max_bytes > std.math.maxInt(i64) or execution.max_regex_work > std.math.maxInt(i64)) return error.InvalidTableConfig;
     if (config.version != 1 or config.tables.len == 0 or config.page_size == 0 or config.page_size > 1000 or config.max_response_bytes < 1024 or config.max_response_bytes > 256 * 1024 * 1024 or config.max_page_memory < 4096 or config.max_page_memory > 1024 * 1024 * 1024) return error.InvalidTableConfig;
     try @import("providers.zig").validateCustom(config.endpoint);
     for (config.tables, 0..) |table, i| {
         if (table.name.len == 0 or table.document_field.len == 0 or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
         if (table.candidate_index) |index| if (index.version != 1 or index.field.len == 0 or index.version_field.len == 0 or std.mem.indexOfScalar(u8, index.field, 0) != null or std.mem.indexOfScalar(u8, index.version_field, 0) != null) return error.InvalidCandidateIndex;
-        if (table.content_index) |index| {
-            if (index.field.len == 0 or std.mem.indexOfScalar(u8, index.field, 0) != null or table.candidate_index != null) return error.InvalidContentIndex;
-            if (index.full_text_index) |name| if (name.len == 0 or name.len > 256 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidContentIndex;
-        }
         if (table.alias) |alias| if (alias.len == 0) return error.InvalidTableConfig;
         for (config.tables[0..i]) |prior| if (std.mem.eql(u8, prior.alias orelse prior.name, table.alias orelse table.name)) return error.DuplicateTableAlias;
     }
@@ -104,7 +108,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const user_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, filter_arena, raw, .{ .allocate = .alloc_always })).value else null;
     const text_query = try contentQuery(filter_arena, search, table);
     const filter = try candidateFilter(filter_arena, search, table, user_filter);
-    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = text_query, .text_index = if (text_query != null) table.content_index.?.full_text_index else null, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
+    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
     defer search.summary.index_requests += fetcher.summary.index_requests;
     // Finite decision budgets preserve foreground order: speculative page
     // requests must not consume the budget reserved by the user for evidence.
@@ -231,7 +235,6 @@ const Fetch = struct {
     document_field: []const u8,
     filter: ?std.json.Value,
     text_query: ?std.json.Value = null,
-    text_index: ?[]const u8 = null,
     fields: []const []const u8,
     http: *httpx.Client,
     summary: struct { index_requests: usize = 0 } = .{},
@@ -326,7 +329,7 @@ const Fetch = struct {
             defer if (!retained) page.deinit(self.a);
             const a = page.arena.allocator();
             const memory = &page.memory;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .query = if (self.text_query == null) @as(?struct { match_all: struct {} }, .{ .match_all = .{} }) else null, .full_text_search = self.text_query, .full_text_index = self.text_index, .filter_query = self.filter, .fields = self.fields, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .value_search_execution = if (self.text_query != null) @as(?ValueSearchExecution, self.config.value_search_execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
             const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
             var attempt: usize = 0;
@@ -398,39 +401,21 @@ fn backoff(search: anytype, attempt: usize, requested: u64) !void {
     }
 }
 
-/// Each alternative needs a necessary ASCII word fragment. The built-in
-/// substring analyzer lowercases and indexes every word suffix (up to 32 bytes).
-/// Punctuation, Unicode boundaries, regex flags and final matching stay local.
+/// Send proven necessary literals against the logical original-content field.
+/// Representation selection and exact containment verification belong to Antfly.
+/// The complete CLI matcher still owns final grep/PCRE semantics.
 fn contentQuery(a: A, search: anytype, table: Table) !?std.json.Value {
-    const index = table.content_index orelse return null;
-    const o = search.options;
-    if (!canPrune(o)) return null;
+    if (!canPrune(search.options)) return null;
     const literals = (try search.matcher.requiredLiterals(a)) orelse return null;
+    if (literals.len == 0) return null;
+    const field = try std.fmt.allocPrint(a, "{s}.content", .{table.document_field});
     var alternatives: std.ArrayList(std.json.Value) = .empty;
     for (literals) |literal| {
-        const term = substringTerm(literal) orelse return null;
-        const lower = try std.ascii.allocLowerString(a, term);
-        const encoded = if (o.fixed)
-            try std.json.Stringify.valueAlloc(a, .{ .match = lower, .field = index.field }, .{})
-        else
-            try std.json.Stringify.valueAlloc(a, .{ .regexp = try std.fmt.allocPrint(a, "{s}.*", .{lower}), .field = index.field }, .{});
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .contains = literal, .field = field, .case_sensitive = true }, .{});
         try alternatives.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
     }
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .disjuncts = alternatives.items }, .{});
     return try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
-}
-fn substringTerm(literal: []const u8) ?[]const u8 {
-    var best: []const u8 = "";
-    var start: usize = 0;
-    for (literal, 0..) |c, i| {
-        if (!std.ascii.isAlphanumeric(c)) {
-            start = i + 1;
-            continue;
-        }
-        const word_run = literal[start .. i + 1];
-        if (word_run.len > best.len) best = word_run[0..@min(word_run.len, 32)];
-    }
-    return if (best.len >= 3) best else null;
 }
 fn canPrune(o: *const @import("options.zig").Options) bool {
     return !((o.ask != null and (o.patterns.items.len == 0 or o.jev_mode)) or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats or o.null_data or (!std.mem.eql(u8, o.encoding, "auto") and !std.mem.eql(u8, o.encoding, "none")));

@@ -2243,7 +2243,7 @@ components:
     QueryDependencyError:
       type: object
       additionalProperties: false
-      description: A stable failure envelope for query embedding, reranking, and decision dependencies.
+      description: A stable failure envelope for query execution policy and embedding, reranking, and decision dependencies.
       required: [code, error, message, retryable]
       properties:
         code:
@@ -2258,6 +2258,8 @@ components:
             - reranker_upstream_failure
             - decision_limit_exceeded
             - invalid_decision_evaluation
+            - value_search_requires_scan
+            - value_search_limit_exceeded
             - decision_provider_unavailable
             - decision_rate_limited
             - decision_upstream_failure
@@ -4632,6 +4634,19 @@ components:
         field:
           type: string
           description: Concrete query field path when known. Pattern-only dynamic templates may omit this.
+        logical_field:
+          type: string
+          description: Original source field accepted by logical value operations. Physical emitted names remain diagnostic/advanced query targets.
+        value_operations:
+          type: array
+          items:
+            type: string
+            enum: [equals, contains, matches, autocomplete]
+          description: |
+            Logical operations supported for this string source. Availability does
+            not attest index coverage or authorize scans. Value operations verify
+            original values; case_sensitive defaults to true, false uses Unicode
+            simple folding without normalization. Execution policy and budgets apply.
         path_pattern:
           type: string
           description: Dynamic-template path_match pattern, when applicable.
@@ -4653,7 +4668,7 @@ components:
           type: array
           items:
             type: string
-            enum: [full_text, exact, range, geo, autocomplete]
+            enum: [full_text, exact, range, geo, autocomplete, substring]
           description: |
             Query modes supported by this concrete field variant. These modes are derived from
             Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
@@ -9470,6 +9485,34 @@ components:
           minimum: 0
           maximum: 60000
           description: Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
+    ValueSearchExecution:
+      type: object
+      additionalProperties: false
+      description: |
+        Execution policy for logical string-value operations. Limits apply to
+        verification work per shard request, including repeated leaf evaluations.
+        Exhaustion fails explicitly; it never returns a successful partial result.
+      properties:
+        allow_scan:
+          type: boolean
+          default: false
+          description: Permit logical value verification without an indexed candidate constraint.
+        max_documents:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 100000
+        max_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 67108864
+        max_regex_work:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 100000000
+          description: Bound on the sum of original string bytes multiplied by compiled regex states. Charged before regex evaluation; sensitive literals bypass this work.
     QueryRequest: # Based on remoteindex.Query
       type: object
       not:
@@ -9479,7 +9522,6 @@ components:
             allOf:
               - required: [hierarchy]
                 properties:
-
                   hierarchy:
                     required: [group_by]
               - not:
@@ -9582,6 +9624,8 @@ components:
                   - required: [foreign_sources]
                   - required: [remote_snapshot]
       properties:
+        value_search_execution:
+          $ref: "#/components/schemas/ValueSearchExecution"
         read_requirements:
           $ref: '#/components/schemas/ReadRequirements'
         lake_read:
@@ -10409,6 +10453,38 @@ components:
         Detailed execution profiling for a query. Present in the response
         when the request sets `profile: true`.
       properties:
+        value_search:
+          type: object
+          description: Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard.
+          properties:
+            documents:
+              type: integer
+              format: int64
+            bytes:
+              type: integer
+              format: int64
+            plans:
+              type: array
+              items:
+                type: object
+                properties:
+                  operation:
+                    type: string
+                    enum: [equals, contains, matches]
+                  field:
+                    type: string
+                  candidate_field:
+                    type: string
+                    nullable: true
+                  index:
+                    type: string
+                    nullable: true
+                  verification:
+                    type: string
+                    enum: [original_value]
+                  fallback_reason:
+                    type: string
+                    nullable: true
         shards:
           $ref: "#/components/schemas/ShardsProfile"
           description: Shard-level execution statistics.

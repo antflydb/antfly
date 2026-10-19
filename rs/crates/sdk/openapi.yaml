@@ -13858,7 +13858,8 @@ components:
     QueryDependencyError:
       type: object
       additionalProperties: false
-      description: A stable failure envelope for query embedding, reranking, and decision dependencies.
+      description: A stable failure envelope for query execution policy and embedding, reranking, and
+        decision dependencies.
       required:
         - code
         - error
@@ -13877,6 +13878,8 @@ components:
             - reranker_upstream_failure
             - decision_limit_exceeded
             - invalid_decision_evaluation
+            - value_search_requires_scan
+            - value_search_limit_exceeded
             - decision_provider_unavailable
             - decision_rate_limited
             - decision_upstream_failure
@@ -16921,6 +16924,27 @@ components:
         field:
           type: string
           description: Concrete query field path when known. Pattern-only dynamic templates may omit this.
+        logical_field:
+          type: string
+          description: Original source field accepted by logical value operations. Physical emitted names
+            remain diagnostic/advanced query targets.
+        value_operations:
+          type: array
+          items:
+            type: string
+            enum:
+              - equals
+              - contains
+              - matches
+              - autocomplete
+          description: >
+            Logical operations supported for this string source. Availability does
+
+            not attest index coverage or authorize scans. Value operations verify
+
+            original values; case_sensitive defaults to true, false uses Unicode
+
+            simple folding without normalization. Execution policy and budgets apply.
         path_pattern:
           type: string
           description: Dynamic-template path_match pattern, when applicable.
@@ -16949,6 +16973,7 @@ components:
               - range
               - geo
               - autocomplete
+              - substring
           description: >
             Query modes supported by this concrete field variant. These modes are derived from
 
@@ -22435,6 +22460,37 @@ components:
           maximum: 60000
           description: Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded
             by query timeout and cancellation.
+    ValueSearchExecution:
+      type: object
+      additionalProperties: false
+      description: >
+        Execution policy for logical string-value operations. Limits apply to
+
+        verification work per shard request, including repeated leaf evaluations.
+
+        Exhaustion fails explicitly; it never returns a successful partial result.
+      properties:
+        allow_scan:
+          type: boolean
+          default: false
+          description: Permit logical value verification without an indexed candidate constraint.
+        max_documents:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 100000
+        max_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 67108864
+        max_regex_work:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 100000000
+          description: Bound on the sum of original string bytes multiplied by compiled regex states.
+            Charged before regex evaluation; sensitive literals bypass this work.
     QueryRequest:
       type: object
       not:
@@ -22607,6 +22663,8 @@ components:
                   - required:
                       - remote_snapshot
       properties:
+        value_search_execution:
+          $ref: '#/components/schemas/ValueSearchExecution'
         read_requirements:
           $ref: '#/components/schemas/ReadRequirements'
         lake_read:
@@ -23732,6 +23790,43 @@ components:
 
         when the request sets `profile: true`.
       properties:
+        value_search:
+          type: object
+          description: Actual logical value verification work, summed across participating shards; plans
+            describe selected physical fields and scan fallback reasons. Budgets remain per shard.
+          properties:
+            documents:
+              type: integer
+              format: int64
+            bytes:
+              type: integer
+              format: int64
+            plans:
+              type: array
+              items:
+                type: object
+                properties:
+                  operation:
+                    type: string
+                    enum:
+                      - equals
+                      - contains
+                      - matches
+                  field:
+                    type: string
+                  candidate_field:
+                    type: string
+                    nullable: true
+                  index:
+                    type: string
+                    nullable: true
+                  verification:
+                    type: string
+                    enum:
+                      - original_value
+                  fallback_reason:
+                    type: string
+                    nullable: true
         shards:
           $ref: '#/components/schemas/ShardsProfile'
           description: Shard-level execution statistics.
@@ -33669,6 +33764,120 @@ components:
       description: A floating-point number used to decrease or increase the relevance scores of a query.
       default: 1.0
       nullable: true
+    EqualsQuery:
+      type: object
+      additionalProperties: false
+      description: >
+        Whole string equality on the original logical field value.
+
+        No normalization is applied. Case-sensitive by default; case_sensitive=false
+
+        uses Unicode simple case folding, not locale-specific or multi-character folding.
+
+        Missing, null, and non-string values do not match. Arrays use any-element
+
+        semantics; a match never spans array elements. Indexes select conservative
+
+        candidates and original values are verified before counting and pagination.
+      required:
+        - equals
+        - field
+      properties:
+        equals:
+          type: string
+        field:
+          type: string
+          minLength: 1
+          description: Logical source field path, not a companion index name.
+        case_sensitive:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        boost:
+          $ref: '#/components/schemas/Boost'
+    ContainsQuery:
+      type: object
+      additionalProperties: false
+      description: >
+        Contiguous substring search on the original logical field value, including whitespace and punctuation.
+
+        No normalization is applied. Case-sensitive by default; case_sensitive=false
+
+        uses Unicode simple case folding, not locale-specific or multi-character folding.
+
+        Missing, null, and non-string values do not match. Arrays use any-element
+
+        semantics; a match never spans array elements. Indexes select conservative
+
+        candidates and original values are verified before counting and pagination.
+      required:
+        - contains
+        - field
+      properties:
+        contains:
+          type: string
+        field:
+          type: string
+          minLength: 1
+          description: Logical source field path, not a companion index name.
+        case_sensitive:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        boost:
+          $ref: '#/components/schemas/Boost'
+    MatchesQuery:
+      type: object
+      additionalProperties: false
+      description: >
+        Unanchored native Unicode regular expression search on the original logical field value. Anchors
+        refer to each complete value; indexed-term regexp semantics are unchanged.
+
+        No normalization is applied. Case-sensitive by default; case_sensitive=false
+
+        uses Unicode simple case folding, not locale-specific or multi-character folding.
+
+        Missing, null, and non-string values do not match. Arrays use any-element
+
+        semantics; a match never spans array elements. Indexes select conservative
+
+        candidates and original values are verified before counting and pagination.
+      required:
+        - matches
+        - field
+      properties:
+        matches:
+          type: string
+        field:
+          type: string
+          minLength: 1
+          description: Logical source field path, not a companion index name.
+        case_sensitive:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        boost:
+          $ref: '#/components/schemas/Boost'
+    AutocompleteQuery:
+      type: object
+      additionalProperties: false
+      description: >
+        Analyzed bool-prefix search on a logical field. The planner selects
+
+        declared search-as-you-type root, shingle and prefix representations.
+
+        Requires a compatible representation; never silently becomes raw prefix search.
+      required:
+        - autocomplete
+        - field
+      properties:
+        autocomplete:
+          type: string
+        field:
+          type: string
+          minLength: 1
+        boost:
+          $ref: '#/components/schemas/Boost'
     TermQuery:
       type: object
       properties:
@@ -34157,6 +34366,10 @@ components:
         - geometry
     Query:
       oneOf:
+        - $ref: '#/components/schemas/EqualsQuery'
+        - $ref: '#/components/schemas/ContainsQuery'
+        - $ref: '#/components/schemas/MatchesQuery'
+        - $ref: '#/components/schemas/AutocompleteQuery'
         - $ref: '#/components/schemas/TermQuery'
         - $ref: '#/components/schemas/MatchQuery'
         - $ref: '#/components/schemas/MultiMatchQuery'

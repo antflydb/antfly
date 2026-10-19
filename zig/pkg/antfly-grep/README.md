@@ -3580,35 +3580,29 @@ pins a file's serialized payload and observation before yielding its rows.
 
 The design decision and safety contract are recorded in
 [the indexed query planning design](../../../docs/design/antfly-grep.md).
-Configure an existing built-in substring companion to avoid retrieving clear
-nonmatches:
+Configure table names and the document root, without index companion names:
 
 ```json
-{"name":"sources","content_index":{"field":"grep.content._substring"}}
+{"name":"sources","document_field":"grep"}
 ```
 
-Map the content field with `"x-antfly-types": ["text", "substring"]`. The companion
-must index complete content atomically with each stored revision. Optional
-`content_index.full_text_index` selects a named full-text index. The CLI uses
-ordinary `full_text_search` (`match` for literals, a safe `regexp` prefix for
-regex candidates), preserves `filter_query`, projects the source contract, and
-paginates by ascending ID in one retained snapshot. Returned content is always
-verified with the complete local matcher. No grep-specific server API or
-per-document miss proof is required.
+The CLI sends proven necessary literals as ordinary logical `contains` queries on
+`grep.content`. Antfly chooses compatible indexed representations and verifies
+original values before pagination. Mapping the content field with
+`"x-antfly-types": ["text", "substring"]` enables indexed candidate selection.
+The CLI explicitly permits scan fallback; optional `value_search_execution` in
+the table configuration controls `allow_scan`, `max_documents`, `max_bytes`, and
+`max_regex_work`. Server verification budgets apply and
+failures are reported. See the [shared logical-field query design](../../../docs/design/logical-field-queries.md).
 
-Every OR branch needs a proven literal containing an ASCII alphanumeric run of
-at least three bytes. Candidate runs are lowercased and capped at the substring
-index's 32-byte limit. Case and separator normalization may produce extra
-candidates; local verification removes them. Unsafe branches, unsupported
-encodings and modes needing nonmatching documents retain ordinary full traversal.
-JSON/statistics retain exhaustive validation and their existing file/byte totals.
-Tables without an index declaration also use full traversal through the query
-API. `content_index` and legacy raw-trigram `candidate_index` are mutually
-exclusive. Query/index errors remain explicit.
+The complete local matcher still decides final regex/PCRE matches. Unprovable
+branches, unsafe encodings, inversion and modes requiring nonmatching documents
+retain exhaustive query traversal. JSON/statistics retain their existing
+file/byte totals. The older raw-trigram `candidate_index` remains compatible.
 
-[Query-planning validation](bench/results/query-planning-validation.json) records
-253 CLI cases on each of macOS and Linux, 143 native query-contract cases,
-nine native HTTP cases, SDK checks, cross-compilation and artifact hashes.
+[Historical query-planning validation](bench/results/query-planning-validation.json)
+records the earlier companion-routing binary and its exact validation results;
+it is not qualification of the logical-field server planner.
 
 ### Qualification of namespace and tuple changes
 

@@ -2156,6 +2156,7 @@ pub const IndexSortMembership = struct {
 };
 
 pub const FieldCapability = struct {
+    logical_field: ?[]const u8 = null,
     name: ?[]const u8 = null,
     field: ?[]const u8 = null,
     path_pattern: ?[]const u8 = null,
@@ -2267,6 +2268,7 @@ pub fn exactFieldCapability(schema: TableSchema, field: ExactField) FieldCapabil
     const doc_value_coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
     return .{
         .field = field.field,
+        .logical_field = field.source_field,
         .field_type = mapping.field_type,
         .searchable = mapping.do_index,
         .filterable = mappingIsFilterable(mapping),
@@ -2288,9 +2290,10 @@ pub fn fullTextFieldCapability(schema: TableSchema, document_name: []const u8, f
     const capability_field = if (exact_keyword) field.emitted_name else field.path;
     return .{
         .field = capability_field,
+        .logical_field = field.path,
         .emitted_name = field.emitted_name,
         .document_schema = document_name,
-        .field_type = if (exact_keyword) .keyword else .text,
+        .field_type = if (exact_keyword) .keyword else if (std.mem.eql(u8, field.analyzer, "substring")) .substring else if (std.mem.startsWith(u8, field.analyzer, "search_as_you_type")) .search_as_you_type else .text,
         .searchable = true,
         .filterable = exact_keyword,
         .aggregatable = false,
@@ -2400,6 +2403,8 @@ pub fn freeFieldCapabilities(alloc: Allocator, capabilities: []FieldCapability) 
 
 pub fn cloneFieldCapabilityAlloc(alloc: Allocator, capability: FieldCapability) !FieldCapability {
     var cloned = capability;
+    cloned.logical_field = if (capability.logical_field) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cloned.logical_field) |value| alloc.free(value);
     cloned.name = if (capability.name) |value| try alloc.dupe(u8, value) else null;
     errdefer if (cloned.name) |value| alloc.free(value);
     cloned.field = if (capability.field) |value| try alloc.dupe(u8, value) else null;
@@ -2444,6 +2449,7 @@ pub fn cloneFieldCapabilitiesAlloc(alloc: Allocator, capabilities: []const Field
 }
 
 pub fn freeOwnedFieldCapability(alloc: Allocator, capability: FieldCapability) void {
+    if (capability.logical_field) |value| alloc.free(value);
     if (capability.name) |value| alloc.free(value);
     if (capability.field) |value| alloc.free(value);
     if (capability.path_pattern) |value| alloc.free(value);
@@ -4238,4 +4244,63 @@ test "schema v02 public binding preserves writer fields and refuses modern confl
         defer alloc.free(actual);
         try std.testing.expectEqualSlices(u8, bytes, actual);
     }
+}
+
+pub const LogicalDocValues = struct { field: []const u8, mapping: FieldMapping };
+
+/// Prefer an explicitly addressed typed representation. A text source may use
+/// one unambiguous raw keyword companion; conflicting alternatives fail closed.
+pub fn resolveLogicalDocValues(schema: TableSchema, source: []const u8) ?LogicalDocValues {
+    if (resolveDeclaredFieldType(schema, source)) |mapping| {
+        if (mappingHasNativeDocValues(mapping) and mapping.field_type != .text and mapping.field_type != .html and mapping.field_type != .substring and mapping.field_type != .search_as_you_type) return .{ .field = source, .mapping = mapping };
+    }
+    var selected: ?LogicalDocValues = null;
+    for (schema.exact_fields) |field| {
+        if (!std.mem.eql(u8, field.source_field, source) or !std.mem.eql(u8, field.mapping.analyzer, "keyword") or field.mapping.field_type != .keyword or !mappingHasNativeDocValues(field.mapping)) continue;
+        if (selected) |previous| if (!std.mem.eql(u8, previous.field, field.field)) return null;
+        selected = .{ .field = field.field, .mapping = field.mapping };
+    }
+    return selected;
+}
+
+/// Conservative source-to-index resolution shared by logical value planning.
+/// Every document schema must agree; never infer compatibility from a suffix.
+pub fn resolveLogicalTextRepresentation(schema: TableSchema, source: []const u8, analyzer: []const u8) ?[]const u8 {
+    if (schema.full_text_documents.len == 0) {
+        var selected: ?[]const u8 = null;
+        for (schema.exact_fields) |field| {
+            if (!std.mem.eql(u8, field.source_field, source) or !field.mapping.do_index or !std.mem.eql(u8, field.mapping.analyzer, analyzer)) continue;
+            if (selected) |previous| if (!std.mem.eql(u8, previous, field.field)) return null;
+            selected = field.field;
+        }
+        return selected;
+    }
+    var selected: ?[]const u8 = null;
+    for (schema.full_text_documents) |document| {
+        var found: ?[]const u8 = null;
+        for (document.fields) |field| {
+            if (!std.mem.eql(u8, field.path, source) or !std.mem.eql(u8, field.analyzer, analyzer)) continue;
+            if (found != null and !std.mem.eql(u8, found.?, field.emitted_name)) return null;
+            found = field.emitted_name;
+        }
+        if (found == null) return null;
+        if (selected != null and !std.mem.eql(u8, selected.?, found.?)) return null;
+        selected = found;
+    }
+    return selected;
+}
+
+test "logical query representation resolution rejects ambiguity and preserves explicit fields" {
+    const schema: TableSchema = .{ .exact_fields = &.{
+        .{ .source_field = "title", .field = "title", .mapping = .{ .field_type = .text, .analyzer = "standard" } },
+        .{ .source_field = "title", .field = "title._keyword", .mapping = .{ .field_type = .keyword, .analyzer = "keyword", .doc_values = true, .sortable = true } },
+    } };
+    try std.testing.expectEqualStrings("title._keyword", resolveLogicalDocValues(schema, "title").?.field);
+    try std.testing.expectEqualStrings("title._keyword", resolveLogicalDocValues(schema, "title._keyword").?.field);
+    const ambiguous: TableSchema = .{ .exact_fields = &.{
+        schema.exact_fields[0],                                                                        schema.exact_fields[1],
+        .{ .source_field = "title", .field = "title.raw", .mapping = schema.exact_fields[1].mapping },
+    } };
+    try std.testing.expect(resolveLogicalDocValues(ambiguous, "title") == null);
+    try std.testing.expect(resolveLogicalTextRepresentation(ambiguous, "title", "keyword") == null);
 }

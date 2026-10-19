@@ -68,7 +68,6 @@ def run_grep(
     token=None,
     page_size=1,
     candidate_index=None,
-    content_index=None,
 ):
     config = tmp_path / "tables.json"
     config.write_text(
@@ -80,7 +79,6 @@ def run_grep(
                 "tables": [
                     {
                         "name": table,
-                        **({"content_index": content_index} if content_index else {}),
                         **(
                             {"candidate_index": candidate_index}
                             if candidate_index
@@ -130,7 +128,7 @@ def test_native_grep_pagination_large_regions_and_permissions(stateful_api, tmp_
             "c": denied,
             "d": document("empty.py", "no match\n"),
         },
-        sync_level="full_text",
+        sync_level="full_index",
     )
     result = run_grep(tmp_path, stateful_api.url, table, "--json", "needle")
     assert result.returncode == 0, result.stderr.decode()
@@ -162,7 +160,7 @@ def forwarded_scan(
                     api.url + f"/tables/{table}/query", json=body, timeout=60
                 )
                 if len(requests_seen) == 1:
-                    assert response.status_code == 200, response.text
+                    assert response.status_code == 200, (response.text, body)
                     first_page()
                 self.send_response(response.status_code)
                 self.send_header("Content-Length", str(len(response.content)))
@@ -199,7 +197,7 @@ def test_native_grep_snapshot_survives_concurrent_mutation(stateful_api, tmp_pat
             "a": document("a.py", "needle ORIGINAL_A\n"),
             "b": document("b.py", "needle ORIGINAL_B\n"),
         },
-        sync_level="full_text",
+        sync_level="full_index",
     )
 
     def update():
@@ -209,7 +207,7 @@ def test_native_grep_snapshot_survives_concurrent_mutation(stateful_api, tmp_pat
                 "b": document("b.py", "needle CHANGED\n"),
                 "c": document("c.py", "needle ADDED\n"),
             },
-            sync_level="full_text",
+            sync_level="full_index",
         )
 
     result, requests_seen = forwarded_scan(tmp_path, stateful_api, table, update)
@@ -252,7 +250,7 @@ def test_native_grep_expired_snapshot_keeps_partial_results(short_cursor_api, tm
             "a": document("a.py", "needle FIRST\n"),
             "b": document("b.py", "needle SECOND\n"),
         },
-        sync_level="full_text",
+        sync_level="full_index",
     )
     result, seen = forwarded_scan(tmp_path, api, table, lambda: time.sleep(1.2))
     assert result.returncode == 2, result.stderr.decode()
@@ -344,7 +342,7 @@ def test_native_grep_certified_candidates_and_legacy_fallback(stateful_api, tmp_
                 grep_trigrams_version="raw-byte-trigrams-v1",
             )
         rows[key] = row
-    stateful_api.batch_write(table, inserts=rows, sync_level="full_text")
+    stateful_api.batch_write(table, inserts=rows, sync_level="full_index")
     baseline = run_grep(tmp_path, stateful_api.url, table, "-Fl", "TARGET")
     accelerated = run_grep(
         tmp_path,
@@ -380,7 +378,7 @@ def test_native_grep_narrow_listing_and_content_projection(stateful_api, tmp_pat
     denied = document("secret.py", "needle SECRET\n")
     denied["grep"]["permissions"] = {"public": False, "readers": ["other"]}
     stateful_api.batch_write(
-        table, inserts={"a": item, "b": denied}, sync_level="full_text"
+        table, inserts={"a": item, "b": denied}, sync_level="full_index"
     )
     config = tmp_path / "projection.json"
     config.write_text(
@@ -437,7 +435,7 @@ def test_native_grep_json_projects_versioned_contract(stateful_api, tmp_path):
         regions=[{"start_line": 1, "end_line": 1}],
         unrelated_blob="x" * 262144,
     )
-    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_text")
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
     config = tmp_path / "json-projection.json"
     config.write_text(
         json.dumps(
@@ -520,28 +518,24 @@ def test_native_grep_builtin_substring_and_regex_candidates(
             "e": document("miss.py", "irrelevant\n" * 16384),
             "f": document("lines.py", "TARGET\nxyz\n"),
         },
-        sync_level="full_text",
+        sync_level="full_index",
     )
-    index = {"field": "grep.content._substring"}
-    # Both supported predicates retrieve a conservative superset. Local
-    # matching rejects case/normalization and cross-line false positives.
-    for flags in (
-        ["-F", "TARGET"],
-        ["TAR.*xyz"],
-        ["-F", "-e", "TARGET", "-e", "irrelevant"],
+    # The server chooses the companion; no physical field names appear in
+    # configuration. CLI regex semantics are still checked after retrieval.
+    for flags, expected in (
+        (["-F", "TARGET"], {"exact.py", "unicode.py", "lines.py"}),
+        (["TAR.*xyz"], {"exact.py", "punctuation.py", "unicode.py"}),
+        (
+            ["-F", "-e", "TARGET", "-e", "irrelevant"],
+            {"exact.py", "unicode.py", "lines.py", "miss.py"},
+        ),
     ):
-        ordinary = run_grep(tmp_path, stateful_api.url, table, *flags, page_size=2)
-        candidates = run_grep(
-            tmp_path, stateful_api.url, table, *flags, page_size=2, content_index=index
-        )
-        assert ordinary.returncode == candidates.returncode == 0, (
-            candidates.stderr.decode()
-        )
-        assert ordinary.stdout == candidates.stdout
+        result = run_grep(tmp_path, stateful_api.url, table, *flags, page_size=2)
+        assert result.returncode == 0, result.stderr.decode()
+        paths = {line.split(b":", 1)[0].decode() for line in result.stdout.splitlines()}
+        assert paths == expected
     for flags in (["--json", "TARGET"], ["-v", "TARGET"], ["-F", "!!!"]):
-        result = run_grep(
-            tmp_path, stateful_api.url, table, *flags, content_index=index
-        )
+        result = run_grep(tmp_path, stateful_api.url, table, *flags)
         assert result.returncode in (0, 1), result.stderr.decode()
     url = stateful_api.url + f"/tables/{table}/query"
     base = {
@@ -551,20 +545,70 @@ def test_native_grep_builtin_substring_and_regex_candidates(
     }
     full = requests.post(url, json=base, timeout=60)
     selected = dict(base)
-    selected.pop("query")
-    selected["full_text_search"] = {"match": "target", "field": index["field"]}
+    selected["query"] = {"contains": "TARGET", "field": "grep.content"}
+    selected["profile"] = True
     filtered = requests.post(url, json=selected, timeout=60)
     assert full.status_code == filtered.status_code == 200, filtered.text
     assert len(filtered.content) < len(full.content) // 8
     hits = filtered.json()["responses"][0]["hits"]["hits"]
-    assert {h["_id"] for h in hits} == {"a", "b", "c", "d", "f"}
+    assert {h["_id"] for h in hits} == {"a", "d", "f"}
+    profile = filtered.json()["responses"][0]["profile"]["value_search"]
+    assert profile["documents"] >= 3 and profile["bytes"] > 0
+    assert any(
+        plan["candidate_field"] == "grep.content._substring"
+        for plan in profile["plans"]
+    )
     assert all("content" in h["_source"]["grep"] for h in hits)
+
+    def query_ids(query, execution=None):
+        payload = {"query": query, "fields": [], "limit": 100}
+        if execution is not None:
+            payload["value_search_execution"] = execution
+        response = requests.post(url, json=payload, timeout=60)
+        assert response.status_code == 200, response.text
+        return {h["_id"] for h in response.json()["responses"][0]["hits"]["hits"]}
+
+    assert query_ids(
+        {"equals": "TARGET xyz\n", "field": "grep.content"}, {"allow_scan": True}
+    ) == {"a"}
+    assert query_ids(
+        {"contains": "target", "field": "grep.content", "case_sensitive": False},
+        {"allow_scan": True},
+    ) == {"a", "b", "d", "f"}
+    assert query_ids({"matches": "^TAR.*xyz", "field": "grep.content"}) == {"a", "c"}
+    assert query_ids({"matches": "TARGET\nxyz", "field": "grep.content"}) == {"f"}
+    assert query_ids(
+        {
+            "bool": {
+                "must": [{"match_all": {}}],
+                "must_not": [{"contains": "TARGET", "field": "grep.content"}],
+            }
+        }
+    ) == {"b", "c", "e"}
+    refused = requests.post(
+        url, json={"query": {"contains": "!", "field": "grep.content"}}, timeout=60
+    )
+    assert (
+        refused.status_code == 422 and "value_search_requires_scan" in refused.text
+    ), refused.text
+    exhausted = requests.post(
+        url,
+        json={
+            "query": {"contains": "TARGET", "field": "grep.content"},
+            "count": True,
+            "value_search_execution": {"max_documents": 1},
+        },
+        timeout=60,
+    )
+    assert (
+        exhausted.status_code == 422 and "value_search_limit_exceeded" in exhausted.text
+    ), exhausted.text
 
     def update_miss():
         stateful_api.batch_write(
             table,
             inserts={"e": document("miss.py", "TARGET NEW\n")},
-            sync_level="full_text",
+            sync_level="full_index",
         )
 
     frozen, seen = forwarded_scan(
@@ -573,11 +617,119 @@ def test_native_grep_builtin_substring_and_regex_candidates(
         table,
         update_miss,
         pattern="TARGET",
-        content_index=index,
     )
     assert frozen.returncode == 0, frozen.stderr.decode()
     assert b"NEW" not in frozen.stdout and b"exact.py" in frozen.stdout
     assert len(seen) > 1
-    assert all(q["full_text_search"] == seen[0]["full_text_search"] for q in seen)
+    assert all(q["query"] == seen[0]["query"] for q in seen)
     assert all("remote_snapshot" in q for q in seen[1:])
     assert all("grep_scan" not in q for q in seen)
+
+
+def test_logical_keyword_and_autocomplete_use_source_fields(stateful_api):
+    table = f"logical_fields_{time.time_ns()}"
+    stateful_api.post(
+        f"/tables/{table}",
+        {
+            "num_shards": 1,
+            "schema": {
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "x-antfly-types": [
+                                        "text",
+                                        "keyword",
+                                        "search_as_you_type",
+                                    ],
+                                }
+                            },
+                        }
+                    }
+                },
+            },
+        },
+    )
+    stateful_api.batch_write(
+        table,
+        inserts={
+            "a": {"title": "Distributed Systems"},
+            "b": {"title": "distributed storage"},
+            "c": {"title": "Distinct Sequences"},
+        },
+        sync_level="full_index",
+    )
+    url = stateful_api.url + f"/tables/{table}/query"
+    for query in (
+        {"equals": "Distributed Systems", "field": "title"},
+        {"autocomplete": "distributed sy", "field": "title"},
+    ):
+        response = requests.post(
+            url, json={"query": query, "profile": True, "limit": 10}, timeout=60
+        )
+        assert response.status_code == 200, response.text
+        result = response.json()["responses"][0]
+        assert {hit["_id"] for hit in result["hits"]["hits"]} == (
+            {"a"} if "equals" in query else {"a", "b"}
+        )
+        if "equals" in query:
+            plan = result["profile"]["value_search"]["plans"][0]
+            assert plan["field"] == "title" and plan["candidate_field"] is not None
+    capabilities = stateful_api.get(f"/tables/{table}")["field_capabilities"]
+    title = [cap for cap in capabilities if cap.get("logical_field") == "title"]
+    assert any("autocomplete" in cap.get("value_operations", []) for cap in title)
+    assert any("equals" in cap.get("value_operations", []) for cap in title)
+
+
+def test_logical_sort_uses_keyword_companion_at_public_boundary(stateful_api):
+    table = f"logical_sort_{time.time_ns()}"
+    stateful_api.post(
+        f"/tables/{table}",
+        {
+            "num_shards": 1,
+            "indexes": {"text": {"type": "full_text"}},
+            "schema": {
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "x-antfly-field": {
+                                        "type": "text",
+                                        "fields": {
+                                            "keyword": {
+                                                "type": "keyword",
+                                                "sortable": True,
+                                            }
+                                        },
+                                    },
+                                }
+                            },
+                        }
+                    }
+                },
+            },
+        },
+    )
+    stateful_api.batch_write(
+        table,
+        inserts={"a": {"title": "zebra"}, "b": {"title": "Apple"}},
+        sync_level="full_index",
+    )
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query",
+        json={"query": {"match_all": {}}, "order_by": [{"field": "title"}], "limit": 2},
+        timeout=60,
+    )
+    assert response.status_code == 200, response.text
+    assert [hit["_id"] for hit in response.json()["responses"][0]["hits"]["hits"]] == [
+        "b",
+        "a",
+    ]

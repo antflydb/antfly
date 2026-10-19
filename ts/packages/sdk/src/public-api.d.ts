@@ -5267,10 +5267,10 @@ export interface components {
              */
             retryable: true;
         };
-        /** @description A stable failure envelope for query embedding, reranking, and decision dependencies. */
+        /** @description A stable failure envelope for query execution policy and embedding, reranking, and decision dependencies. */
         QueryDependencyError: {
             /** @enum {string} */
-            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
+            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "value_search_requires_scan" | "value_search_limit_exceeded" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
             /** @description Legacy alias of code. Use code for programmatic handling. */
             error: string;
             message: string;
@@ -7118,6 +7118,15 @@ export interface components {
             name?: string;
             /** @description Concrete query field path when known. Pattern-only dynamic templates may omit this. */
             field?: string;
+            /** @description Original source field accepted by logical value operations. Physical emitted names remain diagnostic/advanced query targets. */
+            logical_field?: string;
+            /**
+             * @description Logical operations supported for this string source. Availability does
+             *     not attest index coverage or authorize scans. Value operations verify
+             *     original values; case_sensitive defaults to true, false uses Unicode
+             *     simple folding without normalization. Execution policy and budgets apply.
+             */
+            value_operations?: ("equals" | "contains" | "matches" | "autocomplete")[];
             /** @description Dynamic-template path_match pattern, when applicable. */
             path_pattern?: string;
             /** @description Dynamic-template match pattern, when applicable. */
@@ -7134,7 +7143,7 @@ export interface components {
              *     Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
              *     `search_as_you_type`; they are not separate schema toggles.
              */
-            query_modes: ("full_text" | "exact" | "range" | "geo" | "autocomplete")[];
+            query_modes: ("full_text" | "exact" | "range" | "geo" | "autocomplete" | "substring")[];
             /**
              * @description Whether this concrete field is declared sortable in the effective
              *     capability model. A cold declared field is validated on first
@@ -10507,7 +10516,36 @@ export interface components {
              */
             wait_ms?: number;
         };
+        /**
+         * @description Execution policy for logical string-value operations. Limits apply to
+         *     verification work per shard request, including repeated leaf evaluations.
+         *     Exhaustion fails explicitly; it never returns a successful partial result.
+         */
+        ValueSearchExecution: {
+            /**
+             * @description Permit logical value verification without an indexed candidate constraint.
+             * @default false
+             */
+            allow_scan?: boolean;
+            /**
+             * Format: int64
+             * @default 100000
+             */
+            max_documents?: number;
+            /**
+             * Format: int64
+             * @default 67108864
+             */
+            max_bytes?: number;
+            /**
+             * Format: int64
+             * @description Bound on the sum of original string bytes multiplied by compiled regex states. Charged before regex evaluation; sensitive literals bypass this work.
+             * @default 100000000
+             */
+            max_regex_work?: number;
+        };
         QueryRequest: {
+            value_search_execution?: components["schemas"]["ValueSearchExecution"];
             read_requirements?: components["schemas"]["ReadRequirements"];
             /** @deprecated */
             lake_read?: components["schemas"]["LakeReadRequirement"];
@@ -11232,6 +11270,23 @@ export interface components {
          *     when the request sets `profile: true`.
          */
         QueryProfile: {
+            /** @description Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard. */
+            value_search?: {
+                /** Format: int64 */
+                documents?: number;
+                /** Format: int64 */
+                bytes?: number;
+                plans?: {
+                    /** @enum {string} */
+                    operation?: "equals" | "contains" | "matches";
+                    field?: string;
+                    candidate_field?: string | null;
+                    index?: string | null;
+                    /** @enum {string} */
+                    verification?: "original_value";
+                    fallback_reason?: string | null;
+                }[];
+            };
             /** @description Shard-level execution statistics. */
             shards?: components["schemas"]["ShardsProfile"];
             /** @description Join execution statistics (present when query used a join). */
@@ -17293,6 +17348,64 @@ export interface components {
          * @default 1
          */
         Boost: number | null;
+        /**
+         * @description Whole string equality on the original logical field value.
+         *     No normalization is applied. Case-sensitive by default; case_sensitive=false
+         *     uses Unicode simple case folding, not locale-specific or multi-character folding.
+         *     Missing, null, and non-string values do not match. Arrays use any-element
+         *     semantics; a match never spans array elements. Indexes select conservative
+         *     candidates and original values are verified before counting and pagination.
+         */
+        EqualsQuery: {
+            equals: string;
+            /** @description Logical source field path, not a companion index name. */
+            field: string;
+            /** @default true */
+            case_sensitive?: boolean;
+            boost?: components["schemas"]["Boost"];
+        };
+        /**
+         * @description Contiguous substring search on the original logical field value, including whitespace and punctuation.
+         *     No normalization is applied. Case-sensitive by default; case_sensitive=false
+         *     uses Unicode simple case folding, not locale-specific or multi-character folding.
+         *     Missing, null, and non-string values do not match. Arrays use any-element
+         *     semantics; a match never spans array elements. Indexes select conservative
+         *     candidates and original values are verified before counting and pagination.
+         */
+        ContainsQuery: {
+            contains: string;
+            /** @description Logical source field path, not a companion index name. */
+            field: string;
+            /** @default true */
+            case_sensitive?: boolean;
+            boost?: components["schemas"]["Boost"];
+        };
+        /**
+         * @description Unanchored native Unicode regular expression search on the original logical field value. Anchors refer to each complete value; indexed-term regexp semantics are unchanged.
+         *     No normalization is applied. Case-sensitive by default; case_sensitive=false
+         *     uses Unicode simple case folding, not locale-specific or multi-character folding.
+         *     Missing, null, and non-string values do not match. Arrays use any-element
+         *     semantics; a match never spans array elements. Indexes select conservative
+         *     candidates and original values are verified before counting and pagination.
+         */
+        MatchesQuery: {
+            matches: string;
+            /** @description Logical source field path, not a companion index name. */
+            field: string;
+            /** @default true */
+            case_sensitive?: boolean;
+            boost?: components["schemas"]["Boost"];
+        };
+        /**
+         * @description Analyzed bool-prefix search on a logical field. The planner selects
+         *     declared search-as-you-type root, shingle and prefix representations.
+         *     Requires a compatible representation; never silently becomes raw prefix search.
+         */
+        AutocompleteQuery: {
+            autocomplete: string;
+            field: string;
+            boost?: components["schemas"]["Boost"];
+        };
         TermQuery: {
             term: string;
             field?: string;
@@ -17513,7 +17626,7 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        Query: components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
+        Query: components["schemas"]["EqualsQuery"] | components["schemas"]["ContainsQuery"] | components["schemas"]["MatchesQuery"] | components["schemas"]["AutocompleteQuery"] | components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
         /**
          * @description Merge strategy for combining results from the semantic_search and full_text_search.
          *     rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula

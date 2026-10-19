@@ -364,6 +364,7 @@ pub const TraverseResponse = types.TraverseResponse;
 pub const UnsupportedHierarchyGroupingError = types.UnsupportedHierarchyGroupingError;
 pub const UnsupportedIndexCapabilityError = types.UnsupportedIndexCapabilityError;
 pub const UnsupportedQueryError = types.UnsupportedQueryError;
+pub const ValueSearchExecution = types.ValueSearchExecution;
 pub const VectorSourceStorageStatus = types.VectorSourceStorageStatus;
 pub const WebSearchConnection = types.WebSearchConnection;
 pub const OpenApiUpdateSchemaResponse202 = types.OpenApiUpdateSchemaResponse202;

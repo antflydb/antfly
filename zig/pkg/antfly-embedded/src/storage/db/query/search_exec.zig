@@ -1845,6 +1845,7 @@ const NativeDocIdConstraints = struct {
 };
 
 pub const StructuredFilterResolverExecutor = struct {
+    load_stored: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8 = null,
     /// The provider maps public document IDs exactly into its native identity space.
     exact_doc_id_filters: bool = false,
     ctx: ?*anyopaque,
@@ -2453,7 +2454,7 @@ fn collectFullTextResolvedDocSetAlloc(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    const search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+    const search_query: search_mod.SearchQuery = .{ .match_all = {} };
 
     return try collectSearchQueryResolvedDocSetAlloc(
         alloc,
@@ -2463,6 +2464,7 @@ fn collectFullTextResolvedDocSetAlloc(
         search_query,
         true,
         .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
+        .{ .query = text_query, .request = req },
     );
 }
 
@@ -8889,6 +8891,7 @@ fn collectStructuredFilterResolvedDocSetAlloc(
         search_query,
         false,
         .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
+        null,
     );
 }
 
@@ -8897,9 +8900,10 @@ fn collectSearchQueryResolvedDocSetAlloc(
     arena_alloc: Allocator,
     executor: StructuredFilterResolverExecutor,
     text_entry: *index_manager_mod.IndexManager.TextIndex,
-    search_query: search_mod.SearchQuery,
+    unresolved_query: search_mod.SearchQuery,
     allow_analyzed_terms: bool,
     control: query_mod.ExecutionControl,
+    logical: ?struct { query: types.TextQuery, request: types.SearchRequest },
 ) !?doc_set.ResolvedDocSet {
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
@@ -8913,6 +8917,10 @@ fn collectSearchQueryResolvedDocSetAlloc(
     const snapshot_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     const snapshot = text_entry.persistent.acquireSnapshot();
     defer snapshot.release();
+    var values = ValueExecution{ .a = alloc, .snapshot = snapshot, .req = if (logical) |l| l.request else .{}, .load_ctx = executor.ctx, .load = executor.load_stored };
+    defer values.deinit();
+    const search_query = if (logical) |l| try textQueryToSearchQueryWithValues(arena_alloc, l.query, text_entry.text_analysis, text_entry.runtime_schema, &values) else unresolved_query;
+
     if (bench_profile) snapshot_ns = platform_time.monotonicNs() - snapshot_start_ns;
     const capability_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     if (!(try searchQueryCanUseSnapshot(
@@ -11965,7 +11973,9 @@ pub fn searchTextQuery(
     // The trusted lake coordinator prepared this exact text query once under
     // the pinned index configuration. Borrow its analyzer and syntax identities
     // across windows; subsequent predicate/key transformations remain local.
-    var base_search_query = if (effective_req.text_navigation_plan) |prepared| prepared.query else try textQueryToSearchQuery(arena_alloc, text_query, text_source.text_analysis, text_source.runtime_schema);
+    var value_execution = ValueExecution{ .a = alloc, .snapshot = text_source.snapshot, .req = effective_req, .load_ctx = executor.ctx, .load = executor.load_stored };
+    defer value_execution.deinit();
+    var base_search_query = if (effective_req.text_navigation_plan) |prepared| prepared.query else try textQueryToSearchQueryWithValues(arena_alloc, text_query, text_source.text_analysis, text_source.runtime_schema, &value_execution);
     if (executor.native_key) |native_key| base_search_query = try projectTextQueryKeys(arena_alloc, executor.ctx, native_key, base_search_query);
     // Full-text projection publishes replacement snapshots independently of
     // query execution. Pin this generation for the entire request: a borrowed
@@ -12023,6 +12033,7 @@ pub fn searchTextQuery(
         constraint_req.exclusion_query_json = "";
     }
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, constraint_req, .{
+        .load_stored = executor.load_stored,
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
         .exact_doc_id_filters = executor.exact_doc_id_filters,
@@ -16629,6 +16640,7 @@ fn snapshotGeoPointDocValuesCoverage(
 }
 
 fn sortFieldMapping(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.FieldMapping {
+    if (runtime_schema_mod.resolveLogicalDocValues(schema, field)) |resolved| return resolved.mapping;
     return runtime_schema_mod.resolveDeclaredFieldType(schema, field);
 }
 
@@ -18649,13 +18661,183 @@ const MatchAllCandidateCollectState = struct {
     }
 };
 
+const value_query = @import("../../../search/value_query.zig");
+
+/// Request-owned verification: compact membership is memoized so rescoring,
+/// cursor collection and counting do not reload the same original values.
+const ValueExecution = struct {
+    a: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    req: types.SearchRequest,
+    load_ctx: ?*anyopaque,
+    load: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    producers: std.ArrayListUnmanaged(*ValueProducer) = .empty,
+    local_work: value_query.Work = .{},
+    fn deinit(self: *@This()) void {
+        for (self.producers.items) |producer| {
+            producer.matcher.deinit();
+            producer.visited.deinit();
+            producer.matched.deinit();
+            self.a.destroy(producer);
+        }
+        self.producers.deinit(self.a);
+        self.local_work.deinit(self.a);
+    }
+    fn prepare(self: *@This(), arena: Allocator, spec: value_query.Spec, analysis: introducer_mod.TextAnalysisConfig, schema: ?runtime_schema_mod.TableSchema) !search_mod.SearchQuery {
+        const producer = try self.a.create(ValueProducer);
+        errdefer self.a.destroy(producer);
+        producer.* = .{ .owner = self, .visited = roaring.RoaringBitmap.init(self.a), .matched = roaring.RoaringBitmap.init(self.a) };
+        errdefer producer.visited.deinit();
+        errdefer producer.matched.deinit();
+        try producer.matcher.init(self.a, spec);
+        errdefer producer.matcher.deinit();
+        producer.matcher.work = self.req.value_search_work orelse &self.local_work;
+        producer.matcher.policy = self.req.value_search_execution;
+        var candidate: ?search_mod.SearchQuery = null;
+        if (spec.case_sensitive and spec.text.len != 0) {
+            if (spec.kind == .equals) {
+                if (try valueRepresentation(arena, schema, spec.field, "keyword")) |field| {
+                    candidate = .{ .term = .{ .field = field, .term = spec.text } };
+                }
+            } else {
+                const literal = if (spec.kind == .contains) spec.text else producer.matcher.pattern.?.prefilter;
+                if (longestAsciiFragment(literal)) |fragment| {
+                    if (try valueRepresentation(arena, schema, spec.field, "substring")) |field| {
+                        const folded = try arena.dupe(u8, fragment);
+                        for (folded) |*byte| byte.* = std.ascii.toLower(byte.*);
+                        candidate = .{ .prefix = .{ .field = field, .prefix = folded } };
+                    }
+                }
+            }
+        }
+        _ = analysis;
+        if (candidate) |query| {
+            producer.candidate = try search_mod.searchQueryToFilterArena(arena, query);
+        } else if (!self.req.value_search_execution.allow_scan) return error.ValueSearchRequiresScan;
+        if (self.req.profile) {
+            const physical: ?[]const u8 = if (candidate) |q| switch (q) {
+                .term => |t| t.field,
+                .prefix => |t| t.field,
+                else => null,
+            } else null;
+            const work = self.req.value_search_work orelse &self.local_work;
+            try work.record(self.a, spec, physical, self.req.index_name, if (candidate == null) "no_safe_indexed_constraint" else null);
+        }
+        if (self.load == null) return error.UnsupportedQueryRequest;
+        try self.producers.append(self.a, producer);
+        return .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = producer, .produce = ValueProducer.produce }, .boost = spec.boost } };
+    }
+};
+
+const ValueProducer = struct {
+    owner: *ValueExecution,
+    matcher: value_query.Matcher = undefined,
+    candidate: ?@import("../../../search/query.zig").Filter = null,
+    visited: roaring.RoaringBitmap,
+    matched: roaring.RoaringBitmap,
+    fn produce(raw: *anyopaque, a: Allocator, offset: u32, count: u32, incoming: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const owner = self.owner;
+        const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = owner.req.cancellation, .deadline_ns = owner.req.execution_deadline_ns, .pattern_programs = owner.req.text_pattern_programs, .pattern_cache = owner.req.text_pattern_membership };
+        try control.check();
+        var result = roaring.RoaringBitmap.init(a);
+        errdefer result.deinit();
+        if (count == 0) return result;
+        const resolved = owner.snapshot.resolveDocId(offset) orelse return error.InvalidArgument;
+        var lease = try owner.snapshot.leaseSegment(resolved.seg_idx);
+        defer lease.deinit();
+        var indexed = if (self.candidate) |filter| try filter.withControl(control).executeWithOffset(a, lease.entry, offset) else null;
+        defer if (indexed) |*bitmap| bitmap.deinit();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        if (indexed) |*bitmap| if (incoming) |other| bitmap.andWith(other);
+        const selected: ?*const roaring.RoaringBitmap = if (indexed) |*bitmap| bitmap else incoming;
+        var iterator = if (selected) |bitmap| bitmap.iterator() else null;
+        var sequential: u32 = 0;
+        while (true) {
+            const local = if (iterator) |*it| it.next() orelse break else blk: {
+                if (sequential >= count) break;
+                const next = sequential;
+                sequential += 1;
+                break :blk next;
+            };
+            if (local >= count) return error.InvalidArgument;
+            const global = offset + local;
+            if (self.visited.contains(global)) {
+                if (self.matched.contains(global)) try result.add(local);
+                continue;
+            }
+            try control.check();
+            const work = owner.req.value_search_work orelse &owner.local_work;
+            try value_query.Work.charge(&work.documents, 1, owner.req.value_search_execution.max_documents);
+            _ = scratch.reset(.retain_capacity);
+            const id = (try owner.snapshot.storedIdScoped(scratch.allocator(), global)) orelse return error.StoredDocMissing;
+            // This loader is bound to the request's admitted primary read generation.
+            const stored = try owner.load.?(owner.load_ctx, scratch.allocator(), id);
+            var matched = false;
+            if (stored) |bytes| {
+                try value_query.Work.charge(&work.bytes, bytes.len, owner.req.value_search_execution.max_bytes);
+                const parsed = try std.json.parseFromSlice(std.json.Value, scratch.allocator(), bytes, .{ .allocate = .alloc_if_needed });
+                matched = try self.matcher.document(parsed.value);
+            }
+            try self.visited.add(global);
+            if (matched) {
+                try self.matched.add(global);
+                try result.add(local);
+            }
+        }
+        return result;
+    }
+};
+
+fn longestAsciiFragment(text: []const u8) ?[]const u8 {
+    var best: []const u8 = "";
+    var start: usize = 0;
+    for (text, 0..) |byte, i| {
+        if (!std.ascii.isAlphanumeric(byte)) {
+            start = i + 1;
+            continue;
+        }
+        const run = text[start .. i + 1];
+        if (run.len > best.len) best = run;
+    }
+    if (best.len < 3) return null;
+    return best[0..@min(best.len, 32)];
+}
+
+/// Resolve by source mapping and analyzer, never by a guessed suffix. Every
+/// document schema must agree; otherwise use the explicitly permitted scan.
+fn valueRepresentation(a: Allocator, optional_schema: ?runtime_schema_mod.TableSchema, source: []const u8, analyzer: []const u8) !?[]const u8 {
+    const schema = optional_schema orelse return null;
+    const field = runtime_schema_mod.resolveLogicalTextRepresentation(schema, source, analyzer) orelse return null;
+    return try a.dupe(u8, field);
+}
+
 pub fn textQueryToSearchQuery(
     alloc: Allocator,
     text_query: types.TextQuery,
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) anyerror!search_mod.SearchQuery {
+    return textQueryToSearchQueryWithValues(alloc, text_query, text_analysis, runtime_schema, null);
+}
+
+fn textQueryToSearchQueryWithValues(
+    alloc: Allocator,
+    text_query: types.TextQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+    values: ?*ValueExecution,
+) anyerror!search_mod.SearchQuery {
     return switch (text_query) {
+        .value => |spec| if (values) |execution| try execution.prepare(alloc, spec, text_analysis, runtime_schema) else return error.UnsupportedQueryRequest,
+        .autocomplete => |query| blk: {
+            const companion = try std.fmt.allocPrint(alloc, "{s}._2gram", .{query.field});
+            if (!fieldUsesAnalyzer(text_analysis, runtime_schema, companion, "search_as_you_type_2gram")) return error.UnsupportedQueryRequest;
+            const fields = try alloc.alloc(types.TextMultiMatchField, 1);
+            fields[0] = .{ .field = query.field, .boost = 1 };
+            break :blk try multiMatchBoolPrefixToSearchQuery(alloc, .{ .query = query.text, .fields = fields, .boost = query.boost }, text_analysis, runtime_schema);
+        },
         .match_none => .{ .match_none = {} },
         .match_all => .{ .match_all = {} },
         .phrase => |phrase| .{ .term_phrase = .{
@@ -18798,9 +18980,9 @@ pub fn textQueryToSearchQuery(
             .boost = regexp.boost,
         } },
         .bool_query => |bool_query| .{ .bool_query = .{
-            .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema),
-            .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema),
-            .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema),
+            .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema, values),
+            .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema, values),
+            .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema, values),
             .min_should = bool_query.min_should,
             .pure_should_optional = bool_query.pure_should_optional,
             .boost = bool_query.boost,
@@ -18813,12 +18995,13 @@ fn textQuerySliceToSearchQuerySlice(
     items: []const types.TextQuery,
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
+    values: ?*ValueExecution,
 ) anyerror![]search_mod.SearchQuery {
     if (items.len == 0) return &.{};
     var out = try alloc.alloc(search_mod.SearchQuery, items.len);
     errdefer alloc.free(out);
     for (items, 0..) |item, i| {
-        out[i] = try textQueryToSearchQuery(alloc, item, text_analysis, runtime_schema);
+        out[i] = try textQueryToSearchQueryWithValues(alloc, item, text_analysis, runtime_schema, values);
     }
     return out;
 }
@@ -33207,4 +33390,54 @@ test "external lake metadata navigation component timing belongs to completed ex
     var second = try batch.take();
     defer second.deinit();
     try std.testing.expectEqual(@as(?u64, 75 * std.time.ns_per_ms), batch.lastExecutionNs());
+}
+
+test "logical value producers verify before counts negation and pagination and memoize source loads" {
+    const a = std.testing.allocator;
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{
+        .{ .path = "content", .emitted_name = "content._substring", .analyzer = "substring" },
+        .{ .path = "content", .emitted_name = "content._keyword", .analyzer = "keyword" },
+    } }} };
+    const documents = [_]mapper_mod.MapperDoc{
+        .{ .key = "a", .value = "{\"content\":\"connection refused\"}" },
+        .{ .key = "b", .value = "{\"content\":\"Connection-refused\"}" },
+        .{ .key = "c", .value = "{\"content\":\"connection-refused\"}" },
+        .{ .key = "d", .value = "{\"content\":\"no match\"}" },
+    };
+    const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &documents, .{}, schema)).?;
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const Loader = struct {
+        calls: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, id: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            for (documents) |doc| if (std.mem.eql(u8, doc.key, id)) return try alloc.dupe(u8, doc.value);
+            return null;
+        }
+    };
+    var loader = Loader{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var execution = ValueExecution{ .a = a, .snapshot = writer.snapshot(), .req = .{}, .load_ctx = &loader, .load = Loader.load };
+    defer execution.deinit();
+    const query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "connection-refused" } }, .{}, schema, &execution);
+    try std.testing.expectEqual(@as(u32, 1), try search_mod.countMatches(a, writer.snapshot(), query));
+    try std.testing.expectEqual(@as(usize, 3), loader.calls);
+    try std.testing.expectEqual(@as(u32, 1), try search_mod.countMatches(a, writer.snapshot(), query));
+    try std.testing.expectEqual(@as(usize, 3), loader.calls);
+    const negative: search_mod.SearchQuery = .{ .bool_query = .{ .must = &.{.{ .match_all = {} }}, .must_not = &.{query} } };
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), negative));
+    var page = try search_mod.execute(a, writer.snapshot(), .{ .query = query, .k = 1, .include_stored = false });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), page.hits[0].doc_id);
+    const equals = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .equals, .field = "content", .text = "connection-refused" } }, .{}, schema, &execution);
+    try std.testing.expectEqual(@as(u32, 1), try search_mod.countMatches(a, writer.snapshot(), equals));
+    try std.testing.expectError(error.ValueSearchRequiresScan, textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "-" } }, .{}, schema, &execution));
+    execution.req.value_search_execution = .{ .allow_scan = true, .max_documents = 1 };
+    const scan = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "-" } }, .{}, schema, &execution);
+    try std.testing.expectError(error.ValueSearchLimitExceeded, search_mod.countMatches(a, writer.snapshot(), scan));
 }

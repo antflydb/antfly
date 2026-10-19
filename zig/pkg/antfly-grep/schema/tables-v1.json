@@ -76,32 +76,7 @@
               }
             },
             "description": "Complete raw-content byte trigrams encoded as lowercase hex keyword terms; atomic with the source revision. Opt-in acceleration only."
-          },
-          "content_index": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "field"
-            ],
-            "properties": {
-              "field": {
-                "type": "string",
-                "minLength": 1
-              },
-              "full_text_index": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256
-              }
-            },
-            "description": "Built-in substring companion over complete stored content, indexed atomically with every revision. Ordinary full_text_search candidates are verified locally. Mutually exclusive with candidate_index."
           }
-        },
-        "not": {
-          "required": [
-            "candidate_index",
-            "content_index"
-          ]
         }
       }
     },
@@ -114,6 +89,35 @@
       "type": "boolean",
       "default": true,
       "description": "Overlap one retained-snapshot page with local processing. At most two decoded pages are live; quiet and finite per-file match limits use sequential retrieval."
+    },
+    "value_search_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ordinary query execution policy for logical value predicates. Budgets apply per shard request; exhausted budgets are explicit failures.",
+      "properties": {
+        "allow_scan": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_documents": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 100000
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 67108864
+        },
+        "max_regex_work": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 100000000
+        }
+      }
     }
   }
 }

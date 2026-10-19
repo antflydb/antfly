@@ -4523,6 +4523,10 @@ pub const FieldCapability = struct {
     name: ?[]const u8 = null,
     /// Concrete query field path when known. Pattern-only dynamic templates may omit this.
     field: ?[]const u8 = null,
+    /// Original source field accepted by logical value operations. Physical emitted names remain diagnostic/advanced query targets.
+    logical_field: ?[]const u8 = null,
+    /// Logical operations supported for this string source. Availability does not attest index coverage or authorize scans. Value operations verify original values; case_sensitive defaults to true, false uses Unicode simple folding without normalization. Execution policy and budgets apply.
+    value_operations: ?[]const []const u8 = null,
     /// Dynamic-template path_match pattern, when applicable.
     path_pattern: ?[]const u8 = null,
     /// Dynamic-template match pattern, when applicable.
@@ -4555,6 +4559,8 @@ pub const FieldCapability = struct {
     pub const openApiFieldMetadata = .{
         .{ "name", "name", true },
         .{ "field", "field", true },
+        .{ "logical_field", "logical_field", true },
+        .{ "value_operations", "value_operations", true },
         .{ "path_pattern", "path_pattern", true },
         .{ "field_pattern", "field_pattern", true },
         .{ "match_mapping_type", "match_mapping_type", true },
@@ -4587,6 +4593,14 @@ pub const FieldCapability = struct {
         }
         if (self.field) |value| {
             try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.logical_field) |value| {
+            try jw.objectField("logical_field");
+            try jw.write(value);
+        }
+        if (self.value_operations) |value| {
+            try jw.objectField("value_operations");
             try jw.write(value);
         }
         if (self.path_pattern) |value| {
@@ -4774,6 +4788,7 @@ pub const ForeignSource = struct {
 
 /// A stateful global query. Specify a table target or a composed source.
 pub const GlobalStatefulQueryRequest = struct {
+    value_search_execution: ?ValueSearchExecution = null,
     read_requirements: ?ReadRequirements = null,
     lake_read: ?LakeReadRequirement = null,
     /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
@@ -4861,6 +4876,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "value_search_execution", "value_search_execution", true },
         .{ "read_requirements", "read_requirements", true },
         .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -4919,6 +4935,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.value_search_execution) |value| {
+            try jw.objectField("value_search_execution");
+            try jw.write(value);
+        }
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
             try jw.write(value);
@@ -8076,7 +8096,7 @@ pub const QueryConflictError = union(enum) {
     }
 };
 
-/// A stable failure envelope for query embedding, reranking, and decision dependencies.
+/// A stable failure envelope for query execution policy and embedding, reranking, and decision dependencies.
 pub const QueryDependencyError = struct {
     code: []const u8,
     /// Legacy alias of code. Use code for programmatic handling.
@@ -8552,6 +8572,8 @@ pub const QueryHitsTotal = struct {
 
 /// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
 pub const QueryProfile = struct {
+    /// Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard.
+    value_search: ?std.json.Value = null,
     /// Shard-level execution statistics.
     shards: ?ShardsProfile = null,
     /// Join execution statistics (present when query used a join).
@@ -8567,6 +8589,7 @@ pub const QueryProfile = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "value_search", "value_search", true },
         .{ "shards", "shards", true },
         .{ "join", "join", true },
         .{ "reranker", "reranker", true },
@@ -8585,6 +8608,10 @@ pub const QueryProfile = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.value_search) |value| {
+            try jw.objectField("value_search");
+            try jw.write(value);
+        }
         if (self.shards) |value| {
             try jw.objectField("shards");
             try jw.write(value);
@@ -8614,6 +8641,7 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
+    value_search_execution: ?ValueSearchExecution = null,
     read_requirements: ?ReadRequirements = null,
     lake_read: ?LakeReadRequirement = null,
     /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
@@ -8692,6 +8720,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "value_search_execution", "value_search_execution", true },
         .{ "read_requirements", "read_requirements", true },
         .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -8745,6 +8774,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.value_search_execution) |value| {
+            try jw.objectField("value_search_execution");
+            try jw.write(value);
+        }
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
             try jw.write(value);
@@ -14698,6 +14731,7 @@ pub const SqlSettingValue = std.json.Value;
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
+    value_search_execution: ?ValueSearchExecution = null,
     read_requirements: ?ReadRequirements = null,
     lake_read: ?LakeReadRequirement = null,
     /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
@@ -14780,6 +14814,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "value_search_execution", "value_search_execution", true },
         .{ "read_requirements", "read_requirements", true },
         .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -14835,6 +14870,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.value_search_execution) |value| {
+            try jw.objectField("value_search_execution");
+            try jw.write(value);
+        }
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
             try jw.write(value);
@@ -17374,6 +17413,53 @@ pub const User = struct {
                 try jw.objectField("metadata");
                 try jw.write(value);
             },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Execution policy for logical string-value operations. Limits apply to verification work per shard request, including repeated leaf evaluations. Exhaustion fails explicitly; it never returns a successful partial result.
+pub const ValueSearchExecution = struct {
+    /// Permit logical value verification without an indexed candidate constraint.
+    allow_scan: ?bool = null,
+    max_documents: ?i64 = null,
+    max_bytes: ?i64 = null,
+    /// Bound on the sum of original string bytes multiplied by compiled regex states. Charged before regex evaluation; sensitive literals bypass this work.
+    max_regex_work: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "allow_scan", "allow_scan", true },
+        .{ "max_documents", "max_documents", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "max_regex_work", "max_regex_work", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.allow_scan) |value| {
+            try jw.objectField("allow_scan");
+            try jw.write(value);
+        }
+        if (self.max_documents) |value| {
+            try jw.objectField("max_documents");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.max_regex_work) |value| {
+            try jw.objectField("max_regex_work");
+            try jw.write(value);
         }
         try jw.endObject();
     }

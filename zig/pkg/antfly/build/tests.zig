@@ -230,6 +230,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const query_contract_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "api query contract", "local query contract", "decision functions worker transport" } });
     b.step("query-contract-test", "Run query parsing, worker transport and projection contracts").dependOn(&b.addRunArtifact(query_contract_tests).step);
 
+    const logical_field_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "logical value", "logical query" } });
+    b.step("logical-field-query-test", "Verify logical query parsing, planning and original-value membership").dependOn(&b.addRunArtifact(logical_field_tests).step);
+
     const api_http_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_http_runtime_test_root.zig"),
         .target = target,
@@ -248,7 +251,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const schema_contract_tests = b.addTest(.{
         .root_module = schema_contract_mod,
         .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
-        .filters = selectTestFilters(b, &.{ "relational contract schema parsing uses bounded stack", "created nested response allowlists cover generated schemas", "api http public sort capability gate" }),
+        .filters = selectTestFilters(b, &.{ "relational contract schema parsing uses bounded stack", "created nested response allowlists cover generated schemas", "api http public sort capability gate", "logical field public capability ownership" }),
     });
     const parser_source = schema_contract_mod.import_table.get("antfly_local_sources").?;
     const parser_selection = b.addOptions();

@@ -105,6 +105,43 @@ Field capabilities report what the planner can safely do with a concrete field:
 - `sort_lifecycle_state` reports cached physical evidence. `queryable` and `accelerated` are already validated; `declared` or `indexed` can be validated by the first exact-sort request; `unsupported` is not sortable.
 - `index_sort_position` and `index_sort_order` identify fields in the table's physical index sort.
 
+### Logical string operations
+
+Use source field names for whole-value equality, containment, original-value
+regex and autocomplete. Antfly resolves indexed representations; clients do not
+need to select companion suffixes.
+
+```json
+{
+  "query": {"contains": "connection-refused", "field": "content"},
+  "value_search_execution": {"allow_scan": true},
+  "profile": true
+}
+```
+
+`equals`, `contains` and `matches` examine original strings without normalization.
+They default to case-sensitive matching; `case_sensitive: false` uses Unicode
+simple folding. Missing/null/non-string values do not match; arrays match any
+individual string. `matches` uses native Unicode regular-expression search,
+with anchors applying to the complete value. `autocomplete` uses a declared
+search-as-you-type mapping and its analyzer, preserving existing bool-prefix
+matching with alternatives for completed terms and the final prefix. Existing `match` remains analyzed
+full text; `term`, `prefix` and `regexp` retain indexed-term semantics.
+
+Index candidates are verified before counts, ordering and pagination. Unindexed
+fallback requires `value_search_execution.allow_scan`; defaults cap verification
+at 100,000 documents and 64 MiB per shard request. Exhaustion is an error, never
+a successful partial answer. `profile.value_search` explains selected candidate
+fields, fallback reasons and actual verification work. Capabilities expose
+`logical_field` and `value_operations`; these describe semantics, not current
+coverage or permission to scan.
+
+Sorting and aggregations can name a logical text source when it has one
+unambiguous raw keyword representation with compatible doc values. Explicit
+physical-field access remains supported. See the
+[logical-field design](https://github.com/antflydb/antfly/blob/main/docs/design/logical-field-queries.md)
+for the contract and execution constraints.
+
 ## One Request, One Execution Shape
 
 A query request combines several inputs:

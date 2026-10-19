@@ -379,6 +379,7 @@ pub const UnsupportedIndexCapabilityError = types.UnsupportedIndexCapabilityErro
 pub const UnsupportedQueryError = types.UnsupportedQueryError;
 pub const UpdatePasswordRequest = types.UpdatePasswordRequest;
 pub const User = types.User;
+pub const ValueSearchExecution = types.ValueSearchExecution;
 pub const VectorSourceStorageStatus = types.VectorSourceStorageStatus;
 pub const WebSearchConnection = types.WebSearchConnection;
 pub const OpenApiUpdateSchemaResponse202 = types.OpenApiUpdateSchemaResponse202;
