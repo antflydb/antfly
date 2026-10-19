@@ -862,6 +862,9 @@ test "resolver curation ordered review commits outcomes replay and receipts toge
     const accepted = (try review.receipt(a, db.core.store, command)).?;
     try std.testing.expect(accepted.accepted);
     try std.testing.expect(accepted.sequence > 0);
+    // A curator decision requires the curation format, not every feature the
+    // current binary understands (grouped sources and namespaces are separate).
+    try std.testing.expectEqual(catalog.curation_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
     const override_key = try @import("resolution_runtime.zig").reviewOverrideArtifactKeyAlloc(a, "source", "kg", "resolved");
     const override = try db.core.store.get(a, override_key);
     try std.testing.expect(std.mem.indexOf(u8, override, "suppressed") != null);
@@ -869,21 +872,28 @@ test "resolver curation ordered review commits outcomes replay and receipts toge
     const sequence = db.core.store.lastReplaySequence(0);
     try db.applyOrderedCommittedMutation(.{ .resolver_review = command }, .{ .term = 1, .index = 1 }, false);
     try std.testing.expectEqual(sequence, db.core.store.lastReplaySequence(0));
+    // Re-admitting an accepted decision at a later Raft position must preserve
+    // a higher floor installed by another feature after the original receipt.
+    try db.core.store.put(catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.namespace_curation_reader_version));
+    db.core.index_manager.minimum_reader_version.store(catalog.namespace_curation_reader_version, .release);
+    try db.applyOrderedCommittedMutation(.{ .resolver_review = command }, .{ .term = 1, .index = 2 }, false);
+    try std.testing.expectEqual(catalog.namespace_curation_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
     // A stale command records rejection and advances Raft even though its
     // override cannot be applied. No failed CAS can wedge follower replay.
     var stale = command;
     stale.curation_revision = 1;
-    try db.applyOrderedCommittedMutation(.{ .resolver_review = stale }, .{ .term = 1, .index = 2 }, false);
+    try db.applyOrderedCommittedMutation(.{ .resolver_review = stale }, .{ .term = 1, .index = 3 }, false);
     try std.testing.expect(!(try review.receipt(a, db.core.store, stale)).?.accepted);
     try std.testing.expectEqualStrings(override, try db.core.store.get(a, override_key));
-    try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
+    try std.testing.expectEqual(@as(u64, 3), (try db.orderedApplyReceipt()).?.index);
     db.close();
     closed = true;
     var reopened = try DB.open(std.testing.allocator, tmp.path(), options);
     defer reopened.close();
     try std.testing.expect(!(try review.receipt(a, reopened.core.store, stale)).?.accepted);
     try std.testing.expectEqualStrings(override, try reopened.core.store.get(a, override_key));
-    try std.testing.expectEqual(@as(u64, 2), (try reopened.orderedApplyReceipt()).?.index);
+    try std.testing.expectEqual(@as(u64, 3), (try reopened.orderedApplyReceipt()).?.index);
+    try std.testing.expectEqual(catalog.namespace_curation_reader_version, reopened.core.index_manager.minimum_reader_version.load(.acquire));
 }
 
 test "resolver curation namespace migration folds identical state and rejects conflicts" {

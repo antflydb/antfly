@@ -25672,14 +25672,15 @@ pub const DB = struct {
             var owned = catalogs;
             owned.deinit(alloc);
         }
-        if (observed.ready and observed.ordered.?.effect_protocol == 16) {
+        const effect_protocol = @max(try catalogs.requiredEffectProtocol(alloc), if (observed.ordered) |binding| binding.effect_protocol else 14);
+        if (observed.ready and observed.ordered.?.effect_protocol == effect_protocol) {
             var installed = (try inventory.load(alloc, &txn)).?;
             defer installed.deinit();
             var command = installed.value.command;
             command.catalogs = catalogs;
             return command;
         }
-        return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{ .epoch = try std.math.add(u64, if (observed.ordered) |value| value.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc), .effect_protocol = if (self.core.index_manager.minimum_reader_version.load(.acquire) >= 8) 16 else 14 }, .catalogs = catalogs };
+        return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{ .epoch = try std.math.add(u64, if (observed.ordered) |value| value.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc), .effect_protocol = effect_protocol }, .catalogs = catalogs };
     }
 
     fn completeArtifactUpload(txn: anytype, finalization: ?@import("artifact_publication_transport.zig").Finalization, entry: OrderedApplyReceipt) !void {
@@ -26387,6 +26388,10 @@ pub const DB = struct {
         apply_held = false;
         if (replication_payload != null) try self.flushDurableReplicationOutboxes();
         DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
+        // The journal and receipt are durable before detached consumers wake.
+        // Index projection alone cannot advance resolver/promotion targets:
+        // otherwise the last publication waits forever for another base write.
+        notifyResolverReplayRuntimesForCatalog(batch_ctx.index_manager, batch_ctx.resolution_runtime, batch_ctx.promotion_runtime, sequence);
         if (self.executor.hasWorkers()) self.executor.forceSequence(sequence) else {
             prepared_value.batch.sequence = sequence;
             try self.lockApplyForPortableRuntime();

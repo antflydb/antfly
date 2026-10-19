@@ -65,7 +65,7 @@ pub const Plan = struct {
     override_key: []const u8 = "",
     override_value: []const u8 = "",
     source_key: ?[]const u8 = null,
-    minimum_reader: u32 = catalog.supported_reader_version,
+    minimum_reader: u32 = catalog.curation_reader_version,
     pub fn stage(self: Plan, a: A, writes: anytype, sequence: u64) !void {
         if (self.accepted and self.previous == null) try writes.append(a, .{ .key = self.override_key, .value = self.override_value });
         if (self.accepted and self.previous == null) try writes.append(a, .{ .key = catalog.minimum_reader_key, .value = try catalog.readerVersionBytes(self.minimum_reader) });
@@ -100,7 +100,11 @@ pub fn plan(a: A, core: anytype, command: Command, policy_disabled: bool) !Plan 
     var namespace: [24]u8 = undefined;
     @import("doc_identity.zig").encodeNamespace(&namespace, core.identity_namespace);
     if (!std.mem.eql(u8, &namespace, &command.namespace)) return error.InvalidResolverCurationRequest;
-    if (try receipt(a, core.store, command)) |previous| return .{ .command = command, .accepted = previous.accepted, .previous = previous };
+    // Stamp the format this decision actually uses. The binary's newest reader
+    // version may describe unrelated catalog features; retain an existing
+    // higher floor, including when re-admitting a prior accepted receipt.
+    const minimum_reader = @max(catalog.curation_reader_version, core.index_manager.minimum_reader_version.load(.acquire));
+    if (try receipt(a, core.store, command)) |previous| return .{ .command = command, .accepted = previous.accepted, .previous = previous, .minimum_reader = minimum_reader };
     const rejected = Plan{ .command = command };
     if (!policy_disabled) return rejected;
     if (!std.mem.eql(u8, &command.policy_digest, &(try policyDigest(a, core.store)))) return rejected;
@@ -133,7 +137,7 @@ pub fn plan(a: A, core: anytype, command: Command, policy_disabled: bool) !Plan 
         if (try policy.pinnedDistinct(a, original, command.key)) return rejected;
     }
     const override_key = try runtime.reviewOverrideArtifactKeyAlloc(a, command.document, command.source_artifact, command.resolution_artifact);
-    return .{ .command = command, .accepted = true, .minimum_reader = @max(catalog.supported_reader_version, core.index_manager.minimum_reader_version.load(.acquire)), .override_key = override_key, .override_value = try runtime.buildReviewDecisionBytesAlloc(a, try optional(a, core.store, override_key), command.local_id, command.decision, command.table, command.key), .source_key = (try runtime.sourceExtractionKeyForResolutionKeyAlloc(a, &.{cfg}, resolution_key)) orelse return error.InvalidResolverCurationRequest };
+    return .{ .command = command, .accepted = true, .minimum_reader = minimum_reader, .override_key = override_key, .override_value = try runtime.buildReviewDecisionBytesAlloc(a, try optional(a, core.store, override_key), command.local_id, command.decision, command.table, command.key), .source_key = (try runtime.sourceExtractionKeyForResolutionKeyAlloc(a, &.{cfg}, resolution_key)) orelse return error.InvalidResolverCurationRequest };
 }
 pub fn validateRequest(req: anytype) !void {
     const command = req.resolver_review orelse return;

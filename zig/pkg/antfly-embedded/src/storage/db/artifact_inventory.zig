@@ -50,6 +50,31 @@ pub const Catalogs = struct {
     enrichments: []const u8 = "",
     resolvers: []const u8 = "",
 
+    /// Select capabilities from this immutable definition cut, independently
+    /// of the database's monotonic reader floor. Resolver/producer receipts
+    /// need protocol 15; grouped producer ownership needs protocol 16.
+    pub fn requiredEffectProtocol(self: Catalogs, alloc: std.mem.Allocator) !u16 {
+        var required: u16 = 14;
+        if (self.resolvers.len != 0) {
+            const configs = try @import("catalog/resolver_catalog.zig").deserializeCatalog(alloc, self.resolvers);
+            defer {
+                for (configs) |*cfg| cfg.deinit(alloc);
+                alloc.free(configs);
+            }
+            if (configs.len != 0) required = 15;
+        }
+        if (self.enrichments.len != 0) {
+            const configs = try @import("catalog/enrichment_catalog.zig").deserializeCatalog(alloc, self.enrichments);
+            defer {
+                for (configs) |*cfg| cfg.deinit(alloc);
+                alloc.free(configs);
+            }
+            if (configs.len != 0) required = 15;
+            for (configs) |cfg| if (cfg.group_source_json.len != 0 or cfg.prior_context_json.len != 0) return 16;
+        }
+        return required;
+    }
+
     pub fn jsonStringify(self: Catalogs, stream: anytype) @TypeOf(stream.*).Error!void {
         // AIDX contains arbitrary generation/count bytes, not UTF-8. Catalog
         // control messages are bounded and occur once per schema/copy epoch.

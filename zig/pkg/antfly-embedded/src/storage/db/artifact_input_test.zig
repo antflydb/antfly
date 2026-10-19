@@ -108,3 +108,88 @@ test "resolver curation ordered output reads retain absence and value preconditi
     try db.core.store.put(output, "newer resolution");
     try std.testing.expectError(error.EnrichmentSourceChanged, recorder.artifactStore().get(a, output));
 }
+
+test "resolver curation ordered publication wakes detached replay after its durable receipt" {
+    const DB = @import("selected_root.zig").db.DB;
+    const inventory = @import("artifact_inventory.zig");
+    const publication = @import("artifact_publication.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try @import("../../common/test_directory.zig").TestDirectory.init("resolver-publication-wake");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false, .config_generation = 1 });
+    try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write }, .{ .term = 1, .index = 1 }, false);
+    const source_key = try keys.artifactNamedPrefixAlloc(scratch, "doc", "asset", "kg");
+    try db.core.store.put(source_key, "{}");
+    if (db.resolution_runtime == null) try db.initResolutionRuntime();
+    if (db.promotion_runtime == null) try db.initPromotionRuntime();
+    var catalog = try db.artifactInventoryCommand(scratch);
+    catalog.binding.effect_protocol = 15;
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        try inventory.stageOrdered(scratch, &write, catalog, 1);
+        try publication.stageAuthority(&write, .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try write.commit();
+    }
+    const source = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :blk try publication.capturePrimarySource(scratch, &read, catalog.namespace, "doc");
+    };
+    var digest: publication.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &digest, .{});
+    const output_key = try keys.resolutionArtifactKeyAlloc(scratch, "doc", "resolved");
+    var command: publication.Command = .{ .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_kind = .resolver, .producer_name = "concepts", .producer_generation = 1, .producer_artifact_name = "resolved", .sources = (&source)[0..1], .artifact_sources = &.{.{ .key = source_key, .content_digest = digest, .input_position = null, .source_index = 0 }}, .mutations = &.{.{ .family = .resolution, .key = output_key, .value = "{\"config_generation\":1,\"entities\":[]}", .source_index = 0 }}, .publication_digest = @splat(0) };
+    command.publication_digest = command.digest();
+    const before = db.core.store.lastReplaySequence(0);
+    try db.applyOrderedCommittedMutation(.{ .artifact_publication = command }, .{ .term = 1, .index = 2 }, false);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const receipt = (try publication.readReceipt(&read, command, source)).?;
+    try std.testing.expect(receipt.sequence > before);
+    try std.testing.expectEqualStrings(command.mutations[0].value.?, try read.get(output_key));
+    try std.testing.expectEqual(receipt.sequence, db.resolution_runtime.?.stats().target_sequence);
+    try std.testing.expectEqual(receipt.sequence, db.promotion_runtime.?.stats().target_sequence);
+}
+
+test "resolver curation catalog protocol follows producer definitions and retains extensions" {
+    const DB = @import("selected_root.zig").db.DB;
+    const inventory = @import("artifact_inventory.zig");
+    const reader = @import("catalog/resolver_catalog.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try @import("../../common/test_directory.zig").TestDirectory.init("resolver-effect-protocol");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    try std.testing.expectEqual(@as(u16, 14), (try db.artifactInventoryCommand(scratch)).binding.effect_protocol);
+    try db.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false, .config_generation = 1 });
+    try std.testing.expectEqual(@as(u16, 15), (try db.artifactInventoryCommand(scratch)).binding.effect_protocol);
+    // Namespace-reader compatibility does not introduce grouped producers.
+    try db.core.store.put(reader.minimum_reader_key, try reader.readerVersionBytes(reader.namespace_curation_reader_version));
+    db.core.index_manager.minimum_reader_version.store(reader.namespace_curation_reader_version, .release);
+    var extended = try db.artifactInventoryCommand(scratch);
+    try std.testing.expectEqual(@as(u16, 15), extended.binding.effect_protocol);
+    extended.binding.effect_protocol = 16;
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try inventory.stageOrdered(scratch, &txn, extended, 1);
+        try txn.commit();
+    }
+    try db.addResolver(.{ .name = "other", .table = "entities", .source_artifact = "other_source", .resolution_artifact = "other_resolution", .key_template = "other/{{uslug _entity.text}}", .promote = false, .config_generation = 1 });
+    try std.testing.expectEqual(@as(u16, 16), (try db.artifactInventoryCommand(scratch)).binding.effect_protocol);
+    const producers = @import("catalog/enrichment_catalog.zig");
+    for ([_][]const u8{ "", "{\"group_by\":\"thread\",\"order_by\":\"ordinal\",\"field\":\"text\"}" }, 0..) |group_json, i| {
+        const encoded = try producers.serializeCatalog(scratch, &.{.{ .name = "claims", .kind = .asset, .source_field = "body", .group_source_json = group_json }});
+        const catalogs: inventory.Catalogs = .{ .enrichments = encoded };
+        try std.testing.expectEqual(@as(u16, if (i == 0) 15 else 16), try catalogs.requiredEffectProtocol(a));
+    }
+}

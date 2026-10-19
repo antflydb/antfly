@@ -1707,6 +1707,13 @@ Generation-aware input reads dispatch by physical artifact family. Extraction
 heads govern asset roots and units; chunk heads govern chunks. Resolution
 outputs retain physical reads and exact absence/value preconditions, including
 when ordered replay recomputes an existing result after a curator decision.
+Ordered publication notifies detached resolution and promotion workers after
+its journal and receipt commit, so the final publication progresses without a
+later primary write. Catalog effect capabilities come from the captured
+producer/resolver definitions (15 for receipts, 16 for grouped ownership),
+retaining any already-installed extension. They are independent of the durable
+reader floor: reviews require curation reader 6 and preserve higher floors,
+including when an accepted decision is retried at a new Raft position.
 Busy is HTTP 429 with `Retry-After`; capacity and metadata unavailability are
 explicit retry states. Curation needs table-write authorization; namespace
 migration additionally requires administrative route admission and authority to
