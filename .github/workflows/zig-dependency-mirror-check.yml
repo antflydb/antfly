@@ -1,0 +1,40 @@
+name: Verify private Zig dependency mirror
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: arc-antfly-standard-runtime
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: true
+      - uses: ./.github/actions/load-toolchain-policy
+        id: toolchain
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Select a cold source cache
+        run: |
+          cache_root=$(mktemp -d "$RUNNER_TEMP/zig-mirror-check.XXXXXXXX")
+          {
+            echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/global"
+            echo "ZIG_LOCAL_CACHE_DIR=$cache_root/local"
+          } >> "$GITHUB_ENV"
+      - uses: ./.github/actions/prepare-zig-dependencies
+        with:
+          mirror-only: 'true'
+      - name: Verify the complete Zig dependency build path
+        working-directory: zig
+        run: |
+          zig build --fetch=all
+          zig build --fetch=all --system zig-pkg
