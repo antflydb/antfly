@@ -53,6 +53,10 @@ fn bindTemplate(alloc: std.mem.Allocator, txn: anytype, request: requests.Genera
         !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace)) return error.ArtifactCatalogDrift;
     const local = try inventory.catalogs(txn);
     if (!std.mem.eql(u8, &local.digest(), &binding.digest) or !plan.matchesArtifactInventory(local)) return error.ArtifactCatalogDrift;
+    // Older ordered owners cannot supply receipt-backed stream witnesses.
+    // Preserve pending debt until an ordered protocol upgrade; this is not
+    // evidence of catalog corruption and never authorizes legacy outputs.
+    if (binding.effect_protocol != 15) return error.OnlineMergeArtifactTailsUnsupported;
     return .{ .authority = authority, .requirement = requirement };
 }
 

@@ -24,6 +24,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -513,7 +514,9 @@ class CAbiPackagingTests(unittest.TestCase):
             release_gc_workflow.index("group: antfly-release-storage"),
         )
         environments = environment_policy["environments"]
-        self.assertEqual(set(environments), {"container-publish", "release-promotion"})
+        self.assertEqual(
+            set(environments), {"container-publish", "release-promotion", "crates-io"}
+        )
         container_refs = {
             (policy["name"], policy["type"])
             for policy in environments["container-publish"]["branch_policies"]
@@ -526,6 +529,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertTrue(container_refs)
         self.assertTrue(all(policy_type == "tag" for _, policy_type in container_refs))
         self.assertEqual(release_refs, {("main", "branch")})
+        self.assertEqual(environments["crates-io"], environments["release-promotion"])
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()
@@ -889,6 +893,102 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn("version_scheme 1", rendered)
             self.assertIn('license all_of: ["Elastic-2.0", "Apache-2.0"]', rendered)
             self.assertIn('system "./smoke"', rendered)
+            # Execute the exact C program emitted into the formula. A hardcoded
+            # ABI 1/2 allowlist used to reject the current library silently.
+            header = REPO_ROOT / "zig/pkg/antfly-embedded/include/antfly.h"
+            abi = re.search(r"#define ANTFLY_ABI_VERSION (\d+)", header.read_text())
+            implementation = (
+                REPO_ROOT / "zig/pkg/antfly-embedded/src/capi/handles.zig"
+            ).read_text()
+            self.assertIsNotNone(abi)
+            self.assertIn(f"pub const abi_version: u32 = {abi[1]};", implementation)
+            cc = shutil.which("cc")
+            self.assertIsNotNone(cc, "Homebrew smoke regression requires a C compiler")
+            # Ruby must preserve C escapes rather than interpret them in an
+            # interpolating heredoc before the C compiler sees the program.
+            smoke = rendered.split("(testpath/\"smoke.c\").write <<~'C'\n", 1)[1].split(
+                "\n    C", 1
+            )[0]
+            (root / "smoke.c").write_text(smoke)
+            (root / "stub.c").write_text("""
+#include <antfly.h>
+#include <stdlib.h>
+uint32_t antfly_abi_version(void) {
+    const char *abi = getenv("TEST_ABI");
+    return abi ? (uint32_t)atoi(abi) : TEST_EXPECTED_ABI;
+}
+uint32_t antfly_open_options_size(void) {
+    return sizeof(antfly_open_options) + (getenv("TEST_SIZE") ? 1 : 0);
+}
+antfly_error_code antfly_lite_create(const char *path, antfly_db **out_db) {
+    (void)path; (void)out_db;
+    return getenv("TEST_CREATE") ? ANTFLY_INTERNAL : ANTFLY_OK;
+}
+void antfly_db_close(antfly_db *db) { (void)db; }
+const char *antfly_error_code_name(antfly_error_code code) {
+    (void)code; return "INTERNAL";
+}
+const char *antfly_last_error_detail(void) { return "test create failure"; }
+""")
+            legacy = root / "legacy"
+            legacy.mkdir()
+            legacy_header = re.sub(
+                r"(?m)^#define ANTFLY_ABI_VERSION .*\n", "", header.read_text()
+            )
+            for declaration in (
+                "uint32_t antfly_open_options_size(void);",
+                "const char *antfly_last_error_detail(void);",
+                "const char *antfly_error_code_name(antfly_error_code code);",
+            ):
+                legacy_header = legacy_header.replace(declaration, "")
+            (legacy / "antfly.h").write_text(legacy_header)
+            for include, expected_abi in ((header.parent, abi[1]), (legacy, "3")):
+                subprocess.run(
+                    [
+                        cc,
+                        "-Wall",
+                        "-Werror",
+                        f"-DTEST_EXPECTED_ABI={expected_abi}",
+                        "smoke.c",
+                        "stub.c",
+                        "-I",
+                        str(include),
+                        "-o",
+                        "smoke",
+                    ],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                )
+                cases = [
+                    ({}, 0, ""),
+                    ({"TEST_ABI": str(int(abi[1]) + 1)}, 1, "ABI"),
+                    (
+                        {"TEST_SIZE": "1"},
+                        0 if include == legacy else 2,
+                        "" if include == legacy else "open options size differs",
+                    ),
+                    (
+                        {"TEST_CREATE": "1"},
+                        3,
+                        "failed with error 255"
+                        if include == legacy
+                        else "INTERNAL: test create failure",
+                    ),
+                    ({"TEST_ABI": "1"}, 0 if include == legacy else 1, ""),
+                    ({"TEST_ABI": "2"}, 0 if include == legacy else 1, ""),
+                ]
+                for variables, status, message in cases:
+                    with self.subTest(include=include, variables=variables):
+                        result = subprocess.run(
+                            [str(root / "smoke")],
+                            cwd=root,
+                            env={**os.environ, **variables},
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(status, result.returncode, result.stderr)
+                        self.assertIn(message, result.stderr)
             self.assertIn("antfly_1.2.3_Darwin_arm64.tar.gz", rendered)
             self.assertIn("antfly_1.2.3_Linux_arm64_gnu.tar.gz", rendered)
             self.assertIn("antfly_1.2.3_Linux_x86_64_gnu.tar.gz", rendered)

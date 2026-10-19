@@ -746,10 +746,14 @@ fn jsonCapabilityUsize(object: std.json.ObjectMap, name: []const u8) !usize {
 }
 
 fn jsonOptionalCapabilityUsize(object: std.json.ObjectMap, name: []const u8, zero_is_unknown: bool) !?usize {
+    return jsonOptionalCapabilityInt(usize, object, name, zero_is_unknown);
+}
+
+fn jsonOptionalCapabilityInt(comptime T: type, object: std.json.ObjectMap, name: []const u8, zero_is_unknown: bool) !?T {
     const value = object.get(name) orelse return error.InvalidInferenceCapabilities;
     if (value == .null) return null;
     if (value != .integer or value.integer < 0) return error.InvalidInferenceCapabilities;
-    const number = std.math.cast(usize, value.integer) orelse return error.InvalidInferenceCapabilities;
+    const number = std.math.cast(T, value.integer) orelse return error.InvalidInferenceCapabilities;
     return if (zero_is_unknown and number == 0) null else number;
 }
 
@@ -775,7 +779,7 @@ fn parseResolvedBatchCapabilities(value: std.json.Value, version: usize) !work.B
             try jsonOptionalCapabilityUsize(value.object, "max_encoded_media_bytes", false)
         else
             try jsonOptionalCapabilityUsize(value.object, "max_encoded_bytes", true),
-        .max_decoded_pixels = try jsonOptionalCapabilityUsize(value.object, "max_decoded_pixels", version < 2),
+        .max_decoded_pixels = try jsonOptionalCapabilityInt(u64, value.object, "max_decoded_pixels", version < 2),
         .max_media_parts_per_item = try jsonCapabilityUsize(value.object, "max_media_parts_per_item"),
         .per_item_failures = per_item_value.bool,
     };
@@ -1724,4 +1728,13 @@ test "model aware media remote capability pins the resolved embedding generation
     const malformed = try std.mem.replaceOwned(u8, std.testing.allocator, payload, "1111111111111111111111111111111111111111111111111111111111111111", "not-a-revision");
     defer std.testing.allocator.free(malformed);
     try std.testing.expectError(error.InvalidInferenceCapabilities, parseModelCapabilities(std.testing.allocator, malformed, "model", .embed));
+}
+
+test "remote decoded pixel budgets retain wire width independently of pointer size" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"mode\":\"native\",\"preferred_items\":1,\"max_items\":1,\"max_encoded_media_bytes\":null,\"max_decoded_pixels\":4294967296,\"max_media_parts_per_item\":1,\"per_item_failures\":true}", .{});
+    defer parsed.deinit();
+    const capabilities = try parseResolvedBatchCapabilities(parsed.value, 2);
+    try std.testing.expectEqual(@as(?u64, 4294967296), capabilities.max_decoded_pixels);
+    parsed.value.object.getPtr("max_decoded_pixels").?.* = .{ .integer = -1 };
+    try std.testing.expectError(error.InvalidInferenceCapabilities, parseResolvedBatchCapabilities(parsed.value, 2));
 }

@@ -616,9 +616,7 @@ class ReleasePromotionTests(unittest.TestCase):
             discovery.discover_npm_tag(
                 "@antfly/cli",
                 "next",
-                lambda *_args, **_kwargs: response(
-                    {"dist-tags": {"next": "1.3.0-rc.2"}}
-                ),
+                lambda *_args, **_kwargs: response({"next": "1.3.0-rc.2"}),
             ),
             "v1.3.0-rc.2",
         )
@@ -1797,7 +1795,10 @@ class ReleasePromotionTests(unittest.TestCase):
         (root / "embedded-zig-source.json").write_text(json.dumps(manifest))
         return manifest
 
-    def assert_release_ledger(self, schema: int) -> None:
+    def test_npm_only_cli_snapshot_enters_the_ledger(self) -> None:
+        self.assert_release_ledger(5, npm_only=True)
+
+    def assert_release_ledger(self, schema: int, npm_only: bool = False) -> None:
         payload = load_module("build_release_payload_test", "build_release_payload.py")
         products = (
             ("antfly-lite", "antfly-inference") if schema == 2 else ("antfly-embedded",)
@@ -1822,11 +1823,12 @@ class ReleasePromotionTests(unittest.TestCase):
             (extras / "cli-snapshot.json").write_text(
                 json.dumps(
                     {
+                        "schema_version": 2 if npm_only else 1,
                         "version": "0.2.1",
                         "commit": COMMIT,
                         "registry_versions": {
                             "npm": "0.2.1",
-                            "python": "0.2.1",
+                            **({} if npm_only else {"python": "0.2.1"}),
                         },
                     }
                 )

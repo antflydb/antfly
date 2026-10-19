@@ -268,7 +268,7 @@ pub const StreamVerifier = struct {
         switch (node.scope) {
             .producer_defined => {
                 const closure = streams.prepareExtractionClosure(alloc, txn, root, request, self.plan) catch |err| switch (err) {
-                    error.ArtifactPublicationPending, error.ArtifactCoverageBaselinePending, error.EnrichmentSourceChanged => return null,
+                    error.ArtifactPublicationPending, error.ArtifactCoverageBaselinePending, error.OnlineMergeArtifactTailsUnsupported, error.EnrichmentSourceChanged => return null,
                     else => return err,
                 };
                 return .{ .root = root, .requirement = closure.requirement, .observation = closure.observation, .value = .{ .extraction = closure } };

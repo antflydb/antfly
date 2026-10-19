@@ -68,6 +68,7 @@ pub const Collector = struct {
         var store = self.store.*;
         store.allocator = self.out;
         const ref = try store.putWithCancellation(encoded, self.cancellation);
+        defer if (ref.provider_version) |version| store.allocator.free(version);
         try self.refs.append(self.out, .{ .artifact = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .decoded_bytes = self.bytes.items.len });
         self.bytes.clearRetainingCapacity();
         self.members = 0;
@@ -132,6 +133,7 @@ test "external lake opening cohorts reject corrupted members and decoded-size su
     output.allocator = ca;
     const bytes = "authenticated opening metadata";
     const stored = try output.putWithCancellation(bytes, .none);
+    defer if (stored.provider_version) |version| output.allocator.free(version);
     const ref: artifacts.ChunkRef = .{ .artifact_id = stored.artifact_id, .checksum = stored.checksum, .byte_len = stored.byte_len };
     var collector: Collector = .{ .a = a, .out = ca, .store = &store, .cancellation = .none };
     defer collector.deinit();

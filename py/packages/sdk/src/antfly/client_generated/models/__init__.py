@@ -385,6 +385,7 @@ from .external_lake_table_source import ExternalLakeTableSource
 from .external_lake_table_source_format import ExternalLakeTableSourceFormat
 from .external_lake_table_source_kind import ExternalLakeTableSourceKind
 from .external_lake_table_source_object_mutability import ExternalLakeTableSourceObjectMutability
+from .external_lake_table_source_row_identity_version import ExternalLakeTableSourceRowIdentityVersion
 from .external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from .extraction_attribute_group import ExtractionAttributeGroup
 from .extraction_attribute_label import ExtractionAttributeLabel
@@ -891,6 +892,7 @@ from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
 from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+from .inference_embedding_content_input import InferenceEmbeddingContentInput
 from .inference_embedding_group import InferenceEmbeddingGroup
 from .inference_embedding_item_error import InferenceEmbeddingItemError
 from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
@@ -2024,6 +2026,7 @@ __all__ = (
     "ExternalLakeTableSourceFormat",
     "ExternalLakeTableSourceKind",
     "ExternalLakeTableSourceObjectMutability",
+    "ExternalLakeTableSourceRowIdentityVersion",
     "ExternalLakeTableSourceWritePolicy",
     "ExtractionAttributeGroup",
     "ExtractionAttributeLabel",
@@ -2517,6 +2520,7 @@ __all__ = (
     "InferenceDictationTranscript",
     "InferenceDictationWord",
     "InferenceEmbeddingBatchSummary",
+    "InferenceEmbeddingContentInput",
     "InferenceEmbeddingGroup",
     "InferenceEmbeddingItemError",
     "InferenceEmbeddingItemErrorStage",

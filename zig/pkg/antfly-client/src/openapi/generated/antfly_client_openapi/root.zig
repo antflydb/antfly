@@ -558,6 +558,7 @@ pub const InferenceDictationWord = types.InferenceDictationWord;
 pub const InferenceEmbedRequest = types.InferenceEmbedRequest;
 pub const InferenceEmbedResponse = types.InferenceEmbedResponse;
 pub const InferenceEmbeddingBatchSummary = types.InferenceEmbeddingBatchSummary;
+pub const InferenceEmbeddingContentInput = types.InferenceEmbeddingContentInput;
 pub const InferenceEmbeddingGroup = types.InferenceEmbeddingGroup;
 pub const InferenceEmbeddingItemError = types.InferenceEmbeddingItemError;
 pub const InferenceEmbeddingObject = types.InferenceEmbeddingObject;

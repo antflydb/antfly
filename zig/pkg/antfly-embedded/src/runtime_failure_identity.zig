@@ -362,6 +362,7 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_aggregation, .err = error.InvalidAggregation },
     .{ .status = .unsupported_aggregation, .err = error.UnsupportedAggregation },
     .{ .status = .query_candidate_budget_exceeded, .err = error.QueryCandidateBudgetExceeded },
+    .{ .status = .decision_limit_exceeded, .err = error.DecisionLimitExceeded },
     .{ .status = .invalid_index_config, .err = error.InvalidIndexConfig },
     .{ .status = .algebraic_planner_scan_too_large, .err = error.AlgebraicPlannerScanTooLarge },
     .{ .status = .algebraic_result_bucket_limit, .err = error.AlgebraicResultBucketLimit },
@@ -1091,4 +1092,11 @@ test "committed visibility outcomes survive the storage owner boundary" {
         try std.testing.expectError(err, statusToError(failure.status));
         try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
     }
+}
+
+test "external lake evaluation limits survive the compiled query owner boundary" {
+    const failure = failureFromError(error.DecisionLimitExceeded, .local_query, abi.abi_version, 4);
+    try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+    try std.testing.expectError(error.DecisionLimitExceeded, statusToError(failure.status));
+    try std.testing.expectEqualStrings("DecisionLimitExceeded", failure.errorName());
 }

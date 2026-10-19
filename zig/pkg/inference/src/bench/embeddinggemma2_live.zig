@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
     defer watchdog.destroy();
     try watchdog.start(init.io);
     const control = internal.execution_control.InferenceExecutionControl{ .io = init.io, .hard_cancellation = watchdog.boundary() };
-    var load_guard = if (metal) try control.enterUninterruptible(.process_required) else internal.execution_control.UninterruptibleGuard{};
+    var load_guard = if (metal) try control.enterUninterruptible(.uninterruptible) else internal.execution_control.UninterruptibleGuard{};
     defer load_guard.deinit();
     const session = if (metal) try factory.createMetalSession(a, model_path) else try factory.createNativeSession(a, model_path);
     defer session.close();

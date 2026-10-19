@@ -99,6 +99,9 @@ pub const Message = struct {
     /// Raw image bytes for multimodal messages (decoded from data URIs).
     /// Null or empty for text-only messages.
     image_bytes: ?[]const []const u8 = null,
+    /// One H.264 MP4 clip, sampled on CUDA at one frame per second (max 60s).
+    /// Video currently occupies its own message without image/audio parts.
+    video_bytes: ?[]const u8 = null,
     /// Raw encoded audio bytes for multimodal messages.
     /// Null or empty for text/image-only messages.
     audio_bytes: ?[]const []const u8 = null,
@@ -119,6 +122,7 @@ pub const Message = struct {
     }
 
     pub fn hasImages(self: Message) bool {
+        if (self.video_bytes != null) return true;
         if (self.image_bytes) |imgs| return imgs.len > 0;
         return false;
     }
@@ -149,8 +153,20 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
 /// Audio expansion is measured after projection because its token count varies
 /// with the clip and projector metadata.
 pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
-    if (config.mm_tokens_per_image == 0) return 0;
-    return nativeGenerationImageCount(messages) *| (@as(usize, config.mm_tokens_per_image) + 1);
+    var allowance: usize = if (config.mm_tokens_per_image == 0) 0 else nativeGenerationImageCount(messages) *| (@as(usize, config.mm_tokens_per_image) + 1);
+    for (messages) |message| if (message.video_bytes != null) {
+        allowance +|= 60 * (70 + 10);
+    };
+    return allowance;
+}
+
+test "video prompt allowance is independent of the image token setting" {
+    const messages = [_]Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
+    try std.testing.expectEqual(@as(usize, 4800), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma }));
+    try std.testing.expectEqual(@as(usize, 4800), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma, .mm_tokens_per_image = 280 }));
+    const rendered = try formatMessages(std.testing.allocator, &messages);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "<|video|> describe") != null);
 }
 
 pub const NativeGenerationMediaAdmission = struct {
@@ -504,6 +520,7 @@ pub const ChatTemplate = struct {
         // image/text parts when available for multimodal chat templates.
         const chat_msgs = try arena.alloc(jinja.ChatMessage, messages.len);
         for (messages, 0..) |m, i| {
+            if (m.video_bytes != null and m.content_parts != null) return error.UnsupportedMixedVideoInput;
             var parts: ?[]const jinja.ChatContentPart = null;
             if (m.content_parts) |message_parts| {
                 const chat_parts = try arena.alloc(jinja.ChatContentPart, message_parts.len);
@@ -518,7 +535,7 @@ pub const ChatTemplate = struct {
             }
             chat_msgs[i] = .{
                 .role = m.role,
-                .content = m.content,
+                .content = if (m.video_bytes != null) try std.fmt.allocPrint(arena, "<|video|> {s}", .{m.content}) else m.content,
                 .parts = parts,
                 .content_is_null = m.content_is_null,
                 .tool_calls = m.tool_calls,
@@ -3527,6 +3544,17 @@ pub const NativeGenerationPipeline = struct {
         const canonical_prompt = if (self.gpt_config.usesGemma4Channels()) canonicalGemma4Prompt(prompt) else null;
         const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
+        var video_bytes: ?[]const u8 = null;
+        for (messages) |message| if (message.video_bytes) |bytes| {
+            if (video_bytes != null) return error.VideoLimitExceeded;
+            video_bytes = bytes;
+        };
+        if (video_bytes != null) {
+            if (self.cb.kind() != .cuda or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or self.gguf_projector_path == null) return error.UnsupportedVideoBackend;
+            for (messages) |message| {
+                if (message.content_parts != null or message.hasAudio() or (if (message.image_bytes) |imgs| imgs.len > 0 else false)) return error.UnsupportedMixedVideoInput;
+            }
+        }
         const has_images = messagesHaveImages(messages);
         const has_audio = messagesHaveAudio(messages);
         if ((config.qwen3vl_parity_patch_path != null or config.qwen3vl_parity_logits_path != null) and
@@ -3771,6 +3799,8 @@ pub const NativeGenerationPipeline = struct {
                         null;
                     defer if (request_projector) |store| store.close();
                     const projector = self.projector_store orelse request_projector.?;
+                    var projected_video = if (video_bytes) |bytes| try gemma4_projector.encodeProjectedVideoResident(&self.cb, allocator, projector, bytes) else null;
+                    defer if (projected_video) |*video| video.deinit();
                     const resident_images_enabled = images.len <= 8 and self.cb.supportsCopyRows2D() and self.cb.vtable.concatRows2D != null and
                         self.cb.vtable.multiplyScalar != null and !platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GENERATION_IMAGE_HOST", false);
                     var resident_images = if (images.len > 0 and resident_images_enabled)
@@ -3778,6 +3808,9 @@ pub const NativeGenerationPipeline = struct {
                     else
                         null;
                     defer if (resident_images) |*projected| projected.deinit();
+                    const resident_features = if (projected_video) |*video| &video.images else if (resident_images) |*images_resident| images_resident else null;
+                    const video_prompt = if (projected_video) |*video| try gemma4_mm.expandVideoPromptText(allocator, prompt, video.timestamps_us) else null;
+                    defer if (video_prompt) |text| allocator.free(text);
                     var projected_images = if (images.len > 0 and resident_images == null)
                         try gemma4_projector.encodeProjectedImages(&self.cb, allocator, projector, images)
                     else
@@ -3790,8 +3823,8 @@ pub const NativeGenerationPipeline = struct {
                     defer if (projected_audio) |*projected| projected.deinit();
                     const expanded_prompt = try gemma4_mm.expandPromptText(
                         allocator,
-                        prompt,
-                        if (resident_images) |*projected| projected.tokens_per_image else if (projected_images) |*projected| projected.tokens_per_image else &.{},
+                        video_prompt orelse prompt,
+                        if (resident_features) |projected| projected.tokens_per_image else if (projected_images) |*projected| projected.tokens_per_image else &.{},
                         if (projected_audio) |*projected| projected.tokens_per_audio else &.{},
                     );
                     defer allocator.free(expanded_prompt);
@@ -3808,7 +3841,7 @@ pub const NativeGenerationPipeline = struct {
                     while (expanded_prompt_tokens < expanded_encoded.attention_mask.len and expanded_encoded.attention_mask[expanded_prompt_tokens] != 0) : (expanded_prompt_tokens += 1) {}
                     if (expanded_prompt_tokens == 0) return error.EmptyPrompt;
 
-                    prepared_multimodal_prompt = if (resident_images) |*projected|
+                    prepared_multimodal_prompt = if (resident_features) |projected|
                         try gemma4_mm.prepareExpandedPromptEmbeddingsResident(
                             &self.cb,
                             allocator,
@@ -15199,6 +15232,10 @@ pub fn formatMessages(allocator: std.mem.Allocator, messages: []const Message) !
             try buf.appendSlice(allocator, "User: ");
         } else if (std.mem.eql(u8, msg.role, "assistant")) {
             try buf.appendSlice(allocator, "Assistant: ");
+        }
+        if (msg.video_bytes != null) {
+            if (msg.content_parts != null) return error.UnsupportedMixedVideoInput;
+            try buf.appendSlice(allocator, "<|video|> ");
         }
         if (msg.content_parts) |parts| {
             for (parts) |part| {

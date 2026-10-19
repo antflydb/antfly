@@ -237,12 +237,17 @@ pub const Cursor = struct {
 /// Values remain valid until reset or close, independently of other scopes.
 /// Read transactions share one immutable snapshot. Native Lite write scopes
 /// copy the current pending overlay; cursor fallbacks use their cursor view.
+pub const RangeRequest = @import("value_ranges.zig").Request;
+pub const ValueRange = @import("value_ranges.zig").Range;
 pub const ReadScope = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
     const VTable = struct {
+        get_ranges_many: ?*const fn (*anyopaque, []const RangeRequest) anyerror!void = null,
+        get_ranges: ?*const fn (*anyopaque, []const u8, []const ValueRange, [][]const u8) anyerror!void = null,
+        get_range: ?*const fn (*anyopaque, []const u8, u64, usize) anyerror![]const u8 = null,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
@@ -261,6 +266,34 @@ pub const ReadScope = struct {
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+    /// Sorted document keys share one index traversal on capable backends.
+    pub fn getRangesMany(self: *@This(), requests: []const RangeRequest) !void {
+        if (requests.len > 64) return error.InvalidBatch;
+        if (requests.len == 0) return;
+        for (requests, 0..) |request, i| {
+            if (request.ranges.len != request.output.len or request.ranges.len > @import("value_ranges.zig").maximum_ranges) return error.InvalidBatch;
+            if (i != 0 and std.mem.order(u8, requests[i - 1].key, request.key) == .gt) return error.InvalidBatch;
+        }
+        if (self.vtable.get_ranges_many) |read| return BoundaryAbi.call("get_ranges_many", self.boundary_dispatch, read, .{ self.ptr, requests });
+        for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+    }
+    pub fn getRanges(self: *@This(), key: []const u8, ranges: []const ValueRange, output: [][]const u8) !void {
+        if (ranges.len != output.len or ranges.len > @import("value_ranges.zig").maximum_ranges) return error.InvalidBatch;
+        if (ranges.len == 0) return;
+        if (self.vtable.get_ranges) |read| return BoundaryAbi.call("get_ranges", self.boundary_dispatch, read, .{ self.ptr, key, ranges, output });
+        const bytes = try self.get(key);
+        for (ranges, output) |range, *out| {
+            if (range.offset > bytes.len or range.length > bytes.len - range.offset) return error.EndOfStream;
+            out.* = bytes[@intCast(range.offset)..][0..range.length];
+        }
+    }
+    pub fn supportsRange(self: *const @This()) bool {
+        return self.vtable.get_range != null;
+    }
+    pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+        const read_range = self.vtable.get_range orelse return error.Unsupported;
+        return BoundaryAbi.call("get_range", self.boundary_dispatch, read_range, .{ self.ptr, key, offset, length });
+    }
     pub fn supportsSortedScoreColumn(self: *const @This()) bool {
         return self.vtable.read_sorted_score_column != null;
     }
@@ -397,6 +430,18 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
         handle: @TypeOf(handle),
         parent: ?ParentRelease,
         admission: if (pooled_metadata) ?Receipt else void,
+        fn getRangesMany(ptr: *anyopaque, requests: []const RangeRequest) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getRangesMany(requests);
+        }
+        fn getRanges(ptr: *anyopaque, key: []const u8, ranges: []const ValueRange, output: [][]const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getRanges(key, ranges, output);
+        }
+        fn getRange(ptr: *anyopaque, key: []const u8, offset: u64, length: usize) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getRange(key, offset, length);
+        }
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.get(key);
@@ -486,7 +531,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
@@ -1106,6 +1151,41 @@ pub const Store = struct {
 
     pub const ReplayCallback = *const fn (*anyopaque, u64, []const u8) anyerror!void;
 
+    /// Synchronous borrowed replay delivery across archive boundaries. Zig
+    /// error integers belong to the consumer's compilation and stay there.
+    pub const ReplayVisitor = extern struct {
+        context: *anyopaque,
+        visit: *const fn (*anyopaque, u64, [*]const u8, usize) callconv(.c) bool,
+
+        fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+            const self: *const ReplayVisitor = @ptrCast(@alignCast(ptr));
+            // Only this owner-local adapter returns a Zig error. The caller
+            // restores its original failure after the scan unwinds.
+            if (!self.visit(self.context, sequence, payload.ptr, payload.len)) return error.Cancelled;
+        }
+    };
+
+    fn ReplayConsumer(comptime Context: type, comptime callback: fn (Context, u64, []const u8) anyerror!void) type {
+        return struct {
+            context: Context,
+            failure: ?anyerror = null,
+
+            fn visitor(self: *@This()) ReplayVisitor {
+                return .{ .context = self, .visit = visit };
+            }
+
+            fn visit(ptr: *anyopaque, sequence: u64, data: [*]const u8, len: usize) callconv(.c) bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.failure != null) return false;
+                callback(self.context, sequence, data[0..len]) catch |err| {
+                    self.failure = err;
+                    return false;
+                };
+                return true;
+            }
+        };
+    }
+
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         capabilities: *const fn (*anyopaque) backend_types.Capabilities,
@@ -1125,9 +1205,9 @@ pub const Store = struct {
         next_replay_sequence: ?*const fn (*anyopaque, u64) u64 = null,
         append_replay_opaque: ?*const fn (Allocator, *anyopaque, u64, []const u8) anyerror!void = null,
         iterate_replay_from: ?*const fn (Allocator, *anyopaque, u64) anyerror![]ReplayEntry = null,
-        for_each_replay_from: ?*const fn (*anyopaque, u64, *anyopaque, ReplayCallback) anyerror!void = null,
-        for_each_replay_lane_from: ?*const fn (*anyopaque, u8, u64, usize, *anyopaque, ReplayCallback) anyerror!backend_types.ReplayLaneIterationStats = null,
-        for_each_replay_from_matching_hint_mask: ?*const fn (*anyopaque, u64, u8, *anyopaque, ReplayCallback) anyerror!void = null,
+        for_each_replay_from: ?*const fn (*anyopaque, u64, ReplayVisitor) anyerror!void = null,
+        for_each_replay_lane_from: ?*const fn (*anyopaque, u8, u64, usize, ReplayVisitor) anyerror!backend_types.ReplayLaneIterationStats = null,
+        for_each_replay_from_matching_hint_mask: ?*const fn (*anyopaque, u64, u8, ReplayVisitor) anyerror!void = null,
         truncate_replay_up_to: ?*const fn (Allocator, *anyopaque, u64) anyerror!void = null,
         // Append-only optional ABI extensions: older stores retain their
         // original transaction layout and fall back to ordinary admission.
@@ -1284,13 +1364,10 @@ pub const Store = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         if (self.vtable.for_each_replay_from) |f| {
-            const Adapter = struct {
-                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                    return try callback(typed_ctx, sequence, payload);
-                }
-            };
-            return try BoundaryAbi.call("for_each_replay_from", self.boundary_dispatch, f, .{ self.ptr, from_sequence, ctx, Adapter.call });
+            var consumer = ReplayConsumer(@TypeOf(ctx), callback){ .context = ctx };
+            const result = BoundaryAbi.call("for_each_replay_from", self.boundary_dispatch, f, .{ self.ptr, from_sequence, consumer.visitor() });
+            if (consumer.failure) |err| return err;
+            return result;
         }
 
         const entries = try self.iterateReplayFrom(self.allocator, from_sequence);
@@ -1309,28 +1386,19 @@ pub const Store = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         if (self.vtable.for_each_replay_from_matching_hint_mask) |f| {
-            const Adapter = struct {
-                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                    return try callback(typed_ctx, sequence, payload);
-                }
-            };
-            return try BoundaryAbi.call("for_each_replay_from_matching_hint_mask", self.boundary_dispatch, f, .{ self.ptr, from_sequence, required_hint_mask, ctx, Adapter.call });
+            var consumer = ReplayConsumer(@TypeOf(ctx), callback){ .context = ctx };
+            const result = BoundaryAbi.call("for_each_replay_from_matching_hint_mask", self.boundary_dispatch, f, .{ self.ptr, from_sequence, required_hint_mask, consumer.visitor() });
+            if (consumer.failure) |err| return err;
+            return result;
         }
-        if (self.vtable.for_each_replay_lane_from) |f| {
-            const Adapter = struct {
-                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                    return try callback(typed_ctx, sequence, payload);
-                }
-            };
+        if (self.vtable.for_each_replay_lane_from != null) {
             const lane_ordinal = if (required_hint_mask == 0)
                 internal_keys.replay_all_kind
             else if (replayHintOrdinalFromSingleMask(required_hint_mask)) |ordinal|
                 ordinal
             else
                 return error.Unsupported;
-            _ = try BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, 0, ctx, Adapter.call });
+            _ = try self.forEachReplayLaneFrom(lane_ordinal, from_sequence, 0, ctx, callback);
             return;
         }
 
@@ -1352,13 +1420,10 @@ pub const Store = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !backend_types.ReplayLaneIterationStats {
         const f = self.vtable.for_each_replay_lane_from orelse return error.Unsupported;
-        const Adapter = struct {
-            fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                return try callback(typed_ctx, sequence, payload);
-            }
-        };
-        return try BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, max_entries, ctx, Adapter.call });
+        var consumer = ReplayConsumer(@TypeOf(ctx), callback){ .context = ctx };
+        const result = BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, max_entries, consumer.visitor() });
+        if (consumer.failure) |err| return err;
+        return result;
     }
 
     pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
@@ -2275,16 +2340,13 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
         pub fn forEachReplayFrom(
             ptr: *anyopaque,
             from_sequence: u64,
-            callback_ctx: *anyopaque,
-            callback: Store.ReplayCallback,
+            replay_visitor: Store.ReplayVisitor,
         ) anyerror!void {
+            var visitor = replay_visitor;
             if (Handle == Store) {
-                const state = unbox(ptr);
-                if (state.handle.vtable.for_each_replay_from) |f| {
-                    return try f(state.handle.ptr, from_sequence, callback_ctx, callback);
-                }
+                return try unbox(ptr).handle.forEachReplayFrom(from_sequence, @as(*anyopaque, &visitor), Store.ReplayVisitor.consume);
             } else if (@hasDecl(Handle, "forEachReplayFrom")) {
-                return try unbox(ptr).handle.forEachReplayFrom(from_sequence, callback_ctx, callback);
+                return try unbox(ptr).handle.forEachReplayFrom(from_sequence, @as(*anyopaque, &visitor), Store.ReplayVisitor.consume);
             }
             if (@hasDecl(Handle, "iterateReplayFrom")) {
                 const state = unbox(ptr);
@@ -2293,9 +2355,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
                     for (entries) |*entry| entry.deinit(state.allocator);
                     state.allocator.free(entries);
                 }
-                for (entries) |entry| {
-                    try callback(callback_ctx, entry.sequence, entry.payload);
-                }
+                for (entries) |entry| try Store.ReplayVisitor.consume(&visitor, entry.sequence, entry.payload);
                 return;
             }
             return error.Unsupported;
@@ -2305,26 +2365,13 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             ptr: *anyopaque,
             from_sequence: u64,
             required_hint_mask: u8,
-            callback_ctx: *anyopaque,
-            callback: Store.ReplayCallback,
+            replay_visitor: Store.ReplayVisitor,
         ) anyerror!void {
+            var visitor = replay_visitor;
             if (Handle == Store) {
-                const state = unbox(ptr);
-                if (state.handle.vtable.for_each_replay_from_matching_hint_mask) |f| {
-                    return try f(state.handle.ptr, from_sequence, required_hint_mask, callback_ctx, callback);
-                }
-                if (state.handle.vtable.for_each_replay_lane_from) |f| {
-                    const lane_ordinal = if (required_hint_mask == 0)
-                        internal_keys.replay_all_kind
-                    else if (replayHintOrdinalFromSingleMask(required_hint_mask)) |ordinal|
-                        ordinal
-                    else
-                        return error.Unsupported;
-                    _ = try f(state.handle.ptr, lane_ordinal, from_sequence, 0, callback_ctx, callback);
-                    return;
-                }
+                return try unbox(ptr).handle.forEachReplayFromMatchingHintMask(from_sequence, required_hint_mask, @as(*anyopaque, &visitor), Store.ReplayVisitor.consume);
             } else if (@hasDecl(Handle, "forEachReplayFromMatchingHintMask")) {
-                return try unbox(ptr).handle.forEachReplayFromMatchingHintMask(from_sequence, required_hint_mask, callback_ctx, callback);
+                return try unbox(ptr).handle.forEachReplayFromMatchingHintMask(from_sequence, required_hint_mask, @as(*anyopaque, &visitor), Store.ReplayVisitor.consume);
             } else if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
                 const lane_ordinal = if (required_hint_mask == 0)
                     internal_keys.replay_all_kind
@@ -2332,7 +2379,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
                     ordinal
                 else
                     return error.Unsupported;
-                _ = try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, 0, callback_ctx, callback);
+                _ = try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, 0, @as(*anyopaque, &visitor), Store.ReplayVisitor.consume);
                 return;
             }
             return error.Unsupported;
@@ -2343,16 +2390,13 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             lane_ordinal: u8,
             from_sequence: u64,
             max_entries: usize,
-            callback_ctx: *anyopaque,
-            callback: Store.ReplayCallback,
+            replay_visitor: Store.ReplayVisitor,
         ) anyerror!backend_types.ReplayLaneIterationStats {
+            var visitor = replay_visitor;
             if (Handle == Store) {
-                const state = unbox(ptr);
-                if (state.handle.vtable.for_each_replay_lane_from) |f| {
-                    return try f(state.handle.ptr, lane_ordinal, from_sequence, max_entries, callback_ctx, callback);
-                }
+                return try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, max_entries, @as(*anyopaque, &visitor), Store.ReplayVisitor.consume);
             } else if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
-                return try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, max_entries, callback_ctx, callback);
+                return try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, max_entries, @as(*anyopaque, &visitor), Store.ReplayVisitor.consume);
             }
             return error.Unsupported;
         }
@@ -3275,4 +3319,112 @@ test "score reads tolerate unsupported resets through the owning scope dispatche
     try std.testing.expectEqual(@as(usize, 1), state.resets);
     try std.testing.expectEqual(@as(usize, 1), state.closes);
     try std.testing.expect(Foreign.calls > 1);
+}
+
+test "foreign replay visitors preserve consumer failures and resume rejected entries" {
+    const State = struct { fail_read: bool = false };
+    const Mock = struct {
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn capabilities(_: *anyopaque) backend_types.Capabilities {
+            return .{};
+        }
+        fn read(_: Allocator, _: *anyopaque) anyerror!ReadTxn {
+            return error.Unsupported;
+        }
+        fn write(_: Allocator, _: *anyopaque) anyerror!WriteTxn {
+            return error.Unsupported;
+        }
+        fn batch(_: Allocator, _: *anyopaque) anyerror!Batch {
+            return error.Unsupported;
+        }
+        fn lane(ptr: *anyopaque, _: u8, from: u64, limit: usize, replay_visitor: Store.ReplayVisitor) anyerror!backend_types.ReplayLaneIterationStats {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            if (state.fail_read) return error.OutOfMemory;
+            var visitor = replay_visitor;
+            var stats: backend_types.ReplayLaneIterationStats = .{ .scan_batches = 1 };
+            var sequence = from;
+            while (sequence <= 3) : (sequence += 1) {
+                try Store.ReplayVisitor.consume(&visitor, sequence, "borrowed payload");
+                stats.scanned_entries += 1;
+                stats.matched_entries += 1;
+                stats.last_sequence = sequence;
+                if (limit != 0 and stats.matched_entries >= limit) break;
+            }
+            return stats;
+        }
+        fn all(ptr: *anyopaque, from: u64, visitor: Store.ReplayVisitor) anyerror!void {
+            _ = try lane(ptr, internal_keys.replay_all_kind, from, 0, visitor);
+        }
+        fn matching(ptr: *anyopaque, from: u64, _: u8, visitor: Store.ReplayVisitor) anyerror!void {
+            try all(ptr, from, visitor);
+        }
+    };
+    const Consumer = struct {
+        failure: ?anyerror,
+        accepted: usize = 0,
+        calls: usize = 0,
+        next: u64 = 1,
+        fn consume(self: *@This(), sequence: u64, payload: []const u8) anyerror!void {
+            self.calls += 1;
+            try std.testing.expectEqualStrings("borrowed payload", payload);
+            if (sequence == 2) if (self.failure) |err| return err;
+            self.accepted += 1;
+            self.next = sequence + 1;
+        }
+    };
+    const Foreign = TestForeignDispatch(Store);
+    Foreign.calls = 0;
+    var state = State{};
+    var vtable: Store.VTable = .{
+        .deinit = Mock.deinit,
+        .capabilities = Mock.capabilities,
+        .begin_read = Mock.read,
+        .begin_write = Mock.write,
+        .begin_batch = Mock.batch,
+        .for_each_replay_from = Mock.all,
+        .for_each_replay_from_matching_hint_mask = Mock.matching,
+        .for_each_replay_lane_from = Mock.lane,
+    };
+    var store: Store = .{ .allocator = std.testing.allocator, .ptr = &state, .vtable = &vtable, .boundary_dispatch = Foreign.dispatch };
+    // Nested erased wrappers must call the imported dispatcher rather than
+    // invoking a foreign raw vtable and leaking local Zig errors into it.
+    var wrapped = try storeFrom(std.testing.allocator, store);
+    defer wrapped.deinit();
+    wrapped.boundary_dispatch = Foreign.dispatch;
+    for ([_]*Store{ &store, &wrapped }) |handle| {
+        for ([_]anyerror{ error.StopReplayChunk, error.ConsumerPrivateFailure, error.OutOfMemory, error.Cancelled }) |failure| {
+            for (0..4) |method| {
+                var consumer = Consumer{ .failure = failure };
+                const result: anyerror!void = switch (method) {
+                    0 => handle.forEachReplayFrom(1, &consumer, Consumer.consume),
+                    1 => handle.forEachReplayFromMatchingHintMask(1, 0, &consumer, Consumer.consume),
+                    2 => blk: {
+                        _ = handle.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &consumer, Consumer.consume) catch |err| break :blk err;
+                        break :blk {};
+                    },
+                    3 => blk: {
+                        const saved = vtable.for_each_replay_from_matching_hint_mask;
+                        vtable.for_each_replay_from_matching_hint_mask = null;
+                        defer vtable.for_each_replay_from_matching_hint_mask = saved;
+                        break :blk handle.forEachReplayFromMatchingHintMask(1, 0, &consumer, Consumer.consume);
+                    },
+                    else => unreachable,
+                };
+                try std.testing.expectError(failure, result);
+                try std.testing.expectEqual(@as(usize, 2), consumer.calls);
+                try std.testing.expectEqual(@as(usize, 1), consumer.accepted);
+                try std.testing.expectEqual(@as(u64, 2), consumer.next);
+                consumer.failure = null;
+                const stats = try handle.forEachReplayLaneFrom(internal_keys.replay_all_kind, consumer.next, 0, &consumer, Consumer.consume);
+                try std.testing.expectEqual(@as(usize, 2), stats.matched_entries);
+                try std.testing.expectEqual(@as(usize, 3), consumer.accepted);
+            }
+        }
+        state.fail_read = true;
+        var consumer = Consumer{ .failure = null };
+        try std.testing.expectError(error.OutOfMemory, handle.forEachReplayLaneFrom(0, 1, 0, &consumer, Consumer.consume));
+        try std.testing.expectEqual(@as(usize, 0), consumer.calls);
+        state.fail_read = false;
+    }
+    try std.testing.expect(Foreign.calls > 0);
 }

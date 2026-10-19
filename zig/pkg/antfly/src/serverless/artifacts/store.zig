@@ -173,11 +173,13 @@ fn isLowerHex(byte: u8) bool {
 }
 
 pub const ArtifactMetadata = struct {
+    provider_version: ?[]u8 = null,
     artifact_id: []u8,
     byte_len: u64,
     checksum: []u8,
 
     pub fn deinit(self: *ArtifactMetadata, alloc: Allocator) void {
+        if (self.provider_version) |value| alloc.free(value);
         alloc.free(self.artifact_id);
         alloc.free(self.checksum);
         self.* = undefined;
@@ -197,6 +199,7 @@ pub const ArtifactStore = struct {
     upload_scope: ?UploadScope = null,
 
     pub const VTable = struct {
+        object_store: ?*const fn (*anyopaque) *@import("object_store.zig").ObjectStore = null,
         retention_witness: ?*const fn (*anyopaque, UploadScope, CancellationToken) anyerror!?RetentionWitness = null,
         retained_closure: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!bool = null,
         remember_closure: ?*const fn (*anyopaque, []const u8, []const RetentionWitness, CancellationToken) anyerror!void = null,
@@ -219,12 +222,16 @@ pub const ArtifactStore = struct {
         stat_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         verify_content: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, CancellationToken) anyerror!void = null,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
+        delete_with_cancellation: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!void = null,
         put_scoped: ?*const fn (*anyopaque, Allocator, UploadScope, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         visit_scoped_uploads: ?*const fn (*anyopaque, [32]u8, ScopedUploadVisitor, CancellationToken) anyerror!void = null,
         reclaim_retired_scoped_inventory: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
         cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
     };
 
+    pub fn providerStore(self: ArtifactStore) ?*@import("object_store.zig").ObjectStore {
+        return if (self.vtable.object_store) |call| call(self.ptr) else null;
+    }
     pub fn retentionWitness(self: *ArtifactStore, scope: UploadScope, cancellation: CancellationToken) !?RetentionWitness {
         try scope.validate();
         try cancellation.check();
@@ -579,7 +586,12 @@ pub const ArtifactStore = struct {
     }
 
     pub fn delete(self: *ArtifactStore, artifact_id: []const u8) !void {
-        try self.vtable.delete(self.ptr, artifact_id);
+        try self.deleteWithCancellation(artifact_id, .none);
+    }
+    pub fn deleteWithCancellation(self: *ArtifactStore, artifact_id: []const u8, token: CancellationToken) !void {
+        try token.check();
+        if (self.vtable.delete_with_cancellation) |call| try call(self.ptr, artifact_id, token) else try self.vtable.delete(self.ptr, artifact_id);
+        try token.check();
     }
 
     /// Verifies a content-addressed artifact with bounded memory. Backends may

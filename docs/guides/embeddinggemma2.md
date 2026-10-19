@@ -1,10 +1,14 @@
 # EmbeddingGemma 2 embeddings and similarity decisions
 
 Antfly runs the open Hugging Face `google/embeddinggemma-2` safetensors checkpoint
-on native CPU and Metal. Text, images, audio, video and ordered combinations share the
-same embedding space. Video accepts qualified MP4/MOV through ordered groups.
-CUDA, ONNX, PJRT and WebGPU are excluded from this implementation. The original EmbeddingGemma, GLiNER, Laya and Jev routes retain
-their existing contracts.
+on native CPU, Metal and CUDA. Text, images, audio, video and ordered combinations
+share the model embedding space. CPU/Metal retain the qualified media and
+chunking paths described below. CUDA requires an Ampere or newer GPU and uses
+BF16 inference; its video route requires Linux NVDEC and a standalone progressive
+SDR H.264 MP4 clip of at most 60 seconds and 256 MiB. CUDA video does not accept
+mixed content, titles or explicit sampling policies. ONNX, PJRT and WebGPU are
+excluded. The original EmbeddingGemma, GLiNER, Laya and Jev routes retain their
+existing contracts.
 
 ## Checkpoint and numerical contract
 
@@ -23,16 +27,19 @@ A managed registry reference is
 
 The runtime validates the text, vision and audio geometry and weight shapes,
 tokenizer BOS/EOS and media tokens, and the pinned image/audio/video processor. It
-accepts BF16 or F32 weights, converts BF16 values exactly to F32, and uses F32
-activations and accumulation on both supported backends. Quantized and implicit
-F16 execution are rejected for this family.
+accepts BF16 or F32 weights. Native CPU and Metal convert BF16 values exactly to
+F32 and use F32 activations and accumulation. CUDA uses its model-specific BF16
+encoder contract. Quantized and implicit F16 execution are rejected for this
+family. CPU/Metal F32 qualification results below do not establish CUDA parity.
 
 The text encoder is bidirectional, including its alternating global and sliding
 attention. Mean pooling includes every active token: BOS, EOS, task prefixes and
 expanded media tokens. Padding is excluded. The result is L2 normalized. Reduced
 sizes 512, 256 and 128 truncate the 768-vector and then normalize again. The
 8192-token limit includes all expanded media tokens and wrappers; overflow fails
-instead of silently truncating input. Audio is limited to 30 seconds per part.
+instead of silently truncating input. Native CPU/Metal audio parts are limited to 30 seconds. CUDA singleton and
+cohort audio share the model sample ceiling and the expanded 8192-token limit,
+subject to the admitted decode and preparation memory budgets.
 
 Task types are `RETRIEVAL_DOCUMENT` (default), `RETRIEVAL_QUERY`,
 `QUESTION_ANSWERING`, `FACT_VERIFICATION`, `CODE_RETRIEVAL_QUERY`,
@@ -93,11 +100,16 @@ The native endpoint allows up to 64 groups, with 1–64 parts each. Existing exe
 aggregate media budgets can impose lower limits. `error_policy: "per_item"`
 returns valid groups with their original indexes and errors for invalid groups.
 
-The embedding response includes `model_identity`, a backend-independent SHA256
-identity for the exact config, weights, tokenizer, processor, SentenceTransformers
-sidecars and `embeddinggemma2-f32-mean-v1` recipe. Supply that value as request
+The embedding response includes `model_identity`, a SHA256 identity for the exact
+config, weights, tokenizer, processor, SentenceTransformers sidecars and execution
+recipe. CPU and Metal preserve the existing
+`embeddinggemma2-f32-mean-v6-webm-presentation` identity. CUDA derives a separate
+identity from that artifact identity and `embeddinggemma2-cuda-bf16-mean-v1`.
+A pinned F32 identity therefore rejects CUDA BF16 execution, including backend
+fallbacks that cross precision recipes. Supply the returned value as request
 `model_identity` to reject a mismatched generation before encoding. Loaded
-artifacts are checked for changes before and after execution.
+artifacts are checked for changes before and after execution. Identity separation
+is not evidence of numerical parity; CUDA still requires hardware qualification.
 
 The linked provider exposes `embedDenseGroupsDirectWithControl` and uses the same
 validation, media policy, model pinning and admission. CLI examples:
@@ -1065,3 +1077,327 @@ Native CPU, Metal and actually executed Linux ARM64 preserve all rankings and
 top-k sets, with maximum coordinate error below `1e-6`. This includes two
 attributed real VP9/AV1 clips. WebM duration comes from the declared Segment
 Duration when present, preserving pinned FPS sampling at rounded PTS boundaries.
+
+### CUDA BF16 qualification
+
+Use `zig/pkg/inference/scripts/embeddinggemma2/compare.py` with the same pinned
+checkpoint and prepared suite for both runs. `--backend torch-cuda` loads BF16
+weights/activations, casts floating media inputs to BF16 and pools/normalizes in
+F32. `--backend cuda --binary <cuda-binary>` runs the native HTTP pipeline and
+requires CUDA rather than allowing fallback. Both reports declare `bfloat16`;
+CPU/Metal reports remain `float32`, and comparisons reject precision mismatches.
+For example, from `zig/pkg/inference` in the pinned reference environment:
+
+```sh
+python scripts/embeddinggemma2/compare.py --backend torch-cuda \
+  --model-dir "$MODEL" --suite "$SUITE" --output torch-cuda.json
+python scripts/embeddinggemma2/compare.py --backend cuda --binary "$BINARY" \
+  --model-dir "$MODEL" --suite "$SUITE" --reference torch-cuda.json --output cuda.json
+```
+
+The CUDA reference synchronizes completed device work and records device/runtime,
+allocated/reserved memory and their peaks. HTTP timing includes serialization and
+preprocessing, so compare its scope with the reference's preprocessing-inclusive
+measurement rather than treating encoder time as end-to-end time. The existing
+strict vector, ranking and routing gates remain in force. CUDA encoder-only
+benchmark mode is rejected until its measurement contract is implemented.
+Reports remain `production_qualified: false`; executing this harness on NVIDIA
+hardware and retaining its matched results is required before asserting parity.
+
+Optional CUDA attention, projection, vision and graph profiles carry distinct
+identity pins and remain subject to matched BF16 qualification. See the repository
+`zig/pkg/inference/CUDA_TUNING.md` for profile controls, retained memory limits and
+route-evidence gates. Mixed CUDA inputs compose their ordered text/media rows on
+device; repeated video samples reuse projection while preserving logical slots.
+
+CUDA additionally offers `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_NATIVE_VISION=1`
+for native batched tiled vision attention and
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_MEDIA_BATCH=1` for ordered mixed-media/audio
+cohorts with preparation overlap and batched BF16 backbone execution. Both are
+session-frozen, change `model_identity`, and remain opt-in until NVIDIA vector,
+ranking and performance qualification. The comparison harness can require observed
+execution with `--require-route native_vision` and `--require-route media_batch`.
+
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_FUSED_BACKBONE=1` enables fused
+normalization/residual/scaling kernels with explicit BF16 rounding boundaries.
+It changes `model_identity` and remains opt-in pending NVIDIA qualification.
+The BF16 native vision implementation also versions its existing opt-in identity;
+reload and qualify models before using the resulting pin.
+
+
+CUDA `PACKED_PROJECTIONS`, `GRAPH_REPLAY` and `EXTENDED_FLASH` opt-in profiles
+carry updated identities for bounded grouped PLE, cohort replay and portable
+WMMA tail padding. Reload and qualify the new pins before use. Graph replay is
+bounded to four items, 4096 padded rows and four 128-MiB arenas; grouped PLE uses
+at most 16 MiB of output scratch. BF16 composition avoids F32 widening for hard
+tokens and batched input storage. These implementation changes do not establish
+NVIDIA speedups without hardware measurements.
+
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_TUNED_GEMM=1` enables bounded first-use
+cuBLASLt tuning for BF16-output projections. Selected plans cache by geometry,
+workspace and pointer alignment; tuning declines retry ordinary cuBLASLt
+heuristics. Warm actual shapes before graph capture. Require observed selection
+with `--require-route tuned_gemm`; a heuristic-only run does not qualify tuning.
+
+Packed projections consume QKV and gate/up outputs directly, preserving BF16
+rounding boundaries. Fused backbone execution also combines vision residual/norm
+passes. These opt-in profiles have new identity versions; reload and qualify
+pins with NVIDIA differential tests, pretrained vectors/rankings and completed
+GPU timing before production use. The packed vision rotary consumer applies only
+to existing BF16 attention routes. CPU and Metal profiles are unaffected.
+
+CUDA graph replay now shares four bounded arena slots between encoder and vision
+execution. Vision geometry tables persist per grid/batch; BF16 towers can replay
+once warm. Short encoder queries retain exact row counts, larger buckets add at
+most 12.5% rows, and completed warm measurements choose eager or replay execution.
+The graph profile (`media-graphs-v3`) and extended attention profile
+(`extended-dispatch-v3`) require reloaded, newly qualified model pins.
+
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_SPATIAL_POOL=1` enables direct spatial
+merge/standardization, with a distinct CUDA identity. Metal uses the precise
+resident implementation. RMS normalization retains its existing backend
+reduction. CUDA qualification can require `--require-route spatial_pool`,
+`--require-route vision_graph` and `--require-route short_attention`; use repeated
+images/video frames for vision replay and 16–63-token inputs for short attention.
+These gates attest execution, and still require pinned vector/ranking parity and
+completed timing on NVIDIA hardware before promotion.
+
+CUDA audio caches immutable relative-position/query-scale/RMS/frontend constants
+within an independently admitted 8 MiB / 128-entry budget. Warm query-scale
+preparation avoids all twelve per-layer weight readbacks. Borrowers retain their
+snapshots and admission across cache eviction. The fixed audio frontend recipe
+also reuses thread-safe process tables. BLAS-enabled CPU preparation measures completed
+FFT and BLAS preparations per frame count in a bounded cache, excludes cold
+calls, and retains BLAS unless FFT wins by at least 5%. Optimized BLAS remains
+competitive on large batches.
+
+CUDA image cohorts write patches directly into one bounded batch destination
+before a single projection GEMM. This versions the `IMAGE_BATCH` and `MEDIA_BATCH`
+pins with `batched-patches-v2`; reload and run NVIDIA qualification before use.
+The comparison harness can require `audio_constants` and `patch_into` execution.
+Vision scratch now fits four 480×480 frames with packed BF16 preparation into the
+existing 128 MiB graph arena, without raising the cache ceiling.
+
+
+Audio acceleration also batches compatible subsampling lengths and keeps window,
+magnitude, log/mask, channel normalization and flatten preparation on device.
+Batched normalization and flattening read NCHW directly, avoiding five full
+transposes. A planned 512 FFT fuses magnitude on Metal and CUDA; the CPU FFT
+uses Zig SIMD across eight frames. Set `ANTFLY_EMBEDDINGGEMMA2_AUDIO_DFT=1`
+to force reference preparation. CUDA FFT and tiled F32/BF16 implicit-GEMM audio
+convolutions remain opt-in with distinct identities; see CUDA_TUNING.md for
+flags and route gates. No full im2col buffer is required.
+CUDA QKV packing reuses immutable clamp metadata. The CUDA frontend recipe is
+now version 2; existing CUDA qualification pins must be regenerated. Graph
+retention uses completion-event eviction under the unchanged total memory cap.
+These routes require NVIDIA vector/ranking parity and completed-device timing
+before performance promotion.
+
+The optional `ANTFLY_EMBEDDINGGEMMA2_BENCH_FFT=1` test named `completed
+spectrum benchmark` compares warm, completed spectrum preparation. On an Apple
+M4 Max (Debug host harness, three warmups and five timed iterations), the precise
+Metal route gave:
+
+| Audio frames | DFT GPU µs | FFT GPU µs | DFT completed wall µs | FFT completed wall µs |
+|---|---:|---:|---:|---:|
+| 40 | 66.3 | 23.7 | 1204.8 | 455.6 |
+| 200 | 95.8 | 42.6 | 1063.6 | 276.4 |
+| 1000 | 261.4 | 152.3 | 1366.2 | 498.6 |
+
+These are spectrum microbenchmarks against Antfly's DFT route, excluding mel
+projection and model execution. They do not establish end-to-end or PyTorch
+speed. The independent ReleaseFast CPU spectrum benchmark found Accelerate
+faster at 200/1000 frames, supporting measured CPU selection rather than a
+universal FFT default.
+
+Audio preparation additionally offers a fused window/FFT/sparse-mel/log-mask
+kernel and precise-F32 Metal matrix convolution, with tiled and direct
+fallbacks. Warm feature preparation owns
+one Metal frame unless the caller supplies one. The direct batch estimate
+recovers three-clip Metal or two-clip CUDA cohorts at 1,000 frames within the same
+128 MiB envelope. Diagnostics can force the staged frontend with
+`ANTFLY_EMBEDDINGGEMMA2_AUDIO_UNFUSED=1` and direct Metal convolution with
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DIRECT_CONV=1`.
+
+CUDA `AUDIO_FRONTEND_FUSED` and `AUDIO_GRAPH` flags use the
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_` prefix and remain separately identified
+qualification candidates. The latter learns real conformer buffer lifetimes,
+then captures stable addresses under the existing shared graph budget. Use
+`--require-route audio_frontend_fused`, `audio_arena` and `audio_graph` to attest
+execution before comparing pretrained vectors/rankings and completed latency.
+The `ANTFLY_EMBEDDINGGEMMA2_BENCH_AUDIO=1` test named `completed fused frontend
+and tiled Metal convolution benchmark` measures warm framed frontend and
+convolution routes separately with completed GPU and wall times.
+
+On an Apple M4 Max with the Debug host harness, three warmups and five timed
+iterations, resident-input preparation and two-clip convolution measured the
+following completed GPU times. Convolution uses 128 input channels, 32 output
+channels, width 64, and input height `ceil(audio_frames / 2)`.
+
+| Audio frames | Staged FFT frontend µs | Fused frontend µs | Direct conv µs | Tiled conv µs | Matrix conv µs |
+|---|---:|---:|---:|---:|---:|
+| 40 | 81.2 | 27.2 | 889.7 | 484.7 | 275.8 |
+| 200 | 145.2 | 48.9 | 2888.7 | 1773.5 | 588.4 |
+| 1000 | 261.9 | 166.6 | 3621.4 | 2554.5 | 836.1 |
+
+These measurements exclude uploads, decoding and model execution. The harness
+also reports completed wall time; these kernel comparisons do not establish
+end-to-end or PyTorch speed. The retained-peak regression measured 103.1 MiB of
+additional device allocation for the three-clip, 1,000-frame Metal cohort while
+its command frame remained open, below the unchanged 128 MiB envelope.
+
+The pretrained Metal ordered-media suite passes against the pinned official
+PyTorch F32 oracle after these changes, including audio cohorts. Audio cosine
+similarity was 0.999999998 with maximum absolute error 0.000008523; image,
+text/image orderings and mixed inputs also passed. This qualifies the tested
+fixtures; CUDA arithmetic and graph candidates still need NVIDIA qualification.
+
+Metal audio execution also supports measured clipped-linear fusion. Each bounded
+shape/flags entry compares the fused F32 matrix route with staged MPS using
+completed GPU times, three warmups and five timed iterations. Fusion requires a
+5% win. Bounds values reuse the same geometry decision; no request tensor is
+retained. Optional tuning scratch is admitted separately and capped at 32 MiB.
+MPS remains the default for unfamiliar shapes. Qualification requires three
+separate audio requests, admits at most one probe per request and eight per
+provider lifetime, and stops issuing probe commands after an 8 ms time budget
+or cancellation. One already submitted GPU command must still complete.
+The 32-entry decision cache cannot reset the provider-wide probe allowance.
+
+Private audio scratch can survive command frames in an optional cache with a
+128 MiB ceiling. Page-rounded buffer allocations are admitted individually. Producer completion fences protect reuse, pressure
+reclamation returns the reservation, and cancellation does not publish scratch.
+Batch feature preparation submits one frame for the cohort. Context-parallel
+attention retains the established dimension-reduction order and keeps narrow
+heads on the original kernel.
+
+Diagnostic controls are `ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR=1`,
+`ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR=1` (qualification only),
+`ANTFLY_EMBEDDINGGEMMA2_METAL_SERIAL_ATTENTION=1`, and
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_STORAGE=1`.
+
+Compatible audio FFNs also fuse weighted RMS normalization with their scalar
+input bounds. This removes a normalization/clamp intermediate and dispatch even
+when staged MPS wins projection qualification. The established reduction order
+and vector multiplication order are retained; unsupported bounds/layouts use
+the reference route. `ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS=1` reports actual
+fused-linear, norm/clamp, parallel-attention and retained-storage route counts.
+F32 device-weight RMS normalization also shares this SIMD4 row reduction when
+no input bounds are requested, preserving the reference fallback for other
+layouts and arithmetic policies.
+
+The optional `ANTFLY_EMBEDDINGGEMMA2_BENCH_AUDIO=1` tests named `completed clipped
+projection and context-parallel attention benchmark` and `Metal RMS input-clamp
+fusion` reproduce the resident-input comparisons. On an M4 Max, with the Debug
+host harness, three warmups and five completed samples:
+
+| Operation | Rows | Staged/serial GPU µs | Fused/parallel GPU µs |
+|---|---:|---:|---:|
+| RMS + input clamp | 25 | 23.5 | 12.5 |
+| RMS + input clamp | 250 | 43.8 | 20.5 |
+| Local attention, head width 256 | 25 | 111.5 | 76.9 |
+| Local attention, head width 256 | 50 | 146.8 | 96.7 |
+| Local attention, head width 256 | 250 | 532.9 | 348.6 |
+
+The staged RMS rows above already use the improved SIMD4 reduction. These are
+kernel timings, excluding decode, uploads and backbone inference. The fused
+GEMM candidate lost the tested 1024↔4096 projection comparisons at 25/50/250 rows;
+it remains measurement-gated, with MPS retained. Qualification uses a bounded
+nonzero deterministic probe and the admitted immutable weight snapshot. Its
+cold setup time is excluded from warm measurements and is not an end-to-end
+PyTorch speed claim.
+
+The pretrained ordered-media oracle passes with default selection and with
+forced fused GEMM, including the two-clip audio cohort. Default audio cosine
+similarity is 0.999999997 (maximum absolute error 0.000008732); forced fusion is
+0.999999998 (0.000008566). Default execution reports normalization fusion,
+parallel attention and retained-buffer hits; forced qualification records 398
+fused projections. These checks preserve the tested PyTorch F32 vectors and do
+not establish broader retrieval quality or full-pipeline speed parity.
+
+Metal audio retention charges page-rounded buffer allocations when they enter
+retained storage, rather than reserving the entire ceiling per model. Borrowing
+and eviction return their charges; releases reconcile at safe residency-lock
+boundaries. Retention declines on admission or lock contention, preserving eager
+execution. Completion fences, cancellation cleanup, and model pressure reclamation
+remain mandatory.
+
+Nearby Metal audio lengths can share subsampling convolutions with at most
+12.5% geometry padding. Device-only NCHW padding zeros artificial rows after the
+first normalization, preserving the shorter clip's second-convolution boundary.
+Compaction uses the padded batch stride and returns each clip's original rows
+and mask. Existing exact-length CUDA batching is preserved.
+
+Metal audio schedules bind current inputs to prepared immutable model slots
+and coefficient buffers. They retain no request tensors, allocators, or weight
+pins. Sixteen admitted geometry/range entries cover singleton execution and all
+twelve possible cohort frame groups; recurrent shapes receive priority over
+one-off requests. Model pressure releases schedules before their model entries.
+Capture uses request-local scratch; retained instruction/constant arrays are
+sized to the actual capture. Small coefficients share a packed buffer (at most
+4 MiB per plan). Non-escaping linear and nonlinear outputs share a lifetime-planned
+private arena (at most 64 MiB per plan), with model-owned tensor descriptors reused
+on replay. View ancestors extend lifetimes; returned storage remains independently
+owned. Oversized geometries retain ordinary output allocation.
+Host metadata and physical device allocations are admitted before retention,
+including driver padding. Denied optional preparation preserves eager results
+and retries with bounded backoff, so a transient denial cannot permanently lose
+prepared bindings or the arena.
+
+Replay checks current request control at every instruction and uses shared
+compute encoders within each existing command frame. Cohorts keep their bounded
+pipelined frame groups and cancellation fences. Prepared fused linear routes
+are independent of the evictable tuning cache; unprepared routes can complete
+with staged device operations if fusion declines. Five interleaved warm pairs
+compare median encoding times, rejecting isolated outliers. A slower plan cools
+down for eight visits before retrying; a winning plan resamples after 64 visits.
+Commands are still encoded per execution; this is not a GPU command graph.
+Transposed depthwise coefficients use the model preparation cache across weight
+sources. `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.
+
+The Metal backbone uses model-owned indexed coefficient bindings and projection
+slots across text and media requests. Norm coefficients share one admitted
+buffer; layer scalars remain validated host values. Model pressure drops these
+bindings before releasing language projection slots. A two-entry LRU retains
+full-mask attention ranges, positions and aligned device metadata, keyed by
+batch, sequence length and window. Warm reuse allocates no request descriptors
+or upload buffers; padded or sparse masks retain dynamic preparation. Geometry
+storage shares model admission and pressure cleanup. Optional preparation can
+retry after admission pressure clears. CPU audio waves prepare and wait outside
+the execution gate; each ready wave acquires it for device execution and releases
+it before waiting for the next wave. Invalid CPU inputs require no execution
+lease. Preparation leases, cancellation checks and ordered output ownership
+remain in force.
+
+The optional `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_AUDIO_PLAN=1` ordered-media oracle
+run repeats singleton and cohort audio embeddings, checks every vector against the pinned
+checkpoint oracle, and rejects unsupported schedule capture. Route counters
+must demonstrate replay before treating the run as replay qualification.
+
+Pretrained Metal qualification covers a 492-instruction singleton schedule
+with 96 prepared linear slots, 132 retained coefficient bindings and zero named
+lookups during replay. The full output arena is 1,200 KiB; retained host bytes
+including descriptors are about 782 KiB. Three four-layer cohort schedules each
+prepare 32 slots and 44 coefficient bindings, with zero named lookups, a
+2,400 KiB arena and about 264 KiB retained host bytes. Repeated singleton,
+cohort and two-wave public audio calls pass the pinned checkpoint oracle.
+The backbone shares 170 norm coefficient bindings in one 304 KiB allocation,
+with validated scalars and 144 indexed projection hits per warmed forward pass
+for the pinned model. Bindings survive request wrappers and yield to model pressure.
+
+`ANTFLY_EMBEDDINGGEMMA2_BENCH_PREPARED_EXECUTION=1` adds an offline, completed
+comparison to the ordered-media oracle. It alternates phase order across two
+rounds, warms each route, collects twelve samples per route and validates every
+vector. Use a ReleaseFast test binary. The baseline disables prepared backbone
+bindings and selects the earlier linear-only arena policy; the optimized route
+uses indexed backbone bindings and reusable descriptors for nonlinear outputs.
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PREPARED_BACKBONE=1` and
+`ANTFLY_EMBEDDINGGEMMA2_METAL_LINEAR_ONLY_AUDIO_ARENA=1` select those diagnostic
+policies independently. Audio arena policy participates in the schedule key.
+
+Two local M4 Max ReleaseFast comparisons passed every reference vector. Completed
+singleton medians were 28.53 → 27.37 ms and 25.22 → 23.05 ms; two-clip cohort
+medians were 34.50 → 28.44 ms and 26.38 → 25.09 ms. Each comparison used twelve
+samples per route after warmup, with phase order reversed between rounds.
+The measured gains vary with host load: about 4–9% for singleton audio and 5–18%
+for this cohort fixture. These measurements compare native execution policies;
+they do not establish a speed comparison against PyTorch.

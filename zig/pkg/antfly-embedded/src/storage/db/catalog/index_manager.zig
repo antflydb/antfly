@@ -1458,7 +1458,6 @@ pub const IndexManager = struct {
     // boundaries. Keep the asynchronous scheduler from competing with it (or
     // compacting an older schema generation) for CPU, mmap residency, and the
     // shared text-merge resource budget.
-    text_backfill_active: std.atomic.Value(u32) = .init(0),
     next_text_index_instance_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
     /// Process-local generation of the extraction plan consumed by writes.
     /// Prepared batches compare this scalar instead of rereading and hashing
@@ -1765,6 +1764,7 @@ pub const IndexManager = struct {
         /// catalog lock while it waits, then reject a delete/recreate ABA
         /// before publishing a plan derived from the old schema.
         instance_id: u64 = 0,
+        backfill_active: std.atomic.Value(u32) = .init(0),
         /// Protected by analysis_mutex. Planning captures this revision so a
         /// runtime schema or analyzer configuration refresh cannot invalidate
         /// producer admission estimates while the caller waits for a permit.
@@ -20258,29 +20258,25 @@ pub const IndexManager = struct {
         }
     }
 
-    fn beginTextBackfill(self: *IndexManager) void {
-        const prior = self.text_backfill_active.fetchAdd(1, .acq_rel);
-        if (prior != 0) return;
-
-        // A schema-generation rebuild supersedes useful merge work on the
-        // currently opened generation. Invalidate already-dispatched work so
-        // it cannot publish after the bulk builder has started, and leave the
-        // pending bit intact so a still-live index can resume afterwards.
-        for (self.text_indexes.items) |*existing| {
-            self.text_merge_scheduler.supersedeInFlightForIndex(self.alloc, existing.config.name);
-            existing.detachAllMergeDeletionStates();
+    fn beginTextBackfill(self: *IndexManager, entry: *TextIndex, first_page: bool) void {
+        _ = entry.backfill_active.fetchAdd(1, .acq_rel);
+        // Only a new generation supersedes merges. Resuming a private rebuild
+        // page must not discard useful work, especially on unrelated indexes.
+        if (first_page) {
+            self.text_merge_scheduler.supersedeInFlightForIndex(self.alloc, entry.config.name);
+            entry.detachAllMergeDeletionStates();
         }
     }
 
-    fn endTextBackfill(self: *IndexManager) void {
-        const prior = self.text_backfill_active.fetchSub(1, .acq_rel);
+    fn endTextBackfill(entry: *TextIndex) void {
+        const prior = entry.backfill_active.fetchSub(1, .acq_rel);
         std.debug.assert(prior > 0);
     }
 
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
         if (builtin.is_test) test_text_backfill_invocations += 1;
-        self.beginTextBackfill();
-        defer self.endTextBackfill();
+        self.beginTextBackfill(entry, resume_from == null);
+        defer endTextBackfill(entry);
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -20496,8 +20492,8 @@ pub const IndexManager = struct {
         capacity_check: ?types.RepairCapacityCheck,
         yield_check: ?types.RepairYieldCheck,
     ) !?[]u8 {
-        self.beginTextBackfill();
-        defer self.endTextBackfill();
+        self.beginTextBackfill(entry, resume_from == null);
+        defer endTextBackfill(entry);
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
         var schema_views = SchemaViewSet{ .manager = self };
         defer schema_views.deinit();
@@ -23917,7 +23913,6 @@ pub const IndexManager = struct {
     }
 
     pub fn beginTextMergeTask(self: *IndexManager) !?TextMergeTask {
-        if (self.text_backfill_active.load(.acquire) != 0) return null;
         const now_ns = platform_time.monotonicNs();
         self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);
         _ = self.textMergeStats();
@@ -24349,6 +24344,7 @@ pub const IndexManager = struct {
     }
 
     fn beginTextMergeTaskForEntry(self: *IndexManager, entry: *TextIndex) !?TextMergeTask {
+        if (entry.backfill_active.load(.acquire) != 0) return error.IndexApplyBusy;
         // Full-text replay holds this mutex while changing the shared deletion
         // bitmap. Keep planning and cloning in one short critical section so a
         // task can never observe RoaringBitmap.add() between its key and
@@ -46137,6 +46133,66 @@ test "native residual scratch reuses capacity and releases its bounded reservati
         session.endResidualScratch();
     }
     try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.dense_search_working_set).used_bytes);
+}
+
+test "text backfill isolates merge admission and preserves unrelated in-flight work" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{ .name = "rebuilding", .kind = .full_text, .config_json = "{\"field\":\"title\"}" },
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        },
+    });
+
+    var key_buf: [64]u8 = undefined;
+    const opts: IndexBatchOptions = .{
+        .compact_text = false,
+        .compact_text_segment_threshold = 2,
+        .defer_text_compaction = true,
+    };
+    for (0..12) |i| {
+        const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"merge superseded {d}\"}}", .{i});
+        defer alloc.free(value);
+
+        try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+        try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &.{.{ .key = key, .value = value }}, opts);
+    }
+
+    var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    defer task.deinit(alloc);
+    const rebuilding = manager.textIndexEntry("rebuilding").?;
+    manager.beginTextBackfill(rebuilding, true);
+    // Another index's rebuild cannot discard an already dispatched merge.
+    try std.testing.expectEqual(@as(u64, 1), manager.textMergeStats().in_flight_merges);
+    IndexManager.endTextBackfill(rebuilding);
+
+    const live = manager.textIndexEntry("ft_v1").?;
+    manager.beginTextBackfill(live, false);
+    try std.testing.expectError(error.IndexApplyBusy, manager.beginTextMergeTaskForEntry(live));
+    try std.testing.expectEqual(@as(u64, 1), manager.textMergeStats().in_flight_merges);
+    IndexManager.endTextBackfill(live);
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    try std.testing.expect(try manager.finishTextMergeTask(&task, &result));
 }
 
 test "force text compaction supersedes in-flight scheduled merge" {

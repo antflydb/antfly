@@ -23,8 +23,10 @@ const std = @import("std");
 const httpx = @import("httpx");
 const builtin = @import("builtin");
 const managed_receipt = @import("managed_receipt.zig");
+const gliner_catalog = @import("gliner_catalog.zig");
 const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+const embedding_gemma2_catalog = @import("embedding_gemma2_catalog.zig");
 const artifact_dependencies = @import("artifact_dependencies.zig");
 const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
@@ -38,6 +40,8 @@ pub const HubConfig = struct {
     base_url: []const u8 = "https://huggingface.co",
     /// Requested Hub branch, tag or commit (main by default). Metadata resolves
     /// this once; all files in a pull then use the returned immutable commit.
+    /// Reviewed GLiNER checkpoints default to catalog pins unless @revision
+    /// is explicit in the variant or this field names a non-main revision.
     revision: []const u8 = "main",
     /// Maximum bytes accepted for one downloaded model artifact.
     ///
@@ -130,6 +134,24 @@ fn downloadConfigForVariant(config: HubConfig, variant_revision: VariantRevision
         effective.revision = revision;
     }
     return effective;
+}
+
+fn downloadConfigForModel(config: HubConfig, owner: []const u8, name: []const u8, variant_revision: VariantRevision) !HubConfig {
+    var effective = try downloadConfigForVariant(config, variant_revision);
+    if (variant_revision.revision == null and std.mem.eql(u8, config.revision, "main")) {
+        if (gliner_catalog.defaultRevision(owner, name)) |revision| effective.revision = revision;
+    }
+    return effective;
+}
+
+test "qualified GLiNER pulls default to immutable pins and honor explicit revisions" {
+    const pin = gliner_catalog.defaultRevision("fastino", "GLiNER2.5-Decide-1B").?;
+    const plain = try parseVariantRevision("auto");
+    try std.testing.expectEqualStrings(pin, (try downloadConfigForModel(.{}, "fastino", "GLiNER2.5-Decide-1B", plain)).revision);
+    const explicit = try parseVariantRevision("auto@main");
+    try std.testing.expectEqualStrings("main", (try downloadConfigForModel(.{}, "fastino", "GLiNER2.5-Decide-1B", explicit)).revision);
+    try std.testing.expectEqualStrings("review", (try downloadConfigForModel(.{ .revision = "review" }, "fastino", "GLiNER2.5-Decide-1B", plain)).revision);
+    try std.testing.expectEqualStrings("main", (try downloadConfigForModel(.{}, "antflydb", "GLiNER2.5-Decide-1B", plain)).revision);
 }
 
 fn modelFileUrlAlloc(
@@ -633,6 +655,42 @@ fn glinerGgufSuffix(path: []const u8, component: []const u8) ?[]const u8 {
 fn glinerGgufMatchesSuffix(path: []const u8, component: []const u8, suffix: []const u8) bool {
     const actual = glinerGgufSuffix(path, component) orelse return false;
     return std.ascii.eqlIgnoreCase(actual, suffix);
+}
+
+/// A split bundle declares component roles, independently of their precision.
+/// In particular, Q8 encoders may retain an FP32 auxiliary head. Never infer
+/// the head's precision or filename from the encoder's quantization suffix.
+fn appendDeclaredGlinerBundle(
+    allocator: std.mem.Allocator,
+    selected: *std.ArrayListUnmanaged(HubFile),
+    files: []const HubFile,
+    bytes: []const u8,
+    quant_filter: ?[]const u8,
+) !?bool {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidInferenceBundle;
+    const object = parsed.value.object;
+    const family = object.get("family") orelse return null;
+    if (family != .string or !std.mem.eql(u8, family.string, "gliner2_split_bundle/v1")) return null;
+    const encoder = object.get("encoder") orelse return error.InvalidInferenceBundle;
+    const head = object.get("head") orelse return error.InvalidInferenceBundle;
+    if (encoder != .string or head != .string or
+        !managed_receipt.artifactPathIsSafe(encoder.string) or
+        !managed_receipt.artifactPathIsSafe(head.string) or
+        !isGgufFile(encoder.string) or !isGgufFile(head.string) or
+        std.mem.eql(u8, encoder.string, head.string)) return error.InvalidInferenceBundle;
+    if (quant_filter) |quant| {
+        // The descriptor selects the default, not the only available variant.
+        // Limit fallback to a complete GLiNER pair: a generic GGUF may belong
+        // to an unrelated model in the same repository.
+        if (!ggufQuantSuffixMatches(encoder.string, quant))
+            return try appendGlinerSplitGgufBundleForQuant(allocator, selected, files, quant);
+    }
+    if (!hasFile(files, encoder.string) or !hasFile(files, head.string)) return error.MissingModelArtifact;
+    _ = try appendMatchingFileIfMissing(allocator, selected, files, encoder.string);
+    _ = try appendMatchingFileIfMissing(allocator, selected, files, head.string);
+    return true;
 }
 
 fn appendGlinerSplitGgufBundleForQuant(
@@ -1801,6 +1859,35 @@ pub fn downloadPinnedQwen3EmbeddingBundle(
     }
 }
 
+/// Download the immutable official EmbeddingGemma 2 BF16 bundle. All
+/// tokenizer, processor, prompt, pooling, and normalization sidecars are part
+/// of the verified transaction because each affects observable embeddings.
+pub fn downloadPinnedEmbeddingGemma2Bundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_owner: []const u8,
+    source_name: []const u8,
+    source_variant: []const u8,
+    bundle: *const embedding_gemma2_catalog.Bundle,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+) !void {
+    try embedding_gemma2_catalog.validate();
+    try downloadPinnedQwenBundleArtifacts(
+        allocator,
+        io,
+        source_owner,
+        source_name,
+        source_variant,
+        bundle.artifacts(),
+        null,
+        dest_dir,
+        config,
+        progress,
+    );
+}
+
 /// Download an immutable pinned Qwen3 text-reranker bundle. The Q8 serving
 /// bundle pairs llama.cpp's compact two-row scoring-head GGUF with official
 /// Qwen tokenizer/config sidecars; the BF16 bundle remains an exact upstream
@@ -1857,7 +1944,7 @@ pub fn downloadModel(
     }
     const variant_revision = try parseVariantRevision(variant);
     const payload_variant = variant_revision.variant;
-    var effective_config = try downloadConfigForVariant(config, variant_revision);
+    var effective_config = try downloadConfigForModel(config, owner, name, variant_revision);
     const requested_revision = effective_config.revision;
 
     // Create destination directory (pure Zig, cross-platform)
@@ -1929,9 +2016,13 @@ pub fn downloadModel(
             payload_variant["gguf:".len..]
         else
             null;
-        if (try appendBestRequestedGgufPayload(allocator, &to_download, files, quant_filter, projector_selection)) {
-            found_model_payload = true;
+        var declared: ?bool = null;
+        if (hasFile(files, "antfly_inference_bundle.json")) {
+            const descriptor = try readModelFileAlloc(allocator, io, owner, name, "antfly_inference_bundle.json", effective_config, @intCast(@min(config.max_model_bytes, @min(config.max_artifact_bytes, 1024 * 1024))));
+            defer allocator.free(descriptor);
+            declared = try appendDeclaredGlinerBundle(allocator, &to_download, files, descriptor, quant_filter);
         }
+        found_model_payload = declared orelse try appendBestRequestedGgufPayload(allocator, &to_download, files, quant_filter, projector_selection);
     }
 
     // External multimodal projector only.
@@ -3564,6 +3655,48 @@ test "gguf selection keeps gliner encoder and head together" {
     try std.testing.expectEqualStrings("gliner_head.gguf", to_download.items[1].name);
 }
 
+test "declared GLiNER split bundle selects mixed precision components" {
+    const a = std.testing.allocator;
+    const files = [_]HubFile{
+        .{ .name = "gliner2-encoder.Q8_0.gguf" },
+        .{ .name = "gliner_head.gguf" },
+        .{ .name = "unrelated.Q4_K.gguf" },
+    };
+    const descriptor =
+        \\{"family":"gliner2_split_bundle/v1","encoder":"gliner2-encoder.Q8_0.gguf","head":"gliner_head.gguf"}
+    ;
+    for ([_]?[]const u8{ null, "Q8_0" }) |quant| {
+        var selected: std.ArrayListUnmanaged(HubFile) = .empty;
+        defer selected.deinit(a);
+        try std.testing.expect((try appendDeclaredGlinerBundle(a, &selected, &files, descriptor, quant)).?);
+        try std.testing.expectEqual(@as(usize, 2), selected.items.len);
+        try std.testing.expectEqualStrings(files[0].name, selected.items[0].name);
+        try std.testing.expectEqualStrings(files[1].name, selected.items[1].name);
+    }
+    var selected: std.ArrayListUnmanaged(HubFile) = .empty;
+    defer selected.deinit(a);
+    try std.testing.expect(!(try appendDeclaredGlinerBundle(a, &selected, &files, descriptor, "Q4_K")).?);
+    try std.testing.expectEqual(@as(usize, 0), selected.items.len);
+    try std.testing.expectError(error.MissingModelArtifact, appendDeclaredGlinerBundle(a, &selected, files[0..1], descriptor, null));
+    try std.testing.expectEqual(@as(usize, 0), selected.items.len);
+    try std.testing.expect((try appendDeclaredGlinerBundle(a, &selected, &files, "{\"family\":\"other/v1\"}", null)) == null);
+}
+
+test "declared GLiNER split bundle rejects unsafe and malformed references" {
+    const a = std.testing.allocator;
+    var selected: std.ArrayListUnmanaged(HubFile) = .empty;
+    defer selected.deinit(a);
+    for ([_][]const u8{
+        "{\"family\":\"gliner2_split_bundle/v1\"}",
+        "{\"family\":\"gliner2_split_bundle/v1\",\"encoder\":\"../encoder.gguf\",\"head\":\"head.gguf\"}",
+        "{\"family\":\"gliner2_split_bundle/v1\",\"encoder\":\"/encoder.gguf\",\"head\":\"head.gguf\"}",
+        "{\"family\":\"gliner2_split_bundle/v1\",\"encoder\":\"encoder.gguf\",\"head\":\"encoder.gguf\"}",
+    }) |descriptor| {
+        try std.testing.expectError(error.InvalidInferenceBundle, appendDeclaredGlinerBundle(a, &selected, &.{}, descriptor, null));
+        try std.testing.expectEqual(@as(usize, 0), selected.items.len);
+    }
+}
+
 test "gguf gliner partial bundle does not fall back to generic single file" {
     const allocator = std.testing.allocator;
 
@@ -5155,6 +5288,12 @@ fn exerciseHubSnapshot(mode: []const u8, variant: []const u8, expected_format: ?
         try std.testing.expect(receipt.find("model-00001-of-00001.safetensors") == null);
         try std.testing.expect(receipt.find("onnx/model.onnx") == null);
     }
+    if (std.mem.eql(u8, mode, "gliner-split")) {
+        try std.testing.expect(receipt.find("antfly_inference_bundle.json") != null);
+        try std.testing.expect(receipt.find("gliner2-encoder.Q8_0.gguf") != null);
+        try std.testing.expect(receipt.find("gliner_head.gguf") != null);
+        try std.testing.expect(receipt.find("unrelated.Q4_K.gguf") == null);
+    }
     const log = try tmp.dir.readFileAlloc(io, "requests.log", allocator, .limited(64 * 1024));
     defer allocator.free(log);
     try std.testing.expect(std.mem.indexOf(u8, log, "/resolve/main/") == null);
@@ -5187,4 +5326,30 @@ test "Hub snapshot native compatibility alias selects one artifact format" {
     try exerciseHubSnapshot("onnx-only", "native@v1.0", "onnx", null);
     try exerciseHubSnapshot("all", "nativ", null, error.InvalidModelVariant);
     try exerciseHubSnapshot("onnx-only", "gguf", null, error.NoModelFilesFound);
+}
+
+test "Hub snapshot downloads both declared GLiNER components at the resolved commit" {
+    try exerciseHubSnapshot("gliner-split", "auto", "gguf", null);
+    try exerciseHubSnapshot("gliner-split", "gguf", "gguf", null);
+    try exerciseHubSnapshot("gliner-split", "gguf:Q8_0", "gguf", null);
+    try exerciseHubSnapshot("gliner-split", "gguf:Q4_K", null, error.NoModelFilesFound);
+}
+
+test "declared GLiNER default preserves explicit nondefault quantization" {
+    const a = std.testing.allocator;
+    const files = [_]HubFile{
+        .{ .name = "gliner2-encoder.Q8_0.gguf" },
+        .{ .name = "gliner2-head.Q8_0.gguf" },
+        .{ .name = "gliner2-encoder.Q4_K.gguf" },
+        .{ .name = "gliner2-head.Q4_K.gguf" },
+    };
+    const descriptor = "{\"family\":\"gliner2_split_bundle/v1\",\"encoder\":\"gliner2-encoder.Q8_0.gguf\",\"head\":\"gliner2-head.Q8_0.gguf\"}";
+    var baseline: std.ArrayListUnmanaged(HubFile) = .empty;
+    defer baseline.deinit(a);
+    try std.testing.expect(try appendBestRequestedGgufPayload(a, &baseline, &files, "Q4_K", .auto));
+    var selected: std.ArrayListUnmanaged(HubFile) = .empty;
+    defer selected.deinit(a);
+    const declared = try appendDeclaredGlinerBundle(a, &selected, &files, descriptor, "Q4_K");
+    const found = declared orelse try appendBestRequestedGgufPayload(a, &selected, &files, "Q4_K", .auto);
+    try std.testing.expect(found);
 }

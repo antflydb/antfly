@@ -46,10 +46,24 @@ requires every declared runtime archive for each supported platform.
 from the embedded archives, bundling only the native library. Prebuilt language
 packages cover Linux x86-64/ARM64 (glibc 2.28+) and macOS ARM64; the native
 archive matrix is separate. Go/Rust/C use `lib/pkgconfig/libantfly.pc`.
-Dispatch `.github/workflows/embedded-release-publish.yml` with the immutable tag
-and successful build run to verify and publish that snapshot. Go and Rust link
+Embedded package assembly runs the source commit's packaging script in a detached
+worktree at `dist/embedded-package-source`, preserving the active workspace's
+manifests and frozen pnpm lockfile. This also preserves older source commits'
+packaging-script contract. Binding checks use the staged native library and the
+workflow copies their TypeScript build into the staged wrapper before packing.
+The Homebrew C smoke test checks the installed library against
+`ANTFLY_ABI_VERSION` and the open-options layout in its installed header.
+`.github/workflows/embedded-release-publish.yml` automatically publishes embedded
+packages to npm, PyPI, and crates.io after a successful stable or RC build.
+Nightlies retain artifacts without registry publication. Manual dispatch with
+the immutable tag and successful build run is the retry path. Rust crates are
+packaged from that source commit, stamped with the release version, verified,
+and published sys-first with an exact dependency. Existing versions must match
+the sealed package checksums before they can be skipped on retry. Go and Rust link
 `libantfly` from an embedded archive or local build. See
 [licensing maintenance](docs/reference/licensing.md) for trusted publisher setup.
+Registry ownership and all three trusted-publisher configurations are described
+in [registry publishing setup](docs/reference/registry-publishing.md).
 
 Linux has an explicit two-ABI contract:
 
@@ -125,8 +139,8 @@ credentials.
    exact scope membership, and every digest.
 5. Policy-selected package registries, the Homebrew formula, and the single
    multi-architecture container image consume those verified scopes. Stable
-   and RC releases publish npm and PyPI packages; nightly builds verify the same
-   package snapshot but publish it only to R2 and the container registries. The
+   and RC releases publish npm packages; CLI PyPI publication is paused. Nightly
+   builds verify the same package snapshot but publish it only to R2 and the container registries. The
    container publisher is callable
    only by this controller, checks out the recorded controller commit, and
    consumes the GNU runtime archives built from the source commit in step 2.
@@ -240,7 +254,8 @@ The deployment environments follow the versioned contract in
 `scripts/release/github-environments.json`. `release-promotion` accepts only the
 default `main` branch and protects release preflight plus retention approval;
 `container-publish` accepts only the legacy release and operator tag patterns.
-Both copy the required-reviewer set from the `npm` environment and prevent
+`crates-io` accepts only `main` for embedded Rust publication.
+All three copy the required-reviewer set from the `npm` environment and prevent
 self-review. Release preflight and retention planning audit the live GitHub
 configuration before any mutable or destructive operation. An administrator
 applies intentional contract changes with:
@@ -274,7 +289,14 @@ The canonical ABI, archive, package, wheel, backend, and consumer matrix lives
 in `scripts/release/platforms.json`; channel behavior lives in
 `scripts/release/channels.json`. Release jobs, CLI packaging, Homebrew, and
 promotion and retention read those policies instead of maintaining independent
-conditionals or platform tables. Python
+conditionals or platform tables. PyPI publication of the native CLI installer
+is temporarily paused: `publish_pypi` is false for stable and next. The separate
+`embedded-release-publish.yml` workflow publishes `antfly-embedded` independently,
+after its registry setup is complete. CLI wheels are still built and verified as
+release artifacts. Restore those policy flags to resume CLI PyPI publication.
+To finish a partially published CLI release under
+the updated policy, use the exact-ledger recovery dispatch from `main`; rerunning
+an old workflow retains its original policy. Python
 dependencies used by the release control plane are exact and hash-locked in
 `scripts/release/requirements.lock`; Node and npm versions are exact as well.
 Every workflow declares an explicit `GITHUB_TOKEN` permission baseline, and all
@@ -437,6 +459,9 @@ Run a snapshot for the current default-branch head with
 `gh workflow run antfly-nightly.yml`. To reproduce a snapshot from a specific
 default-branch commit, add `-f source_commit=<40-character-commit>`.
 
+CLI PyPI publication is paused in `scripts/release/channels.json`. New CLI
+snapshots contain npm packages only; legacy wheel snapshots remain verifiable.
+
 Stable releases publish:
 
 - GitHub Release artifacts
@@ -444,7 +469,6 @@ Stable releases publish:
 - the `latest` R2 metadata pointer and stable installer bootstrap
 - Zig Homebrew formula `antfly`
 - npm CLI packages with dist-tag `latest`
-- PyPI CLI wheels
 - container tags `<version>` and `latest`
 
 RC releases publish:
@@ -453,8 +477,6 @@ RC releases publish:
 - R2 release artifacts
 - the `next` R2 metadata pointer
 - npm CLI packages with dist-tag `next`
-- PyPI CLI wheels using PEP 440 prerelease versions, for example
-  `0.2.0-rc.1` becomes `0.2.0rc1`
 - container tags `<version>` and `next`
 
 RC releases do not update the `latest` R2 channel, Homebrew stable formula, or

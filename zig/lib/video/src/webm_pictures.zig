@@ -455,10 +455,10 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
         const session = if (!cold) retained.?.session.? else try codecs.Session.create(a, if (reader.track.codec == .vp9) .vp9 else .av1, decoder_options);
         if (retained) |owner| owner.session = session;
         defer if (retained == null) session.destroy();
-        session.options.control = control;
+        session.setControl(control);
         // The composite control borrows this call's stack; never retain it.
         defer if (retained != null) {
-            session.options.control = .{};
+            session.setControl(.{});
         };
         const previous_stats = session.output_stats;
         defer if (options.replay_stats) |stats| {
@@ -639,7 +639,9 @@ test "WebM header metadata admission outlives indexing and allocation failures r
             try std.testing.expectEqual(@as(u64, headers.pictures.len * @sizeOf(Picture) + headers.restarts.len * @sizeOf(Restart)), pool.snapshot().host_bytes);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+    // Refuse backing remaps so every campaign enumerates the same allocations.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Campaign.run, .{});
 }
 
 test "WebM metadata indexing rejects overflowing and denied shared budgets" {
@@ -762,7 +764,9 @@ test "WebM indexed replay allocation failures reclaim index bootstrap and decode
             try walkIndexed(a, &reader, options, indexed, &.{3}, &dummy, accept);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+    // Refuse backing remaps so every campaign enumerates the same allocations.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Campaign.run, .{});
 }
 
 test "WebM indexed replay preserves expanded VP9 AV1 depth chroma grain and layers" {
@@ -1212,6 +1216,10 @@ test "WebM continuation retains VP8 VP9 AV1 references and preserves replay outp
             replay_packets += stats.packets_decoded;
             var window_pool = media.admission.Pool{ .limits = .{ .host_bytes = 0 } };
             try retained.walk(indexed, .{ .decoder = .{ .admission_pool = &window_pool } }, &.{id}, &actual, Capture.accept);
+            if (retained.session) |session| {
+                try std.testing.expect(std.meta.eql(media.source.Control{}, session.options.control));
+                try std.testing.expect(std.meta.eql(media.source.Control{}, session.owner.control));
+            }
             try std.testing.expectEqual(media.admission.Resources{}, window_pool.snapshot());
             try std.testing.expectEqual(expected.count, actual.count);
             try std.testing.expectEqualSlices(u8, &expected.digest, &actual.digest);

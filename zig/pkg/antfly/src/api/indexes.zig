@@ -7686,6 +7686,8 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(chunking_openapi.ChunkerConfig, .chunker);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.TextChunkOptions, .chunker_text);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.AudioChunkOptions, .chunker_audio);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkEmbeddingTarget, .chunker_embedding);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.MediaChunkPolicy, .chunker_policy);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
@@ -7712,12 +7714,32 @@ fn consumerTests() type {
                 .chunker,
                 .chunker_text,
                 .chunker_audio,
+                .chunker_embedding,
+                .chunker_policy,
                 .index_execution,
                 .execution_policy,
             }) |shape| {
                 try std.testing.expect(!public_index_contract.isAllowedCreatedObjectField(shape, "client_value"));
                 try std.testing.expect(!public_index_contract.isAllowedCreatedObjectField(shape, "settings"));
             }
+            const config =
+                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","embedding":{"model":"encoder","dimensions":2,"execute":false,"allow_partial":true,"client_value":"private"},"policy":{"max_frames":8,"target_tokens":"invalid","settings":"private"}}}
+            ;
+            const created = try encodeCreatedIndexConfig(std.testing.allocator, "media", config);
+            defer std.testing.allocator.free(created);
+            var decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
+            defer decoded.deinit();
+            const chunker = decoded.value.object.get("chunker").?.object;
+            const embedding = chunker.get("embedding").?.object;
+            try std.testing.expectEqualStrings("encoder", embedding.get("model").?.string);
+            try std.testing.expectEqual(@as(i64, 2), embedding.get("dimensions").?.integer);
+            try std.testing.expect(!embedding.get("execute").?.bool);
+            try std.testing.expect(embedding.get("allow_partial").?.bool);
+            try std.testing.expect(!embedding.contains("client_value"));
+            const policy = chunker.get("policy").?.object;
+            try std.testing.expectEqual(@as(i64, 8), policy.get("max_frames").?.integer);
+            try std.testing.expect(!policy.contains("target_tokens"));
+            try std.testing.expect(!policy.contains("settings"));
         }
 
         test "public index config encoders redact nested credentials" {

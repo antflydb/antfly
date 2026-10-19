@@ -15977,7 +15977,13 @@ export interface components {
             table_id: string;
             /** @enum {string} */
             format: "parquet" | "iceberg";
+            /** @description Parquet prefix, Iceberg table, or an explicit Parquet snapshot head ending in .parquet-manifest.json. Snapshot heads name immutable checksummed file-list chunks; each query revalidates the head without listing the data prefix. */
             uri: string;
+            /**
+             * @description Server-assigned public row identity version, fixed when the source is attached and preserved across index creation and schema updates.
+             * @enum {integer}
+             */
+            readonly row_identity_version?: 1 | 2;
             /** @default auto */
             schema_fingerprint?: string;
             /**
@@ -20533,7 +20539,13 @@ export interface components {
         InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
         InferenceMediaContentPart: components["schemas"]["MediaContentPart"];
         InferenceContentPart: components["schemas"]["ContentPart"];
-        /** @description EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. Video uses video/mp4, video/quicktime, video/webm or video/mp2t media/attachment parts, 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. The expanded sequence must fit 8192 tokens. */
+        /** @description One ordered input producing one combined embedding. Supported by EmbeddingGemma 2. Text, image, and audio parts may be combined in order. On Linux CUDA, a group containing one video/mp4 media part produces one clip embedding using NVDEC; mixed video groups are unsupported. Video requires progressive SDR H.264 MP4, at most 60 seconds and 256 MiB, subject to narrower request limits. Sampling uses 1 FPS capped uniformly to 32 frames, with at most 140 visual tokens per frame. The expanded input, including task prompts, BOS/EOS, and media tokens, must fit within 8192 tokens. Overflow is rejected without truncation. */
+        InferenceEmbeddingContentInput: {
+            /** @description Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part. */
+            title?: string;
+            content: components["schemas"]["ContentPart"][];
+        };
+        /** @description EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. CPU/Metal video accepts video/mp4, video/quicktime, video/webm or video/mp2t, using 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. Linux CUDA video uses NVDEC and requires one standalone progressive SDR H.264 video/mp4 part, without a title or other parts, at most 60 seconds and 256 MiB subject to narrower request limits. The expanded sequence including all media soft tokens must fit 8192 tokens. */
         InferenceEmbeddingGroup: {
             /** @description Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part. */
             title?: string;
@@ -20551,22 +20563,24 @@ export interface components {
              *     - a single string
              *     - an array of strings
              *     - an array of OpenAI-style content parts for multimodal embedding
-             *     - an array of ordered groups for EmbeddingGemma 2, one vector per group
+             *     - an object with an ordered content array, producing one embedding
+             *     - an array of ordered content objects, producing one embedding per object
+             *     Legacy arrays of content parts continue to produce one embedding per part.
              */
-            input: string | string[] | components["schemas"]["ContentPart"][] | components["schemas"]["InferenceEmbeddingGroup"][];
+            input: string | string[] | components["schemas"]["ContentPart"][] | components["schemas"]["InferenceEmbeddingGroup"][] | components["schemas"]["InferenceEmbeddingContentInput"] | components["schemas"]["InferenceEmbeddingContentInput"][];
             /**
              * @description Encoding format for the embeddings (only "float" supported)
              * @default float
              * @enum {string}
              */
             encoding_format?: "float";
-            /** @description Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512, 256, or 128 only. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models. */
+            /** @description Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). EmbeddingGemma 2 is trained for 768, 512, 256, and 128 dimensions. Not supported for sparse models. */
             dimensions?: number;
             /**
-             * @description Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+             * @description Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 applies its official prompt for each of the eight task types to text-bearing inputs and rejects custom instructions. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
              * @enum {string}
              */
-            task_type?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "QUESTION_ANSWERING" | "FACT_VERIFICATION" | "CODE_RETRIEVAL_QUERY" | "CLASSIFICATION" | "CLUSTERING" | "SEMANTIC_SIMILARITY";
+            task_type?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "QUESTION_ANSWERING" | "FACT_VERIFICATION" | "FACT_CHECKING" | "CODE_RETRIEVAL_QUERY" | "CODE_RETRIEVAL" | "CLASSIFICATION" | "CLUSTERING" | "SEMANTIC_SIMILARITY";
             /** @description Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support. */
             instruction?: string;
             /**
@@ -20588,6 +20602,8 @@ export interface components {
         };
         /** @description OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors */
         InferenceEmbedResponse: {
+            /** @description Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail if the resident text encoder cannot execute; this field does not describe preprocessing placement. */
+            backend?: string | null;
             /** @description EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and recipe. Dimensions and retrieval roles must also match index configuration. */
             model_identity?: string;
             /**

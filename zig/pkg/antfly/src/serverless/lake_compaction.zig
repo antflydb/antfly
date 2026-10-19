@@ -124,7 +124,8 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
                 const keep = try scratch.alloc(bool, batch.rowCount());
                 @memset(keep, true);
                 try stream.deleteMask(scratch, batch, keep);
-                for (keep, batch.row_refs, 0..) |visible, reference, row| {
+                for (keep, 0..) |visible, row| {
+                    const reference = batch.rowRef(row);
                     if (scanned == job.max_rows) break :scan;
                     var image: V = .{ .object = .empty };
                     var bytes: usize = 0;

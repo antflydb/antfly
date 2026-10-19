@@ -168,6 +168,51 @@ pub fn build(b: *std.Build) void {
         self.assertEqual(result.returncode == 0, succeeds, output)
         return output
 
+    def test_long_run_allows_ready_sibling_compilation(self):
+        self.write("probe.zig", "export fn probe() u32 { return 42; }\n")
+        self.write(
+            "gate.py",
+            """from pathlib import Path
+import sys, time
+mode = sys.argv[1]
+if mode == 'hold': Path('started').write_text('ready')
+if mode == 'release': Path('released').write_text('done')
+else:
+    marker = Path('released' if mode == 'hold' else 'started')
+    deadline = time.monotonic() + 30
+    while not marker.exists():
+        if time.monotonic() >= deadline: raise RuntimeError('ready compiler was blocked by a long Run step')
+        time.sleep(0.01)
+""",
+        )
+        self.write(
+            "build.zig",
+            """const std = @import("std");
+fn gate(b: *std.Build, mode: []const u8) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{ "python3", "gate.py", mode });
+    run.expectExitCode(0);
+    run.has_side_effects = true;
+    _ = run.captureStdOut(.{});
+    return run;
+}
+pub fn build(b: *std.Build) void {
+    const hold = gate(b, "hold");
+    const ready = gate(b, "ready");
+    const object = b.addObject(.{ .name = "overlap-probe", .root_module = b.createModule(.{
+        .root_source_file = b.path("probe.zig"), .target = b.graph.host, .optimize = .debug,
+    }) });
+    object.step.dependOn(&ready.step);
+    const release = gate(b, "release");
+    release.step.dependOn(&object.step);
+    const step = b.step("test", "Prove compilation overlaps a running test");
+    step.dependOn(&hold.step);
+    step.dependOn(&release.step);
+}
+""",
+        )
+        self.build()
+        self.assertEqual((self.root / "released").read_text(), "done")
+
     def test_both_owners_run_once_with_shared_types_and_late_options(self):
         output = self.build()
         self.assertEqual(output.count("local owned..."), 1, output)

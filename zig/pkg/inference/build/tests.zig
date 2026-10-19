@@ -80,7 +80,9 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("antfly_video", ctx.graph.inference_mod.import_table.get("antfly_video").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
     tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("jinja", ctx.graph.jinja_mod);
@@ -99,6 +101,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("prometheus", ctx.graph.prometheus_mod);
     tests.root_module.addImport("structlog", ctx.graph.structlog_mod);
     tests.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
+    tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     tests.root_module.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
     tests.root_module.addImport("inference_internal", tests.root_module);
     if (ctx.graph.inference_client_mod) |mod| {
@@ -108,6 +111,7 @@ pub fn create(ctx: Context) Suite {
         runtime_build.configureSystemBlas(b, tests.root_module, ctx.target, ctx.backend.blas_root);
     }
     runtime_build.configureMetal(b, tests.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
+    runtime_build.configureCudaVideo(b, tests.root_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     tests.root_module.link_libc = ctx.backend.link_libc;
 
     // Keep the standalone server's CLI and configuration parsing covered too.
@@ -132,6 +136,10 @@ pub fn create(ctx: Context) Suite {
     cli_tests.root_module.link_libc = ctx.backend.link_libc;
 
     const run_cli_tests = ctx.addRunArtifact(cli_tests);
+    // Runtime passthrough arguments arrive after Zig 0.17's configure phase.
+    // The library runner remains strict; its default-only CLI companion may
+    // be empty only when an explicit include selector matches no CLI test.
+    run_cli_tests.addArg("--allow-empty-filtered-suite");
     for (selected_test_filters) |filter| {
         run_cli_tests.addArgs(&.{ "--test-filter", filter });
     }
@@ -173,6 +181,23 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_quant_kernel_metal_runtime_check_tests = checks.metal_runtime;
     const run_bge_m3_e2e_bench_tests = checks.bge_benchmark;
     const test_step = ctx.step("test", "Run unit tests");
+    const media_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media/src/inference.zig" })),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    }) });
+    const media_step = ctx.step("test-video-media", "Run bounded media and NVDEC callback tests without a GPU");
+    media_step.dependOn(&ctx.addRunArtifact(media_tests).step);
+    if (ctx.target.result.os.tag == .linux) {
+        const callbacks = b.addExecutable(.{ .name = "video-decode-callback-tests", .root_module = b.createModule(.{
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+            .link_libc = true,
+        }) });
+        callbacks.root_module.addCSourceFile(.{ .file = ctx.path("tests/video_decode_test.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-UNDEBUG" } });
+        media_step.dependOn(&ctx.addRunArtifact(callbacks).step);
+    }
+    test_step.dependOn(media_step);
     ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites").dependOn(&run_tests.step);
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
     if (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos) {
