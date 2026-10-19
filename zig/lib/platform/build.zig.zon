@@ -18,7 +18,10 @@
     .version = "0.0.1",
     .fingerprint = 0x777bb317e35826e7,
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        // Test-only: deterministic scheduling for the rw_lock tests.
+        .vopr = .{ .path = "../vopr" },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

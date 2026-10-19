@@ -261,7 +261,7 @@ const graph_edge_ttl_expiration = @import("graph_edge_ttl_expiration.zig");
 const graph_edge_ttl_tombstone = @import("graph_edge_ttl_tombstone.zig");
 const graph_state_name = @import("graph_state_name.zig");
 const native_backup = @import("native/backup.zig");
-const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const snapshot_admission_mod = @import("snapshot_admission.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
@@ -1073,7 +1073,7 @@ const AsyncContentionStats = execution_resources.AsyncContentionStats;
 const ProfiledLock = execution_resources.ProfiledLock;
 
 const ProfiledApplyLock = struct {
-    rw_lock: *apply_rw_lock_mod.ApplyRwLock,
+    rw_lock: *WriterPreferringRwLock,
     stats: *MutexContentionStats,
     hold_start_ns: u64,
     profiled: bool,
@@ -1103,7 +1103,7 @@ const EnrichmentAppendContext = struct {
     index_repair_checkpoint: ?index_repair_state.Location = null,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     portable_runtime_activation_pending: ?*const std.atomic.Value(bool) = null,
     snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
@@ -2687,7 +2687,7 @@ pub fn splitBootstrapMarkersEqual(a: range_state_mod.SplitBootstrapMarker, b: ra
 
 pub const lockAtomicWithBackoffProfiled = local_mutation.lockAtomicWithBackoffProfiled;
 
-fn lockApplyWithBackoffProfiled(rw_lock: *apply_rw_lock_mod.ApplyRwLock, stats: *MutexContentionStats) ProfiledApplyLock {
+fn lockApplyWithBackoffProfiled(rw_lock: *WriterPreferringRwLock, stats: *MutexContentionStats) ProfiledApplyLock {
     if (!asyncIndexProfileEnabled()) {
         rw_lock.lockExclusive();
         return .{
@@ -37011,7 +37011,7 @@ fn noteTargetAdvanceDebtLogged(ctx: *AsyncContext, index_name: []const u8, now_n
 }
 
 test "async dense catch-up tokens bind one exact session" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
         .store = undefined,
@@ -37043,7 +37043,7 @@ test "async dense catch-up tokens bind one exact session" {
 }
 
 test "async dense catch-up token owns snapshot admission through close" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var snapshot_admission: snapshot_admission_mod.SnapshotAdmission = .{};
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
@@ -37119,7 +37119,7 @@ fn oldestTargetAdvanceStuck(ctx: *AsyncContext, timeout_ns: u64, now_ns: u64) !?
 }
 
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
     defer resource_manager.deinit(std.testing.allocator);
     var ctx = AsyncContext{
@@ -37225,7 +37225,7 @@ test "native publication finalization forwards raced source completion" {
     var runtime = std.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var ctx = AsyncContext{
         .alloc = alloc,
         .store = undefined,
@@ -37257,7 +37257,7 @@ test "native publication finalization forwards raced source completion" {
 }
 
 test "external dense bulk waiter owns admission across catch-up handoff" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
         .store = undefined,
@@ -37307,7 +37307,7 @@ test "external dense bulk waiter owns admission across catch-up handoff" {
 }
 
 test "async context dense catch-up session finish is idempotent when already closed" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
         .store = undefined,
@@ -37403,7 +37403,7 @@ test "dense target advance is blocked while external bulk session is active" {
 }
 
 test "target advance debt logging is rate limited without doing repair work" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
         .store = undefined,
@@ -37420,7 +37420,7 @@ test "target advance debt logging is rate limited without doing repair work" {
 }
 
 test "target advance maintenance handoff is exact-incarnation scoped" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
         .store = undefined,
@@ -37443,7 +37443,7 @@ test "target advance maintenance handoff is exact-incarnation scoped" {
 }
 
 test "target advance stuck tracking records first-seen time and clears on success" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
         .store = undefined,
@@ -88868,8 +88868,8 @@ test "db merge-style cutover fences enrichment to the merged receiver range with
 
 test "db merge artifact import holds both apply locks through copy failure" {
     const Probe = struct {
-        donor: *apply_rw_lock_mod.ApplyRwLock,
-        receiver: *apply_rw_lock_mod.ApplyRwLock,
+        donor: *WriterPreferringRwLock,
+        receiver: *WriterPreferringRwLock,
         checked: bool = false,
         both_held: bool = false,
 

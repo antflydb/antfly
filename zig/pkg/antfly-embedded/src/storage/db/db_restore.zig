@@ -21,7 +21,7 @@ const DB = db_zig.DB;
 const RelationalProjectionPlan = @import("query/relational_projection.zig").Plan;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const antfly_test_error_logs = @import("antfly_test_error_logs");
-const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const apply_state = @import("derived/apply_state.zig");
 const artifact_ids = @import("artifact/ids.zig");
 const artifact_reconcile_intent = @import("artifact/reconcile_intent.zig");
@@ -327,7 +327,7 @@ pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
     return async_stats;
 }
 
-pub fn snapshotApplyLockStats(self: *DB) apply_rw_lock_mod.ApplyRwLock.Stats {
+pub fn snapshotApplyLockStats(self: *DB) WriterPreferringRwLock.Stats {
     return self.core.apply_mutex.snapshot();
 }
 
@@ -4640,7 +4640,7 @@ pub fn persistIncompleteHbcSnapshotRepair(
 }
 
 test "portable activation failure still releases dense session bookkeeping" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_mutex: WriterPreferringRwLock = .{};
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
         .store = undefined,

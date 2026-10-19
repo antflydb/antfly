@@ -72,7 +72,7 @@ else
 const chunk_artifact_mod = @import("../../../chunking/chunk.zig");
 const chunking_types_mod = @import("../../../chunking/types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
-const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const ownership_mod = @import("../ownership.zig");
 const lease_mod = @import("../lease.zig");
 const types = @import("../types.zig");
@@ -4891,7 +4891,7 @@ const UnsupportedEnrichmentRuntime = struct {
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
-    coverage_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null,
+    coverage_apply_mutex: ?*WriterPreferringRwLock = null,
     write_ctx: *anyopaque,
     write_fn: GeneratedRecordWriter,
     failure_ctx: ?*anyopaque = null,
@@ -4994,7 +4994,7 @@ const UnsupportedEnrichmentRuntime = struct {
         change_journal: *change_journal_mod.Journal,
         replay_source: replay_source_mod.Source,
         index_manager: *index_manager_mod.IndexManager,
-        coverage_apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        coverage_apply_mutex: *WriterPreferringRwLock,
         write_ctx: *anyopaque,
         write_fn: GeneratedRecordWriter,
         failure_ctx: ?*anyopaque,
@@ -5397,7 +5397,7 @@ const PlatformEnrichmentRuntime = struct {
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
-    coverage_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null,
+    coverage_apply_mutex: ?*WriterPreferringRwLock = null,
     write_ctx: *anyopaque,
     write_fn: GeneratedRecordWriter,
     failure_ctx: ?*anyopaque = null,
@@ -5523,7 +5523,7 @@ const PlatformEnrichmentRuntime = struct {
         change_journal: *change_journal_mod.Journal,
         replay_source: replay_source_mod.Source,
         index_manager: *index_manager_mod.IndexManager,
-        coverage_apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        coverage_apply_mutex: *WriterPreferringRwLock,
         write_ctx: *anyopaque,
         write_fn: GeneratedRecordWriter,
         failure_ctx: ?*anyopaque,
@@ -31200,7 +31200,7 @@ test "derived coverage outcome transitions are exclusive and idempotent" {
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var coverage_apply_mutex = apply_rw_lock_mod.ApplyRwLock{};
+    var coverage_apply_mutex = WriterPreferringRwLock{};
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,

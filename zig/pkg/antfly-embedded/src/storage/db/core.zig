@@ -18,7 +18,7 @@ const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const db_config = @import("config.zig");
-const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const snapshot_admission_mod = @import("snapshot_admission.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
@@ -373,7 +373,7 @@ pub const OpenedCoreResources = struct {
     change_journal: *change_journal_mod.Journal,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
     snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.Io.Mutex,
@@ -416,7 +416,7 @@ pub const AsyncResources = struct {
     applied_sequence_checkpoint_path: ?[]const u8,
     index_repair_checkpoint: ?index_repair_state.Location,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.Io.Mutex,
 };
@@ -429,7 +429,7 @@ pub const BatchExecutionResources = struct {
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
     snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.Io.Mutex,
@@ -507,7 +507,7 @@ pub const DBCore = struct {
     change_journal: *change_journal_mod.Journal,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
     snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.Io.Mutex,
@@ -3013,7 +3013,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     var owned_change_journal: ?*change_journal_mod.Journal = null;
     var owned_shard_manager: ?*shard_mod.ShardManager = null;
     var owned_index_manager: ?*index_manager_mod.IndexManager = null;
-    var owned_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null;
+    var owned_apply_mutex: ?*WriterPreferringRwLock = null;
     var owned_snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null;
     var owned_snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null;
     var owned_repair_replay_mutex: ?*std.Io.Mutex = null;
@@ -3048,7 +3048,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     owned_shard_manager = shard_manager;
     const index_manager = try alloc.create(index_manager_mod.IndexManager);
     owned_index_manager = index_manager;
-    const apply_mutex = try alloc.create(apply_rw_lock_mod.ApplyRwLock);
+    const apply_mutex = try alloc.create(WriterPreferringRwLock);
     apply_mutex.* = .{};
     owned_apply_mutex = apply_mutex;
     const snapshot_admission = try alloc.create(snapshot_admission_mod.SnapshotAdmission);

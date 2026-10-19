@@ -29,7 +29,7 @@ const native_artifact_sink = @import("../../native_artifact_sink.zig");
 const native_backup = @import("../native/backup.zig");
 const process_memory = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
-const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const backend_types = @import("../../backend_types.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
@@ -1442,7 +1442,7 @@ pub const IndexManager = struct {
     vector_block_projection_dirty: std.atomic.Value(bool) = .init(false),
     vector_block_candidate_sequence: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
-    catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
+    catalog_mutex: WriterPreferringRwLock = .{},
     /// Serialize local receipt counter preparation through its physical commit.
     /// Acquire after primary/graph/index guards; never acquire an index guard
     /// while holding this mutex. Provider execution happens before acquisition.
@@ -1499,7 +1499,7 @@ pub const IndexManager = struct {
     /// acquire exclusive under DB apply, without retaining a catalog lease. This fences
     /// primary contributor reads through commit while preserving worker
     /// parallelism across indexes. Never acquire DB apply from a shared holder.
-    graph_primary_publication: apply_rw_lock_mod.ApplyRwLock = .{},
+    graph_primary_publication: WriterPreferringRwLock = .{},
     graph_artifact_rebuild_pending: bool = false, // protected by catalog_mutex
     graph_metric_schedule_pin_mutex: std.Io.Mutex = .init,
     graph_metric_schedule_pins_drained: std.Io.Condition = .init,
@@ -1773,7 +1773,7 @@ pub const IndexManager = struct {
         io: std.Io,
         merge_delta_mutex: std.Io.Mutex = .init,
         merge_deletion_states: std.ArrayListUnmanaged(*TextMergeDeletionState) = .empty,
-        analysis_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
+        analysis_mutex: WriterPreferringRwLock = .{},
         config: types.IndexConfig,
         chunk_name: ?[]u8,
         source_artifact_names: [][]u8 = &.{},

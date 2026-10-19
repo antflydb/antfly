@@ -54,7 +54,7 @@ const backend_types = @import("backend_types.zig");
 const hbc_backend = @import("hbc_backend.zig");
 const posting_segment_store_mod = @import("posting_segment_store.zig");
 const resource_manager_mod = @import("resource_manager.zig");
-const apply_rw_lock_mod = @import("db/apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const lsm_backend = @import("lsm_backend/mod.zig");
 const platform_time = @import("antfly_platform").time;
 const vec = @import("antfly_vector").vector;
@@ -524,7 +524,7 @@ fn releaseMetadataCacheEntry(alloc: Allocator, entry: *MetadataCacheEntry) void 
 
 const BorrowedNodeLease = union(enum) {
     locked: struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         node: *const Node,
     },
     retained: struct {
@@ -550,7 +550,7 @@ const BorrowedNodeLease = union(enum) {
 
 const BorrowedQuantizedLease = union(enum) {
     locked: struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         quantized: *const QuantizedSet,
     },
     retained: struct {
@@ -576,7 +576,7 @@ const BorrowedQuantizedLease = union(enum) {
 
 const BorrowedVectorLease = union(enum) {
     locked: struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         vector: []const f32,
     },
     retained: struct {
@@ -602,7 +602,7 @@ const BorrowedVectorLease = union(enum) {
 
 const BorrowedMetadataLease = union(enum) {
     locked: struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         metadata: []const u8,
     },
     retained: struct {
@@ -829,7 +829,7 @@ fn noteHbcKindEviction(stats: *HbcCacheStats, kind: HbcCacheKind) void {
 
 /// Read-optimized ownership fence for the process-wide HBC cache maps.
 ///
-/// `ApplyRwLock` intentionally provides a writer-preferring service fence for
+/// `WriterPreferringRwLock` intentionally provides a writer-preferring service fence for
 /// apply/runtime coordination, but its shared path takes two mutexes and
 /// updates several global telemetry atomics. A vector query can perform
 /// hundreds of cache lookups, so that design turns read-only hits into one
@@ -1021,7 +1021,7 @@ const CacheRwLock = struct {
         self.writer_gate.unlock();
     }
 
-    fn snapshot(self: *const @This()) apply_rw_lock_mod.ApplyRwLock.Stats {
+    fn snapshot(self: *const @This()) WriterPreferringRwLock.Stats {
         return .{
             // Deliberately zero: exact shared telemetry would reintroduce a
             // globally written cache line on every vector hit.
@@ -5318,7 +5318,7 @@ pub const HBCIndex = struct {
     // the shared side for progress. Shared acquisition and odd-generation
     // waits are cooperative through std.Io. Best-effort searches remain
     // lock-free.
-    published_snapshot_mu: apply_rw_lock_mod.ApplyRwLock = .{},
+    published_snapshot_mu: WriterPreferringRwLock = .{},
     published_mutation_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Seqlock-style epoch for optimistic complete-snapshot searches. Every
     /// mutation, including an aborted one that leaves the durable generation
@@ -5393,7 +5393,7 @@ pub const HBCIndex = struct {
     cache_enabled: bool = true,
     retained_vector_cache_enabled: bool = true,
     bypass_external_vector_cache: bool = false,
-    cache_mu: apply_rw_lock_mod.ApplyRwLock,
+    cache_mu: WriterPreferringRwLock,
     active_searches: std.atomic.Value(u32),
     // Invalidations advance this epoch before touching the shared cache. A
     // rerank batch can therefore admit vectors read from one primary snapshot

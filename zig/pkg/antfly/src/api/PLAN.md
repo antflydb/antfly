@@ -52,7 +52,7 @@ is complete:
 - bounded fanout width instead of launching all groups at once
 - long-lived `std.Io.Threaded` query runtime on the provisioned `DataServer`
   path with explicit `async_limit`
-- local DB `ApplyRwLock` with safe pure-read paths moved to shared locking
+- local DB `WriterPreferringRwLock` (formerly `ApplyRwLock`) with safe pure-read paths moved to shared locking
 - mixed local read/write measurement via
   [rw_lock_bench.zig](../../../../bench/storage/rw_lock_bench.zig)
 - local DB `ExecutionContext` threaded through `search`, `searchComposed`,

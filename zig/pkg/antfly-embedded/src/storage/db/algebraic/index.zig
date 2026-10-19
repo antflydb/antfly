@@ -45,7 +45,7 @@ const lsm_backend = @import("../../lsm_backend.zig");
 const lsm_storage_io = @import("../../lsm_backend/storage_io.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const background_runtime = @import("../../background_runtime.zig");
-const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const doc_identity = @import("../doc_identity.zig");
 const doc_set = @import("../doc_set.zig");
 const derived_types = @import("../derived/derived_types.zig");
@@ -3068,7 +3068,7 @@ pub const Index = struct {
     // duped in), so config-derived and adaptive sketches are handled uniformly.
     // All read/maintenance paths iterate this, not config().hll_cardinalities.
     hll_registry: std.ArrayListUnmanaged(HllCardinalityConfig) = .empty,
-    hll_registry_lock: apply_rw_lock_mod.ApplyRwLock = .{},
+    hll_registry_lock: WriterPreferringRwLock = .{},
     // Query-side adaptive observations are accumulated in memory and flushed
     // by leader-gated maintenance. Reads never open a storage write transaction.
     hll_observation_mutex: std.atomic.Mutex = .unlocked,
@@ -3153,7 +3153,7 @@ pub const Index = struct {
     }
 
     const HllRegistryGuard = struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         items: []const HllCardinalityConfig,
 
         pub fn deinit(self: *@This()) void {
@@ -3169,7 +3169,7 @@ pub const Index = struct {
     }
 
     const HllRegistryWriteGuard = struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         items: []const HllCardinalityConfig,
 
         pub fn deinit(self: *@This()) void {

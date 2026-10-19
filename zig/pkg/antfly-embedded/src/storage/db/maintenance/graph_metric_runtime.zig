@@ -17,7 +17,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const lease_mod = @import("../lease.zig");
 const ownership_mod = @import("../ownership.zig");
@@ -341,7 +341,7 @@ const UnsupportedGraphMetricRuntime = struct {
         _: Allocator,
         _: anytype,
         _: *index_manager_mod.IndexManager,
-        _: *apply_rw_lock_mod.ApplyRwLock,
+        _: *WriterPreferringRwLock,
         _: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !@This() {
@@ -422,7 +422,7 @@ const PlatformGraphMetricRuntime = struct {
         alloc: Allocator,
         store: anytype,
         index_manager: *index_manager_mod.IndexManager,
-        apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        apply_mutex: *WriterPreferringRwLock,
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !GraphMetricRuntime {

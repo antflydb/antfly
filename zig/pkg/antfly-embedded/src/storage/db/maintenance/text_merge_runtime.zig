@@ -17,7 +17,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
@@ -78,7 +78,7 @@ const UnsupportedTextMergeRuntime = struct {
     pub fn init(
         _: Allocator,
         _: *index_manager_mod.IndexManager,
-        _: *apply_rw_lock_mod.ApplyRwLock,
+        _: *WriterPreferringRwLock,
         _: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !@This() {
@@ -171,7 +171,7 @@ const PlatformTextMergeRuntime = struct {
     io: ?Io,
     native_storage_pool: *storage_io_mod.NativeStoragePool,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     config: Config,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -237,7 +237,7 @@ const PlatformTextMergeRuntime = struct {
     pub fn init(
         alloc: Allocator,
         index_manager: *index_manager_mod.IndexManager,
-        apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        apply_mutex: *WriterPreferringRwLock,
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !TextMergeRuntime {
@@ -398,7 +398,7 @@ const PlatformTextMergeRuntime = struct {
         // can miss every gap indefinitely, silently starving the scheduler
         // that is supposed to relieve the very segment-count pressure the
         // replayer is blocked on. Register as a real (bounded) exclusive
-        // waiter so the writer-preferring ApplyRwLock stops admitting new
+        // waiter so the WriterPreferringRwLock stops admitting new
         // shared holders once we start waiting, so this worker wins the
         // very next release instead of only winning if it happens to poll
         // during a gap. The deadline still degrades to the same
@@ -1006,7 +1006,7 @@ fn isShutdown(runtime: *TextMergeRuntime) bool {
     return runtime.shutdown;
 }
 
-fn lockApplyExclusive(lock: *apply_rw_lock_mod.ApplyRwLock) void {
+fn lockApplyExclusive(lock: *WriterPreferringRwLock) void {
     lock.lockExclusive();
 }
 
@@ -1077,11 +1077,11 @@ fn consumeTestFailure(counter: *std.atomic.Value(u32)) bool {
     return false;
 }
 
-fn lockApplyShared(lock: *apply_rw_lock_mod.ApplyRwLock) void {
+fn lockApplyShared(lock: *WriterPreferringRwLock) void {
     lock.lockShared();
 }
 
-fn tryPublicationHandoff(apply_mutex: *apply_rw_lock_mod.ApplyRwLock, lease: *?*std.atomic.Mutex) bool {
+fn tryPublicationHandoff(apply_mutex: *WriterPreferringRwLock, lease: *?*std.atomic.Mutex) bool {
     if (lease.* == null) return false;
     if (apply_mutex.tryLockExclusive()) return true;
     lease.*.?.unlock();
@@ -1090,7 +1090,7 @@ fn tryPublicationHandoff(apply_mutex: *apply_rw_lock_mod.ApplyRwLock, lease: *?*
 }
 
 test "text merge publication handoff releases index lease before global contention" {
-    var global: apply_rw_lock_mod.ApplyRwLock = .{};
+    var global: WriterPreferringRwLock = .{};
     var index: std.atomic.Mutex = .unlocked;
     var lease: ?*std.atomic.Mutex = &index;
     global.lockShared();

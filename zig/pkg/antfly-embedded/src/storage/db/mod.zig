@@ -73,7 +73,7 @@ pub const transform = @import("transform.zig");
 pub const aggregations = @import("aggregations.zig");
 pub const algebraic = @import("algebraic/mod.zig");
 pub const backfill_state = @import("backfill_state.zig");
-pub const apply_rw_lock = @import("apply_rw_lock.zig");
+pub const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 pub const ChangeJournal = @import("derived/change_journal.zig").Journal;
 pub const DerivedLog = @import("derived/derived_log.zig").DerivedLog;
 pub const IndexManager = @import("catalog/index_manager.zig").IndexManager;
@@ -239,7 +239,6 @@ test {
     _ = aggregations;
     _ = algebraic;
     _ = backfill_state;
-    _ = apply_rw_lock;
     _ = ChangeJournal;
     _ = DerivedLog;
     _ = IndexManager;

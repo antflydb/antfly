@@ -6537,7 +6537,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &.{
             "storage.db.aggregations.",
             "storage.db.aggregations_contract.",
-            "storage.db.apply_rw_lock.",
             "storage.db.artifact.ids.",
             "storage.db.artifact.activation_boundary.",
             "storage.db.artifact.authored_acceptance.",
@@ -6823,7 +6822,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.lmdb_vopr.",
             "storage.maintenance.",
             "storage.mem_backend.",
-            "storage.mem_ordered.",
             "storage.object_storage.",
             "storage.persistent.",
             "storage.persistent_vopr.",

@@ -160,7 +160,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_algebraic_token;
     _ = @import("antfly_local_sources").storage_db_algebraic_value;
     _ = @import("antfly_local_sources").storage_db_algebraic_vector;
-    _ = @import("antfly_local_sources").storage_db_apply_rw_lock;
     _ = @import("antfly_local_sources").storage_db_artifact_ids;
     _ = @import("antfly_local_sources").storage_db_backfill_state;
     _ = @import("antfly_local_sources").storage_db_batcher;
@@ -414,7 +413,7 @@ comptime {
     _ = @import("lsm_vopr.zig");
     _ = @import("antfly_local_sources").storage_maintenance;
     _ = @import("antfly_local_sources").storage_mem_backend;
-    _ = @import("antfly_local_sources").storage_mem_ordered;
+    _ = @import("antfly_local_sources").storage_mem_backend_ordered;
     _ = @import("antfly_local_sources").storage_object_storage;
     _ = @import("antfly_local_sources").storage_persistent;
     _ = @import("antfly_local_sources").storage_posting_segment_store;

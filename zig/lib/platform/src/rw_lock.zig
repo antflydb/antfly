@@ -15,14 +15,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const platform = @import("antfly_platform");
-const platform_time = @import("antfly_platform").time;
-const AtomicU64 = platform.atomic.Value(u64);
+const platform_time = @import("time.zig");
+const AtomicU64 = @import("atomic.zig").Value(u64);
 
 /// Writer-preferring service fence. Shared acquisition is intentionally not
 /// reentrant: once a writer closes admission, a call tree that already holds
 /// shared must use lock-assuming helpers instead of acquiring shared again.
-pub const ApplyRwLock = struct {
+pub const WriterPreferringRwLock = struct {
     pub const Stats = struct {
         shared_lock_calls: u64 = 0,
         shared_contended_calls: u64 = 0,
@@ -344,7 +343,7 @@ fn monotonicNs() u64 {
     return platform_time.monotonicNs();
 }
 
-fn noteWait(self: *ApplyRwLock, comptime kind: enum { shared, exclusive }, wait_ns: u64) void {
+fn noteWait(self: *WriterPreferringRwLock, comptime kind: enum { shared, exclusive }, wait_ns: u64) void {
     switch (kind) {
         .shared => {
             _ = self.shared_wait_ns.fetchAdd(wait_ns, .monotonic);
@@ -364,8 +363,8 @@ fn atomicMaxU64(value: *AtomicU64, candidate: u64) void {
     }
 }
 
-test "apply rw lock permits nested shared acquisition while no writer is queued" {
-    var lock: ApplyRwLock = .{};
+test "writer preferring rw lock permits nested shared acquisition while no writer is queued" {
+    var lock: WriterPreferringRwLock = .{};
 
     lock.lockShared();
     defer lock.unlockShared();
@@ -376,8 +375,8 @@ test "apply rw lock permits nested shared acquisition while no writer is queued"
     try std.testing.expect(!lock.tryLockExclusive());
 }
 
-test "apply rw lock exclusive blocks while shared held" {
-    var lock: ApplyRwLock = .{};
+test "writer preferring rw lock exclusive blocks while shared held" {
+    var lock: WriterPreferringRwLock = .{};
 
     lock.lockShared();
     defer lock.unlockShared();
@@ -385,8 +384,8 @@ test "apply rw lock exclusive blocks while shared held" {
     try std.testing.expect(!lock.tryLockExclusive());
 }
 
-test "apply rw lock failed exclusive try does not poison future shared or exclusive lock" {
-    var lock: ApplyRwLock = .{};
+test "writer preferring rw lock failed exclusive try does not poison future shared or exclusive lock" {
+    var lock: WriterPreferringRwLock = .{};
 
     lock.lockShared();
     try std.testing.expect(!lock.tryLockExclusive());
@@ -399,18 +398,18 @@ test "apply rw lock failed exclusive try does not poison future shared or exclus
     lock.unlockExclusive();
 }
 
-test "apply rw lock exclusive tryLock succeeds when idle" {
-    var lock: ApplyRwLock = .{};
+test "writer preferring rw lock exclusive tryLock succeeds when idle" {
+    var lock: WriterPreferringRwLock = .{};
 
     try std.testing.expect(lock.tryLockExclusive());
     lock.unlockExclusive();
 }
 
-test "apply rw lock lets queued readers through sustained exclusive loop" {
+test "writer preferring rw lock lets queued readers through sustained exclusive loop" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const Context = struct {
-        lock: ApplyRwLock = .{},
+        lock: WriterPreferringRwLock = .{},
         reader_ready: std.atomic.Value(bool) = .init(false),
         reader_done: std.atomic.Value(bool) = .init(false),
         writer_done: std.atomic.Value(bool) = .init(false),
@@ -448,7 +447,7 @@ test "apply rw lock lets queued readers through sustained exclusive loop" {
     try std.testing.expect(!ctx.writer_done.load(.acquire) or spins < 100_000);
 }
 
-test "apply rw lock runtime shared wait cancellation clears priority handoff" {
+test "writer preferring rw lock runtime shared wait cancellation clears priority handoff" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const Cancellation = struct {
@@ -463,7 +462,7 @@ test "apply rw lock runtime shared wait cancellation clears priority handoff" {
     defer io_impl.deinit();
     const io = io_impl.io();
     var cancelled = std.atomic.Value(bool).init(true);
-    var lock: ApplyRwLock = .{ .io = io };
+    var lock: WriterPreferringRwLock = .{ .io = io };
 
     try std.testing.expectError(
         error.Cancelled,
@@ -474,7 +473,7 @@ test "apply rw lock runtime shared wait cancellation clears priority handoff" {
     lock.unlockExclusive();
 }
 
-test "apply rw lock runtime writer cancellation clears intent and reader gate" {
+test "writer preferring rw lock runtime writer cancellation clears intent and reader gate" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const Cancellation = struct {
@@ -489,7 +488,7 @@ test "apply rw lock runtime writer cancellation clears intent and reader gate" {
     defer io_impl.deinit();
     const io = io_impl.io();
     var cancelled = std.atomic.Value(bool).init(true);
-    var lock: ApplyRwLock = .{ .io = io };
+    var lock: WriterPreferringRwLock = .{ .io = io };
     lock.lockShared();
 
     try std.testing.expectError(
@@ -507,7 +506,7 @@ test "apply rw lock runtime writer cancellation clears intent and reader gate" {
     lock.unlockExclusive();
 }
 
-test "apply rw lock preserves backend task cancellation" {
+test "writer preferring rw lock preserves backend task cancellation" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const NeverCancelled = struct {
@@ -516,12 +515,12 @@ test "apply rw lock preserves backend task cancellation" {
         }
     };
     const Waiter = struct {
-        fn shared(lock: *ApplyRwLock, io: std.Io) !void {
+        fn shared(lock: *WriterPreferringRwLock, io: std.Io) !void {
             try lock.lockSharedIo(io, @as(?NeverCancelled, null));
             lock.unlockShared();
         }
 
-        fn exclusive(lock: *ApplyRwLock, io: std.Io) !void {
+        fn exclusive(lock: *WriterPreferringRwLock, io: std.Io) !void {
             try lock.lockExclusiveIo(io, @as(?NeverCancelled, null));
             lock.unlockExclusive();
         }
@@ -530,7 +529,7 @@ test "apply rw lock preserves backend task cancellation" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var lock: ApplyRwLock = .{ .io = io };
+    var lock: WriterPreferringRwLock = .{ .io = io };
 
     lock.lockExclusive();
     var exclusive_held = true;
@@ -587,7 +586,7 @@ test "apply rw lock preserves backend task cancellation" {
     lock.unlockExclusive();
 }
 
-test "apply rw lock cooperative writer yields to queued reader on one-worker runtime" {
+test "writer preferring rw lock cooperative writer yields to queued reader on one-worker runtime" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const NeverCancelled = struct {
@@ -596,7 +595,7 @@ test "apply rw lock cooperative writer yields to queued reader on one-worker run
         }
     };
     const Context = struct {
-        lock: *ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         io: std.Io,
         reader_done: std.atomic.Value(bool) = .init(false),
         writer_done: std.atomic.Value(bool) = .init(false),
@@ -624,7 +623,7 @@ test "apply rw lock cooperative writer yields to queued reader on one-worker run
     });
     defer io_impl.deinit();
     const io = io_impl.io();
-    var lock: ApplyRwLock = .{ .io = io };
+    var lock: WriterPreferringRwLock = .{ .io = io };
     lock.lockExclusive();
     var exclusive_held = true;
     defer if (exclusive_held) lock.unlockExclusive();
@@ -662,7 +661,7 @@ test "apply rw lock cooperative writer yields to queued reader on one-worker run
     try std.testing.expect(ctx.writer_done.load(.acquire));
 }
 
-test "apply rw lock queued io writer blocks later shared barging" {
+test "writer preferring rw lock queued io writer blocks later shared barging" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const NeverCancelled = struct {
@@ -671,7 +670,7 @@ test "apply rw lock queued io writer blocks later shared barging" {
         }
     };
     const Context = struct {
-        lock: *ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         io: std.Io,
         writer_done: std.atomic.Value(bool) = .init(false),
         writer_failed: std.atomic.Value(bool) = .init(false),
@@ -689,7 +688,7 @@ test "apply rw lock queued io writer blocks later shared barging" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var lock: ApplyRwLock = .{ .io = io };
+    var lock: WriterPreferringRwLock = .{ .io = io };
     lock.lockShared();
     var shared_held = true;
     defer if (shared_held) lock.unlockShared();
@@ -720,9 +719,9 @@ test "apply rw lock queued io writer blocks later shared barging" {
     try std.testing.expect(!barged);
 }
 
-test "apply rw lock concurrent readers preserve writer exclusion through repeated wakeups" {
+test "writer preferring rw lock concurrent readers preserve writer exclusion through repeated wakeups" {
     const Context = struct {
-        lock: ApplyRwLock = .{},
+        lock: WriterPreferringRwLock = .{},
         value: u64 = 0,
         inverse: u64 = ~@as(u64, 0),
         done: std.atomic.Value(u32) = .init(0),
@@ -796,14 +795,14 @@ const LockVoprHarness = if (builtin.is_test) struct {
     }
 } else struct {};
 
-test "apply rw lock VOPR wakes shared and exclusive waiters without advancing time" {
+test "writer preferring rw lock VOPR wakes shared and exclusive waiters without advancing time" {
     var runtime = try LockVoprHarness.vopr.vopr_io.VoprIo.init(.{});
     defer runtime.deinit();
     const io = runtime.io();
     var harness: LockVoprHarness = .{ .runtime = &runtime };
     defer harness.deinit();
     const Work = struct {
-        fn run(lock: *ApplyRwLock, shared: bool, cancellable: bool, done: *bool) anyerror!void {
+        fn run(lock: *WriterPreferringRwLock, shared: bool, cancellable: bool, done: *bool) anyerror!void {
             if (shared) {
                 // Even a caller's native fallback must not move this wait
                 // away from the bound VOPR synchronization authority.
@@ -818,7 +817,7 @@ test "apply rw lock VOPR wakes shared and exclusive waiters without advancing ti
     };
     for ([_]bool{ false, true }) |shared| {
         for ([_]bool{ false, true }) |cancellable| {
-            var lock: ApplyRwLock = .{ .io = io };
+            var lock: WriterPreferringRwLock = .{ .io = io };
             if (shared) lock.lockExclusive() else lock.lockShared();
             var held = true;
             var done = false;
@@ -848,7 +847,7 @@ test "apply rw lock VOPR wakes shared and exclusive waiters without advancing ti
     try runtime.ensureNoCapabilityViolation();
 }
 
-test "apply rw lock VOPR deadline and callback cancellation reopen reader admission" {
+test "writer preferring rw lock VOPR deadline and callback cancellation reopen reader admission" {
     var runtime = try LockVoprHarness.vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
     defer runtime.deinit();
     const io = runtime.io();
@@ -861,7 +860,7 @@ test "apply rw lock VOPR deadline and callback cancellation reopen reader admiss
         }
     };
     const Work = struct {
-        fn run(lock: *ApplyRwLock, deadline: ?std.Io.Clock.Timestamp, cancelled: *const bool) anyerror!void {
+        fn run(lock: *WriterPreferringRwLock, deadline: ?std.Io.Clock.Timestamp, cancelled: *const bool) anyerror!void {
             if (deadline) |until| {
                 try lock.lockExclusiveDeadlineIo(lock.io.?, until);
             } else {
@@ -871,7 +870,7 @@ test "apply rw lock VOPR deadline and callback cancellation reopen reader admiss
         }
     };
     for ([_]bool{ false, true }) |use_deadline| {
-        var lock: ApplyRwLock = .{ .io = io };
+        var lock: WriterPreferringRwLock = .{ .io = io };
         lock.lockShared();
         defer lock.unlockShared();
         var cancelled = false;
@@ -907,13 +906,13 @@ test "apply rw lock VOPR deadline and callback cancellation reopen reader admiss
     try runtime.ensureNoCapabilityViolation();
 }
 
-test "apply rw lock VOPR unlock before parking does not lose its wake" {
+test "writer preferring rw lock VOPR unlock before parking does not lose its wake" {
     var runtime = try LockVoprHarness.vopr.vopr_io.VoprIo.init(.{});
     defer runtime.deinit();
     const io = runtime.io();
     var harness: LockVoprHarness = .{ .runtime = &runtime };
     defer harness.deinit();
-    var lock: ApplyRwLock = .{ .io = io };
+    var lock: WriterPreferringRwLock = .{ .io = io };
     lock.lockExclusive();
     // Force the precise pre-park overlap: admission failed, then unlock ran
     // before the wait primitive could register this epoch on its futex queue.
@@ -921,7 +920,7 @@ test "apply rw lock VOPR unlock before parking does not lose its wake" {
     try std.testing.expect(!lock.tryLockShared());
     lock.unlockExclusive();
     const Work = struct {
-        fn run(mutex: *ApplyRwLock, expected: u32) anyerror!void {
+        fn run(mutex: *WriterPreferringRwLock, expected: u32) anyerror!void {
             try mutex.waitForLock(mutex.io.?, expected, false, null, false);
             try std.testing.expect(mutex.tryLockShared());
             mutex.unlockShared();

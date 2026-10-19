@@ -49,7 +49,7 @@ const graph_asset_state = @import("graph_asset_state.zig");
 
 const graph_edge_contender = @import("graph_edge_contender.zig");
 
-const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 
 const snapshot_admission_mod = @import("snapshot_admission.zig");
 
@@ -185,7 +185,7 @@ pub const AsyncContext = struct {
     applied_sequence_checkpoint_path: ?[]const u8 = null,
     index_repair_checkpoint: ?index_repair_state.Location = null,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     // Heap-stable admission state shared by the DB wrapper and callbacks that
     // outlive DB.open's by-value return. Activation publishes this flag while
     // holding apply exclusive; every catalog-sensitive lease revalidates it
@@ -641,7 +641,7 @@ pub const BatchExecutionContext = struct {
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     portable_runtime_activation_pending: ?*const std.atomic.Value(bool) = null,
     snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
@@ -2293,7 +2293,7 @@ pub fn acquireSnapshotReplay(
 /// Lock the apply mutex with the portable-runtime gate checked before and
 /// after, so an activation that starts while this caller waits is still seen.
 pub fn lockApplyGated(
-    mutex: *apply_rw_lock_mod.ApplyRwLock,
+    mutex: *WriterPreferringRwLock,
     pending: ?*const std.atomic.Value(bool),
     comptime mode: enum { exclusive, shared },
 ) !void {
