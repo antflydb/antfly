@@ -1555,6 +1555,31 @@ that allocator remains alive through commit or abandoned-output cleanup. Interna
 window/output-retry storage uses reclaiming workspace backing even when the
 caller supplies an arena for independently owned outputs.
 
+Live ingestion shares immutable encoded snapshots through reference-counted
+owners. Packet windows and decoder views allocate their own packet/span metadata;
+contiguous reads borrow payload slices, while cross-span reads use bounded copy
+fallbacks. Validation of coordinator-owned prefixes advances only new packets;
+untrusted reader APIs continue to verify their content bindings. Projection keys
+use a process-local source capability, epoch generation and absolute packet ID,
+so retention rebasing cannot alias another picture or stream.
+
+A live stream retains an admitted decoder owner while a GOP grows, including
+portable reference pictures, dynamic parameter registry and eligible VideoToolbox
+state. Retention eviction, configuration/period transitions and failed inference
+reset that owner. Rewinding selections retain the existing replay fallback.
+
+HLS/DASH HTTP reads and framing use a producer with two queued fragments while
+model execution and delivery callbacks remain on the caller thread. The queue
+uses the transport's existing snapshot admission, plus model admission for its
+context. Cancellation stops and joins the producer before returning. Its transient
+request checkpoint reaches the HTTP cancellation watchdog and never escapes into
+snapshot controls. Acknowledged queued fragments survive callback or append
+failure and are consumed before another HTTP request on retry. Custom readers
+without the request-control capability, single-threaded builds and thread-start
+failure retain synchronous operation. Statistics report prefetched fragments and
+publications overlapping caller-side preparation/execution/delivery; these are
+not GPU utilization measurements.
+
 Metal vision retains up to two admitted activation layouts per model. Each uses
 bounded 512-row FFN tiles, snapshots immutable norm coefficients and reuses
 separate norm, residual, alternating hidden and prepared-head ranges. Activation

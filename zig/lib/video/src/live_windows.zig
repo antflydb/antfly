@@ -26,6 +26,7 @@ pub const Options = struct {
 pub const Window = struct {
     snapshot: ?*media.stream.Snapshot,
     overlay: ?*ParameterOverlay = null,
+    segmented: ?*Segmented = null,
     reader: media.mp4.Reader,
     epoch: usize,
     identity: []u8,
@@ -35,6 +36,7 @@ pub const Window = struct {
         self.reader.deinit();
         if (self.snapshot) |snapshot| snapshot.deinit();
         if (self.overlay) |overlay| overlay.deinit();
+        if (self.segmented) |segmented| segmented.deinit();
         a.free(self.identity);
         self.identity_reservation.deinit();
         self.* = undefined;
@@ -122,6 +124,52 @@ pub fn borrowWithParameters(a: std.mem.Allocator, reader: *media.mp4.Reader, par
     window.reader.packets[0].offset = reader.input.length();
     return window;
 }
+/// Clone only packet/span metadata and retain immutable payload storage. This is
+/// used by an epoch-owned decoder whose references outlive a delivered window.
+pub fn clone(a: std.mem.Allocator, original: *const Window, options: Options) !Window {
+    var constructing = true;
+    const segmented = original.segmented orelse return error.UnsupportedVideoSource;
+    const metadata_bytes = try std.math.add(usize, @sizeOf(Segmented), try std.math.add(usize, try std.math.mul(usize, segmented.spans.len, @sizeOf(Segmented.Span)), try std.math.mul(usize, segmented.owners.len, @sizeOf(*media.stream.Snapshot))));
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = original.reader.packets.len * @sizeOf(media.mp4.Packet) }) else media.admission.Token{};
+    errdefer if (constructing) reservation.deinit();
+    var view_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = metadata_bytes }) else media.admission.Token{};
+    errdefer if (constructing) view_reservation.deinit();
+    var identity_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = original.identity.len }) else media.admission.Token{};
+    errdefer if (constructing) identity_reservation.deinit();
+    const identity = try a.dupe(u8, original.identity);
+    errdefer if (constructing) a.free(identity);
+    const packets = try a.dupe(media.mp4.Packet, original.reader.packets);
+    errdefer if (constructing) a.free(packets);
+    const spans = try a.dupe(Segmented.Span, segmented.spans);
+    errdefer if (constructing) a.free(spans);
+    const owners = try a.dupe(*media.stream.Snapshot, segmented.owners);
+    errdefer if (constructing) a.free(owners);
+    const view = try a.create(Segmented);
+    // No fallible work between acquiring references and publishing their owner.
+    for (owners) |owner| owner.retain();
+    view.* = .{ .allocator = a, .spans = spans, .owners = owners, .reservation = view_reservation, .input = .{ .allocator = a, .identity = identity, .control = options.stream.control, .limits = options.stream.source_limits, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = view, .read_at = Segmented.readAt, .borrow_at = Segmented.borrowAt, .length = segmented.input.length() } } } };
+    var reader = original.reader;
+    reader.allocator = a;
+    reader.input = &view.input;
+    reader.metadata = .{ .bytes = &.{}, .source = null };
+    reader.packets = packets;
+    reader.index_reservation = reservation;
+    // Ownership has moved into result; only its cleanup runs after this point.
+    var result = Window{ .snapshot = null, .segmented = view, .reader = reader, .epoch = original.epoch, .identity = identity, .identity_reservation = identity_reservation };
+    constructing = false;
+    if (original.overlay) |overlay| {
+        // Use a separate scope to avoid also running construction errdefers.
+        return clonePrefix(&result, overlay.first, overlay.prefix, options);
+    }
+    return result;
+}
+fn clonePrefix(window: *Window, first: media.mp4.Packet, prefix: []const u8, options: Options) !Window {
+    errdefer window.deinit();
+    window.reader.packets[0] = first;
+    try prefixParameters(window, prefix, options);
+    return window.*;
+}
+
 fn sameTrack(left: media.mp4.Track, right: media.mp4.Track) bool {
     var l = left;
     var r = right;
@@ -131,13 +179,123 @@ fn sameTrack(left: media.mp4.Track, right: media.mp4.Track) bool {
     r.color_info = &.{};
     return std.meta.eql(l, r) and std.mem.eql(u8, left.avcc, right.avcc) and std.mem.eql(u8, left.color_info, right.color_info);
 }
+/// An independently owned source view; payload storage stays in retained immutable
+/// snapshots. Source counters and packet metadata are private to each consumer.
+const Segmented = struct {
+    const Span = struct { offset: u64, bytes: []const u8 };
+    allocator: std.mem.Allocator,
+    input: media.source.Source,
+    spans: []Span,
+    owners: []*media.stream.Snapshot,
+    reservation: media.admission.Token,
+    fn locate(self: *const Segmented, offset: u64) usize {
+        var lo: usize = 0;
+        var hi = self.spans.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.spans[mid].offset <= offset) lo = mid + 1 else hi = mid;
+        }
+        return lo -| 1;
+    }
+    fn borrowAt(raw: *anyopaque, offset: u64, size: usize, control: media.source.Control) !?[]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try control.check();
+        const span = self.spans[self.locate(offset)];
+        const relative = offset - span.offset;
+        if (relative > span.bytes.len or size > span.bytes.len - relative) return null;
+        return span.bytes[@intCast(relative)..][0..size];
+    }
+    fn readAt(raw: *anyopaque, offset: u64, destination: []u8, control: media.source.Control) !usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var done: usize = 0;
+        var index = self.locate(offset);
+        while (done < destination.len and index < self.spans.len) : (index += 1) {
+            try control.check();
+            const span = self.spans[index];
+            const relative = offset + done - span.offset;
+            if (relative > span.bytes.len) return error.UnexpectedEndOfSource;
+            const size: usize = @intCast(@min(destination.len - done, span.bytes.len - relative));
+            @memcpy(destination[done..][0..size], span.bytes[@intCast(relative)..][0..size]);
+            done += size;
+        }
+        return done;
+    }
+    fn deinit(self: *@This()) void {
+        std.debug.assert(self.input.retained_bytes == 0);
+        for (self.owners) |owner| owner.deinit();
+        self.allocator.free(self.owners);
+        self.allocator.free(self.spans);
+        self.reservation.deinit();
+        self.allocator.destroy(self);
+    }
+};
+/// Join published immutable snapshots without copying their encoded payloads.
+/// The returned view survives segment eviction and may be consumed independently.
+pub fn join(a: std.mem.Allocator, identity: []const u8, segments: []const media.live_mp4.Segment, options: Options) !Window {
+    if (identity.len > options.max_identity_bytes or segments.len == 0 or segments.len > options.max_units) return error.ResourceLimitExceeded;
+    const first = segments[0];
+    if (first.reader.track.timescale == 0) return error.InvalidSamplingMetadata;
+    var count: usize = 0;
+    var size: u64 = 0;
+    var previous: ?media.mp4.Packet = null;
+    for (segments) |segment| {
+        try options.stream.control.check();
+        if (segment.epoch != first.epoch or !sameTrack(first.reader.track, segment.reader.track)) return error.UnsupportedDynamicVideoConfig;
+        if (first.dash_timing) |left| {
+            const right = segment.dash_timing orelse return error.UnsupportedDynamicVideoConfig;
+            if (!left.period.compatible(right.period)) return error.UnsupportedDynamicVideoConfig;
+        } else if (segment.dash_timing != null) return error.UnsupportedDynamicVideoConfig;
+        for (segment.reader.packets) |packet| {
+            if (previous) |last| if (packet.media_dts < try std.math.add(i64, last.media_dts, last.duration)) return error.NonMonotonicMediaSegment;
+            previous = packet;
+            count = try std.math.add(usize, count, 1);
+            size = try std.math.add(u64, size, packet.size);
+            if (count > options.max_packets or size > options.stream.max_bytes) return error.ResourceLimitExceeded;
+            if (packet.offset > segment.backing.bytes.len or packet.size > segment.backing.bytes.len - packet.offset) return error.UnexpectedEndOfSource;
+        }
+    }
+    if (count == 0) return error.EmptyVideo;
+    const metadata_bytes = try std.math.add(usize, @sizeOf(Segmented), try std.math.add(usize, try std.math.mul(usize, count, @sizeOf(Segmented.Span)), try std.math.mul(usize, segments.len, @sizeOf(*media.stream.Snapshot))));
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = count * @sizeOf(media.mp4.Packet) }) else media.admission.Token{};
+    errdefer reservation.deinit();
+    var view_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = metadata_bytes }) else media.admission.Token{};
+    errdefer view_reservation.deinit();
+    var identity_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = identity.len }) else media.admission.Token{};
+    errdefer identity_reservation.deinit();
+    const owned_identity = try a.dupe(u8, identity);
+    errdefer a.free(owned_identity);
+    const packets = try a.alloc(media.mp4.Packet, count);
+    errdefer a.free(packets);
+    const spans = try a.alloc(Segmented.Span, count);
+    errdefer a.free(spans);
+    const owners = try a.alloc(*media.stream.Snapshot, segments.len);
+    errdefer a.free(owners);
+    const view = try a.create(Segmented);
+    errdefer a.destroy(view);
+    var cursor: u64 = 0;
+    var at: usize = 0;
+    for (segments, owners) |segment, *owner| {
+        owner.* = segment.backing;
+        for (segment.reader.packets) |packet| {
+            packets[at] = packet;
+            packets[at].offset = cursor;
+            spans[at] = .{ .offset = cursor, .bytes = segment.backing.bytes[@intCast(packet.offset)..][0..packet.size] };
+            cursor += packet.size;
+            at += 1;
+        }
+    }
+    for (owners) |owner| owner.retain();
+    view.* = .{ .allocator = a, .spans = spans, .owners = owners, .reservation = view_reservation, .input = .{ .allocator = a, .identity = owned_identity, .control = options.stream.control, .limits = options.stream.source_limits, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = view, .read_at = Segmented.readAt, .borrow_at = Segmented.borrowAt, .length = size } } } };
+    return .{ .snapshot = null, .segmented = view, .epoch = first.epoch, .identity = owned_identity, .identity_reservation = identity_reservation, .reader = .{ .allocator = a, .input = &view.input, .metadata = .{ .bytes = &.{}, .source = null }, .track = first.reader.track, .packets = packets, .index_reservation = reservation, .limits = .{} } };
+}
+
 /// Collect a finite set of published units in decode order. Include codec
 /// preroll before the requested sampling interval and sufficient future packets
 /// for reordered output. Epoch/config changes must form separate model windows.
 /// Returned storage is independent of every input segment and packet lease.
 /// A live producer must establish a presentation watermark before publishing a
 /// final window; this function does not infer completeness from EXTINF or PART.
-pub fn join(a: std.mem.Allocator, identity: []const u8, segments: []const media.live_mp4.Segment, options: Options) !Window {
+pub fn joinCopy(a: std.mem.Allocator, identity: []const u8, segments: []const media.live_mp4.Segment, options: Options) !Window {
     if (identity.len > options.max_identity_bytes) return error.ResourceLimitExceeded;
     if (segments.len == 0 or segments.len > options.max_units) return error.ResourceLimitExceeded;
     const first = segments[0];
@@ -247,9 +405,19 @@ pub fn copyWithParameters(a: std.mem.Allocator, identity: []const u8, reader: *m
 }
 pub fn prefixParameters(window: *Window, parameters: []const u8, options: Options) !void {
     if (parameters.len == 0) return;
-    const replacement = try copyWithParameters(window.reader.allocator, window.identity, &window.reader, window.epoch, parameters, options);
+    if (window.overlay != null) return error.UnsupportedDynamicVideoConfig;
+    var borrowed = try borrowWithParameters(window.reader.allocator, &window.reader, parameters, options);
+    errdefer borrowed.deinit();
+    // The old source is heap-stable (snapshot/segmented); transfer its owner.
+    borrowed.snapshot = window.snapshot;
+    borrowed.segmented = window.segmented;
+    borrowed.epoch = window.epoch;
+    if (borrowed.snapshot) |snapshot| snapshot.input.identity = borrowed.identity;
+    if (borrowed.segmented) |segmented| segmented.input.identity = borrowed.identity;
+    window.snapshot = null;
+    window.segmented = null;
     window.deinit();
-    window.* = replacement;
+    window.* = borrowed;
 }
 
 fn joinAllocationRun(a: std.mem.Allocator) !void {
@@ -272,6 +440,33 @@ fn joinAllocationRun(a: std.mem.Allocator) !void {
     var original = try two.reader.readPacket(0);
     defer original.deinit();
     try std.testing.expectEqualSlices(u8, original.bytes, packet.bytes);
+    try std.testing.expect(packet.owned == null);
+    try std.testing.expectEqual(@intFromPtr(original.bytes.ptr), @intFromPtr(packet.bytes.ptr));
+    var oracle = try joinCopy(a, "oracle", &.{ one, two }, .{});
+    defer oracle.deinit();
+    for (window.reader.packets, 0..) |_, id| {
+        var actual = try window.reader.readPacket(id);
+        defer actual.deinit();
+        var expected = try oracle.reader.readPacket(id);
+        defer expected.deinit();
+        try std.testing.expectEqualSlices(u8, expected.bytes, actual.bytes);
+    }
+    var retained = try clone(a, &window, .{ .stream = .{ .admission_pool = &pool } });
+    defer retained.deinit();
+    var retained_payload = try retained.reader.readPacket(0);
+    defer retained_payload.deinit();
+    try std.testing.expectEqualSlices(u8, window.segmented.?.spans[0].bytes, retained_payload.bytes);
+    packet.deinit();
+    window.reader.track.inband_parameter_sets = true;
+    const prefix = [_]u8{ 0, 0, 0, 1, 0x67 };
+    try prefixParameters(&window, &prefix, .{ .stream = .{ .admission_pool = &pool } });
+    var prefixed_clone = try clone(a, &window, .{ .stream = .{ .admission_pool = &pool } });
+    defer prefixed_clone.deinit();
+    var wanted = try window.reader.readPacket(0);
+    defer wanted.deinit();
+    var actual = try prefixed_clone.reader.readPacket(0);
+    defer actual.deinit();
+    try std.testing.expectEqualSlices(u8, wanted.bytes, actual.bytes);
 }
 test "live packet window joins units with independently owned source metadata and leases" {
     try joinAllocationRun(std.testing.allocator);
@@ -297,16 +492,17 @@ test "live packet window rejects mixed epochs duplicate clocks and packet bounds
     var identity = "independent".*;
     var window = try join(a, &identity, &.{one}, .{});
     @memset(&identity, 'x');
-    try std.testing.expectEqualStrings("independent", window.snapshot.?.input.identity);
+    try std.testing.expectEqualStrings("independent", window.reader.input.identity);
     defer window.deinit();
     const configuration = try a.dupe(u8, one.reader.track.avcc);
     defer a.free(configuration);
     one.deinit();
     one_live = false;
     try std.testing.expectEqualSlices(u8, configuration, window.reader.track.avcc);
+    try std.testing.expectEqualStrings("window/segment/0", window.segmented.?.owners[0].input.identity);
     var retained = try window.reader.readPacket(0);
     defer retained.deinit();
-    try std.testing.expectEqualSlices(u8, window.snapshot.?.bytes[@intCast(window.reader.packets[0].offset)..][0..window.reader.packets[0].size], retained.bytes);
+    try std.testing.expectEqualSlices(u8, window.segmented.?.spans[0].bytes, retained.bytes);
 }
 
 fn borrowedOverlayAllocationRun(a: std.mem.Allocator) !void {
@@ -340,7 +536,7 @@ test "live packet window borrowed bootstrap matches materialization and releases
     try std.testing.checkAllAllocationFailures(std.testing.allocator, borrowedOverlayAllocationRun, .{});
 }
 
-test "live packet window fills one final backing allocation within exact admission" {
+test "live packet window admits metadata only and borrows payload without allocation" {
     const a = std.testing.allocator;
     const file = @embedFile("../testdata/live/fragmented.mp4");
     var ingest = try media.live_mp4.Ingest.init(a, "window", file[0..797], .{});
@@ -351,7 +547,8 @@ test "live packet window fills one final backing allocation within exact admissi
     const identity = "single-backing";
     var size: usize = one.reader.track.avcc.len + one.reader.track.color_info.len;
     for (one.reader.packets) |packet| size += packet.size;
-    const exact = size + @sizeOf(media.stream.Snapshot) + identity.len + one.reader.packets.len * @sizeOf(media.mp4.Packet) + one.reader.track.avcc.len + one.reader.track.color_info.len;
+    const exact = @sizeOf(Segmented) + @sizeOf(*media.stream.Snapshot) + identity.len + one.reader.packets.len * (@sizeOf(media.mp4.Packet) + @sizeOf(Segmented.Span));
+    try std.testing.expect(exact < size);
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = exact } };
     var window = try join(a, identity, &.{one}, .{ .stream = .{ .admission_pool = &pool } });
     try std.testing.expectEqual(@as(u64, @intCast(exact)), pool.high_water.host_bytes);

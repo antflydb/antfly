@@ -608,16 +608,85 @@ pub fn embedNextLiveCached(out: std.mem.Allocator, session: Session, tokenizer: 
     try coordinator.commit(&prepared);
     return result;
 }
+/// Live model decoder state owns admitted allocations across immutable snapshots.
+/// A retained GOP can grow without rebuilding its DPB/VideoToolbox session.
+/// Eviction or an epoch transition resets references before rebinding the reader.
+pub const LiveDecoder = struct {
+    allocation: *LiveAllocation,
+    reader: @import("antfly_media").mp4.Reader = undefined,
+    continuation: @import("embedding_gemma2_video.zig").DecoderContinuation,
+    window: ?@import("antfly_video").live_windows.Window = null,
+    registry: ?*@import("antfly_video").h264_dynamic.Session = null,
+    epoch: ?usize = null,
+    generation: usize = 0,
+    packet_base: usize = 0,
+    packets: usize = 0,
+    pub fn create(session: Session, control: Control) !*LiveDecoder {
+        const allocation = try LiveAllocation.create(workspaceBackingAllocator(session.backend()), session, control);
+        errdefer allocation.deinit();
+        const self = try allocation.allocator().create(LiveDecoder);
+        self.* = .{ .allocation = allocation, .continuation = .{ .allocator = allocation.allocator(), .reader = &self.reader, .session = session } };
+        return self;
+    }
+    pub fn deinit(self: *LiveDecoder) void {
+        self.reset();
+        const allocation = self.allocation;
+        allocation.allocator().destroy(self);
+        allocation.deinit();
+    }
+    pub fn reset(self: *LiveDecoder) void {
+        self.continuation.deinit();
+        if (self.registry) |registry| registry.deinit();
+        self.registry = null;
+        if (self.window) |*window| window.deinit();
+        self.window = null;
+        self.continuation.parameter_sets = null;
+        self.epoch = null;
+        self.packets = 0;
+    }
+    fn bind(self: *LiveDecoder, prepared: *@import("antfly_video").live_coordinator.Prepared) !*@import("embedding_gemma2_video.zig").DecoderContinuation {
+        if (self.epoch != null and (self.epoch.? != prepared.window.epoch or self.generation != prepared.generation or self.packet_base != prepared.packet_base)) self.reset();
+        if (prepared.window.reader.packets.len < self.packets) return error.InvalidLivePictureIndex;
+        var window = try @import("antfly_video").live_windows.clone(self.allocation.allocator(), &prepared.window, .{ .stream = .{ .control = prepared.window.reader.input.control, .admission_pool = prepared.window.reader.input.admission_pool } });
+        errdefer window.deinit();
+        self.reader = window.reader;
+        errdefer self.reset();
+        if (self.reader.track.inband_parameter_sets) {
+            if (self.registry) |registry| {
+                if (self.reader.packets.len > self.packets) try registry.append(&self.reader);
+            } else {
+                self.registry = try @import("antfly_video").h264_dynamic.Session.init(self.allocation.allocator(), &self.reader, .{ .max_dependency_packets = 8192, .max_parameter_packets = 8192 });
+                self.continuation.parameter_sets = self.registry;
+            }
+        }
+        self.epoch = prepared.window.epoch;
+        self.generation = prepared.generation;
+        self.packet_base = prepared.packet_base;
+        self.packets = self.reader.packets.len;
+        try self.allocation.trim();
+        if (self.window) |*old| old.deinit();
+        self.window = window;
+        return &self.continuation;
+    }
+};
+
 /// Compute an independently owned vector without advancing the live window.
 /// Streaming delivery retains it until output acknowledgement and commit succeed.
 pub fn embedPreparedLiveCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, coordinator: *@import("antfly_video").live_coordinator.Coordinator, prepared: *@import("antfly_video").live_coordinator.Prepared, caption: ?[]const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !LiveResult {
+    return embedPreparedLiveWithDecoder(out, session, tokenizer, coordinator, prepared, caption, options, lock, control, cache, null);
+}
+
+pub fn embedPreparedLiveWithDecoder(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, coordinator: *@import("antfly_video").live_coordinator.Coordinator, prepared: *@import("antfly_video").live_coordinator.Prepared, caption: ?[]const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache, decoder: ?*LiveDecoder) !LiveResult {
     const effective = control orelse Control{};
     try effective.check();
     const allocation = try LiveAllocation.create(workspaceBackingAllocator(session.backend()), session, effective);
     defer allocation.deinit();
     const sampling = @import("embedding_gemma2_video.zig").Sampling{ .source_timestamps = prepared.policy };
-    var selection: ?@import("embedding_gemma2_video.zig").ReaderSelection = if (prepared.has_pictures and prepared.logical != null) (@import("embedding_gemma2_video.zig").ReaderSelection.init(allocation.allocator(), &prepared.window.reader, sampling, &prepared.logical.?, coordinator.options.window.stream.admission_pool, coordinator.options.window.stream.control) catch |err| return allocation.failure(err)) else null;
+    var selection: ?@import("embedding_gemma2_video.zig").ReaderSelection = if (prepared.has_pictures and prepared.logical != null) (@import("embedding_gemma2_video.zig").ReaderSelection.initImmutable(allocation.allocator(), &prepared.window.reader, sampling, &prepared.logical.?, coordinator.options.window.stream.admission_pool, coordinator.options.window.stream.control, coordinator.sourceBinding(prepared.window.epoch, prepared.generation), prepared.packet_base) catch |err| return allocation.failure(err)) else null;
     defer if (selection) |*owner| owner.deinit();
+    if (selection) |*owner| if (decoder) |state| {
+        owner.continuation = try state.bind(prepared);
+    };
     try allocation.trim();
     const parts = [_]Part{ .{ .sampled_video = .{ .reader = &prepared.window.reader, .sampling = sampling, .selection = if (selection) |*owner| owner else null } }, .{ .text = caption orelse "" } };
     const result: ?Result = if (prepared.has_pictures) try embedCached(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control, cache) else null;
@@ -5385,5 +5454,68 @@ test "embeddinggemma2 live retry windows never retain storage in a caller output
     try std.testing.expectEqual(capacity, arena.queryCapacity());
     try std.testing.expect(controller.snapshot().host_scratch_bytes < 128 * 1024);
     stream.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "embeddinggemma2 live decoder retains immutable references across growing windows and resets on eviction" {
+    const a = std.testing.allocator;
+    const media = @import("antfly_media");
+    const video = @import("antfly_video");
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 512 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    const snapshot = try media.stream.Snapshot.copy(a, "live-decoder", &.{@embedFile("../testdata/video/closed.mp4")}, .{});
+    var segment = media.live_mp4.Segment{ .backing = snapshot, .reader = try media.mp4.Reader.init(a, &snapshot.input, .{}), .ordinal = 0, .epoch = 0, .identity = try a.dupe(u8, "live-decoder"), .identity_reservation = .{} };
+    var segment_live = true;
+    defer if (segment_live) segment.deinit();
+    var prepared = video.live_coordinator.Prepared{ .window = try video.live_windows.join(a, "live-decoder-view", &.{segment}, .{}), .policy = .{}, .ordinal = 0, .source_start_ns = 0, .source_end_ns = 1, .has_pictures = true };
+    var prepared_live = true;
+    defer if (prepared_live) prepared.deinit();
+    segment.deinit();
+    segment_live = false;
+    const owner = try LiveDecoder.create(session, .{});
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
+    const packets = prepared.window.reader.packets;
+    const half = @max(@as(usize, 1), packets.len / 2);
+    prepared.window.reader.packets = packets[0..half];
+    const first = owner.bind(&prepared) catch |err| {
+        prepared.window.reader.packets = packets;
+        return err;
+    };
+    prepared.window.reader.packets = packets;
+    first.decoder = try video.h264.Incremental.init(owner.allocation.allocator(), &owner.reader, .{});
+    const decoder = first.decoder.?;
+    const Capture = struct {
+        digest: [32]u8 = undefined,
+        fn accept(raw: *anyopaque, _: usize, frame: *const video.h264.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.crypto.hash.sha2.Sha256.hash(frame.nv12, &self.digest, .{});
+        }
+    };
+    var capture = Capture{};
+    const initial = try decoder.decodeSelected(&owner.reader, &.{0}, &capture, Capture.accept);
+    const second = try owner.bind(&prepared);
+    try std.testing.expectEqual(decoder, second.decoder.?);
+    const last: usize = 1;
+    const continued = try decoder.decodeSelected(&owner.reader, &.{last}, &capture, Capture.accept);
+    var expected = Capture{};
+    const replay = try video.h264.decodeSelected(a, &prepared.window.reader, &.{last}, .{}, &expected, Capture.accept);
+    try std.testing.expectEqualSlices(u8, &expected.digest, &capture.digest);
+    try std.testing.expect(continued.decoded_packets < replay.decoded_packets);
+    try std.testing.expect(initial.decoded_packets + continued.decoded_packets <= packets.len);
+    prepared.packet_base = 1;
+    _ = try owner.bind(&prepared);
+    try std.testing.expect(owner.continuation.decoder == null);
+    prepared.deinit();
+    prepared_live = false;
+    // The retained reader remains valid after the delivered window is freed.
+    var held = try owner.reader.readPacket(0);
+    try std.testing.expect(held.bytes.len != 0);
+    held.deinit();
+    owner.deinit();
+    owner_live = false;
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
 }

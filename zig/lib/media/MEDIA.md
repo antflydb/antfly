@@ -885,3 +885,17 @@ maximum token bounds. Compact phase reductions preserve explicit workspace
 policy. Live encoder admission can shrink a ready cohort without discarding
 its prepared inputs. Later pressure preserves completed vectors and indexes;
 the broker retries only failed items after prepared owners drain.
+
+Immutable published `stream.Snapshot` storage supports independent retained
+owners. Each consumer releases its reader leases before its snapshot reference;
+the final release frees storage and its admission token. Readers keep independent
+mutable source counters. `source.Range.borrow_at` optionally lends a contiguous
+immutable extent under the ordinary read/retention/admission limits, with
+`read_at` as the cross-extent fallback. Provider storage must outlive all leases.
+
+HTTP adapters distinguish their stable source `control` from a transient
+`request_control`. The latter also reaches HTTP watchdog cancellation but is
+never copied into retained segment snapshots. Live readers expose
+`swapReadControl` for a scoped ingestion producer; callers restore the prior
+checkpoint only after that producer joins. This permits bounded read/model
+overlap without allowing a request-local callback to escape into a window.

@@ -20,6 +20,9 @@ const windows = @import("live_windows.zig");
 const sampling = @import("sampling.zig");
 const pictures = @import("h264_pictures.zig");
 const avc = @import("avc.zig");
+// Cache identities are process-local capabilities for independently owned
+// immutable snapshots, never URL or caller-claimed content hashes.
+var next_source_id: std.atomic.Value(u64) = .init(1);
 pub const Options = struct {
     window: windows.Options = .{},
     duration_ns: i64 = 2 * std.time.ns_per_s,
@@ -37,6 +40,8 @@ pub const Prepared = struct {
     logical: ?pictures.Index = null,
     policy: sampling.TimestampPolicy,
     ordinal: usize,
+    packet_base: usize = 0,
+    generation: usize = 0,
     source_start_ns: i64,
     source_end_ns: i64,
     has_pictures: bool,
@@ -76,6 +81,9 @@ pub const Coordinator = struct {
     stream: ?*pictures.Stream = null,
     parameters: Parameters = .{},
     logical_base: usize = 0,
+    packet_base: usize = 0,
+    generation: usize = 0,
+    source_id: u64,
     stats: Stats = .{},
     ordinal: usize = 0,
     finished: bool = false,
@@ -87,7 +95,26 @@ pub const Coordinator = struct {
         if (options.advance_ns) |advance| if (advance == 0 or advance > std.math.maxInt(i64)) return error.InvalidLiveWindowAdvance;
         try (sampling.TimestampPolicy{ .step_ns = options.step_ns, .max_frames = options.max_frames }).validate();
         const reservation = if (options.window.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Coordinator) }) else media.admission.Token{};
-        return .{ .allocator = a, .options = options, .reservation = reservation };
+        const source_id = id: while (true) {
+            const value = next_source_id.load(.monotonic);
+            if (value == std.math.maxInt(u64)) {
+                var owned = reservation;
+                owned.deinit();
+                return error.ResourceLimitExceeded;
+            }
+            if (next_source_id.cmpxchgWeak(value, value + 1, .monotonic, .monotonic) == null) break :id value;
+        };
+        return .{ .allocator = a, .options = options, .reservation = reservation, .source_id = source_id };
+    }
+    pub fn sourceBinding(self: *const Coordinator, epoch: usize, generation: usize) [32]u8 {
+        var bytes: [24]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], self.source_id, .little);
+        std.mem.writeInt(u64, bytes[8..16], @intCast(epoch), .little);
+        std.mem.writeInt(u64, bytes[16..24], @intCast(generation), .little);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-owned-live-source-v1");
+        hash.update(&bytes);
+        return hash.finalResult();
     }
     fn dropStream(self: *Coordinator) void {
         if (self.stream) |stream| stream.deinit();
@@ -143,7 +170,7 @@ pub const Coordinator = struct {
         try checkpoint.reservation.resize(.{ .host_bytes = checkpoint.bytes.len });
         var suffix = reader.*;
         suffix.packets = reader.packets[removed..];
-        var canonical = try windows.copyWithParameters(self.allocator, "live-parameter-checkpoint", &suffix, self.units[0].epoch, checkpoint.bytes, self.options.window);
+        var canonical = try windows.borrowWithParameters(self.allocator, &suffix, checkpoint.bytes, self.options.window);
         defer canonical.deinit();
         if (self.stream) |stream| try stream.rebaseWithPrefix(reader, removed, &canonical.reader);
         self.parameters.deinit();
@@ -182,7 +209,7 @@ pub const Coordinator = struct {
             const picture_options = pictures.Options{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } };
             if (self.options.incremental_validation) {
                 if (self.stream == null) self.stream = try pictures.Stream.init(self.allocator, &view.reader, picture_options);
-                _ = try self.stream.?.advance(&view.reader);
+                _ = try self.stream.?.advanceOwned(&view.reader);
                 logical = try self.stream.?.snapshot(&view.reader);
             } else {
                 self.dropStream();
@@ -204,11 +231,13 @@ pub const Coordinator = struct {
             released = try std.math.add(usize, released, try charge(old));
             removed_packets = try std.math.add(usize, removed_packets, old.reader.packets.len);
         }
+        const next_packet_base = try std.math.add(usize, self.packet_base, removed_packets);
         if (keep != 0) try self.rebaseStream(&view.reader, removed_packets);
         if (self.logical) |*previous| previous.deinit();
         self.logical = logical;
         logical = null;
         self.logical_base = removed_packets;
+        self.packet_base = next_packet_base;
         self.pending_ns = pending_ns;
         if (self.logical) |validated| {
             self.stats.validation_walks += 1;
@@ -281,7 +310,7 @@ pub const Coordinator = struct {
             }
         }
         if (logical != null) self.stats.metadata_snapshots += 1;
-        return .{ .window = window, .logical = logical, .policy = .{ .start_ns = start, .end_ns = end, .step_ns = self.options.step_ns, .max_frames = self.options.max_frames }, .source_start_ns = start, .source_end_ns = end, .has_pictures = eligible, .ordinal = self.ordinal, .dash_timing = self.units[0].dash_timing, .hls_timing = self.units[0].hls_timing };
+        return .{ .window = window, .logical = logical, .policy = .{ .start_ns = start, .end_ns = end, .step_ns = self.options.step_ns, .max_frames = self.options.max_frames }, .source_start_ns = start, .source_end_ns = end, .has_pictures = eligible, .ordinal = self.ordinal, .packet_base = self.packet_base, .generation = self.generation, .dash_timing = self.units[0].dash_timing, .hls_timing = self.units[0].hls_timing };
     }
     /// Latest independently decoded preroll at/before a presentation cursor.
     /// All payload probes are fallible and run before retention state changes.
@@ -359,12 +388,14 @@ pub const Coordinator = struct {
             removed_packets = try std.math.add(usize, removed_packets, unit.reader.packets.len);
         }
         const next_base = try std.math.add(usize, self.logical_base, removed_packets);
+        const next_packet_base = try std.math.add(usize, self.packet_base, removed_packets);
         try self.rebaseStream(@constCast(&prepared.window.reader), removed_packets);
         self.start_ns = next_start;
         self.epoch_committed = true;
         self.ordinal += 1;
         self.retained_bytes -= released;
         self.logical_base = next_base;
+        self.packet_base = next_packet_base;
         for (self.units[0..keep]) |*unit| unit.deinit();
         std.mem.copyForwards(media.live_mp4.Segment, self.units[0 .. self.count - keep], self.units[keep..self.count]);
         self.count -= keep;
@@ -380,9 +411,10 @@ pub const Coordinator = struct {
             prepared.deinit();
             return error.LiveEpochUndrained;
         }
-        self.resetEpoch();
+        try self.resetEpoch();
     }
-    fn resetEpoch(self: *Coordinator) void {
+    fn resetEpoch(self: *Coordinator) !void {
+        const generation = try std.math.add(usize, self.generation, 1);
         for (self.units[0..self.count]) |*unit| unit.deinit();
         self.count = 0;
         self.retained_bytes = 0;
@@ -395,6 +427,8 @@ pub const Coordinator = struct {
         self.dropStream();
         self.parameters.deinit();
         self.logical_base = 0;
+        self.packet_base = 0;
+        self.generation = generation;
         self.finished = false;
         self.epoch_committed = false;
     }
@@ -421,7 +455,7 @@ pub const Coordinator = struct {
             if (!self.sameEpoch(self.pending.?)) {
                 try self.finish();
                 if (try self.prepareAlloc(a)) |prepared| return prepared;
-                self.resetEpoch();
+                try self.resetEpoch();
             }
             try self.append(&self.pending);
             if (try self.prepareAlloc(a)) |prepared| return prepared;
@@ -1134,4 +1168,16 @@ test "live coordinator readiness is allocation free and snapshot allocator failu
     try std.testing.expect(prepared.has_pictures);
     try coordinator.commit(&prepared);
     try std.testing.expect(!try coordinator.ready());
+}
+
+test "live coordinator source capabilities isolate instances and period generations" {
+    var first = try Coordinator.init(std.testing.allocator, .{});
+    defer first.deinit();
+    var second = try Coordinator.init(std.testing.allocator, .{});
+    defer second.deinit();
+    const original = first.sourceBinding(0, first.generation);
+    try std.testing.expect(!std.mem.eql(u8, &original, &second.sourceBinding(0, second.generation)));
+    try first.resetEpoch();
+    try std.testing.expect(!std.mem.eql(u8, &original, &first.sourceBinding(0, first.generation)));
+    try std.testing.expectEqualSlices(u8, &original, &first.sourceBinding(0, 0));
 }

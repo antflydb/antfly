@@ -36,7 +36,7 @@ pub const Delivery = struct {
         return value;
     }
 };
-pub const Stats = struct { resources: usize = 0, windows: usize = 0 };
+pub const Stats = struct { resources: usize = 0, windows: usize = 0, prefetched_fragments: usize = 0, overlapped_fragments: usize = 0 };
 /// Borrows session/tokenizer/coordinator/cache/lock and their stable controls.
 /// These owners outlive this state, including any pending output and permit.
 /// Captions/tasks are copied so retry cannot silently change model inputs.
@@ -53,6 +53,9 @@ pub const Stream = struct {
     control: Control,
     cache: ?*embedding.FrameCache,
     pending: ?Pending = null,
+    decoder: ?*embedding.LiveDecoder = null,
+    retained: [3]?media.live_mp4.Segment = @splat(null),
+    retained_count: usize = 0,
     active: bool = false,
     stats: Stats = .{},
     const Pending = struct {
@@ -85,6 +88,8 @@ pub const Stream = struct {
         return .{ .allocator = a, .session = session, .tokenizer = tokenizer, .coordinator = coordinator, .caption = owned_caption, .options = owned_options, .task = task, .context_permit = context_permit, .lock = lock, .control = effective, .cache = cache };
     }
     pub fn deinit(self: *Stream) void {
+        for (&self.retained) |*unit| if (unit.*) |*value| value.deinit();
+        if (self.decoder) |decoder| decoder.deinit();
         if (self.pending) |*pending| pending.deinit(self.allocator);
         if (self.caption) |caption| self.allocator.free(caption);
         self.allocator.free(self.task);
@@ -104,7 +109,11 @@ pub const Stream = struct {
                 };
                 errdefer prepared.deinit();
                 try allocation.trim();
-                const output = embedding.embedPreparedLiveCached(allocation.allocator(), self.session, self.tokenizer, self.coordinator, &prepared, self.caption, self.options, self.lock, self.control, self.cache) catch |err| return allocation.failure(err);
+                if (prepared.has_pictures and prepared.window.reader.track.codec == .avc and self.decoder == null) self.decoder = try embedding.LiveDecoder.create(self.session, self.control);
+                const output = embedding.embedPreparedLiveWithDecoder(allocation.allocator(), self.session, self.tokenizer, self.coordinator, &prepared, self.caption, self.options, self.lock, self.control, self.cache, self.decoder) catch |err| {
+                    if (self.decoder) |decoder| decoder.reset();
+                    return allocation.failure(err);
+                };
                 errdefer if (output.result) |result| allocation.allocator().free(result.vector);
                 try allocation.trim();
                 self.pending = .{ .prepared = prepared, .output = output, .allocation = allocation };
@@ -133,45 +142,168 @@ pub const Stream = struct {
         self.pending = null;
         self.stats.windows += 1;
     }
-    /// Process one Reader-selected resource; callbacks can execute before EOF.
-    /// Explicit retry drains retained output before requesting any more bytes.
-    /// Returns false for a still-growing partial body; polling is caller-paced.
-    /// Reader owns its transport cancellation; control owns model/delivery work.
+    /// Append acknowledgement precedes model delivery. On failure this unit is
+    /// already owned by the coordinator and must never enter transport again.
+    fn append(self: *Stream, delivery: *media.http_stream.FragmentDelivery, context: *anyopaque, accept: *const fn (*anyopaque, *Delivery) anyerror!void) !void {
+        try self.control.check();
+        self.coordinator.beginEpoch(delivery.segment.?) catch |err| {
+            if (err != error.LiveEpochUndrained) return err;
+            try self.drain(context, accept);
+            try self.coordinator.beginEpoch(delivery.segment.?);
+        };
+        try self.coordinator.append(&delivery.segment);
+        delivery.acknowledge();
+        try self.drain(context, accept);
+    }
+    fn drainRetained(self: *Stream, context: *anyopaque, accept: *const fn (*anyopaque, *Delivery) anyerror!void) !void {
+        while (self.retained_count != 0) {
+            var delivery = media.http_stream.FragmentDelivery{ .segment = self.retained[0] };
+            // Even when model delivery fails after append, encoded ownership
+            // has transferred; preserve only units not taken by the coordinator.
+            defer {
+                self.retained[0] = delivery.segment;
+                if (delivery.segment == null) {
+                    for (0..self.retained_count - 1) |index| self.retained[index] = self.retained[index + 1];
+                    self.retained[self.retained_count - 1] = null;
+                    self.retained_count -= 1;
+                }
+            }
+            try self.append(&delivery, context, accept);
+        }
+    }
+    fn Producer(comptime R: type) type {
+        return struct {
+            const P = @This();
+            stream: *Stream,
+            reader: R,
+            io: std.Io,
+            storage: [2]media.live_mp4.Segment = undefined,
+            queue: std.Io.Queue(media.live_mp4.Segment) = undefined,
+            stopped: std.atomic.Value(bool) = .init(false),
+            computing: std.atomic.Value(bool) = .init(false),
+            published: usize = 0,
+            overlaps: usize = 0,
+            previous: ?media.source.Control = null,
+            failure: ?anyerror = null,
+            complete: bool = false,
+            fn check(raw: ?*const anyopaque) !void {
+                const self: *const P = @ptrCast(@alignCast(raw.?));
+                if (self.stopped.load(.acquire)) return error.Cancelled;
+                if (self.previous) |control| try control.check();
+                try self.stream.control.check();
+            }
+            fn publish(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+                const self: *P = @ptrCast(@alignCast(raw));
+                try check(self);
+                self.queue.putOneUncancelable(self.io, delivery.segment.?) catch return error.Cancelled;
+                delivery.segment = null;
+                delivery.acknowledge();
+                self.published += 1;
+                self.overlaps += @intFromBool(self.computing.load(.acquire));
+            }
+            fn run(self: *P) void {
+                self.read() catch |err| {
+                    self.failure = err;
+                };
+                self.queue.close(self.io);
+            }
+            fn read(self: *P) !void {
+                if (try self.reader.streamNext(self, publish)) |progress| self.complete = progress.resource_complete;
+            }
+        };
+    }
+    /// One HTTP resource per call. A bounded producer overlaps reading/framing
+    /// with caller-thread model execution and callbacks. The producer always
+    /// stops and joins before return, including callback failure/cancellation.
+    /// Acknowledged queued fragments survive retry before any further HTTP.
     pub fn process(self: *Stream, reader: anytype, context: *anyopaque, accept: *const fn (*anyopaque, *Delivery) anyerror!void) !bool {
         try self.control.check();
         if (self.active) return error.InvalidMediaStreamState;
         self.active = true;
         defer self.active = false;
         try self.drain(context, accept);
+        try self.drainRetained(context, accept);
+        const Reader = @typeInfo(@TypeOf(reader)).pointer.child;
+        if (comptime !@import("builtin").single_threaded and @hasDecl(Reader, "swapReadControl")) {
+            const P = Producer(@TypeOf(reader));
+            var permit = try embedding.admitHostPreprocess(self.session, @sizeOf(P), self.control);
+            defer permit.deinit();
+            var producer = P{ .stream = self, .reader = reader, .io = self.control.io orelse std.Options.debug_io };
+            producer.queue = .init(&producer.storage);
+            producer.previous = reader.swapReadControl(.{ .context = &producer, .check_fn = P.check });
+            defer _ = reader.swapReadControl(producer.previous);
+            const thread = std.Thread.spawn(.{}, P.run, .{&producer}) catch return self.processSerial(reader, context, accept);
+            var joined = false;
+            defer {
+                producer.stopped.store(true, .release);
+                producer.queue.close(producer.io);
+                if (!joined) thread.join();
+                // A transport acknowledgement belongs to the retained queue,
+                // even if an earlier model callback fails. Never drop/re-fetch it.
+                var remaining: [1]media.live_mp4.Segment = undefined;
+                while (true) {
+                    _ = producer.queue.getUncancelable(producer.io, &remaining, 1) catch break;
+                    std.debug.assert(self.retained_count < self.retained.len);
+                    self.retained[self.retained_count] = remaining[0];
+                    self.retained_count += 1;
+                }
+                if (producer.complete) self.stats.resources += 1;
+                self.stats.prefetched_fragments += producer.published;
+                self.stats.overlapped_fragments += producer.overlaps;
+            }
+            var incoming: [1]media.live_mp4.Segment = undefined;
+            while (true) {
+                _ = producer.queue.getUncancelable(producer.io, &incoming, 1) catch break;
+                var delivery = media.http_stream.FragmentDelivery{ .segment = incoming[0] };
+                defer if (delivery.segment) |*value| value.deinit();
+                producer.computing.store(true, .release);
+                defer producer.computing.store(false, .release);
+                self.append(&delivery, context, accept) catch |err| {
+                    if (delivery.segment) |value| {
+                        // Not appended: retain the current unit ahead of the
+                        // queue. Queue capacity is reduced below while draining.
+                        self.retained[0] = value;
+                        self.retained_count = 1;
+                        delivery.segment = null;
+                    }
+                    return err;
+                };
+            }
+            thread.join();
+            joined = true;
+            if (producer.failure) |err| return err;
+            if (reader.ended()) {
+                try self.coordinator.finish();
+                try self.drain(context, accept);
+            }
+            return producer.complete;
+        }
+        return self.processSerial(reader, context, accept);
+    }
+    fn processSerial(self: *Stream, reader: anytype, context: *anyopaque, accept: *const fn (*anyopaque, *Delivery) anyerror!void) !bool {
         const Sink = struct {
             stream: *Stream,
             context: *anyopaque,
             accept: *const fn (*anyopaque, *Delivery) anyerror!void,
             fn publish(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
                 const sink: *@This() = @ptrCast(@alignCast(raw));
-                try sink.stream.control.check();
-                sink.stream.coordinator.beginEpoch(delivery.segment.?) catch |err| {
-                    if (err != error.LiveEpochUndrained) return err;
-                    try sink.stream.drain(sink.context, sink.accept);
-                    try sink.stream.coordinator.beginEpoch(delivery.segment.?);
-                };
-                try sink.stream.coordinator.append(&delivery.segment);
-                // Encoded-fragment ownership already moved into the coordinator.
-                // A later inference/output error must not append it again.
-                delivery.acknowledge();
-                try sink.stream.drain(sink.context, sink.accept);
+                try sink.stream.append(delivery, sink.context, sink.accept);
             }
         };
         var sink = Sink{ .stream = self, .context = context, .accept = accept };
-        const result = try reader.streamNext(&sink, Sink.publish);
-        if (result) |progress| if (progress.resource_complete) {
-            self.stats.resources += 1;
-        };
+        if (try reader.streamNext(&sink, Sink.publish)) |progress| {
+            if (progress.resource_complete) self.stats.resources += 1;
+            if (reader.ended()) {
+                try self.coordinator.finish();
+                try self.drain(context, accept);
+            }
+            return progress.resource_complete;
+        }
         if (reader.ended()) {
             try self.coordinator.finish();
             try self.drain(context, accept);
         }
-        return if (result) |progress| progress.resource_complete else false;
+        return false;
     }
 };
 
@@ -238,4 +370,93 @@ test "embeddinggemma2 live idle drain needs no model admission or allocator" {
     var context: u8 = 0;
     try stream.drain(&context, Consumer.accept);
     try std.testing.expect(stream.pending == null);
+}
+
+test "embeddinggemma2 live producer overlaps caller delivery cancels blocked reads and retains queued acknowledgement" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Fake = struct {
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .metal;
+        }
+        const vtable = Session.VTable{ .run = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = backend, .close = undefined };
+    };
+    const Gate = struct {
+        main: std.Thread.Id,
+        second_published: std.atomic.Value(bool) = .init(false),
+        calls: usize = 0,
+        fn accept(raw: *anyopaque, delivery: *Delivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.main, std.Thread.getCurrentId());
+            try std.testing.expect(delivery.value.result == null);
+            while (!self.second_published.load(.acquire)) std.atomic.spinLoopHint();
+            self.calls += 1;
+            if (self.calls == 1) return error.ConsumerFailure;
+        }
+    };
+    const Reader = struct {
+        units: [2]?media.live_mp4.Segment,
+        gate: *Gate,
+        control: ?media.source.Control = null,
+        reads: usize = 0,
+        block: bool = true,
+        const Progress = struct { resource_complete: bool };
+        pub fn swapReadControl(self: *@This(), control: ?media.source.Control) ?media.source.Control {
+            const old = self.control;
+            self.control = control;
+            return old;
+        }
+        pub fn streamNext(self: *@This(), raw: *anyopaque, accept: *const fn (*anyopaque, *media.http_stream.FragmentDelivery) anyerror!void) !?Progress {
+            self.reads += 1;
+            if (self.reads > 1) return null;
+            for (&self.units) |*unit| {
+                var delivery = media.http_stream.FragmentDelivery{ .segment = unit.* };
+                defer unit.* = delivery.segment;
+                try accept(raw, &delivery);
+                try std.testing.expect(delivery.acknowledged);
+            }
+            self.gate.second_published.store(true, .release);
+            if (!self.block) return .{ .resource_complete = true };
+            // Model a network read waiting for more input: the transient
+            // request checkpoint must wake it when delivery fails.
+            while (true) {
+                try self.control.?.check();
+                std.atomic.spinLoopHint();
+            }
+        }
+        pub fn ended(self: *@This()) bool {
+            return self.reads > 1;
+        }
+    };
+    inline for (.{ false, true }) |block| {
+        var gate = Gate{ .main = std.Thread.getCurrentId() };
+        const bytes = @embedFile("../testdata/video/live-fragmented.mp4");
+        var ingest = try media.live_mp4.Ingest.init(a, "producer-overlap", bytes[0..797], .{});
+        defer ingest.deinit();
+        try ingest.push(bytes[797..11206]);
+        const first = try ingest.finishSegment();
+        try ingest.push(bytes[11206..20811]);
+        const second = try ingest.finishSegment();
+        var reader = Reader{ .units = .{ first, second }, .gate = &gate, .block = block };
+        defer for (&reader.units) |*unit| if (unit.*) |*value| value.deinit();
+        var coordinator = try coordinator_mod.Coordinator.init(a, .{ .duration_ns = 1, .advance_ns = std.time.ns_per_s });
+        defer coordinator.deinit();
+        coordinator.start_ns = 1;
+        coordinator.epoch_committed = true; // Intervals between timestamps need no model weights.
+        var marker: u8 = 0;
+        const session = Session{ .ptr = &marker, .vtable = &Fake.vtable };
+        var stream = try Stream.init(a, session, undefined, &coordinator, null, .{}, null, .{ .io = std.testing.io }, null);
+        defer stream.deinit();
+        try std.testing.expectError(error.ConsumerFailure, stream.process(&reader, &gate, Gate.accept));
+        try std.testing.expect(stream.pending != null);
+        try std.testing.expectEqual(@as(usize, 1), stream.retained_count);
+        try std.testing.expectEqual(@as(usize, 1), reader.reads);
+        try std.testing.expect(reader.control == null);
+        try std.testing.expectEqual(@as(usize, 2), stream.stats.prefetched_fragments);
+        _ = try stream.process(&reader, &gate, Gate.accept);
+        try std.testing.expectEqual(@as(usize, 0), stream.retained_count);
+        try std.testing.expectEqual(@as(usize, 3), stream.stats.windows);
+        try std.testing.expectEqual(@as(usize, 4), gate.calls);
+        try std.testing.expectEqual(@as(usize, @intFromBool(!block)), stream.stats.resources);
+    }
 }

@@ -38455,7 +38455,11 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
     const acknowledged_prefix = reader.stream_ledger.acknowledged;
     if (ts) {
         try std.testing.expect(reader.stream_ledger.acknowledged > 0);
-    } else try std.testing.expectEqual(@as(usize, if (parts) 1 else 2), reader.stream_ledger.acknowledged);
+    } else {
+        const minimum: usize = if (parts) 1 else 2;
+        try std.testing.expect(reader.stream_ledger.acknowledged >= minimum);
+        try std.testing.expect(reader.stream_ledger.acknowledged <= minimum + 2);
+    }
     try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
     try std.testing.expect(stream.pending != null and !stream.pending.?.acknowledged);
     try std.testing.expectEqual(@as(usize, 0), flow.ordinal);
@@ -38487,7 +38491,7 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
         for (expected.result.?.vector, actual.result.?.vector) |left, right| max_error = @max(max_error, @abs(left - right));
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
-    std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, max_error });
+    std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} prefetched={d} overlaps={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, stream.stats.prefetched_fragments, stream.stats.overlapped_fragments, max_error });
 }
 
 test "embeddinggemma2 video partial DASH pretrained windows preserve vectors across clean short EOF and growth" {
@@ -38662,7 +38666,7 @@ test "embeddinggemma2 video partial DASH pretrained windows preserve vectors acr
     var capture = Capture{ .transport = &transport, .wire = &wire };
     defer for (&capture.outputs) |*entry| if (entry.*) |value| if (value.result) |result| a.free(result.vector);
     try std.testing.expectError(error.ConsumerFailure, stream.process(&reader, &capture, Capture.accept));
-    try std.testing.expectEqual(@as(usize, 2), reader.stream_ledger.acknowledged);
+    try std.testing.expect(reader.stream_ledger.acknowledged >= 2 and reader.stream_ledger.acknowledged <= 4);
     try std.testing.expectEqual(@as(u64, 1), reader.dash_position.?.sequence);
     try std.testing.expect(stream.pending != null and !stream.pending.?.acknowledged);
     try std.testing.expectEqual(@as(usize, 0), flow.ordinal);

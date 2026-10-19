@@ -137,6 +137,7 @@ pub const Stream = struct {
     allocations: media.admission.TrackedAllocator,
     prefix: [32]u8,
     valid: bool = true,
+    owned_prefix: bool = false,
     last_stats: h264.Statistics = .{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 },
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !*Stream {
         if (options.max_pictures == 0 or reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
@@ -178,11 +179,24 @@ pub const Stream = struct {
         reservation.deinit();
     }
     pub fn advance(self: *Stream, reader: *media.mp4.Reader) !h264.Statistics {
+        return self.advancePrefix(reader, false);
+    }
+    /// The owner guarantees the already-published packet prefix is immutable,
+    /// and only appends new packets or rebases through rebaseWithPrefix. This
+    /// capability avoids rereading every previous payload on each small part.
+    /// Do not mix with advance on the same active stream.
+    pub fn advanceOwned(self: *Stream, reader: *media.mp4.Reader) !h264.Statistics {
+        return self.advancePrefix(reader, true);
+    }
+    fn advancePrefix(self: *Stream, reader: *media.mp4.Reader, owned: bool) !h264.Statistics {
+        if (self.position != 0 and self.owned_prefix != owned) return error.InvalidLivePictureIndex;
         if (!self.valid) return error.InvalidVideoDecoder;
         if (reader.packets.len > self.options.max_packets or reader.packets.len <= self.position) return error.ResourceLimitExceeded;
-        const previous = try prefixHash(reader, self.position, self.options.decode.max_packet_bytes);
-        if (!std.mem.eql(u8, &previous, &self.prefix)) return error.InvalidLivePictureIndex;
-        const next = try prefixHash(reader, reader.packets.len, self.options.decode.max_packet_bytes);
+        const next = if (owned) self.prefix else blk: {
+            const previous = try prefixHash(reader, self.position, self.options.decode.max_packet_bytes);
+            if (!std.mem.eql(u8, &previous, &self.prefix)) return error.InvalidLivePictureIndex;
+            break :blk try prefixHash(reader, reader.packets.len, self.options.decode.max_packet_bytes);
+        };
         errdefer self.valid = false;
         self.collector.pending_pts = null;
         self.collector.pending_first_packet = null;
@@ -190,6 +204,7 @@ pub const Stream = struct {
         const observer = h264.PictureObserver{ .context = &self.collector, .accept = Collector.accept, .pending = Collector.pending };
         const stats = (if (self.registry) |owner| self.advanceDynamic(reader, owner, observer) else self.core.advance(reader, observer)) catch |err| return if (err == error.OutOfMemory) self.allocations.denied orelse err else err;
         self.prefix = next;
+        self.owned_prefix = owned;
         self.position = reader.packets.len;
         self.last_stats = stats;
         return stats;
@@ -269,7 +284,7 @@ pub const Stream = struct {
             if (mask != 0 and mask != 7 and picture.first_packet < removed) return error.InvalidLivePictureIndex;
         }
         if (suffix.packets.len != self.position - removed) return error.InvalidLivePictureIndex;
-        const binding = try prefixHash(suffix, suffix.packets.len, self.options.decode.max_packet_bytes);
+        const binding = if (self.owned_prefix) self.prefix else try prefixHash(suffix, suffix.packets.len, self.options.decode.max_packet_bytes);
         const core_removed = removed -| self.epoch_base;
         if (!self.core.canRebase(core_removed)) return error.InvalidLivePictureIndex;
         if (self.registry) |owner| try owner.rebase(removed);

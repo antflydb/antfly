@@ -83,11 +83,13 @@ pub const Segment = struct {
     samples_digest: ?SamplesDigest = null,
     hls_timing: ?HlsTiming = null,
     pub fn deinit(self: *Segment) void {
-        const allocator = self.backing.input.allocator;
+        // Retained window/decoder owners can outlive the segment. Keep the
+        // source identity and its admission alive with that same backing.
+        std.debug.assert(self.backing.owned_identity == null);
+        self.backing.owned_identity = self.identity;
+        self.backing.identity_reservation = self.identity_reservation;
         self.reader.deinit();
         self.backing.deinit();
-        allocator.free(self.identity);
-        self.identity_reservation.deinit();
         self.* = undefined;
     }
 };
